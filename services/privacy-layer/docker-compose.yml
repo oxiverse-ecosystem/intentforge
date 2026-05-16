@@ -1,0 +1,78 @@
+services:
+  gluetun:
+    image: qmcgaw/gluetun
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file:
+      - ../../.env
+    environment:
+      - VPN_SERVICE_PROVIDER=protonvpn
+      - VPN_TYPE=openvpn
+      - FREE_ONLY=on
+      - OPENVPN_USER=${OPENVPN_USERNAME}
+      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD}
+      - DNS_KEEP_NAMESERVERS=on
+      - HTTP_PROXY=on
+      - SHADOWSOCKS=on
+      - HTTP_CONTROL_SERVER_ADDRESS=:8000
+    ports:
+      - "8888:8888/tcp" # HTTP Proxy
+      - "8388:8388/tcp" # Shadowsocks
+      - "8080:8080"     # SearXNG (Routed)
+      - "5000:5000"     # Whoogle (Routed)
+      - "3000:3000"     # Invidious (Routed)
+      - "4000:4000"     # Gateway (Routed)
+      - "6000:6000"     # Indexer (Routed)
+      - "1080:1080"     # HAProxy (Tor/VPN Fallback)
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  vpn-rotator:
+    image: alpine:latest
+    container_name: vpn-rotator
+    command: sh -c "while true; do sleep 7200; wget -qO- --method=PUT --body-data='{\"status\":\"stopped\"}' http://127.0.0.1:8000/v1/vpn/status; done"
+    depends_on:
+      - gluetun
+    network_mode: "service:gluetun"
+    restart: always
+
+  bridge-fetcher:
+    image: alpine:latest
+    container_name: tor-bridge-fetcher
+    volumes:
+      - privacy-data:/data
+    command: sh -c "apk add --no-cache curl jq && while true; do echo 'Fetching bridges...'; FETCHED=\$$(curl -s --connect-timeout 10 --retry 3 'https://bridges.torproject.org/moat/circumvention/builtin'); if [ \$$? -eq 0 ] && [ ! -z \"\$$FETCHED\" ]; then echo \"\$$FETCHED\" | jq -r '.obfs4[]' > /data/bridges.txt; echo 'Successfully fetched bridges.'; else echo 'Failed to fetch bridges. Retrying in 1 hour...'; fi; sleep 86400; done"
+    depends_on:
+      - gluetun
+    network_mode: "service:gluetun"
+    restart: always
+
+  tor-proxy:
+    build: ./tor
+    container_name: tor-proxy
+    volumes:
+      - privacy-data:/data
+    depends_on:
+      - bridge-fetcher
+    network_mode: "service:gluetun"
+    restart: always
+
+  haproxy:
+    image: haproxy:alpine
+    container_name: haproxy-privacy
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - tor-proxy
+    network_mode: "service:gluetun"
+    restart: always
+
+volumes:
+  privacy-data:

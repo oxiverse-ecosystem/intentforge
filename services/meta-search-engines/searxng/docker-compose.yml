@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  searxng:
+    container_name: searxng
+    image: searxng/searxng:latest
+    network_mode: "container:gluetun"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    restart: always
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

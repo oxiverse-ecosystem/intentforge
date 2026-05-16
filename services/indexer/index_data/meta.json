@@ -1,0 +1,100 @@
+{
+  "index_settings": {
+    "docstore_compression": "lz4",
+    "docstore_blocksize": 16384
+  },
+  "segments": [
+    {
+      "segment_id": "26e835b0-5e38-4966-882d-8909cdd5303f",
+      "max_doc": 22,
+      "deletes": null
+    },
+    {
+      "segment_id": "5bb7c0d3-d4ae-47e5-9d35-6ca9dffa4b12",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
+      "segment_id": "22e47460-de7f-4edf-80ee-67f20202f1e2",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
+      "segment_id": "21e37f73-f802-44ac-8d26-18591b55f0b2",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
+      "segment_id": "2553a7f5-1062-49bc-a5ed-7cb9c0de6abb",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
+      "segment_id": "a58638ce-3b6e-49ed-a1fb-65f5c210b02b",
+      "max_doc": 1,
+      "deletes": null
+    }
+  ],
+  "schema": [
+    {
+      "name": "url",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "position",
+          "fieldnorms": true,
+          "tokenizer": "default"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "title",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "position",
+          "fieldnorms": true,
+          "tokenizer": "default"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "content",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "position",
+          "fieldnorms": true,
+          "tokenizer": "default"
+        },
+        "stored": false,
+        "fast": false
+      }
+    },
+    {
+      "name": "timestamp",
+      "type": "u64",
+      "options": {
+        "indexed": true,
+        "fieldnorms": true,
+        "fast": true,
+        "stored": true
+      }
+    },
+    {
+      "name": "embedding",
+      "type": "bytes",
+      "options": {
+        "indexed": false,
+        "fieldnorms": false,
+        "fast": false,
+        "stored": true
+      }
+    }
+  ],
+  "opstamp": 104
+}

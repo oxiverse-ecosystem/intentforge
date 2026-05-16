@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  whoogle:
+    container_name: whoogle
+    image: benbusby/whoogle-search:latest
+    network_mode: "container:gluetun"
+    restart: always
+    environment:
+      - WHOOGLE_CONFIG_HTTPS=0 # Set to 1 if using a reverse proxy with SSL
+      - WHOOGLE_CONFIG_THEME=dark
+      - WHOOGLE_CONFIG_SEARCH_LANGUAGE=lang_en
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

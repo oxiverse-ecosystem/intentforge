@@ -1,0 +1,29 @@
+services:
+  invidious:
+    container_name: invidious
+    image: quay.io/invidious/invidious:latest
+    network_mode: "container:gluetun"
+    environment:
+      - INVIDIOUS_DATABASE_URL=postgres://kemal:kemal@localhost:5432/invidious
+      - INVIDIOUS_HMAC_KEY=intentforge_v2_invidious_hmac_key_987654321
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  db:
+    container_name: invidious-db
+    image: postgres:14-alpine
+    network_mode: "container:gluetun"
+    restart: always
+    environment:
+      - POSTGRES_DB=invidious
+      - POSTGRES_USER=kemal
+      - POSTGRES_PASSWORD=kemal
+    volumes:
+      - invidious-db-data:/var/lib/postgresql/data
+
+volumes:
+  invidious-db-data:

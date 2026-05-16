@@ -1,0 +1,35 @@
+use_default_settings: true
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "intentforge_v2_ultra_secret_key_123456789"
+search:
+  safe_search: 0
+  autocomplete: "google"
+  formats:
+    - html
+    - json
+outgoing:
+  max_request_timeout: 60.0 # Increased global timeout
+
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+
+  - name: bing
+    engine: bing
+    shortcut: b
+
+  - name: brave
+    engine: brave
+    shortcut: br
+    timeout: 10.0 # Engine specific timeout
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: w
