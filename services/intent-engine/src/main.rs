@@ -149,15 +149,19 @@ async fn analyze_query(
         let mut model = state.qwen_model.lock().unwrap();
         
         let prompt = format!(
-            "<|im_start|>system\nYou are a search query analyzer. Output JSON.
-Rules:
-- intent: one of [technical, how-to, comparison, conceptual]
-- constraints: list of strings
-- expanded_queries: list of 2 strings
+            "<|im_start|>system\nYou are a high-precision search intent analyzer. Output valid JSON only.
+Goals:
+1. Identify Intent: [technical, how-to, comparison, conceptual, navigation, transactional]
+2. Extract Constraints: list of core requirements (include version, platform, avoidances).
+3. Expanded Queries: list of 2 queries that would yield the most precise results.
+
+Disambiguation Rules:
+- If 'Rust' is queried without context, assume programming unless game-specific terms (survival, raid, monument) are present.
+- Capture 'avoid', 'exclude', 'no' as negative constraints (e.g., \"exclude: web\").
 
 Example:
-User: rust async
-Assistant: {{\"intent\": \"technical\", \"constraints\": [\"rust\", \"async\"], \"expanded_queries\": [\"rust tokio vs async-std performance\", \"rust async await tutorial\"]}}<|im_end|>
+User: latest rust updates security avoid web
+Assistant: {{\"intent\": \"technical\", \"constraints\": [\"rust language\", \"security\", \"exclude: web frameworks\", \"published: this week\"], \"expanded_queries\": [\"rust programming language security updates May 2026\", \"rust memory safety CVE 2026\"]}}<|im_end|>
 <|im_start|>user\n{}<|im_end|>
 <|im_start|>assistant\n{{",
             params.q

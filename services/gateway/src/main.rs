@@ -104,7 +104,7 @@ async fn handle_search(Query(params): Query<SearchParams>) -> Json<UnifiedRespon
     // Use vector for Local Indexer (Semantic Search)
     let mut indexer_query = if let Some(ref v) = vector {
         let v_json = serde_json::to_string(v).unwrap();
-        format!("http://localhost:6000/search?q={}&vector={}&min_score=0.8", q_encoded, urlencoding::encode(&v_json))
+        format!("http://localhost:6000/search?q={}&vector={}&min_score=0.5", q_encoded, urlencoding::encode(&v_json))
     } else {
         format!("http://localhost:6000/search?q={}", q_encoded)
     };

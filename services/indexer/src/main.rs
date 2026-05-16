@@ -165,13 +165,15 @@ async fn handle_search(
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let threshold = params.min_score.unwrap_or(0.75);
 
+    let mut semantic_pass_urls = std::collections::HashSet::new();
+    let is_semantic = query_vector.is_some();
+
     for (_score, doc_address) in top_docs {
         let retrieved_doc: TantivyDocument = searcher.doc(doc_address).unwrap();
         let url = retrieved_doc.get_first(url_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
         let title = retrieved_doc.get_first(title_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
         let timestamp = retrieved_doc.get_first(timestamp_field).and_then(|v| v.as_u64()).unwrap_or(0);
         
-        bm25_ranked.push(url.clone());
         metadata.insert(url.clone(), (title.clone(), timestamp));
 
         if let Some(ref q_vec) = query_vector {
@@ -185,9 +187,17 @@ async fn handle_search(
                     let dot_product: f32 = q_vec.iter().zip(doc_vec.iter()).map(|(a, b)| a * b).sum();
                     if dot_product >= threshold {
                         semantic_ranked.push((url.clone(), dot_product, title.clone(), timestamp));
+                        semantic_pass_urls.insert(url.clone());
                     }
                 }
             }
+        }
+        
+        // Only add to BM25 rank if it's not a semantic search OR if it passed semantic threshold
+        // If it's NOT a semantic search, we add everything.
+        // If it IS a semantic search, we only add it if it has an embedding AND passed, OR if it has NO embedding (fallback)
+        if !is_semantic || semantic_pass_urls.contains(&url) {
+             bm25_ranked.push(url.clone());
         }
     }
 
@@ -197,6 +207,7 @@ async fn handle_search(
     let mut rrf_scores: HashMap<String, f32> = HashMap::new();
 
     for (rank, url) in bm25_ranked.iter().enumerate() {
+        if is_semantic && !semantic_pass_urls.contains(url) { continue; }
         *rrf_scores.entry(url.clone()).or_insert(0.0) += 1.0 / (k + (rank + 1) as f32);
     }
 

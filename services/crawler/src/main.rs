@@ -72,10 +72,13 @@ async fn handle_crawl(Query(params): Query<CrawlParams>) -> Json<CrawlResponse> 
         (title, cleaned)
     };
 
+    // Prepend title to content for embedding to improve alignment
+    let embedding_text = format!("{}. {}", title, cleaned_content);
+
     // Get embedding from Intent Engine
     let intent_engine_url = "http://localhost:3000/embed";
     let embedding_resp = client.get(intent_engine_url)
-        .query(&[("text", &cleaned_content)])
+        .query(&[("text", &embedding_text)])
         .send()
         .await;
 
