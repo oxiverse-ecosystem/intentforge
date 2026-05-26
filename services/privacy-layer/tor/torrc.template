@@ -3,9 +3,9 @@ SocksPort 0.0.0.0:9050
 DataDirectory /var/lib/tor
 Log notice stdout
 
-# Enable Bridges
-UseBridges 1
-ClientTransportPlugin obfs4 exec /usr/bin/lyrebird
+# Disable Bridges
+UseBridges 0
+# ClientTransportPlugin obfs4 exec /usr/bin/lyrebird
 
 # Bridges will be included from the shared volume via entrypoint
-%include /data/torrc.bridges
+# %include /data/torrc.bridges

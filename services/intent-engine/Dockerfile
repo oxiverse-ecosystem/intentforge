@@ -23,5 +23,5 @@ COPY --from=builder /usr/src/intent-engine/target/release/intent-engine .
 COPY setup.sh .
 RUN sed -i 's/\r$//' setup.sh && chmod +x setup.sh
 
-EXPOSE 3000
+EXPOSE 3005
 ENTRYPOINT ["./setup.sh"]

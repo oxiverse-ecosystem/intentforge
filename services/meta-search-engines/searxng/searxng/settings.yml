@@ -1,35 +1,54 @@
 use_default_settings: true
+
 server:
   port: 8080
   bind_address: "0.0.0.0"
   secret_key: "intentforge_v2_ultra_secret_key_123456789"
+
 search:
   safe_search: 0
   autocomplete: "google"
   formats:
     - html
     - json
+  suspended_times:
+    SearxEngineAccessDenied: 0
+    SearxEngineCaptcha: 0
+    SearxEngineTooManyRequests: 0
+    SearxEngineTimeout: 0
+
 outgoing:
-  max_request_timeout: 60.0 # Increased global timeout
+  max_request_timeout: 4.5
 
 engines:
   - name: google
-    engine: google
-    shortcut: g
+    disabled: true
 
   - name: bing
-    engine: bing
-    shortcut: b
+    disabled: false
+    timeout: 4.0
 
   - name: brave
-    engine: brave
-    shortcut: br
-    timeout: 10.0 # Engine specific timeout
+    disabled: false
+    timeout: 2.5
 
   - name: duckduckgo
-    engine: duckduckgo
-    shortcut: ddg
+    disabled: true
+
+  - name: qwant
+    disabled: true
+
+  - name: startpage
+    disabled: true
 
   - name: wikipedia
-    engine: wikipedia
-    shortcut: w
+    disabled: true
+
+  - name: wikidata
+    disabled: true
+
+  - name: ahmia
+    disabled: true
+
+  - name: torch
+    disabled: true

@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(index_path)?;
 
     let mut schema_builder = Schema::builder();
-    schema_builder.add_text_field("url", STORED | TEXT);
+    schema_builder.add_text_field("url", STRING | STORED);
     schema_builder.add_text_field("title", STORED | TEXT);
     schema_builder.add_text_field("content", TEXT);
     schema_builder.add_u64_field("timestamp", INDEXED | FAST | STORED);
@@ -63,7 +63,24 @@ async fn main() -> anyhow::Result<()> {
     
     let schema = schema_builder.build();
 
-    let index = Index::open_or_create(tantivy::directory::MmapDirectory::open(index_path)?, schema.clone())?;
+    let index = match Index::open_or_create(tantivy::directory::MmapDirectory::open(index_path)?, schema.clone()) {
+        Ok(idx) => {
+            if idx.schema() != schema {
+                tracing::warn!("Schema mismatch detected, recreating index...");
+                let _ = std::fs::remove_dir_all(index_path);
+                std::fs::create_dir_all(index_path)?;
+                Index::create_in_dir(index_path, schema.clone())?
+            } else {
+                idx
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to open index: {:?}, clearing directory and recreating...", e);
+            let _ = std::fs::remove_dir_all(index_path);
+            std::fs::create_dir_all(index_path)?;
+            Index::create_in_dir(index_path, schema.clone())?
+        }
+    };
 
     let writer = index.writer(50_000_000)?; 
     let reader = index
@@ -81,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/index", post(handle_ingest))
+        .route("/urls", get(handle_list_urls))
         .route("/search", get(handle_search))
         .with_state(state);
 
@@ -124,11 +142,48 @@ async fn handle_ingest(
         doc.add_bytes(embedding_field, bytes);
     }
 
+    // Delete existing document with the same URL to prevent duplicates
+    let term = tantivy::Term::from_field_text(url_field, &payload.url);
+    writer.delete_term(term);
+
     writer.add_document(doc).unwrap();
     writer.commit().unwrap();
     tracing::info!("Successfully committed: {}", payload.url);
 
     Json(serde_json::json!({ "status": "indexed", "url": payload.url }))
+}
+
+#[derive(Serialize)]
+struct IndexedUrl {
+    url: String,
+    timestamp: u64,
+}
+
+async fn handle_list_urls(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<IndexedUrl>> {
+    let searcher = state.reader.searcher();
+    let url_field = state.schema.get_field("url").unwrap();
+    let timestamp_field = state.schema.get_field("timestamp").unwrap();
+    
+    let query = tantivy::query::AllQuery;
+    let top_docs = match searcher.search(&query, &tantivy::collector::TopDocs::with_limit(1000)) {
+        Ok(docs) => docs,
+        Err(_) => vec![],
+    };
+    
+    let mut list = Vec::new();
+    for (_, doc_address) in top_docs {
+        if let Ok(retrieved_doc) = searcher.doc::<TantivyDocument>(doc_address) {
+            let url = retrieved_doc.get_first(url_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let timestamp = retrieved_doc.get_first(timestamp_field).and_then(|v| v.as_u64()).unwrap_or(0);
+            if !url.is_empty() {
+                list.push(IndexedUrl { url, timestamp });
+            }
+        }
+    }
+    
+    Json(list)
 }
 
 async fn handle_search(
@@ -161,6 +216,7 @@ async fn handle_search(
     let mut bm25_ranked = Vec::new();
     let mut semantic_ranked = Vec::new();
     let mut metadata: HashMap<String, (String, u64)> = HashMap::new();
+    let mut urls_without_embeddings = std::collections::HashSet::new();
     
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let threshold = params.min_score.unwrap_or(0.75);
@@ -176,6 +232,7 @@ async fn handle_search(
         
         metadata.insert(url.clone(), (title.clone(), timestamp));
 
+        let mut has_embedding = false;
         if let Some(ref q_vec) = query_vector {
             if let Some(doc_bytes) = retrieved_doc.get_first(embedding_field).and_then(|v| v.as_bytes()) {
                 let doc_vec: Vec<f32> = doc_bytes
@@ -184,6 +241,7 @@ async fn handle_search(
                     .collect();
                 
                 if doc_vec.len() == q_vec.len() {
+                    has_embedding = true;
                     let dot_product: f32 = q_vec.iter().zip(doc_vec.iter()).map(|(a, b)| a * b).sum();
                     if dot_product >= threshold {
                         semantic_ranked.push((url.clone(), dot_product, title.clone(), timestamp));
@@ -193,10 +251,14 @@ async fn handle_search(
             }
         }
         
+        if !has_embedding {
+            urls_without_embeddings.insert(url.clone());
+        }
+        
         // Only add to BM25 rank if it's not a semantic search OR if it passed semantic threshold
         // If it's NOT a semantic search, we add everything.
         // If it IS a semantic search, we only add it if it has an embedding AND passed, OR if it has NO embedding (fallback)
-        if !is_semantic || semantic_pass_urls.contains(&url) {
+        if !is_semantic || semantic_pass_urls.contains(&url) || !has_embedding {
              bm25_ranked.push(url.clone());
         }
     }
@@ -207,7 +269,7 @@ async fn handle_search(
     let mut rrf_scores: HashMap<String, f32> = HashMap::new();
 
     for (rank, url) in bm25_ranked.iter().enumerate() {
-        if is_semantic && !semantic_pass_urls.contains(url) { continue; }
+        if is_semantic && !semantic_pass_urls.contains(url) && !urls_without_embeddings.contains(url) { continue; }
         *rrf_scores.entry(url.clone()).or_insert(0.0) += 1.0 / (k + (rank + 1) as f32);
     }
 
