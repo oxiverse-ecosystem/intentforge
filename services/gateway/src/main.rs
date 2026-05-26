@@ -6,7 +6,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // ─── API Types ───────────────────────────────────────────────────────
 
@@ -352,25 +353,155 @@ fn compute_final_score(
         + (weights.local_bonus * local)
 }
 
+// ─── Circuit Breaker (Dynamic Engine Backoff) ──────────────────────
+// Tracks per-engine health. States: Closed (ok), Open (skip), HalfOpen (probe).
+// No hardcoded skip lists — engines auto-recover after backoff window.
+
+struct CircuitBreaker {
+    engines: Mutex<HashMap<String, EngineHealth>>,
+}
+
+struct EngineHealth {
+    consecutive_failures: u32,
+    last_failure: Option<Instant>,
+    open_until: Option<Instant>, // circuit open (skip this engine) until this time
+}
+
+impl CircuitBreaker {
+    fn new() -> Self {
+        Self {
+            engines: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn is_open(&self, engine: &str) -> bool {
+        let engines = self.engines.lock().unwrap();
+        if let Some(health) = engines.get(engine) {
+            if let Some(until) = health.open_until {
+                return Instant::now() < until;
+            }
+        }
+        false
+    }
+
+    fn record_success(&self, engine: &str) {
+        let mut engines = self.engines.lock().unwrap();
+        let health = engines.entry(engine.to_string()).or_insert(EngineHealth {
+            consecutive_failures: 0,
+            last_failure: None,
+            open_until: None,
+        });
+        health.consecutive_failures = 0;
+        health.open_until = None;
+    }
+
+    fn record_failure(&self, engine: &str) {
+        let mut engines = self.engines.lock().unwrap();
+        let health = engines.entry(engine.to_string()).or_insert(EngineHealth {
+            consecutive_failures: 0,
+            last_failure: None,
+            open_until: None,
+        });
+        health.consecutive_failures += 1;
+        health.last_failure = Some(Instant::now());
+
+        // Exponential backoff: 30s, 60s, 120s, ... capped at 10 min
+        if health.consecutive_failures >= 3 {
+            let backoff_secs = 30u64 * 2u64.pow(health.consecutive_failures.saturating_sub(3));
+            let backoff = Duration::from_secs(backoff_secs.min(600));
+            health.open_until = Some(Instant::now() + backoff);
+            tracing::warn!(
+                "Circuit OPEN for engine '{}' — {} failures, backing off {:?}",
+                engine, health.consecutive_failures, backoff
+            );
+        }
+    }
+}
+
+// ─── Search Result Cache (TTL-based) ───────────────────────────────
+// Caches (query, intent) → aggregated results for 5 minutes.
+// Avoids hammering meta-search engines for repeated queries.
+
+struct SearchCache {
+    entries: Mutex<HashMap<String, CacheEntry>>,
+}
+
+struct CacheEntry {
+    response_json: String, // serialized UnifiedResponse
+    inserted_at: Instant,
+    ttl: Duration,
+}
+
+impl SearchCache {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        let entries = self.entries.lock().unwrap();
+        if let Some(entry) = entries.get(key) {
+            if entry.inserted_at.elapsed() < entry.ttl {
+                return Some(entry.response_json.clone());
+            }
+        }
+        None
+    }
+
+    fn put(&self, key: String, response_json: String, ttl: Duration) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.insert(key, CacheEntry {
+            response_json,
+            inserted_at: Instant::now(),
+            ttl,
+        });
+
+        // Evict expired entries to prevent unbounded growth
+        entries.retain(|_, e| e.inserted_at.elapsed() < e.ttl);
+    }
+}
+
 // ─── Main ────────────────────────────────────────────────────────────
+
+struct AppState {
+    circuit: CircuitBreaker,
+    cache: SearchCache,
+}
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let state = Arc::new(AppState {
+        circuit: CircuitBreaker::new(),
+        cache: SearchCache::new(),
+    });
+
     let app = Router::new()
         .route("/", get(|| async { "IntentForge-v2 Gateway" }))
         .route("/health", get(|| async { "OK" }))
-        .route("/search", get(handle_search));
+        .route("/search", get(handle_search))
+        .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
-    tracing::info!("Gateway listening on {} (multi-signal ranking)", addr);
+    tracing::info!("Gateway listening on {} (circuit-breaker + cache)", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn handle_search(Query(params): Query<SearchParams>) -> Json<UnifiedResponse> {
+async fn handle_search(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> Json<serde_json::Value> {
+    // 0. Check cache first (5-min TTL)
+    let cache_key = format!("{}:{}", params.q.to_lowercase().trim(), "all");
+    if let Some(cached) = state.cache.get(&cache_key) {
+        tracing::info!("Cache hit for query: {}", params.q);
+        let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
+        return Json(value);
+    }
     // Timeout HTTP client — 1.5s for meta-search
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(1500))
@@ -443,6 +574,12 @@ async fn handle_search(Query(params): Query<SearchParams>) -> Json<UnifiedRespon
     let invidious_url = format!("http://127.0.0.1:3000/api/v1/search?q={}", q_encoded);
 
     let client_ref = &client;
+    let circuit_ref = &state.circuit;
+
+    // Check circuit breaker before calling each engine
+    let searx_open = circuit_ref.is_open("searxng");
+    let whoogle_open = circuit_ref.is_open("whoogle");
+    let invidious_open = circuit_ref.is_open("invidious");
 
     let indexer_fut = async {
         let resp = client_ref.get(&indexer_query).send().await?;
@@ -454,6 +591,10 @@ async fn handle_search(Query(params): Query<SearchParams>) -> Json<UnifiedRespon
     };
 
     let searx_fut = async {
+        if searx_open {
+            tracing::info!("SearXNG circuit OPEN — skipping");
+            return Ok(SearxResponse { results: vec![] });
+        }
         let resp = client_ref.get(&searx_url).send().await?;
         let status = resp.status();
         resp.json::<SearxResponse>().await.map_err(|e| {
@@ -463,6 +604,10 @@ async fn handle_search(Query(params): Query<SearchParams>) -> Json<UnifiedRespon
     };
 
     let whoogle_fut = async {
+        if whoogle_open {
+            tracing::info!("Whoogle circuit OPEN — skipping");
+            return Ok(WhoogleResponse { results: vec![] });
+        }
         let resp = client_ref.get(&whoogle_url).send().await?;
         let status = resp.status();
         resp.json::<WhoogleResponse>().await.map_err(|e| {
@@ -472,6 +617,10 @@ async fn handle_search(Query(params): Query<SearchParams>) -> Json<UnifiedRespon
     };
 
     let invidious_fut = async {
+        if invidious_open {
+            tracing::info!("Invidious circuit OPEN — skipping");
+            return Ok(vec![]);
+        }
         let resp = client_ref.get(&invidious_url).send().await?;
         let status = resp.status();
         resp.json::<Vec<InvidiousResult>>().await.map_err(|e| {
@@ -502,16 +651,19 @@ async fn handle_search(Query(params): Query<SearchParams>) -> Json<UnifiedRespon
     match searx_res {
         Ok(searx_data) => {
             tracing::info!("SearXNG returned {} results", searx_data.results.len());
+            circuit_ref.record_success("searxng");
             web_results.extend(searx_data.results);
         }
         Err(e) => {
             tracing::error!("SearXNG request failed/timed out: {:?}", e);
+            circuit_ref.record_failure("searxng");
         }
     }
 
     match whoogle_res {
         Ok(whoogle_data) => {
             tracing::info!("Whoogle returned {} results", whoogle_data.results.len());
+            circuit_ref.record_success("whoogle");
             for r in whoogle_data.results {
                 web_results.push(SearxResult {
                     title: r.title,
@@ -524,12 +676,14 @@ async fn handle_search(Query(params): Query<SearchParams>) -> Json<UnifiedRespon
         }
         Err(e) => {
             tracing::warn!("Whoogle request failed/timed out: {:?}", e);
+            circuit_ref.record_failure("whoogle");
         }
     }
 
     match invidious_res {
         Ok(invidious_data) => {
             tracing::info!("Invidious returned {} results", invidious_data.len());
+            circuit_ref.record_success("invidious");
             for r in invidious_data {
                 if r.result_type.as_deref() == Some("video") {
                     if let Some(vid) = r.video_id {
@@ -547,6 +701,7 @@ async fn handle_search(Query(params): Query<SearchParams>) -> Json<UnifiedRespon
         }
         Err(e) => {
             tracing::warn!("Invidious request failed/timed out: {:?}", e);
+            circuit_ref.record_failure("invidious");
         }
     }
 
@@ -620,11 +775,17 @@ async fn handle_search(Query(params): Query<SearchParams>) -> Json<UnifiedRespon
         });
     }
 
-    Json(UnifiedResponse {
+    let response = UnifiedResponse {
         intent,
         local_results,
         web_results,
-    })
+    };
+
+    // Cache for 5 minutes
+    let response_json = serde_json::to_string(&response).unwrap_or_default();
+    state.cache.put(cache_key, response_json, Duration::from_secs(300));
+
+    Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({})))
 }
 
 fn fallback_intent(q: &str) -> IntentResponse {
