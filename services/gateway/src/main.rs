@@ -1021,7 +1021,7 @@ async fn handle_search(
     // Deduplicate — URL normalization + domain-based dedup
     // Multiple query variations may return the same page with different URLs
     // KEY: merge sources so we know which engines agreed on each result
-    let mut unique_web_results = Vec::new();
+    let mut unique_web_results: Vec<SearxResult> = Vec::new();
     let mut url_to_index: HashMap<String, usize> = HashMap::new(); // normalized URL -> index in unique_web_results
     let mut seen_domains = std::collections::HashMap::<String, usize>::new();
     const MAX_PER_DOMAIN: usize = 5; // prevent single-domain dominance
