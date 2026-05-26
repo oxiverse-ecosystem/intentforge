@@ -687,6 +687,113 @@ fn normalize_scores(scores: &mut [f32]) {
     }
 }
 
+// ─── JSON Key Deduplication ────────────────────────────────────────
+// Removes duplicate keys from JSON objects. Keeps the LAST value for each key.
+// Handles nested objects and arrays. Algorithmic — no hardcoded key lists.
+
+fn deduplicate_json_keys(json_str: &str) -> String {
+    // Fast path: if no duplicate keys, return as-is
+    if serde_json::from_str::<serde_json::Value>(json_str).is_ok() {
+        return json_str.to_string();
+    }
+
+    // Slow path: manually deduplicate keys by tracking seen keys per nesting level
+    let chars_vec: Vec<char> = json_str.chars().collect();
+    let mut duplicate_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut idx = 0;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut seen_keys: Vec<Vec<String>> = vec![Vec::new()];
+
+    while idx < chars_vec.len() {
+        let c = chars_vec[idx];
+        if esc {
+            esc = false;
+            idx += 1;
+            continue;
+        }
+        if c == '\\' && in_str {
+            esc = true;
+            idx += 1;
+            continue;
+        }
+        if c == '"' {
+            in_str = !in_str;
+            if in_str {
+                let start = idx;
+                idx += 1;
+                while idx < chars_vec.len() {
+                    if chars_vec[idx] == '\\' { idx += 2; continue; }
+                    if chars_vec[idx] == '"' { break; }
+                    idx += 1;
+                }
+                let key: String = chars_vec[start+1..idx].iter().collect();
+                let mut j = idx + 1;
+                while j < chars_vec.len() && chars_vec[j].is_whitespace() { j += 1; }
+                if j < chars_vec.len() && chars_vec[j] == ':' {
+                    if let Some(seen) = seen_keys.last_mut() {
+                        if seen.contains(&key) {
+                            // Duplicate — find value extent and mark for removal
+                            let mut k = j + 1;
+                            while k < chars_vec.len() && chars_vec[k].is_whitespace() { k += 1; }
+                            if k < chars_vec.len() {
+                                if chars_vec[k] == '"' {
+                                    k += 1;
+                                    while k < chars_vec.len() {
+                                        if chars_vec[k] == '\\' { k += 2; continue; }
+                                        if chars_vec[k] == '"' { k += 1; break; }
+                                        k += 1;
+                                    }
+                                } else if chars_vec[k] == '{' || chars_vec[k] == '[' {
+                                    let mut d = 0;
+                                    let mut in_s = false;
+                                    let mut es = false;
+                                    while k < chars_vec.len() {
+                                        if es { es = false; k += 1; continue; }
+                                        if chars_vec[k] == '\\' && in_s { es = true; k += 1; continue; }
+                                        if chars_vec[k] == '"' { in_s = !in_s; }
+                                        if !in_s {
+                                            if chars_vec[k] == '{' || chars_vec[k] == '[' { d += 1; }
+                                            if chars_vec[k] == '}' || chars_vec[k] == ']' { d -= 1; if d == 0 { k += 1; break; } }
+                                        }
+                                        k += 1;
+                                    }
+                                } else {
+                                    while k < chars_vec.len() && chars_vec[k] != ',' && chars_vec[k] != '}' && chars_vec[k] != ']' { k += 1; }
+                                }
+                            }
+                            while k < chars_vec.len() && chars_vec[k].is_whitespace() { k += 1; }
+                            if k < chars_vec.len() && chars_vec[k] == ',' { k += 1; }
+                            duplicate_ranges.push((start, k));
+                        } else {
+                            seen.push(key);
+                        }
+                    }
+                }
+                in_str = false;
+                idx += 1;
+                continue;
+            }
+        }
+        if !in_str {
+            if c == '{' || c == '[' { seen_keys.push(Vec::new()); }
+            else if c == '}' || c == ']' { seen_keys.pop(); }
+        }
+        idx += 1;
+    }
+
+    if duplicate_ranges.is_empty() { return json_str.to_string(); }
+
+    let mut result = String::with_capacity(json_str.len());
+    let mut last_end = 0;
+    for (start, end) in &duplicate_ranges {
+        result.push_str(&json_str[last_end..*start]);
+        last_end = *end;
+    }
+    result.push_str(&json_str[last_end..]);
+    result
+}
+
 // ─── Circuit Breaker (Dynamic Engine Backoff) ──────────────────────
 // Tracks per-engine health. States: Closed (ok), Open (skip), HalfOpen (probe).
 // No hardcoded skip lists — engines auto-recover after backoff window.
@@ -969,16 +1076,12 @@ async fn handle_search(
         let status = resp.status();
         let raw_text = resp.text().await.unwrap_or_default();
         // Whoogle sometimes returns JSON with duplicate keys (e.g. two "title" fields).
-        // serde_json rejects duplicates by default. Fix: parse as Value, which keeps last.
-        match serde_json::from_str::<serde_json::Value>(&raw_text) {
-            Ok(val) => {
-                serde_json::from_value::<WhoogleResponse>(val).map_err(|e| {
-                    tracing::error!("Failed to parse Whoogle JSON (status: {}): {:?}", status, e);
-                    e
-                })
-            }
+        // serde_json rejects duplicates. Fix: deduplicate keys in each JSON object.
+        let cleaned = deduplicate_json_keys(&raw_text);
+        match serde_json::from_str::<WhoogleResponse>(&cleaned) {
+            Ok(parsed) => Ok(parsed),
             Err(e) => {
-                tracing::error!("Failed to parse Whoogle raw JSON (status: {}): {:?}", status, e);
+                tracing::error!("Failed to parse Whoogle JSON (status: {}): {:?}", status, e);
                 Err(e.into())
             }
         }
