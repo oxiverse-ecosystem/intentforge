@@ -692,9 +692,9 @@ fn normalize_scores(scores: &mut [f32]) {
 // Handles nested objects and arrays. Algorithmic — no hardcoded key lists.
 
 fn deduplicate_json_keys(json_str: &str) -> String {
-    // Fast path: if no duplicate keys, return as-is
-    if serde_json::from_str::<serde_json::Value>(json_str).is_ok() {
-        return json_str.to_string();
+    // Fast path: parse as Value (keeps last duplicate key), re-serialize cleanly
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+        return serde_json::to_string(&val).unwrap_or_else(|_| json_str.to_string());
     }
 
     // Slow path: manually deduplicate keys by tracking seen keys per nesting level
