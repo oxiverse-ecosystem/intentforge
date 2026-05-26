@@ -1045,7 +1045,8 @@ async fn handle_search(
         })
     };
 
-    // Fire all SearXNG variations in parallel
+    // Fire all SearXNG variations in parallel, with retry on 0 results
+    // (VPN drops cause simultaneous failures across all engines — retry recovers)
     let searx_futs: Vec<_> = searx_urls.iter().map(|url| {
         let url = url.clone();
         let searx_open = searx_open;
@@ -1053,12 +1054,31 @@ async fn handle_search(
             if searx_open {
                 return Ok(SearxResponse { results: vec![] });
             }
-            let resp = client_ref.get(&url).send().await?;
-            let status = resp.status();
-            resp.json::<SearxResponse>().await.map_err(|e| {
-                tracing::error!("Failed to parse SearXNG JSON (status: {}): {:?}", status, e);
-                e
-            })
+            // First attempt
+            let first = async {
+                let resp = client_ref.get(&url).send().await?;
+                let status = resp.status();
+                resp.json::<SearxResponse>().await.map_err(|e| {
+                    tracing::error!("Failed to parse SearXNG JSON (status: {}): {:?}", status, e);
+                    e
+                })
+            }.await;
+
+            match first {
+                Ok(data) if !data.results.is_empty() => Ok(data),
+                Ok(_) => {
+                    // 0 results — likely VPN drop or engine timeout. Retry once after 2s.
+                    tracing::warn!("SearXNG returned 0 results, retrying in 2s...");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let resp = client_ref.get(&url).send().await?;
+                    let status = resp.status();
+                    resp.json::<SearxResponse>().await.map_err(|e| {
+                        tracing::error!("SearXNG retry parse failed (status: {}): {:?}", status, e);
+                        e
+                    })
+                }
+                Err(e) => Err(e),
+            }
         }
     }).collect();
 

@@ -1,4 +1,12 @@
-use_default_settings: true
+use_default_settings:
+  engines:
+    keep_only:
+      - bing
+      - brave
+      - startpage
+      - wikipedia
+      - mojeek
+      - yandex
 
 server:
   port: 8080
@@ -17,7 +25,6 @@ search:
     SearxEngineCaptcha: 0
     SearxEngineTooManyRequests: 0
     SearxEngineTimeout: 0
-  # Increase default result count for broader recall
   default_lang: "en"
 
 outgoing:
@@ -37,29 +44,16 @@ engines:
     disabled: false
     timeout: 6.0
 
-  # Secondary engines (re-enable for rotation)
-  - name: duckduckgo
-    disabled: false
-    timeout: 5.0
-
-  - name: qwant
-    disabled: false
-    timeout: 5.0
-
   - name: startpage
     disabled: false
     timeout: 5.5
 
-  # Reference engines (always useful)
+  # Reference engines
   - name: wikipedia
     disabled: false
-    timeout: 2.0
+    timeout: 3.0
 
-  - name: wikidata
-    disabled: false
-    timeout: 2.0
-
-  # NEW: Additional engines for broader recall
+  # Additional engines for broader recall
   - name: mojeek
     disabled: false
     timeout: 6.0
@@ -67,6 +61,16 @@ engines:
   - name: yandex
     disabled: false
     timeout: 6.0
+
+  # Disabled — permanently blocked via VPN (403) or always timeout
+  - name: duckduckgo
+    disabled: true
+
+  - name: qwant
+    disabled: true
+
+  - name: wikidata
+    disabled: true
 
   # Tor-only engines (disabled for VPN path)
   - name: ahmia
