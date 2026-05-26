@@ -76,6 +76,8 @@ struct IndexerResult {
     title: String,
     #[serde(default)]
     score: f32,
+    #[serde(default)]
+    authority: f32,
 }
 
 #[derive(Serialize)]
@@ -314,6 +316,127 @@ fn calculate_intent_boost(url: &str, title: &str, query: &str, intent: &str) -> 
     boost
 }
 
+// ─── Content Quality (Dynamic — Shannon Entropy + Gibberish Detection) ──
+// Detects spam, auto-generated content, and low-information results.
+// NOT hardcoded — based on information-theoretic measures.
+
+fn content_quality_score(text: &str) -> f32 {
+    if text.len() < 20 {
+        return 0.1; // too short to be useful
+    }
+
+    let mut score: f32 = 1.0;
+
+    // Shannon entropy — measures information content
+    // Natural language: 3.5-5.0 bits/char. Gibberish: <2.5 or >6.5
+    let entropy = {
+        let mut freq = [0u32; 128];
+        let mut total = 0u32;
+        for ch in text.chars() {
+            if (ch as usize) < 128 {
+                freq[ch as usize] += 1;
+                total += 1;
+            }
+        }
+        if total == 0 { return 0.1; }
+        let mut h = 0.0f32;
+        for &f in &freq {
+            if f > 0 {
+                let p = f as f32 / total as f32;
+                h -= p * p.log2();
+            }
+        }
+        h
+    };
+
+    if entropy < 2.0 {
+        score *= 0.2; // very low entropy = repetitive spam
+    } else if entropy < 3.0 {
+        score *= 0.5;
+    } else if entropy > 6.5 {
+        score *= 0.3; // very high entropy = random characters
+    }
+
+    // Alpha ratio — natural language is >60% alphabetic
+    let alpha_count = text.chars().filter(|c| c.is_alphabetic()).count();
+    let alpha_ratio = alpha_count as f32 / text.len().max(1) as f32;
+    if alpha_ratio < 0.4 {
+        score *= 0.3; // too many non-alpha chars
+    }
+
+    // Average word length — natural language: 4-8 chars
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if !words.is_empty() {
+        let avg_word_len: f32 = words.iter().map(|w| w.len() as f32).sum::<f32>() / words.len() as f32;
+        if avg_word_len > 20.0 {
+            score *= 0.2; // concatenated garbage
+        } else if avg_word_len > 15.0 {
+            score *= 0.5;
+        }
+    }
+
+    // Content farm / clickbait signals (dynamic pattern detection, not hardcoded domains)
+    let text_lower = text.to_lowercase();
+    let spam_patterns = ["click here", "buy now", "limited time", "act now",
+        "you won't believe", "shocking", "one weird trick"];
+    let spam_hits = spam_patterns.iter().filter(|p| text_lower.contains(**p)).count();
+    if spam_hits >= 2 {
+        score *= 0.4;
+    }
+
+    score.clamp(0.0, 1.0)
+}
+
+// ─── Semantic Relevance (Keyword Overlap Proxy) ──────────────────────
+// Measures how many query terms appear in the result title + description.
+// This is a fast proxy for full embedding cosine similarity.
+
+fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
+    let q_lower = query.to_lowercase();
+    let t_lower = title.to_lowercase();
+    let c_lower = content.to_lowercase();
+
+    // Extract topic terms (skip stop words and very short words)
+    let stop_words = ["the","a","an","in","on","for","with","using","from","to",
+        "and","or","of","is","are","was","were","be","been","has","have","had",
+        "do","does","did","will","would","could","should","may","might",
+        "how","what","where","when","why","which","who","this","that","these",
+        "those","it","its","i","me","my","we","our","you","your","he","she","they"];
+    let query_terms: Vec<&str> = q_lower.split_whitespace()
+        .filter(|w| w.len() > 2 && !stop_words.contains(w))
+        .collect();
+
+    if query_terms.is_empty() {
+        return 0.5;
+    }
+
+    let combined = format!("{} {}", t_lower, c_lower);
+    let combined_words: Vec<&str> = combined.split_whitespace().collect();
+    let matched = query_terms.iter().filter(|t| combined_words.iter().any(|w| w == *t || w.trim_matches(|c: char| !c.is_alphanumeric()) == **t)).count();
+    let coverage = matched as f32 / query_terms.len() as f32;
+
+    // Title match is more valuable than content match (also word-boundary)
+    let title_words: Vec<&str> = t_lower.split_whitespace().collect();
+    let title_matched = query_terms.iter().filter(|t| title_words.iter().any(|w| w == *t || w.trim_matches(|c: char| !c.is_alphanumeric()) == **t)).count();
+    let title_coverage = title_matched as f32 / query_terms.len() as f32;
+
+    // Weighted: 60% title match + 40% content match
+    let base = (title_coverage * 0.6 + coverage * 0.4).clamp(0.0, 1.0);
+    
+    // Hard penalty: if less than 30% of query terms appear anywhere, result is likely irrelevant
+    // This catches "Best Buy" for query "best rust web framework" — only "best" matches
+    if coverage < 0.3 && title_coverage < 0.3 {
+        // If coverage is very low (<25%), this is almost certainly irrelevant
+        if coverage < 0.25 {
+            return 0.01; // essentially zero — will be filtered out
+        }
+        // Otherwise scale down aggressively
+        return (base * coverage * 3.0).clamp(0.0, 0.15);
+    }
+    
+    base
+}
+
 // ─── Multi-Signal Fusion ─────────────────────────────────────────────
 
 struct RankingWeights {
@@ -322,16 +445,20 @@ struct RankingWeights {
     freshness: f32,  // recency
     authority: f32,  // domain authority
     local_bonus: f32, // bonus for locally indexed
+    quality: f32,    // content quality (entropy, spam detection)
+    semantic: f32,   // semantic relevance (keyword overlap with query)
 }
 
 impl Default for RankingWeights {
     fn default() -> Self {
         Self {
-            rrf: 0.30,
-            intent: 0.20,
-            freshness: 0.15,
-            authority: 0.15,
-            local_bonus: 0.10,
+            rrf: 0.15,       // reduced from 0.20 — less important than relevance
+            intent: 0.10,    // reduced from 0.15
+            freshness: 0.08, // reduced from 0.10
+            authority: 0.12, // reduced from 0.15
+            local_bonus: 0.10, // same
+            quality: 0.10,   // content quality (spam detection)
+            semantic: 0.35,  // INCREASED: most important signal — query-result relevance
         }
     }
 }
@@ -342,6 +469,8 @@ fn compute_final_score(
     freshness: f32,
     authority: f32,
     is_local: bool,
+    quality: f32,
+    semantic: f32,
     weights: &RankingWeights,
 ) -> f32 {
     let local = if is_local { 1.0 } else { 0.0 };
@@ -351,6 +480,8 @@ fn compute_final_score(
         + (weights.freshness * freshness)
         + (weights.authority * authority)
         + (weights.local_bonus * local)
+        + (weights.quality * quality)
+        + (weights.semantic * semantic)
 }
 
 // ─── Circuit Breaker (Dynamic Engine Backoff) ──────────────────────
@@ -551,7 +682,16 @@ async fn handle_search(
         Err(_) => None,
     };
 
-    // 3. Search Local Indexer, SearXNG, Whoogle, and Invidious in parallel
+    // 3. Multi-Variation Fan-Out: query SearXNG with expanded queries for broader recall
+    // The intent engine returns 2-4 query variations. We fire them all to SearXNG.
+    // This catches results that the original query phrasing might miss.
+    let expanded_queries = if intent.expanded_queries.len() > 1 {
+        intent.expanded_queries.clone()
+    } else {
+        vec![q.clone()]
+    };
+    tracing::info!("Fan-out with {} query variations: {:?}", expanded_queries.len(), expanded_queries);
+
     let freshness_keywords = ["latest", "recent", "week", "month", "today", "newest", "cve", "vulnerability"];
     let is_freshness_query = intent.constraints.iter().any(|c| {
         let c_low = c.to_lowercase();
@@ -570,7 +710,11 @@ async fn handle_search(
         indexer_query.push_str("&freshness_boost=true");
     }
 
-    let searx_url = format!("http://127.0.0.1:8080/search?q={}&format=json", q_encoded);
+    // Build SearXNG URLs for all expanded queries (max 4 variations)
+    let searx_urls: Vec<String> = expanded_queries.iter().take(4).map(|eq| {
+        format!("http://127.0.0.1:8080/search?q={}&format=json", urlencoding::encode(eq))
+    }).collect();
+
     let whoogle_url = format!("http://127.0.0.1:5000/search?q={}&format=json", q_encoded);
     let invidious_url = format!("http://127.0.0.1:3000/api/v1/search?q={}", q_encoded);
 
@@ -591,18 +735,22 @@ async fn handle_search(
         })
     };
 
-    let searx_fut = async {
-        if searx_open {
-            tracing::info!("SearXNG circuit OPEN — skipping");
-            return Ok(SearxResponse { results: vec![] });
+    // Fire all SearXNG variations in parallel
+    let searx_futs: Vec<_> = searx_urls.iter().map(|url| {
+        let url = url.clone();
+        let searx_open = searx_open;
+        async move {
+            if searx_open {
+                return Ok(SearxResponse { results: vec![] });
+            }
+            let resp = client_ref.get(&url).send().await?;
+            let status = resp.status();
+            resp.json::<SearxResponse>().await.map_err(|e| {
+                tracing::error!("Failed to parse SearXNG JSON (status: {}): {:?}", status, e);
+                e
+            })
         }
-        let resp = client_ref.get(&searx_url).send().await?;
-        let status = resp.status();
-        resp.json::<SearxResponse>().await.map_err(|e| {
-            tracing::error!("Failed to parse SearXNG JSON (status: {}): {:?}", status, e);
-            e
-        })
-    };
+    }).collect();
 
     let whoogle_fut = async {
         if whoogle_open {
@@ -630,9 +778,10 @@ async fn handle_search(
         })
     };
 
-    let (indexer_res, searx_res, whoogle_res, invidious_res) = tokio::join!(
+    // Join all futures: indexer + all SearXNG variations + whoogle + invidious
+    let (indexer_res, searx_results, whoogle_res, invidious_res) = tokio::join!(
         indexer_fut,
-        searx_fut,
+        futures::future::join_all(searx_futs),
         whoogle_fut,
         invidious_fut
     );
@@ -646,18 +795,21 @@ async fn handle_search(
         }
     };
 
-    // 5. Aggregate Web Results
+    // 5. Aggregate Web Results from all sources
     let mut web_results: Vec<SearxResult> = Vec::new();
 
-    match searx_res {
-        Ok(searx_data) => {
-            tracing::info!("SearXNG returned {} results", searx_data.results.len());
-            circuit_ref.record_success("searxng");
-            web_results.extend(searx_data.results);
-        }
-        Err(e) => {
-            tracing::error!("SearXNG request failed/timed out: {:?}", e);
-            circuit_ref.record_failure("searxng");
+    // Aggregate SearXNG results from all query variations
+    for (i, searx_res) in searx_results.into_iter().enumerate() {
+        match searx_res {
+            Ok(searx_data) => {
+                tracing::info!("SearXNG variation {} returned {} results", i, searx_data.results.len());
+                circuit_ref.record_success("searxng");
+                web_results.extend(searx_data.results);
+            }
+            Err(e) => {
+                tracing::error!("SearXNG variation {} request failed/timed out: {:?}", i, e);
+                circuit_ref.record_failure("searxng");
+            }
         }
     }
 
@@ -706,25 +858,57 @@ async fn handle_search(
         }
     }
 
-    // Deduplicate
+    // Deduplicate — URL normalization + domain-based dedup
+    // Multiple query variations may return the same page with different URLs
     let mut unique_web_results = Vec::new();
     let mut seen_urls = std::collections::HashSet::new();
+    let mut seen_domains = std::collections::HashMap::<String, usize>::new();
+    const MAX_PER_DOMAIN: usize = 5; // prevent single-domain dominance
+
     for res in web_results {
-        if seen_urls.insert(res.url.clone()) {
+        // Normalize URL: lowercase, strip trailing slash, strip fragment
+        let normalized = {
+            let lower = res.url.to_lowercase();
+            let no_fragment = lower.split('#').next().unwrap_or(&lower);
+            let no_trailing = no_fragment.trim_end_matches('/');
+            no_trailing.to_string()
+        };
+
+        // Domain dedup: cap results per domain for diversity
+        let domain = reqwest::Url::parse(&res.url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+            .unwrap_or_default();
+
+        let domain_count = seen_domains.entry(domain.clone()).or_insert(0);
+        if *domain_count >= MAX_PER_DOMAIN {
+            continue;
+        }
+
+        if seen_urls.insert(normalized) {
+            *domain_count += 1;
             unique_web_results.push(res);
         }
     }
     let mut web_results = unique_web_results;
 
-    // 6. Multi-Signal Ranking
+    tracing::info!("After dedup: {} unique web results", web_results.len());
+
+    // 6. Multi-Signal Ranking with Content Quality + Semantic Relevance
     let weights = RankingWeights::default();
 
-    // Rank web results with multi-signal scoring
+    // Rank web results
     for (i, res) in web_results.iter_mut().enumerate() {
-        let rank_score = 10.0 / (i + 1) as f32; // normalized rank score
+        let rank_score = 10.0 / (i + 1) as f32;
         let intent_boost = calculate_intent_boost(&res.url, &res.title, &q, &intent.intent);
         let freshness = freshness_score(&res.url, &intent.intent);
         let authority = domain_authority_score(&res.url);
+
+        // NEW: Content quality — penalize spam/gibberish
+        let quality = content_quality_score(&res.content);
+
+        // NEW: Semantic relevance — how well does the result match the query?
+        let semantic = semantic_relevance_score(&q, &res.title, &res.content);
 
         res.score = compute_final_score(
             rank_score,
@@ -732,17 +916,29 @@ async fn handle_search(
             freshness,
             authority,
             false, // not local
+            quality,
+            semantic,
             &weights,
         );
     }
+    // Filter out results with very low semantic relevance (<15% of query terms matched)
+    // This removes "Best Buy" for "best rust web framework" — completely irrelevant results
+    web_results.retain(|res| {
+        let semantic = semantic_relevance_score(&q, &res.title, &res.content);
+        semantic >= 0.15
+    });
     web_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Rank local results with multi-signal scoring
+    // Rank local results — they get full semantic scoring too
     for (i, res) in local_results.iter_mut().enumerate() {
         let rank_score = 10.0 / (i + 1) as f32;
         let intent_boost = calculate_intent_boost(&res.url, &res.title, &q, &intent.intent);
         let freshness = freshness_score(&res.url, &intent.intent);
-        let authority = domain_authority_score(&res.url);
+        // Use authority from the indexer (computed from crawl data) if available, else compute from domain
+        let authority = if res.authority > 0.0 { res.authority } else { domain_authority_score(&res.url) };
+        // so quality is inherently higher (we crawled the full page)
+        let quality = 0.8; // trusted — we crawled and indexed this ourselves
+        let semantic = semantic_relevance_score(&q, &res.title, "");
 
         res.score = compute_final_score(
             rank_score,
@@ -750,17 +946,20 @@ async fn handle_search(
             freshness,
             authority,
             true, // local index bonus
+            quality,
+            semantic,
             &weights,
         );
     }
     local_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
-    // 7. Feed Meta-Search Results into Crawl Queue
-    let crawl_urls: Vec<serde_json::Value> = web_results.iter().take(10).enumerate().map(|(i, r)| {
+    // 7. Feed Meta-Search Results into Crawl Queue with relevance signals
+    // Include the score so the crawler can prioritize high-relevance URLs
+    let crawl_urls: Vec<serde_json::Value> = web_results.iter().take(15).enumerate().map(|(i, r)| {
         serde_json::json!({
             "url": r.url,
-            "priority": 1.0 / (i + 1) as f32,
-            "source": "meta-search"
+            "priority": r.score, // use the computed relevance score, not just position
+            "source": format!("meta-search:{}", r.engine)
         })
     }).collect();
 

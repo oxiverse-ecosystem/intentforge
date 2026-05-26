@@ -27,6 +27,8 @@ struct IngestRequest {
     timestamp: Option<u64>,
     #[serde(default)]
     embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    authority: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +47,8 @@ struct SearchResult {
     url: String,
     title: String,
     score: f32,
+    #[serde(default)]
+    authority: f32,
 }
 
 #[tokio::main]
@@ -60,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
     schema_builder.add_text_field("content", TEXT);
     schema_builder.add_u64_field("timestamp", INDEXED | FAST | STORED);
     schema_builder.add_bytes_field("embedding", STORED);
+    schema_builder.add_f64_field("authority", STORED | FAST);
     
     let schema = schema_builder.build();
 
@@ -121,6 +126,7 @@ async fn handle_ingest(
     let content_field = state.schema.get_field("content").unwrap();
     let timestamp_field = state.schema.get_field("timestamp").unwrap();
     let embedding_field = state.schema.get_field("embedding").unwrap();
+    let authority_field = state.schema.get_field("authority").unwrap();
 
     let mut writer = state.writer.lock().await;
     let mut doc = TantivyDocument::default();
@@ -141,6 +147,10 @@ async fn handle_ingest(
         let bytes: Vec<u8> = vec.iter().flat_map(|&f| f.to_le_bytes()).collect();
         doc.add_bytes(embedding_field, bytes);
     }
+
+    // Store domain authority score if provided
+    let auth = payload.authority.unwrap_or(0.5);
+    doc.add_f64(authority_field, auth);
 
     // Delete existing document with the same URL to prevent duplicates
     let term = tantivy::Term::from_field_text(url_field, &payload.url);
@@ -195,6 +205,7 @@ async fn handle_search(
     let title_field = state.schema.get_field("title").unwrap();
     let timestamp_field = state.schema.get_field("timestamp").unwrap();
     let embedding_field = state.schema.get_field("embedding").unwrap();
+    let authority_field = state.schema.get_field("authority").unwrap();
 
     let query_vector: Option<Vec<f32>> = params.vector.and_then(|v_str| {
         serde_json::from_str::<Vec<f32>>(&v_str).ok()
@@ -215,7 +226,7 @@ async fn handle_search(
 
     let mut bm25_ranked = Vec::new();
     let mut semantic_ranked = Vec::new();
-    let mut metadata: HashMap<String, (String, u64)> = HashMap::new();
+    let mut metadata: HashMap<String, (String, u64, f64)> = HashMap::new(); // url -> (title, timestamp, authority)
     let mut urls_without_embeddings = std::collections::HashSet::new();
     
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
@@ -229,8 +240,9 @@ async fn handle_search(
         let url = retrieved_doc.get_first(url_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
         let title = retrieved_doc.get_first(title_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
         let timestamp = retrieved_doc.get_first(timestamp_field).and_then(|v| v.as_u64()).unwrap_or(0);
+        let authority = retrieved_doc.get_first(authority_field).and_then(|v| v.as_f64()).unwrap_or(0.5);
         
-        metadata.insert(url.clone(), (title.clone(), timestamp));
+        metadata.insert(url.clone(), (title.clone(), timestamp, authority));
 
         let mut has_embedding = false;
         if let Some(ref q_vec) = query_vector {
@@ -280,7 +292,7 @@ async fn handle_search(
     let mut results: Vec<SearchResult> = rrf_scores
         .into_iter()
         .map(|(url, score)| {
-            let (title, ts) = metadata.get(&url).cloned().unwrap_or(("No Title".to_string(), 0));
+            let (title, ts, auth) = metadata.get(&url).cloned().unwrap_or(("No Title".to_string(), 0, 0.5));
             let mut final_score = score;
             if params.freshness_boost.unwrap_or(false) && ts > 0 {
                 let age = now.saturating_sub(ts);
@@ -288,7 +300,9 @@ async fn handle_search(
                 let boost = scale / (scale + age as f32);
                 final_score *= 1.0 + (boost * 0.5);
             }
-            SearchResult { url, title, score: final_score }
+            // Authority boost: pages with higher authority get a 0-30% boost
+            final_score *= 1.0 + (auth as f32 * 0.3);
+            SearchResult { url, title, score: final_score, authority: auth as f32 }
         })
         .collect();
 

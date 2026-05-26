@@ -256,6 +256,108 @@ fn classify_by_centroids(query_embedding: &[f32], centroids: &[Vec<f32>]) -> (St
     (best_intent.to_string(), best_score)
 }
 
+// ─── Query Expansion (Dynamic, Not Hardcoded) ────────────────────────
+// Generates query variations for broader recall across meta-search engines.
+// Each variation captures a different phrasing of the same intent.
+
+fn expand_queries(query: &str, intent: &str) -> Vec<String> {
+    let q = query.trim();
+    let q_lower = q.to_lowercase();
+    let words: Vec<&str> = q_lower.split_whitespace().collect();
+    let mut expansions = vec![q.to_string()]; // always include original
+
+    match intent {
+        "how-to" => {
+            // "how to deploy to aws" → "aws deployment guide", "deploy application aws tutorial"
+            let stripped = q_lower
+                .strip_prefix("how to ").or_else(|| q_lower.strip_prefix("how do i "))
+                .or_else(|| q_lower.strip_prefix("how can i "))
+                .unwrap_or(&q_lower);
+            if stripped != q_lower {
+                expansions.push(format!("{} guide", stripped));
+                expansions.push(format!("{} tutorial", stripped));
+            }
+        }
+        "comparison" => {
+            // "rust vs go" → "rust go comparison", "rust compared to go"
+            if q_lower.contains(" vs ") || q_lower.contains(" versus ") {
+                let replaced = q_lower.replace(" versus ", " vs ");
+                let parts: Vec<&str> = replaced.split(" vs ").collect();
+                if parts.len() == 2 {
+                    expansions.push(format!("{} {} comparison", parts[0].trim(), parts[1].trim()));
+                    expansions.push(format!("{} compared to {}", parts[0].trim(), parts[1].trim()));
+                }
+            }
+            // "best X 2025" → "top X 2025", "X recommendation 2025"
+            if q_lower.starts_with("best ") || q_lower.starts_with("top ") {
+                let core = if q_lower.starts_with("best ") {
+                    q.strip_prefix("best ").or_else(|| q.strip_prefix("Best ")).unwrap_or(q)
+                } else {
+                    q.strip_prefix("top ").or_else(|| q.strip_prefix("Top ")).unwrap_or(q)
+                };
+                expansions.push(format!("top {}", core));
+                expansions.push(format!("{} recommendation", core));
+            }
+        }
+        "technical" => {
+            // "rust async runtime" → "rust async programming", "rust async await docs"
+            // Extract topic terms (skip generic ones)
+            let stop = ["the","a","an","in","on","for","with","using","from","to","and","or","of","is","are"];
+            let topic_words: Vec<&str> = words.iter()
+                .filter(|w| w.len() > 2 && !stop.contains(w))
+                .copied()
+                .collect();
+            if topic_words.len() >= 2 {
+                // Use last 2-3 topic words + "documentation" or "docs"
+                let tail: Vec<&str> = topic_words.iter().rev().take(3).rev().copied().collect();
+                expansions.push(format!("{} documentation", tail.join(" ")));
+                expansions.push(format!("{} examples", tail.join(" ")));
+            }
+        }
+        "informational" => {
+            // "what is machine learning" → "machine learning explained", "machine learning overview"
+            let stripped = q_lower
+                .strip_prefix("what is ").or_else(|| q_lower.strip_prefix("what are "))
+                .or_else(|| q_lower.strip_prefix("explain "))
+                .or_else(|| q_lower.strip_prefix("define "));
+            if let Some(core) = stripped {
+                if core.len() > 3 {
+                    expansions.push(format!("{} explained", core));
+                    expansions.push(format!("{} overview", core));
+                }
+            }
+        }
+        "fresh" => {
+            // "latest rust release" → "rust release 2026", "rust new version"
+            // Remove temporal words and rephrase
+            let temporal = ["latest","recent","newest","today","this week","this month","new"];
+            let mut core_words: Vec<&str> = Vec::new();
+            for w in &words {
+                if !temporal.iter().any(|t| *t == *w) && w.len() > 2 {
+                    core_words.push(w);
+                }
+            }
+            if !core_words.is_empty() {
+                let core = core_words.join(" ");
+                expansions.push(format!("{} 2026", core));
+                expansions.push(format!("{} update", core));
+            }
+        }
+        _ => {}
+    }
+
+    // Deduplicate and cap at 4
+    let mut seen = std::collections::HashSet::new();
+    let mut unique = Vec::new();
+    for exp in expansions {
+        let key = exp.to_lowercase();
+        if seen.insert(key) && unique.len() < 4 {
+            unique.push(exp);
+        }
+    }
+    unique
+}
+
 // ─── Main ────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -406,12 +508,14 @@ async fn analyze_query(
     // Layer 1: Rule-based pre-classifier (< 1ms)
     let result = if let Some(rule_match) = rule_based_classify(&params.q) {
         tracing::info!("Layer 1 (rules) -> {} (conf: {:.2})", rule_match.intent, rule_match.confidence);
+        let expanded = expand_queries(&params.q, rule_match.intent);
+        tracing::info!("Expanded to {} query variations", expanded.len());
         IntentResponse {
             query: params.q.clone(),
             intent: rule_match.intent.to_string(),
             confidence: rule_match.confidence,
             constraints: vec![],
-            expanded_queries: vec![params.q.clone()],
+            expanded_queries: expanded,
         }
     } else {
         // Layer 2: Embedding centroid classifier (~2ms)
@@ -421,12 +525,14 @@ async fn analyze_query(
             Some(query_embedding) => {
                 let (intent, confidence) = classify_by_centroids(&query_embedding, &state.category_centroids);
                 tracing::info!("Layer 2 (centroids) -> {} (conf: {:.2})", intent, confidence);
+                let expanded = expand_queries(&params.q, &intent);
+                tracing::info!("Expanded to {} query variations", expanded.len());
                 IntentResponse {
                     query: params.q.clone(),
                     intent,
                     confidence,
                     constraints: vec![],
-                    expanded_queries: vec![params.q.clone()],
+                    expanded_queries: expanded,
                 }
             }
             None => {

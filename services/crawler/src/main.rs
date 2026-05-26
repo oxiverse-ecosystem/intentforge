@@ -463,6 +463,57 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+// ─── Content Quality Gate ────────────────────────────────────────────
+// Reject content that's too short, too repetitive, or gibberish.
+// This prevents the local index from being polluted with low-quality pages.
+
+fn is_indexworthy(title: &str, content: &str) -> bool {
+    // Must have a real title
+    if title.len() < 5 || title == "No Title" {
+        return false;
+    }
+
+    // Must have meaningful content (at least 200 chars of actual text)
+    if content.len() < 200 {
+        return false;
+    }
+
+    // Check for gibberish: Shannon entropy
+    let entropy = {
+        let mut freq = [0u32; 128];
+        let mut total = 0u32;
+        for ch in content.chars().take(2000) {
+            if (ch as usize) < 128 {
+                freq[ch as usize] += 1;
+                total += 1;
+            }
+        }
+        if total == 0 { return false; }
+        let mut h = 0.0f32;
+        for &f in &freq {
+            if f > 0 {
+                let p = f as f32 / total as f32;
+                h -= p * p.log2();
+            }
+        }
+        h
+    };
+
+    // Natural language entropy is 3.5-5.5. Below 2.5 = repetitive, above 6.5 = random
+    if entropy < 2.5 || entropy > 6.5 {
+        return false;
+    }
+
+    // Check alpha ratio — must be mostly text, not code/numbers
+    let alpha_count = content.chars().filter(|c| c.is_alphabetic()).count();
+    let alpha_ratio = alpha_count as f32 / content.len().max(1) as f32;
+    if alpha_ratio < 0.3 {
+        return false; // probably code or data, not readable text
+    }
+
+    true
+}
+
 // ─── Crawl + Index ───────────────────────────────────────────────────
 
 async fn crawl_and_index(
@@ -482,20 +533,33 @@ async fn crawl_and_index(
             .map(|e| e.text().collect::<Vec<_>>().join(""))
             .unwrap_or_else(|| "No Title".to_string());
 
+        // Try progressively broader selectors for main content
         let mut main_content = String::new();
-        let selectors = vec!["main", "article", ".content", "#content", "body"];
+        let selectors = vec!["main", "article", ".content", "#content",
+                            ".post", ".entry", ".article-body", "body"];
         for sel_str in selectors {
             let sel = Selector::parse(sel_str).unwrap();
             if let Some(element) = document.select(&sel).next() {
                 main_content = element.text().collect::<Vec<_>>().join(" ");
-                if main_content.len() > 200 { break; }
+                if main_content.len() > 500 { break; }
             }
         }
-        let cleaned_content: String = main_content.trim().chars().take(5000).collect();
+        // Clean: collapse whitespace, take first 8000 chars (increased from 5000)
+        let cleaned_content: String = {
+            let collapsed: String = main_content.split_whitespace().collect::<Vec<_>>().join(" ");
+            collapsed.chars().take(8000).collect()
+        };
 
         let links = extract_links(&document, &entry.url);
         (title, cleaned_content, links)
     };
+
+    // Content quality gate — don't pollute the index with gibberish
+    if !is_indexworthy(&title, &cleaned_content) {
+        tracing::info!("Skipping low-quality page: {} (title_len={}, content_len={})",
+                       entry.url, title.len(), cleaned_content.len());
+        return Ok((title, cleaned_content, links));
+    }
 
     let embedding_text = format!("{}. {}", title, cleaned_content);
     let embedding: Option<Vec<f32>> = match state.crawl_client
