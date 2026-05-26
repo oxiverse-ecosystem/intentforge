@@ -1204,11 +1204,11 @@ async fn handle_search(
 
     // Rank local results using precomputed semantic scores
     let local_semantic_scores: Vec<f32> = local_results.iter()
-        .map(|res| semantic_relevance_score(&q, &res.title, ""))
+        .map(|res| semantic_relevance_score(&q, &res.title, &res.content))
         .collect();
     for (i, res) in local_results.iter_mut().enumerate() {
-        // Use RRF-consistent formula: local index is one "source" with ranked positions
-        let rank_score = 1.0 / (60.0 + (i + 1) as f32);
+        // Use the indexer's actual score (BM25 + semantic RRF) as the rank signal
+        let rank_score = (res.score).max(0.01);
         let intent_boost = calculate_intent_boost(&res.url, &res.title, &q, &intent.intent);
         let freshness = freshness_score(&res.url, &intent.intent);
         let authority = if res.authority > 0.0 { res.authority } else { domain_authority_score(&res.url) };

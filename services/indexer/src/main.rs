@@ -337,7 +337,7 @@ async fn handle_search(
                 final_score *= 2.0;
             }
 
-            SearchResult { url, title, score: final_score, authority: auth as f32, content: if content.len() > 2000 { content[..2000].to_string() } else { content } }
+            SearchResult { url, title, score: final_score, authority: auth as f32, content: if content.len() > 2000 { content.chars().take(2000).collect() } else { content } }
         })
         .collect();
 
