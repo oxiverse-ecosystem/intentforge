@@ -692,12 +692,8 @@ fn normalize_scores(scores: &mut [f32]) {
 // Handles nested objects and arrays. Algorithmic — no hardcoded key lists.
 
 fn deduplicate_json_keys(json_str: &str) -> String {
-    // Fast path: parse as Value (keeps last duplicate key), re-serialize cleanly
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-        return serde_json::to_string(&val).unwrap_or_else(|_| json_str.to_string());
-    }
-
-    // Slow path: manually deduplicate keys by tracking seen keys per nesting level
+    // Manual dedup: serde_json rejects duplicate keys even for Value type.
+    // Parse char-by-char, track seen keys per nesting level, remove duplicates.
     let chars_vec: Vec<char> = json_str.chars().collect();
     let mut duplicate_ranges: Vec<(usize, usize)> = Vec::new();
     let mut idx = 0;
