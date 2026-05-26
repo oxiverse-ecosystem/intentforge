@@ -29,6 +29,8 @@ struct IngestRequest {
     embedding: Option<Vec<f32>>,
     #[serde(default)]
     authority: Option<f64>,
+    #[serde(default)]
+    quality: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -212,6 +214,9 @@ async fn handle_search(
     });
 
     let query_parser = tantivy::query::QueryParser::for_index(&state.index, vec![title_field, state.schema.get_field("content").unwrap()]);
+    // Also create a title-only parser for title boost scoring
+    let title_query_parser = tantivy::query::QueryParser::for_index(&state.index, vec![title_field]);
+
     let query = if params.q.is_empty() {
         Box::new(tantivy::query::AllQuery) as Box<dyn tantivy::query::Query>
     } else {
@@ -221,8 +226,27 @@ async fn handle_search(
         }
     };
 
+    let title_query = if params.q.is_empty() {
+        Box::new(tantivy::query::AllQuery) as Box<dyn tantivy::query::Query>
+    } else {
+        match title_query_parser.parse_query(&params.q) {
+            Ok(q) => q,
+            Err(_) => Box::new(tantivy::query::AllQuery) as Box<dyn tantivy::query::Query>,
+        }
+    };
+
     let limit = 100;
     let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(limit)).unwrap();
+
+    // Title-only search for boost scoring
+    let title_hits: std::collections::HashSet<String> = searcher.search(&title_query, &tantivy::collector::TopDocs::with_limit(limit))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(_, addr)| {
+            searcher.doc::<TantivyDocument>(addr).ok()
+                .and_then(|d| d.get_first(url_field).and_then(|v| v.as_str()).map(|s| s.to_string()))
+        })
+        .collect();
 
     let mut bm25_ranked = Vec::new();
     let mut semantic_ranked = Vec::new();
@@ -302,6 +326,13 @@ async fn handle_search(
             }
             // Authority boost: pages with higher authority get a 0-30% boost
             final_score *= 1.0 + (auth as f32 * 0.3);
+
+            // Title boost: results where the query matches the title get 2x boost
+            // This is a much stronger relevance signal than content-only matches
+            if title_hits.contains(&url) {
+                final_score *= 2.0;
+            }
+
             SearchResult { url, title, score: final_score, authority: auth as f32 }
         })
         .collect();

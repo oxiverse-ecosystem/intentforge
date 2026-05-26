@@ -514,6 +514,163 @@ fn is_indexworthy(title: &str, content: &str) -> bool {
     true
 }
 
+// ─── Content Quality Score (for indexing) ────────────────────────────
+// Returns a 0.0-1.0 quality score to store in the index.
+// Uses Shannon entropy + alpha ratio + word length analysis.
+// NOT hardcoded — based on information-theoretic measures.
+
+fn compute_content_quality(content: &str) -> f32 {
+    if content.len() < 100 {
+        return 0.2;
+    }
+
+    let mut score: f32 = 1.0;
+
+    // Shannon entropy
+    let entropy = {
+        let mut freq = [0u32; 128];
+        let mut total = 0u32;
+        for ch in content.chars().take(2000) {
+            if (ch as usize) < 128 {
+                freq[ch as usize] += 1;
+                total += 1;
+            }
+        }
+        if total == 0 { return 0.1; }
+        let mut h = 0.0f32;
+        for &f in &freq {
+            if f > 0 {
+                let p = f as f32 / total as f32;
+                h -= p * p.log2();
+            }
+        }
+        h
+    };
+
+    if entropy < 2.0 {
+        score *= 0.2;
+    } else if entropy < 3.0 {
+        score *= 0.5;
+    } else if entropy > 6.5 {
+        score *= 0.3;
+    }
+
+    // Alpha ratio
+    let alpha_count = content.chars().filter(|c| c.is_alphabetic()).count();
+    let alpha_ratio = alpha_count as f32 / content.len().max(1) as f32;
+    if alpha_ratio < 0.4 {
+        score *= 0.4;
+    }
+
+    // Word length analysis
+    let words: Vec<&str> = content.split_whitespace().collect();
+    if !words.is_empty() {
+        let avg_word_len: f32 = words.iter().map(|w| w.len() as f32).sum::<f32>() / words.len() as f32;
+        if avg_word_len > 20.0 {
+            score *= 0.2;
+        } else if avg_word_len > 15.0 {
+            score *= 0.5;
+        }
+    }
+
+    // Content length bonus — longer content is generally more useful (up to a point)
+    let len_bonus = (content.len() as f32 / 5000.0).min(1.0) * 0.1;
+    score += len_bonus;
+
+    score.clamp(0.0, 1.0)
+}
+
+// ─── Publication Date Extraction ─────────────────────────────────────
+// Extracts publication dates from HTML meta tags, <time> elements, and URL patterns.
+// Returns a Unix timestamp if found, None otherwise.
+// This enables real freshness scoring instead of guessing from URLs.
+
+fn extract_publication_date(document: &Html, url: &str) -> Option<u64> {
+    // 1. Try <meta property="article:published_time"> (most reliable)
+    let meta_selectors = [
+        "meta[property='article:published_time']",
+        "meta[property='article:modified_time']",
+        "meta[name='datePublished']",
+        "meta[name='date']",
+        "meta[name='DC.date']",
+        "meta[name='dcterms.modified']",
+        "meta[itemprop='datePublished']",
+    ];
+
+    for sel_str in &meta_selectors {
+        let sel = Selector::parse(sel_str).unwrap();
+        if let Some(element) = document.select(&sel).next() {
+            if let Some(content) = element.value().attr("content") {
+                if let Some(ts) = parse_date_string(content) {
+                    return Some(ts);
+                }
+            }
+        }
+    }
+
+    // 2. Try <time datetime="...">
+    let time_sel = Selector::parse("time[datetime]").unwrap();
+    if let Some(element) = document.select(&time_sel).next() {
+        if let Some(datetime) = element.value().attr("datetime") {
+            if let Some(ts) = parse_date_string(datetime) {
+                return Some(ts);
+            }
+        }
+    }
+
+    // 3. Try URL date patterns: /2026/05/26/, /2026-05-, etc.
+    let url_lower = url.to_lowercase();
+    let url_date_patterns = [
+        // /2026/05/26/
+        regex::Regex::new(r"/(\d{4})/(\d{2})/(\d{2})/").unwrap(),
+        // /2026/05/
+        regex::Regex::new(r"/(\d{4})/(\d{2})/").unwrap(),
+        // 2026-05-26
+        regex::Regex::new(r"(\d{4})-(\d{2})-(\d{2})").unwrap(),
+    ];
+
+    for re in &url_date_patterns {
+        if let Some(caps) = re.captures(&url_lower) {
+            let year: u32 = caps.get(1).map(|m| m.as_str().parse().unwrap_or(0)).unwrap_or(0);
+            let month: u32 = caps.get(2).map(|m| m.as_str().parse().unwrap_or(1)).unwrap_or(1);
+            let day: u32 = caps.get(3).map(|m| m.as_str().parse().unwrap_or(1)).unwrap_or(1);
+
+            if year >= 2000 && year <= 2030 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+                // Approximate Unix timestamp
+                let days_since_epoch = (year as u64 - 1970) * 365 + (month as u64 - 1) * 30 + day as u64;
+                return Some(days_since_epoch * 86400);
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_date_string(date_str: &str) -> Option<u64> {
+    // Try ISO 8601: "2026-05-26T10:30:00Z" or "2026-05-26"
+    let cleaned = date_str.trim().trim_end_matches('Z').trim_end_matches('z');
+
+    // Extract date part (first 10 chars: YYYY-MM-DD)
+    if cleaned.len() >= 10 {
+        let date_part = &cleaned[..10];
+        let parts: Vec<&str> = date_part.split('-').collect();
+        if parts.len() == 3 {
+            if let (Ok(year), Ok(month), Ok(day)) = (
+                parts[0].parse::<u32>(),
+                parts[1].parse::<u32>(),
+                parts[2].parse::<u32>(),
+            ) {
+                if year >= 2000 && year <= 2030 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+                    let days_since_epoch = (year as u64 - 1970) * 365 + (month as u64 - 1) * 30 + day as u64;
+                    return Some(days_since_epoch * 86400);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 // ─── Crawl + Index ───────────────────────────────────────────────────
 
 async fn crawl_and_index(
@@ -525,7 +682,7 @@ async fn crawl_and_index(
 
     // Parse + extract everything from Html in a block so it's dropped before any .await
     // (scraper::Html contains Cell<usize> which is not Send)
-    let (title, cleaned_content, links) = {
+    let (title, cleaned_content, links, pub_date, quality_score) = {
         let document = Html::parse_document(&html_content);
 
         let title_selector = Selector::parse("title").unwrap();
@@ -551,7 +708,14 @@ async fn crawl_and_index(
         };
 
         let links = extract_links(&document, &entry.url);
-        (title, cleaned_content, links)
+
+        // Extract publication date from meta tags, <time> elements, or URL
+        let pub_date = extract_publication_date(&document, &entry.url);
+
+        // Compute content quality score
+        let quality_score = compute_content_quality(&cleaned_content);
+
+        (title, cleaned_content, links, pub_date, quality_score)
     };
 
     // Content quality gate — don't pollute the index with gibberish
@@ -578,12 +742,18 @@ async fn crawl_and_index(
         Err(_) => None,
     };
 
-    let index_payload = serde_json::json!({
+    let mut index_payload = serde_json::json!({
         "url": entry.url,
         "title": title,
         "content": cleaned_content,
         "embedding": embedding,
+        "quality": quality_score as f64,
     });
+
+    // Include publication timestamp if found (enables real freshness scoring)
+    if let Some(ts) = pub_date {
+        index_payload["timestamp"] = serde_json::json!(ts);
+    }
 
     let _ = state.crawl_client
         .post(format!("{}/index", state.indexer_url))

@@ -259,6 +259,8 @@ fn classify_by_centroids(query_embedding: &[f32], centroids: &[Vec<f32>]) -> (St
 // ─── Query Expansion (Dynamic, Not Hardcoded) ────────────────────────
 // Generates query variations for broader recall across meta-search engines.
 // Each variation captures a different phrasing of the same intent.
+// Strategy: reformulate the core topic with intent-appropriate context,
+// preserving key qualifiers (years, specific names, technical terms).
 
 fn expand_queries(query: &str, intent: &str) -> Vec<String> {
     let q = query.trim();
@@ -266,16 +268,28 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
     let words: Vec<&str> = q_lower.split_whitespace().collect();
     let mut expansions = vec![q.to_string()]; // always include original
 
+    // Extract the "core topic" by stripping intent-leading words
+    let core = extract_core_topic(&q_lower, intent);
+    let core_trimmed = core.trim();
+
     match intent {
         "how-to" => {
             // "how to deploy to aws" → "aws deployment guide", "deploy application aws tutorial"
-            let stripped = q_lower
-                .strip_prefix("how to ").or_else(|| q_lower.strip_prefix("how do i "))
-                .or_else(|| q_lower.strip_prefix("how can i "))
-                .unwrap_or(&q_lower);
-            if stripped != q_lower {
-                expansions.push(format!("{} guide", stripped));
-                expansions.push(format!("{} tutorial", stripped));
+            if core_trimmed.len() > 3 {
+                // Rearrange: put the action first, then context
+                let core_words: Vec<&str> = core_trimmed.split_whitespace().collect();
+                if core_words.len() >= 2 {
+                    // "deploy to aws" → "aws deployment guide"
+                    let last_words: Vec<&str> = core_words.iter().rev().take(2).rev().copied().collect();
+                    let action_word = core_words.first().unwrap_or(&"");
+                    expansions.push(format!("{} {} guide", last_words.join(" "), action_word));
+                    expansions.push(format!("{} tutorial", core_trimmed));
+                } else {
+                    expansions.push(format!("{} guide", core_trimmed));
+                    expansions.push(format!("{} tutorial", core_trimmed));
+                }
+                // Also try the original query without "how to" as a direct search
+                expansions.push(format!("{} step by step", core_trimmed));
             }
         }
         "comparison" => {
@@ -284,52 +298,54 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
                 let replaced = q_lower.replace(" versus ", " vs ");
                 let parts: Vec<&str> = replaced.split(" vs ").collect();
                 if parts.len() == 2 {
-                    expansions.push(format!("{} {} comparison", parts[0].trim(), parts[1].trim()));
-                    expansions.push(format!("{} compared to {}", parts[0].trim(), parts[1].trim()));
+                    let (a, b) = (parts[0].trim(), parts[1].trim());
+                    expansions.push(format!("{} {} comparison", a, b));
+                    expansions.push(format!("{} compared to {}", a, b));
+                    // Preserve year if present
+                    if let Some(year) = extract_year(&q_lower) {
+                        expansions.push(format!("{} vs {} {}", a, b, year));
+                    }
                 }
             }
             // "best X 2025" → "top X 2025", "X recommendation 2025"
             if q_lower.starts_with("best ") || q_lower.starts_with("top ") {
-                let core = if q_lower.starts_with("best ") {
-                    q.strip_prefix("best ").or_else(|| q.strip_prefix("Best ")).unwrap_or(q)
-                } else {
-                    q.strip_prefix("top ").or_else(|| q.strip_prefix("Top ")).unwrap_or(q)
-                };
-                expansions.push(format!("top {}", core));
-                expansions.push(format!("{} recommendation", core));
+                let prefix = if q_lower.starts_with("best ") { "best" } else { "top" };
+                let rest = q.strip_prefix(&format!("{} ", prefix)).unwrap_or(q);
+                expansions.push(format!("top {}", rest));
+                expansions.push(format!("{} recommendation", rest));
+                // Also try without the prefix for broader results
+                expansions.push(rest.to_string());
             }
         }
         "technical" => {
-            // "rust async runtime" → "rust async programming", "rust async await docs"
-            // Extract topic terms (skip generic ones)
+            // "rust async runtime" → "rust async runtime documentation", "rust async programming"
             let stop = ["the","a","an","in","on","for","with","using","from","to","and","or","of","is","are"];
             let topic_words: Vec<&str> = words.iter()
                 .filter(|w| w.len() > 2 && !stop.contains(w))
                 .copied()
                 .collect();
             if topic_words.len() >= 2 {
-                // Use last 2-3 topic words + "documentation" or "docs"
+                // Add documentation/examples suffix
                 let tail: Vec<&str> = topic_words.iter().rev().take(3).rev().copied().collect();
                 expansions.push(format!("{} documentation", tail.join(" ")));
                 expansions.push(format!("{} examples", tail.join(" ")));
+                // Try "programming" suffix for broader technical results
+                if !q_lower.contains("programming") {
+                    expansions.push(format!("{} programming", topic_words.join(" ")));
+                }
             }
         }
         "informational" => {
             // "what is machine learning" → "machine learning explained", "machine learning overview"
-            let stripped = q_lower
-                .strip_prefix("what is ").or_else(|| q_lower.strip_prefix("what are "))
-                .or_else(|| q_lower.strip_prefix("explain "))
-                .or_else(|| q_lower.strip_prefix("define "));
-            if let Some(core) = stripped {
-                if core.len() > 3 {
-                    expansions.push(format!("{} explained", core));
-                    expansions.push(format!("{} overview", core));
-                }
+            if core_trimmed.len() > 3 {
+                expansions.push(format!("{} explained", core_trimmed));
+                expansions.push(format!("{} overview", core_trimmed));
+                // Also try the core topic alone (often gets Wikipedia/encyclopedia results)
+                expansions.push(core_trimmed.to_string());
             }
         }
         "fresh" => {
             // "latest rust release" → "rust release 2026", "rust new version"
-            // Remove temporal words and rephrase
             let temporal = ["latest","recent","newest","today","this week","this month","new"];
             let mut core_words: Vec<&str> = Vec::new();
             for w in &words {
@@ -338,9 +354,20 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
                 }
             }
             if !core_words.is_empty() {
-                let core = core_words.join(" ");
-                expansions.push(format!("{} 2026", core));
-                expansions.push(format!("{} update", core));
+                let core_str = core_words.join(" ");
+                expansions.push(format!("{} 2026", core_str));
+                expansions.push(format!("{} update", core_str));
+                // Also try "release notes" pattern
+                if core_str.contains("release") || core_str.contains("version") {
+                    expansions.push(format!("{} changelog", core_str));
+                }
+            }
+        }
+        "navigational" => {
+            // For navigational, the original query is usually best
+            // But try adding "official" and "site"
+            if !q_lower.contains("official") {
+                expansions.push(format!("official {}", q));
             }
         }
         _ => {}
@@ -356,6 +383,53 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
         }
     }
     unique
+}
+
+fn extract_core_topic<'a>(q_lower: &'a str, intent: &str) -> &'a str {
+    match intent {
+        "how-to" => {
+            q_lower
+                .strip_prefix("how to ").or_else(|| q_lower.strip_prefix("how do i "))
+                .or_else(|| q_lower.strip_prefix("how can i "))
+                .or_else(|| q_lower.strip_prefix("how do you "))
+                .or_else(|| q_lower.strip_prefix("steps to "))
+                .or_else(|| q_lower.strip_prefix("guide to "))
+                .or_else(|| q_lower.strip_prefix("tutorial "))
+                .unwrap_or(q_lower)
+        }
+        "informational" => {
+            q_lower
+                .strip_prefix("what is ").or_else(|| q_lower.strip_prefix("what are "))
+                .or_else(|| q_lower.strip_prefix("what does "))
+                .or_else(|| q_lower.strip_prefix("explain "))
+                .or_else(|| q_lower.strip_prefix("define "))
+                .or_else(|| q_lower.strip_prefix("meaning of "))
+                .unwrap_or(q_lower)
+        }
+        "transactional" => {
+            q_lower
+                .strip_prefix("buy ").or_else(|| q_lower.strip_prefix("download "))
+                .or_else(|| q_lower.strip_prefix("install "))
+                .or_else(|| q_lower.strip_prefix("get "))
+                .or_else(|| q_lower.strip_prefix("purchase "))
+                .unwrap_or(q_lower)
+        }
+        _ => q_lower,
+    }
+}
+
+fn extract_year(text: &str) -> Option<&str> {
+    // Find 4-digit year patterns (2020-2029)
+    for word in text.split_whitespace() {
+        if word.len() == 4 && word.starts_with("20") {
+            if let Ok(year) = word.parse::<u32>() {
+                if year >= 2020 && year <= 2029 {
+                    return Some(word);
+                }
+            }
+        }
+    }
+    None
 }
 
 // ─── Main ────────────────────────────────────────────────────────────

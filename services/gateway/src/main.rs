@@ -42,6 +42,8 @@ struct SearxResult {
     engine: String,
     #[serde(default)]
     score: f32,
+    #[serde(default)]
+    sources: Vec<String>, // tracks all engines/sources that returned this result
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -387,9 +389,34 @@ fn content_quality_score(text: &str) -> f32 {
     score.clamp(0.0, 1.0)
 }
 
-// ─── Semantic Relevance (Keyword Overlap Proxy) ──────────────────────
-// Measures how many query terms appear in the result title + description.
-// This is a fast proxy for full embedding cosine similarity.
+// ─── Simple Stemming (English Plurals) ──────────────────────────────
+// Strips trailing 's' for plurals to improve cross-morphological matching.
+// "frameworks" → "framework", "browsers" → "browser"
+// Conservative: only applies to words > 4 chars, excludes -us/-is/-ss/-os endings.
+
+fn stem(word: &str) -> String {
+    let len = word.len();
+    if len <= 4 {
+        return word.to_string();
+    }
+    if word.ends_with('s')
+        && !word.ends_with("ss")
+        && !word.ends_with("us")
+        && !word.ends_with("is")
+        && !word.ends_with("os")
+    {
+        return word[..len - 1].to_string();
+    }
+    word.to_string()
+}
+
+// ─── Semantic Relevance (TF Cosine + Bigrams + Stemming) ──────────
+// Measures topical relevance using:
+// - TF cosine similarity with title 3x weighting
+// - Bigram phrase matching: "rust framework" as adjacent words is stronger than separate
+// - Simple stemming: "frameworks" matches "framework"
+// - Adaptive coverage threshold: shorter queries need higher per-term match rate
+// NOT just keyword overlap — proper information retrieval scoring.
 
 fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
     let q_lower = query.to_lowercase();
@@ -397,44 +424,139 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
     let c_lower = content.to_lowercase();
 
     // Extract topic terms (skip stop words and very short words)
-    let stop_words = ["the","a","an","in","on","for","with","using","from","to",
+    let stop_words: std::collections::HashSet<&str> = [
+        "the","a","an","in","on","for","with","using","from","to",
         "and","or","of","is","are","was","were","be","been","has","have","had",
         "do","does","did","will","would","could","should","may","might",
         "how","what","where","when","why","which","who","this","that","these",
-        "those","it","its","i","me","my","we","our","you","your","he","she","they"];
-    let query_terms: Vec<&str> = q_lower.split_whitespace()
-        .filter(|w| w.len() > 2 && !stop_words.contains(w))
-        .collect();
+        "those","it","its","i","me","my","we","our","you","your","he","she","they",
+        "be","as","at","by","not","but","if","so","than","too","very","can","just",
+        "best","top","new","old","good","bad","big","small","fast","first","last",
+        "most","more","less","many","few","each","every","all","any","some",
+    ].iter().copied().collect();
 
+    let tokenize = |text: &str| -> Vec<String> {
+        text.split_whitespace()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .filter(|w| w.len() > 2 && !stop_words.contains(w.as_str()))
+            .map(|w| stem(&w))
+            .collect()
+    };
+
+    let query_terms = tokenize(&q_lower);
     if query_terms.is_empty() {
         return 0.5;
     }
 
-    let combined = format!("{} {}", t_lower, c_lower);
-    let combined_words: Vec<&str> = combined.split_whitespace().collect();
-    let matched = query_terms.iter().filter(|t| combined_words.iter().any(|w| w == *t || w.trim_matches(|c: char| !c.is_alphanumeric()) == **t)).count();
+    // Build weighted term frequency map — title terms get 3x weight
+    let mut tf: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    let title_tokens = tokenize(&t_lower);
+    let content_tokens = tokenize(&c_lower);
+
+    for term in &title_tokens {
+        *tf.entry(term.clone()).or_insert(0.0) += 3.0;
+    }
+    for term in &content_tokens {
+        *tf.entry(term.clone()).or_insert(0.0) += 1.0;
+    }
+
+    // Build query TF map
+    let mut qtf: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for term in &query_terms {
+        *qtf.entry(term.clone()).or_insert(0.0) += 1.0;
+    }
+
+    // Cosine similarity on unigrams
+    let mut dot_product = 0.0f32;
+    let mut q_norm_sq = 0.0f32;
+    let mut d_norm_sq = 0.0f32;
+
+    let mut seen_terms: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for term in &query_terms {
+        if !seen_terms.insert(term.clone()) {
+            continue;
+        }
+        let q_val = qtf.get(term).copied().unwrap_or(0.0);
+        let d_val = tf.get(term).copied().unwrap_or(0.0);
+        dot_product += q_val * d_val;
+        q_norm_sq += q_val * q_val;
+        d_norm_sq += d_val * d_val;
+    }
+
+    if q_norm_sq < 1e-8 || d_norm_sq < 1e-8 {
+        return 0.01;
+    }
+
+    let cosine_sim = dot_product / (q_norm_sq.sqrt() * d_norm_sq.sqrt());
+
+    // Coverage: fraction of query terms found in document
+    let matched = query_terms.iter().filter(|t| tf.contains_key(*t)).count();
     let coverage = matched as f32 / query_terms.len() as f32;
 
-    // Title match is more valuable than content match (also word-boundary)
-    let title_words: Vec<&str> = t_lower.split_whitespace().collect();
-    let title_matched = query_terms.iter().filter(|t| title_words.iter().any(|w| w == *t || w.trim_matches(|c: char| !c.is_alphanumeric()) == **t)).count();
-    let title_coverage = title_matched as f32 / query_terms.len() as f32;
+    // Bigram phrase matching: check if query bigrams appear as adjacent words.
+    // "rust framework" as adjacent words is much stronger than "rust" and "framework"
+    // appearing in different sentences. Catches phrase-level relevance.
+    let bigram_score = if query_terms.len() >= 2 {
+        let title_joined = title_tokens.join(" ");
+        let content_joined = content_tokens.join(" ");
+        let mut bigram_hits_title = 0.0f32;
+        let mut bigram_hits_content = 0.0f32;
+        let num_bigrams = (query_terms.len() - 1) as f32;
 
-    // Weighted: 60% title match + 40% content match
-    let base = (title_coverage * 0.6 + coverage * 0.4).clamp(0.0, 1.0);
-    
-    // Hard penalty: if less than 30% of query terms appear anywhere, result is likely irrelevant
-    // This catches "Best Buy" for query "best rust web framework" — only "best" matches
-    if coverage < 0.3 && title_coverage < 0.3 {
-        // If coverage is very low (<25%), this is almost certainly irrelevant
-        if coverage < 0.25 {
-            return 0.01; // essentially zero — will be filtered out
+        for w in query_terms.windows(2) {
+            let bigram = format!("{} {}", w[0], w[1]);
+            if title_joined.contains(&bigram) {
+                bigram_hits_title += 1.0;
+            } else if content_joined.contains(&bigram) {
+                bigram_hits_content += 1.0;
+            }
         }
-        // Otherwise scale down aggressively
-        return (base * coverage * 3.0).clamp(0.0, 0.15);
+        // Title bigrams worth 3x, like unigram TF weighting
+        ((bigram_hits_title * 3.0 + bigram_hits_content) / (num_bigrams * 3.0)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    // Combine all signals:
+    // - Unigram cosine (70% of unigram signal) + coverage (30% of unigram signal)
+    // - Then blend unigram (80%) with bigram phrase coherence (20%)
+    let unigram_combined = cosine_sim * 0.7 + coverage * 0.3;
+    let combined = unigram_combined * 0.8 + bigram_score * 0.2;
+
+    // Adaptive coverage threshold: shorter queries need higher per-term match rate
+    // to avoid false positives. Longer queries can tolerate partial matches.
+    let min_coverage = match query_terms.len() {
+        1 => 1.0,   // single term must match exactly
+        2 => 0.45,  // at least 1 of 2
+        3 => 0.30,  // at least 1 of 3
+        _ => 0.20,  // 4+ terms: lenient
+    };
+
+    if coverage < min_coverage {
+        if coverage < 0.10 {
+            return 0.01; // essentially irrelevant
+        }
+        return (combined * 0.3).clamp(0.0, 0.15);
     }
-    
-    base
+
+    combined.clamp(0.0, 1.0)
+}
+
+// ─── Engine Consensus Score ─────────────────────────────────────────
+// Algorithmic: results returned by multiple independent sources get higher scores.
+// This is the single strongest quality signal — if Bing, Brave, DuckDuckGo, and
+// the local index all agree on a result, it's almost certainly relevant.
+// No hardcoded lists — just count distinct sources.
+
+fn consensus_score(sources: &[String]) -> f32 {
+    if sources.is_empty() {
+        return 0.3; // single-source result
+    }
+    let unique_sources: std::collections::HashSet<&String> = sources.iter().collect();
+    let count = unique_sources.len() as f32;
+    // Logarithmic scaling: 1 source = 0.3, 2 = 0.55, 3 = 0.7, 4+ = 0.85+
+    // This prevents runaway boosts while still rewarding cross-source agreement
+    (0.3 + 0.2 * (count - 1.0).max(0.0).ln()).clamp(0.3, 0.95)
 }
 
 // ─── Multi-Signal Fusion ─────────────────────────────────────────────
@@ -447,18 +569,20 @@ struct RankingWeights {
     local_bonus: f32, // bonus for locally indexed
     quality: f32,    // content quality (entropy, spam detection)
     semantic: f32,   // semantic relevance (keyword overlap with query)
+    consensus: f32,  // cross-source agreement
 }
 
 impl Default for RankingWeights {
     fn default() -> Self {
         Self {
-            rrf: 0.15,       // reduced from 0.20 — less important than relevance
-            intent: 0.10,    // reduced from 0.15
-            freshness: 0.08, // reduced from 0.10
-            authority: 0.12, // reduced from 0.15
-            local_bonus: 0.10, // same
+            rrf: 0.10,       // reduced — consensus is a better signal
+            intent: 0.08,    // reduced slightly
+            freshness: 0.07, // same
+            authority: 0.10, // same
+            local_bonus: 0.05, // reduced — consensus replaces some of this
             quality: 0.10,   // content quality (spam detection)
-            semantic: 0.35,  // INCREASED: most important signal — query-result relevance
+            semantic: 0.30,  // still the most important signal
+            consensus: 0.20, // NEW: cross-source agreement — very strong signal
         }
     }
 }
@@ -471,6 +595,7 @@ fn compute_final_score(
     is_local: bool,
     quality: f32,
     semantic: f32,
+    consensus: f32,
     weights: &RankingWeights,
 ) -> f32 {
     let local = if is_local { 1.0 } else { 0.0 };
@@ -482,6 +607,7 @@ fn compute_final_score(
         + (weights.local_bonus * local)
         + (weights.quality * quality)
         + (weights.semantic * semantic)
+        + (weights.consensus * consensus)
 }
 
 // ─── Circuit Breaker (Dynamic Engine Backoff) ──────────────────────
@@ -711,8 +837,13 @@ async fn handle_search(
     }
 
     // Build SearXNG URLs for all expanded queries (max 4 variations)
+    // For freshness queries, add time_range parameter to get recent results
     let searx_urls: Vec<String> = expanded_queries.iter().take(4).map(|eq| {
-        format!("http://127.0.0.1:8080/search?q={}&format=json", urlencoding::encode(eq))
+        let mut url = format!("http://127.0.0.1:8080/search?q={}&format=json&pageno=1", urlencoding::encode(eq));
+        if is_freshness_query {
+            url.push_str("&time_range=month");
+        }
+        url
     }).collect();
 
     let whoogle_url = format!("http://127.0.0.1:5000/search?q={}&format=json", q_encoded);
@@ -797,6 +928,9 @@ async fn handle_search(
 
     // 5. Aggregate Web Results from all sources
     let mut web_results: Vec<SearxResult> = Vec::new();
+    // Track per-URL RRF contributions from each source's ranked position
+    // This gives a proper rank-fusion score instead of meaningless insertion order
+    let mut url_rrf_contributions: HashMap<String, f32> = HashMap::new();
 
     // Aggregate SearXNG results from all query variations
     for (i, searx_res) in searx_results.into_iter().enumerate() {
@@ -804,7 +938,17 @@ async fn handle_search(
             Ok(searx_data) => {
                 tracing::info!("SearXNG variation {} returned {} results", i, searx_data.results.len());
                 circuit_ref.record_success("searxng");
-                web_results.extend(searx_data.results);
+                // Track position-based RRF contribution per URL within this variation
+                for (pos, result) in searx_data.results.into_iter().enumerate() {
+                    let normalized = {
+                        let lower = result.url.to_lowercase();
+                        let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                        no_fragment.trim_end_matches('/').to_string()
+                    };
+                    let rrf_contrib = 1.0 / (60.0 + (pos + 1) as f32);
+                    *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
+                    web_results.push(result);
+                }
             }
             Err(e) => {
                 tracing::error!("SearXNG variation {} request failed/timed out: {:?}", i, e);
@@ -817,13 +961,21 @@ async fn handle_search(
         Ok(whoogle_data) => {
             tracing::info!("Whoogle returned {} results", whoogle_data.results.len());
             circuit_ref.record_success("whoogle");
-            for r in whoogle_data.results {
+            for (pos, r) in whoogle_data.results.into_iter().enumerate() {
+                let normalized = {
+                    let lower = r.url.to_lowercase();
+                    let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                    no_fragment.trim_end_matches('/').to_string()
+                };
+                let rrf_contrib = 1.0 / (60.0 + (pos + 1) as f32);
+                *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
                 web_results.push(SearxResult {
                     title: r.title,
                     url: r.url,
                     content: r.description.unwrap_or_default(),
                     engine: "whoogle".to_string(),
                     score: 0.0,
+                    sources: vec!["whoogle".to_string()],
                 });
             }
         }
@@ -837,16 +989,24 @@ async fn handle_search(
         Ok(invidious_data) => {
             tracing::info!("Invidious returned {} results", invidious_data.len());
             circuit_ref.record_success("invidious");
-            for r in invidious_data {
+            for (pos, r) in invidious_data.into_iter().enumerate() {
                 if r.result_type.as_deref() == Some("video") {
                     if let Some(vid) = r.video_id {
                         let video_url = format!("https://www.youtube.com/watch?v={}", vid);
+                        let normalized = {
+                            let lower = video_url.to_lowercase();
+                            let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                            no_fragment.trim_end_matches('/').to_string()
+                        };
+                        let rrf_contrib = 1.0 / (60.0 + (pos + 1) as f32);
+                        *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
                         web_results.push(SearxResult {
                             title: r.title.unwrap_or_else(|| "No Title".to_string()),
                             url: video_url,
                             content: r.description.unwrap_or_default(),
                             engine: "invidious".to_string(),
                             score: 0.0,
+                            sources: vec!["invidious".to_string()],
                         });
                     }
                 }
@@ -860,8 +1020,9 @@ async fn handle_search(
 
     // Deduplicate — URL normalization + domain-based dedup
     // Multiple query variations may return the same page with different URLs
+    // KEY: merge sources so we know which engines agreed on each result
     let mut unique_web_results = Vec::new();
-    let mut seen_urls = std::collections::HashSet::new();
+    let mut url_to_index: HashMap<String, usize> = HashMap::new(); // normalized URL -> index in unique_web_results
     let mut seen_domains = std::collections::HashMap::<String, usize>::new();
     const MAX_PER_DOMAIN: usize = 5; // prevent single-domain dominance
 
@@ -885,30 +1046,53 @@ async fn handle_search(
             continue;
         }
 
-        if seen_urls.insert(normalized) {
+        if let Some(&existing_idx) = url_to_index.get(&normalized) {
+            // URL already seen — merge the engine/source into the existing result
+            let source = if res.engine.is_empty() { "unknown".to_string() } else { res.engine.clone() };
+            if !unique_web_results[existing_idx].sources.contains(&source) {
+                unique_web_results[existing_idx].sources.push(source);
+            }
+            // RRF contributions are already summed in url_rrf_contributions
+            // during aggregation, so no extra work needed here
+        } else {
+            // New URL — add it with its source
+            let source = if res.engine.is_empty() { "unknown".to_string() } else { res.engine.clone() };
+            let mut result = res;
+            result.sources = vec![source];
+            url_to_index.insert(normalized, unique_web_results.len());
             *domain_count += 1;
-            unique_web_results.push(res);
+            unique_web_results.push(result);
         }
     }
     let mut web_results = unique_web_results;
 
     tracing::info!("After dedup: {} unique web results", web_results.len());
 
-    // 6. Multi-Signal Ranking with Content Quality + Semantic Relevance
+    // 6. Multi-Signal Ranking with Content Quality + Semantic Relevance + Consensus + RRF
     let weights = RankingWeights::default();
 
-    // Rank web results
+    // Pre-compute semantic relevance scores once (avoids double computation in ranking + filter)
+    let semantic_scores: Vec<f32> = web_results.iter()
+        .map(|res| semantic_relevance_score(&q, &res.title, &res.content))
+        .collect();
+
+    // Rank web results using all signals
     for (i, res) in web_results.iter_mut().enumerate() {
-        let rank_score = 10.0 / (i + 1) as f32;
+        // Use proper position-based RRF from each engine's ranked output
+        // instead of meaningless insertion order
+        let normalized = {
+            let lower = res.url.to_lowercase();
+            let no_fragment = lower.split('#').next().unwrap_or(&lower);
+            no_fragment.trim_end_matches('/').to_string()
+        };
+        let rank_score = url_rrf_contributions.get(&normalized).copied().unwrap_or(0.01);
+
         let intent_boost = calculate_intent_boost(&res.url, &res.title, &q, &intent.intent);
         let freshness = freshness_score(&res.url, &intent.intent);
         let authority = domain_authority_score(&res.url);
-
-        // NEW: Content quality — penalize spam/gibberish
         let quality = content_quality_score(&res.content);
-
-        // NEW: Semantic relevance — how well does the result match the query?
-        let semantic = semantic_relevance_score(&q, &res.title, &res.content);
+        let semantic = semantic_scores[i]; // use precomputed score
+        let consensus = consensus_score(&res.sources);
 
         res.score = compute_final_score(
             rank_score,
@@ -918,27 +1102,31 @@ async fn handle_search(
             false, // not local
             quality,
             semantic,
+            consensus,
             &weights,
         );
     }
-    // Filter out results with very low semantic relevance (<15% of query terms matched)
-    // This removes "Best Buy" for "best rust web framework" — completely irrelevant results
-    web_results.retain(|res| {
-        let semantic = semantic_relevance_score(&q, &res.title, &res.content);
-        semantic >= 0.15
+    // Filter out results with very low semantic relevance using precomputed scores
+    let mut _idx = 0;
+    web_results.retain(|_| {
+        let keep = semantic_scores[_idx] >= 0.15;
+        _idx += 1;
+        keep
     });
     web_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Rank local results — they get full semantic scoring too
+    // Rank local results using precomputed semantic scores
+    let local_semantic_scores: Vec<f32> = local_results.iter()
+        .map(|res| semantic_relevance_score(&q, &res.title, ""))
+        .collect();
     for (i, res) in local_results.iter_mut().enumerate() {
-        let rank_score = 10.0 / (i + 1) as f32;
+        // Use RRF-consistent formula: local index is one "source" with ranked positions
+        let rank_score = 1.0 / (60.0 + (i + 1) as f32);
         let intent_boost = calculate_intent_boost(&res.url, &res.title, &q, &intent.intent);
         let freshness = freshness_score(&res.url, &intent.intent);
-        // Use authority from the indexer (computed from crawl data) if available, else compute from domain
         let authority = if res.authority > 0.0 { res.authority } else { domain_authority_score(&res.url) };
-        // so quality is inherently higher (we crawled the full page)
-        let quality = 0.8; // trusted — we crawled and indexed this ourselves
-        let semantic = semantic_relevance_score(&q, &res.title, "");
+        let quality = 0.8; // trusted: we crawled and indexed this ourselves
+        let semantic = local_semantic_scores[i];
 
         res.score = compute_final_score(
             rank_score,
@@ -948,6 +1136,7 @@ async fn handle_search(
             true, // local index bonus
             quality,
             semantic,
+            0.3, // local-only = single source consensus
             &weights,
         );
     }

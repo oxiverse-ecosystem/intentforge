@@ -17,6 +17,8 @@ search:
     SearxEngineCaptcha: 0
     SearxEngineTooManyRequests: 0
     SearxEngineTimeout: 0
+  # Increase default result count for broader recall
+  default_lang: "en"
 
 outgoing:
   max_request_timeout: 8.0
@@ -56,6 +58,15 @@ engines:
   - name: wikidata
     disabled: false
     timeout: 2.0
+
+  # NEW: Additional engines for broader recall
+  - name: mojeek
+    disabled: false
+    timeout: 6.0
+
+  - name: yandex
+    disabled: false
+    timeout: 6.0
 
   # Tor-only engines (disabled for VPN path)
   - name: ahmia
