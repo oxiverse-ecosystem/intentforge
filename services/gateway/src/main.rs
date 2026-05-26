@@ -80,6 +80,8 @@ struct IndexerResult {
     score: f32,
     #[serde(default)]
     authority: f32,
+    #[serde(default)]
+    content: String,
 }
 
 #[derive(Serialize)]
@@ -1125,7 +1127,7 @@ async fn handle_search(
         let intent_boost = calculate_intent_boost(&res.url, &res.title, &q, &intent.intent);
         let freshness = freshness_score(&res.url, &intent.intent);
         let authority = if res.authority > 0.0 { res.authority } else { domain_authority_score(&res.url) };
-        let quality = 0.8; // trusted: we crawled and indexed this ourselves
+        let quality = content_quality_score(&res.content);
         let semantic = local_semantic_scores[i];
 
         res.score = compute_final_score(

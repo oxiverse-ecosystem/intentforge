@@ -51,6 +51,8 @@ struct SearchResult {
     score: f32,
     #[serde(default)]
     authority: f32,
+    #[serde(default)]
+    content: String,
 }
 
 #[tokio::main]
@@ -63,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     let mut schema_builder = Schema::builder();
     schema_builder.add_text_field("url", STRING | STORED);
     schema_builder.add_text_field("title", STORED | TEXT);
-    schema_builder.add_text_field("content", TEXT);
+    schema_builder.add_text_field("content", TEXT | STORED);
     schema_builder.add_u64_field("timestamp", INDEXED | FAST | STORED);
     schema_builder.add_bytes_field("embedding", STORED);
     schema_builder.add_f64_field("authority", STORED | FAST);
@@ -208,6 +210,7 @@ async fn handle_search(
     let timestamp_field = state.schema.get_field("timestamp").unwrap();
     let embedding_field = state.schema.get_field("embedding").unwrap();
     let authority_field = state.schema.get_field("authority").unwrap();
+    let content_field = state.schema.get_field("content").unwrap();
 
     let query_vector: Option<Vec<f32>> = params.vector.and_then(|v_str| {
         serde_json::from_str::<Vec<f32>>(&v_str).ok()
@@ -250,7 +253,7 @@ async fn handle_search(
 
     let mut bm25_ranked = Vec::new();
     let mut semantic_ranked = Vec::new();
-    let mut metadata: HashMap<String, (String, u64, f64)> = HashMap::new(); // url -> (title, timestamp, authority)
+    let mut metadata: HashMap<String, (String, u64, f64, String)> = HashMap::new(); // url -> (title, timestamp, authority, content)
     let mut urls_without_embeddings = std::collections::HashSet::new();
     
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
@@ -265,8 +268,9 @@ async fn handle_search(
         let title = retrieved_doc.get_first(title_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
         let timestamp = retrieved_doc.get_first(timestamp_field).and_then(|v| v.as_u64()).unwrap_or(0);
         let authority = retrieved_doc.get_first(authority_field).and_then(|v| v.as_f64()).unwrap_or(0.5);
+        let content = retrieved_doc.get_first(content_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
         
-        metadata.insert(url.clone(), (title.clone(), timestamp, authority));
+        metadata.insert(url.clone(), (title.clone(), timestamp, authority, content));
 
         let mut has_embedding = false;
         if let Some(ref q_vec) = query_vector {
@@ -316,7 +320,7 @@ async fn handle_search(
     let mut results: Vec<SearchResult> = rrf_scores
         .into_iter()
         .map(|(url, score)| {
-            let (title, ts, auth) = metadata.get(&url).cloned().unwrap_or(("No Title".to_string(), 0, 0.5));
+            let (title, ts, auth, content) = metadata.get(&url).cloned().unwrap_or(("No Title".to_string(), 0, 0.5, String::new()));
             let mut final_score = score;
             if params.freshness_boost.unwrap_or(false) && ts > 0 {
                 let age = now.saturating_sub(ts);
@@ -333,7 +337,7 @@ async fn handle_search(
                 final_score *= 2.0;
             }
 
-            SearchResult { url, title, score: final_score, authority: auth as f32 }
+            SearchResult { url, title, score: final_score, authority: auth as f32, content: if content.len() > 2000 { content[..2000].to_string() } else { content } }
         })
         .collect();
 
