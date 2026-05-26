@@ -1065,23 +1065,35 @@ async fn handle_search(
     let whoogle_fut = async {
         if whoogle_open {
             tracing::info!("Whoogle circuit OPEN — skipping");
-            return Ok(WhoogleResponse { results: vec![] });
+            return Ok::<WhoogleResponse, anyhow::Error>(WhoogleResponse { results: vec![] });
         }
         let resp = client_ref.get(&whoogle_url).send().await?;
         let status = resp.status();
         let raw_text = resp.text().await.unwrap_or_default();
-        // Debug: log raw response for diagnosis
-        let raw_len = raw_text.len();
-        let preview: String = raw_text.chars().take(300).collect();
-        tracing::warn!("WHOOGLE_DEBUG raw ({} bytes): {}", raw_len, preview);
-        // Whoogle sometimes returns JSON with duplicate keys (e.g. two "title" fields).
-        // serde_json rejects duplicates. Fix: deduplicate keys in each JSON object.
-        let cleaned = deduplicate_json_keys(&raw_text);
-        let cleaned_len = cleaned.len();
-        let cleaned_preview: String = cleaned.chars().take(300).collect();
-        tracing::warn!("WHOOGLE_DEBUG cleaned ({} bytes): {}", cleaned_len, cleaned_preview);
-        match serde_json::from_str::<WhoogleResponse>(&cleaned) {
-            Ok(parsed) => Ok(parsed),
+        // Parse Whoogle JSON into Value (no struct-level duplicate field rejection),
+        // then extract results manually. This avoids serde's "duplicate field" error
+        // caused by Whoogle returning both "title" and "text" keys in each result.
+        match serde_json::from_str::<serde_json::Value>(&raw_text) {
+            Ok(val) => {
+                let results: Vec<WhoogleResult> = val
+                    .get("results")
+                    .and_then(|r| r.as_array())
+                    .map(|arr| {
+                        arr.iter().filter_map(|item| {
+                            let url = item.get("href").or_else(|| item.get("link"))
+                                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let title = item.get("title").or_else(|| item.get("text"))
+                                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let description = item.get("content").or_else(|| item.get("desc"))
+                                .or_else(|| item.get("snippet"))
+                                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            if url.is_empty() { return None; }
+                            Some(WhoogleResult { url, title, description: Some(description) })
+                        }).collect()
+                    })
+                    .unwrap_or_default();
+                Ok(WhoogleResponse { results })
+            }
             Err(e) => {
                 tracing::error!("Failed to parse Whoogle JSON (status: {}): {:?}", status, e);
                 Err(e.into())
