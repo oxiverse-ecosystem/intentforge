@@ -502,9 +502,10 @@ async fn handle_search(
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
         return Json(value);
     }
-    // Timeout HTTP client — 1.5s for meta-search
+    // Timeout HTTP client — 10s for meta-search (SearXNG aggregates multiple engines)
+    // Results are cached for 5 min, so this hit only happens once per query
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(1500))
+        .timeout(Duration::from_secs(10))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .build()
         .unwrap();
