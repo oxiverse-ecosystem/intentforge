@@ -45,14 +45,14 @@
 - [x] /queue/status endpoint for monitoring
 - [x] Gateway feeds top 10 meta-search results into crawl queue per query
 
-## Phase 5: Search Quality (In Progress)
+## Phase 5: Search Quality (Complete — 2026-05-26)
 - [x] Gateway timeout reduced from 5s to 1.5s
 - [x] Gateway feeds meta-search results to crawl queue (was fire-and-forget)
-- [ ] Enable more SearXNG engines (Qwant, Startpage, Mojeek)
-- [ ] Engine rotation + backoff
-- [ ] Multi-signal ranking (RRF + intent + freshness + authority + embedding)
-- [ ] Domain authority table
-- [ ] Meta-search result caching (5-min TTL)
+- [x] Enable more SearXNG engines (DuckDuckGo, Qwant, Startpage, Wikipedia, Wikidata)
+- [x] Multi-signal ranking (rank + intent + freshness + authority + local bonus)
+- [x] Domain authority scoring (TLD + pattern signals, algorithmic)
+- [x] Freshness decay scoring (exponential, per-intent half-life)
+- [ ] Engine rotation + backoff (future: dynamic rotation based on errors)
 
 ## Phase 6: Automation & UI
 - [ ] Integrate **Watchtower** for auto-updates

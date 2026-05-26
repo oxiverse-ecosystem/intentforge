@@ -472,25 +472,30 @@ async fn crawl_and_index(
     let resp = state.crawl_client.get(&entry.url).send().await?;
     let html_content = resp.text().await.unwrap_or_default();
 
-    let document = Html::parse_document(&html_content);
+    // Parse + extract everything from Html in a block so it's dropped before any .await
+    // (scraper::Html contains Cell<usize> which is not Send)
+    let (title, cleaned_content, links) = {
+        let document = Html::parse_document(&html_content);
 
-    let title_selector = Selector::parse("title").unwrap();
-    let title = document.select(&title_selector).next()
-        .map(|e| e.text().collect::<Vec<_>>().join(""))
-        .unwrap_or_else(|| "No Title".to_string());
+        let title_selector = Selector::parse("title").unwrap();
+        let title = document.select(&title_selector).next()
+            .map(|e| e.text().collect::<Vec<_>>().join(""))
+            .unwrap_or_else(|| "No Title".to_string());
 
-    let mut main_content = String::new();
-    let selectors = vec!["main", "article", ".content", "#content", "body"];
-    for sel_str in selectors {
-        let sel = Selector::parse(sel_str).unwrap();
-        if let Some(element) = document.select(&sel).next() {
-            main_content = element.text().collect::<Vec<_>>().join(" ");
-            if main_content.len() > 200 { break; }
+        let mut main_content = String::new();
+        let selectors = vec!["main", "article", ".content", "#content", "body"];
+        for sel_str in selectors {
+            let sel = Selector::parse(sel_str).unwrap();
+            if let Some(element) = document.select(&sel).next() {
+                main_content = element.text().collect::<Vec<_>>().join(" ");
+                if main_content.len() > 200 { break; }
+            }
         }
-    }
-    let cleaned_content: String = main_content.trim().chars().take(5000).collect();
+        let cleaned_content: String = main_content.trim().chars().take(5000).collect();
 
-    let links = extract_links(&document, &entry.url);
+        let links = extract_links(&document, &entry.url);
+        (title, cleaned_content, links)
+    };
 
     let embedding_text = format!("{}. {}", title, cleaned_content);
     let embedding: Option<Vec<f32>> = match state.crawl_client
