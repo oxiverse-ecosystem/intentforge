@@ -1,1 +1,17 @@
+# Rust build artifacts
+**/target/
+
+# Index data (runtime)
 index_data/
+
+# Model files (large, downloaded at runtime)
+models/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp

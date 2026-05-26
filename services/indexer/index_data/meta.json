@@ -8,12 +8,27 @@
       "segment_id": "07809ad2-920f-4e37-8218-8ddfa4d3fbca",
       "max_doc": 9,
       "deletes": {
-        "num_deleted_docs": 2,
-        "opstamp": 563
+        "num_deleted_docs": 5,
+        "opstamp": 578
       }
     },
     {
+      "segment_id": "97cda898-8718-4f60-938a-2f415c538480",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
+      "segment_id": "3bf0616e-bb96-45d6-a283-62fff49382fa",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
       "segment_id": "0a96fd52-4aec-45d9-b317-6580c5ad9875",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
+      "segment_id": "df6f2086-4deb-4275-a71b-2f19da584c92",
       "max_doc": 1,
       "deletes": null
     },
@@ -84,5 +99,5 @@
       }
     }
   ],
-  "opstamp": 563
+  "opstamp": 578
 }
