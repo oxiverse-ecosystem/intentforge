@@ -1,9 +1,9 @@
 [[roles]]
 name = "vpn-rotator"
+apikey_file = "/tmp/.gluetun_apikey"
 routes = [
   "GET /v1/publicip/ip",
   "PUT /v1/vpn/status",
   "GET /v1/vpn/status",
   "GET /v1/vpn/settings"
 ]
-auth = "none"

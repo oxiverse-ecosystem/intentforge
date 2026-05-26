@@ -1,6 +1,6 @@
 services:
   gluetun:
-    image: qmcgaw/gluetun
+    image: qmcgaw/gluetun:v3.39.0
     container_name: gluetun
     cap_add:
       - NET_ADMIN
@@ -18,10 +18,7 @@ services:
       - HTTP_PROXY=on
       - SHADOWSOCKS=on
       - HTTP_CONTROL_SERVER_ADDRESS=:8000
-      - HTTP_CONTROL_SERVER_AUTH_CONFIG_FILEPATH=/gluetun/auth/config.toml
-      - HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE=vpn-rotator
-    volumes:
-      - ./config/gluetun/auth.toml:/gluetun/auth/config.toml:ro
+      - HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE=public
     ports:
       - "8888:8888/tcp" # HTTP Proxy
       - "8388:8388/tcp" # Shadowsocks
