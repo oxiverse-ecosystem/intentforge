@@ -18,6 +18,10 @@ services:
       - HTTP_PROXY=on
       - SHADOWSOCKS=on
       - HTTP_CONTROL_SERVER_ADDRESS=:8000
+      - HTTP_CONTROL_SERVER_AUTH_CONFIG_FILEPATH=/gluetun/auth/config.toml
+      - HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE=vpn-rotator
+    volumes:
+      - ./config/gluetun/auth.toml:/gluetun/auth/config.toml:ro
     ports:
       - "8888:8888/tcp" # HTTP Proxy
       - "8388:8388/tcp" # Shadowsocks
@@ -37,7 +41,19 @@ services:
   vpn-rotator:
     image: alpine:latest
     container_name: vpn-rotator
-    command: sh -c "while true; do sleep 7200; wget -qO- --method=PUT --body-data='{\"status\":\"stopped\"}' http://127.0.0.1:8000/v1/vpn/status; done"
+    command: >
+      sh -c "apk add --no-cache curl &&
+      echo 'VPN rotator started — rotating every 2 hours' &&
+      while true; do
+        sleep 7200;
+        echo \"$$(date -u) Rotating VPN IP...\";
+        curl -s -m 10 -X PUT -d '{\"status\":\"stopped\"}' http://127.0.0.1:8000/v1/vpn/status;
+        sleep 5;
+        curl -s -m 10 -X PUT -d '{\"status\":\"running\"}' http://127.0.0.1:8000/v1/vpn/status;
+        sleep 10;
+        IP=$$(curl -s -m 10 http://127.0.0.1:8000/v1/publicip/ip 2>/dev/null || echo 'unknown');
+        echo \"$$(date -u) VPN rotated. New IP: $$IP\";
+      done"
     depends_on:
       - gluetun
     network_mode: "service:gluetun"
