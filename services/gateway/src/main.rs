@@ -1070,9 +1070,16 @@ async fn handle_search(
         let resp = client_ref.get(&whoogle_url).send().await?;
         let status = resp.status();
         let raw_text = resp.text().await.unwrap_or_default();
+        // Debug: log raw response for diagnosis
+        let raw_len = raw_text.len();
+        let preview: String = raw_text.chars().take(300).collect();
+        eprintln!("[WHOOGLE DEBUG] raw ({} bytes): {}", raw_len, preview);
         // Whoogle sometimes returns JSON with duplicate keys (e.g. two "title" fields).
         // serde_json rejects duplicates. Fix: deduplicate keys in each JSON object.
         let cleaned = deduplicate_json_keys(&raw_text);
+        let cleaned_len = cleaned.len();
+        let cleaned_preview: String = cleaned.chars().take(300).collect();
+        eprintln!("[WHOOGLE DEBUG] cleaned ({} bytes): {}", cleaned_len, cleaned_preview);
         match serde_json::from_str::<WhoogleResponse>(&cleaned) {
             Ok(parsed) => Ok(parsed),
             Err(e) => {
