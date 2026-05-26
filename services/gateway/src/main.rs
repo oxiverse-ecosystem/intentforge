@@ -50,7 +50,6 @@ struct SearxResult {
 struct WhoogleResult {
     #[serde(alias = "href", alias = "link")]
     url: String,
-    #[serde(alias = "title")]
     title: String,
     #[serde(alias = "desc", alias = "snippet", default)]
     description: Option<String>,
