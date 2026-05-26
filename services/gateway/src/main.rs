@@ -574,17 +574,69 @@ struct RankingWeights {
     consensus: f32,  // cross-source agreement
 }
 
-impl Default for RankingWeights {
-    fn default() -> Self {
-        Self {
-            rrf: 0.10,       // reduced — consensus is a better signal
-            intent: 0.08,    // reduced slightly
-            freshness: 0.07, // same
-            authority: 0.10, // same
-            local_bonus: 0.05, // reduced — consensus replaces some of this
-            quality: 0.10,   // content quality (spam detection)
-            semantic: 0.30,  // still the most important signal
-            consensus: 0.20, // NEW: cross-source agreement — very strong signal
+impl RankingWeights {
+    fn for_intent(intent: &str) -> Self {
+        match intent {
+            "fresh" => Self {
+                rrf: 0.08,
+                intent: 0.05,
+                freshness: 0.20,   // news needs recency
+                authority: 0.15,   // news needs trustworthy sources
+                local_bonus: 0.02,
+                quality: 0.10,
+                semantic: 0.25,
+                consensus: 0.15,
+            },
+            "technical" => Self {
+                rrf: 0.10,
+                intent: 0.12,      // technical intent boost matters
+                freshness: 0.05,   // docs are stable
+                authority: 0.15,   // official docs preferred
+                local_bonus: 0.05,
+                quality: 0.08,
+                semantic: 0.35,    // technical queries need precision
+                consensus: 0.10,
+            },
+            "navigational" => Self {
+                rrf: 0.05,
+                intent: 0.25,      // navigational intent is dominant
+                freshness: 0.03,
+                authority: 0.20,   // official sites preferred
+                local_bonus: 0.02,
+                quality: 0.05,
+                semantic: 0.30,
+                consensus: 0.10,
+            },
+            "comparison" => Self {
+                rrf: 0.12,
+                intent: 0.10,
+                freshness: 0.10,   // reviews should be recent
+                authority: 0.08,
+                local_bonus: 0.02,
+                quality: 0.12,     // comparison content quality matters
+                semantic: 0.30,
+                consensus: 0.16,   // cross-source agreement for comparisons
+            },
+            "how-to" => Self {
+                rrf: 0.10,
+                intent: 0.10,
+                freshness: 0.08,
+                authority: 0.08,
+                local_bonus: 0.05,
+                quality: 0.10,
+                semantic: 0.32,    // how-to needs precise matching
+                consensus: 0.17,
+            },
+            _ => Self {  // informational, default
+                rrf: 0.10,
+                intent: 0.08,
+                freshness: 0.07,
+                authority: 0.10,
+                local_bonus: 0.05,
+                quality: 0.10,
+                semantic: 0.30,
+                consensus: 0.20,
+            },
         }
     }
 }
@@ -610,6 +662,29 @@ fn compute_final_score(
         + (weights.quality * quality)
         + (weights.semantic * semantic)
         + (weights.consensus * consensus)
+}
+
+// ─── Cross-Query Score Normalization ────────────────────────────────
+// Normalizes scores to [0, 1] using robust percentile scaling.
+// Makes scores comparable across different queries (a 1.5 on one query
+// shouldn't be confused with 1.5 on another).
+
+fn normalize_scores(scores: &mut [f32]) {
+    if scores.len() < 3 {
+        return; // not enough data to normalize
+    }
+    let mut sorted: Vec<f32> = scores.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let p10_idx = ((sorted.len() as f32 * 0.10) as usize).min(sorted.len() - 1);
+    let p90_idx = ((sorted.len() as f32 * 0.90) as usize).min(sorted.len() - 1);
+    let p10 = sorted[p10_idx];
+    let p90 = sorted[p90_idx];
+    let range = (p90 - p10).max(0.001); // avoid division by zero
+
+    for score in scores.iter_mut() {
+        *score = ((*score - p10) / range).clamp(0.0, 1.0);
+    }
 }
 
 // ─── Circuit Breaker (Dynamic Engine Backoff) ──────────────────────
@@ -1071,7 +1146,7 @@ async fn handle_search(
     tracing::info!("After dedup: {} unique web results", web_results.len());
 
     // 6. Multi-Signal Ranking with Content Quality + Semantic Relevance + Consensus + RRF
-    let weights = RankingWeights::default();
+    let weights = RankingWeights::for_intent(&intent.intent);
 
     // Pre-compute semantic relevance scores once (avoids double computation in ranking + filter)
     let semantic_scores: Vec<f32> = web_results.iter()
@@ -1108,14 +1183,24 @@ async fn handle_search(
             &weights,
         );
     }
-    // Filter out results with very low semantic relevance using precomputed scores
+    // Filter out results with very low semantic relevance using adaptive threshold
+    let semantic_threshold = if web_results.len() > 30 { 0.25 }
+        else if web_results.len() > 20 { 0.20 }
+        else { 0.15 };
     let mut _idx = 0;
     web_results.retain(|_| {
-        let keep = semantic_scores[_idx] >= 0.15;
+        let keep = semantic_scores[_idx] >= semantic_threshold;
         _idx += 1;
         keep
     });
     web_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Normalize web scores to [0, 1] for cross-query comparability
+    let mut web_scores: Vec<f32> = web_results.iter().map(|r| r.score).collect();
+    normalize_scores(&mut web_scores);
+    for (i, r) in web_results.iter_mut().enumerate() {
+        r.score = web_scores[i];
+    }
 
     // Rank local results using precomputed semantic scores
     let local_semantic_scores: Vec<f32> = local_results.iter()
@@ -1144,15 +1229,40 @@ async fn handle_search(
     }
     local_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Quality gate: filter out garbage local results (error pages, stale content)
+    local_results.retain(|r| {
+        let title_ok = r.title.len() > 5;
+        let url_lower = r.url.to_lowercase();
+        let not_error = !url_lower.contains("/error")
+            && !url_lower.contains("/404")
+            && !url_lower.contains("/login")
+            && !url_lower.contains("/signin")
+            && !url_lower.contains("/signup")
+            && !url_lower.contains("/account")
+            && !url_lower.contains("/cookie");
+        title_ok && not_error
+    });
+
+    // Normalize local scores to [0, 1]
+    let mut local_scores: Vec<f32> = local_results.iter().map(|r| r.score).collect();
+    normalize_scores(&mut local_scores);
+    for (i, r) in local_results.iter_mut().enumerate() {
+        r.score = local_scores[i];
+    }
+
     // 7. Feed Meta-Search Results into Crawl Queue with relevance signals
     // Include the score so the crawler can prioritize high-relevance URLs
-    let crawl_urls: Vec<serde_json::Value> = web_results.iter().take(15).enumerate().map(|(i, r)| {
-        serde_json::json!({
-            "url": r.url,
-            "priority": r.score, // use the computed relevance score, not just position
-            "source": format!("meta-search:{}", r.engine)
-        })
-    }).collect();
+    let crawl_urls: Vec<serde_json::Value> = web_results.iter()
+        .filter(|r| r.score > 0.3 && !r.content.is_empty() && r.title.len() > 10)
+        .take(20)
+        .enumerate()
+        .map(|(i, r)| {
+            serde_json::json!({
+                "url": r.url,
+                "priority": r.score,
+                "source": format!("meta-search:{}", r.engine)
+            })
+        }).collect();
 
     if !crawl_urls.is_empty() {
         tracing::info!("Feeding {} URLs to crawl queue", crawl_urls.len());
