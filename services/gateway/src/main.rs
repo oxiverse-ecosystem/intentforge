@@ -967,10 +967,21 @@ async fn handle_search(
         }
         let resp = client_ref.get(&whoogle_url).send().await?;
         let status = resp.status();
-        resp.json::<WhoogleResponse>().await.map_err(|e| {
-            tracing::error!("Failed to parse Whoogle JSON (status: {}): {:?}", status, e);
-            e
-        })
+        let raw_text = resp.text().await.unwrap_or_default();
+        // Whoogle sometimes returns JSON with duplicate keys (e.g. two "title" fields).
+        // serde_json rejects duplicates by default. Fix: parse as Value, which keeps last.
+        match serde_json::from_str::<serde_json::Value>(&raw_text) {
+            Ok(val) => {
+                serde_json::from_value::<WhoogleResponse>(val).map_err(|e| {
+                    tracing::error!("Failed to parse Whoogle JSON (status: {}): {:?}", status, e);
+                    e
+                })
+            }
+            Err(e) => {
+                tracing::error!("Failed to parse Whoogle raw JSON (status: {}): {:?}", status, e);
+                Err(e.into())
+            }
+        }
     };
 
     let invidious_fut = async {
