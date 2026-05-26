@@ -31,10 +31,6 @@ outgoing:
   max_request_timeout: 8.0
 
 engines:
-  # Disabled — too CAPTCHA-prone via SearXNG
-  - name: google
-    disabled: true
-
   # Primary engines (active)
   - name: bing
     disabled: false
@@ -62,19 +58,5 @@ engines:
     disabled: false
     timeout: 6.0
 
-  # Disabled — permanently blocked via VPN (403) or always timeout
-  - name: duckduckgo
-    disabled: true
-
-  - name: qwant
-    disabled: true
-
-  - name: wikidata
-    disabled: true
-
-  # Tor-only engines (disabled for VPN path)
-  - name: ahmia
-    disabled: true
-
-  - name: torch
-    disabled: true
+  # Disabled engines are excluded by keep_only above — no need to list them here.
+  # If you want to re-enable an engine, add it to keep_only AND add its config below.
