@@ -22,6 +22,8 @@ services:
       - SEARXNG_URL=http://localhost:8080
       - CRAWLER_URL=http://localhost:5001
       - INDEXER_URL=http://localhost:6000
+    volumes:
+      - ../shared-signals:/tmp/vpn-signals
     network_mode: "container:gluetun"
     depends_on:
       - intent-engine

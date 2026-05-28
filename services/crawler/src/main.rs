@@ -70,43 +70,56 @@ impl ContentType {
 
 fn detect_content_type(url: &str) -> ContentType {
     let url_lower = url.to_lowercase();
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+        .unwrap_or_default();
 
-    if url_lower.contains("/news/") || url_lower.contains("/article/")
-        || url_lower.contains("/press/") || url_lower.contains("/blog/")
-        || url_lower.contains("news.ycombinator.com")
-        || url_lower.contains("arstechnica.com")
-        || url_lower.contains("theverge.com")
-        || url_lower.contains("techcrunch.com")
+    // ── News detection: path signals + subdomain signals ──
+    let news_paths = ["/news/", "/article/", "/press/", "/blog/", "/story/",
+                     "/breaking/", "/report/", "/headline/"];
+    let news_subdomains = ["news.", "blog.", "press.", "media."];
+    if news_paths.iter().any(|p| url_lower.contains(p))
+        || news_subdomains.iter().any(|s| host.starts_with(s))
     {
         return ContentType::News;
     }
 
-    if url_lower.contains("/docs/") || url_lower.contains("/doc/")
-        || url_lower.contains("/api/") || url_lower.contains("/reference/")
-        || url_lower.contains("/documentation/") || url_lower.contains("/manual/")
-        || url_lower.contains("docs.rs") || url_lower.contains("doc.rust-lang")
-        || url_lower.contains("developer.mozilla.org")
-        || url_lower.contains("learn.microsoft.com")
+    // ── Documentation detection: path + subdomain signals ──
+    let doc_paths = ["/docs/", "/doc/", "/api/", "/reference/", "/documentation/",
+                     "/manual/", "/guide/", "/tutorial/", "/handbook/", "/wiki/",
+                     "/learn/", "/examples/", "/getting-started/"];
+    let doc_subdomains = ["docs.", "doc.", "developer.", "dev.", "learn.",
+                          "api.", "reference.", "manual.", "wiki."];
+    if doc_paths.iter().any(|p| url_lower.contains(p))
+        || doc_subdomains.iter().any(|s| host.starts_with(s))
     {
         return ContentType::Documentation;
     }
 
-    if url_lower.contains("/forum/") || url_lower.contains("/thread/")
-        || url_lower.contains("/discussion/") || url_lower.contains("/q/")
-        || url_lower.contains("stackoverflow.com")
-        || url_lower.contains("reddit.com")
-        || url_lower.contains("news.ycombinator.com/item")
-    {
+    // ── Forum detection: path signals ──
+    let forum_paths = ["/forum/", "/thread/", "/discussion/", "/q/", "/question/",
+                       "/topic/", "/post/", "/comment/", "/reply/", "/ask/",
+                       "/community/", "/board/"];
+    if forum_paths.iter().any(|p| url_lower.contains(p)) {
         return ContentType::Forum;
     }
 
-    if url_lower.contains("/product/") || url_lower.contains("/p/")
-        || url_lower.contains("/item/") || url_lower.contains("/store/")
-        || url_lower.contains("/shop/") || url_lower.contains("/pricing")
-    {
+    // ── Product detection: path signals ──
+    let product_paths = ["/product/", "/p/", "/item/", "/store/", "/shop/",
+                         "/pricing", "/buy/", "/purchase/", "/cart/"];
+    if product_paths.iter().any(|p| url_lower.contains(p)) {
         return ContentType::Product;
     }
 
+    // ── Article detection: long-form content paths ──
+    let article_paths = ["/article/", "/essay/", "/write-up/", "/publication/",
+                         "/paper/", "/research/"];
+    if article_paths.iter().any(|p| url_lower.contains(p)) {
+        return ContentType::Article;
+    }
+
+    // ── Homepage detection: bare root path ──
     if let Ok(parsed) = Url::parse(url) {
         let path = parsed.path();
         if path == "/" || path.is_empty() {

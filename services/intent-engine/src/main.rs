@@ -24,6 +24,19 @@ const INTENT_CATEGORIES: &[&str] = &[
     "fresh",
 ];
 
+// ─── Structured Constraints ──────────────────────────────────────────
+// Positive: terms the results MUST include/relate to
+// Negative: terms the results MUST NOT include/relate to
+// Extracted algorithmically from query syntax, not hardcoded.
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct Constraints {
+    #[serde(default)]
+    pub positive: Vec<String>,
+    #[serde(default)]
+    pub negative: Vec<String>,
+}
+
 // ─── API Types ───────────────────────────────────────────────────────
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -38,7 +51,9 @@ pub struct IntentResponse {
     pub intent: String,
     pub confidence: f32,
     #[serde(default)]
-    pub constraints: Vec<String>,
+    pub constraints: Vec<String>,       // legacy flat list (kept for compat)
+    #[serde(default)]
+    pub structured_constraints: Constraints, // new: positive + negative
     #[serde(default)]
     pub expanded_queries: Vec<String>,
 }
@@ -62,6 +77,160 @@ pub struct AppState {
     pub intent_cache: Cache<String, IntentResponse>,
     pub embed_cache: Cache<String, Vec<f32>>,
     pub category_centroids: Vec<Vec<f32>>,
+}
+
+// ─── Constraint Extraction (Algorithmic) ────────────────────────────
+// Extracts positive and negative constraints from natural language queries.
+//
+// Negative patterns detected:
+//   - "NOT X", "-X", "without X", "except X", "excluding X"
+//   - "no X" (when not at start of sentence as "no" = "number")
+//   - "but not X", "other than X", "minus X"
+//
+// Positive patterns detected:
+//   - "for X", "with X", "that is X", "must be X"
+//   - Comma-separated list items after the core topic
+//   - Adjective-like modifiers: "async", "lightweight", "fast", etc.
+//
+// Strategy: split query into constraint segments using punctuation and
+// constraint trigger words, classify each segment as positive or negative.
+
+fn extract_constraints(query: &str) -> Constraints {
+    let q = query.trim();
+    let q_lower = q.to_lowercase();
+    let mut positive = Vec::new();
+    let mut negative = Vec::new();
+
+    // ── Phase 1: Extract explicit negative constraints ──
+    // Pattern: "NOT <word(s)>", "-<word>", "without <word(s)>", etc.
+    // We extract the term following the negative marker.
+
+    let negative_markers = [
+        " not ", " -", " without ", " except ", " excluding ",
+        " but not ", " other than ", " minus ", " no ",
+    ];
+
+    for marker in &negative_markers {
+        let mut search_from = 0;
+        while let Some(pos) = q_lower[search_from..].find(marker) {
+            let abs_pos = search_from + pos;
+            let after_marker = abs_pos + marker.len();
+            if after_marker < q_lower.len() {
+                // Extract the constraint term(s) after the marker
+                // Take up to 3 words or until next comma/period/conjunction
+                let remaining = &q[after_marker..];
+                let term = extract_constraint_term(remaining);
+                if !term.is_empty() && term.len() > 1 {
+                    negative.push(term);
+                }
+            }
+            search_from = after_marker;
+        }
+    }
+
+    // ── Phase 2: Extract positive constraints ──
+    // Look for requirement signals in the query
+
+    // "for <X>", "with <X>", "that is <X>", "must be <X>"
+    let positive_markers = [
+        " for ", " with ", " that is ", " that are ", " must be ",
+        " must have ", " needs to ", " should be ", " which is ",
+        " which are ",
+    ];
+
+    for marker in &positive_markers {
+        if let Some(pos) = q_lower.find(marker) {
+            let after = pos + marker.len();
+            if after < q_lower.len() {
+                let remaining = &q[after..];
+                let term = extract_constraint_term(remaining);
+                if !term.is_empty() && term.len() > 1 {
+                    positive.push(term);
+                }
+            }
+        }
+    }
+
+    // ── Phase 3: Comma-separated constraint list ──
+    // "rust framework, async, lightweight, no macros"
+    // The first segment is the main query, subsequent ones are constraints.
+    let segments: Vec<&str> = q.split(',').collect();
+    if segments.len() >= 2 {
+        for segment in &segments[1..] {
+            let seg_trimmed = segment.trim();
+            let seg_lower = seg_trimmed.to_lowercase();
+
+            // Check if this segment starts with a negative marker
+            let is_negative = seg_lower.starts_with("no ")
+                || seg_lower.starts_with("not ")
+                || seg_lower.starts_with("without ")
+                || seg_lower.starts_with("except ")
+                || seg_lower.starts_with("-");
+
+            if is_negative {
+                // Extract the term after the negative marker
+                let term_start = seg_lower.find(' ').map(|p| p + 1).unwrap_or(0);
+                if term_start < seg_trimmed.len() {
+                    let term = seg_trimmed[term_start..].trim().to_string();
+                    if !term.is_empty() && term.len() > 1 {
+                        negative.push(term);
+                    }
+                }
+            } else {
+                // It's a positive constraint
+                let cleaned = seg_trimmed.trim_matches(|c: char| c.is_whitespace() || c == '.');
+                if !cleaned.is_empty() && cleaned.len() > 1 {
+                    positive.push(cleaned.to_string());
+                }
+            }
+        }
+    }
+
+    // ── Phase 4: "vs" comparison constraints ──
+    // "rust vs go" → don't treat as constraints, but "X without Y" in comparisons
+    // is already handled by Phase 1
+
+    // Deduplicate
+    positive.sort();
+    positive.dedup();
+    negative.sort();
+    negative.dedup();
+
+    // Remove any term that appears in both (conflicting → drop both)
+    let pos_set: std::collections::HashSet<String> = positive.iter().cloned().collect();
+    let neg_set: std::collections::HashSet<String> = negative.iter().cloned().collect();
+    positive.retain(|p| !neg_set.contains(p));
+    negative.retain(|n| !pos_set.contains(n));
+
+    // Remove very short or very long terms (likely parsing errors)
+    positive.retain(|t| t.len() >= 2 && t.len() <= 50);
+    negative.retain(|t| t.len() >= 2 && t.len() <= 50);
+
+    Constraints { positive, negative }
+}
+
+/// Extract a constraint term from the text after a marker.
+/// Takes up to 3 words, stops at punctuation or conjunctions.
+fn extract_constraint_term(text: &str) -> String {
+    let stop_words = ["and", "or", "but", "the", "a", "an", "is", "are", "in", "on"];
+    let mut words = Vec::new();
+
+    for word in text.split_whitespace() {
+        let clean = word.trim_matches(|c: char| c == ',' || c == '.' || c == ';' || c == ':');
+        if clean.is_empty() {
+            break;
+        }
+        let lower = clean.to_lowercase();
+        if stop_words.contains(&lower.as_str()) && !words.is_empty() {
+            break;
+        }
+        words.push(clean);
+        if words.len() >= 3 {
+            break;
+        }
+    }
+
+    words.join(" ")
 }
 
 // ─── Layer 1: Rule-Based Pre-Classifier (< 1ms) ─────────────────────
@@ -122,10 +291,14 @@ fn rule_based_classify(query: &str) -> Option<RuleMatch> {
     }
 
     // ── Fresh/News ──
+    // Algorithmic year detection: any 4-digit number in [2020, 2040] range
+    let has_year = q.split_whitespace().any(|w| {
+        w.len() == 4 && w.chars().all(|c| c.is_ascii_digit())
+            && w.parse::<u32>().map_or(false, |y| y >= 2020 && y <= 2040)
+    });
     if q.contains("latest") || q.contains("recent") || q.contains("newest")
         || q.contains("today") || q.contains("this week")
-        || q.contains("this month") || q.contains("2026")
-        || q.contains("2025") || q.starts_with("news ")
+        || q.contains("this month") || has_year || q.starts_with("news ")
         || q.contains(" update") || q.contains(" release")
         || q.contains(" cve") || q.contains(" vulnerability")
     {
@@ -257,10 +430,6 @@ fn classify_by_centroids(query_embedding: &[f32], centroids: &[Vec<f32>]) -> (St
 }
 
 // ─── Query Expansion (Dynamic, Not Hardcoded) ────────────────────────
-// Generates query variations for broader recall across meta-search engines.
-// Each variation captures a different phrasing of the same intent.
-// Strategy: reformulate the core topic with intent-appropriate context,
-// preserving key qualifiers (years, specific names, technical terms).
 
 fn expand_queries(query: &str, intent: &str) -> Vec<String> {
     let q = query.trim();
@@ -268,18 +437,14 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
     let words: Vec<&str> = q_lower.split_whitespace().collect();
     let mut expansions = vec![q.to_string()]; // always include original
 
-    // Extract the "core topic" by stripping intent-leading words
     let core = extract_core_topic(&q_lower, intent);
     let core_trimmed = core.trim();
 
     match intent {
         "how-to" => {
-            // "how to deploy to aws" → "aws deployment guide", "deploy application aws tutorial"
             if core_trimmed.len() > 3 {
-                // Rearrange: put the action first, then context
                 let core_words: Vec<&str> = core_trimmed.split_whitespace().collect();
                 if core_words.len() >= 2 {
-                    // "deploy to aws" → "aws deployment guide"
                     let last_words: Vec<&str> = core_words.iter().rev().take(2).rev().copied().collect();
                     let action_word = core_words.first().unwrap_or(&"");
                     expansions.push(format!("{} {} guide", last_words.join(" "), action_word));
@@ -288,12 +453,10 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
                     expansions.push(format!("{} guide", core_trimmed));
                     expansions.push(format!("{} tutorial", core_trimmed));
                 }
-                // Also try the original query without "how to" as a direct search
                 expansions.push(format!("{} step by step", core_trimmed));
             }
         }
         "comparison" => {
-            // "rust vs go" → "rust go comparison", "rust compared to go"
             if q_lower.contains(" vs ") || q_lower.contains(" versus ") {
                 let replaced = q_lower.replace(" versus ", " vs ");
                 let parts: Vec<&str> = replaced.split(" vs ").collect();
@@ -301,51 +464,42 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
                     let (a, b) = (parts[0].trim(), parts[1].trim());
                     expansions.push(format!("{} {} comparison", a, b));
                     expansions.push(format!("{} compared to {}", a, b));
-                    // Preserve year if present
                     if let Some(year) = extract_year(&q_lower) {
                         expansions.push(format!("{} vs {} {}", a, b, year));
                     }
                 }
             }
-            // "best X 2025" → "top X 2025", "X recommendation 2025"
             if q_lower.starts_with("best ") || q_lower.starts_with("top ") {
                 let prefix = if q_lower.starts_with("best ") { "best" } else { "top" };
                 let rest = q.strip_prefix(&format!("{} ", prefix)).unwrap_or(q);
                 expansions.push(format!("top {}", rest));
                 expansions.push(format!("{} recommendation", rest));
-                // Also try without the prefix for broader results
                 expansions.push(rest.to_string());
             }
         }
         "technical" => {
-            // "rust async runtime" → "rust async runtime documentation", "rust async programming"
             let stop = ["the","a","an","in","on","for","with","using","from","to","and","or","of","is","are"];
             let topic_words: Vec<&str> = words.iter()
                 .filter(|w| w.len() > 2 && !stop.contains(w))
                 .copied()
                 .collect();
             if topic_words.len() >= 2 {
-                // Add documentation/examples suffix
                 let tail: Vec<&str> = topic_words.iter().rev().take(3).rev().copied().collect();
                 expansions.push(format!("{} documentation", tail.join(" ")));
                 expansions.push(format!("{} examples", tail.join(" ")));
-                // Try "programming" suffix for broader technical results
                 if !q_lower.contains("programming") {
                     expansions.push(format!("{} programming", topic_words.join(" ")));
                 }
             }
         }
         "informational" => {
-            // "what is machine learning" → "machine learning explained", "machine learning overview"
             if core_trimmed.len() > 3 {
                 expansions.push(format!("{} explained", core_trimmed));
                 expansions.push(format!("{} overview", core_trimmed));
-                // Also try the core topic alone (often gets Wikipedia/encyclopedia results)
                 expansions.push(core_trimmed.to_string());
             }
         }
         "fresh" => {
-            // "latest rust release" → "rust release 2026", "rust new version"
             let temporal = ["latest","recent","newest","today","this week","this month","new"];
             let mut core_words: Vec<&str> = Vec::new();
             for w in &words {
@@ -357,15 +511,12 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
                 let core_str = core_words.join(" ");
                 expansions.push(format!("{} 2026", core_str));
                 expansions.push(format!("{} update", core_str));
-                // Also try "release notes" pattern
                 if core_str.contains("release") || core_str.contains("version") {
                     expansions.push(format!("{} changelog", core_str));
                 }
             }
         }
         "navigational" => {
-            // For navigational, the original query is usually best
-            // But try adding "official" and "site"
             if !q_lower.contains("official") {
                 expansions.push(format!("official {}", q));
             }
@@ -373,7 +524,6 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
         _ => {}
     }
 
-    // Deduplicate and cap at 4
     let mut seen = std::collections::HashSet::new();
     let mut unique = Vec::new();
     for exp in expansions {
@@ -419,7 +569,6 @@ fn extract_core_topic<'a>(q_lower: &'a str, intent: &str) -> &'a str {
 }
 
 fn extract_year(text: &str) -> Option<&str> {
-    // Find 4-digit year patterns (2020-2029)
     for word in text.split_whitespace() {
         if word.len() == 4 && word.starts_with("20") {
             if let Ok(year) = word.parse::<u32>() {
@@ -440,12 +589,10 @@ async fn main() -> anyhow::Result<()> {
 
     let device = Device::Cpu;
 
-    // Model Paths (only MiniLM — Qwen removed)
     let bert_path = "./models/model.safetensors";
     let bert_config_path = "./models/config.json";
     let bert_tokenizer_path = "./models/tokenizer_embed.json";
 
-    // Wait for models
     for path in &[bert_path, bert_config_path, bert_tokenizer_path] {
         let mut retry_count = 0;
         while !std::path::Path::new(path).exists() && retry_count < 60 {
@@ -466,7 +613,6 @@ async fn main() -> anyhow::Result<()> {
     let bert_tokenizer = Tokenizer::from_file(bert_tokenizer_path)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // Pre-compute intent category centroids (happens once at startup)
     tracing::info!("Computing intent category centroids...");
     let category_centroids = {
         let category_examples: Vec<Vec<&str>> = vec![
@@ -558,7 +704,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3005));
-    tracing::info!("Intent Engine listening on {} (lightweight: rules + centroids, no LLM)", addr);
+    tracing::info!("Intent Engine listening on {} (rules + centroids + constraint extraction)", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -574,12 +720,26 @@ async fn analyze_query(
 ) -> Json<IntentResponse> {
     let query_norm = params.q.trim().to_lowercase();
 
-    // Check cache
     if let Some(cached) = state.intent_cache.get(&query_norm).await {
         return Json(cached);
     }
 
-    // Layer 1: Rule-based pre-classifier (< 1ms)
+    // Extract constraints from the query
+    let structured = extract_constraints(&params.q);
+    tracing::info!(
+        "Constraints extracted: positive={:?}, negative={:?}",
+        structured.positive, structured.negative
+    );
+
+    // Build flat constraints list for backward compatibility
+    let mut flat_constraints: Vec<String> = Vec::new();
+    for c in &structured.positive {
+        flat_constraints.push(format!("+{}", c));
+    }
+    for c in &structured.negative {
+        flat_constraints.push(format!("-{}", c));
+    }
+
     let result = if let Some(rule_match) = rule_based_classify(&params.q) {
         tracing::info!("Layer 1 (rules) -> {} (conf: {:.2})", rule_match.intent, rule_match.confidence);
         let expanded = expand_queries(&params.q, rule_match.intent);
@@ -588,11 +748,11 @@ async fn analyze_query(
             query: params.q.clone(),
             intent: rule_match.intent.to_string(),
             confidence: rule_match.confidence,
-            constraints: vec![],
+            constraints: flat_constraints.clone(),
+            structured_constraints: structured.clone(),
             expanded_queries: expanded,
         }
     } else {
-        // Layer 2: Embedding centroid classifier (~2ms)
         tracing::info!("Layer 1 ambiguous, using Layer 2 (centroids)");
         let bert_model = state.bert_model.lock().unwrap();
         match compute_embedding(&state.device, &*bert_model, &state.bert_tokenizer, &params.q) {
@@ -605,7 +765,8 @@ async fn analyze_query(
                     query: params.q.clone(),
                     intent,
                     confidence,
-                    constraints: vec![],
+                    constraints: flat_constraints.clone(),
+                    structured_constraints: structured.clone(),
                     expanded_queries: expanded,
                 }
             }
@@ -615,7 +776,8 @@ async fn analyze_query(
                     query: params.q.clone(),
                     intent: "informational".to_string(),
                     confidence: 0.3,
-                    constraints: vec![],
+                    constraints: flat_constraints.clone(),
+                    structured_constraints: structured.clone(),
                     expanded_queries: vec![params.q.clone()],
                 }
             }

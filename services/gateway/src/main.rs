@@ -16,6 +16,14 @@ struct SearchParams {
     q: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+struct Constraints {
+    #[serde(default)]
+    positive: Vec<String>,
+    #[serde(default)]
+    negative: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct IntentResponse {
     #[serde(default)]
@@ -25,6 +33,8 @@ struct IntentResponse {
     confidence: f32,
     #[serde(default)]
     constraints: Vec<String>,
+    #[serde(default)]
+    structured_constraints: Constraints,
     #[serde(default)]
     expanded_queries: Vec<String>,
 }
@@ -90,8 +100,9 @@ struct UnifiedResponse {
     web_results: Vec<SearxResult>,
 }
 
-// ─── Domain Authority (Algorithmic, Not Hardcoded) ───────────────────
-// Scores based on domain signals: TLD, known quality indicators
+// ─── Domain Authority (Fully Algorithmic) ────────────────────────────
+// Scores based purely on URL structure signals — no hardcoded domain lists.
+// Signals: TLD trust, subdomain patterns, path patterns, URL complexity.
 
 fn domain_authority_score(url: &str) -> f32 {
     let url_lower = url.to_lowercase();
@@ -102,72 +113,96 @@ fn domain_authority_score(url: &str) -> f32 {
 
     let mut score: f32 = 0.5; // baseline for unknown domains
 
-    // ── TLD-based scoring (algorithmic) ──
-    if host.ends_with(".edu") || host.ends_with(".gov") {
-        score += 0.3; // institutional authority
-    } else if host.ends_with(".org") {
-        score += 0.1; // generally trustworthy
+    // ── TLD-based trust scoring (algorithmic) ──
+    // Institutional TLDs: highest trust
+    if host.ends_with(".edu") || host.ends_with(".gov") || host.ends_with(".ac.uk") {
+        score += 0.3;
+    }
+    // Organizational TLDs: moderate trust
+    else if host.ends_with(".org") || host.ends_with(".net") {
+        score += 0.1;
+    }
+    // Country TLDs: slight trust (real organizations)
+    else if host.rfind('.').map_or(false, |i| {
+        let tld = &host[i+1..];
+        tld.len() == 2 && tld.chars().all(|c| c.is_alphabetic())
+    }) {
+        score += 0.05;
     }
 
-    // ── Domain pattern scoring (signals, not hardcoded lists) ──
-    // Official documentation patterns
-    if host.starts_with("docs.") || host.starts_with("doc.")
-        || host.starts_with("developer.") || host.starts_with("dev.")
-        || host.starts_with("learn.") || host.starts_with("api.")
-        || url_lower.contains("/docs/") || url_lower.contains("/api/")
-        || url_lower.contains("/reference/")
-    {
+    // ── Subdomain pattern scoring (algorithmic) ──
+    // Documentation/developer subdomains: high quality signal
+    let doc_prefixes = ["docs.", "doc.", "developer.", "dev.", "learn.", "api.",
+                        "reference.", "manual.", "wiki.", "help.", "support."];
+    if doc_prefixes.iter().any(|p| host.starts_with(p)) {
         score += 0.25;
     }
 
-    // Official source patterns
-    if host.starts_with("official") || url_lower.contains("/official")
-        || url_lower.contains("/homepage")
-    {
+    // ── Path pattern scoring (algorithmic) ──
+    // Documentation paths: strong quality signal
+    let doc_paths = ["/docs/", "/doc/", "/api/", "/reference/", "/documentation/",
+                     "/manual/", "/guide/", "/tutorial/", "/handbook/", "/wiki/"];
+    if doc_paths.iter().any(|p| url_lower.contains(p)) {
         score += 0.2;
     }
 
-    // High-quality content platforms
-    if host.contains("wikipedia.org") || host.contains("wikimedia.org") {
-        score += 0.2;
-    }
-    if host.contains("stackoverflow.com") || host.contains("stackexchange.com") {
-        score += 0.15;
-    }
-    if host.contains("github.com") || host.contains("gitlab.com")
-        || host.contains("codeberg.org")
-    {
-        score += 0.15;
-    }
-
-    // Package registries (technical authority)
-    if host.contains("crates.io") || host.contains("pypi.org")
-        || host.contains("npmjs.com") || host.contains("docs.rs")
-        || host.contains("pkg.go.dev") || host.contains("rubygems.org")
-    {
-        score += 0.2;
+    // Code hosting signal: path contains repo-like structure
+    let path = reqwest::Url::parse(url).ok().map(|u| u.path().to_lowercase()).unwrap_or_default();
+    let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if path_segments.len() >= 2 {
+        // Looks like /owner/repo pattern (code hosting)
+        let has_repo_pattern = path_segments[0].len() >= 2
+            && path_segments[1].len() >= 2
+            && !path_segments[0].contains('.')
+            && !path_segments[1].contains('.');
+        if has_repo_pattern {
+            score += 0.1;
+        }
     }
 
-    // Well-known news/review sites
-    if host.contains("arstechnica.com") || host.contains("theverge.com")
-        || host.contains("wired.com") || host.contains("techcrunch.com")
-        || host.contains("arxiv.org")
-    {
+    // Package registry signal: path contains version-like patterns
+    let has_version_pattern = path_segments.iter().any(|s| {
+        s.starts_with('v') && s[1..].chars().all(|c| c.is_numeric() || c == '.')
+            && s.len() >= 2
+    });
+    if has_version_pattern {
         score += 0.1;
     }
 
-    // Content farms / low quality signals
-    if url_lower.contains("content-farm") || url_lower.contains("clickbait")
-        || url_lower.contains("top10best") || url_lower.contains("bestof")
-    {
+    // ── URL complexity signals ──
+    // Short, clean URLs tend to be more authoritative
+    let host_parts: Vec<&str> = host.split('.').collect();
+    if host_parts.len() == 2 {
+        // bare domain (example.com) — likely a primary site
+        score += 0.1;
+    } else if host_parts.len() >= 5 {
+        // Too many subdomains — likely a CDN or user-generated content
+        score -= 0.1;
+    }
+
+    // Long query strings = less authoritative (tracking, filters, etc.)
+    if url_lower.contains('?') {
+        let query_part = url_lower.split('?').nth(1).unwrap_or("");
+        let param_count = query_part.matches('&').count();
+        if param_count > 5 {
+            score -= 0.1;
+        }
+    }
+
+    // Content farm / clickbait signals (dynamic pattern detection)
+    let spam_path_patterns = ["content-farm", "clickbait", "top10best", "bestof",
+                              "listicle", "buzzfeed"];
+    if spam_path_patterns.iter().any(|p| url_lower.contains(p)) {
         score -= 0.2;
     }
 
-    // Medium/dev.to — decent but not authoritative
-    if host.contains("medium.com") || host.contains("dev.to")
-        || host.contains("hashnode.dev")
-    {
-        score += 0.05;
+    // ── Content platform scoring (algorithmic: path signals) ──
+    // User-generated content platforms have distinctive URL patterns
+    let ugc_signals = url_lower.contains("/thread/") || url_lower.contains("/question/")
+        || url_lower.contains("/post/") || url_lower.contains("/comment/")
+        || url_lower.contains("/discussion/") || url_lower.contains("/q/");
+    if ugc_signals {
+        score += 0.05; // UGC is decent but not authoritative
     }
 
     score.clamp(0.0, 1.0)
@@ -221,7 +256,9 @@ fn freshness_score(url: &str, intent: &str) -> f32 {
     (-estimated_age_hours / half_life_hours).exp()
 }
 
-// ─── Intent Boost (Enhanced) ─────────────────────────────────────────
+// ─── Intent Boost (Fully Algorithmic) ────────────────────────────────
+// Boosts results based on structural URL/title signals matching intent.
+// No hardcoded domain lists — uses path patterns and URL structure.
 
 fn calculate_intent_boost(url: &str, title: &str, query: &str, intent: &str) -> f32 {
     let url_lower = url.to_lowercase();
@@ -254,9 +291,8 @@ fn calculate_intent_boost(url: &str, title: &str, query: &str, intent: &str) -> 
                 }
             }
 
-            // Documentation/official signals
-            if url_lower.contains("docs.") || url_lower.contains("doc.")
-                || url_lower.contains("/docs/") || url_lower.contains("/doc/")
+            // Documentation/official signals (path-based, not domain-based)
+            if url_lower.contains("/docs/") || url_lower.contains("/doc/")
                 || url_lower.contains("documentation") || url_lower.contains("wiki")
                 || title_lower.contains("documentation") || title_lower.contains("official")
                 || title_lower.contains("homepage")
@@ -265,31 +301,34 @@ fn calculate_intent_boost(url: &str, title: &str, query: &str, intent: &str) -> 
             }
         }
         "technical" => {
-            // Code repos, API docs, libraries
-            if url_lower.contains("github.com") || url_lower.contains("gitlab.com")
-                || url_lower.contains("docs.rs") || url_lower.contains("crates.io")
-                || url_lower.contains("npmjs.com") || url_lower.contains("pypi.org")
-                || url_lower.contains("/api/") || url_lower.contains("reference")
-                || url_lower.contains("stackoverflow.com")
-                || url_lower.contains("developer.")
+            // Path-based signals for technical content
+            if url_lower.contains("/docs/") || url_lower.contains("/doc/")
+                || url_lower.contains("/api/") || url_lower.contains("/reference/")
+                || url_lower.contains("/examples/") || url_lower.contains("/manual/")
+                || url_lower.contains("/crates/") || url_lower.contains("/packages/")
+                || url_lower.contains("/modules/") || url_lower.contains("/library/")
             {
                 boost += 0.5;
             }
+            // Q&A / forum signals
+            if url_lower.contains("/q/") || url_lower.contains("/question/")
+                || url_lower.contains("/thread/") || url_lower.contains("/issues/")
+            {
+                boost += 0.3;
+            }
         }
         "how-to" | "conceptual" | "informational" | "comparison" | "fresh" => {
-            // Tutorials, guides, wikis, forums, news
-            if url_lower.contains("stackoverflow.com") || url_lower.contains("reddit.com")
-                || url_lower.contains("/blog/") || url_lower.contains("/tutorial/")
-                || url_lower.contains("/guide/") || url_lower.contains("wikipedia.org")
-                || url_lower.contains("dev.to") || url_lower.contains("medium.com")
-                || url_lower.contains("news.ycombinator.com")
-                || url_lower.contains("/news/") || url_lower.contains("/article/")
-                || url_lower.contains("arxiv.org")
+            // Path-based signals for content types
+            if url_lower.contains("/blog/") || url_lower.contains("/tutorial/")
+                || url_lower.contains("/guide/") || url_lower.contains("/wiki/")
+                || url_lower.contains("/article/") || url_lower.contains("/learn/")
+                || url_lower.contains("/news/") || url_lower.contains("/thread/")
+                || url_lower.contains("/q/") || url_lower.contains("/question/")
             {
                 boost += 0.4;
             }
 
-            // For comparison intent, boost review sites
+            // For comparison intent, boost review-type content
             if intent_lower == "comparison" {
                 if title_lower.contains("vs") || title_lower.contains("versus")
                     || title_lower.contains("comparison") || title_lower.contains("review")
@@ -388,6 +427,87 @@ fn content_quality_score(text: &str) -> f32 {
     }
 
     score.clamp(0.0, 1.0)
+}
+
+// ─── Constraint Scoring (Dynamic, Query-Derived) ───────────────────
+// Applies structured constraints from intent analysis:
+// - Positive constraints: boost results that match constraint terms
+// - Negative constraints: penalize results that match negative terms
+// NOT hardcoded — constraints come from the query itself.
+// Score range: 0.0 (violates negative) to 1.0 (matches all positives, no negatives)
+
+fn constraint_score(
+    title: &str,
+    content: &str,
+    constraints: &Constraints,
+) -> f32 {
+    if constraints.positive.is_empty() && constraints.negative.is_empty() {
+        return 1.0; // no constraints = no penalty
+    }
+
+    let text_lower = format!("{} {}", title.to_lowercase(), content.to_lowercase());
+    let mut score: f32 = 1.0;
+
+    // Negative constraints: hard penalty for each match
+    for neg in &constraints.negative {
+        let neg_lower = neg.to_lowercase();
+        // Check word boundary match (not substring)
+        let words: Vec<&str> = text_lower.split_whitespace().collect();
+        let neg_words: Vec<&str> = neg_lower.split_whitespace().collect();
+        if neg_words.len() == 1 {
+            // Single word: check if any word in text matches
+            if words.iter().any(|w| *w == neg_lower || w.trim_matches(|c: char| !c.is_alphanumeric()) == neg_lower) {
+                score *= 0.15; // severe penalty for negative constraint violation
+            }
+        } else {
+            // Multi-word: check if the phrase appears
+            if text_lower.contains(&neg_lower) {
+                score *= 0.15;
+            }
+        }
+    }
+
+    // Positive constraints: boost for each match
+    if !constraints.positive.is_empty() {
+        let mut matched = 0;
+        for pos in &constraints.positive {
+            let pos_lower = pos.to_lowercase();
+            let pos_words: Vec<&str> = pos_lower.split_whitespace().collect();
+            if pos_words.len() == 1 {
+                let words: Vec<&str> = text_lower.split_whitespace().collect();
+                if words.iter().any(|w| *w == pos_lower || w.trim_matches(|c: char| !c.is_alphanumeric()) == pos_lower) {
+                    matched += 1;
+                }
+            } else {
+                if text_lower.contains(&pos_lower) {
+                    matched += 1;
+                }
+            }
+        }
+        // Coverage: fraction of positive constraints matched
+        let coverage = matched as f32 / constraints.positive.len() as f32;
+        // Scale: 0% coverage = 0.5x, 100% coverage = 1.3x
+        score *= 0.5 + coverage * 0.8;
+    }
+
+    score.clamp(0.0, 1.5)
+}
+
+// ─── VPN Signal Writer ──────────────────────────────────────────────
+// Writes a signal file to trigger VPN rotation when rate limiting is detected.
+// The vpn-rotator container watches this file.
+
+fn trigger_vpn_rotation(reason: &str) {
+    // Write signal to shared bind-mount directory
+    let signal_dir = "/tmp/vpn-signals";
+    let signal_path = format!("{}/rotate_signal", signal_dir);
+    // Ensure directory exists
+    let _ = std::fs::create_dir_all(signal_dir);
+    if let Err(e) = std::fs::write(&signal_path, reason) {
+        tracing::warn!("Failed to write VPN rotation signal: {:?}", e);
+    } else {
+        tracing::info!("VPN rotation signal written: {}", reason);
+    }
 }
 
 // ─── Simple Stemming (English Plurals) ──────────────────────────────
@@ -571,70 +691,77 @@ struct RankingWeights {
     quality: f32,    // content quality (entropy, spam detection)
     semantic: f32,   // semantic relevance (keyword overlap with query)
     consensus: f32,  // cross-source agreement
+    constraint: f32, // constraint matching (positive/negative)
 }
 
 impl RankingWeights {
     fn for_intent(intent: &str) -> Self {
         match intent {
             "fresh" => Self {
+                rrf: 0.07,
+                intent: 0.04,
+                freshness: 0.18,
+                authority: 0.13,
+                local_bonus: 0.02,
+                quality: 0.08,
+                semantic: 0.22,
+                consensus: 0.13,
+                constraint: 0.13,
+            },
+            "technical" => Self {
                 rrf: 0.08,
-                intent: 0.05,
-                freshness: 0.20,   // news needs recency
-                authority: 0.15,   // news needs trustworthy sources
+                intent: 0.10,
+                freshness: 0.04,
+                authority: 0.12,
+                local_bonus: 0.04,
+                quality: 0.06,
+                semantic: 0.30,
+                consensus: 0.08,
+                constraint: 0.18,
+            },
+            "navigational" => Self {
+                rrf: 0.04,
+                intent: 0.20,
+                freshness: 0.03,
+                authority: 0.18,
+                local_bonus: 0.02,
+                quality: 0.04,
+                semantic: 0.25,
+                consensus: 0.08,
+                constraint: 0.16,
+            },
+            "comparison" => Self {
+                rrf: 0.10,
+                intent: 0.08,
+                freshness: 0.08,
+                authority: 0.06,
                 local_bonus: 0.02,
                 quality: 0.10,
                 semantic: 0.25,
-                consensus: 0.15,
-            },
-            "technical" => Self {
-                rrf: 0.10,
-                intent: 0.12,      // technical intent boost matters
-                freshness: 0.05,   // docs are stable
-                authority: 0.15,   // official docs preferred
-                local_bonus: 0.05,
-                quality: 0.08,
-                semantic: 0.35,    // technical queries need precision
-                consensus: 0.10,
-            },
-            "navigational" => Self {
-                rrf: 0.05,
-                intent: 0.25,      // navigational intent is dominant
-                freshness: 0.03,
-                authority: 0.20,   // official sites preferred
-                local_bonus: 0.02,
-                quality: 0.05,
-                semantic: 0.30,
-                consensus: 0.10,
-            },
-            "comparison" => Self {
-                rrf: 0.12,
-                intent: 0.10,
-                freshness: 0.10,   // reviews should be recent
-                authority: 0.08,
-                local_bonus: 0.02,
-                quality: 0.12,     // comparison content quality matters
-                semantic: 0.30,
-                consensus: 0.16,   // cross-source agreement for comparisons
+                consensus: 0.13,
+                constraint: 0.18,
             },
             "how-to" => Self {
-                rrf: 0.10,
-                intent: 0.10,
-                freshness: 0.08,
-                authority: 0.08,
-                local_bonus: 0.05,
-                quality: 0.10,
-                semantic: 0.32,    // how-to needs precise matching
-                consensus: 0.17,
+                rrf: 0.08,
+                intent: 0.08,
+                freshness: 0.06,
+                authority: 0.06,
+                local_bonus: 0.04,
+                quality: 0.08,
+                semantic: 0.28,
+                consensus: 0.14,
+                constraint: 0.18,
             },
             _ => Self {  // informational, default
-                rrf: 0.10,
-                intent: 0.08,
-                freshness: 0.07,
-                authority: 0.10,
-                local_bonus: 0.05,
-                quality: 0.10,
-                semantic: 0.30,
-                consensus: 0.20,
+                rrf: 0.08,
+                intent: 0.06,
+                freshness: 0.06,
+                authority: 0.08,
+                local_bonus: 0.04,
+                quality: 0.08,
+                semantic: 0.26,
+                consensus: 0.16,
+                constraint: 0.18,
             },
         }
     }
@@ -649,6 +776,7 @@ fn compute_final_score(
     quality: f32,
     semantic: f32,
     consensus: f32,
+    constraint: f32,
     weights: &RankingWeights,
 ) -> f32 {
     let local = if is_local { 1.0 } else { 0.0 };
@@ -661,6 +789,7 @@ fn compute_final_score(
         + (weights.quality * quality)
         + (weights.semantic * semantic)
         + (weights.consensus * consensus)
+        + (weights.constraint * constraint)
 }
 
 // ─── Cross-Query Score Normalization ────────────────────────────────
@@ -1070,14 +1199,33 @@ async fn handle_search(
                     // 0 results — likely VPN drop or engine timeout. Retry once after 2s.
                     tracing::warn!("SearXNG returned 0 results, retrying in 2s...");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let resp = client_ref.get(&url).send().await?;
-                    let status = resp.status();
-                    resp.json::<SearxResponse>().await.map_err(|e| {
-                        tracing::error!("SearXNG retry parse failed (status: {}): {:?}", status, e);
-                        e
-                    })
+                    let retry = async {
+                        let resp = client_ref.get(&url).send().await?;
+                        let status = resp.status();
+                        // Detect rate limiting (429) and trigger VPN rotation
+                        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                            tracing::warn!("SearXNG got 429 Too Many Requests — triggering VPN rotation");
+                            trigger_vpn_rotation("429_rate_limit");
+                        }
+                        resp.json::<SearxResponse>().await.map_err(|e| {
+                            tracing::error!("SearXNG retry parse failed (status: {}): {:?}", status, e);
+                            e
+                        })
+                    }.await;
+                    // If retry also returned 0 results, signal VPN rotation
+                    if let Ok(ref data) = retry {
+                        if data.results.is_empty() {
+                            tracing::warn!("SearXNG retry returned 0 results — triggering VPN rotation");
+                            trigger_vpn_rotation("zero_results_after_retry");
+                        }
+                    }
+                    retry
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    tracing::warn!("SearXNG request failed — triggering VPN rotation: {:?}", e);
+                    trigger_vpn_rotation("request_failed");
+                    Err(e)
+                }
             }
         }
     }).collect();
@@ -1318,6 +1466,7 @@ async fn handle_search(
         let quality = content_quality_score(&res.content);
         let semantic = semantic_scores[i]; // use precomputed score
         let consensus = consensus_score(&res.sources);
+        let c_score = constraint_score(&res.title, &res.content, &intent.structured_constraints);
 
         res.score = compute_final_score(
             rank_score,
@@ -1328,6 +1477,7 @@ async fn handle_search(
             quality,
             semantic,
             consensus,
+            c_score,
             &weights,
         );
     }
@@ -1362,6 +1512,7 @@ async fn handle_search(
         let authority = if res.authority > 0.0 { res.authority } else { domain_authority_score(&res.url) };
         let quality = content_quality_score(&res.content);
         let semantic = local_semantic_scores[i];
+        let c_score = constraint_score(&res.title, &res.content, &intent.structured_constraints);
 
         res.score = compute_final_score(
             rank_score,
@@ -1372,6 +1523,7 @@ async fn handle_search(
             quality,
             semantic,
             0.3, // local-only = single source consensus
+            c_score,
             &weights,
         );
     }
@@ -1443,6 +1595,7 @@ fn fallback_intent(q: &str) -> IntentResponse {
         intent: "informational".to_string(),
         confidence: 0.3,
         constraints: vec![],
+        structured_constraints: Constraints::default(),
         expanded_queries: vec![q.to_string()],
     }
 }

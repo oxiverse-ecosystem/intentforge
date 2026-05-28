@@ -27,7 +27,6 @@ services:
       - "3000:3000"     # Invidious (Routed)
       - "4000:4000"     # Gateway (Routed)
       - "6000:6000"     # Indexer (Routed)
-      # - "1080:1080"     # HAProxy (Tor/VPN Fallback) — disabled, Tor not active
     restart: always
     logging:
       driver: "json-file"
@@ -38,55 +37,11 @@ services:
   vpn-rotator:
     image: alpine:latest
     container_name: vpn-rotator
-    command: >
-      sh -c "apk add --no-cache curl &&
-      echo 'VPN rotator started — rotating every 2 hours' &&
-      while true; do
-        sleep 7200;
-        echo \"$$(date -u) Rotating VPN IP...\";
-        curl -s -m 10 -X PUT -d '{\"status\":\"stopped\"}' http://127.0.0.1:8000/v1/vpn/status;
-        sleep 5;
-        curl -s -m 10 -X PUT -d '{\"status\":\"running\"}' http://127.0.0.1:8000/v1/vpn/status;
-        sleep 10;
-        IP=$$(curl -s -m 10 http://127.0.0.1:8000/v1/publicip/ip 2>/dev/null || echo 'unknown');
-        echo \"$$(date -u) VPN rotated. New IP: $$IP\";
-      done"
+    volumes:
+      - ./vpn-rotator.sh:/vpn-rotator.sh:ro
+      - ../shared-signals:/tmp/vpn-signals
+    command: ["sh", "/vpn-rotator.sh"]
     depends_on:
       - gluetun
     network_mode: "service:gluetun"
     restart: always
-
-  # --- Tor infrastructure (disabled — VPN-only for now, re-enable later) ---
-  # bridge-fetcher:
-  #   image: alpine:latest
-  #   container_name: tor-bridge-fetcher
-  #   volumes:
-  #     - privacy-data:/data
-  #   command: sh -c "apk add --no-cache curl jq && while true; do echo 'Fetching bridges...'; FETCHED=$$(curl -s --connect-timeout 10 --retry 3 'https://bridges.torproject.org/moat/circumvention/builtin'); if [ $$? -eq 0 ] && [ ! -z \"$$FETCHED\" ]; then echo \"$$FETCHED\" | jq -r '.obfs4[]' > /data/bridges.txt; echo 'Successfully fetched bridges.'; else echo 'Failed to fetch bridges. Retrying in 1 hour...'; fi; sleep 86400; done"
-  #   depends_on:
-  #     - gluetun
-  #   network_mode: "service:gluetun"
-  #   restart: always
-  #
-  # tor-proxy:
-  #   build: ./tor
-  #   container_name: tor-proxy
-  #   volumes:
-  #     - privacy-data:/data
-  #   depends_on:
-  #     - bridge-fetcher
-  #   network_mode: "service:gluetun"
-  #   restart: always
-  #
-  # haproxy:
-  #   image: haproxy:alpine
-  #   container_name: haproxy-privacy
-  #   volumes:
-  #     - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-  #   depends_on:
-  #     - tor-proxy
-  #   network_mode: "service:gluetun"
-  #   restart: always
-
-# volumes:
-#   privacy-data:
