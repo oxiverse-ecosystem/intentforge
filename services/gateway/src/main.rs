@@ -883,23 +883,17 @@ fn normalize_scores(scores: &mut [f32]) {
     let max_score = indexed[n - 1].1;
     let total_range = max_score - min_score;
 
+    // Use min-max normalization over the full range to preserve relative
+    // differences at the top (percentile-based was clamping top results to 1.0)
     if total_range < 0.01 {
         // All scores nearly identical — use rank-based to force spread
         for (rank, &(orig_idx, _)) in indexed.iter().enumerate() {
             scores[orig_idx] = (rank as f32) / ((n - 1) as f32);
         }
-    } else if percentile_range < total_range * 0.15 {
-        // Percentile range is < 15% of total range — scores are clustered
-        // Use hybrid: blend percentile (60%) with rank-based (40%) for better spread
-        for (rank, &(orig_idx, raw)) in indexed.iter().enumerate() {
-            let percentile = ((raw - p10) / percentile_range.max(0.001)).clamp(0.0, 1.0);
-            let rank_norm = (rank as f32) / ((n - 1) as f32);
-            scores[orig_idx] = percentile * 0.6 + rank_norm * 0.4;
-        }
     } else {
-        // Good spread — use percentile normalization
+        // Min-max normalization: best result = 1.0, worst = 0.0, others proportional
         for score in scores.iter_mut() {
-            *score = ((*score - p10) / percentile_range.max(0.001)).clamp(0.0, 1.0);
+            *score = ((*score - min_score) / total_range).clamp(0.0, 1.0);
         }
     }
 }
@@ -969,6 +963,8 @@ fn preprocess_searxng_query(query: &str) -> String {
         return q.to_string();
     }
     
+    // Preserve dotted names like "node.js", "deno.js", "c++" — don't strip dots
+    // that are part of technology names
     cleaned
 }
 
@@ -1186,9 +1182,39 @@ impl SearchCache {
 
 // ─── Main ────────────────────────────────────────────────────────────
 
+// ─── Rate-Limit Tracker ─────────────────────────────────────────────
+// Tracks rate-limit events in a sliding window for proactive VPN rotation.
+// When too many rate-limits accumulate, triggers preemptive rotation
+// before the circuit breaker even opens.
+
+struct RateLimitTracker {
+    events: Mutex<Vec<Instant>>,
+}
+
+impl RateLimitTracker {
+    fn new() -> Self {
+        Self { events: Mutex::new(Vec::new()) }
+    }
+
+    fn record(&self) {
+        let mut events = self.events.lock().unwrap();
+        let now = Instant::now();
+        // Prune events older than 5 minutes
+        events.retain(|e| now.duration_since(*e) < Duration::from_secs(300));
+        events.push(now);
+    }
+
+    fn count_in_window(&self, window_secs: u64) -> usize {
+        let events = self.events.lock().unwrap();
+        let now = Instant::now();
+        events.iter().filter(|e| now.duration_since(**e) < Duration::from_secs(window_secs)).count()
+    }
+}
+
 struct AppState {
     circuit: CircuitBreaker,
     cache: SearchCache,
+    rate_limits: RateLimitTracker,
 }
 
 #[tokio::main]
@@ -1198,6 +1224,7 @@ async fn main() {
     let state = Arc::new(AppState {
         circuit: CircuitBreaker::new(),
         cache: SearchCache::new(),
+        rate_limits: RateLimitTracker::new(),
     });
 
     let app = Router::new()
@@ -1281,6 +1308,26 @@ async fn handle_search(
     } else {
         vec![q.clone()]
     };
+
+    // Strip negative constraint terms from expanded queries before SearXNG fan-out.
+    // "python web framework not django" → "python web framework"
+    // Sending "not django" to SearXNG pollutes results with Django pages.
+    let neg_terms: Vec<String> = intent.structured_constraints.negative.iter()
+        .map(|n| n.to_lowercase())
+        .collect();
+    let cleaned_queries: Vec<String> = expanded_queries.iter().map(|eq| {
+        if neg_terms.is_empty() { return eq.clone(); }
+        let mut words: Vec<&str> = eq.split_whitespace().collect();
+        // Remove negative constraint words and their negation triggers ("not", "except", "without", "other than")
+        let neg_triggers = ["not", "except", "without", "excluding", "other", "than"];
+        words.retain(|w| {
+            let w_lower = w.to_lowercase();
+            !neg_terms.contains(&w_lower) && !neg_triggers.contains(&w_lower.as_str())
+        });
+        words.join(" ")
+    }).filter(|q| q.split_whitespace().count() >= 2).collect();
+
+    let expanded_queries = if !cleaned_queries.is_empty() { cleaned_queries } else { expanded_queries };
     tracing::info!("Fan-out with {} query variations: {:?}", expanded_queries.len(), expanded_queries);
 
     let freshness_keywords = ["latest", "recent", "week", "month", "today", "newest", "cve", "vulnerability"];
@@ -1318,6 +1365,7 @@ async fn handle_search(
 
     let client_ref = &client;
     let circuit_ref = &state.circuit;
+    let ratelimit_ref = &state.rate_limits;
 
     // Check circuit breaker before calling each engine
     let searx_open = circuit_ref.is_open("searxng");
@@ -1361,16 +1409,35 @@ async fn handle_search(
             match first {
                 Ok(data) if !data.results.is_empty() => Ok(data),
                 Ok(_) => {
-                    // 0 results — likely VPN drop or engine timeout. Retry once after 2s.
+                    // 0 results — check if retry would help.
+                    // Skip retry for obviously malformed queries (special chars, too long, gibberish)
+                    let url_lower = url.to_lowercase();
+                    let q_part = url_lower.split("q=").nth(1).unwrap_or("");
+                    let q_decoded = q_part.split("&").next().unwrap_or("");
+                    let alpha_ratio: f32 = if q_decoded.len() > 0 {
+                        q_decoded.chars().filter(|c| c.is_alphabetic() || c.is_whitespace()).count() as f32 / q_decoded.len() as f32
+                    } else { 0.0 };
+                    let is_malformed = q_decoded.len() > 200 || alpha_ratio < 0.3;
+                    if is_malformed {
+                        tracing::info!("Skipping retry for malformed query (alpha_ratio={:.2}, len={})", alpha_ratio, q_decoded.len());
+                        return Ok(SearxResponse { results: vec![] });
+                    }
+                    // Retry once after 2s for legitimate queries that returned 0 results
                     tracing::warn!("SearXNG returned 0 results, retrying in 2s...");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let retry: Result<SearxResponse, reqwest::Error> = async {
                         let resp = client_ref.get(&url).send().await?;
                         let status = resp.status();
-                        // Detect rate limiting (429) and trigger VPN rotation
+                        // Detect rate limiting (429) and trigger VPN rotation with rate-limit count
                         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                            tracing::warn!("SearXNG got 429 Too Many Requests — triggering VPN rotation");
-                            trigger_vpn_rotation("429_rate_limit");
+                            let rl_count = ratelimit_ref.count_in_window(300);
+                            ratelimit_ref.record();
+                            let new_count = ratelimit_ref.count_in_window(300);
+                            tracing::warn!(
+                                "SearXNG got 429 Too Many Requests — rate-limits in 5min window: {} → {}",
+                                rl_count, new_count
+                            );
+                            trigger_vpn_rotation(&format!("429_rate_limit_{}", new_count));
                         }
                         let raw = resp.text().await.unwrap_or_default();
                         let sanitized = sanitize_json_text(&raw);
@@ -1768,9 +1835,11 @@ async fn handle_search(
         web_results,
     };
 
-    // Cache for 5 minutes
+    // Cache for 5 minutes — but never cache empty results (engine timeouts/rate limits)
     let response_json = serde_json::to_string(&response).unwrap_or_default();
-    state.cache.put(cache_key, response_json, Duration::from_secs(300));
+    if !response.web_results.is_empty() {
+        state.cache.put(cache_key, response_json, Duration::from_secs(300));
+    }
 
     Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({})))
 }
