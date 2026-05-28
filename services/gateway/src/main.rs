@@ -95,7 +95,15 @@ struct IndexerResult {
 
 #[derive(Serialize)]
 struct UnifiedResponse {
-    intent: IntentResponse,
+    intent: String,
+    #[serde(default)]
+    confidence: f32,
+    #[serde(default)]
+    constraints: Vec<String>,
+    #[serde(default)]
+    structured_constraints: Constraints,
+    #[serde(default)]
+    expanded_queries: Vec<String>,
     local_results: Vec<IndexerResult>,
     web_results: Vec<SearxResult>,
 }
@@ -526,9 +534,13 @@ fn constraint_score(
             || text_lower.contains(&neg_lower) || text_normalized.contains(&neg_normalized)
         };
         if matched {
-            // Penalty scales with number of constraints: more constraints = less penalty per violation
-            // but always severe. Single constraint: 0.02x (98% penalty). Multiple: 0.05x per violation.
-            let penalty = if neg_count <= 1.0 { 0.02 } else { 0.05 };
+            // Penalty scales gradually with constraint count to avoid compounding:
+            // 1 constraint: 0.02 (98% penalty — severe for single exclusions)
+            // 2 constraints: 0.10 per violation (0.10^2 = 0.01 if both hit)
+            // 3 constraints: 0.16 per violation (0.16^3 = 0.004 if all hit)
+            // 4+ constraints: 0.20 per violation (0.20^4 = 0.002 if all hit)
+            // This prevents score collapse while still heavily penalizing violations.
+            let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
             tracing::info!("CONSTRAINT HIT: '{}' in title='{}' → penalty={}", neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())], penalty);
             score *= penalty;
         } else {
@@ -649,6 +661,7 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
         "be","as","at","by","not","but","if","so","than","too","very","can","just",
         "best","top","new","old","good","bad","big","small","fast","first","last",
         "most","more","less","many","few","each","every","all","any","some",
+        "modern","quick","simple","easy","great","popular","powerful",
     ].iter().copied().collect();
 
     let tokenize = |text: &str| -> Vec<String> {
@@ -994,6 +1007,36 @@ fn preprocess_searxng_query(query: &str) -> String {
             cleaned = rest.to_string();
             break;
         }
+    }
+    
+    // Strip noise adjectives that search engines misinterpret as nouns.
+    // "fast" → speed tests (fast.com), "modern" → dictionary definitions,
+    // "quick" → speed tests, "simple" → dictionary, etc.
+    // These words have strong standalone noun meanings that override their
+    // intended use as descriptors. They're safe to strip because:
+    //   1. They're filtered as stop words in semantic_relevance_score() already
+    //   2. They don't change the topical intent ("fast web framework python"
+    //      and "web framework python" return the same relevant results)
+    //   3. Positive constraint checking still verifies them in results
+    // Algorithmic: derived from the semantic scoring stop_words set plus
+    // adjectives with strong alternate noun senses (modern=era, quick=speed).
+    let noise_adjectives: std::collections::HashSet<&str> = [
+        "fast", "quick", "slow", "modern", "simple", "easy", "hard",
+        "best", "top", "good", "bad", "new", "old", "big", "small",
+        "great", "awesome", "cool", "popular", "powerful", "amazing",
+    ].iter().copied().collect();
+    
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    if words.len() > 2 {
+        // Only strip noise adjectives if the query has enough remaining content
+        let filtered: Vec<&str> = words.iter()
+            .filter(|w| !noise_adjectives.contains(*w))
+            .copied()
+            .collect();
+        if filtered.len() >= 2 {
+            cleaned = filtered.join(" ");
+        }
+        // If stripping would leave < 2 words, keep original (query is too short)
     }
     
     // If cleaned is empty or too short, fall back to original
@@ -1877,7 +1920,11 @@ async fn handle_search(
     }
 
     let response = UnifiedResponse {
-        intent,
+        intent: intent.intent.clone(),
+        confidence: intent.confidence,
+        constraints: intent.constraints.clone(),
+        structured_constraints: intent.structured_constraints.clone(),
+        expanded_queries: intent.expanded_queries.clone(),
         local_results,
         web_results,
     };

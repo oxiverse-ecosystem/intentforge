@@ -566,7 +566,8 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
         }
         "technical" => {
             let stop = ["the","a","an","in","on","for","with","using","from","to","and","or","of","is","are",
-                        "excluding","without","except","other","than"];
+                        "excluding","without","except","other","than",
+                        "not","no","but","minus"];
             let topic_words: Vec<&str> = words.iter()
                 .filter(|w| w.len() > 2 && !stop.contains(w))
                 .copied()
