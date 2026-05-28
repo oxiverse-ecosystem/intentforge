@@ -32,15 +32,14 @@ search:
   default_lang: "en"
 
 outgoing:
-  max_request_timeout: 12.0  # increased for Tor latency
+  request_timeout: 8.0  # increased for Tor latency (default is 3s)
+  max_request_timeout: 15.0
   # Per-network routing: Tor for .onion engines, default (VPN) for regular
   networks:
     tor:
       proxies:
         all://: socks5h://127.0.0.1:9050
       using_tor_proxy: true
-      extra_proxy_timeout: 15
-      request_timeout: 15.0
       retries: 2
 
 engines:

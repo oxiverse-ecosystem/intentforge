@@ -497,12 +497,10 @@ fn constraint_score(
         let neg_lower = neg.to_lowercase();
         let neg_normalized: String = neg_lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
         let neg_words: Vec<&str> = neg_lower.split_whitespace().collect();
-        // For single-word constraints: match against TITLE primarily (content is too noisy)
-        // For multi-word constraints: match against title + content
+        // Match against title + content + URL for all constraint lengths
+        // Content matching uses word boundaries to reduce noise
         let matched = if neg_words.len() == 1 {
-            // Title-first matching for single-word constraints
-            // Check: exact word match, trimmed match, alphanumeric-normalized match,
-            // and also substring match on normalized text for compound terms like "nodejs" containing "node"
+            // Title matching: exact word, trimmed, normalized
             title_lower.split_whitespace().any(|w| {
                 w == neg_lower
                 || w.trim_matches(|c: char| !c.is_alphanumeric()) == neg_lower
@@ -515,13 +513,24 @@ fn constraint_score(
                 let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
                 w_clean == neg_normalized || w_clean.contains(&neg_normalized)
             })
-            // Also check full normalized title as substring fallback (>= 3 chars)
             || (neg_normalized.len() >= 3 && title_normalized.contains(&neg_normalized))
-            // Also check if the term is in the URL path (e.g., github.com/flask)
+            // Content matching: word boundary match in first 500 chars to limit noise
+            || {
+                let content_prefix: String = content.chars().take(500).collect();
+                let content_lower = content_prefix.to_lowercase();
+                content_lower.split_whitespace().any(|w| {
+                    w == neg_lower
+                    || w.trim_matches(|c: char| !c.is_alphanumeric()) == neg_lower
+                    || {
+                        let w_alpha: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                        w_alpha == neg_normalized
+                    }
+                })
+            }
+            // URL path matching (e.g., github.com/flask)
             || text_lower.split('/').any(|segment| {
                 let seg = segment.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
                 seg == neg_lower
-                // Also check domain: strip "www." prefix and ".tld" suffix
                 || {
                     let no_www = seg.strip_prefix("www.").unwrap_or(&seg);
                     let domain = no_www.split('.').next().unwrap_or(no_www);
@@ -1946,10 +1955,39 @@ async fn handle_search(
     web_results = filtered;
     web_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Hard filter: remove results that violate negative constraints
+    // This catches violations that score penalties alone can't fully suppress,
+    // especially comparison/list articles that mention excluded terms in content.
+    let has_negative_constraints = !intent.structured_constraints.negative.is_empty();
+    if has_negative_constraints {
+        let filtered_backup = web_results.clone(); // backup for fallback
+        let before_count = web_results.len();
+        web_results.retain(|r| {
+            let c_score = constraint_score(&r.title, &r.content, &r.url, &intent.structured_constraints);
+            // Keep result if constraint_score is above penalty threshold (0.15)
+            // A score of 0.02 means single violation, 0.0004 means double violation
+            // Threshold of 0.15 keeps results with no violations (1.0) and positive boosts,
+            // but drops anything that hit even one negative constraint
+            c_score >= 0.15
+        });
+        let removed = before_count.saturating_sub(web_results.len());
+        if removed > 0 {
+            tracing::info!("Negative constraint hard filter: removed {}/{} results", removed, before_count);
+        }
+        // Ensure we always have at least some results (fallback if filter was too aggressive)
+        if web_results.is_empty() {
+            tracing::warn!("Negative constraint filter removed all results — relaxing threshold");
+            // Re-run with relaxed threshold: only filter double+ violations
+            web_results = filtered_backup.into_iter().filter(|r| {
+                let c_score = constraint_score(&r.title, &r.content, &r.url, &intent.structured_constraints);
+                c_score >= 0.01
+            }).collect();
+        }
+    }
+
     // Normalize web scores to [0, 1] for cross-query comparability
     // When negative constraints exist, use relative normalization (top=1.0)
     // instead of percentile normalization, which would undo constraint penalties.
-    let has_negative_constraints = !intent.structured_constraints.negative.is_empty();
     if !has_negative_constraints {
         let mut web_scores: Vec<f32> = web_results.iter().map(|r| r.score).collect();
         normalize_scores(&mut web_scores);
