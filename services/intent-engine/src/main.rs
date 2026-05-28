@@ -226,6 +226,49 @@ fn extract_constraints(query: &str) -> Constraints {
     // "rust vs go" → don't treat as constraints, but "X without Y" in comparisons
     // is already handled by Phase 1
 
+    // ── Phase 5: Implicit positive constraints from topic nouns ──
+    // When negative constraints exist, the remaining topic nouns in the query
+    // (not stop words, not markers, not negative terms) are implicit positives.
+    // "python web framework not django" → remaining: [python, web, framework] → +python
+    // "css framework not bootstrap not tailwind" → remaining: [css, framework] → +css
+    // Only extract if we have negatives but few/no positives (the marker-based
+    // extraction missed them because there was no "for"/"with" prefix).
+    if !negative.is_empty() && positive.len() < 2 {
+        let stop_words: std::collections::HashSet<&str> = [
+            "the","a","an","in","on","for","with","using","from","to",
+            "and","or","of","is","are","was","were","be","been","has","have","had",
+            "do","does","did","will","would","could","should","may","might",
+            "how","what","where","when","why","which","who","this","that","these",
+            "those","it","its","i","me","my","we","our","you","your","he","she","they",
+            "be","as","at","by","not","but","if","so","than","too","very","can","just",
+            "best","top","new","old","good","bad","big","small","fast","first","last",
+            "most","more","less","many","few","each","every","all","any","some",
+            "modern","quick","simple","easy","great","popular","powerful",
+            "no","without","except","excluding","other","than","minus",
+            "that","which","must","needs","should","can",
+            // Domain-generic words that aren't useful as constraints
+            "framework","library","language","tool","editor","database",
+            "generator","server","client","application","app","software",
+            "system","platform","service","api","sdk","package","module",
+        ].iter().copied().collect();
+
+        let neg_set: std::collections::HashSet<String> = negative.iter().cloned().collect();
+        let pos_set: std::collections::HashSet<String> = positive.iter().cloned().collect();
+
+        // Extract candidate topic words from the query
+        let words: Vec<&str> = q_lower.split_whitespace().collect();
+        for w in &words {
+            let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+            if w_clean.len() < 2 { continue; }
+            if stop_words.contains(w_clean.as_str()) { continue; }
+            if neg_set.contains(&w_clean) { continue; }
+            if pos_set.contains(&w_clean) { continue; }
+            // Only add as implicit positive if it looks like a topic noun
+            // (not a generic adjective or verb)
+            positive.push(w_clean);
+        }
+    }
+
     // Deduplicate
     positive.sort();
     positive.dedup();

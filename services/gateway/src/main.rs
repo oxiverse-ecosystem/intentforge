@@ -564,7 +564,16 @@ fn constraint_score(
                 || text_normalized.split_whitespace().any(|w| w == pos_normalized)
                 || (pos_normalized.len() >= 3 && text_normalized.contains(&pos_normalized))
             } else {
-                text_lower.contains(&pos_lower) || text_normalized.contains(&pos_normalized)
+                // Multi-word: exact phrase match OR all words present individually
+                // "async support" → match "async" AND "support" anywhere in text
+                text_lower.contains(&pos_lower)
+                || text_normalized.contains(&pos_normalized)
+                || pos_words.iter().all(|w| {
+                    let w_clean = w.chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+                    text_lower.split_whitespace().any(|tw| {
+                        tw == *w || tw.trim_matches(|c: char| !c.is_alphanumeric()) == *w
+                    }) || (w_clean.len() >= 3 && text_normalized.contains(&w_clean))
+                })
             };
             if found {
                 matched += 1;
@@ -1431,10 +1440,12 @@ async fn handle_search(
         indexer_query.push_str("&freshness_boost=true");
     }
 
-    // Build SearXNG URLs for all expanded queries (max 4 variations)
+    // Build SearXNG URLs for expanded queries (max 2 variations)
+    // 4 queries × 2.2s each through VPN = 8.8s, hitting the 10s timeout.
+    // 2 queries × 2.2s = 4.4s, well within budget.
     // Preprocess queries to strip trigger words that cause dictionary/shopping results
     // For freshness queries, add time_range parameter to get recent results
-    let searx_urls: Vec<String> = expanded_queries.iter().take(4).map(|eq| {
+    let searx_urls: Vec<String> = expanded_queries.iter().take(2).map(|eq| {
         let clean_eq = preprocess_searxng_query(eq);
         let mut url = format!("http://127.0.0.1:8080/search?q={}&format=json&pageno=1", urlencoding::encode(&clean_eq));
         if is_freshness_query {
@@ -1826,13 +1837,21 @@ async fn handle_search(
     web_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     // Normalize web scores to [0, 1] for cross-query comparability
-    // SKIP normalization when negative constraints exist — it would undo constraint penalties
+    // When negative constraints exist, use relative normalization (top=1.0)
+    // instead of percentile normalization, which would undo constraint penalties.
     let has_negative_constraints = !intent.structured_constraints.negative.is_empty();
     if !has_negative_constraints {
         let mut web_scores: Vec<f32> = web_results.iter().map(|r| r.score).collect();
         normalize_scores(&mut web_scores);
         for (i, r) in web_results.iter_mut().enumerate() {
             r.score = web_scores[i];
+        }
+    } else if !web_results.is_empty() {
+        // Relative normalization: top result = 1.0, others scaled proportionally
+        // This gives good score spread even when all results have similar raw scores
+        let top_score = web_results[0].score.max(0.001);
+        for r in web_results.iter_mut() {
+            r.score = (r.score / top_score).clamp(0.0, 1.0);
         }
     }
 
