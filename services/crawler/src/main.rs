@@ -173,7 +173,7 @@ impl CrawlQueueManager {
             queue: BinaryHeap::new(),
             seen_urls: HashSet::new(),
             domain_limiter: DomainRateLimiter::new(2000),
-            max_queue_size: 10000,
+            max_queue_size: 50000,
             max_discovered_per_page: 20,
         }
     }
@@ -242,6 +242,7 @@ fn normalize_url(url: &str) -> String {
 
 fn default_seed_urls() -> Vec<(&'static str, &'static str)> {
     vec![
+        // ── Documentation & Learning ──
         ("https://en.wikipedia.org/wiki/Main_Page", "seed"),
         ("https://doc.rust-lang.org/book/", "seed"),
         ("https://docs.python.org/3/", "seed"),
@@ -249,12 +250,47 @@ fn default_seed_urls() -> Vec<(&'static str, &'static str)> {
         ("https://docs.rs/", "seed"),
         ("https://pkg.go.dev/", "seed"),
         ("https://learn.microsoft.com/en-us/", "seed"),
+        ("https://devdocs.io/", "seed"),
+        ("https://kotlinlang.org/docs/", "seed"),
+        ("https://www.typescriptlang.org/docs/", "seed"),
+        ("https://react.dev/learn", "seed"),
+        ("https://vuejs.org/guide/", "seed"),
+        ("https://angular.dev/overview", "seed"),
+        ("https://nextjs.org/docs", "seed"),
+        ("https://docs.docker.com/", "seed"),
+        ("https://kubernetes.io/docs/", "seed"),
+        ("https://terraform.io/docs", "seed"),
+        ("https://aws.amazon.com/documentation/", "seed"),
+        // ── Q&A & Community ──
         ("https://stackoverflow.com/questions", "seed"),
         ("https://github.com/trending", "seed"),
         ("https://news.ycombinator.com/", "seed"),
+        ("https://www.reddit.com/r/programming/", "seed"),
+        ("https://www.reddit.com/r/rust/", "seed"),
+        ("https://www.reddit.com/r/python/", "seed"),
+        ("https://lobste.rs/", "seed"),
+        ("https://dev.to/", "seed"),
+        ("https://medium.com/tag/programming", "seed"),
+        // ── Package Registries ──
         ("https://crates.io/", "seed"),
         ("https://pypi.org/", "seed"),
         ("https://www.npmjs.com/", "seed"),
+        ("https://rubygems.org/", "seed"),
+        ("https://maven.org/", "seed"),
+        ("https://nuget.org/", "seed"),
+        // ── News & Tech ──
+        ("https://arxiv.org/list/cs.AI/recent", "seed"),
+        ("https://arxiv.org/list/cs.CL/recent", "seed"),
+        ("https://techcrunch.com/", "seed"),
+        ("https://www.theverge.com/tech", "seed"),
+        ("https://arstechnica.com/", "seed"),
+        ("https://www.wired.com/tag/programming/", "seed"),
+        // ── Open Source & Tools ──
+        ("https://github.com/topics/machine-learning", "seed"),
+        ("https://github.com/topics/web-framework", "seed"),
+        ("https://github.com/topics/search-engine", "seed"),
+        ("https://alternativeto.net/", "seed"),
+        ("https://www.producthunt.com/", "seed"),
     ]
 }
 

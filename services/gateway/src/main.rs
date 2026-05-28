@@ -917,6 +917,45 @@ fn compute_final_score(
 }
 
 // ─── Cross-Query Score Normalization ────────────────────────────────
+// Strip tracking/query params from URLs for better dedup.
+// Handles utm_*, fbclid, gclid, ref, srsltid, etc.
+// "https://example.com/page?utm_source=google&id=5" → "https://example.com/page?id=5"
+
+fn strip_tracking_params(url: &str) -> String {
+    static TRACKING_PARAMS: &[&str] = &[
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "utm_id", "utm_source_platform", "utm_creative_format", "utm_marketing_tactic",
+        "fbclid", "gclid", "gclsrc", "dclid", "gbraid", "wbraid",
+        "msclkid", "twclid", "li_fat_id",
+        "srsltid", "source", "ref", "ref_src", "ref_url",
+        "_ga", "_gl", "mc_cid", "mc_eid",
+        "yclid", "ymclid", "ysclid",
+    ];
+
+    let (path, query) = match url.find('?') {
+        Some(pos) => (&url[..pos], &url[pos + 1..]),
+        None => return url.to_string(),
+    };
+
+    if query.is_empty() {
+        return url.to_string();
+    }
+
+    let filtered: Vec<&str> = query
+        .split('&')
+        .filter(|param| {
+            let key = param.split('=').next().unwrap_or("");
+            !TRACKING_PARAMS.iter().any(|tp| key == *tp)
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        path.to_string()
+    } else {
+        format!("{}?{}", path, filtered.join("&"))
+    }
+}
+
 // Normalizes scores to [0, 1] using robust percentile scaling.
 // Makes scores comparable across different queries (a 1.5 on one query
 // shouldn't be confused with 1.5 on another).
@@ -1173,6 +1212,11 @@ struct EngineHealth {
     consecutive_failures: u32,
     last_failure: Option<Instant>,
     open_until: Option<Instant>, // circuit open (skip this engine) until this time
+    // Dynamic weight tracking
+    total_successes: u64,
+    total_failures: u64,
+    total_results_returned: u64,
+    last_success: Option<Instant>,
 }
 
 impl CircuitBreaker {
@@ -1198,9 +1242,15 @@ impl CircuitBreaker {
             consecutive_failures: 0,
             last_failure: None,
             open_until: None,
+            total_successes: 0,
+            total_failures: 0,
+            total_results_returned: 0,
+            last_success: None,
         });
         health.consecutive_failures = 0;
         health.open_until = None;
+        health.total_successes += 1;
+        health.last_success = Some(Instant::now());
     }
 
     fn record_failure(&self, engine: &str) {
@@ -1209,9 +1259,14 @@ impl CircuitBreaker {
             consecutive_failures: 0,
             last_failure: None,
             open_until: None,
+            total_successes: 0,
+            total_failures: 0,
+            total_results_returned: 0,
+            last_success: None,
         });
         health.consecutive_failures += 1;
         health.last_failure = Some(Instant::now());
+        health.total_failures += 1;
 
         // Exponential backoff: 30s, 60s, 120s, ... capped at 10 min
         if health.consecutive_failures >= 3 {
@@ -1222,6 +1277,46 @@ impl CircuitBreaker {
                 "Circuit OPEN for engine '{}' — {} failures, backing off {:?}",
                 engine, health.consecutive_failures, backoff
             );
+        }
+    }
+
+    // Record how many results an engine returned (for weight calculation)
+    fn record_results(&self, engine: &str, count: u64) {
+        let mut engines = self.engines.lock().unwrap();
+        let health = engines.entry(engine.to_string()).or_insert(EngineHealth {
+            consecutive_failures: 0,
+            last_failure: None,
+            open_until: None,
+            total_successes: 0,
+            total_failures: 0,
+            total_results_returned: 0,
+            last_success: None,
+        });
+        health.total_results_returned += count;
+    }
+
+    // Get dynamic weight for an engine based on historical performance.
+    // Returns a value in [0.5, 2.0]:
+    //   - New engines (no history): 1.0 (neutral)
+    //   - Reliable engines (high success rate, many results): up to 2.0
+    //   - Unreliable engines (low success rate): down to 0.5
+    // This is used to boost/penalize RRF contributions from each engine.
+    fn weight(&self, engine: &str) -> f32 {
+        let engines = self.engines.lock().unwrap();
+        if let Some(health) = engines.get(engine) {
+            let total = health.total_successes + health.total_failures;
+            if total < 5 {
+                return 1.0; // not enough data, stay neutral
+            }
+            let success_rate = health.total_successes as f32 / total as f32;
+            // Boost engines that return more results (they have broader coverage)
+            let result_volume = (health.total_results_returned as f32 / total as f32).min(50.0);
+            let volume_boost = (result_volume / 20.0).clamp(0.8, 1.3);
+            // Combine: success rate [0.5, 1.5] * volume boost [0.8, 1.3]
+            let weight = (0.5 + success_rate) * volume_boost;
+            weight.clamp(0.5, 2.0)
+        } else {
+            1.0 // unknown engine, neutral weight
         }
     }
 }
@@ -1644,15 +1739,19 @@ async fn handle_search(
             Ok(searx_data) => {
                 tracing::info!("SearXNG variation {} returned {} results", i, searx_data.results.len());
                 circuit_ref.record_success("searxng");
+                circuit_ref.record_results("searxng", searx_data.results.len() as u64);
                 // Track position-based RRF contribution per URL within this variation
+                // Weight by engine reliability (dynamic learning)
                 for (pos, result) in searx_data.results.into_iter().enumerate() {
+                    let engine_weight = circuit_ref.weight(&result.engine);
                     let normalized = {
                         let lower = result.url.to_lowercase();
                         let no_fragment = lower.split('#').next().unwrap_or(&lower);
                         let no_trailing = no_fragment.trim_end_matches('/');
-                        no_trailing.replacen("://www.", "://", 1)
+                        let no_www = no_trailing.replacen("://www.", "://", 1);
+                        strip_tracking_params(&no_www)
                     };
-                    let rrf_contrib = 1.0 / (60.0 + (pos + 1) as f32);
+                    let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
                     *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
                     web_results.push(result);
                 }
@@ -1668,14 +1767,17 @@ async fn handle_search(
         Ok(whoogle_data) => {
             tracing::info!("Whoogle returned {} results", whoogle_data.results.len());
             circuit_ref.record_success("whoogle");
+            circuit_ref.record_results("whoogle", whoogle_data.results.len() as u64);
+            let whoogle_weight = circuit_ref.weight("whoogle");
             for (pos, r) in whoogle_data.results.into_iter().enumerate() {
                 let normalized = {
                     let lower = r.url.to_lowercase();
                     let no_fragment = lower.split('#').next().unwrap_or(&lower);
                     let no_trailing = no_fragment.trim_end_matches('/');
-                    no_trailing.replacen("://www.", "://", 1)
+                    let no_www = no_trailing.replacen("://www.", "://", 1);
+                    strip_tracking_params(&no_www)
                 };
-                let rrf_contrib = 1.0 / (60.0 + (pos + 1) as f32);
+                let rrf_contrib = whoogle_weight / (60.0 + (pos + 1) as f32);
                 *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
                 web_results.push(SearxResult {
                     title: r.title,
@@ -1697,6 +1799,8 @@ async fn handle_search(
         Ok(invidious_data) => {
             tracing::info!("Invidious returned {} results", invidious_data.len());
             circuit_ref.record_success("invidious");
+            circuit_ref.record_results("invidious", invidious_data.len() as u64);
+            let invidious_weight = circuit_ref.weight("invidious");
             for (pos, r) in invidious_data.into_iter().enumerate() {
                 if r.result_type.as_deref() == Some("video") {
                     if let Some(vid) = r.video_id {
@@ -1705,9 +1809,10 @@ async fn handle_search(
                             let lower = video_url.to_lowercase();
                             let no_fragment = lower.split('#').next().unwrap_or(&lower);
                             let no_trailing = no_fragment.trim_end_matches('/');
-                            no_trailing.replacen("://www.", "://", 1)
+                            let no_www = no_trailing.replacen("://www.", "://", 1);
+                            strip_tracking_params(&no_www)
                         };
-                        let rrf_contrib = 1.0 / (60.0 + (pos + 1) as f32);
+                        let rrf_contrib = invidious_weight / (60.0 + (pos + 1) as f32);
                         *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
                         web_results.push(SearxResult {
                             title: r.title.unwrap_or_else(|| "No Title".to_string()),
@@ -1736,13 +1841,15 @@ async fn handle_search(
     const MAX_PER_DOMAIN: usize = 5; // prevent single-domain dominance
 
     for res in web_results {
-        // Normalize URL: lowercase, strip trailing slash, strip fragment, strip www.
+        // Normalize URL: lowercase, strip trailing slash, strip fragment, strip www,
+        // strip tracking params (utm_*, fbclid, gclid, ref, etc.)
         let normalized = {
             let lower = res.url.to_lowercase();
             let no_fragment = lower.split('#').next().unwrap_or(&lower);
             let no_trailing = no_fragment.trim_end_matches('/');
-            // Strip www. prefix for better dedup (www.example.com == example.com)
-            no_trailing.replacen("://www.", "://", 1)
+            let no_www = no_trailing.replacen("://www.", "://", 1);
+            // Strip tracking query params
+            strip_tracking_params(&no_www)
         };
 
         // Domain dedup: cap results per domain for diversity
@@ -1794,7 +1901,8 @@ async fn handle_search(
             let lower = res.url.to_lowercase();
             let no_fragment = lower.split('#').next().unwrap_or(&lower);
             let no_trailing = no_fragment.trim_end_matches('/');
-            no_trailing.replacen("://www.", "://", 1)
+            let no_www = no_trailing.replacen("://www.", "://", 1);
+            strip_tracking_params(&no_www)
         };
         let rank_score = url_rrf_contributions.get(&normalized).copied().unwrap_or(0.01);
 

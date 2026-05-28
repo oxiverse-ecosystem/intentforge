@@ -26,7 +26,7 @@ MAX_INTERVAL=14400            # 4h maximum (forced rotation)
 HEALTH_CHECK_INTERVAL=120     # Check health every 2 minutes
 SIGNAL_CHECK_FAST=5           # Check signal every 5s when rate-limited
 SIGNAL_CHECK_NORMAL=15        # Normal signal check interval
-CONSECUTIVE_FAIL_THRESHOLD=3  # Health failures before rotation
+CONSECUTIVE_FAIL_THRESHOLD=5  # Health failures before rotation (let gluetun self-heal first)
 
 # ── Rate-Limit Tracking ──
 RATELIMIT_WINDOW=300          # 5-minute sliding window

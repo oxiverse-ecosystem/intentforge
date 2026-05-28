@@ -28,6 +28,12 @@ services:
       - "4000:4000"     # Gateway (Routed)
       - "6000:6000"     # Indexer (Routed)
     restart: always
+    healthcheck:
+      test: ["CMD", "/gluetun-entrypoint", "healthcheck"]
+      interval: 15s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
     logging:
       driver: "json-file"
       options:
@@ -45,3 +51,16 @@ services:
       - gluetun
     network_mode: "service:gluetun"
     restart: always
+
+  tor:
+    build: ./tor
+    container_name: tor
+    network_mode: "service:gluetun"
+    volumes:
+      - ./tor/data:/var/lib/tor
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
