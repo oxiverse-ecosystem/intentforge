@@ -52,7 +52,14 @@ echo "$(date -u) [vpn-rotator] Intelligent rotator v2 started"
 echo "$(date -u) [vpn-rotator] Rate-limit cooldown: ${MIN_INTERVAL_RATELIMIT}s, Forced: ${MIN_INTERVAL_FORCED}s"
 
 get_current_ip() {
-    curl -s -m 10 "$HEALTH_URL" 2>/dev/null | tr -d '[:space:]'
+    wget -qO- --timeout=10 "http://127.0.0.1:8000/v1/publicip/ip" 2>/dev/null | tr -d '[:space:]'
+}
+
+# PUT request via wget (busybox wget supports POST which works for Gluetun API)
+gluetun_put() {
+    local url="$1"
+    local data="$2"
+    wget -qO- --timeout=10 --post-data="$data" "$url" > /dev/null 2>&1
 }
 
 # Count rate-limit events in the sliding window
@@ -120,11 +127,11 @@ rotate_vpn() {
     fi
     
     # Stop VPN
-    curl -s -m 10 -X PUT -d '{"status":"stopped"}' "$CONTROL_URL" > /dev/null 2>&1
+    gluetun_put "$CONTROL_URL" '{"status":"stopped"}'
     sleep 5
     
     # Start VPN
-    curl -s -m 10 -X PUT -d '{"status":"running"}' "$CONTROL_URL" > /dev/null 2>&1
+    gluetun_put "$CONTROL_URL" '{"status":"running"}'
     sleep 10
     
     # Verify IP actually changed

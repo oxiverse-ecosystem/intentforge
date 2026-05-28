@@ -439,13 +439,14 @@ fn content_quality_score(text: &str) -> f32 {
 fn constraint_score(
     title: &str,
     content: &str,
+    url: &str,
     constraints: &Constraints,
 ) -> f32 {
     if constraints.positive.is_empty() && constraints.negative.is_empty() {
         return 1.0; // no constraints = no penalty
     }
 
-    let text_lower = format!("{} {}", title.to_lowercase(), content.to_lowercase());
+    let text_lower = format!("{} {} {}", title.to_lowercase(), content.to_lowercase(), url.to_lowercase());
     let mut score: f32 = 1.0;
 
     // Pre-normalize text: remove dots/hyphens/underscores between alphanumerics for fuzzy matching
@@ -1724,7 +1725,7 @@ async fn handle_search(
         let quality = content_quality_score(&res.content);
         let semantic = semantic_scores[i]; // use precomputed score
         let consensus = consensus_score(&res.sources);
-        let c_score = constraint_score(&res.title, &res.content, &intent.structured_constraints);
+        let c_score = constraint_score(&res.title, &res.content, &res.url, &intent.structured_constraints);
 
         res.score = compute_final_score(
             rank_score,
@@ -1774,7 +1775,7 @@ async fn handle_search(
         let authority = if res.authority > 0.0 { res.authority } else { domain_authority_score(&res.url) };
         let quality = content_quality_score(&res.content);
         let semantic = local_semantic_scores[i];
-        let c_score = constraint_score(&res.title, &res.content, &intent.structured_constraints);
+        let c_score = constraint_score(&res.title, &res.content, &res.url, &intent.structured_constraints);
 
         res.score = compute_final_score(
             rank_score,
