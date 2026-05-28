@@ -448,18 +448,47 @@ fn constraint_score(
     let text_lower = format!("{} {}", title.to_lowercase(), content.to_lowercase());
     let mut score: f32 = 1.0;
 
-    // Negative constraints: severe penalty for each match
-    // When user explicitly excludes something, violations should be nearly eliminated
+    // Pre-normalize text: remove dots/hyphens/underscores between alphanumerics for fuzzy matching
+    // "node.js" → "nodejs", "c++" → "c++" (kept), "real-time" → "realtime"
+    let text_normalized: String = {
+        let chars: Vec<char> = text_lower.chars().collect();
+        let mut out = String::with_capacity(chars.len());
+        for (i, &c) in chars.iter().enumerate() {
+            if c == '.' || c == '-' || c == '_' {
+                // Only keep if between alphanumeric chars (collapse separators)
+                if i > 0 && i + 1 < chars.len()
+                    && chars[i-1].is_alphanumeric() && chars[i+1].is_alphanumeric()
+                {
+                    // Skip separator — collapse "node.js" to "nodejs"
+                } else {
+                    out.push(c);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
     let neg_count = constraints.negative.len() as f32;
     for neg in &constraints.negative {
         let neg_lower = neg.to_lowercase();
-        // Check word boundary match (not substring)
-        let words: Vec<&str> = text_lower.split_whitespace().collect();
+        // Also normalize the constraint term itself
+        let neg_normalized: String = neg_lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
         let neg_words: Vec<&str> = neg_lower.split_whitespace().collect();
         let matched = if neg_words.len() == 1 {
-            words.iter().any(|w| *w == neg_lower || w.trim_matches(|c: char| !c.is_alphanumeric()) == neg_lower)
+            // Check: exact word match, trimmed match, or normalized-against-normalized
+            text_lower.split_whitespace().any(|w| {
+                w == neg_lower
+                || w.trim_matches(|c: char| !c.is_alphanumeric()) == neg_lower
+                || w.chars().filter(|c| c.is_alphanumeric()).collect::<String>() == neg_normalized
+            })
+            // Also check if the normalized constraint appears as a word boundary match
+            // in the normalized text (catches "node.js" → "nodejs" match)
+            || text_normalized.split_whitespace().any(|w| w == neg_normalized)
+            // And as a substring in normalized text for compound terms
+            || (neg_normalized.len() >= 3 && text_normalized.contains(&neg_normalized))
         } else {
-            text_lower.contains(&neg_lower)
+            text_lower.contains(&neg_lower) || text_normalized.contains(&neg_normalized)
         };
         if matched {
             // Penalty scales with number of constraints: more constraints = less penalty per violation
@@ -469,21 +498,26 @@ fn constraint_score(
         }
     }
 
-    // Positive constraints: boost for each match
+    // Positive constraints: boost for each match (fuzzy matching)
     if !constraints.positive.is_empty() {
         let mut matched = 0;
         for pos in &constraints.positive {
             let pos_lower = pos.to_lowercase();
+            let pos_normalized: String = pos_lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
             let pos_words: Vec<&str> = pos_lower.split_whitespace().collect();
-            if pos_words.len() == 1 {
-                let words: Vec<&str> = text_lower.split_whitespace().collect();
-                if words.iter().any(|w| *w == pos_lower || w.trim_matches(|c: char| !c.is_alphanumeric()) == pos_lower) {
-                    matched += 1;
-                }
+            let found = if pos_words.len() == 1 {
+                text_lower.split_whitespace().any(|w| {
+                    w == pos_lower
+                    || w.trim_matches(|c: char| !c.is_alphanumeric()) == pos_lower
+                    || w.chars().filter(|c| c.is_alphanumeric()).collect::<String>() == pos_normalized
+                })
+                || text_normalized.split_whitespace().any(|w| w == pos_normalized)
+                || (pos_normalized.len() >= 3 && text_normalized.contains(&pos_normalized))
             } else {
-                if text_lower.contains(&pos_lower) {
-                    matched += 1;
-                }
+                text_lower.contains(&pos_lower) || text_normalized.contains(&pos_normalized)
+            };
+            if found {
+                matched += 1;
             }
         }
         // Coverage: fraction of positive constraints matched
