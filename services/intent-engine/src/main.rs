@@ -484,15 +484,18 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
     match intent {
         "how-to" => {
             if core_trimmed.len() > 3 {
-                let core_words: Vec<&str> = core_trimmed.split_whitespace().collect();
-                if core_words.len() >= 2 {
-                    let last_words: Vec<&str> = core_words.iter().rev().take(2).rev().copied().collect();
-                    let action_word = core_words.first().unwrap_or(&"");
-                    expansions.push(format!("{} {} guide", last_words.join(" "), action_word));
-                    expansions.push(format!("{} tutorial", core_trimmed));
-                } else {
-                    expansions.push(format!("{} guide", core_trimmed));
-                    expansions.push(format!("{} tutorial", core_trimmed));
+                // Filter stop words to get meaningful topic words for variations
+                let howto_stop = ["a","an","the","to","for","in","on","of","and","or","is","are","with","from","by"];
+                let topic_words: Vec<&str> = core_trimmed.split_whitespace()
+                    .filter(|w| w.len() > 1 && !howto_stop.contains(w) && !w.parse::<f64>().is_ok())
+                    .collect();
+                if topic_words.len() >= 2 {
+                    let tail: Vec<&str> = topic_words.iter().rev().take(3).rev().copied().collect();
+                    expansions.push(format!("{} tutorial", tail.join(" ")));
+                    expansions.push(format!("{} guide", tail.join(" ")));
+                } else if topic_words.len() == 1 {
+                    expansions.push(format!("{} tutorial", topic_words[0]));
+                    expansions.push(format!("{} guide", topic_words[0]));
                 }
                 expansions.push(format!("{} step by step", core_trimmed));
             }
@@ -519,7 +522,8 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
             }
         }
         "technical" => {
-            let stop = ["the","a","an","in","on","for","with","using","from","to","and","or","of","is","are"];
+            let stop = ["the","a","an","in","on","for","with","using","from","to","and","or","of","is","are",
+                        "excluding","without","except","other","than"];
             let topic_words: Vec<&str> = words.iter()
                 .filter(|w| w.len() > 2 && !stop.contains(w))
                 .copied()
