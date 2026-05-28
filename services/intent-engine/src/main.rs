@@ -490,14 +490,18 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
                     .filter(|w| w.len() > 1 && !howto_stop.contains(w) && !w.parse::<f64>().is_ok())
                     .collect();
                 if topic_words.len() >= 2 {
-                    let tail: Vec<&str> = topic_words.iter().rev().take(3).rev().copied().collect();
-                    expansions.push(format!("{} tutorial", tail.join(" ")));
-                    expansions.push(format!("{} guide", tail.join(" ")));
+                    // Cap at 5 words to keep queries concise for SearXNG
+                    let max_words = 5;
+                    let capped: Vec<&str> = topic_words.iter().take(max_words).copied().collect();
+                    expansions.push(format!("{} tutorial", capped.join(" ")));
+                    expansions.push(format!("{} guide", capped.join(" ")));
                 } else if topic_words.len() == 1 {
                     expansions.push(format!("{} tutorial", topic_words[0]));
                     expansions.push(format!("{} guide", topic_words[0]));
                 }
-                expansions.push(format!("{} step by step", core_trimmed));
+                // Cap core_trimmed for step-by-step too
+                let core_capped: String = core_trimmed.split_whitespace().take(6).collect::<Vec<&str>>().join(" ");
+                expansions.push(format!("{} step by step", core_capped));
             }
         }
         "comparison" => {
@@ -529,11 +533,14 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
                 .copied()
                 .collect();
             if topic_words.len() >= 2 {
-                let tail: Vec<&str> = topic_words.iter().rev().take(3).rev().copied().collect();
-                expansions.push(format!("{} documentation", tail.join(" ")));
-                expansions.push(format!("{} examples", tail.join(" ")));
+                // Cap at 5 words to keep queries concise for SearXNG
+                // Long queries (>6 words) cause 0 results on most engines
+                let max_words = 5;
+                let capped: Vec<&str> = topic_words.iter().take(max_words).copied().collect();
+                expansions.push(format!("{} documentation", capped.join(" ")));
+                expansions.push(format!("{} examples", capped.join(" ")));
                 if !q_lower.contains("programming") {
-                    expansions.push(format!("{} programming", topic_words.join(" ")));
+                    expansions.push(format!("{} programming", capped.join(" ")));
                 }
             }
         }
