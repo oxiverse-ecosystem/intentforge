@@ -470,31 +470,52 @@ fn constraint_score(
         out
     };
     let neg_count = constraints.negative.len() as f32;
+    // Pre-normalize title for constraint matching
+    let title_lower = title.to_lowercase();
+    let title_normalized: String = {
+        let chars: Vec<char> = title_lower.chars().collect();
+        let mut out = String::with_capacity(chars.len());
+        for (i, &c) in chars.iter().enumerate() {
+            if c == '.' || c == '-' || c == '_' {
+                if i > 0 && i + 1 < chars.len()
+                    && chars[i-1].is_alphanumeric() && chars[i+1].is_alphanumeric()
+                { /* skip separator */ } else { out.push(c); }
+            } else { out.push(c); }
+        }
+        out
+    };
     for neg in &constraints.negative {
         let neg_lower = neg.to_lowercase();
-        // Also normalize the constraint term itself
         let neg_normalized: String = neg_lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
         let neg_words: Vec<&str> = neg_lower.split_whitespace().collect();
+        // For single-word constraints: match against TITLE primarily (content is too noisy)
+        // For multi-word constraints: match against title + content
         let matched = if neg_words.len() == 1 {
-            // Check: exact word match, trimmed match, or normalized-against-normalized
-            text_lower.split_whitespace().any(|w| {
+            // Title-first matching for single-word constraints
+            title_lower.split_whitespace().any(|w| {
                 w == neg_lower
                 || w.trim_matches(|c: char| !c.is_alphanumeric()) == neg_lower
                 || w.chars().filter(|c| c.is_alphanumeric()).collect::<String>() == neg_normalized
             })
-            // Also check if the normalized constraint appears as a word boundary match
-            // in the normalized text (catches "node.js" → "nodejs" match)
-            || text_normalized.split_whitespace().any(|w| w == neg_normalized)
-            // And as a substring in normalized text for compound terms
-            || (neg_normalized.len() >= 3 && text_normalized.contains(&neg_normalized))
+            || title_normalized.split_whitespace().any(|w| w == neg_normalized)
+            || (neg_normalized.len() >= 5 && title_normalized.contains(&neg_normalized))
+            // Also check if the term is in the URL path (e.g., github.com/flask)
+            || text_lower.split('/').any(|segment| {
+                segment.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase() == neg_lower
+            })
         } else {
-            text_lower.contains(&neg_lower) || text_normalized.contains(&neg_normalized)
+            // Multi-word: check title first, then content
+            title_lower.contains(&neg_lower) || title_normalized.contains(&neg_normalized)
+            || text_lower.contains(&neg_lower) || text_normalized.contains(&neg_normalized)
         };
         if matched {
             // Penalty scales with number of constraints: more constraints = less penalty per violation
             // but always severe. Single constraint: 0.02x (98% penalty). Multiple: 0.05x per violation.
             let penalty = if neg_count <= 1.0 { 0.02 } else { 0.05 };
+            tracing::info!("CONSTRAINT HIT: '{}' in title='{}' → penalty={}", neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())], penalty);
             score *= penalty;
+        } else {
+            tracing::info!("CONSTRAINT MISS: '{}' not in '{}'", neg, &text_lower[..text_lower.char_indices().nth(60).map(|(i,_)| i).unwrap_or(text_lower.len())]);
         }
     }
 
@@ -914,6 +935,43 @@ fn sanitize_json_text(raw: &str) -> String {
     deduplicate_json_keys(&out)
 }
 
+// Preprocess query for SearXNG — strip trigger words that cause dictionary/shopping results
+fn preprocess_searxng_query(query: &str) -> String {
+    let q = query.trim();
+    let q_lower = q.to_lowercase();
+    
+    // Prefixes that trigger dictionary/definition results on Bing
+    let prefix_triggers = [
+        "comparing ", "compare ", "compared ", "comparison of ",
+        "explanation of ", "definition of ",
+        "implications of ", "analysis of ", "overview of ",
+        "understanding ", "introduction to ",
+    ];
+    let mut cleaned = q_lower.to_string();
+    for prefix in &prefix_triggers {
+        if let Some(rest) = cleaned.strip_prefix(prefix) {
+            cleaned = rest.to_string();
+            break;
+        }
+    }
+    
+    // Strip "how to / how do i / how can i" prefixes
+    let start_triggers = ["how to ", "how do i ", "how can i ", "how do you "];
+    for prefix in &start_triggers {
+        if let Some(rest) = cleaned.strip_prefix(prefix) {
+            cleaned = rest.to_string();
+            break;
+        }
+    }
+    
+    // If cleaned is empty or too short, fall back to original
+    if cleaned.len() < 3 {
+        return q.to_string();
+    }
+    
+    cleaned
+}
+
 // ─── JSON Key Deduplication ────────────────────────────────────────
 // Removes duplicate keys from JSON objects. Keeps the LAST value for each key.
 // Handles nested objects and arrays. Algorithmic — no hardcoded key lists.
@@ -1244,9 +1302,11 @@ async fn handle_search(
     }
 
     // Build SearXNG URLs for all expanded queries (max 4 variations)
+    // Preprocess queries to strip trigger words that cause dictionary/shopping results
     // For freshness queries, add time_range parameter to get recent results
     let searx_urls: Vec<String> = expanded_queries.iter().take(4).map(|eq| {
-        let mut url = format!("http://127.0.0.1:8080/search?q={}&format=json&pageno=1", urlencoding::encode(eq));
+        let clean_eq = preprocess_searxng_query(eq);
+        let mut url = format!("http://127.0.0.1:8080/search?q={}&format=json&pageno=1", urlencoding::encode(&clean_eq));
         if is_freshness_query {
             url.push_str("&time_range=month");
         }
@@ -1609,10 +1669,14 @@ async fn handle_search(
     web_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     // Normalize web scores to [0, 1] for cross-query comparability
-    let mut web_scores: Vec<f32> = web_results.iter().map(|r| r.score).collect();
-    normalize_scores(&mut web_scores);
-    for (i, r) in web_results.iter_mut().enumerate() {
-        r.score = web_scores[i];
+    // SKIP normalization when negative constraints exist — it would undo constraint penalties
+    let has_negative_constraints = !intent.structured_constraints.negative.is_empty();
+    if !has_negative_constraints {
+        let mut web_scores: Vec<f32> = web_results.iter().map(|r| r.score).collect();
+        normalize_scores(&mut web_scores);
+        for (i, r) in web_results.iter_mut().enumerate() {
+            r.score = web_scores[i];
+        }
     }
 
     // Rank local results using precomputed semantic scores
