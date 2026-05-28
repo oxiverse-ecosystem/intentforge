@@ -448,22 +448,24 @@ fn constraint_score(
     let text_lower = format!("{} {}", title.to_lowercase(), content.to_lowercase());
     let mut score: f32 = 1.0;
 
-    // Negative constraints: hard penalty for each match
+    // Negative constraints: severe penalty for each match
+    // When user explicitly excludes something, violations should be nearly eliminated
+    let neg_count = constraints.negative.len() as f32;
     for neg in &constraints.negative {
         let neg_lower = neg.to_lowercase();
         // Check word boundary match (not substring)
         let words: Vec<&str> = text_lower.split_whitespace().collect();
         let neg_words: Vec<&str> = neg_lower.split_whitespace().collect();
-        if neg_words.len() == 1 {
-            // Single word: check if any word in text matches
-            if words.iter().any(|w| *w == neg_lower || w.trim_matches(|c: char| !c.is_alphanumeric()) == neg_lower) {
-                score *= 0.15; // severe penalty for negative constraint violation
-            }
+        let matched = if neg_words.len() == 1 {
+            words.iter().any(|w| *w == neg_lower || w.trim_matches(|c: char| !c.is_alphanumeric()) == neg_lower)
         } else {
-            // Multi-word: check if the phrase appears
-            if text_lower.contains(&neg_lower) {
-                score *= 0.15;
-            }
+            text_lower.contains(&neg_lower)
+        };
+        if matched {
+            // Penalty scales with number of constraints: more constraints = less penalty per violation
+            // but always severe. Single constraint: 0.02x (98% penalty). Multiple: 0.05x per violation.
+            let penalty = if neg_count <= 1.0 { 0.02 } else { 0.05 };
+            score *= penalty;
         }
     }
 
@@ -781,15 +783,22 @@ fn compute_final_score(
 ) -> f32 {
     let local = if is_local { 1.0 } else { 0.0 };
 
-    (weights.rrf * rank_score)
+    let base_score = (weights.rrf * rank_score)
         + (weights.intent * intent_boost)
         + (weights.freshness * freshness)
         + (weights.authority * authority)
         + (weights.local_bonus * local)
         + (weights.quality * quality)
         + (weights.semantic * semantic)
-        + (weights.consensus * consensus)
-        + (weights.constraint * constraint)
+        + (weights.consensus * consensus);
+
+    // Constraint score acts as a GLOBAL multiplier:
+    // - 1.0 = no constraints or all satisfied
+    // - <1.0 = negative constraint violated (severe penalty)
+    // - 0.5-1.3 = positive constraint coverage
+    // This ensures negative constraints actually demote violating results
+    // instead of only affecting the small constraint weight component.
+    base_score * constraint
 }
 
 // ─── Cross-Query Score Normalization ────────────────────────────────
@@ -798,21 +807,77 @@ fn compute_final_score(
 // shouldn't be confused with 1.5 on another).
 
 fn normalize_scores(scores: &mut [f32]) {
-    if scores.len() < 3 {
+    let n = scores.len();
+    if n < 2 {
         return; // not enough data to normalize
     }
-    let mut sorted: Vec<f32> = scores.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    let p10_idx = ((sorted.len() as f32 * 0.10) as usize).min(sorted.len() - 1);
-    let p90_idx = ((sorted.len() as f32 * 0.90) as usize).min(sorted.len() - 1);
-    let p10 = sorted[p10_idx];
-    let p90 = sorted[p90_idx];
-    let range = (p90 - p10).max(0.001); // avoid division by zero
+    // Create indexed scores for rank-based normalization
+    let mut indexed: Vec<(usize, f32)> = scores.iter().enumerate().map(|(i, &s)| (i, s)).collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    for score in scores.iter_mut() {
-        *score = ((*score - p10) / range).clamp(0.0, 1.0);
+    // Check if percentile normalization would cluster (p10-p90 range too tight)
+    let p10_idx = ((n as f32 * 0.10) as usize).min(n - 1);
+    let p90_idx = ((n as f32 * 0.90) as usize).min(n - 1);
+    let p10 = indexed[p10_idx].1;
+    let p90 = indexed[p90_idx].1;
+    let percentile_range = p90 - p10;
+
+    // Also check overall range
+    let min_score = indexed[0].1;
+    let max_score = indexed[n - 1].1;
+    let total_range = max_score - min_score;
+
+    if total_range < 0.01 {
+        // All scores nearly identical — use rank-based to force spread
+        for (rank, &(orig_idx, _)) in indexed.iter().enumerate() {
+            scores[orig_idx] = (rank as f32) / ((n - 1) as f32);
+        }
+    } else if percentile_range < total_range * 0.15 {
+        // Percentile range is < 15% of total range — scores are clustered
+        // Use hybrid: blend percentile (60%) with rank-based (40%) for better spread
+        for (rank, &(orig_idx, raw)) in indexed.iter().enumerate() {
+            let percentile = ((raw - p10) / percentile_range.max(0.001)).clamp(0.0, 1.0);
+            let rank_norm = (rank as f32) / ((n - 1) as f32);
+            scores[orig_idx] = percentile * 0.6 + rank_norm * 0.4;
+        }
+    } else {
+        // Good spread — use percentile normalization
+        for score in scores.iter_mut() {
+            *score = ((*score - p10) / percentile_range.max(0.001)).clamp(0.0, 1.0);
+        }
     }
+}
+
+// ─── Text Content Sanitizer ───────────────────────────────────────
+// Strips control characters from text content for safe JSON serialization.
+// Preserves normal whitespace (tab, newline, space) but removes NUL, BS, etc.
+
+fn sanitize_text_content(text: &str) -> String {
+    text.chars().filter(|&c| !c.is_control() || c == 0x09 as char || c == 0x0A as char || c == 0x0D as char).collect()
+}
+
+// ─── JSON Text Sanitizer ──────────────────────────────────────────
+// Strips control characters (except \t, \n, \r) that SearXNG may return
+// in search result content. These cause serde_json parse failures.
+// Also handles duplicate JSON keys that some engines produce.
+
+fn sanitize_json_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            // Allow tab, newline, carriage return
+            '\t' | '\n' | '\r' => out.push(ch),
+            // Strip other control characters (0x00-0x1F)
+            c if c.is_control() => {
+                // Replace with space to preserve word boundaries
+                out.push(' ');
+            }
+            _ => out.push(ch),
+        }
+    }
+    // Deduplicate keys (SearXNG sometimes returns duplicate keys)
+    deduplicate_json_keys(&out)
 }
 
 // ─── JSON Key Deduplication ────────────────────────────────────────
@@ -1183,14 +1248,20 @@ async fn handle_search(
             if searx_open {
                 return Ok(SearxResponse { results: vec![] });
             }
-            // First attempt
-            let first = async {
+            // First attempt — sanitize control chars before JSON parse
+            let first: Result<SearxResponse, reqwest::Error> = async {
                 let resp = client_ref.get(&url).send().await?;
                 let status = resp.status();
-                resp.json::<SearxResponse>().await.map_err(|e| {
-                    tracing::error!("Failed to parse SearXNG JSON (status: {}): {:?}", status, e);
-                    e
-                })
+                let raw = resp.text().await.unwrap_or_default();
+                let sanitized = sanitize_json_text(&raw);
+                match serde_json::from_str::<SearxResponse>(&sanitized) {
+                    Ok(data) => Ok(data),
+                    Err(e) => {
+                        tracing::error!("Failed to parse SearXNG JSON (status: {}): {:?}", status, e);
+                        // Return empty response instead of error to allow retry
+                        Ok(SearxResponse { results: vec![] })
+                    }
+                }
             }.await;
 
             match first {
@@ -1199,7 +1270,7 @@ async fn handle_search(
                     // 0 results — likely VPN drop or engine timeout. Retry once after 2s.
                     tracing::warn!("SearXNG returned 0 results, retrying in 2s...");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let retry = async {
+                    let retry: Result<SearxResponse, reqwest::Error> = async {
                         let resp = client_ref.get(&url).send().await?;
                         let status = resp.status();
                         // Detect rate limiting (429) and trigger VPN rotation
@@ -1207,10 +1278,15 @@ async fn handle_search(
                             tracing::warn!("SearXNG got 429 Too Many Requests — triggering VPN rotation");
                             trigger_vpn_rotation("429_rate_limit");
                         }
-                        resp.json::<SearxResponse>().await.map_err(|e| {
-                            tracing::error!("SearXNG retry parse failed (status: {}): {:?}", status, e);
-                            e
-                        })
+                        let raw = resp.text().await.unwrap_or_default();
+                        let sanitized = sanitize_json_text(&raw);
+                        match serde_json::from_str::<SearxResponse>(&sanitized) {
+                            Ok(data) => Ok(data),
+                            Err(e) => {
+                                tracing::error!("SearXNG retry parse failed (status: {}): {:?}", status, e);
+                                Ok(SearxResponse { results: vec![] })
+                            }
+                        }
                     }.await;
                     // If retry also returned 0 results, signal VPN rotation
                     if let Ok(ref data) = retry {
@@ -1316,7 +1392,8 @@ async fn handle_search(
                     let normalized = {
                         let lower = result.url.to_lowercase();
                         let no_fragment = lower.split('#').next().unwrap_or(&lower);
-                        no_fragment.trim_end_matches('/').to_string()
+                        let no_trailing = no_fragment.trim_end_matches('/');
+                        no_trailing.replacen("://www.", "://", 1)
                     };
                     let rrf_contrib = 1.0 / (60.0 + (pos + 1) as f32);
                     *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
@@ -1338,7 +1415,8 @@ async fn handle_search(
                 let normalized = {
                     let lower = r.url.to_lowercase();
                     let no_fragment = lower.split('#').next().unwrap_or(&lower);
-                    no_fragment.trim_end_matches('/').to_string()
+                    let no_trailing = no_fragment.trim_end_matches('/');
+                    no_trailing.replacen("://www.", "://", 1)
                 };
                 let rrf_contrib = 1.0 / (60.0 + (pos + 1) as f32);
                 *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
@@ -1369,7 +1447,8 @@ async fn handle_search(
                         let normalized = {
                             let lower = video_url.to_lowercase();
                             let no_fragment = lower.split('#').next().unwrap_or(&lower);
-                            no_fragment.trim_end_matches('/').to_string()
+                            let no_trailing = no_fragment.trim_end_matches('/');
+                            no_trailing.replacen("://www.", "://", 1)
                         };
                         let rrf_contrib = 1.0 / (60.0 + (pos + 1) as f32);
                         *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
@@ -1400,12 +1479,13 @@ async fn handle_search(
     const MAX_PER_DOMAIN: usize = 5; // prevent single-domain dominance
 
     for res in web_results {
-        // Normalize URL: lowercase, strip trailing slash, strip fragment
+        // Normalize URL: lowercase, strip trailing slash, strip fragment, strip www.
         let normalized = {
             let lower = res.url.to_lowercase();
             let no_fragment = lower.split('#').next().unwrap_or(&lower);
             let no_trailing = no_fragment.trim_end_matches('/');
-            no_trailing.to_string()
+            // Strip www. prefix for better dedup (www.example.com == example.com)
+            no_trailing.replacen("://www.", "://", 1)
         };
 
         // Domain dedup: cap results per domain for diversity
@@ -1456,7 +1536,8 @@ async fn handle_search(
         let normalized = {
             let lower = res.url.to_lowercase();
             let no_fragment = lower.split('#').next().unwrap_or(&lower);
-            no_fragment.trim_end_matches('/').to_string()
+            let no_trailing = no_fragment.trim_end_matches('/');
+            no_trailing.replacen("://www.", "://", 1)
         };
         let rank_score = url_rrf_contributions.get(&normalized).copied().unwrap_or(0.01);
 
@@ -1574,6 +1655,13 @@ async fn handle_search(
                 .send()
                 .await;
         });
+    }
+
+    // Sanitize content in web_results to remove control characters
+    // that SearXNG search engines may return in snippets
+    for res in web_results.iter_mut() {
+        res.title = sanitize_text_content(&res.title);
+        res.content = sanitize_text_content(&res.content);
     }
 
     let response = UnifiedResponse {

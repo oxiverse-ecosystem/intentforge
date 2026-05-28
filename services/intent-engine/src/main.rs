@@ -102,8 +102,8 @@ fn extract_constraints(query: &str) -> Constraints {
     let mut negative = Vec::new();
 
     // ── Phase 1: Extract explicit negative constraints ──
-    // Pattern: "NOT <word(s)>", "-<word>", "without <word(s)>", etc.
-    // We extract the term following the negative marker.
+    // Handles: "NOT X", "-X", "without X", "except X", "excluding X"
+    // Also handles conjunctive lists: "excluding X and Y and Z"
 
     let negative_markers = [
         " not ", " -", " without ", " except ", " excluding ",
@@ -116,12 +116,13 @@ fn extract_constraints(query: &str) -> Constraints {
             let abs_pos = search_from + pos;
             let after_marker = abs_pos + marker.len();
             if after_marker < q_lower.len() {
-                // Extract the constraint term(s) after the marker
-                // Take up to 3 words or until next comma/period/conjunction
                 let remaining = &q[after_marker..];
-                let term = extract_constraint_term(remaining);
-                if !term.is_empty() && term.len() > 1 {
-                    negative.push(term);
+                // Extract multiple terms connected by "and"
+                let terms = extract_conjunctive_terms(remaining);
+                for term in terms {
+                    if !term.is_empty() && term.len() > 1 {
+                        negative.push(term);
+                    }
                 }
             }
             search_from = after_marker;
@@ -130,22 +131,35 @@ fn extract_constraints(query: &str) -> Constraints {
 
     // ── Phase 2: Extract positive constraints ──
     // Look for requirement signals in the query
-
     // "for <X>", "with <X>", "that is <X>", "must be <X>"
+    // Stop at negative markers to avoid capturing negated content
+
     let positive_markers = [
         " for ", " with ", " that is ", " that are ", " must be ",
         " must have ", " needs to ", " should be ", " which is ",
         " which are ",
     ];
 
+    let negative_starts = [" not ", " without ", " except ", " excluding ",
+                           " but not ", " other than ", " minus ", " no "];
+
     for marker in &positive_markers {
         if let Some(pos) = q_lower.find(marker) {
             let after = pos + marker.len();
             if after < q_lower.len() {
                 let remaining = &q[after..];
-                let term = extract_constraint_term(remaining);
-                if !term.is_empty() && term.len() > 1 {
-                    positive.push(term);
+                // Stop at the first negative marker
+                let end = negative_starts.iter()
+                    .filter_map(|nm| remaining.to_lowercase().find(nm))
+                    .min()
+                    .unwrap_or(remaining.len());
+                let clean_remaining = &remaining[..end];
+                // Use extract_conjunctive_terms to handle "X and Y" lists
+                let terms = extract_conjunctive_terms(clean_remaining);
+                for term in terms {
+                    if !term.is_empty() && term.len() > 1 {
+                        positive.push(term);
+                    }
                 }
             }
         }
@@ -207,6 +221,33 @@ fn extract_constraints(query: &str) -> Constraints {
     negative.retain(|t| t.len() >= 2 && t.len() <= 50);
 
     Constraints { positive, negative }
+}
+
+/// Extract multiple terms connected by "and" from a negated context.
+/// "mysql and sqlite" → ["mysql", "sqlite"]
+/// "react" → ["react"]
+fn extract_conjunctive_terms(text: &str) -> Vec<String> {
+    let stop_at = [" but ", " or ", " for ", " with ", " that ", " which ", ".", ",", ";",
+                   " not ", " without ", " except ", " excluding ", " minus ", " no "];
+    // Find the end of the negated phrase
+    let end = stop_at.iter()
+        .filter_map(|s| text.to_lowercase().find(s))
+        .min()
+        .unwrap_or(text.len());
+    let phrase = &text[..end];
+
+    // Split on " and " to get individual terms
+    let parts: Vec<&str> = phrase.split(" and ").collect();
+    if parts.len() > 1 {
+        // Multiple terms connected by "and"
+        parts.iter()
+            .map(|p| extract_constraint_term(p))
+            .filter(|t| !t.is_empty())
+            .collect()
+    } else {
+        // Single term
+        vec![extract_constraint_term(phrase)]
+    }
 }
 
 /// Extract a constraint term from the text after a marker.
