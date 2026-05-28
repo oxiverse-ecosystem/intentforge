@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev g++ && rm -rf /va
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
 
-# Now copy the real source and build
+# Now copy the real source and build (CACHE_BUST forces recompilation)
+ARG CACHE_BUST=1
 COPY src ./src
 COPY setup.sh .
 RUN touch src/main.rs && RUSTFLAGS="-C target-cpu=native" cargo build --release

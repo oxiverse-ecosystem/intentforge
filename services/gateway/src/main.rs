@@ -492,16 +492,32 @@ fn constraint_score(
         // For multi-word constraints: match against title + content
         let matched = if neg_words.len() == 1 {
             // Title-first matching for single-word constraints
+            // Check: exact word match, trimmed match, alphanumeric-normalized match,
+            // and also substring match on normalized text for compound terms like "nodejs" containing "node"
             title_lower.split_whitespace().any(|w| {
                 w == neg_lower
                 || w.trim_matches(|c: char| !c.is_alphanumeric()) == neg_lower
-                || w.chars().filter(|c| c.is_alphanumeric()).collect::<String>() == neg_normalized
+                || {
+                    let w_alpha: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                    w_alpha == neg_normalized || w_alpha.contains(&neg_normalized)
+                }
             })
-            || title_normalized.split_whitespace().any(|w| w == neg_normalized)
-            || (neg_normalized.len() >= 5 && title_normalized.contains(&neg_normalized))
+            || title_normalized.split_whitespace().any(|w| {
+                let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                w_clean == neg_normalized || w_clean.contains(&neg_normalized)
+            })
+            // Also check full normalized title as substring fallback (>= 3 chars)
+            || (neg_normalized.len() >= 3 && title_normalized.contains(&neg_normalized))
             // Also check if the term is in the URL path (e.g., github.com/flask)
             || text_lower.split('/').any(|segment| {
-                segment.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase() == neg_lower
+                let seg = segment.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                seg == neg_lower
+                // Also check domain: strip "www." prefix and ".tld" suffix
+                || {
+                    let no_www = seg.strip_prefix("www.").unwrap_or(&seg);
+                    let domain = no_www.split('.').next().unwrap_or(no_www);
+                    domain == neg_lower
+                }
             })
         } else {
             // Multi-word: check title first, then content

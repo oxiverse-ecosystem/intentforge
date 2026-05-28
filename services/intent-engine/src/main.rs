@@ -227,8 +227,12 @@ fn extract_constraints(query: &str) -> Constraints {
 /// "mysql and sqlite" → ["mysql", "sqlite"]
 /// "react" → ["react"]
 fn extract_conjunctive_terms(text: &str) -> Vec<String> {
-    let stop_at = [" but ", " or ", " for ", " with ", " that ", " which ", ".", ",", ";",
-                   " not ", " without ", " except ", " excluding ", " minus ", " no "];
+    // Stop words that terminate the conjunctive chain.
+    // NOTE: "not", "without", "except" etc. are NOT stop words here
+    // because "and not X" is a valid conjunctive negative pattern.
+    let stop_at = [" but ", " or ", " for ", " with ", " that ", " which ",
+                   " not ", " without ", " except ", " excluding ", " other than ",
+                   ".", ",", ";", "?", "!"];
     // Find the end of the negated phrase
     let end = stop_at.iter()
         .filter_map(|s| text.to_lowercase().find(s))
@@ -236,17 +240,30 @@ fn extract_conjunctive_terms(text: &str) -> Vec<String> {
         .unwrap_or(text.len());
     let phrase = &text[..end];
 
+    // Strip leading negative markers from individual parts
+    // so "and not deno" → "deno", "and without X" → "X"
+    let neg_prefixes = ["not ", "no ", "without ", "except ", "excluding ", "minus ", "-"];
+    let strip_neg = |s: &str| -> String {
+        let trimmed = s.trim();
+        for prefix in &neg_prefixes {
+            if trimmed.to_lowercase().starts_with(prefix) {
+                return trimmed[prefix.len()..].trim().to_string();
+            }
+        }
+        trimmed.to_string()
+    };
+
     // Split on " and " to get individual terms
     let parts: Vec<&str> = phrase.split(" and ").collect();
     if parts.len() > 1 {
         // Multiple terms connected by "and"
         parts.iter()
-            .map(|p| extract_constraint_term(p))
+            .map(|p| extract_constraint_term(&strip_neg(p)))
             .filter(|t| !t.is_empty())
             .collect()
     } else {
         // Single term
-        vec![extract_constraint_term(phrase)]
+        vec![extract_constraint_term(&strip_neg(phrase))]
     }
 }
 
