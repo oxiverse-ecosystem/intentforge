@@ -165,6 +165,28 @@ fn extract_constraints(query: &str) -> Constraints {
         }
     }
 
+    // ── Phase 2.5: Extract site: and filetype: as positive constraints ──
+    // These are explicit positive filters the user wants applied
+    for cap in q_lower.match_indices("site:") {
+        let after = cap.0 + 5; // skip "site:"
+        let rest = &q[after..];
+        // Take until next space or end
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let site_val = &rest[..end];
+        if !site_val.is_empty() {
+            positive.push(format!("site:{}", site_val));
+        }
+    }
+    for cap in q_lower.match_indices("filetype:") {
+        let after = cap.0 + 9; // skip "filetype:"
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let ft_val = &rest[..end];
+        if !ft_val.is_empty() {
+            positive.push(format!("filetype:{}", ft_val));
+        }
+    }
+
     // ── Phase 3: Comma-separated constraint list ──
     // "rust framework, async, lightweight, no macros"
     // The first segment is the main query, subsequent ones are constraints.
@@ -232,7 +254,7 @@ fn extract_conjunctive_terms(text: &str) -> Vec<String> {
     // because "and not X" is a valid conjunctive negative pattern.
     let stop_at = [" but ", " or ", " for ", " with ", " that ", " which ",
                    " not ", " without ", " except ", " excluding ", " other than ",
-                   ".", ",", ";", "?", "!"];
+                   ".", ",", ";", "?", "!", " site:", " after:", " before:", " -"];
     // Find the end of the negated phrase
     let end = stop_at.iter()
         .filter_map(|s| text.to_lowercase().find(s))

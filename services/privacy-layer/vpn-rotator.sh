@@ -52,14 +52,20 @@ echo "$(date -u) [vpn-rotator] Intelligent rotator v2 started"
 echo "$(date -u) [vpn-rotator] Rate-limit cooldown: ${MIN_INTERVAL_RATELIMIT}s, Forced: ${MIN_INTERVAL_FORCED}s"
 
 get_current_ip() {
-    wget -qO- --timeout=10 "http://127.0.0.1:8000/v1/publicip/ip" 2>/dev/null | tr -d '[:space:]'
+    local resp=$(wget -qO- --timeout=10 "http://127.0.0.1:8000/v1/publicip/ip" 2>/dev/null)
+    # Extract IP from JSON: {"public_ip":"1.2.3.4",...}
+    echo "$resp" | sed -n 's/.*"public_ip"\s*:\s*"\([^"]*\)".*/\1/p'
 }
 
-# PUT request via wget (busybox wget supports POST which works for Gluetun API)
+# PUT request via nc (netcat) — busybox wget doesn't support PUT
 gluetun_put() {
     local url="$1"
     local data="$2"
-    wget -qO- --timeout=10 --post-data="$data" "$url" > /dev/null 2>&1
+    local host=$(echo "$url" | sed -E 's|https?://([^/:]+).*|\1|')
+    local port=$(echo "$url" | sed -E 's|https?://[^:]+:([0-9]+).*|\1|')
+    local path=$(echo "$url" | sed -E 's|https?://[^/]+(/.*)|\1|')
+    [ -z "$path" ] && path="/"
+    printf "PUT %s HTTP/1.0\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"         "$path" "$host" "${#data}" "$data" | nc -w 10 "$host" "$port" > /dev/null 2>&1
 }
 
 # Count rate-limit events in the sliding window

@@ -572,16 +572,37 @@ fn constraint_score(
 // The vpn-rotator container watches this file.
 
 fn trigger_vpn_rotation(reason: &str) {
-    // Write signal to shared bind-mount directory
+    tracing::info!("VPN rotation triggered: {}", reason);
+    // Write signal to shared bind-mount directory (legacy, for vpn-rotator script)
     let signal_dir = "/tmp/vpn-signals";
     let signal_path = format!("{}/rotate_signal", signal_dir);
-    // Ensure directory exists
     let _ = std::fs::create_dir_all(signal_dir);
-    if let Err(e) = std::fs::write(&signal_path, reason) {
-        tracing::warn!("Failed to write VPN rotation signal: {:?}", e);
-    } else {
-        tracing::info!("VPN rotation signal written: {}", reason);
-    }
+    let _ = std::fs::write(&signal_path, reason);
+    // Direct VPN control via Gluetun API (gateway shares gluetun's network namespace)
+    std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::new();
+        // Stop VPN
+        let _ = client.put("http://127.0.0.1:8000/v1/vpn/status")
+            .json(&serde_json::json!({"status": "stopped"}))
+            .timeout(std::time::Duration::from_secs(10))
+            .send();
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        // Start VPN
+        let _ = client.put("http://127.0.0.1:8000/v1/vpn/status")
+            .json(&serde_json::json!({"status": "running"}))
+            .timeout(std::time::Duration::from_secs(10))
+            .send();
+        std::thread::sleep(std::time::Duration::from_secs(15));
+        // Verify new IP
+        if let Ok(resp) = client.get("http://127.0.0.1:8000/v1/publicip/ip")
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+        {
+            if let Ok(ip) = resp.text() {
+                tracing::info!("VPN rotated, new IP info: {}", ip);
+            }
+        }
+    });
 }
 
 // ─── Simple Stemming (English Plurals) ──────────────────────────────
@@ -1339,7 +1360,9 @@ async fn handle_search(
         let neg_triggers = ["not", "except", "without", "excluding", "other", "than"];
         words.retain(|w| {
             let w_lower = w.to_lowercase();
-            !neg_terms.contains(&w_lower) && !neg_triggers.contains(&w_lower.as_str())
+            // Strip leading dash for comparison: "-snake" → "snake"
+            let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower).to_string();
+            !neg_terms.contains(&w_stripped) && !neg_terms.contains(&w_lower) && !neg_triggers.contains(&w_stripped.as_str()) && !neg_triggers.contains(&w_lower.as_str())
         });
         words.join(" ")
     }).filter(|q| q.split_whitespace().count() >= 2).collect();
@@ -1741,15 +1764,22 @@ async fn handle_search(
         );
     }
     // Filter out results with very low semantic relevance using adaptive threshold
+    // Always keep top 5 results regardless of threshold (fallback for single-engine scenarios)
     let semantic_threshold = if web_results.len() > 30 { 0.25 }
         else if web_results.len() > 20 { 0.20 }
         else { 0.15 };
-    let mut _idx = 0;
-    web_results.retain(|_| {
-        let keep = semantic_scores[_idx] >= semantic_threshold;
-        _idx += 1;
-        keep
-    });
+    let mut keep_indices: Vec<usize> = Vec::new();
+    for (i, &score) in semantic_scores.iter().enumerate() {
+        if score >= semantic_threshold || i < 5 {
+            keep_indices.push(i);
+        }
+    }
+    if keep_indices.is_empty() && !web_results.is_empty() {
+        // Shouldn't happen (top 5 always kept), but safety fallback
+        keep_indices = (0..web_results.len().min(5)).collect();
+    }
+    let filtered: Vec<_> = keep_indices.into_iter().map(|i| web_results[i].clone()).collect();
+    web_results = filtered;
     web_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     // Normalize web scores to [0, 1] for cross-query comparability
