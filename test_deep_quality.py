@@ -138,10 +138,11 @@ async def deep_audit_query(session, query, expected_terms, neg_constraints=None)
             "error": "Request failed or timed out",
         }
 
-    intent_data = data.get("intent", {})
+    intent_val = data.get("intent", "?")
+    confidence_val = data.get("confidence", 0)
     web_results = data.get("web_results", [])
     local_results = data.get("local_results", [])
-    constraints = intent_data.get("structured_constraints", {})
+    constraints = data.get("structured_constraints", {})
 
     # Check top 5 results in detail
     results_to_check = web_results[:5]
@@ -164,13 +165,13 @@ async def deep_audit_query(session, query, expected_terms, neg_constraints=None)
         "query": query,
         "status": "OK" if web_results else "EMPTY",
         "elapsed_ms": round(elapsed_ms, 0),
-        "intent": intent_data.get("intent", "?"),
-        "confidence": round(intent_data.get("confidence", 0), 2),
+        "intent": intent_val,
+        "confidence": round(confidence_val, 2),
         "num_web": len(web_results),
         "num_local": len(local_results),
         "positive_constraints": constraints.get("positive", []),
         "negative_constraints": constraints.get("negative", []),
-        "expanded_queries": intent_data.get("expanded_queries", [])[:3],
+        "expanded_queries": data.get("expanded_queries", [])[:3],
         "avg_relevance": round(avg_relevance, 2),
         "terms_coverage": sorted(list(terms_coverage)),
         "neg_violations": neg_violations,

@@ -1305,6 +1305,7 @@ struct AppState {
     circuit: CircuitBreaker,
     cache: SearchCache,
     rate_limits: RateLimitTracker,
+    http_client: reqwest::Client,
 }
 
 #[tokio::main]
@@ -1315,6 +1316,12 @@ async fn main() {
         circuit: CircuitBreaker::new(),
         cache: SearchCache::new(),
         rate_limits: RateLimitTracker::new(),
+        http_client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .pool_max_idle_per_host(10)
+            .build()
+            .unwrap(),
     });
 
     let app = Router::new()
@@ -1341,13 +1348,8 @@ async fn handle_search(
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
         return Json(value);
     }
-    // Timeout HTTP client — 10s for meta-search (SearXNG aggregates multiple engines)
-    // Results are cached for 5 min, so this hit only happens once per query
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .build()
-        .unwrap();
+    // Use shared HTTP client from AppState (connection pooling across requests)
+    let client = state.http_client.clone();
 
     let q = params.q.clone();
     let q_encoded = urlencoding::encode(&q);
@@ -1516,9 +1518,9 @@ async fn handle_search(
                         tracing::info!("Skipping retry for malformed query (alpha_ratio={:.2}, len={})", alpha_ratio, q_decoded.len());
                         return Ok(SearxResponse { results: vec![] });
                     }
-                    // Retry once after 2s for legitimate queries that returned 0 results
-                    tracing::warn!("SearXNG returned 0 results, retrying in 2s...");
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // Retry once after 1s for legitimate queries that returned 0 results
+                    tracing::warn!("SearXNG returned 0 results, retrying in 1s...");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     let retry: Result<SearxResponse, reqwest::Error> = async {
                         let resp = client_ref.get(&url).send().await?;
                         let status = resp.status();

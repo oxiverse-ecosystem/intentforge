@@ -101,12 +101,11 @@ def run_query(query: str, name: str = "") -> TestResult:
         if resp.status_code == 200:
             data = resp.json()
             result.raw_response = data
-            intent = data.get("intent", {})
-            result.intent = intent.get("intent", "unknown")
-            result.confidence = intent.get("confidence", 0.0)
-            result.constraints_positive = intent.get("structured_constraints", {}).get("positive", [])
-            result.constraints_negative = intent.get("structured_constraints", {}).get("negative", [])
-            result.expanded_queries = intent.get("expanded_queries", [])
+            result.intent = data.get("intent", "unknown")
+            result.confidence = data.get("confidence", 0.0)
+            result.constraints_positive = data.get("structured_constraints", {}).get("positive", [])
+            result.constraints_negative = data.get("structured_constraints", {}).get("negative", [])
+            result.expanded_queries = data.get("expanded_queries", [])
             result.num_web_results = len(data.get("web_results", []))
             result.num_local_results = len(data.get("local_results", []))
         else:

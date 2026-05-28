@@ -5,6 +5,8 @@ services:
     container_name: searxng
     image: searxng/searxng:latest
     network_mode: "container:gluetun"
+    environment:
+      - GRANIAN_WORKERS=4
     volumes:
       - ./searxng:/etc/searxng:rw
     restart: always
