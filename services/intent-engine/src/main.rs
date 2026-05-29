@@ -112,6 +112,28 @@ fn extract_constraints(query: &str) -> Constraints {
         " instead of ", " replacement for ",
     ];
 
+    // Also match negative markers at the start of the query (no leading space)
+    // For "not django web framework", extract just "django" as negative,
+    // not the entire phrase. The rest is context for the search.
+    let negative_start_markers = [
+        "not ", "- ", "without ", "except ", "excluding ",
+        "minus ", "no ",
+    ];
+
+    // Process start-of-string markers first
+    for marker in &negative_start_markers {
+        if q_lower.starts_with(marker) {
+            let remaining = &q[marker.len()..];
+            // Take only the first 1-2 words as the negative term
+            // (not the whole remaining query)
+            let term = extract_constraint_term(remaining);
+            if !term.is_empty() && term.len() > 1 {
+                negative.push(term);
+            }
+            break; // only one start marker can match
+        }
+    }
+
     for marker in &negative_markers {
         let mut search_from = 0;
         while let Some(pos) = q_lower[search_from..].find(marker) {
@@ -558,11 +580,21 @@ fn classify_by_centroids(query_embedding: &[f32], centroids: &[Vec<f32>]) -> (St
 
 // ─── Query Expansion (Dynamic, Not Hardcoded) ────────────────────────
 
-fn expand_queries(query: &str, intent: &str) -> Vec<String> {
+fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<String> {
     let q = query.trim();
     let q_lower = q.to_lowercase();
     let words: Vec<&str> = q_lower.split_whitespace().collect();
     let mut expansions = vec![q.to_string()]; // always include original
+
+    // Build set of negative constraint terms to exclude from expansions
+    // "not django" should NOT generate "django documentation" as an expansion
+    let neg_set: std::collections::HashSet<String> = constraints.negative.iter()
+        .map(|n| n.to_lowercase())
+        .collect();
+    let neg_triggers: std::collections::HashSet<&str> = [
+        "not", "no", "without", "except", "excluding", "but", "minus",
+        "other", "than", "alternative", "alternatives", "instead",
+    ].iter().copied().collect();
 
     let core = extract_core_topic(&q_lower, intent);
     let core_trimmed = core.trim();
@@ -574,6 +606,12 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
                 let howto_stop = ["a","an","the","to","for","in","on","of","and","or","is","are","with","from","by"];
                 let topic_words: Vec<&str> = core_trimmed.split_whitespace()
                     .filter(|w| w.len() > 1 && !howto_stop.contains(w) && !w.parse::<f64>().is_ok())
+                    .filter(|w| {
+                        let w_lower = w.to_lowercase();
+                        let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower);
+                        !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
+                            && !neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str())
+                    })
                     .collect();
                 if topic_words.len() >= 2 {
                     // Cap at 5 words to keep queries concise for SearXNG
@@ -617,6 +655,13 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
                         "not","no","but","minus"];
             let topic_words: Vec<&str> = words.iter()
                 .filter(|w| w.len() > 2 && !stop.contains(w))
+                .filter(|w| {
+                    // Filter out negative constraint terms from expansions
+                    let w_lower = w.to_lowercase();
+                    let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower);
+                    !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
+                        && !neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str())
+                })
                 .copied()
                 .collect();
             if topic_words.len() >= 2 {
@@ -643,7 +688,13 @@ fn expand_queries(query: &str, intent: &str) -> Vec<String> {
             let mut core_words: Vec<&str> = Vec::new();
             for w in &words {
                 if !temporal.iter().any(|t| *t == *w) && w.len() > 2 {
-                    core_words.push(w);
+                    let w_lower = w.to_lowercase();
+                    let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower);
+                    if !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
+                        && !neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str())
+                    {
+                        core_words.push(w);
+                    }
                 }
             }
             if !core_words.is_empty() {
@@ -881,7 +932,7 @@ async fn analyze_query(
 
     let result = if let Some(rule_match) = rule_based_classify(&params.q) {
         tracing::info!("Layer 1 (rules) -> {} (conf: {:.2})", rule_match.intent, rule_match.confidence);
-        let expanded = expand_queries(&params.q, rule_match.intent);
+        let expanded = expand_queries(&params.q, rule_match.intent, &structured);
         tracing::info!("Expanded to {} query variations", expanded.len());
         IntentResponse {
             query: params.q.clone(),
@@ -898,7 +949,7 @@ async fn analyze_query(
             Some(query_embedding) => {
                 let (intent, confidence) = classify_by_centroids(&query_embedding, &state.category_centroids);
                 tracing::info!("Layer 2 (centroids) -> {} (conf: {:.2})", intent, confidence);
-                let expanded = expand_queries(&params.q, &intent);
+                let expanded = expand_queries(&params.q, &intent, &structured);
                 tracing::info!("Expanded to {} query variations", expanded.len());
                 IntentResponse {
                     query: params.q.clone(),

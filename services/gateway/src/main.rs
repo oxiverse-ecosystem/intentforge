@@ -715,11 +715,12 @@ fn constraint_score(
         }
         // Coverage: fraction of positive constraints matched
         let coverage = matched as f32 / constraints.positive.len() as f32;
-        // Scale: 0% coverage = 0.5x, 100% coverage = 1.3x
-        score *= 0.5 + coverage * 0.8;
+        // Scale: 0% coverage = 0.3x (penalty), 100% coverage = 1.8x (strong boost)
+        // This ensures results matching user-specified requirements rank prominently
+        score *= 0.3 + coverage * 1.5;
     }
 
-    score.clamp(0.0, 1.5)
+    score.clamp(0.0, 2.0)
 }
 
 // ─── VPN Signal Writer ──────────────────────────────────────────────
@@ -922,13 +923,15 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
 
 fn consensus_score(sources: &[String]) -> f32 {
     if sources.is_empty() {
-        return 0.3; // single-source result
+        return 0.2; // single-source result — lowest confidence
     }
     let unique_sources: std::collections::HashSet<&String> = sources.iter().collect();
     let count = unique_sources.len() as f32;
-    // Logarithmic scaling: 1 source = 0.3, 2 = 0.55, 3 = 0.7, 4+ = 0.85+
-    // This prevents runaway boosts while still rewarding cross-source agreement
-    (0.3 + 0.2 * (count - 1.0).max(0.0).ln()).clamp(0.3, 0.95)
+    // Logarithmic scaling with proper differentiation:
+    // 1 source = 0.20, 2 = 0.41, 3 = 0.53, 4 = 0.62, 5 = 0.68
+    // Multi-source agreement is the strongest quality signal — if Bing,
+    // Brave, Whoogle, and the local index all agree, the result is gold.
+    (0.2 + 0.3 * count.ln()).clamp(0.2, 1.0)
 }
 
 // ─── Multi-Signal Fusion ─────────────────────────────────────────────
@@ -949,70 +952,70 @@ impl RankingWeights {
     fn for_intent(intent: &str) -> Self {
         match intent {
             "fresh" => Self {
-                rrf: 0.07,
+                rrf: 0.06,
                 intent: 0.04,
-                freshness: 0.18,
-                authority: 0.13,
+                freshness: 0.16,
+                authority: 0.10,
                 local_bonus: 0.02,
                 quality: 0.08,
-                semantic: 0.22,
-                consensus: 0.13,
-                constraint: 0.13,
-            },
-            "technical" => Self {
-                rrf: 0.08,
-                intent: 0.10,
-                freshness: 0.04,
-                authority: 0.12,
-                local_bonus: 0.04,
-                quality: 0.06,
-                semantic: 0.30,
-                consensus: 0.08,
-                constraint: 0.18,
-            },
-            "navigational" => Self {
-                rrf: 0.04,
-                intent: 0.20,
-                freshness: 0.03,
-                authority: 0.18,
-                local_bonus: 0.02,
-                quality: 0.04,
-                semantic: 0.25,
-                consensus: 0.08,
+                semantic: 0.20,
+                consensus: 0.18,
                 constraint: 0.16,
             },
-            "comparison" => Self {
-                rrf: 0.10,
+            "technical" => Self {
+                rrf: 0.07,
                 intent: 0.08,
-                freshness: 0.08,
-                authority: 0.06,
-                local_bonus: 0.02,
-                quality: 0.10,
-                semantic: 0.25,
-                consensus: 0.13,
-                constraint: 0.18,
-            },
-            "how-to" => Self {
-                rrf: 0.08,
-                intent: 0.08,
-                freshness: 0.06,
-                authority: 0.06,
+                freshness: 0.03,
+                authority: 0.10,
                 local_bonus: 0.04,
-                quality: 0.08,
+                quality: 0.06,
                 semantic: 0.28,
                 consensus: 0.14,
-                constraint: 0.18,
+                constraint: 0.20,
             },
-            _ => Self {  // informational, default
+            "navigational" => Self {
+                rrf: 0.03,
+                intent: 0.18,
+                freshness: 0.02,
+                authority: 0.15,
+                local_bonus: 0.02,
+                quality: 0.04,
+                semantic: 0.22,
+                consensus: 0.12,
+                constraint: 0.22,
+            },
+            "comparison" => Self {
                 rrf: 0.08,
                 intent: 0.06,
                 freshness: 0.06,
-                authority: 0.08,
-                local_bonus: 0.04,
+                authority: 0.05,
+                local_bonus: 0.02,
                 quality: 0.08,
+                semantic: 0.22,
+                consensus: 0.18,
+                constraint: 0.25,
+            },
+            "how-to" => Self {
+                rrf: 0.06,
+                intent: 0.06,
+                freshness: 0.04,
+                authority: 0.05,
+                local_bonus: 0.04,
+                quality: 0.06,
                 semantic: 0.26,
-                consensus: 0.16,
-                constraint: 0.18,
+                consensus: 0.18,
+                constraint: 0.25,
+            },
+            _ => Self {  // informational, default
+                rrf: 0.06,
+                intent: 0.05,
+                freshness: 0.05,
+                authority: 0.06,
+                local_bonus: 0.03,
+                quality: 0.07,
+                semantic: 0.24,
+                consensus: 0.20,
+                constraint: 0.24,
             },
         }
     }
@@ -1116,17 +1119,32 @@ fn normalize_scores(scores: &mut [f32]) {
     let max_score = indexed[n - 1].1;
     let total_range = max_score - min_score;
 
-    // Use min-max normalization over the full range to preserve relative
-    // differences at the top (percentile-based was clamping top results to 1.0)
+    // Use min-max normalization with p95 as effective max to preserve
+    // granularity among top results. Results above p95 get compressed
+    // into [0.95, 1.0] band instead of all clustering at 1.0.
     if total_range < 0.01 {
         // All scores nearly identical — use rank-based to force spread
         for (rank, &(orig_idx, _)) in indexed.iter().enumerate() {
             scores[orig_idx] = (rank as f32) / ((n - 1) as f32);
         }
     } else {
-        // Min-max normalization: best result = 1.0, worst = 0.0, others proportional
+        // Use 95th percentile as the "effective max" — this prevents top
+        // results from all clustering at 1.0 while still mapping the best
+        // results to a high score.
+        let p95_idx = ((n as f32 * 0.95) as usize).min(n - 1);
+        let p95 = indexed[p95_idx].1;
+        let effective_range = (p95 - min_score).max(0.01);
+
         for score in scores.iter_mut() {
-            *score = ((*score - min_score) / total_range).clamp(0.0, 1.0);
+            let raw = (*score - min_score) / effective_range;
+            if raw > 1.0 {
+                // Above p95: compress into [0.95, 1.0] band
+                // This gives top results visible spread instead of all being 1.0
+                let excess = (raw - 1.0).min(1.0); // cap excess at 1.0
+                *score = 0.95 + excess * 0.05;
+            } else {
+                *score = raw.clamp(0.0, 0.95);
+            }
         }
     }
 }
@@ -1889,13 +1907,38 @@ async fn main() {
 async fn handle_search(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
-) -> Json<serde_json::Value> {
-    // 0. Check cache first (5-min TTL)
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    // 0. Validate query — reject empty or whitespace-only queries
+    let q_trimmed = params.q.trim();
+    if q_trimmed.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Missing or empty query parameter 'q'",
+                "results": [],
+                "count": 0,
+            })),
+        );
+    }
+    // Reject queries that are only special characters (no alphanumeric content)
+    let alpha_count = q_trimmed.chars().filter(|c| c.is_alphanumeric()).count();
+    if alpha_count == 0 {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Query must contain at least one alphanumeric character",
+                "results": [],
+                "count": 0,
+            })),
+        );
+    }
+
+    // 0b. Check cache first (5-min TTL)
     let cache_key = format!("{}:{}", params.q.to_lowercase().trim(), "all");
     if let Some(cached) = state.cache.get(&cache_key) {
         tracing::info!("Cache hit for query: {}", params.q);
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return Json(value);
+        return (axum::http::StatusCode::OK, Json(value));
     }
     // Use shared HTTP client from AppState (connection pooling across requests)
     let client = state.http_client.clone();
@@ -2569,7 +2612,7 @@ async fn handle_search(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({})))
+    (axum::http::StatusCode::OK, Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({}))))
 }
 
 fn fallback_intent(q: &str) -> IntentResponse {
