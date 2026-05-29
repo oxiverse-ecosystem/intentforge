@@ -11,6 +11,13 @@ use std::time::{Duration, Instant};
 
 // ─── API Types ───────────────────────────────────────────────────────
 
+// Helper: deserialize null/missing string fields as empty String
+fn deserialize_null_as_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where D: serde::Deserializer<'de> {
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 struct SearchParams {
     q: String,
@@ -96,16 +103,21 @@ struct IndexerResult {
 // ─── Image Result (from SearXNG categories=images) ────────────────
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct SearxImageResult {
+    #[serde(deserialize_with = "deserialize_null_as_default")]
     title: String,
+    #[serde(deserialize_with = "deserialize_null_as_default")]
     url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     img_src: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     thumbnail: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    thumbnail_src: String,
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     content: String,
+    #[serde(deserialize_with = "deserialize_null_as_default")]
     engine: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     source: String,
 }
 
@@ -117,13 +129,16 @@ struct SearxImageResponse {
 // ─── News Result (from SearXNG categories=news) ───────────────────
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct SearxNewsResult {
+    #[serde(deserialize_with = "deserialize_null_as_default")]
     title: String,
+    #[serde(deserialize_with = "deserialize_null_as_default")]
     url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     content: String,
+    #[serde(deserialize_with = "deserialize_null_as_default")]
     engine: String,
     #[serde(default, alias = "publishedDate")]
-    published_date: String,
+    published_date: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1642,20 +1657,34 @@ async fn handle_images(
     );
 
     let results: Vec<ImageResult> = match state.http_client.get(&searx_url).send().await {
-        Ok(resp) => match resp.json::<SearxImageResponse>().await {
-            Ok(data) => data.results.into_iter().map(|r| ImageResult {
-                title: r.title,
-                url: r.url,
-                image_url: if r.img_src.is_empty() { r.thumbnail.clone() } else { r.img_src },
-                thumbnail_url: r.thumbnail,
-                description: r.content,
-                source: r.engine,
-            }).collect(),
+        Ok(resp) => match resp.text().await {
+            Ok(raw) => {
+                let sanitized = sanitize_json_text(&raw);
+                match serde_json::from_str::<SearxImageResponse>(&sanitized) {
+                    Ok(data) => data.results.into_iter().map(|r| {
+                        let thumb = if !r.thumbnail.is_empty() { r.thumbnail.clone() }
+                            else if !r.thumbnail_src.is_empty() { r.thumbnail_src.clone() }
+                            else { r.source.clone() };
+                        ImageResult {
+                            title: r.title,
+                            url: r.url,
+                            image_url: if r.img_src.is_empty() { thumb.clone() } else { r.img_src },
+                            thumbnail_url: thumb,
+                            description: r.content,
+                            source: r.engine,
+                        }
+                    }).collect(),
+                    Err(e) => {
+                        tracing::warn!("SearXNG image parse error: {}", e);
+                        vec![]
+                    }
+                }
+            }
             Err(e) => {
-                tracing::warn!("SearXNG image parse error: {}", e);
+                tracing::warn!("SearXNG image body read error: {}", e);
                 vec![]
             }
-        },
+        }
         Err(e) => {
             tracing::warn!("SearXNG image request error: {}", e);
             vec![]
@@ -1753,19 +1782,28 @@ async fn handle_news(
     );
 
     let results: Vec<NewsResult> = match state.http_client.get(&searx_url).send().await {
-        Ok(resp) => match resp.json::<SearxNewsResponse>().await {
-            Ok(data) => data.results.into_iter().map(|r| NewsResult {
-                title: r.title,
-                url: r.url,
-                description: r.content,
-                published_at: r.published_date,
-                source: r.engine,
-            }).collect(),
+        Ok(resp) => match resp.text().await {
+            Ok(raw) => {
+                let sanitized = sanitize_json_text(&raw);
+                match serde_json::from_str::<SearxNewsResponse>(&sanitized) {
+                    Ok(data) => data.results.into_iter().map(|r| NewsResult {
+                        title: r.title,
+                        url: r.url,
+                        description: r.content,
+                        published_at: r.published_date.unwrap_or_default(),
+                        source: r.engine,
+                    }).collect(),
+                    Err(e) => {
+                        tracing::warn!("SearXNG news parse error: {}", e);
+                        vec![]
+                    }
+                }
+            }
             Err(e) => {
-                tracing::warn!("SearXNG news parse error: {}", e);
+                tracing::warn!("SearXNG news body read error: {}", e);
                 vec![]
             }
-        },
+        }
         Err(e) => {
             tracing::warn!("SearXNG news request error: {}", e);
             vec![]
