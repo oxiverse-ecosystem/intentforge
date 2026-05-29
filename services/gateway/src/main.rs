@@ -93,6 +93,81 @@ struct IndexerResult {
     content: String,
 }
 
+// ─── Image Result (from SearXNG categories=images) ────────────────
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SearxImageResult {
+    title: String,
+    url: String,
+    #[serde(default)]
+    img_src: String,
+    #[serde(default)]
+    thumbnail: String,
+    #[serde(default)]
+    content: String,
+    engine: String,
+    #[serde(default)]
+    source: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SearxImageResponse {
+    results: Vec<SearxImageResult>,
+}
+
+// ─── News Result (from SearXNG categories=news) ───────────────────
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SearxNewsResult {
+    title: String,
+    url: String,
+    #[serde(default)]
+    content: String,
+    engine: String,
+    #[serde(default, alias = "publishedDate")]
+    published_date: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SearxNewsResponse {
+    results: Vec<SearxNewsResult>,
+}
+
+// ─── API Response Shapes ──────────────────────────────────────────
+#[derive(Serialize)]
+struct ImageResult {
+    title: String,
+    url: String,
+    image_url: String,
+    thumbnail_url: String,
+    #[serde(default)]
+    description: String,
+    source: String,
+}
+
+#[derive(Serialize)]
+struct VideoResult {
+    title: String,
+    url: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    video_id: String,
+    #[serde(default)]
+    thumbnail: String,
+    #[serde(default)]
+    source: String,
+}
+
+#[derive(Serialize)]
+struct NewsResult {
+    title: String,
+    url: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    published_at: String,
+    source: String,
+}
+
 // ─── Merged Result (Unified Local + Web) ─────────────────────────────
 // A single result type that can come from local index, web search, or both.
 // When a URL appears in both sources, sources are merged and consensus boost applied.
