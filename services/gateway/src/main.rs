@@ -1564,10 +1564,24 @@ async fn main() {
             .unwrap(),
     });
 
+    // Prewarm: fire dummy queries to warm up SearXNG engine connections + intent engine.
+    // Without this, the first real query takes 4-5s extra for cold start.
+    let prewarm_client = state.http_client.clone();
+    tokio::spawn(async move {
+        tracing::info!("Prewarming SearXNG + intent engine...");
+        let _ = tokio::join!(
+            prewarm_client.get("http://127.0.0.1:8080/search?q=warmup&format=json&pageno=1").send(),
+            prewarm_client.get("http://127.0.0.1:3005/analyze?q=warmup").send(),
+            prewarm_client.get("http://127.0.0.1:3005/embed?text=warmup").send(),
+        );
+        tracing::info!("Prewarm complete");
+    });
+
     let app = Router::new()
         .route("/", get(|| async { "IntentForge-v2 Gateway" }))
         .route("/health", get(|| async { "OK" }))
         .route("/search", get(handle_search))
+        .route("/search/fast", get(handle_search_fast))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
@@ -1682,12 +1696,17 @@ async fn handle_search(
         indexer_query.push_str("&freshness_boost=true");
     }
 
-    // Build SearXNG URLs for expanded queries (max 2 variations)
-    // 4 queries × 2.2s each through VPN = 8.8s, hitting the 10s timeout.
-    // 2 queries × 2.2s = 4.4s, well within budget.
+    // Build SearXNG URLs for expanded queries
+    // Dynamic fan-out: 1 query for simple/freshness intents (saves 1-3s),
+    // 2 queries only for complex/constrained/comparison intents where recall matters.
+    let searx_fanout = match intent.intent.as_str() {
+        "comparison" | "transactional" if intent.structured_constraints.negative.len() > 0 => 2,
+        _ => 1,
+    };
+    tracing::info!("SearXNG fan-out: {} query(s) for intent '{}'", searx_fanout, intent.intent);
     // Preprocess queries to strip trigger words that cause dictionary/shopping results
     // For freshness queries, add time_range parameter to get recent results
-    let searx_urls: Vec<String> = expanded_queries.iter().take(2).map(|eq| {
+    let searx_urls: Vec<String> = expanded_queries.iter().take(searx_fanout).map(|eq| {
         let clean_eq = preprocess_searxng_query(eq);
         let mut url = format!("http://127.0.0.1:8080/search?q={}&format=json&pageno=1", urlencoding::encode(&clean_eq));
         if is_freshness_query {
@@ -2151,4 +2170,60 @@ fn fallback_intent(q: &str) -> IntentResponse {
         structured_constraints: Constraints::default(),
         expanded_queries: vec![q.to_string()],
     }
+}
+
+// ─── Fast Search: Local Index Only (~100ms) ───────────────────────
+// Returns only local index results. No SearXNG, no intent analysis.
+// Frontend can call this + /search in parallel for instant feedback.
+
+async fn handle_search_fast(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> Json<serde_json::Value> {
+    let q = params.q.clone();
+    let q_encoded = urlencoding::encode(&q);
+
+    // Check cache first
+    let cache_key = format!("fast:{}", q.to_lowercase().trim());
+    if let Some(cached) = state.cache.get(&cache_key) {
+        let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
+        return Json(value);
+    }
+
+    // Query local index only — no network calls except to indexer
+    let indexer_url = format!("http://127.0.0.1:6000/search?q={}", q_encoded);
+    let results = match state.http_client.get(&indexer_url).send().await {
+        Ok(resp) => {
+            match resp.json::<Vec<IndexerResult>>().await {
+                Ok(indexer_results) => {
+                    // Convert to MergedResult format
+                    indexer_results.into_iter().map(|r| MergedResult {
+                        url: r.url,
+                        title: r.title,
+                        content: r.content,
+                        score: r.score,
+                        authority: r.authority,
+                        sources: vec!["local".to_string()],
+                        is_local: true,
+                    }).collect::<Vec<_>>()
+                }
+                Err(_) => vec![]
+            }
+        }
+        Err(_) => vec![]
+    };
+
+    let response = serde_json::json!({
+        "source": "local",
+        "results": results,
+        "count": results.len(),
+    });
+
+    // Cache for 5 minutes
+    let response_json = serde_json::to_string(&response).unwrap_or_default();
+    if !results.is_empty() {
+        state.cache.put(cache_key, response_json, Duration::from_secs(300));
+    }
+
+    Json(response)
 }
