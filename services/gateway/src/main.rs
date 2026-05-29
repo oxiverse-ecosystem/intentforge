@@ -1623,6 +1623,59 @@ struct AppState {
     http_client: reqwest::Client,
 }
 
+async fn handle_images(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> Json<serde_json::Value> {
+    let q = params.q.clone();
+    let q_encoded = urlencoding::encode(&q);
+
+    let cache_key = format!("images:{}", q.to_lowercase().trim());
+    if let Some(cached) = state.cache.get(&cache_key) {
+        let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
+        return Json(value);
+    }
+
+    let searx_url = format!(
+        "http://127.0.0.1:8080/search?q={}&format=json&categories=images&pageno=1",
+        q_encoded
+    );
+
+    let results: Vec<ImageResult> = match state.http_client.get(&searx_url).send().await {
+        Ok(resp) => match resp.json::<SearxImageResponse>().await {
+            Ok(data) => data.results.into_iter().map(|r| ImageResult {
+                title: r.title,
+                url: r.url,
+                image_url: if r.img_src.is_empty() { r.thumbnail.clone() } else { r.img_src },
+                thumbnail_url: r.thumbnail,
+                description: r.content,
+                source: r.engine,
+            }).collect(),
+            Err(e) => {
+                tracing::warn!("SearXNG image parse error: {}", e);
+                vec![]
+            }
+        },
+        Err(e) => {
+            tracing::warn!("SearXNG image request error: {}", e);
+            vec![]
+        }
+    };
+
+    let response = serde_json::json!({
+        "results": results,
+        "count": results.len(),
+        "query": q,
+    });
+
+    let response_json = serde_json::to_string(&response).unwrap_or_default();
+    if !results.is_empty() {
+        state.cache.put(cache_key, response_json, Duration::from_secs(300));
+    }
+
+    Json(response)
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -1657,6 +1710,7 @@ async fn main() {
         .route("/health", get(|| async { "OK" }))
         .route("/search", get(handle_search))
         .route("/search/fast", get(handle_search_fast))
+        .route("/images", get(handle_images))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
