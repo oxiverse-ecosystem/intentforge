@@ -2153,12 +2153,66 @@ async fn handle_search(
         })
     };
 
-    // Join all futures: indexer + all SearXNG variations + whoogle + invidious
-    let (indexer_res, searx_results, whoogle_res, invidious_res) = tokio::join!(
+    // Conditional media fan-out based on intent
+    let q_lower = q.to_lowercase();
+    let is_news_intent = intent.intent.contains("news")
+        || intent.intent.contains("fresh")
+        || q_lower.contains("news")
+        || q_lower.contains("latest");
+    let is_image_intent = intent.intent.contains("image")
+        || intent.intent.contains("visual")
+        || q_lower.contains("image")
+        || q_lower.contains("photo")
+        || q_lower.contains("picture");
+
+    let news_fut = async {
+        if !is_news_intent || searx_open {
+            return Ok(SearxNewsResponse { results: vec![] }) as Result<SearxNewsResponse, anyhow::Error>;
+        }
+        let news_url = format!(
+            "http://127.0.0.1:8080/search?q={}&format=json&categories=news&pageno=1",
+            q_encoded
+        );
+        let resp = client_ref.get(&news_url).send().await?;
+        let raw = resp.text().await.unwrap_or_default();
+        let sanitized = sanitize_json_text(&raw);
+        match serde_json::from_str::<SearxNewsResponse>(&sanitized) {
+            Ok(data) => Ok(data),
+            Err(e) => {
+                tracing::warn!("SearXNG news fan-out parse error: {}", e);
+                Ok(SearxNewsResponse { results: vec![] })
+            }
+        }
+    };
+
+    let image_fut = async {
+        if !is_image_intent || searx_open {
+            return Ok(SearxImageResponse { results: vec![] }) as Result<SearxImageResponse, anyhow::Error>;
+        }
+        let image_url = format!(
+            "http://127.0.0.1:8080/search?q={}&format=json&categories=images&pageno=1",
+            q_encoded
+        );
+        let resp = client_ref.get(&image_url).send().await?;
+        let raw = resp.text().await.unwrap_or_default();
+        let sanitized = sanitize_json_text(&raw);
+        match serde_json::from_str::<SearxImageResponse>(&sanitized) {
+            Ok(data) => Ok(data),
+            Err(e) => {
+                tracing::warn!("SearXNG image fan-out parse error: {}", e);
+                Ok(SearxImageResponse { results: vec![] })
+            }
+        }
+    };
+
+    // Join all futures: indexer + all SearXNG variations + whoogle + invidious + media
+    let (indexer_res, searx_results, whoogle_res, invidious_res, news_res, image_res) = tokio::join!(
         indexer_fut,
         futures::future::join_all(searx_futs),
         whoogle_fut,
-        invidious_fut
+        invidious_fut,
+        news_fut,
+        image_fut,
     );
 
     // 4. Process Local Results
@@ -2272,6 +2326,68 @@ async fn handle_search(
         Err(e) => {
             tracing::warn!("Invidious request failed/timed out: {:?}", e);
             circuit_ref.record_failure("invidious");
+        }
+    }
+
+    // Add news results to web results (if news intent detected)
+    if is_news_intent {
+        match news_res {
+            Ok(news_data) => {
+                tracing::info!("News fan-out returned {} results", news_data.results.len());
+                for (pos, r) in news_data.results.into_iter().enumerate() {
+                    let normalized = {
+                        let lower = r.url.to_lowercase();
+                        let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                        let no_trailing = no_fragment.trim_end_matches('/');
+                        let no_www = no_trailing.replacen("://www.", "://", 1);
+                        strip_tracking_params(&no_www)
+                    };
+                    let rrf_contrib = 1.0 / (60.0 + (pos + 1) as f32);
+                    *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
+                    web_results.push(SearxResult {
+                        title: r.title,
+                        url: r.url,
+                        content: r.content,
+                        engine: r.engine,
+                        score: 0.0,
+                        sources: vec!["news".to_string()],
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("News fan-out failed: {}", e);
+            }
+        }
+    }
+
+    // Add image results to web results (if image intent detected)
+    if is_image_intent {
+        match image_res {
+            Ok(image_data) => {
+                tracing::info!("Image fan-out returned {} results", image_data.results.len());
+                for (pos, r) in image_data.results.into_iter().enumerate() {
+                    let normalized = {
+                        let lower = r.url.to_lowercase();
+                        let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                        let no_trailing = no_fragment.trim_end_matches('/');
+                        let no_www = no_trailing.replacen("://www.", "://", 1);
+                        strip_tracking_params(&no_www)
+                    };
+                    let rrf_contrib = 1.0 / (60.0 + (pos + 1) as f32);
+                    *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
+                    web_results.push(SearxResult {
+                        title: r.title,
+                        url: r.url,
+                        content: r.content,
+                        engine: r.engine,
+                        score: 0.0,
+                        sources: vec!["images".to_string()],
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Image fan-out failed: {}", e);
+            }
         }
     }
 
