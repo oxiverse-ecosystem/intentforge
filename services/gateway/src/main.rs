@@ -1676,6 +1676,64 @@ async fn handle_images(
     Json(response)
 }
 
+async fn handle_videos(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> Json<serde_json::Value> {
+    let q = params.q.clone();
+    let q_encoded = urlencoding::encode(&q);
+
+    let cache_key = format!("videos:{}", q.to_lowercase().trim());
+    if let Some(cached) = state.cache.get(&cache_key) {
+        let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
+        return Json(value);
+    }
+
+    let invidious_url = format!("http://127.0.0.1:3000/api/v1/search?q={}", q_encoded);
+
+    let results: Vec<VideoResult> = match state.http_client.get(&invidious_url).send().await {
+        Ok(resp) => match resp.json::<Vec<InvidiousResult>>().await {
+            Ok(data) => data.into_iter()
+                .filter(|r| r.result_type.as_deref() == Some("video"))
+                .filter_map(|r| {
+                    let vid = r.video_id?;
+                    let title = r.title.unwrap_or_default();
+                    let description = r.description.unwrap_or_default();
+                    Some(VideoResult {
+                        title,
+                        url: format!("https://www.youtube.com/watch?v={}", vid),
+                        description,
+                        thumbnail: format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", vid),
+                        video_id: vid,
+                        source: "invidious".to_string(),
+                    })
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("Invidious parse error: {}", e);
+                vec![]
+            }
+        },
+        Err(e) => {
+            tracing::warn!("Invidious request error: {}", e);
+            vec![]
+        }
+    };
+
+    let response = serde_json::json!({
+        "results": results,
+        "count": results.len(),
+        "query": q,
+    });
+
+    let response_json = serde_json::to_string(&response).unwrap_or_default();
+    if !results.is_empty() {
+        state.cache.put(cache_key, response_json, Duration::from_secs(300));
+    }
+
+    Json(response)
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -1711,6 +1769,7 @@ async fn main() {
         .route("/search", get(handle_search))
         .route("/search/fast", get(handle_search_fast))
         .route("/images", get(handle_images))
+        .route("/videos", get(handle_videos))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
