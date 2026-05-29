@@ -292,13 +292,14 @@ fn extract_constraints(query: &str) -> Constraints {
     // is already handled by Phase 1
 
     // ── Phase 5: Implicit positive constraints from topic nouns ──
-    // When negative constraints exist, the remaining topic nouns in the query
-    // (not stop words, not markers, not negative terms) are implicit positives.
+    // Extract remaining topic nouns as implicit positives when marker-based
+    // extraction didn't capture enough constraints.
     // "python web framework not django" → remaining: [python, web, framework] → +python
-    // "css framework not bootstrap not tailwind" → remaining: [css, framework] → +css
-    // Only extract if we have negatives but few/no positives (the marker-based
-    // extraction missed them because there was no "for"/"with" prefix).
-    if !negative.is_empty() && positive.len() < 2 {
+    // "rust async web framework" (no markers) → remaining: [rust, async, web, framework] → +rust, +async
+    // "lightweight javascript bundler" → remaining: [lightweight, javascript, bundler] → +lightweight, +javascript
+    // Fires when: (a) positive list is empty (no markers matched), OR
+    //              (b) negatives exist but few positives (marker-based missed them).
+    if positive.is_empty() || (!negative.is_empty() && positive.len() < 2) {
         let stop_words: std::collections::HashSet<&str> = [
             "the","a","an","in","on","for","with","using","from","to",
             "and","or","of","is","are","was","were","be","been","has","have","had",
@@ -315,6 +316,9 @@ fn extract_constraints(query: &str) -> Constraints {
             "framework","library","language","tool","editor","database",
             "generator","server","client","application","app","software",
             "system","platform","service","api","sdk","package","module",
+            "bundler","runtime","programming","tutorial","tutorials","guide",
+            "documentation","docs","learn","getting","started","introduction",
+            "explained","overview","comparison","compared","versus",
         ].iter().copied().collect();
 
         // Build set of words already consumed as part of compound terms

@@ -1,0 +1,115 @@
+# SearXNG2 settings — all engines route through Tor (port 9051)
+# This instance provides parallel search throughput via a different IP path.
+# SearXNG1 uses VPN (gluetun), SearXNG2 uses Tor (tor2).
+# Tor adds ~3-5s latency, so timeouts are higher than VPN-path SearXNG1.
+
+use_default_settings:
+  engines:
+    keep_only:
+      - bing
+      - brave
+      - startpage
+      - wikipedia
+      - mojeek
+      - yandex
+      - duckduckgo
+      - ahmia
+      - presearch
+      - marginalia
+      - bing images
+      - bing news
+      - google news
+
+server:
+  port: 8081
+  bind_address: "0.0.0.0"
+  secret_key: "intentforge_v2_searxng2_secret_key_987654321"
+
+search:
+  safe_search: 0
+  autocomplete: "google"
+  formats:
+    - html
+    - json
+  suspended_times:
+    SearxEngineAccessDenied: 300
+    SearxEngineCaptcha: 600
+    SearxEngineTooManyRequests: 120
+    SearxEngineTimeout: 60
+  default_lang: "en"
+
+outgoing:
+  request_timeout: 6.0     # Lowered from 10s — fail fast, avoid 10s timeout cascade
+  max_request_timeout: 10.0
+  # ALL traffic goes through Tor2 (port 9051)
+  networks:
+    default:
+      proxies:
+        all://: socks5h://127.0.0.1:9051
+      using_tor_proxy: true
+      retries: 1            # retries through Tor are expensive
+    tor:
+      proxies:
+        all://: socks5h://127.0.0.1:9051
+      using_tor_proxy: true
+      retries: 1
+
+engines:
+  # ── All engines via Tor (default network) ──
+  - name: bing
+    disabled: false
+    timeout: 8.0
+
+  - name: brave
+    disabled: false
+    timeout: 8.0
+
+  - name: startpage
+    disabled: false
+    timeout: 8.0
+
+  - name: wikipedia
+    disabled: false
+    timeout: 6.0
+
+  - name: mojeek
+    disabled: false
+    timeout: 6.0
+
+  - name: yandex
+    disabled: false
+    timeout: 6.0
+
+  - name: duckduckgo
+    disabled: false
+    timeout: 8.0
+
+  - name: presearch
+    disabled: false
+    timeout: 8.0
+
+  - name: marginalia
+    disabled: false
+    timeout: 10.0
+
+  # ── Onion engine via Tor ──
+  - name: ahmia
+    disabled: false
+    network: tor
+    timeout: 20.0
+
+  # ── Image & News engines via Tor ──
+  - name: bing images
+    engine: bing_images
+    disabled: false
+    timeout: 8.0
+
+  - name: bing news
+    engine: bing_news
+    disabled: false
+    timeout: 8.0
+
+  - name: google news
+    engine: google_news
+    disabled: false
+    timeout: 8.0
