@@ -1734,6 +1734,58 @@ async fn handle_videos(
     Json(response)
 }
 
+async fn handle_news(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> Json<serde_json::Value> {
+    let q = params.q.clone();
+    let q_encoded = urlencoding::encode(&q);
+
+    let cache_key = format!("news:{}", q.to_lowercase().trim());
+    if let Some(cached) = state.cache.get(&cache_key) {
+        let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
+        return Json(value);
+    }
+
+    let searx_url = format!(
+        "http://127.0.0.1:8080/search?q={}&format=json&categories=news&pageno=1",
+        q_encoded
+    );
+
+    let results: Vec<NewsResult> = match state.http_client.get(&searx_url).send().await {
+        Ok(resp) => match resp.json::<SearxNewsResponse>().await {
+            Ok(data) => data.results.into_iter().map(|r| NewsResult {
+                title: r.title,
+                url: r.url,
+                description: r.content,
+                published_at: r.published_date,
+                source: r.engine,
+            }).collect(),
+            Err(e) => {
+                tracing::warn!("SearXNG news parse error: {}", e);
+                vec![]
+            }
+        },
+        Err(e) => {
+            tracing::warn!("SearXNG news request error: {}", e);
+            vec![]
+        }
+    };
+
+    let response = serde_json::json!({
+        "results": results,
+        "count": results.len(),
+        "query": q,
+    });
+
+    let response_json = serde_json::to_string(&response).unwrap_or_default();
+    if !results.is_empty() {
+        state.cache.put(cache_key, response_json, Duration::from_secs(300));
+    }
+
+    Json(response)
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -1770,6 +1822,7 @@ async fn main() {
         .route("/search/fast", get(handle_search_fast))
         .route("/images", get(handle_images))
         .route("/videos", get(handle_videos))
+        .route("/news", get(handle_news))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
