@@ -107,7 +107,7 @@ fn extract_constraints(query: &str) -> Constraints {
 
     let negative_markers = [
         " not ", " -", " without ", " except ", " excluding ",
-        " but not ", " other than ", " minus ", " no ",
+        " but not ", " other than ", " minus ", " besides ", " no ",
         " alternative to ", " alternatives to ", " alternative for ",
         " instead of ", " replacement for ",
     ];
@@ -117,7 +117,7 @@ fn extract_constraints(query: &str) -> Constraints {
     // not the entire phrase. The rest is context for the search.
     let negative_start_markers = [
         "not ", "- ", "without ", "except ", "excluding ",
-        "minus ", "no ",
+        "minus ", "besides ", "no ",
     ];
 
     // Process start-of-string markers first
@@ -134,12 +134,32 @@ fn extract_constraints(query: &str) -> Constraints {
         }
     }
 
+    // Known compound terms that start with "no " but aren't negations
+    // "no sql" → "nosql", "no code" → "nocode", "no loss" → "noloss"
+    let no_compounds = [
+        "sql", "code", "loss", "ops", "code", "block",
+    ];
+
     for marker in &negative_markers {
         let mut search_from = 0;
         while let Some(pos) = q_lower[search_from..].find(marker) {
             let abs_pos = search_from + pos;
             let after_marker = abs_pos + marker.len();
             if after_marker < q_lower.len() {
+                // Special case: " no <term>" where no+term is a compound domain term
+                if *marker == " no " {
+                    let remaining_after_no = &q_lower[after_marker..];
+                    let next_word = remaining_after_no.split_whitespace().next().unwrap_or("");
+                    if no_compounds.contains(&next_word) {
+                        // Push the compound form as positive: "no sql" → "nosql"
+                        let compound = format!("no{}", next_word);
+                        if !positive.contains(&compound) {
+                            positive.push(compound);
+                        }
+                        search_from = after_marker + next_word.len();
+                        continue;
+                    }
+                }
                 let remaining = &q[after_marker..];
                 // Extract multiple terms connected by "and"
                 let terms = extract_conjunctive_terms(remaining, 1);
@@ -165,7 +185,7 @@ fn extract_constraints(query: &str) -> Constraints {
     ];
 
     let negative_starts = [" not ", " without ", " except ", " excluding ",
-                           " but not ", " other than ", " minus ", " no ",
+                           " but not ", " other than ", " minus ", " besides ", " no ",
                            " alternative to ", " alternatives to ", " alternative for ",
                            " instead of ", " replacement for "];
 
@@ -227,9 +247,24 @@ fn extract_constraints(query: &str) -> Constraints {
                 || seg_lower.starts_with("not ")
                 || seg_lower.starts_with("without ")
                 || seg_lower.starts_with("except ")
+                || seg_lower.starts_with("excluding ")
+                || seg_lower.starts_with("besides ")
                 || seg_lower.starts_with("-");
 
             if is_negative {
+                // Special case: "no <compound>" where no+term is a domain term
+                if seg_lower.starts_with("no ") {
+                    let after_no = &seg_lower[3..];
+                    let next_word = after_no.split_whitespace().next().unwrap_or("");
+                    if no_compounds.contains(&next_word) {
+                        // Push compound form as positive: "no sql" → "nosql"
+                        let compound = format!("no{}", next_word);
+                        if !positive.contains(&compound) {
+                            positive.push(compound);
+                        }
+                        continue;
+                    }
+                }
                 // Extract only the first word after the negative marker
                 // "no heavy macros" → "macros" (not "heavy macros")
                 let term_start = seg_lower.find(' ').map(|p| p + 1).unwrap_or(0);
@@ -271,16 +306,26 @@ fn extract_constraints(query: &str) -> Constraints {
             "how","what","where","when","why","which","who","this","that","these",
             "those","it","its","i","me","my","we","our","you","your","he","she","they",
             "be","as","at","by","not","but","if","so","than","too","very","can","just",
-            "best","top","new","old","good","bad","big","small","fast","first","last",
+            "best","top","new","old","good","bad","big","small","first","last",
             "most","more","less","many","few","each","every","all","any","some",
-            "modern","quick","simple","easy","great","popular","powerful","lightweight",
-            "no","without","except","excluding","other","than","minus",
+            "quick","simple","easy","great","popular","powerful",
+            "no","without","except","excluding","besides","other","than","minus",
             "that","which","must","needs","should","can",
             // Domain-generic words that aren't useful as constraints
             "framework","library","language","tool","editor","database",
             "generator","server","client","application","app","software",
             "system","platform","service","api","sdk","package","module",
         ].iter().copied().collect();
+
+        // Build set of words already consumed as part of compound terms
+        // (e.g., "sql" consumed by "nosql" compound)
+        let mut consumed_words: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for pos in &positive {
+            if pos.starts_with("no") && pos.len() > 2 {
+                let component = &pos[2..];
+                consumed_words.insert(component.to_string());
+            }
+        }
 
         let neg_set: std::collections::HashSet<String> = negative.iter().cloned().collect();
         let pos_set: std::collections::HashSet<String> = positive.iter().cloned().collect();
@@ -293,6 +338,7 @@ fn extract_constraints(query: &str) -> Constraints {
             if stop_words.contains(w_clean.as_str()) { continue; }
             if neg_set.contains(&w_clean) { continue; }
             if pos_set.contains(&w_clean) { continue; }
+            if consumed_words.contains(&w_clean) { continue; }
             // Only add as implicit positive if it looks like a topic noun
             // (not a generic adjective or verb)
             positive.push(w_clean);
@@ -746,7 +792,7 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
     let mut unique = Vec::new();
     for exp in expansions {
         let key = exp.to_lowercase();
-        if seen.insert(key) && unique.len() < 4 {
+        if seen.insert(key) && unique.len() < 2 {
             unique.push(exp);
         }
     }
