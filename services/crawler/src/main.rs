@@ -394,31 +394,61 @@ async fn main() {
         });
     }
 
-    // Background crawl worker
+    // Background crawl worker — batch concurrent crawling
     {
         let state = state.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
+                // Dequeue up to 5 entries (respecting domain rate limits)
                 let now_ms = now_millis();
-                let entry = {
+                let mut batch: Vec<CrawlEntry> = Vec::new();
+                {
                     let mut queue = state.queue.lock().await;
-                    queue.dequeue(now_ms)
-                };
+                    for _ in 0..5 {
+                        if let Some(entry) = queue.dequeue(now_ms) {
+                            batch.push(entry);
+                        } else {
+                            break;
+                        }
+                    }
+                }
 
-                let Some(entry) = entry else {
+                if batch.is_empty() {
                     continue;
-                };
+                }
 
-                tracing::info!("Crawling [{}] {} (priority: {:.2})", entry.source, entry.url, entry.priority);
+                tracing::info!("Crawling batch of {} URLs", batch.len());
 
-                match crawl_and_index(&state, &entry).await {
-                    Ok((_title, _content, links)) => {
-                        tracing::info!("Indexed: {} ({} links found)", entry.url, links.len());
+                // Process batch concurrently
+                let futs: Vec<_> = batch.iter().map(|entry| {
+                    let state = state.clone();
+                    let entry = entry.clone();
+                    async move {
+                        tracing::info!("Crawling [{}] {} (priority: {:.2})", entry.source, entry.url, entry.priority);
+                        match crawl_and_index(&state, &entry).await {
+                            Ok((title, content, links)) => {
+                                tracing::info!("Indexed: {} ({} links found, {} chars)", entry.url, links.len(), content.len());
+                                Some((entry, links))
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to crawl {}: {:?}", entry.url, e);
+                                None
+                            }
+                        }
+                    }
+                }).collect();
 
-                        let mut queue = state.queue.lock().await;
-                        let now = now_secs();
+                let results = futures::future::join_all(futs).await;
+
+                // Enqueue discovered links from all successful crawls
+                {
+                    let mut queue = state.queue.lock().await;
+                    let now = now_secs();
+                    let mut total_discovered = 0;
+                    for result in results.into_iter().flatten() {
+                        let (entry, links) = result;
                         let mut discovered = 0;
                         for link in links {
                             if discovered >= queue.max_discovered_per_page {
@@ -437,12 +467,10 @@ async fn main() {
                                 discovered += 1;
                             }
                         }
-                        if discovered > 0 {
-                            tracing::info!("Discovered {} new URLs from {}", discovered, entry.url);
-                        }
+                        total_discovered += discovered;
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to crawl {}: {:?}", entry.url, e);
+                    if total_discovered > 0 {
+                        tracing::info!("Discovered {} new URLs from batch", total_discovered);
                     }
                 }
             }

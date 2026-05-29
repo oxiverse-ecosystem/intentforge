@@ -93,6 +93,26 @@ struct IndexerResult {
     content: String,
 }
 
+// ─── Merged Result (Unified Local + Web) ─────────────────────────────
+// A single result type that can come from local index, web search, or both.
+// When a URL appears in both sources, sources are merged and consensus boost applied.
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct MergedResult {
+    url: String,
+    title: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    score: f32,
+    #[serde(default)]
+    authority: f32,
+    #[serde(default)]
+    sources: Vec<String>,  // e.g. ["local", "bing", "brave", "whoogle"]
+    #[serde(default)]
+    is_local: bool,
+}
+
 #[derive(Serialize)]
 struct UnifiedResponse {
     intent: String,
@@ -104,8 +124,7 @@ struct UnifiedResponse {
     structured_constraints: Constraints,
     #[serde(default)]
     expanded_queries: Vec<String>,
-    local_results: Vec<IndexerResult>,
-    web_results: Vec<SearxResult>,
+    results: Vec<MergedResult>,
 }
 
 // ─── Domain Authority (Fully Algorithmic) ────────────────────────────
@@ -1374,6 +1393,123 @@ impl SearchCache {
     }
 }
 
+// ─── Unified Merge: Local + Web → Single Ranked List ────────────────
+// Cross-source dedup: URLs appearing in both local index AND web search
+// get merged with a consensus boost. This is the strongest relevance signal.
+// Returns a single sorted list by final score.
+
+fn merge_local_and_web(
+    local: Vec<IndexerResult>,
+    web: Vec<SearxResult>,
+    query: &str,
+    intent: &str,
+    constraints: &Constraints,
+) -> Vec<MergedResult> {
+    let mut merged: Vec<MergedResult> = Vec::new();
+    let mut url_to_idx: HashMap<String, usize> = HashMap::new();
+
+    // Helper: normalize URL for dedup matching
+    let normalize = |url: &str| -> String {
+        let lower = url.to_lowercase();
+        let no_fragment = lower.split('#').next().unwrap_or(&lower);
+        let no_trailing = no_fragment.trim_end_matches('/');
+        let no_www = no_trailing.replacen("://www.", "://", 1);
+        strip_tracking_params(&no_www)
+    };
+
+    // 1. Add local results first (they have richer content)
+    for r in local {
+        let norm = normalize(&r.url);
+        let entry = MergedResult {
+            url: r.url,
+            title: r.title,
+            content: r.content,
+            score: r.score,
+            authority: r.authority,
+            sources: vec!["local".to_string()],
+            is_local: true,
+        };
+        url_to_idx.insert(norm, merged.len());
+        merged.push(entry);
+    }
+
+    // 2. Add web results — merge if URL already in local
+    for r in web {
+        let norm = normalize(&r.url);
+        if let Some(&idx) = url_to_idx.get(&norm) {
+            // URL exists in local index — merge sources and apply consensus boost
+            let existing = &mut merged[idx];
+            let source = if r.engine.is_empty() { "web".to_string() } else { r.engine.clone() };
+            if !existing.sources.contains(&source) {
+                existing.sources.push(source);
+            }
+            // Add any extra sources from the web result
+            for s in &r.sources {
+                if !existing.sources.contains(s) {
+                    existing.sources.push(s.clone());
+                }
+            }
+            // Consensus boost: appearing in both local AND web = very strong signal
+            // Apply 1.5x boost (only once, even if multiple web sources merge)
+            if existing.score > 0.0 {
+                existing.score *= 1.5;
+            }
+            // Prefer richer content — if web has more content, use it
+            if r.content.len() > existing.content.len() {
+                existing.content = r.content;
+            }
+        } else {
+            let source = if r.engine.is_empty() { "web".to_string() } else { r.engine.clone() };
+            let authority = domain_authority_score(&r.url);
+            let entry = MergedResult {
+                url: r.url,
+                title: r.title,
+                content: r.content,
+                score: r.score,
+                authority,
+                sources: vec![source],
+                is_local: false,
+            };
+            url_to_idx.insert(norm, merged.len());
+            merged.push(entry);
+        }
+    }
+
+    // 3. Apply unified ranking signals to all results
+    let weights = RankingWeights::for_intent(intent);
+    for r in merged.iter_mut() {
+        let semantic = semantic_relevance_score(query, &r.title, &r.content);
+        let intent_boost = calculate_intent_boost(&r.url, &r.title, query, intent);
+        let freshness = freshness_score(&r.url, intent);
+        let quality = content_quality_score(&r.content);
+        let c_score = constraint_score(&r.title, &r.content, &r.url, constraints);
+        let consensus = consensus_score(&r.sources);
+
+        // Weighted combination (replaces the per-source scoring)
+        let local_bonus = if r.is_local { 1.0 } else { 0.0 };
+        let base = (weights.semantic * semantic)
+            + (weights.intent * intent_boost)
+            + (weights.freshness * freshness)
+            + (weights.authority * r.authority)
+            + (weights.quality * quality)
+            + (weights.consensus * consensus)
+            + (weights.local_bonus * local_bonus);
+        r.score = base * c_score;
+    }
+
+    // 4. Sort by score descending
+    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 5. Normalize scores to [0, 1]
+    let mut scores: Vec<f32> = merged.iter().map(|r| r.score).collect();
+    normalize_scores(&mut scores);
+    for (i, r) in merged.iter_mut().enumerate() {
+        r.score = scores[i];
+    }
+
+    merged
+}
+
 // ─── Main ────────────────────────────────────────────────────────────
 
 // ─── Rate-Limit Tracker ─────────────────────────────────────────────
@@ -1894,145 +2030,47 @@ async fn handle_search(
 
     tracing::info!("After dedup: {} unique web results", web_results.len());
 
-    // 6. Multi-Signal Ranking with Content Quality + Semantic Relevance + Consensus + RRF
-    let weights = RankingWeights::for_intent(&intent.intent);
-
-    // Pre-compute semantic relevance scores once (avoids double computation in ranking + filter)
-    let semantic_scores: Vec<f32> = web_results.iter()
+    // 6. Quality Gates (before merge)
+    // Filter web results with very low semantic relevance
+    let semantic_scores_web: Vec<f32> = web_results.iter()
         .map(|res| semantic_relevance_score(&q, &res.title, &res.content))
         .collect();
-
-    // Rank web results using all signals
-    for (i, res) in web_results.iter_mut().enumerate() {
-        // Use proper position-based RRF from each engine's ranked output
-        // instead of meaningless insertion order
-        let normalized = {
-            let lower = res.url.to_lowercase();
-            let no_fragment = lower.split('#').next().unwrap_or(&lower);
-            let no_trailing = no_fragment.trim_end_matches('/');
-            let no_www = no_trailing.replacen("://www.", "://", 1);
-            strip_tracking_params(&no_www)
-        };
-        let rank_score = url_rrf_contributions.get(&normalized).copied().unwrap_or(0.01);
-
-        let intent_boost = calculate_intent_boost(&res.url, &res.title, &q, &intent.intent);
-        let freshness = freshness_score(&res.url, &intent.intent);
-        let authority = domain_authority_score(&res.url);
-        let quality = content_quality_score(&res.content);
-        let semantic = semantic_scores[i]; // use precomputed score
-        let consensus = consensus_score(&res.sources);
-        let c_score = constraint_score(&res.title, &res.content, &res.url, &intent.structured_constraints);
-
-        res.score = compute_final_score(
-            rank_score,
-            intent_boost,
-            freshness,
-            authority,
-            false, // not local
-            quality,
-            semantic,
-            consensus,
-            c_score,
-            &weights,
-        );
-    }
-    // Filter out results with very low semantic relevance using adaptive threshold
-    // Always keep top 5 results regardless of threshold (fallback for single-engine scenarios)
     let semantic_threshold = if web_results.len() > 30 { 0.25 }
         else if web_results.len() > 20 { 0.20 }
         else { 0.15 };
     let mut keep_indices: Vec<usize> = Vec::new();
-    for (i, &score) in semantic_scores.iter().enumerate() {
+    for (i, &score) in semantic_scores_web.iter().enumerate() {
         if score >= semantic_threshold || i < 5 {
             keep_indices.push(i);
         }
     }
     if keep_indices.is_empty() && !web_results.is_empty() {
-        // Shouldn't happen (top 5 always kept), but safety fallback
         keep_indices = (0..web_results.len().min(5)).collect();
     }
-    let filtered: Vec<_> = keep_indices.into_iter().map(|i| web_results[i].clone()).collect();
-    web_results = filtered;
-    web_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    web_results = keep_indices.into_iter().map(|i| web_results[i].clone()).collect();
 
-    // Hard filter: remove results that violate negative constraints
-    // This catches violations that score penalties alone can't fully suppress,
-    // especially comparison/list articles that mention excluded terms in content.
-    let has_negative_constraints = !intent.structured_constraints.negative.is_empty();
-    if has_negative_constraints {
-        let filtered_backup = web_results.clone(); // backup for fallback
+    // Hard filter: remove web results that violate negative constraints
+    if !intent.structured_constraints.negative.is_empty() {
         let before_count = web_results.len();
         web_results.retain(|r| {
             let c_score = constraint_score(&r.title, &r.content, &r.url, &intent.structured_constraints);
-            // Keep result if constraint_score is above penalty threshold (0.15)
-            // A score of 0.02 means single violation, 0.0004 means double violation
-            // Threshold of 0.15 keeps results with no violations (1.0) and positive boosts,
-            // but drops anything that hit even one negative constraint
             c_score >= 0.15
         });
         let removed = before_count.saturating_sub(web_results.len());
         if removed > 0 {
-            tracing::info!("Negative constraint hard filter: removed {}/{} results", removed, before_count);
+            tracing::info!("Negative constraint hard filter: removed {}/{} web results", removed, before_count);
         }
-        // Ensure we always have at least some results (fallback if filter was too aggressive)
-        if web_results.is_empty() {
-            tracing::warn!("Negative constraint filter removed all results — relaxing threshold");
-            // Re-run with relaxed threshold: only filter double+ violations
-            web_results = filtered_backup.into_iter().filter(|r| {
+        if web_results.is_empty() && before_count > 0 {
+            tracing::warn!("Negative constraint filter removed all web results — relaxing threshold");
+            // Re-add with relaxed threshold
+            web_results = web_results.into_iter().filter(|r| {
                 let c_score = constraint_score(&r.title, &r.content, &r.url, &intent.structured_constraints);
                 c_score >= 0.01
             }).collect();
         }
     }
 
-    // Normalize web scores to [0, 1] for cross-query comparability
-    // When negative constraints exist, use relative normalization (top=1.0)
-    // instead of percentile normalization, which would undo constraint penalties.
-    if !has_negative_constraints {
-        let mut web_scores: Vec<f32> = web_results.iter().map(|r| r.score).collect();
-        normalize_scores(&mut web_scores);
-        for (i, r) in web_results.iter_mut().enumerate() {
-            r.score = web_scores[i];
-        }
-    } else if !web_results.is_empty() {
-        // Relative normalization: top result = 1.0, others scaled proportionally
-        // This gives good score spread even when all results have similar raw scores
-        let top_score = web_results[0].score.max(0.001);
-        for r in web_results.iter_mut() {
-            r.score = (r.score / top_score).clamp(0.0, 1.0);
-        }
-    }
-
-    // Rank local results using precomputed semantic scores
-    let local_semantic_scores: Vec<f32> = local_results.iter()
-        .map(|res| semantic_relevance_score(&q, &res.title, &res.content))
-        .collect();
-    for (i, res) in local_results.iter_mut().enumerate() {
-        // Use the indexer's actual score (BM25 + semantic RRF) as the rank signal
-        let rank_score = (res.score).max(0.01);
-        let intent_boost = calculate_intent_boost(&res.url, &res.title, &q, &intent.intent);
-        let freshness = freshness_score(&res.url, &intent.intent);
-        let authority = if res.authority > 0.0 { res.authority } else { domain_authority_score(&res.url) };
-        let quality = content_quality_score(&res.content);
-        let semantic = local_semantic_scores[i];
-        let c_score = constraint_score(&res.title, &res.content, &res.url, &intent.structured_constraints);
-
-        res.score = compute_final_score(
-            rank_score,
-            intent_boost,
-            freshness,
-            authority,
-            true, // local index bonus
-            quality,
-            semantic,
-            0.3, // local-only = single source consensus
-            c_score,
-            &weights,
-        );
-    }
-    local_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Quality gate: filter out garbage local results (error pages, stale content)
+    // Quality gate: filter garbage local results
     local_results.retain(|r| {
         let title_ok = r.title.len() > 5;
         let url_lower = r.url.to_lowercase();
@@ -2046,20 +2084,11 @@ async fn handle_search(
         title_ok && not_error
     });
 
-    // Normalize local scores to [0, 1]
-    let mut local_scores: Vec<f32> = local_results.iter().map(|r| r.score).collect();
-    normalize_scores(&mut local_scores);
-    for (i, r) in local_results.iter_mut().enumerate() {
-        r.score = local_scores[i];
-    }
-
-    // 7. Feed Meta-Search Results into Crawl Queue with relevance signals
-    // Include the score so the crawler can prioritize high-relevance URLs
+    // 7. Feed Meta-Search Results into Crawl Queue
     let crawl_urls: Vec<serde_json::Value> = web_results.iter()
         .filter(|r| r.score > 0.3 && !r.content.is_empty() && r.title.len() > 10)
         .take(20)
-        .enumerate()
-        .map(|(i, r)| {
+        .map(|r| {
             serde_json::json!({
                 "url": r.url,
                 "priority": r.score,
@@ -2079,11 +2108,20 @@ async fn handle_search(
         });
     }
 
-    // Sanitize content in web_results to remove control characters
-    // that SearXNG search engines may return in snippets
-    for res in web_results.iter_mut() {
-        res.title = sanitize_text_content(&res.title);
-        res.content = sanitize_text_content(&res.content);
+    // 8. Unified Merge: Local + Web → Single Ranked List
+    // Cross-source dedup, consensus boosting, unified ranking
+    let mut results = merge_local_and_web(
+        local_results,
+        web_results,
+        &q,
+        &intent.intent,
+        &intent.structured_constraints,
+    );
+
+    // Sanitize content for safe JSON serialization
+    for r in results.iter_mut() {
+        r.title = sanitize_text_content(&r.title);
+        r.content = sanitize_text_content(&r.content);
     }
 
     let response = UnifiedResponse {
@@ -2092,13 +2130,12 @@ async fn handle_search(
         constraints: intent.constraints.clone(),
         structured_constraints: intent.structured_constraints.clone(),
         expanded_queries: intent.expanded_queries.clone(),
-        local_results,
-        web_results,
+        results,
     };
 
-    // Cache for 5 minutes — but never cache empty results (engine timeouts/rate limits)
+    // Cache for 5 minutes — but never cache empty results
     let response_json = serde_json::to_string(&response).unwrap_or_default();
-    if !response.web_results.is_empty() {
+    if !response.results.is_empty() {
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 

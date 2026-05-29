@@ -109,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/index", post(handle_ingest))
         .route("/urls", get(handle_list_urls))
         .route("/search", get(handle_search))
+        .route("/stats", get(handle_stats))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 6000));
@@ -337,7 +338,7 @@ async fn handle_search(
                 final_score *= 2.0;
             }
 
-            SearchResult { url, title, score: final_score, authority: auth as f32, content: if content.len() > 2000 { content.chars().take(2000).collect() } else { content } }
+            SearchResult { url, title, score: final_score, authority: auth as f32, content: if content.len() > 500 { content.chars().take(500).collect() } else { content } }
         })
         .collect();
 
@@ -345,4 +346,30 @@ async fn handle_search(
     results.truncate(10);
 
     Json(results)
+}
+
+async fn handle_stats(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let searcher = state.reader.searcher();
+    let doc_count = searcher.num_docs();
+    let segment_count = searcher.segment_readers().len();
+
+    // Get index directory size
+    let index_size = std::fs::read_dir("./index_data")
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+
+    Json(serde_json::json!({
+        "documents": doc_count,
+        "segments": segment_count,
+        "index_size_bytes": index_size,
+        "index_size_mb": (index_size as f64 / 1_048_576.0).round() as u64,
+    }))
 }

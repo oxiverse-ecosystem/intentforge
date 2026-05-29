@@ -16,3 +16,8 @@ Thumbs.db
 .vscode/
 *.swp
 services/privacy-layer/.env
+
+# Runtime data
+services/privacy-layer/tor/data/
+services/indexer/index_data/
+shared-signals/

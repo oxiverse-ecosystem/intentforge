@@ -108,6 +108,8 @@ fn extract_constraints(query: &str) -> Constraints {
     let negative_markers = [
         " not ", " -", " without ", " except ", " excluding ",
         " but not ", " other than ", " minus ", " no ",
+        " alternative to ", " alternatives to ", " alternative for ",
+        " instead of ", " replacement for ",
     ];
 
     for marker in &negative_markers {
@@ -141,7 +143,9 @@ fn extract_constraints(query: &str) -> Constraints {
     ];
 
     let negative_starts = [" not ", " without ", " except ", " excluding ",
-                           " but not ", " other than ", " minus ", " no "];
+                           " but not ", " other than ", " minus ", " no ",
+                           " alternative to ", " alternatives to ", " alternative for ",
+                           " instead of ", " replacement for "];
 
     for marker in &positive_markers {
         if let Some(pos) = q_lower.find(marker) {
