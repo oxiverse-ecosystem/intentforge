@@ -633,10 +633,18 @@ fn constraint_score(
                     || {
                         let w_alpha: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
                         w_alpha == neg_normalized
+                        // Compound-word awareness: "tailwindcss" starts with "tailwind"
+                        // Length ratio guard: constraint must be ≥60% of word length to avoid
+                        // false positives like "reactive" matching "react"
+                        || (w_alpha.len() > neg_normalized.len()
+                            && neg_normalized.len() >= 3
+                            && w_alpha.starts_with(&neg_normalized)
+                            && neg_normalized.len() as f32 / w_alpha.len() as f32 >= 0.6)
+                        || w_alpha.contains(&neg_normalized)
                     }
                 })
             }
-            // URL path matching (e.g., github.com/flask)
+            // URL path matching (e.g., github.com/reactjs, geeksforgeeks.org/reactjs/)
             || text_lower.split('/').any(|segment| {
                 let seg = segment.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
                 seg == neg_lower
@@ -644,6 +652,14 @@ fn constraint_score(
                     let no_www = seg.strip_prefix("www.").unwrap_or(&seg);
                     let domain = no_www.split('.').next().unwrap_or(no_www);
                     domain == neg_lower
+                }
+                // Compound-word prefix in URL segments: "reactjs" starts with "react"
+                || {
+                    let seg_alpha: String = seg.chars().filter(|c| c.is_alphanumeric()).collect();
+                    seg_alpha.len() > neg_normalized.len()
+                        && neg_normalized.len() >= 3
+                        && seg_alpha.starts_with(&neg_normalized)
+                        && neg_normalized.len() as f32 / seg_alpha.len() as f32 >= 0.6
                 }
             })
         } else {
