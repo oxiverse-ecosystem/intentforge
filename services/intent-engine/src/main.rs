@@ -126,7 +126,7 @@ fn extract_constraints(query: &str) -> Constraints {
             let remaining = &q[marker.len()..];
             // Take only the first 1-2 words as the negative term
             // (not the whole remaining query)
-            let term = extract_constraint_term(remaining);
+            let term = extract_constraint_term(remaining, 1);
             if !term.is_empty() && term.len() > 1 {
                 negative.push(term);
             }
@@ -142,7 +142,7 @@ fn extract_constraints(query: &str) -> Constraints {
             if after_marker < q_lower.len() {
                 let remaining = &q[after_marker..];
                 // Extract multiple terms connected by "and"
-                let terms = extract_conjunctive_terms(remaining);
+                let terms = extract_conjunctive_terms(remaining, 1);
                 for term in terms {
                     if !term.is_empty() && term.len() > 1 {
                         negative.push(term);
@@ -181,7 +181,7 @@ fn extract_constraints(query: &str) -> Constraints {
                     .unwrap_or(remaining.len());
                 let clean_remaining = &remaining[..end];
                 // Use extract_conjunctive_terms to handle "X and Y" lists
-                let terms = extract_conjunctive_terms(clean_remaining);
+                let terms = extract_conjunctive_terms(clean_remaining, 2);
                 for term in terms {
                     if !term.is_empty() && term.len() > 1 {
                         positive.push(term);
@@ -230,10 +230,14 @@ fn extract_constraints(query: &str) -> Constraints {
                 || seg_lower.starts_with("-");
 
             if is_negative {
-                // Extract the term after the negative marker
+                // Extract only the first word after the negative marker
+                // "no heavy macros" → "macros" (not "heavy macros")
                 let term_start = seg_lower.find(' ').map(|p| p + 1).unwrap_or(0);
                 if term_start < seg_trimmed.len() {
-                    let term = seg_trimmed[term_start..].trim().to_string();
+                    let rest = &seg_trimmed[term_start..].trim();
+                    let term = rest.split_whitespace().next().unwrap_or("")
+                        .trim_matches(|c: char| c == ',' || c == '.' || c == ';')
+                        .to_string();
                     if !term.is_empty() && term.len() > 1 {
                         negative.push(term);
                     }
@@ -269,7 +273,7 @@ fn extract_constraints(query: &str) -> Constraints {
             "be","as","at","by","not","but","if","so","than","too","very","can","just",
             "best","top","new","old","good","bad","big","small","fast","first","last",
             "most","more","less","many","few","each","every","all","any","some",
-            "modern","quick","simple","easy","great","popular","powerful",
+            "modern","quick","simple","easy","great","popular","powerful","lightweight",
             "no","without","except","excluding","other","than","minus",
             "that","which","must","needs","should","can",
             // Domain-generic words that aren't useful as constraints
@@ -301,11 +305,11 @@ fn extract_constraints(query: &str) -> Constraints {
     negative.sort();
     negative.dedup();
 
-    // Remove any term that appears in both (conflicting → drop both)
-    let pos_set: std::collections::HashSet<String> = positive.iter().cloned().collect();
+    // Remove any term that appears in both — negative takes priority
+    // (if user says "not vim", we don't also boost for "vim")
     let neg_set: std::collections::HashSet<String> = negative.iter().cloned().collect();
     positive.retain(|p| !neg_set.contains(p));
-    negative.retain(|n| !pos_set.contains(n));
+    // negative stays as-is — explicit exclusions always win
 
     // Remove very short or very long terms (likely parsing errors)
     positive.retain(|t| t.len() >= 2 && t.len() <= 50);
@@ -317,7 +321,8 @@ fn extract_constraints(query: &str) -> Constraints {
 /// Extract multiple terms connected by "and" from a negated context.
 /// "mysql and sqlite" → ["mysql", "sqlite"]
 /// "react" → ["react"]
-fn extract_conjunctive_terms(text: &str) -> Vec<String> {
+/// max_words controls how many words per term (1 for negatives, 2 for positives).
+fn extract_conjunctive_terms(text: &str, max_words: usize) -> Vec<String> {
     // Stop words that terminate the conjunctive chain.
     // NOTE: "not", "without", "except" etc. are NOT stop words here
     // because "and not X" is a valid conjunctive negative pattern.
@@ -349,19 +354,34 @@ fn extract_conjunctive_terms(text: &str) -> Vec<String> {
     if parts.len() > 1 {
         // Multiple terms connected by "and"
         parts.iter()
-            .map(|p| extract_constraint_term(&strip_neg(p)))
+            .map(|p| extract_constraint_term(&strip_neg(p), max_words))
             .filter(|t| !t.is_empty())
             .collect()
     } else {
         // Single term
-        vec![extract_constraint_term(&strip_neg(phrase))]
+        vec![extract_constraint_term(&strip_neg(phrase), max_words)]
     }
 }
 
 /// Extract a constraint term from the text after a marker.
-/// Takes up to 3 words, stops at punctuation or conjunctions.
-fn extract_constraint_term(text: &str) -> String {
+/// Takes up to `max_words` words, stops at punctuation, conjunctions, or quality adjectives.
+/// For negatives (max_words=1): "not vim" → "vim" (single word only)
+/// For positives (max_words=2): "for game engine" → "game engine", "for beginners fast" → "beginners"
+fn extract_constraint_term(text: &str, max_words: usize) -> String {
     let stop_words = ["and", "or", "but", "the", "a", "an", "is", "are", "in", "on"];
+    // Quality adjectives/modifiers that terminate extraction after the first content word.
+    // "for beginners fast modern" → "beginners" (stops at "fast")
+    // "for game engine lightweight" → "game engine" (stops at "lightweight")
+    let quality_adjectives = [
+        "fast", "modern", "quick", "lightweight", "simple", "easy", "powerful",
+        "popular", "efficient", "cheap", "free", "secure", "safe", "reliable",
+        "scalable", "flexible", "extensible", "portable", "robust", "minimal",
+        "minimalist", "beginner-friendly", "user-friendly", "open-source",
+        "cross-platform", "high-performance", "production-ready", "mature",
+        "stable", "fastest", "lightest", "newest", "latest", "greatest",
+        "best", "top", "new", "old", "good", "great", "small", "big",
+        "alternative", "alternatives", "recommended", "suggested",
+    ];
     let mut words = Vec::new();
 
     for word in text.split_whitespace() {
@@ -370,11 +390,18 @@ fn extract_constraint_term(text: &str) -> String {
             break;
         }
         let lower = clean.to_lowercase();
+        // Standard stop words (always stop)
         if stop_words.contains(&lower.as_str()) && !words.is_empty() {
             break;
         }
+        // Quality adjectives stop extraction only after we've collected at least one word.
+        // This prevents "fast framework" from being truncated to just "fast",
+        // but "beginners fast modern" correctly yields "beginners".
+        if !words.is_empty() && quality_adjectives.contains(&lower.as_str()) {
+            break;
+        }
         words.push(clean);
-        if words.len() >= 3 {
+        if words.len() >= max_words {
             break;
         }
     }
@@ -460,7 +487,8 @@ fn rule_based_classify(query: &str) -> Option<RuleMatch> {
         "function", "method", "class", "interface", "struct", "enum",
         "trait", "impl", "syntax", "compiler", "runtime", "debug",
         "error", "bug", "fix", "issue", "version", "migration",
-        "documentation", "docs", "reference", "manpage",
+        "documentation", "docs", "reference", "manpage", "engine",
+        "editor", "programming", "algorithm", "data structure",
     ];
     let tech_languages = [
         "rust", "python", "javascript", "typescript", "go", "golang",
@@ -811,13 +839,19 @@ async fn main() -> anyhow::Result<()> {
                  "kubernetes documentation", "react official site", "vue.js homepage",
                  "typescript handbook", "go documentation", "linux man pages",
                  "arch wiki", "reddit", "wikipedia", "youtube", "twitter"],
-            vec!["what is machine learning", "what is a neural network",
+            vec![
+                 "what is machine learning", "what is a neural network",
                  "explain quantum computing", "what does TCP do",
                  "how does a compiler work", "what is the internet",
                  "why is the sky blue", "what is photosynthesis",
                  "define algorithm", "meaning of recursion",
                  "what are design patterns", "what is REST API",
-                 "explain blockchain", "what is DNS", "how wifi works"],
+                 "explain blockchain", "what is DNS", "how wifi works",
+                 // Non-question informational: seeking content/info without question words
+                 "healthy breakfast recipes", "python tutorials for beginners",
+                 "travel tips for europe", "gardening guide for spring",
+                 "best hiking trails near seattle", "history of ancient rome",
+                 "climate change effects on agriculture", "beginner yoga poses"],
             vec!["rust async runtime", "python requests library",
                  "javascript fetch API", "go goroutines",
                  "docker compose volumes", "kubernetes pods",
