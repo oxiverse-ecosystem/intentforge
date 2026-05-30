@@ -966,10 +966,10 @@ impl RankingWeights {
                 rrf: 0.07,
                 intent: 0.08,
                 freshness: 0.03,
-                authority: 0.10,
+                authority: 0.16,  // boosted from 0.10 — breaks ties among 0.950-scoring results
                 local_bonus: 0.04,
                 quality: 0.06,
-                semantic: 0.28,
+                semantic: 0.22,   // reduced from 0.28 to balance authority boost
                 consensus: 0.14,
                 constraint: 0.20,
             },
@@ -1128,22 +1128,21 @@ fn normalize_scores(scores: &mut [f32]) {
             scores[orig_idx] = (rank as f32) / ((n - 1) as f32);
         }
     } else {
-        // Use 95th percentile as the "effective max" — this prevents top
-        // results from all clustering at 1.0 while still mapping the best
-        // results to a high score.
-        let p95_idx = ((n as f32 * 0.95) as usize).min(n - 1);
-        let p95 = indexed[p95_idx].1;
-        let effective_range = (p95 - min_score).max(0.01);
+        // Use 99th percentile as the "effective max" — this prevents top
+        // results from clustering at 1.0 while preserving differentiation
+        // among the top ~95% of results (authority, consensus, etc. matter).
+        let p99_idx = ((n as f32 * 0.99) as usize).min(n - 1);
+        let p99 = indexed[p99_idx].1;
+        let effective_range = (p99 - min_score).max(0.01);
 
         for score in scores.iter_mut() {
             let raw = (*score - min_score) / effective_range;
             if raw > 1.0 {
-                // Above p95: compress into [0.95, 1.0] band
-                // This gives top results visible spread instead of all being 1.0
-                let excess = (raw - 1.0).min(1.0); // cap excess at 1.0
-                *score = 0.95 + excess * 0.05;
+                // Above p99: compress into [0.97, 1.0] band
+                let excess = (raw - 1.0).min(1.0);
+                *score = 0.97 + excess * 0.03;
             } else {
-                *score = raw.clamp(0.0, 0.95);
+                *score = raw.clamp(0.0, 0.97);
             }
         }
     }
@@ -1670,6 +1669,7 @@ struct AppState {
     cache: SearchCache,
     rate_limits: RateLimitTracker,
     http_client: reqwest::Client,
+    searxng2_url: Option<String>,
 }
 
 async fn handle_images(
@@ -1862,6 +1862,11 @@ async fn handle_news(
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let searxng2_url = std::env::var("SEARXNG2_URL").ok();
+    if searxng2_url.is_some() {
+        tracing::info!("SearXNG2 enabled: parallel VPN fan-out active");
+    }
+
     let state = Arc::new(AppState {
         circuit: CircuitBreaker::new(),
         cache: SearchCache::new(),
@@ -1872,18 +1877,25 @@ async fn main() {
             .pool_max_idle_per_host(10)
             .build()
             .unwrap(),
+        searxng2_url,
     });
 
     // Prewarm: fire dummy queries to warm up SearXNG engine connections + intent engine.
     // Without this, the first real query takes 4-5s extra for cold start.
     let prewarm_client = state.http_client.clone();
+    let prewarm_searxng2 = state.searxng2_url.clone();
     tokio::spawn(async move {
         tracing::info!("Prewarming SearXNG + intent engine...");
-        let _ = tokio::join!(
+        let mut prewarm_futs = vec![
             prewarm_client.get("http://127.0.0.1:8080/search?q=warmup&format=json&pageno=1").send(),
             prewarm_client.get("http://127.0.0.1:3005/analyze?q=warmup").send(),
             prewarm_client.get("http://127.0.0.1:3005/embed?text=warmup").send(),
-        );
+        ];
+        if let Some(ref s2_url) = prewarm_searxng2 {
+            let url = format!("{}/search?q=warmup&format=json&pageno=1", s2_url);
+            prewarm_futs.push(prewarm_client.get(url).send());
+        }
+        let _ = futures::future::join_all(prewarm_futs).await;
         tracing::info!("Prewarm complete");
     });
 
@@ -2035,18 +2047,26 @@ async fn handle_search(
     }
 
     // Build SearXNG URLs for expanded queries
-    // Dynamic fan-out: 1 query for simple/freshness intents (saves 1-3s),
-    // 2 queries only for complex/constrained/comparison intents where recall matters.
+    // Dynamic fan-out: 1 query for freshness intents (speed > recall),
+    // 2 queries for everything else (technical, how-to, comparison, informational, etc.)
+    // to maximize recall and utilize both SearXNG instances in parallel.
     let searx_fanout = match intent.intent.as_str() {
-        "comparison" | "transactional" if intent.structured_constraints.negative.len() > 0 => 2,
-        _ => 1,
+        "fresh" => 1,
+        _ => 2,
     };
-    tracing::info!("SearXNG fan-out: {} query(s) for intent '{}'", searx_fanout, intent.intent);
+    let searx_base_urls: Vec<&str> = if state.searxng2_url.is_some() {
+        vec!["http://127.0.0.1:8080", state.searxng2_url.as_deref().unwrap()]
+    } else {
+        vec!["http://127.0.0.1:8080"]
+    };
+    tracing::info!("SearXNG fan-out: {} query(s) for intent '{}' ({} instance(s))", searx_fanout, intent.intent, searx_base_urls.len());
     // Preprocess queries to strip trigger words that cause dictionary/shopping results
     // For freshness queries, add time_range parameter to get recent results
-    let searx_urls: Vec<String> = expanded_queries.iter().take(searx_fanout).map(|eq| {
+    let searx_urls: Vec<String> = expanded_queries.iter().take(searx_fanout).enumerate().map(|(i, eq)| {
         let clean_eq = preprocess_searxng_query(eq);
-        let mut url = format!("http://127.0.0.1:8080/search?q={}&format=json&pageno=1", urlencoding::encode(&clean_eq));
+        // Round-robin across SearXNG instances: query 0 → instance 0, query 1 → instance 1
+        let base_url = searx_base_urls[i % searx_base_urls.len()];
+        let mut url = format!("{}/search?q={}&format=json&pageno=1", base_url, urlencoding::encode(&clean_eq));
         if is_freshness_query {
             url.push_str("&time_range=month");
         }

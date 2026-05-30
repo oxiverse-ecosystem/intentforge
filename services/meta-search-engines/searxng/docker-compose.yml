@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   searxng:
     container_name: searxng
@@ -9,6 +7,31 @@ services:
       - GRANIAN_WORKERS=4
     volumes:
       - ./searxng:/etc/searxng:rw
+    restart: always
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── SearXNG2 via Tor (tor2, port 9051) — parallel search path ──
+  # All engines route through Tor for a different IP than the VPN path.
+  # Gateway round-robins queries across both SearXNG instances.
+  searxng2:
+    container_name: searxng2
+    image: searxng/searxng:latest
+    network_mode: "container:gluetun"
+    environment:
+      - GRANIAN_WORKERS=4
+      - SEARXNG_PORT=8081
+    volumes:
+      - ./searxng2:/etc/searxng:ro
     restart: always
     cap_drop:
       - ALL

@@ -22,7 +22,8 @@ services:
     ports:
       - "8888:8888/tcp" # HTTP Proxy
       - "8388:8388/tcp" # Shadowsocks
-      - "8080:8080"     # SearXNG (Routed)
+      - "8080:8080"     # SearXNG (via VPN)
+      - "8081:8081"     # SearXNG2 (via Tor — parallel path)
       - "5000:5000"     # Whoogle (Routed)
       - "3000:3000"     # Invidious (Routed)
       - "4000:4000"     # Gateway (Routed)
@@ -58,6 +59,23 @@ services:
     network_mode: "service:gluetun"
     volumes:
       - ./tor/data:/var/lib/tor
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Second Tor instance for parallel SearXNG2 throughput ──
+  # SearXNG2 routes all queries through this Tor (port 9051).
+  # SearXNG1 uses VPN (gluetun). Both run in parallel.
+  # Tor provides a completely different IP path — true parallelism.
+  tor2:
+    build: ./tor2
+    container_name: tor2
+    network_mode: "service:gluetun"
+    volumes:
+      - ./tor2/data:/var/lib/tor
     restart: always
     logging:
       driver: "json-file"

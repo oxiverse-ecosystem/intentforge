@@ -36,7 +36,7 @@ search:
   default_lang: "en"
 
 outgoing:
-  request_timeout: 2.5  # hard cap — VPN adds ~1s base latency, engines get 1.5s to respond
+  request_timeout: 3.0  # raised from 2.5s to give fast engines (bing, brave) more room
   max_request_timeout: 5.0
   # Per-network routing: Tor for .onion engines, default (VPN) for regular
   networks:
@@ -66,11 +66,11 @@ engines:
 
   - name: mojeek
     disabled: false
-    timeout: 2.5
+    timeout: 2.0    # lowered from 2.5s — often blocked, fail fast to let faster engines win
 
   - name: yandex
     disabled: false
-    timeout: 2.5
+    timeout: 2.0    # lowered from 2.5s — often CAPTCHA'd, fail fast to let faster engines win
 
   # ── New engines (via VPN) ──
   - name: duckduckgo
