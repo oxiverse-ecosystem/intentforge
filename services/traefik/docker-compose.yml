@@ -1,0 +1,18 @@
+services:
+  traefik:
+    image: traefik:v3.1
+    container_name: traefik
+    network_mode: "container:gluetun"
+    volumes:
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./dynamic:/etc/traefik/dynamic:ro
+      - ./acme:/etc/traefik/acme
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -27,6 +27,8 @@ services:
       - "5000:5000"     # Whoogle (Routed)
       - "3000:3000"     # Invidious (Routed)
       - "4000:4000"     # Gateway (Routed)
+      - "80:80"         # Traefik HTTP (ACME challenge + redirect)
+      - "443:443"       # Traefik HTTPS (api.oxiverse.com)
       - "6000:6000"     # Indexer (Routed)
     restart: always
     healthcheck:

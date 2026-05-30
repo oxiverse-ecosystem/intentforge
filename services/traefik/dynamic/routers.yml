@@ -1,0 +1,18 @@
+# Traefik Dynamic Configuration
+# Only the main API (gateway) is exposed to the internet
+
+http:
+  routers:
+    gateway:
+      rule: "Host(`api.oxiverse.com`)"
+      entryPoints:
+        - websecure
+      service: gateway
+      tls:
+        certResolver: letsencrypt
+
+  services:
+    gateway:
+      loadBalancer:
+        servers:
+          - url: "http://localhost:4000"
