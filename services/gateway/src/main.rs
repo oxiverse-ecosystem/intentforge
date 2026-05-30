@@ -147,6 +147,16 @@ struct SearxNewsResponse {
 }
 
 // ─── API Response Shapes ──────────────────────────────────────────
+
+// Map detailed intent subtypes to standard search categories
+fn parent_category(intent: &str) -> String {
+    match intent {
+        "navigational" => "navigational",
+        "informational" | "technical" | "how-to" | "comparison" | "fresh" => "informational",
+        "transactional" => "transactional",
+        _ => "informational",
+    }.to_string()
+}
 #[derive(Serialize)]
 struct ImageResult {
     title: String,
@@ -206,6 +216,8 @@ struct MergedResult {
 #[derive(Serialize)]
 struct UnifiedResponse {
     intent: String,
+    #[serde(default)]
+    category: String,
     #[serde(default)]
     confidence: f32,
     #[serde(default)]
@@ -345,7 +357,7 @@ fn freshness_score(url: &str, intent: &str) -> f32 {
     // for the document's last_crawled_at timestamp.
 
     let url_lower = url.to_lowercase();
-    let mut estimated_age_hours: f32 = 720.0; // default: 30 days
+    let mut estimated_age_hours: f32 = 168.0; // default: 7 days (less aggressive decay)
 
     // Fresh content signals in URL
     if url_lower.contains("/2026/") || url_lower.contains("2026-") {
@@ -1419,10 +1431,10 @@ impl CircuitBreaker {
         health.last_failure = Some(Instant::now());
         health.total_failures += 1;
 
-        // Exponential backoff: 30s, 60s, 120s, ... capped at 10 min
-        if health.consecutive_failures >= 3 {
-            let backoff_secs = 30u64 * 2u64.pow(health.consecutive_failures.saturating_sub(3));
-            let backoff = Duration::from_secs(backoff_secs.min(600));
+        // Exponential backoff: 15s, 30s, 60s, ... capped at 5 min
+        if health.consecutive_failures >= 2 {
+            let backoff_secs = 15u64 * 2u64.pow(health.consecutive_failures.saturating_sub(2));
+            let backoff = Duration::from_secs(backoff_secs.min(300));
             health.open_until = Some(Instant::now() + backoff);
             tracing::warn!(
                 "Circuit OPEN for engine '{}' — {} failures, backing off {:?}",
@@ -1872,10 +1884,10 @@ async fn main() {
         cache: SearchCache::new(),
         rate_limits: RateLimitTracker::new(),
         http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(3))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .pool_max_idle_per_host(10)
-            .connect_timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(1))
             .build()
             .unwrap(),
         searxng2_url,
@@ -2136,9 +2148,9 @@ async fn handle_search(
                         tracing::info!("Skipping retry for malformed query (alpha_ratio={:.2}, len={})", alpha_ratio, q_decoded.len());
                         return Ok(SearxResponse { results: vec![] });
                     }
-                    // Retry once after 1s for legitimate queries that returned 0 results
-                    tracing::warn!("SearXNG returned 0 results, retrying in 1s...");
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    // Retry once after 500ms for legitimate queries that returned 0 results
+                    tracing::warn!("SearXNG returned 0 results, retrying in 500ms...");
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let retry: Result<SearxResponse, reqwest::Error> = async {
                         let resp = client_ref.get(&url).send().await?;
                         let status = resp.status();
@@ -2288,15 +2300,15 @@ async fn handle_search(
     };
 
     // Join all futures: indexer + all SearXNG variations + whoogle + invidious + media
-    // SearXNG fan-out has a 4s timeout — if Tor2/VPN is slow, return partial results fast
+    // SearXNG fan-out has a 3s timeout — if Tor2/VPN is slow, return partial results fast
     let searx_fut_with_timeout = async {
         match tokio::time::timeout(
-            std::time::Duration::from_secs(4),
+            std::time::Duration::from_secs(3),
             futures::future::join_all(searx_futs),
         ).await {
             Ok(results) => results,
             Err(_) => {
-                tracing::warn!("SearXNG fan-out timed out after 4s — returning partial results");
+                tracing::warn!("SearXNG fan-out timed out after 3s — returning partial results");
                 vec![]
             }
         }
@@ -2544,9 +2556,9 @@ async fn handle_search(
     let semantic_scores_web: Vec<f32> = web_results.iter()
         .map(|res| semantic_relevance_score(&q, &res.title, &res.content))
         .collect();
-    let semantic_threshold = if web_results.len() > 30 { 0.25 }
-        else if web_results.len() > 20 { 0.20 }
-        else { 0.15 };
+    let semantic_threshold = if web_results.len() > 30 { 0.15 }
+        else if web_results.len() > 20 { 0.12 }
+        else { 0.08 };
     let mut keep_indices: Vec<usize> = Vec::new();
     for (i, &score) in semantic_scores_web.iter().enumerate() {
         if score >= semantic_threshold || i < 5 {
@@ -2635,6 +2647,7 @@ async fn handle_search(
 
     let response = UnifiedResponse {
         intent: intent.intent.clone(),
+        category: parent_category(&intent.intent),
         confidence: intent.confidence,
         constraints: intent.constraints.clone(),
         structured_constraints: intent.structured_constraints.clone(),
