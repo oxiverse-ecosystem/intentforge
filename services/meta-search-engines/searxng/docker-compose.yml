@@ -5,6 +5,7 @@ services:
     network_mode: "container:gluetun"
     environment:
       - GRANIAN_WORKERS=4
+      - GRANIAN_HOST=0.0.0.0
     volumes:
       - ./searxng:/etc/searxng:rw
     restart: always
@@ -30,6 +31,7 @@ services:
     environment:
       - GRANIAN_WORKERS=4
       - SEARXNG_PORT=8081
+      - GRANIAN_HOST=0.0.0.0
     volumes:
       - ./searxng2:/etc/searxng:ro
     restart: always
