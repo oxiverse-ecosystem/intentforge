@@ -108,7 +108,7 @@ fn extract_constraints(query: &str) -> Constraints {
     let negative_markers = [
         " not ", " -", " without ", " except ", " excluding ",
         " but not ", " other than ", " minus ", " besides ", " no ",
-        " alternative to ", " alternatives to ", " alternative for ",
+        " alternative to ", " alternatives to ",
         " instead of ", " replacement for ",
     ];
 
@@ -186,7 +186,7 @@ fn extract_constraints(query: &str) -> Constraints {
 
     let negative_starts = [" not ", " without ", " except ", " excluding ",
                            " but not ", " other than ", " minus ", " besides ", " no ",
-                           " alternative to ", " alternatives to ", " alternative for ",
+                           " alternative to ", " alternatives to ",
                            " instead of ", " replacement for "];
 
     for marker in &positive_markers {
@@ -311,14 +311,25 @@ fn extract_constraints(query: &str) -> Constraints {
             "most","more","less","many","few","each","every","all","any","some",
             "quick","simple","easy","great","popular","powerful",
             "no","without","except","excluding","besides","other","than","minus",
-            "that","which","must","needs","should","can",
+            "that","which","must","needs","should","can","vs","v","versus",
+            // Prepositions, conjunctions, articles, pronouns that slip through
+            "set","up","down","out","off","over","under","about","into","through",
+            "between","after","before","during","since","until","above","below",
+            "per","via","way","ways","thing","things","type","kind","sort",
             // Domain-generic words that aren't useful as constraints
             "framework","library","language","tool","editor","database",
             "generator","server","client","application","app","software",
             "system","platform","service","api","sdk","package","module",
             "bundler","runtime","programming","tutorial","tutorials","guide",
             "documentation","docs","learn","getting","started","introduction",
-            "explained","overview","comparison","compared","versus",
+            "explained","overview","comparison","compared","production",
+            "deployment","alternative","alternatives","option","options",
+            "solution","solutions","recommendation","recommendations",
+            // Year numbers (extracted as constraints but pollute ranking)
+            "2024","2025","2026","2023","2022","2021","2020",
+            // Measurement/quantity words
+            "price","cost","budget","cheap","free","under","over","less","more",
+            "best","top","good","great","popular","recommended",
         ].iter().copied().collect();
 
         // Build set of words already consumed as part of compound terms
@@ -418,7 +429,15 @@ fn extract_conjunctive_terms(text: &str, max_words: usize) -> Vec<String> {
 /// For negatives (max_words=1): "not vim" → "vim" (single word only)
 /// For positives (max_words=2): "for game engine" → "game engine", "for beginners fast" → "beginners"
 fn extract_constraint_term(text: &str, max_words: usize) -> String {
-    let stop_words = ["and", "or", "but", "the", "a", "an", "is", "are", "in", "on"];
+    let stop_words = ["and", "or", "but", "the", "a", "an", "is", "are", "in", "on",
+        "for", "with", "from", "to", "of", "at", "by", "as", "via",
+        "under", "over", "about", "into", "through", "between", "after", "before",
+        "during", "since", "until", "above", "below", "per", "up", "down", "out",
+        "off", "set", "how", "what", "where", "when", "why", "which", "who",
+        // Domain-generic words that aren't useful as extracted constraints
+        "programming", "framework", "library", "language", "tool", "database",
+        "server", "client", "application", "app", "software", "system",
+        "platform", "service", "tutorial", "guide", "documentation", "docs"];
     // Quality adjectives/modifiers that terminate extraction after the first content word.
     // "for beginners fast modern" → "beginners" (stops at "fast")
     // "for game engine lightweight" → "game engine" (stops at "lightweight")

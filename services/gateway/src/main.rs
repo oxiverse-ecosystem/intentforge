@@ -1872,9 +1872,10 @@ async fn main() {
         cache: SearchCache::new(),
         rate_limits: RateLimitTracker::new(),
         http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(5))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .pool_max_idle_per_host(10)
+            .connect_timeout(Duration::from_secs(2))
             .build()
             .unwrap(),
         searxng2_url,
@@ -2287,9 +2288,22 @@ async fn handle_search(
     };
 
     // Join all futures: indexer + all SearXNG variations + whoogle + invidious + media
+    // SearXNG fan-out has a 4s timeout — if Tor2/VPN is slow, return partial results fast
+    let searx_fut_with_timeout = async {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            futures::future::join_all(searx_futs),
+        ).await {
+            Ok(results) => results,
+            Err(_) => {
+                tracing::warn!("SearXNG fan-out timed out after 4s — returning partial results");
+                vec![]
+            }
+        }
+    };
     let (indexer_res, searx_results, whoogle_res, invidious_res, news_res, image_res) = tokio::join!(
         indexer_fut,
-        futures::future::join_all(searx_futs),
+        searx_fut_with_timeout,
         whoogle_fut,
         invidious_fut,
         news_fut,

@@ -39,8 +39,8 @@ search:
   default_lang: "en"
 
 outgoing:
-  request_timeout: 6.0     # Lowered from 10s — fail fast, avoid 10s timeout cascade
-  max_request_timeout: 10.0
+  request_timeout: 4.0     # Fail fast on Tor — engines that can't respond in 4s aren't useful
+  max_request_timeout: 6.0
   # ALL traffic goes through Tor2 (port 9051)
   networks:
     default:
@@ -58,58 +58,58 @@ engines:
   # ── All engines via Tor (default network) ──
   - name: bing
     disabled: false
-    timeout: 8.0
+    timeout: 4.0
 
   - name: brave
     disabled: false
-    timeout: 8.0
+    timeout: 4.0
 
   - name: startpage
     disabled: false
-    timeout: 8.0
+    timeout: 4.0
 
   - name: wikipedia
     disabled: false
-    timeout: 6.0
+    timeout: 3.0
 
   - name: mojeek
     disabled: false
-    timeout: 6.0
+    timeout: 3.0
 
   - name: yandex
     disabled: false
-    timeout: 6.0
+    timeout: 3.0
 
   - name: duckduckgo
     disabled: false
-    timeout: 8.0
+    timeout: 4.0
 
   - name: presearch
     disabled: false
-    timeout: 8.0
+    timeout: 4.0
 
   - name: marginalia
     disabled: false
-    timeout: 10.0
+    timeout: 5.0
 
   # ── Onion engine via Tor ──
   - name: ahmia
     disabled: false
     network: tor
-    timeout: 20.0
+    timeout: 10.0
 
   # ── Image & News engines via Tor ──
   - name: bing images
     engine: bing_images
     disabled: false
-    timeout: 8.0
+    timeout: 4.0
 
   - name: bing news
     engine: bing_news
     disabled: false
-    timeout: 8.0
+    timeout: 4.0
 
   - name: google news
     engine: google_news
     disabled: false
-    timeout: 8.0
+    timeout: 4.0

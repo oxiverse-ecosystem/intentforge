@@ -20,7 +20,8 @@ services:
     environment:
       - INTENT_ENGINE_URL=http://localhost:3005
       - SEARXNG_URL=http://localhost:8080
-      - SEARXNG2_URL=http://localhost:8081
+      # SearXNG2 disabled until Tor2 is stable (DNS bootstrap issues)
+      # - SEARXNG2_URL=http://localhost:8081
       - CRAWLER_URL=http://localhost:5001
       - INDEXER_URL=http://localhost:6000
     volumes:
