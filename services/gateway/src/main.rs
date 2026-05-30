@@ -2172,8 +2172,10 @@ async fn handle_search(
                     retry
                 }
                 Err(e) => {
-                    tracing::warn!("SearXNG request failed — triggering VPN rotation: {:?}", e);
-                    trigger_vpn_rotation("request_failed");
+                    // Don't trigger VPN rotation on connection errors — these are local
+                    // infrastructure issues (container down, port conflict), not IP blocks.
+                    // VPN rotation only helps with 429 rate limits or search engine blocks.
+                    tracing::warn!("SearXNG request failed (local error, no VPN rotation): {:?}", e);
                     Err(e)
                 }
             }
