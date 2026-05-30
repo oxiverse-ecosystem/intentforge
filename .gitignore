@@ -23,6 +23,7 @@ services/privacy-layer/.env
 # Runtime data
 services/privacy-layer/tor/data/
 services/privacy-layer/tor2/data/
+services/traefik/acme/
 shared-signals/
 
 # Test artifacts

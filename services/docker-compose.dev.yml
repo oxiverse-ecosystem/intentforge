@@ -1,0 +1,95 @@
+# IntentForge v2 — DEVELOPMENT Compose
+# Minimal stack for local testing: no VPN, no Tor, no Traefik
+# Services communicate via Docker bridge network (container DNS names)
+# Gateway exposed directly on localhost:4000
+#
+# Usage (from project root):
+#   make dev-up            # build + start
+#   make dev-down          # stop
+#   make dev-nuke          # stop + delete everything
+#   make dev-rebuild       # nuke + fresh build
+#   make dev-logs          # tail logs
+#
+# Manual (from services/ dir):
+#   docker compose -f docker-compose.dev.yml up -d --build
+#   docker compose -f docker-compose.dev.yml down
+
+services:
+  # ══════════════════════════════════════════════════════════════════
+  # CORE SERVICES ONLY — fast iteration
+  # ══════════════════════════════════════════════════════════════════
+
+  intent-engine:
+    build:
+      context: ./intent-engine
+      dockerfile: Dockerfile
+    container_name: if-dev-intent-engine
+    volumes:
+      - ./intent-engine/models:/app/models
+    environment:
+      - RUST_LOG=info
+      - RAYON_NUM_THREADS=2
+    networks:
+      - intentforge
+    # no restart — fail fast in dev
+
+  searxng:
+    container_name: if-dev-searxng
+    image: searxng/searxng:latest
+    environment:
+      - GRANIAN_WORKERS=2
+      - GRANIAN_HOST=0.0.0.0
+    volumes:
+      - ./meta-search-engines/searxng/searxng:/etc/searxng:rw
+    networks:
+      - intentforge
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+
+  indexer:
+    build:
+      context: ./indexer
+      dockerfile: Dockerfile
+    container_name: if-dev-indexer
+    volumes:
+      - ./indexer/index_data:/app/index_data
+    networks:
+      - intentforge
+
+  crawler:
+    build:
+      context: ./crawler
+      dockerfile: Dockerfile
+    container_name: if-dev-crawler
+    networks:
+      - intentforge
+
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: if-dev-gateway
+    ports:
+      - "4000:4000"
+    environment:
+      # Bridge network: use container DNS names instead of localhost
+      - INTENT_ENGINE_URL=http://if-dev-intent-engine:3005
+      - SEARXNG_URL=http://if-dev-searxng:8080
+      - SEARXNG2_URL=
+      - CRAWLER_URL=http://if-dev-crawler:5001
+      - INDEXER_URL=http://if-dev-indexer:6000
+    depends_on:
+      - intent-engine
+      - crawler
+      - indexer
+      - searxng
+    networks:
+      - intentforge
+
+networks:
+  intentforge:
+    driver: bridge
