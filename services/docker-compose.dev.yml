@@ -145,6 +145,8 @@ services:
       - WHOOGLE_CONFIG_THEME=dark
       - WHOOGLE_CONFIG_SEARCH_LANGUAGE=lang_en
       - WHOOGLE_CONFIG_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+    volumes:
+      - ./meta-search-engines/whoogle/torrc:/etc/tor/torrc:ro
     logging:
       driver: "json-file"
       options:
