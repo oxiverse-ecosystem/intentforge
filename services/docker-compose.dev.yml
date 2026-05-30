@@ -1,22 +1,208 @@
 # IntentForge v2 — DEVELOPMENT Compose
-# Minimal stack for local testing: no VPN, no Tor, no Traefik
-# Services communicate via Docker bridge network (container DNS names)
-# Gateway exposed directly on localhost:4000
-#
-# Usage (from project root):
-#   make dev-up            # build + start
-#   make dev-down          # stop
-#   make dev-nuke          # stop + delete everything
-#   make dev-rebuild       # nuke + fresh build
-#   make dev-logs          # tail logs
-#
-# Manual (from services/ dir):
-#   docker compose -f docker-compose.dev.yml up -d --build
-#   docker compose -f docker-compose.dev.yml down
+# Full stack MINUS Traefik. VPN + Tor + all search engines included.
+# Gateway exposed directly on localhost:4000 (no SSL proxy).
+# Difference from prod: no Traefik, no ports 80/443, fewer workers.
 
 services:
   # ══════════════════════════════════════════════════════════════════
-  # CORE SERVICES ONLY — fast iteration
+  # PRIVACY LAYER — VPN + Tor
+  # ══════════════════════════════════════════════════════════════════
+
+  gluetun:
+    image: qmcgaw/gluetun:v3.39.0
+    container_name: if-dev-gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file:
+      - ../.env
+    environment:
+      - VPN_SERVICE_PROVIDER=protonvpn
+      - VPN_TYPE=openvpn
+      - FREE_ONLY=on
+      - DNS_ADDRESS=1.1.1.1
+      - HTTP_PROXY=on
+      - SHADOWSOCKS=on
+      - HTTP_CONTROL_SERVER_ADDRESS=:8000
+      - HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE=public
+    ports:
+      - "8888:8888/tcp"
+      - "8388:8388/tcp"
+      - "8080:8080"
+      - "8081:8081"
+      - "5000:5000"
+      - "3000:3000"
+      - "4000:4000"
+      - "6000:6000"
+    restart: always
+    healthcheck:
+      test: ["CMD", "/gluetun-entrypoint", "healthcheck"]
+      interval: 15s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  vpn-rotator:
+    image: alpine:latest
+    container_name: if-dev-vpn-rotator
+    volumes:
+      - ./privacy-layer/vpn-rotator.sh:/vpn-rotator.sh:ro
+      - ./shared-signals:/tmp/vpn-signals
+    command: ["sh", "/vpn-rotator.sh"]
+    depends_on:
+      - gluetun
+    network_mode: "service:gluetun"
+    restart: always
+
+  tor:
+    build: ./privacy-layer/tor
+    container_name: if-dev-tor
+    network_mode: "service:gluetun"
+    volumes:
+      - ./privacy-layer/tor/data:/var/lib/tor
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  tor2:
+    build: ./privacy-layer/tor2
+    container_name: if-dev-tor2
+    network_mode: "service:gluetun"
+    volumes:
+      - ./privacy-layer/tor2/data:/var/lib/tor
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ══════════════════════════════════════════════════════════════════
+  # META-SEARCH ENGINES
+  # ══════════════════════════════════════════════════════════════════
+
+  searxng:
+    container_name: if-dev-searxng
+    image: searxng/searxng:latest
+    network_mode: "service:gluetun"
+    environment:
+      - GRANIAN_WORKERS=2
+      - GRANIAN_HOST=0.0.0.0
+    volumes:
+      - ./meta-search-engines/searxng/searxng:/etc/searxng:rw
+    restart: always
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  searxng2:
+    container_name: if-dev-searxng2
+    image: searxng/searxng:latest
+    network_mode: "service:gluetun"
+    environment:
+      - GRANIAN_WORKERS=2
+      - SEARXNG_PORT=8081
+      - GRANIAN_HOST=0.0.0.0
+    volumes:
+      - ./meta-search-engines/searxng/searxng2:/etc/searxng:rw
+    restart: always
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  whoogle:
+    container_name: if-dev-whoogle
+    image: benbusby/whoogle-search:latest
+    network_mode: "service:gluetun"
+    restart: always
+    environment:
+      - WHOOGLE_CONFIG_HTTPS=0
+      - WHOOGLE_CONFIG_THEME=dark
+      - WHOOGLE_CONFIG_SEARCH_LANGUAGE=lang_en
+      - WHOOGLE_CONFIG_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  invidious-db:
+    container_name: if-dev-invidious-db
+    image: postgres:14-alpine
+    network_mode: "service:gluetun"
+    restart: always
+    environment:
+      - POSTGRES_DB=invidious
+      - POSTGRES_USER=kemal
+      - POSTGRES_PASSWORD=kemal
+    volumes:
+      - invidious-db-data-dev:/var/lib/postgresql/data
+
+  invidious:
+    container_name: if-dev-invidious
+    image: quay.io/invidious/invidious:latest
+    network_mode: "service:gluetun"
+    depends_on:
+      - invidious-db
+    environment:
+      - INVIDIOUS_DATABASE_URL=postgres://kemal:kemal@localhost:5432/invidious
+      - INVIDIOUS_HMAC_KEY=intentforge_v2_invidious_hmac_key_987654321
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ══════════════════════════════════════════════════════════════════
+  # INDEXER + CRAWLER
+  # ══════════════════════════════════════════════════════════════════
+
+  indexer:
+    build:
+      context: ./indexer
+      dockerfile: Dockerfile
+    container_name: if-dev-indexer
+    volumes:
+      - ./indexer/index_data:/app/index_data
+    network_mode: "service:gluetun"
+    restart: always
+
+  crawler:
+    build:
+      context: ./crawler
+      dockerfile: Dockerfile
+    container_name: if-dev-crawler
+    network_mode: "service:gluetun"
+    restart: always
+
+  # ══════════════════════════════════════════════════════════════════
+  # INTENT ENGINE + GATEWAY
   # ══════════════════════════════════════════════════════════════════
 
   intent-engine:
@@ -29,67 +215,32 @@ services:
     environment:
       - RUST_LOG=info
       - RAYON_NUM_THREADS=2
-    networks:
-      - intentforge
-    # no restart — fail fast in dev
-
-  searxng:
-    container_name: if-dev-searxng
-    image: searxng/searxng:latest
-    environment:
-      - GRANIAN_WORKERS=2
-      - GRANIAN_HOST=0.0.0.0
-    volumes:
-      - ./meta-search-engines/searxng/searxng:/etc/searxng:rw
-    networks:
-      - intentforge
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-
-  indexer:
-    build:
-      context: ./indexer
-      dockerfile: Dockerfile
-    container_name: if-dev-indexer
-    volumes:
-      - ./indexer/index_data:/app/index_data
-    networks:
-      - intentforge
-
-  crawler:
-    build:
-      context: ./crawler
-      dockerfile: Dockerfile
-    container_name: if-dev-crawler
-    networks:
-      - intentforge
+    network_mode: "service:gluetun"
+    restart: always
 
   gateway:
     build:
       context: ./gateway
       dockerfile: Dockerfile
     container_name: if-dev-gateway
-    ports:
-      - "4000:4000"
     environment:
-      # Bridge network: use container DNS names instead of localhost
-      - INTENT_ENGINE_URL=http://if-dev-intent-engine:3005
-      - SEARXNG_URL=http://if-dev-searxng:8080
-      - SEARXNG2_URL=
-      - CRAWLER_URL=http://if-dev-crawler:5001
-      - INDEXER_URL=http://if-dev-indexer:6000
+      - INTENT_ENGINE_URL=http://localhost:3005
+      - SEARXNG_URL=http://localhost:8080
+      - SEARXNG2_URL=http://localhost:8081
+      - CRAWLER_URL=http://localhost:5001
+      - INDEXER_URL=http://localhost:6000
+    volumes:
+      - ./shared-signals:/tmp/vpn-signals
+    network_mode: "service:gluetun"
     depends_on:
       - intent-engine
       - crawler
       - indexer
       - searxng
-    networks:
-      - intentforge
+      - searxng2
+      - whoogle
+      - invidious
+    restart: always
 
-networks:
-  intentforge:
-    driver: bridge
+volumes:
+  invidious-db-data-dev:
