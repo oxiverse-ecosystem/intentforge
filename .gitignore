@@ -2,7 +2,7 @@
 **/target/
 
 # Index data (runtime)
-index_data/
+**/index_data/
 
 # Model files (large, downloaded at runtime)
 models/
@@ -15,9 +15,21 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Secrets — NEVER commit .env files
+.env
 services/privacy-layer/.env
 
 # Runtime data
 services/privacy-layer/tor/data/
-services/indexer/index_data/
+services/privacy-layer/tor2/data/
 shared-signals/
+
+# Test artifacts
+searx_test.json
+*.pyc
+__pycache__/
+
+# Hermes agent state
+.hermes/plans/
+docs/plans/
