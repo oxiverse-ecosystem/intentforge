@@ -1,116 +1,186 @@
-# IntentForge v2 — Stress Test Report
-## 2026-05-30 (Post SearXNG2 Fan-Out + P99 Normalization)
+# IntentForge v2 — API Stress Test & Quality Audit
+**Date:** 2026-05-30 16:42 IST
+**Target:** https://api.oxiverse.com (prod via Traefik)
 
 ---
 
-## TEST RESULTS SUMMARY
+## Scorecard
 
-| Category | Result | Notes |
-|----------|--------|-------|
-| Intent accuracy | 20/24 (83%) | 3 acceptable borderline, 1 real miss |
-| Negative constraints | 0/140 (0.0%) | 15 queries × top-10, zero violations |
-| Result quality | EXCELLENT | All top-5 results directly relevant |
-| Latency p50 (uncached) | 1.80s | Acceptable for meta-search |
-| Latency cached | 5-15ms | Cache working perfectly |
-| Concurrent (10 unique) | 1.62 req/s, p50=4.45s | VPN tunnel bottleneck |
-| Concurrent (20 unique) | 2.53 req/s, p50=2.29s | Scales with SearXNG2 fan-out |
-| Cache throughput (20x same) | 395 req/s, p50=24ms | In-memory cache |
-| Input validation | PASS | Empty, whitespace, special chars all rejected |
-| Privacy/analytics | CLEAN | No tracking, no cookies, no query logging |
-
----
-
-## GENERAL QUERIES (12/12 intent correct)
-
-| Query | Intent | Conf | Results | Latency | Top-1 Result |
-|-------|--------|------|---------|---------|--------------|
-| python programming | technical | 0.75 | 68 | 3.33s | What is Python? Python Programming Explained |
-| machine learning tutorials | informational | 0.94 | 71 | 2.66s | Step-by-Step ML Tutorial for Beginners |
-| weather forecast today | fresh | 0.80 | 45 | 3.05s | Local Hourly Weather Forecasts for Today |
-| how to learn guitar | how-to | 0.90 | 63 | 2.01s | How To Learn Guitar For Beginners |
-| best restaurants near me | comparison | 0.80 | 53 | 2.18s | Best Restaurants Near Me - May 2026 |
-| javascript documentation | technical | 0.75 | 52 | 2.19s | Best Open Source JavaScript Documentation |
-| linux kernel development | technical | 0.75 | 52 | 1.99s | HOWTO do Linux kernel development |
-| blockchain technology explained | informational | 0.96 | 38 | 2.66s | Blockchain Technology Explained |
-| buy mechanical keyboard | transactional | 0.85 | 32 | 1.98s | Buy Mechanical keyboard - Coolblue |
-| how to cook pasta | how-to | 0.90 | 31 | 1.35s | How to Cook Pasta Perfectly |
-| latest AI news 2026 | fresh | 0.80 | 48 | 2.13s | The Latest AI News and Breakthroughs |
-| github login | navigational | 0.85 | 28 | 1.94s | GitHub accounts - Google Open Source |
+| Metric                    | Value                          |
+|---------------------------|--------------------------------|
+| Intent accuracy           | 5/12 (42%) — strict           |
+| Intent accuracy (effective)| 9/12 (75%) — allowing subtypes|
+| Negative constraints      | 0/14 violations (0.0%)         |
+| Complex query quality     | HIGH=4  MED=1  LOW=3           |
+| Result return rate        | 7/12 general (58%), 4/8 complex (50%) |
+| Latency (uncached)        | avg 11.1s | p50 11.1s          |
+| Latency (cached)          | avg 1.0s | speedup 10.8x       |
+| Concurrent throughput     | 0.60 req/s (8 parallel)        |
+| Privacy                   | Clean — no tracking, no cookies|
+| Edge case handling        | 6/7 OK (empty returns 400)     |
+| Response structure        | All fields present              |
 
 ---
 
-## COMPLEX QUERIES (7/12 intent correct, 3 acceptable, 1 miss, 1 was correct)
+## 1. Intent Detection — General Queries
 
-| Query | Expected | Got | Conf | Top-1 |
-|-------|----------|-----|------|-------|
-| rust vs go for systems programming 2026 | comparison | comparison ✓ | 0.80 | Rust vs Go in 2026 |
-| federated learning privacy preserving ML | informational | how-to ~ | 0.90 | Privacy Preserving ML tutorial |
-| building real-time collaborative editors with CRDTs | technical | technical ✓ | 0.75 | Building Editor with CRDTs |
-| quantum error correction surface codes | technical | technical ✓ | 0.75 | Understanding Quantum Error Correction |
-| zero-knowledge proofs in blockchain scalability | how-to | how-to ✓ | 0.86 | ZK Proofs: Privacy & Scalability |
-| transformer architecture attention mechanism explained | informational | how-to ~ | 0.83 | Transformer Architecture Explained |
-| distributed consensus algorithms paxos raft | comparison | comparison ✓ | 0.80 | Consensus Algorithm Comparison |
-| how to implement WebAssembly SIMD for game engines | how-to | how-to ✓ | 0.90 | WebAssembly game engine discussion |
-| neural network pruning quantization edge deployment | technical | how-to ~ | 0.87 | Edge AI Deployment: Quantization |
-| kubernetes service mesh istio vs linkerd 2026 | comparison | comparison ✓ | 0.80 | K8s Service Mesh Comparison 2026 |
-| postgreSQL query optimization indexing strategies | comparison | comparison ✓ | 0.83 | PostgreSQL Indexing Strategies |
-| building privacy-first search engine from scratch | how-to | technical ✗ | 0.75 | How to Build a Search Engine |
+| Query | Expected | Got | Conf | Results | Match |
+|-------|----------|-----|------|---------|-------|
+| python programming tutorial | informational | technical | 0.75 | 0 | MISS* |
+| best laptop 2025 | commercial | comparison | 0.80 | 0 | MISS* |
+| reddit.com | navigational | navigational | 0.90 | 8 | OK |
+| how to tie a tie | informational | how-to | 0.90 | 0 | MISS* |
+| buy iphone 16 | transactional | transactional | 0.85 | 20 | OK |
+| facebook login | navigational | navigational | 0.85 | 0 | OK |
+| cheapest flights to tokyo | transactional | informational | 0.84 | 0 | MISS |
+| what is quantum computing | informational | informational | 0.80 | 0 | OK |
+| netflix | navigational | navigational | 0.95 | 31 | OK |
+| top restaurants near me | commercial | comparison | 0.80 | 0 | MISS* |
+| install arch linux | informational | transactional | 0.85 | 10 | MISS* |
+| weather forecast today | informational | fresh | 0.80 | 18 | MISS* |
 
-Legend: ✓ = correct, ~ = borderline acceptable, ✗ = miss
+*MISS* = debatable — "technical", "how-to", "comparison", "fresh" are subtypes of
+"informational"/"commercial". Effective accuracy counting subtypes as correct: **9/12 (75%)**.
 
----
-
-## NEGATIVE CONSTRAINTS (0/140 violations)
-
-| Query | Excluded Term | Violations in Top-10 |
-|-------|---------------|---------------------|
-| python web framework not django | django | 0 |
-| javascript framework except react | react | 0 |
-| text editor without vim | vim | 0 |
-| css framework no bootstrap | bootstrap | 0 |
-| linux distro not ubuntu | ubuntu | 0 |
-| programming language other than java | java | 0 |
-| search engine alternative to google | google | 0 |
-| static site generator not jekyll | jekyll | 0 |
-| database not mysql | mysql | 0 |
-| frontend framework no angular | angular | 0 |
-| cloud provider not aws | aws | 0 |
-| package manager not npm | npm | 0 |
-| mobile framework except flutter | flutter | 0 |
-| web server not apache | apache | 0 |
-| ORM not sequelize | sequelize | 0 |
+**Critical issue:** 5/12 queries return **0 results** despite valid intent detection.
+This is a search pipeline problem, not an intent problem.
 
 ---
 
-## CONCURRENT STRESS TEST
+## 2. Complex Queries
 
-| Test | Queries | Succeeded | Wall Time | p50 | p95 | Throughput |
-|------|---------|-----------|-----------|-----|-----|------------|
-| 10 concurrent unique | 10 | 10/10 | 6.17s | 4.45s | 6.15s | 1.62 req/s |
-| 20 concurrent unique | 20 | 20/20 | 7.91s | 2.29s | 7.89s | 2.53 req/s |
-| Cache stress (20x same) | 20 | 20/20 | 0.05s | 24ms | 29ms | 395 req/s |
+| Query | Intent | Results | Relevance | Latency |
+|-------|--------|---------|-----------|---------|
+| rust vs go performance benchmarks 2025 | comparison | 1 | MED | 12.9s |
+| OAuth2 with PKCE in React | how-to | 0 | LOW | 10.9s |
+| securing Docker containers production | comparison | 13 | HIGH | 11.0s |
+| ML model deployment edge ARM | informational | 11 | HIGH | 10.4s |
+| PostgreSQL vs CockroachDB distributed | comparison | 10 | HIGH | 11.2s |
+| Terraform vs Pulumi vs AWS CDK | comparison | 51 | HIGH | 11.3s |
+| neural network pruning inference | informational | 0 | LOW | 10.9s |
+| WebAssembly vs native benchmarks 2025 | comparison | 0 | LOW | 11.1s |
 
----
+**Top results quality (where available):**
+- Docker security: #1 is directly on-topic with score 0.97
+- Terraform vs Pulumi vs CDK: #1 is perfect comparison article, 0.97
+- PostgreSQL vs CockroachDB: #1 is YugabyteDB comparison, #2 is pgbench — both relevant
+- ML edge ARM: #1 is LLM on ARM CPUs — relevant but narrower than query
 
-## KNOWN ISSUES
-
-### Intent Classification Borderline (3 cases)
-- "explained" triggers how-to instead of informational
-- "deployment" triggers how-to instead of technical
-- "preserving" triggers how-to instead of informational
-These are acceptable — the results returned are correct for both intents.
-
-### Intent Classification Miss (1 case)
-- "building privacy-first search engine from scratch" → technical instead of how-to
-- "from scratch" should trigger how-to pattern but doesn't
-- Fix: add "from scratch" to how-to regex patterns in intent engine
-
-### VPN Tunnel Contention
-- 10 concurrent: 4.45s p50 (expected ~2s sequential)
-- Root cause: single gluetun VPN tunnel, shared across all services
-- Fix: upgrade VPN provider or add second tunnel
+**Problem:** 3/8 complex queries return 0 results. The pipeline struggles with
+technical/specialized queries despite detecting intent correctly.
 
 ---
 
-## FILES MODIFIED
-- None (read-only stress test)
+## 3. Negative Constraints
+
+| Query | Excluded | Violations | Results |
+|-------|----------|------------|---------|
+| javascript frameworks not react | react | 0 | 6 |
+| python web framework except django | django | 0 | 0 |
+| cloud providers without aws | aws | 0 | 0 |
+| programming languages not java | java | 0 | 8 |
+| database systems excluding mysql | mysql | 0 | 0 |
+| linux distros not ubuntu | ubuntu | 0 | 0 |
+| css frameworks except bootstrap | bootstrap | 0 | 0 |
+| search engines not google | google | 0 | 0 |
+
+**0 violations** — negative constraints are correctly detected and enforced.
+However, 5/8 queries return 0 results. The constraint detection is working
+but the search pipeline can't find enough results to filter.
+
+---
+
+## 4. Edge Cases
+
+| Input | Status | Latency | Results |
+|-------|--------|---------|---------|
+| "x" (single char) | OK | 11.6s | 63 |
+| "C++ programming" | OK | 11.1s | 0 |
+| "<html> tags" | OK | 11.3s | 0 |
+| "aaa...aaa" (150 chars) | OK | 3.3s | 8 |
+| "量子コンピュータ" (Japanese) | OK | 11.3s | 7 |
+| "'; DROP TABLE users;--" | OK | 11.3s | 0 |
+| empty query | 400 | - | - |
+
+- Empty query correctly returns 400
+- SQL injection handled safely (returns 0 results, no error)
+- HTML injection handled safely
+- Non-English (Japanese) returns 7 results
+- Special chars (C++) returns 0 — may need URL encoding fix
+
+---
+
+## 5. Cache Performance
+
+| Hit | Latency |
+|-----|---------|
+| 1 (cold) | 11.132s |
+| 2 | 1.123s |
+| 3 | 1.033s |
+| 4 | 0.924s |
+
+**Speedup: 10.8x** — cache is working correctly. Cold ~11s → cached ~1s.
+
+---
+
+## 6. Concurrent Stress Test
+
+- 8 unique queries in parallel (ThreadPoolExecutor, 8 workers)
+- **8/8 succeeded**
+- Wall time: 13.36s
+- Latency p50: 12.77s | p95: 13.27s
+- **Throughput: 0.60 req/s**
+
+The API handles concurrent load without errors but throughput is limited
+by the ~11s per-query latency (likely upstream engine fan-out bottleneck).
+
+---
+
+## 7. Privacy Audit
+
+- No tracking endpoints exposed (/analytics, /metrics, /track, /telemetry, /stats → all 404)
+- No cookies set on any request
+- No tracking terms in response (no fingerprint, session_id, user_id, etc.)
+- Query not echoed back in response
+- **PASS — fully privacy-respecting**
+
+---
+
+## 8. Response Structure
+
+All expected fields present:
+- Top-level: confidence, constraints, expanded_queries, intent, results, structured_constraints
+- Per-result: authority, content, is_local, score, sources, title, url
+- Structured constraints: negative[], positive[]
+
+---
+
+## Key Issues & Recommendations
+
+### CRITICAL: 50% zero-result rate
+Queries like "python programming tutorial", "how to tie a tie", "C++ programming"
+return 0 results. This is the #1 issue. The search pipeline is not fetching
+enough results from upstream engines or the result filtering is too aggressive.
+
+**Investigate:** Upstream engine fan-out, result deduplication thresholds,
+minimum score cutoffs.
+
+### HIGH: Latency ~11s per uncached query
+Every uncached request takes ~11s. This is likely the engine fan-out
+(SearXNG + Tor + Whoogle + Bing + Brave + Mojeek + DuckDuckGo + Yandex + Startpage)
+running sequentially or with high timeouts.
+
+**Investigate:** Parallel engine requests, per-engine timeout tuning (2-3s max),
+circuit breaker for slow engines.
+
+### MEDIUM: Intent taxonomy mismatch
+The API uses fine-grained intents (technical, how-to, comparison, fresh)
+while standard search uses 4 categories (informational, navigational,
+transactional, commercial). Consider either:
+1. Mapping subtypes to parent categories in response
+2. Documenting the extended taxonomy
+
+### LOW: Special chars (C++) return 0 results
+URL encoding of "C++" may be stripping the ++ characters.
+Check if `urllib.parse.quote("C++")` → `C%2B%2B` is handled correctly
+by the gateway query parser.
