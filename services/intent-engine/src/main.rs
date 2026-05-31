@@ -718,12 +718,14 @@ fn bigram_rarity(token: &str) -> f32 {
     // Higher value = more common in English = less "domain-like".
     // Only stored for common bigrams — rare ones default to 0.05.
     let bigram_freq: std::collections::HashMap<&str, f32> = [
+        // Top-tier: very common English bigrams
         ("th", 3.7), ("he", 3.1), ("in", 2.7), ("er", 2.5), ("an", 2.3),
         ("re", 2.2), ("on", 2.1), ("at", 2.0), ("en", 2.0), ("nd", 1.9),
         ("ti", 1.9), ("es", 1.8), ("or", 1.8), ("te", 1.7), ("of", 1.7),
         ("ed", 1.6), ("is", 1.6), ("it", 1.6), ("al", 1.6), ("ar", 1.5),
         ("st", 1.5), ("to", 1.5), ("nt", 1.5), ("ng", 1.5), ("se", 1.5),
         ("ha", 1.5), ("as", 1.4), ("ou", 1.4), ("io", 1.4), ("le", 1.4),
+        // Common: frequent in everyday English
         ("li", 1.3), ("ve", 1.3), ("co", 1.3), ("me", 1.3), ("de", 1.3),
         ("ne", 1.2), ("ri", 1.2), ("ro", 1.2), ("ic", 1.2), ("ce", 1.1),
         ("la", 1.1), ("ta", 1.1), ("ma", 1.1), ("ra", 1.1), ("ec", 1.1),
@@ -739,11 +741,40 @@ fn bigram_rarity(token: &str) -> f32 {
         ("mo", 0.5), ("vi", 0.5), ("fr", 0.4), ("sp", 0.4), ("rs", 0.4),
         ("ts", 0.4), ("gr", 0.4), ("tw", 0.4), ("ep", 0.4), ("sc", 0.4),
         ("hu", 0.4), ("sm", 0.3), ("sw", 0.3), ("dw", 0.3), ("kn", 0.3),
-        ("gn", 0.3), ("wr", 0.3), ("pn", 0.3), ("ps", 0.3), ("mn", 0.2),
-        ("nm", 0.2), ("xu", 0.2), ("xz", 0.1), ("ox", 0.1), ("xi", 0.05),
-        ("iv", 0.2), ("nf", 0.05), ("tf", 0.01), ("gi", 0.1), ("zx", 0.01),
+        ("gn", 0.3), ("wr", 0.3), ("pn", 0.3), ("ps", 0.3),
+        // Moderate: less common but still normal English bigrams
+        ("oo", 0.7), ("ok", 0.5), ("ks", 0.4), ("ey", 0.5), ("bo", 0.5),
+        ("oa", 0.5), ("ke", 0.5), ("ek", 0.3), ("ak", 0.3), ("rn", 0.4),
+        ("rd", 0.5), ("ld", 0.5), ("lk", 0.3), ("rk", 0.3), ("wn", 0.4),
+        ("wl", 0.2), ("rm", 0.4), ("mp", 0.5), ("nk", 0.3), ("sk", 0.3),
+        ("ck", 0.4), ("ff", 0.3), ("ll", 0.5), ("tt", 0.4), ("dd", 0.2),
+        ("pp", 0.3), ("bb", 0.2), ("nn", 0.3), ("mm", 0.2), ("rr", 0.1),
+        ("ee", 0.5), ("ea", 0.8), ("ai", 0.4), ("ei", 0.3), ("oi", 0.3),
+        ("au", 0.3), ("ua", 0.3), ("ue", 0.4), ("ow", 0.5), ("ew", 0.4),
+        ("aw", 0.3), ("ay", 0.4), ("oy", 0.3), ("wo", 0.3), ("wa", 0.5),
+        ("gi", 0.1), ("ug", 0.3), ("ag", 0.3), ("og", 0.3), ("eg", 0.3),
+        ("up", 0.4), ("op", 0.4), ("ip", 0.3), ("ap", 0.4),
+        ("uf", 0.2), ("of", 1.7), ("af", 0.2), ("if", 0.4), ("ef", 0.3),
+        ("ub", 0.3), ("ib", 0.3), ("ob", 0.3), ("eb", 0.3),
+        ("uv", 0.2), ("ov", 0.3), ("av", 0.3), ("ev", 0.4),
+        ("uz", 0.1), ("iz", 0.1), ("az", 0.1), ("ez", 0.1),
+        // Very rare: strong signal for coined/brand names
+        ("mn", 0.2), ("nm", 0.2), ("xu", 0.2), ("xz", 0.1), ("ox", 0.1),
+        ("xi", 0.05), ("nf", 0.05), ("tf", 0.01), ("zx", 0.01),
         ("qw", 0.01), ("vk", 0.01), ("gl", 0.2), ("gg", 0.1), ("fb", 0.1),
-        ("gm", 0.1),
+        ("gm", 0.1), ("xb", 0.05), ("xc", 0.1), ("xd", 0.05), ("xf", 0.05),
+        ("xh", 0.05), ("xj", 0.01), ("xk", 0.01), ("xl", 0.05), ("xm", 0.05),
+        ("xn", 0.05), ("xp", 0.1), ("xq", 0.01), ("xr", 0.05), ("xs", 0.1),
+        ("xt", 0.1), ("xv", 0.05), ("xw", 0.01), ("xx", 0.01), ("xy", 0.05),
+        ("yf", 0.1), ("yg", 0.1), ("yh", 0.05), ("yj", 0.01), ("yk", 0.1),
+        ("yl", 0.2), ("ym", 0.2), ("yn", 0.2), ("yp", 0.2), ("yq", 0.01),
+        ("yr", 0.1), ("ys", 0.3), ("yt", 0.2), ("yv", 0.1), ("yw", 0.05),
+        ("yx", 0.05), ("yy", 0.05), ("yz", 0.05), ("za", 0.1), ("zb", 0.05),
+        ("zc", 0.05), ("zd", 0.05), ("ze", 0.2), ("zf", 0.05), ("zg", 0.05),
+        ("zh", 0.05), ("zi", 0.1), ("zj", 0.01), ("zk", 0.05), ("zl", 0.05),
+        ("zm", 0.05), ("zn", 0.05), ("zo", 0.1), ("zp", 0.05), ("zq", 0.01),
+        ("zr", 0.05), ("zs", 0.05), ("zt", 0.05), ("zu", 0.1), ("zv", 0.05),
+        ("zw", 0.05), ("zy", 0.1), ("zz", 0.1),
     ].iter().copied().collect();
 
     let max_freq = 3.7f32; // "th" is the most common English bigram
@@ -1050,15 +1081,67 @@ fn compute_navigational_score(
         0.45  // balanced zone
     };
 
-    let score = alpha * char_nav + (1.0 - alpha) * emb_nav;
+    let nav_raw = alpha * char_nav + (1.0 - alpha) * emb_nav;
 
+    // ── Step 8: Entity-only factor ──
+    // Pure entity queries (brand/site names) have almost no "concept tokens"
+    // (generic English words like "database", "hooks", "tutorial").
+    // When concept tokens are present alongside an entity, the query is less
+    // navigational — the user is asking ABOUT something, not going TO it.
+    //
+    // KEY: concept detection uses bigram_rarity, NOT entityness.
+    // Entityness fails for words like "hooks" (consonant clusters → moderate entityness)
+    // even though they're common English words. Bigram rarity correctly identifies them:
+    //   "hooks"    → bigrams ho,oo,ok,ks → all common → low rarity → concept ✓
+    //   "database" → bigrams da,at,ta,ab,ba,as,se → common → low rarity → concept ✓
+    //   "oxiverse" → bigrams ox,xi,iv,ve,rs,se → rare → high rarity → entity ✓
+    //   "react"    → bigrams re,ea,ac,ct → common → low rarity → concept ✓
+    //
+    // This means "react hooks" = 2 concepts = eof=0.0 → score=0 → not navigational
+    // while "intentforge tos" = 0 concepts (tos=abbr, intentforge=rare bigrams) → navigational
+    let stopwords = ["what", "is", "are", "the", "a", "an", "how", "to", "do", "does",
+                     "can", "for", "in", "on", "of", "and", "or", "vs", "versus",
+                     "best", "top", "cheap", "buy", "price", "near", "me", "free",
+                     "online", "download", "install", "use", "using"];
+    let mut concept_tokens = 0usize;
+    let mut total_tokens = 0usize;
+    let mut _dbg_rarities: Vec<(String, f32, f32)> = Vec::new();
+    for (i, word) in words.iter().enumerate() {
+        if stopwords.contains(word) { continue; }
+        // Skip abbreviations — they're modifiers (tos, css), not concept words
+        if abbr_scores[i] > 0.5 { continue; }
+        total_tokens += 1;
+        let rarity = bigram_rarity(word);
+        _dbg_rarities.push((word.to_string(), entity_scores[i], rarity));
+        // A "concept token" is a generic English word with common bigrams.
+        // The bigram_rarity function maps: "th"→0.0, "ox"→0.97, "xi"→0.99.
+        // Common English words (hooks, database, tutorial) have rarity ~0.70-0.88.
+        // Coined brand names (oxiverse, netflix, intentforge) have rarity > 0.90.
+        // Threshold at 0.90 separates the two populations.
+        if rarity < 0.90 {
+            concept_tokens += 1;
+        }
+    }
+    let concept_fraction = if total_tokens > 0 {
+        concept_tokens as f32 / total_tokens as f32
+    } else { 0.0 };
+    let entity_only_factor = (1.0 - concept_fraction).max(0.0);
+
+    let score = nav_raw * entity_only_factor;
+
+    let dbg_str: String = _dbg_rarities.iter()
+        .map(|(w, e, r)| format!("{}(ent={:.2},rare={:.2})", w, e, r))
+        .collect::<Vec<_>>()
+        .join(", ");
     tracing::info!(
-        "NAV SCORE v4: eff_entity={:.3} max_entity={:.3} max_abbr={:.3} abbr_discount={} \
+        "NAV SCORE v5: eff_entity={:.3} max_entity={:.3} max_abbr={:.3} abbr_discount={} \
          entropy={:.3} dist_generic={:.3} max_sim={:.3} \
-         structure={:.3} char_nav={:.3} emb_nav={:.3} alpha={:.2} → score={:.3}",
+         structure={:.3} char_nav={:.3} emb_nav={:.3} alpha={:.2} \
+         concepts={}/{} eof={:.2} tokens=[{}] → score={:.3}",
         effective_entity, max_entity, max_abbr, abbr_driven_entity > 0.5,
         entropy, dist_from_generic, max_sim,
-        structure_bonus, char_nav, emb_nav, alpha, score
+        structure_bonus, char_nav, emb_nav, alpha,
+        concept_tokens, total_tokens, entity_only_factor, dbg_str, score
     );
 
     score.clamp(0.0, 1.0)
