@@ -2172,7 +2172,14 @@ async fn handle_search(
     let ratelimit_ref = &state.rate_limits;
 
     // Check circuit breaker before calling each engine
-    let searx_open = circuit_ref.is_open("searxng");
+    // Per-instance keys: SearXNG1 (gluetun) and SearXNG2 (independent) fail independently
+    let searx_instance_keys: Vec<String> = searx_base_urls.iter().enumerate().map(|(i, _)| {
+        format!("searxng{}", i)
+    }).collect();
+    let searx_instance_open: Vec<bool> = searx_instance_keys.iter()
+        .map(|k| circuit_ref.is_open(k))
+        .collect();
+    let all_searx_open = searx_instance_open.iter().all(|&o| o);
     let whoogle_open = circuit_ref.is_open("whoogle");
     let invidious_open = circuit_ref.is_open("invidious");
 
@@ -2187,11 +2194,14 @@ async fn handle_search(
 
     // Fire all SearXNG variations in parallel, with retry on 0 results
     // (VPN drops cause simultaneous failures across all engines — retry recovers)
-    let searx_futs: Vec<_> = searx_urls.iter().map(|url| {
+    let searx_instance_keys_ref = &searx_instance_keys;
+    let searx_futs: Vec<_> = searx_urls.iter().enumerate().map(|(i, url)| {
         let url = url.clone();
-        let searx_open = searx_open;
+        let instance_key = searx_instance_keys_ref[i].clone();
+        let is_open = searx_instance_open[i];
         async move {
-            if searx_open {
+            if is_open {
+                tracing::info!("SearXNG {} circuit OPEN — skipping", instance_key);
                 return Ok(SearxResponse { results: vec![] });
             }
             // First attempt — sanitize control chars before JSON parse
@@ -2338,7 +2348,7 @@ async fn handle_search(
         || q_lower.contains("picture");
 
     let news_fut = async {
-        if !is_news_intent || searx_open {
+        if !is_news_intent || all_searx_open {
             return Ok(SearxNewsResponse { results: vec![] }) as Result<SearxNewsResponse, anyhow::Error>;
         }
         let news_url = format!(
@@ -2358,7 +2368,7 @@ async fn handle_search(
     };
 
     let image_fut = async {
-        if !is_image_intent || searx_open {
+        if !is_image_intent || all_searx_open {
             return Ok(SearxImageResponse { results: vec![] }) as Result<SearxImageResponse, anyhow::Error>;
         }
         let image_url = format!(
@@ -2417,11 +2427,12 @@ async fn handle_search(
 
     // Aggregate SearXNG results from all query variations
     for (i, searx_res) in searx_results.into_iter().enumerate() {
+        let instance_key = &searx_instance_keys[i];
         match searx_res {
             Ok(searx_data) => {
                 tracing::info!("SearXNG variation {} returned {} results", i, searx_data.results.len());
-                circuit_ref.record_success("searxng");
-                circuit_ref.record_results("searxng", searx_data.results.len() as u64);
+                circuit_ref.record_success(instance_key);
+                circuit_ref.record_results(instance_key, searx_data.results.len() as u64);
                 // Track position-based RRF contribution per URL within this variation
                 // Weight by engine reliability (dynamic learning)
                 for (pos, result) in searx_data.results.into_iter().enumerate() {
@@ -2440,7 +2451,7 @@ async fn handle_search(
             }
             Err(e) => {
                 tracing::error!("SearXNG variation {} request failed/timed out: {:?}", i, e);
-                circuit_ref.record_failure("searxng");
+                circuit_ref.record_failure(instance_key);
             }
         }
     }
