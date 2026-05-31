@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
-// ─── Intent Categories ───────────────────────────────────────────────
+// ─── Intent Categories (legacy, kept for reference) ────────────────
+#[allow(dead_code)]
 const INTENT_CATEGORIES: &[&str] = &[
     "navigational",
     "informational",
@@ -478,13 +479,605 @@ fn extract_constraint_term(text: &str, max_words: usize) -> String {
     words.join(" ")
 }
 
-// ─── Layer 1: Rule-Based Pre-Classifier (< 1ms) ─────────────────────
 
+// ─── Evidence-Based Intent Classification ──────────────────────────
+// Replaces the cascade of IF rule THEN intent with an evidence accumulator.
+// Each detector contributes independent signals across all 7 intent categories.
+// The final intent emerges from the weighted combination — no single detector
+// can force an outcome, and competing signals coexist.
+
+#[derive(Clone, Debug)]
+struct IntentEvidence {
+    navigational: f32,
+    informational: f32,
+    technical: f32,
+    how_to: f32,
+    comparison: f32,
+    transactional: f32,
+    fresh: f32,
+}
+
+impl IntentEvidence {
+    fn zero() -> Self {
+        Self {
+            navigational: 0.0, informational: 0.0, technical: 0.0,
+            how_to: 0.0, comparison: 0.0, transactional: 0.0, fresh: 0.0,
+        }
+    }
+
+    fn scores(&self) -> [(&'static str, f32); 7] {
+        [
+            ("navigational", self.navigational),
+            ("informational", self.informational),
+            ("technical", self.technical),
+            ("how-to", self.how_to),
+            ("comparison", self.comparison),
+            ("transactional", self.transactional),
+            ("fresh", self.fresh),
+        ]
+    }
+
+    fn argmax(&self) -> (&'static str, f32) {
+        self.scores().iter()
+            .cloned()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(("informational", 0.0))
+    }
+
+    fn merge(a: &Self, weight_a: f32, b: &Self, weight_b: f32) -> Self {
+        let total = weight_a + weight_b;
+        if total < 1e-8 { return a.clone(); }
+        let wa = weight_a / total;
+        let wb = weight_b / total;
+        Self {
+            navigational:    a.navigational    * wa + b.navigational    * wb,
+            informational:   a.informational   * wa + b.informational   * wb,
+            technical:       a.technical        * wa + b.technical       * wb,
+            how_to:          a.how_to           * wa + b.how_to          * wb,
+            comparison:      a.comparison       * wa + b.comparison      * wb,
+            transactional:   a.transactional    * wa + b.transactional   * wb,
+            fresh:           a.fresh            * wa + b.fresh           * wb,
+        }
+    }
+}
+
+// ─── Individual Detectors ─────────────────────────────────────────
+// Each detector returns IntentEvidence with scores across all categories.
+// Detectors are independent — no detector reads another's output.
+
+fn question_detector(query: &str) -> IntentEvidence {
+    let q = query.trim().to_lowercase();
+    let mut ev = IntentEvidence::zero();
+
+    if q.starts_with("how to ") || q.starts_with("how do i ")
+        || q.starts_with("how can i ") || q.starts_with("how do you ")
+        || q.starts_with("how does ") || q.starts_with("how do ")
+        || q.starts_with("steps to ") || q.starts_with("guide to ")
+        || q.starts_with("tutorial ") || q.contains(" tutorial")
+    {
+        ev.how_to = 0.85;
+        ev.informational = 0.25;
+    } else if q.starts_with("what is ") || q.starts_with("what are ")
+        || q.starts_with("what does ") || q.starts_with("explain ")
+        || q.starts_with("who is ")
+        || q.starts_with("define ") || q.starts_with("meaning of ")
+    {
+        ev.informational = 0.80;
+    } else if q.starts_with("why ") || q.starts_with("when ")
+        || q.starts_with("where ")
+    {
+        // "why use rust over c++" — "why" can be informational or comparison.
+        // If "vs"/"over"/"better" present, lean comparison.
+        if q.contains(" vs ") || q.contains(" versus ") || q.contains(" over ")
+            || q.contains(" better ") || q.starts_with("which ")
+        {
+            ev.comparison = 0.65;
+            ev.informational = 0.35;
+        } else {
+            ev.informational = 0.70;
+        }
+    }
+
+    ev
+}
+
+fn domain_detector(query: &str) -> IntentEvidence {
+    let q = query.trim().to_lowercase();
+    let words: Vec<&str> = q.split_whitespace().collect();
+    let mut ev = IntentEvidence::zero();
+
+    // TLD patterns: strongest navigational signal
+    if q.contains(".com") || q.contains(".org") || q.contains(".net")
+        || q.contains(".io") || q.contains(".dev") || q.contains(".rs")
+        || q.contains(".py") || q.contains(".go") || q.contains(".edu")
+        || q.contains(".gov")
+    {
+        ev.navigational = 0.90;
+        return ev;
+    }
+
+    // Detect competing intent signals — when these are present,
+    // the user is asking ABOUT a platform, not going TO it.
+    let has_how_to = q.starts_with("how to ") || q.starts_with("how do i ")
+        || q.starts_with("how can i ") || q.starts_with("how do you ")
+        || q.starts_with("steps to ") || q.starts_with("guide to ")
+        || q.starts_with("tutorial ") || q.contains(" tutorial");
+    let has_question = q.starts_with("what is ") || q.starts_with("what are ")
+        || q.starts_with("what does ") || q.starts_with("explain ")
+        || q.starts_with("why ") || q.starts_with("define ");
+    let has_comparison = q.contains(" vs ") || q.contains(" versus ")
+        || q.starts_with("best ") || q.starts_with("top ")
+        || q.starts_with("compare ") || q.starts_with("which ");
+    let has_transactional = q.starts_with("buy ") || q.starts_with("download ")
+        || q.starts_with("install ") || q.starts_with("purchase ")
+        || q.contains(" pricing") || q.contains(" price");
+    let has_fresh = q.contains("latest") || q.contains("recent")
+        || q.contains("newest") || q.contains("new ");
+
+    let competing_intent = has_how_to || has_question || has_comparison
+        || has_transactional || has_fresh;
+
+    // Known platform destinations
+    let known_platforms: &[&str] = &[
+        "github", "gitlab", "bitbucket", "stackoverflow", "stackexchange",
+        "reddit", "twitter", "x", "facebook", "instagram", "linkedin",
+        "youtube", "twitch", "discord", "slack", "notion", "figma",
+        "dribbble", "behance", "medium", "substack", "mastodon",
+        "docker", "npm", "pypi", "crates", "rubygems",
+        "vercel", "netlify", "heroku", "digitalocean", "linode",
+        "stripe", "twilio", "sendgrid", "mailchimp",
+        "jira", "confluence", "trello", "asana", "linear",
+        "spotify", "netflix", "hulu", "plex",
+        "wikipedia", "wikimedia", "archive",
+        "google", "bing", "duckduckgo",
+        "apple", "microsoft", "amazon", "aws", "gcp", "azure",
+        "openai", "anthropic", "huggingface",
+    ];
+
+    let known_compound: &[(&str, &str)] = &[
+        ("docker", "hub"), ("docker", "desktop"),
+        ("aws", "console"), ("gcp", "console"), ("azure", "portal"),
+        ("google", "docs"), ("google", "drive"), ("google", "cloud"),
+        ("github", "actions"), ("github", "pages"), ("github", "copilot"),
+        ("apple", "music"), ("apple", "tv"),
+        ("microsoft", "teams"), ("microsoft", "365"),
+        ("stack", "overflow"), ("stack", "exchange"),
+    ];
+
+    // Check compound matches first
+    if words.len() >= 2 {
+        for (a, b) in known_compound {
+            if words.contains(a) && words.contains(b) {
+                // When competing intent is present, reduce navigational signal.
+                // "how to use docker hub" → nav=0.30, not 0.85
+                // "docker hub" alone → nav=0.85
+                ev.navigational = if competing_intent { 0.30 } else { 0.85 };
+                return ev;
+            }
+        }
+    }
+
+    // Single platform name match — only when query is SHORT (1-2 tokens)
+    // AND no competing intent signal is present.
+    if words.len() <= 2 && !competing_intent {
+        for word in &words {
+            if known_platforms.contains(word) {
+                ev.navigational = 0.75;
+                return ev;
+            }
+        }
+    }
+
+    // Platform mentioned in longer query with competing intent → weak signal
+    if competing_intent {
+        for word in &words {
+            if known_platforms.contains(word) {
+                ev.navigational = ev.navigational.max(0.25);
+            }
+        }
+    }
+
+    // Explicit navigational keywords
+    if q.starts_with("official ") || q.contains(" homepage")
+        || q.contains(" login") || q.contains(" sign in")
+        || q.contains(" sign up") || q.starts_with("go to ")
+        || q.starts_with("open ")
+    {
+        ev.navigational = 0.80;
+    } else if q.contains("terms of service") || q.contains("privacy policy")
+        || q.ends_with(" tos") || q.contains(" tos ")
+    {
+        ev.navigational = 0.75;
+    }
+
+    ev
+}
+
+fn tech_detector(query: &str) -> IntentEvidence {
+    let q = query.trim().to_lowercase();
+    let mut ev = IntentEvidence::zero();
+
+    let tech_terms = [
+        "api", "sdk", "library", "framework", "crate", "package", "module",
+        "function", "method", "class", "interface", "struct", "enum",
+        "trait", "impl", "syntax", "compiler", "runtime", "debug",
+        "error", "bug", "fix", "issue", "version", "migration",
+        "documentation", "docs", "reference", "manpage", "engine",
+        "editor", "programming", "algorithm", "data structure",
+    ];
+    let tech_languages = [
+        "rust", "python", "javascript", "typescript", "go", "golang",
+        "java", "c++", "cpp", "swift", "kotlin", "ruby",
+        "php", "haskell", "elixir", "scala",
+        "react", "vue", "angular", "svelte", "nextjs", "next.js",
+        "django", "flask", "fastapi", "express", "axum", "tokio",
+        "docker", "kubernetes", "k8s", "linux", "git", "nginx",
+        "postgres", "mysql", "redis", "mongodb", "sqlite",
+        "css", "html", "sql", "nosql", "graphql", "grpc", "rest",
+        "webpack", "vite", "tailwind", "bootstrap", "sass",
+        "aws", "gcp", "azure", "terraform", "ansible",
+        "tcp", "udp", "http", "https", "ssh", "ftp", "dns", "dhcp",
+        "json", "yaml", "xml", "csv", "jwt", "oauth", "cors", "csrf",
+    ];
+
+    let has_tech_term = tech_terms.iter().any(|t| q.contains(t));
+    let has_tech_lang = tech_languages.iter().any(|l| {
+        q.split_whitespace().any(|w| w == *l)
+    });
+
+    if has_tech_term || has_tech_lang {
+        ev.technical = 0.65;
+        // Tech terms with action words lean how-to
+        if q.starts_with("install ") || q.starts_with("set up ")
+            || q.starts_with("configure ") || q.starts_with("deploy ")
+            || q.starts_with("build ")
+        {
+            ev.how_to = 0.45;
+        }
+    }
+
+    ev
+}
+
+fn commercial_detector(query: &str) -> IntentEvidence {
+    let q = query.trim().to_lowercase();
+    let mut ev = IntentEvidence::zero();
+
+    // Transactional signals
+    if q.starts_with("buy ") || q.starts_with("download ")
+        || q.starts_with("install ") || q.starts_with("get ")
+        || q.starts_with("purchase ") || q.starts_with("order ")
+        || q.starts_with("subscribe ") || q.starts_with("sign up for ")
+        || q.contains(" pricing") || q.contains(" free download")
+    {
+        ev.transactional = 0.80;
+    }
+
+    // Comparison signals
+    if q.contains(" vs ") || q.contains(" versus ")
+        || q.starts_with("best ") || q.starts_with("top ")
+        || q.starts_with("compare ") || q.contains(" comparison")
+        || q.starts_with("which ") || q.starts_with("better ")
+    {
+        ev.comparison = 0.75;
+    }
+
+    ev
+}
+
+fn freshness_detector(query: &str) -> IntentEvidence {
+    let q = query.trim().to_lowercase();
+    let mut ev = IntentEvidence::zero();
+
+    let has_year = q.split_whitespace().any(|w| {
+        w.len() == 4 && w.chars().all(|c| c.is_ascii_digit())
+            && w.parse::<u32>().map_or(false, |y| y >= 2020 && y <= 2040)
+    });
+    if q.contains("latest") || q.contains("recent") || q.contains("newest")
+        || q.contains("today") || q.contains("this week")
+        || q.contains("this month") || has_year || q.starts_with("news ")
+        || q.contains(" update") || q.contains(" release")
+        || q.contains(" changes") || q.contains(" changelog")
+        || q.contains(" cve") || q.contains(" vulnerability")
+        || q.starts_with("new ")
+    {
+        ev.fresh = 0.75;
+    }
+
+    ev
+}
+
+fn entity_detector(
+    query: &str,
+    query_embedding: &[f32],
+    centroids: &[Vec<f32>],
+) -> IntentEvidence {
+    // Entity detection using character-level signals (bigram rarity,
+    // abbreviation patterns, concept fraction). This is the evidence-based
+    // replacement for the old Layer 1.5 navigational override.
+    //
+    // Instead of IF score > threshold THEN navigational, it contributes
+    // a navigational signal that competes with other evidence.
+
+    let q_lower = query.trim().to_lowercase();
+    let words: Vec<&str> = q_lower.split_whitespace().collect();
+    let mut ev = IntentEvidence::zero();
+    if words.is_empty() { return ev; }
+
+    // ── Per-token character analysis ──
+    let mut entity_scores: Vec<f32> = Vec::new();
+    let mut abbr_scores: Vec<f32> = Vec::new();
+    for word in &words {
+        entity_scores.push(token_entityness(word));
+        abbr_scores.push(abbreviation_score(word));
+    }
+
+    let max_entity: f32 = entity_scores.iter().cloned().fold(0.0f32, f32::max);
+    let entity_density: f32 = entity_scores.iter().sum::<f32>()
+        / entity_scores.len().max(1) as f32;
+    let max_abbr: f32 = abbr_scores.iter().cloned().fold(0.0f32, f32::max);
+
+    // ── Abbreviation discount ──
+    let mut abbr_driven = false;
+    for (i, word) in words.iter().enumerate() {
+        let chars: Vec<char> = word.chars().collect();
+        let vowels = chars.iter().filter(|c| "aeiou".contains(**c)).count();
+        let vratio = if chars.is_empty() { 0.0 } else { vowels as f32 / chars.len() as f32 };
+        if vratio < 0.15 && abbr_scores[i] > 0.6 && entity_scores[i] > 0.4 {
+            abbr_driven = true;
+        }
+    }
+
+    // ── Tech-term discount ──
+    let tech_terms_nav = [
+        "api", "sdk", "css", "html", "sql", "nosql", "graphql", "grpc",
+        "webpack", "vite", "tailwind", "bootstrap", "sass", "terraform",
+        "ansible", "docker", "kubernetes", "k8s", "nginx", "redis",
+        "postgres", "mysql", "mongodb", "sqlite", "axum", "tokio",
+    ];
+    let mut tech_driven = false;
+    for (i, word) in words.iter().enumerate() {
+        if entity_scores[i] > 0.4 && tech_terms_nav.contains(word) {
+            tech_driven = true;
+        }
+    }
+
+    // ── Bigram rarity ──
+    let best_rarity = words.iter()
+        .map(|w| bigram_rarity(w))
+        .fold(0.0f32, f32::max);
+
+    // ── Concept fraction ──
+    let stopwords = ["what", "is", "are", "the", "a", "an", "how", "to", "do", "does",
+                     "can", "for", "in", "on", "of", "and", "or", "vs", "versus",
+                     "best", "top", "cheap", "buy", "price", "near", "me", "free",
+                     "online", "download", "install", "use", "using"];
+    let mut concept_tokens = 0usize;
+    let mut total_tokens = 0usize;
+    for (i, word) in words.iter().enumerate() {
+        if stopwords.contains(word) { continue; }
+        if abbr_scores[i] > 0.5 { continue; }
+        total_tokens += 1;
+        let rarity = bigram_rarity(word);
+        if rarity < 0.90 {
+            concept_tokens += 1;
+        }
+    }
+    let concept_fraction = if total_tokens > 0 {
+        concept_tokens as f32 / total_tokens as f32
+    } else { 0.0 };
+    let entity_only_factor = (1.0 - concept_fraction).max(0.0);
+
+    // ── Embedding signals ──
+    let sims: Vec<f32> = centroids.iter()
+        .map(|c| cosine_similarity(query_embedding, c))
+        .collect();
+    let max_sim = sims.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let min_sim = sims.iter().cloned().fold(f32::INFINITY, f32::min);
+    let discriminability = (max_sim - min_sim).max(0.0);
+
+    let dim = centroids.first().map(|c| c.len()).unwrap_or(384);
+    let mut generic_centroid = vec![0.0f32; dim];
+    for centroid in centroids {
+        for (i, v) in centroid.iter().enumerate() { generic_centroid[i] += v; }
+    }
+    let n = centroids.len() as f32;
+    if n > 0.0 {
+        for v in generic_centroid.iter_mut() { *v /= n; }
+        let norm: f32 = generic_centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-8 { for v in generic_centroid.iter_mut() { *v /= norm; } }
+    }
+    let dist_from_generic = 1.0 - cosine_similarity(query_embedding, &generic_centroid);
+
+    let entropy = {
+        let shift = if min_sim < 0.01 { -min_sim + 0.01 } else { 0.0 };
+        let shifted: Vec<f32> = sims.iter().map(|s| s + shift).collect();
+        let total: f32 = shifted.iter().sum();
+        if total < 1e-8 { 0.0 } else {
+            let mut h = 0.0f32;
+            for &s in &shifted {
+                let p = s / total;
+                if p > 1e-8 { h -= p * p.log2(); }
+            }
+            h / (sims.len() as f32).log2().max(1.0)
+        }
+    };
+
+    // ── Combine into navigational evidence ──
+    let mut effective_entity = max_entity * 0.6 + entity_density * 0.4;
+    if abbr_driven { effective_entity *= 0.6; }
+    if tech_driven { effective_entity *= 0.5; }
+
+    let entity_with_rarity = (effective_entity * 0.55 + best_rarity * 0.45).min(1.0);
+    let char_nav = entity_with_rarity.max(max_abbr * 0.5);
+    let emb_nav_raw = entropy * 0.5 + dist_from_generic.max(0.0) * 0.3
+        + (1.0 - max_sim).max(0.0) * 0.2;
+    let disc_penalty = (discriminability / 0.10).min(1.0);
+    let emb_nav = emb_nav_raw * disc_penalty;
+
+    let alpha = if discriminability < 0.08 && effective_entity > 0.40 { 0.80 }
+        else if discriminability < 0.08 { 0.65 }
+        else if discriminability > 0.15 && effective_entity < 0.40 { 0.30 }
+        else if effective_entity > 0.55 { 0.60 }
+        else { 0.45 };
+
+    let nav_raw = alpha * char_nav + (1.0 - alpha) * emb_nav;
+    let nav_score = nav_raw * entity_only_factor;
+
+    ev.navigational = nav_score.clamp(0.0, 1.0);
+
+    tracing::info!(
+        "entity_detector: eff_entity={:.3} best_rarity={:.3} concepts={}/{} \
+         alpha={:.2} disc={:.3} → nav={:.3}",
+        effective_entity, best_rarity, concept_tokens, total_tokens,
+        alpha, discriminability, ev.navigational
+    );
+
+    ev
+}
+
+fn embedding_detector(
+    query_embedding: &[f32],
+    centroids: &[Vec<f32>],
+) -> IntentEvidence {
+    // Pure embedding signal: cosine similarity to each category centroid.
+    // Uses softmax with temperature to amplify small differences in the
+    // 0.91-0.97 similarity range that MiniLM produces.
+
+    let mut ev = IntentEvidence::zero();
+    let sims: Vec<f32> = centroids.iter()
+        .map(|c| cosine_similarity(query_embedding, c))
+        .collect();
+
+    if sims.is_empty() { return ev; }
+
+    let max_sim = sims.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let min_sim = sims.iter().cloned().fold(f32::INFINITY, f32::min);
+    let discriminability = (max_sim - min_sim).max(0.0);
+
+    // Softmax with temperature to amplify small differences.
+    // Uses log-sum-exp trick for numerical stability.
+    // Lower temperature = sharper distribution (trusts small differences more).
+    let temp = 0.01f32;
+    let max_s = sims.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let shifted: Vec<f32> = sims.iter().map(|s| (s - max_s) / temp).collect();
+    let exp_shifted: Vec<f32> = shifted.iter().map(|s| s.exp()).collect();
+    let exp_sum: f32 = exp_shifted.iter().sum();
+    let softmax: Vec<f32> = if exp_sum > 1e-8 {
+        exp_shifted.iter().map(|e| e / exp_sum).collect()
+    } else {
+        vec![1.0 / sims.len() as f32; sims.len()]
+    };
+
+    // Confidence scaling: how much the best category stands out.
+    // disc < 0.05 → weak signal, scale down
+    // disc > 0.10 → strong signal, use full softmax
+    let confidence = (discriminability / 0.08).clamp(0.2, 1.0);
+
+    let categories = [
+        "navigational", "informational", "technical",
+        "how-to", "comparison", "transactional", "fresh",
+    ];
+
+    for (i, cat) in categories.iter().enumerate() {
+        if i < softmax.len() {
+            let score = softmax[i] * confidence;
+            match *cat {
+                "navigational" => ev.navigational = score,
+                "informational" => ev.informational = score,
+                "technical" => ev.technical = score,
+                "how-to" => ev.how_to = score,
+                "comparison" => ev.comparison = score,
+                "transactional" => ev.transactional = score,
+                "fresh" => ev.fresh = score,
+                _ => {}
+            }
+        }
+    }
+
+    tracing::info!(
+        "embedding_detector: max_sim={:.4} disc={:.4} confidence={:.3} softmax=[{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}]",
+        max_sim, discriminability, confidence,
+        softmax.get(0).unwrap_or(&0.0), softmax.get(1).unwrap_or(&0.0),
+        softmax.get(2).unwrap_or(&0.0), softmax.get(3).unwrap_or(&0.0),
+        softmax.get(4).unwrap_or(&0.0), softmax.get(5).unwrap_or(&0.0),
+        softmax.get(6).unwrap_or(&0.0)
+    );
+
+    ev
+}
+
+fn evidence_classify(
+    query: &str,
+    query_embedding: Option<&Vec<f32>>,
+    centroids: &[Vec<f32>],
+) -> (String, f32) {
+    // Evidence accumulation: each detector contributes independent signals.
+    // No detector can force an outcome — the final intent emerges from
+    // the weighted combination of all evidence.
+
+    let q_evidence = question_detector(query);
+    let d_evidence = domain_detector(query);
+    let t_evidence = tech_detector(query);
+    let c_evidence = commercial_detector(query);
+    let f_evidence = freshness_detector(query);
+
+    // Entity detector needs embeddings for centroid distance signals
+    let e_evidence = if let Some(emb) = query_embedding {
+        entity_detector(query, emb, centroids)
+    } else {
+        IntentEvidence::zero()
+    };
+
+    // Merge all detectors with their weights
+    // Weights reflect how much we trust each signal type
+    let mut combined = IntentEvidence::zero();
+    let mut total_weight = 0.0f32;
+
+    let detectors: &[(IntentEvidence, f32)] = &[
+        (q_evidence, 1.0),   // Question patterns are very reliable
+        (d_evidence, 1.0),   // Domain/TLD patterns are very reliable
+        (t_evidence, 0.7),   // Tech terms are moderate signal
+        (c_evidence, 0.9),   // Commercial patterns are reliable
+        (f_evidence, 0.8),   // Freshness patterns are fairly reliable
+        (e_evidence, 0.6),   // Entity detection is noisier
+    ];
+
+    for (ev, weight) in detectors {
+        if *weight > 0.0 {
+            combined = IntentEvidence::merge(&combined, total_weight, ev, *weight);
+            total_weight += *weight;
+        }
+    }
+
+    // Embedding detector (if available) as tiebreaker
+    if let Some(emb) = query_embedding {
+        let emb_ev = embedding_detector(emb, centroids);
+        combined = IntentEvidence::merge(&combined, total_weight, &emb_ev, 0.4);
+    }
+
+    let (intent, score) = combined.argmax();
+
+    tracing::info!(
+        "evidence_classify: nav={:.3} info={:.3} tech={:.3} how={:.3} \
+         comp={:.3} txn={:.3} fresh={:.3} → {} ({:.3})",
+        combined.navigational, combined.informational, combined.technical,
+        combined.how_to, combined.comparison, combined.transactional,
+        combined.fresh, intent, score
+    );
+
+    (intent.to_string(), score.clamp(0.0, 1.0))
+}
+
+// ─── Layer 1: Rule-Based Pre-Classifier (LEGACY — replaced by evidence detectors) ──
+
+#[allow(dead_code)]
 struct RuleMatch {
     intent: &'static str,
     confidence: f32,
 }
 
+#[allow(dead_code)]
 fn rule_based_classify(query: &str) -> Option<RuleMatch> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
@@ -673,6 +1266,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (norm_a * norm_b)
 }
 
+#[allow(dead_code)]
 fn classify_by_centroids(query_embedding: &[f32], centroids: &[Vec<f32>]) -> (String, f32) {
     let mut best_intent = "informational";
     let mut best_score = -1.0f32;
@@ -839,6 +1433,7 @@ fn token_entityness(token: &str) -> f32 {
     raw.clamp(0.0, 1.0)
 }
 
+#[allow(dead_code)]
 fn domain_matchability(token: &str) -> f32 {
     // Wrapper — entityness IS domain matchability now.
     // High entityness = rare character patterns = could appear in a domain.
@@ -896,6 +1491,7 @@ fn abbreviation_score(token: &str) -> f32 {
     (vowel_sparsity * 0.5 + length_factor * 0.3 + cluster_density * 0.2).clamp(0.0, 1.0)
 }
 
+#[allow(dead_code)]
 fn compute_navigational_score(
     query: &str,
     query_embedding: &[f32],
@@ -1508,139 +2104,31 @@ async fn analyze_query(
         flat_constraints.push(format!("-{}", c));
     }
 
-    // ── Layer 1: Rule-based pre-classification ──
-    let rule_result = rule_based_classify(&params.q);
-
-    // ── Get embedding for Layer 1.5 + Layer 2 ──
+    // ── Get embedding for evidence detectors ──
     let query_embedding = {
         let bert_model = state.bert_model.lock().unwrap();
         compute_embedding(&state.device, &*bert_model, &state.bert_tokenizer, &params.q)
     };
 
-    let result = if let Some(rule_match) = rule_result {
-        tracing::info!("Layer 1 (rules) -> {} (conf: {:.2})", rule_match.intent, rule_match.confidence);
+    // ── Evidence-based classification ──
+    // All detectors run independently. No cascade, no overrides.
+    // The intent emerges from weighted evidence accumulation.
+    let (intent, confidence) = evidence_classify(
+        &params.q,
+        query_embedding.as_ref(),
+        &state.category_centroids,
+    );
 
-        // ── Layer 1.5: Navigational override ──
-        // If rules said non-navigational, check if the query structure suggests
-        // navigational intent using continuous signals (entityness + domain_matchability
-        // + centroid entropy). This catches "oxiverse tos" → "technical" misclassifications.
-        let intent = if rule_match.intent != "navigational" {
-            if let Some(ref embedding) = query_embedding {
-                let nav_score = compute_navigational_score(
-                    &params.q, embedding, &state.category_centroids
-                );
-                // Only override if: nav_score is high AND rule confidence is not too high.
-                // High-confidence rule results (like "what is" → informational, 0.80)
-                // should not be overridden by the noisy navigational detector.
-                // The rule-based layer catches question patterns that char-level
-                // entityness can't distinguish from brand queries.
-                if nav_score > 0.40 && rule_match.confidence < 0.80 {
-                    tracing::info!(
-                        "Layer 1.5 OVERRIDE: {} -> navigational (nav_score={:.3})",
-                        rule_match.intent, nav_score
-                    );
-                    "navigational".to_string()
-                } else {
-                    rule_match.intent.to_string()
-                }
-            } else {
-                rule_match.intent.to_string()
-            }
-        } else {
-            rule_match.intent.to_string()
-        };
+    let expanded = expand_queries(&params.q, &intent, &structured);
+    tracing::info!("Expanded to {} query variations", expanded.len());
 
-        // ── Abbreviation-aware query expansion ──
-        // If any token has high abbreviation_score AND the query was overridden
-        // to navigational, generate a "dropped abbreviation" expansion variant.
-        // Per user feedback: run ALL variants (original + dropped), fuse rankings.
-        // Don't trust the dropped version alone.
-        let expanded = if intent == "navigational" {
-            let words: Vec<&str> = params.q.split_whitespace().collect();
-            let has_abbreviation = words.iter().any(|w| abbreviation_score(w) > 0.6);
-            if has_abbreviation && words.len() > 1 {
-                // Generate expansion with abbreviation tokens removed
-                let dropped: Vec<&str> = words.iter()
-                    .filter(|w| abbreviation_score(w) <= 0.6)
-                    .copied()
-                    .collect();
-                let mut expansions = vec![params.q.clone()];
-                if !dropped.is_empty() && dropped.len() < words.len() {
-                    expansions.push(dropped.join(" "));
-                }
-                expansions
-            } else {
-                expand_queries(&params.q, &intent, &structured)
-            }
-        } else {
-            expand_queries(&params.q, &intent, &structured)
-        };
-
-        tracing::info!("Expanded to {} query variations", expanded.len());
-        IntentResponse {
-            query: params.q.clone(),
-            intent,
-            confidence: if rule_match.intent == "navigational" { rule_match.confidence } else { 0.80 },
-            constraints: flat_constraints.clone(),
-            structured_constraints: structured.clone(),
-            expanded_queries: expanded,
-        }
-    } else {
-        // ── Layer 2: Centroid classification ──
-        tracing::info!("Layer 1 ambiguous, using Layer 2 (centroids)");
-        match query_embedding {
-            Some(embedding) => {
-                let (centroid_intent, confidence) = classify_by_centroids(&embedding, &state.category_centroids);
-
-                // ── Layer 1.5 for centroid results too ──
-                // Lower threshold (0.40) because centroids don't have a confidence
-                // guard like rules do. The bigram_rarity + discriminability signals
-                // provide enough separation to avoid false positives.
-                let intent = if centroid_intent != "navigational" {
-                    let nav_score = compute_navigational_score(
-                        &params.q, &embedding, &state.category_centroids
-                    );
-                    // Require nav_score > 0.50 for centroid override.
-                    // Rule path has lower threshold (0.40) because it has the confidence guard.
-                    // Centroid path needs higher bar to avoid false positives like
-                    // "tcp connection" (0.487) where abbreviation discount isn't enough.
-                    if nav_score > 0.50 {
-                        tracing::info!(
-                            "Layer 1.5 OVERRIDE (centroid): {} -> navigational (nav_score={:.3})",
-                            centroid_intent, nav_score
-                        );
-                        "navigational".to_string()
-                    } else {
-                        centroid_intent.clone()
-                    }
-                } else {
-                    centroid_intent.clone()
-                };
-
-                tracing::info!("Layer 2 (centroids) -> {} (conf: {:.2})", intent, confidence);
-                let expanded = expand_queries(&params.q, &intent, &structured);
-                tracing::info!("Expanded to {} query variations", expanded.len());
-                IntentResponse {
-                    query: params.q.clone(),
-                    intent,
-                    confidence,
-                    constraints: flat_constraints.clone(),
-                    structured_constraints: structured.clone(),
-                    expanded_queries: expanded,
-                }
-            }
-            None => {
-                tracing::warn!("Embedding failed, defaulting to informational");
-                IntentResponse {
-                    query: params.q.clone(),
-                    intent: "informational".to_string(),
-                    confidence: 0.3,
-                    constraints: flat_constraints.clone(),
-                    structured_constraints: structured.clone(),
-                    expanded_queries: vec![params.q.clone()],
-                }
-            }
-        }
+    let result = IntentResponse {
+        query: params.q.clone(),
+        intent,
+        confidence,
+        constraints: flat_constraints,
+        structured_constraints: structured,
+        expanded_queries: expanded,
     };
 
     state.intent_cache.insert(query_norm, result.clone()).await;

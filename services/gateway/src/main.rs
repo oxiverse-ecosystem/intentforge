@@ -1612,6 +1612,22 @@ fn merge_local_and_web(
 
     // 3. Apply unified ranking signals to all results
     let weights = RankingWeights::for_intent(intent);
+
+    // Navigational domain boost: if intent is navigational and the query
+    // looks like a platform name (1-2 tokens), boost results whose host
+    // matches the query. This fixes "github" → github.com subpages being
+    // ranked below irrelevant content.
+    let nav_query_domain: Option<String> = if intent == "navigational" {
+        let q_words: Vec<&str> = query.split_whitespace().collect();
+        if q_words.len() <= 2 {
+            // Check if query looks like a domain name (no spaces, alphanumeric)
+            let joined = q_words.join("").to_lowercase();
+            if joined.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '.') {
+                Some(joined)
+            } else { None }
+        } else { None }
+    } else { None };
+
     for r in merged.iter_mut() {
         let semantic = semantic_relevance_score(query, &r.title, &r.content);
         let intent_boost = calculate_intent_boost(&r.url, &r.title, query, intent);
@@ -1620,7 +1636,35 @@ fn merge_local_and_web(
         let c_score = constraint_score(&r.title, &r.content, &r.url, constraints);
         let consensus = consensus_score(&r.sources);
 
-        // Weighted combination (replaces the per-source scoring)
+        // Navigational domain match boost: if the URL host contains the
+        // query as a domain component, this is likely the destination the
+        // user wants. Strong boost for homepage, moderate for subpages.
+        let nav_domain_boost = if let Some(ref domain) = nav_query_domain {
+            if let Ok(parsed) = reqwest::Url::parse(&r.url) {
+                if let Some(host) = parsed.host_str() {
+                    let host_lower = host.to_lowercase();
+                    // Exact match: host is query.com or www.query.com
+                    if host_lower == format!("{}.com", domain)
+                        || host_lower == format!("www.{}.com", domain)
+                        || host_lower == format!("{}.org", domain)
+                        || host_lower == format!("{}.io", domain)
+                        || host_lower == format!("{}.dev", domain)
+                    {
+                        let path = parsed.path();
+                        if path == "/" || path.is_empty() {
+                            0.4 // homepage boost
+                        } else {
+                            0.25 // subpage boost
+                        }
+                    } else if host_lower.contains(domain.as_str()) {
+                        0.1 // related domain
+                    } else {
+                        0.0
+                    }
+                } else { 0.0 }
+            } else { 0.0 }
+        } else { 0.0 };
+
         let local_bonus = if r.is_local { 1.0 } else { 0.0 };
         let base = (weights.semantic * semantic)
             + (weights.intent * intent_boost)
@@ -1628,7 +1672,8 @@ fn merge_local_and_web(
             + (weights.authority * r.authority)
             + (weights.quality * quality)
             + (weights.consensus * consensus)
-            + (weights.local_bonus * local_bonus);
+            + (weights.local_bonus * local_bonus)
+            + nav_domain_boost;
         r.score = base * c_score;
     }
 
@@ -2069,7 +2114,7 @@ async fn handle_search(
             !neg_terms.contains(&w_stripped) && !neg_terms.contains(&w_lower) && !neg_triggers.contains(&w_stripped.as_str()) && !neg_triggers.contains(&w_lower.as_str())
         });
         words.join(" ")
-    }).filter(|q| q.split_whitespace().count() >= 2).collect();
+    }).filter(|q| !q.trim().is_empty()).collect();
 
     let expanded_queries = if !cleaned_queries.is_empty() { cleaned_queries } else { expanded_queries };
     tracing::info!("Fan-out with {} query variations: {:?}", expanded_queries.len(), expanded_queries);
@@ -2336,12 +2381,12 @@ async fn handle_search(
     // Like a search engine: fast engines contribute, slow ones get cut by individual timeouts
     let searx_fut_with_timeout = async {
         match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
             futures::future::join_all(searx_futs),
         ).await {
             Ok(results) => results,
             Err(_) => {
-                tracing::warn!("SearXNG fan-out timed out after 2s — returning partial results");
+                tracing::warn!("SearXNG fan-out timed out after 5s — returning partial results");
                 vec![]
             }
         }
