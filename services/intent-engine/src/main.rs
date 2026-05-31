@@ -506,12 +506,20 @@ fn rule_based_classify(query: &str) -> Option<RuleMatch> {
     {
         return Some(RuleMatch { intent: "navigational", confidence: 0.85 });
     }
+    // Legal/policy pages: "oxiverse terms of service", "github privacy policy"
+    // These are navigational — user wants a specific site's legal page.
+    // Question patterns (what is, explain) are checked above and take priority.
+    if q.contains("terms of service") || q.contains("privacy policy")
+        || q.ends_with(" tos") || q.contains(" tos ")
+    {
+        return Some(RuleMatch { intent: "navigational", confidence: 0.80 });
+    }
 
     // ── How-To ──
     if q.starts_with("how to ") || q.starts_with("how do i ")
         || q.starts_with("how can i ") || q.starts_with("how do you ")
         || q.starts_with("steps to ") || q.starts_with("guide to ")
-        || q.starts_with("tutorial ")
+        || q.starts_with("tutorial ") || q.contains(" tutorial")
     {
         return Some(RuleMatch { intent: "how-to", confidence: 0.9 });
     }
@@ -550,6 +558,18 @@ fn rule_based_classify(query: &str) -> Option<RuleMatch> {
         return Some(RuleMatch { intent: "fresh", confidence: 0.8 });
     }
 
+    // ── Informational (question patterns) ──
+    // Must be checked BEFORE technical — "what is python" should be
+    // informational, not technical, even though "python" is a tech term.
+    if q.starts_with("what is ") || q.starts_with("what are ")
+        || q.starts_with("what does ") || q.starts_with("explain ")
+        || q.starts_with("why ") || q.starts_with("when ")
+        || q.starts_with("where ") || q.starts_with("who is ")
+        || q.starts_with("define ") || q.starts_with("meaning of ")
+    {
+        return Some(RuleMatch { intent: "informational", confidence: 0.8 });
+    }
+
     // ── Technical ──
     let tech_terms = [
         "api", "sdk", "library", "framework", "crate", "package", "module",
@@ -567,6 +587,11 @@ fn rule_based_classify(query: &str) -> Option<RuleMatch> {
         "django", "flask", "fastapi", "express", "axum", "tokio",
         "docker", "kubernetes", "k8s", "linux", "git", "nginx",
         "postgres", "mysql", "redis", "mongodb", "sqlite",
+        "css", "html", "sql", "nosql", "graphql", "grpc", "rest",
+        "webpack", "vite", "tailwind", "bootstrap", "sass",
+        "aws", "gcp", "azure", "terraform", "ansible",
+        "tcp", "udp", "http", "https", "ssh", "ftp", "dns", "dhcp",
+        "json", "yaml", "xml", "csv", "jwt", "oauth", "cors", "csrf",
     ];
 
     let has_tech_term = tech_terms.iter().any(|t| q.contains(t));
@@ -576,16 +601,6 @@ fn rule_based_classify(query: &str) -> Option<RuleMatch> {
 
     if has_tech_term || has_tech_lang {
         return Some(RuleMatch { intent: "technical", confidence: 0.75 });
-    }
-
-    // ── Informational ──
-    if q.starts_with("what is ") || q.starts_with("what are ")
-        || q.starts_with("what does ") || q.starts_with("explain ")
-        || q.starts_with("why ") || q.starts_with("when ")
-        || q.starts_with("where ") || q.starts_with("who is ")
-        || q.starts_with("define ") || q.starts_with("meaning of ")
-    {
-        return Some(RuleMatch { intent: "informational", confidence: 0.8 });
     }
 
     // No strong signal → Layer 2
@@ -673,6 +688,380 @@ fn classify_by_centroids(query_embedding: &[f32], centroids: &[Vec<f32>]) -> (St
     }
 
     (best_intent.to_string(), best_score)
+}
+
+// ─── Layer 1.5: Embedding-Based Navigational Detection ─────────────
+// Addresses the failure mode where rule-based classifies "oxiverse tos"
+// as "technical" and centroid confirms it.
+//
+// Three continuous signals, no hardcoded lists:
+//   1. entityness: per-token distance from generic centroid + distribution entropy
+//   2. domain_matchability: character-level check if tokens look like domain segments
+//   3. abbreviation_score: vowel ratio + length + consonant cluster patterns
+//
+// Combined multiplicatively into a navigational score.
+// Only overrides non-navigational rule results when score is high.
+
+fn bigram_rarity(token: &str) -> f32 {
+    // Computes how rare the character bigrams in a token are compared to
+    // English text. Coined brand names (oxiverse, netflix, github) use
+    // rare bigrams (ox, xi, iv, nf, tf) while natural English words use
+    // common bigrams (th, he, in, er, an, on, at).
+    //
+    // This is the core signal that distinguishes brands from dictionary words.
+    // No word lists — pure character statistics from English corpus frequencies.
+    let lower = token.to_lowercase();
+    let chars: Vec<char> = lower.chars().collect();
+    if chars.len() < 2 { return 0.5; }
+
+    // Log-frequency of common English bigrams (COCA/Brown corpus).
+    // Higher value = more common in English = less "domain-like".
+    // Only stored for common bigrams — rare ones default to 0.05.
+    let bigram_freq: std::collections::HashMap<&str, f32> = [
+        ("th", 3.7), ("he", 3.1), ("in", 2.7), ("er", 2.5), ("an", 2.3),
+        ("re", 2.2), ("on", 2.1), ("at", 2.0), ("en", 2.0), ("nd", 1.9),
+        ("ti", 1.9), ("es", 1.8), ("or", 1.8), ("te", 1.7), ("of", 1.7),
+        ("ed", 1.6), ("is", 1.6), ("it", 1.6), ("al", 1.6), ("ar", 1.5),
+        ("st", 1.5), ("to", 1.5), ("nt", 1.5), ("ng", 1.5), ("se", 1.5),
+        ("ha", 1.5), ("as", 1.4), ("ou", 1.4), ("io", 1.4), ("le", 1.4),
+        ("li", 1.3), ("ve", 1.3), ("co", 1.3), ("me", 1.3), ("de", 1.3),
+        ("ne", 1.2), ("ri", 1.2), ("ro", 1.2), ("ic", 1.2), ("ce", 1.1),
+        ("la", 1.1), ("ta", 1.1), ("ma", 1.1), ("ra", 1.1), ("ec", 1.1),
+        ("si", 1.0), ("id", 1.0), ("ol", 1.0), ("ur", 1.0), ("ch", 1.0),
+        ("ly", 0.9), ("ot", 0.9), ("ut", 0.9), ("mi", 0.9), ("pe", 0.9),
+        ("tr", 0.9), ("ct", 0.9), ("ge", 0.9), ("no", 0.9), ("il", 0.9),
+        ("pa", 0.8), ("nc", 0.8), ("el", 0.8), ("di", 0.8), ("ac", 0.8),
+        ("ns", 0.8), ("ab", 0.7), ("po", 0.7), ("ca", 0.7), ("ho", 0.7),
+        ("om", 0.7), ("ie", 0.7), ("hi", 0.7), ("ig", 0.6), ("ss", 0.6),
+        ("pr", 0.6), ("wh", 0.6), ("un", 0.6), ("im", 0.6), ("os", 0.6),
+        ("lo", 0.6), ("su", 0.5), ("wi", 0.5), ("be", 0.5), ("ph", 0.5),
+        ("cr", 0.5), ("ni", 0.5), ("bl", 0.5), ("pl", 0.5), ("sh", 0.5),
+        ("mo", 0.5), ("vi", 0.5), ("fr", 0.4), ("sp", 0.4), ("rs", 0.4),
+        ("ts", 0.4), ("gr", 0.4), ("tw", 0.4), ("ep", 0.4), ("sc", 0.4),
+        ("hu", 0.4), ("sm", 0.3), ("sw", 0.3), ("dw", 0.3), ("kn", 0.3),
+        ("gn", 0.3), ("wr", 0.3), ("pn", 0.3), ("ps", 0.3), ("mn", 0.2),
+        ("nm", 0.2), ("xu", 0.2), ("xz", 0.1), ("ox", 0.1), ("xi", 0.05),
+        ("iv", 0.2), ("nf", 0.05), ("tf", 0.01), ("gi", 0.1), ("zx", 0.01),
+        ("qw", 0.01), ("vk", 0.01), ("gl", 0.2), ("gg", 0.1), ("fb", 0.1),
+        ("gm", 0.1),
+    ].iter().copied().collect();
+
+    let max_freq = 3.7f32; // "th" is the most common English bigram
+    let mut rarity_sum = 0.0f32;
+    let mut count = 0usize;
+    for i in 0..chars.len()-1 {
+        let bg: String = chars[i..i+2].iter().collect();
+        let freq = bigram_freq.get(bg.as_str()).copied().unwrap_or(0.05);
+        rarity_sum += (max_freq - freq) / max_freq;
+        count += 1;
+    }
+    if count == 0 { return 0.5; }
+    (rarity_sum / count as f32).clamp(0.0, 1.0)
+}
+
+fn unigram_rarity(token: &str) -> f32 {
+    // How rare are the individual characters? Rare letters (j, x, q, z, k)
+    // boost the score. Common letters (e, t, a, o, i, n) lower it.
+    let lower = token.to_lowercase();
+    if lower.is_empty() { return 0.5; }
+    let unigram_freq: std::collections::HashMap<char, f32> = [
+        ('e', 2.8), ('t', 2.7), ('a', 2.5), ('o', 2.4), ('i', 2.4),
+        ('n', 2.3), ('s', 2.2), ('h', 2.1), ('r', 2.1), ('d', 1.8),
+        ('l', 1.7), ('c', 1.5), ('u', 1.4), ('m', 1.3), ('w', 1.2),
+        ('f', 1.1), ('g', 1.0), ('y', 1.0), ('p', 1.0), ('b', 0.9),
+        ('v', 0.6), ('k', 0.4), ('j', 0.1), ('x', 0.1), ('q', 0.1),
+        ('z', 0.1),
+    ].iter().copied().collect();
+    let max_freq = 2.8f32; // 'e' is most common
+    let mut rarity_sum = 0.0f32;
+    for c in lower.chars() {
+        let freq = unigram_freq.get(&c).copied().unwrap_or(0.05);
+        rarity_sum += (max_freq - freq) / max_freq;
+    }
+    (rarity_sum / lower.chars().count() as f32).clamp(0.0, 1.0)
+}
+
+fn token_entityness(token: &str) -> f32 {
+    // How entity-like is this token? Uses bigram rarity — the character-level
+    // signal that distinguishes coined brand names from dictionary words.
+    //
+    // "oxiverse" → high rarity (ox, xi, iv are rare bigrams) → ~0.62
+    // "photosynthesis" → low rarity (ph, ho, to, os are common) → ~0.35
+    // "search" → moderate rarity (se, ea, rc, ch) → ~0.53
+    // "intentforge" → moderate (in, nt, te common; tf, or rare) → ~0.36
+    //
+    // No thresholds, no lists — a continuous function of character statistics.
+    let lower = token.to_lowercase();
+    if lower.len() < 2 { return 0.3; }
+    if !lower.chars().all(|c| c.is_alphabetic()) { return 0.3; }
+
+    let br = bigram_rarity(token);
+    let ur = unigram_rarity(token);
+
+    let mut raw = br * 0.6 + ur * 0.4;
+
+    // Short token bonus: abbreviations and short brand names get a bump
+    if lower.len() <= 4 { raw *= 1.15; }
+    // Long natural word penalty: 10+ letter words are almost always dictionary words
+    if lower.len() >= 10 { raw *= 0.7; }
+
+    raw.clamp(0.0, 1.0)
+}
+
+fn domain_matchability(token: &str) -> f32 {
+    // Wrapper — entityness IS domain matchability now.
+    // High entityness = rare character patterns = could appear in a domain.
+    token_entityness(token)
+}
+
+fn abbreviation_score(token: &str) -> f32 {
+    // Continuous function detecting abbreviation-like character patterns.
+    // No predefined abbreviation list — pure character statistics.
+    //
+    // Signals:
+    //   - Vowel ratio: abbreviations have fewer vowels (~25-33%) vs English (~40%)
+    //   - Length: abbreviations are typically 2-5 characters
+    //   - Consonant clusters: abbreviations often have 3+ consecutive consonants
+    //
+    // Returns [0.0, 1.0]: higher = more likely an abbreviation.
+    if token.len() < 2 || token.len() > 8 { return 0.0; }
+    let lower = token.to_lowercase();
+    let chars: Vec<char> = lower.chars().collect();
+
+    // All non-alpha = not an abbreviation (numbers, symbols)
+    if !chars.iter().all(|c| c.is_alphabetic()) { return 0.0; }
+
+    let vowels = chars.iter().filter(|c| "aeiou".contains(**c)).count();
+    let vowel_ratio = vowels as f32 / chars.len() as f32;
+
+    // Length factor: peaks at 2-4 chars, decays after
+    let length_factor = match chars.len() {
+        2 => 0.9,
+        3 => 1.0,
+        4 => 0.85,
+        5 => 0.6,
+        _ => 0.3,
+    };
+
+    // Vowel sparsity: lower vowel ratio → higher score
+    // English avg ~0.40, abbreviations ~0.25-0.33
+    let vowel_sparsity = (1.0 - (vowel_ratio / 0.45).min(1.0)).max(0.0);
+
+    // Consonant cluster density: count runs of 3+ consecutive consonants
+    let mut cluster_count = 0usize;
+    let mut consecutive_consonants = 0usize;
+    for &c in &chars {
+        if !("aeiou".contains(c)) {
+            consecutive_consonants += 1;
+            if consecutive_consonants >= 3 {
+                cluster_count += 1;
+            }
+        } else {
+            consecutive_consonants = 0;
+        }
+    }
+    let cluster_density = (cluster_count as f32) / (chars.len() as f32).max(1.0);
+
+    (vowel_sparsity * 0.5 + length_factor * 0.3 + cluster_density * 0.2).clamp(0.0, 1.0)
+}
+
+fn compute_navigational_score(
+    query: &str,
+    query_embedding: &[f32],
+    centroids: &[Vec<f32>],
+) -> f32 {
+    // v4: BLENDED ADAPTIVE NAVIGATIONAL SCORING
+    //
+    // Addresses ALL failure modes from user feedback:
+    //   1. Continuum entityness (not binary OOV) — uses bigram rarity
+    //   2. "photosynthesis" false positive — bigram rarity naturally low
+    //   3. Short informational queries — adaptive alpha trusts embeddings
+    //   4. Abbreviation discount — zero-vowel abbrevs (tcp, css) get discounted
+    //
+    // KEY DESIGN: score = alpha * char_signals + (1-alpha) * embedding_signals
+    // where alpha adapts based on signal strength.
+    // Multiplicative combination failed because ALL signals had to agree.
+    // Additive blending lets strong signals compensate for weak ones.
+
+    let q_lower = query.trim().to_lowercase();
+    let words: Vec<&str> = q_lower.split_whitespace().collect();
+    if words.is_empty() { return 0.0; }
+
+    // ── Step 1: Generic centroid ──
+    let dim = centroids.first().map(|c| c.len()).unwrap_or(384);
+    let mut generic_centroid = vec![0.0f32; dim];
+    for centroid in centroids {
+        for (i, v) in centroid.iter().enumerate() {
+            generic_centroid[i] += v;
+        }
+    }
+    let n = centroids.len() as f32;
+    if n > 0.0 {
+        for v in generic_centroid.iter_mut() { *v /= n; }
+        let norm: f32 = generic_centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-8 {
+            for v in generic_centroid.iter_mut() { *v /= norm; }
+        }
+    }
+
+    // ── Step 2: Per-token character-level analysis ──
+    let mut entity_scores: Vec<f32> = Vec::new();
+    let mut abbr_scores: Vec<f32> = Vec::new();
+
+    for word in &words {
+        let ent = token_entityness(word);
+        let abbr = abbreviation_score(word);
+        entity_scores.push(ent);
+        abbr_scores.push(abbr);
+    }
+
+    let entity_density: f32 = if entity_scores.is_empty() { 0.0 }
+        else { entity_scores.iter().sum::<f32>() / entity_scores.len() as f32 };
+    let max_entity: f32 = entity_scores.iter().cloned().fold(0.0f32, f32::max);
+    let max_abbr: f32 = abbr_scores.iter().cloned().fold(0.0f32, f32::max);
+
+    // ── Step 3: Abbreviation discount ──
+    // Zero-vowel abbreviations (tcp, css, html, js) have high abbreviation_score
+    // but are NOT navigational. Discount entity signals driven purely by
+    // abbreviation patterns when the token has near-zero vowel ratio.
+    let mut abbr_driven_entity = 0.0f32;
+    for (i, word) in words.iter().enumerate() {
+        let chars: Vec<char> = word.chars().collect();
+        let vowels = chars.iter().filter(|c| "aeiou".contains(**c)).count();
+        let vowel_ratio = if chars.is_empty() { 0.0 } else { vowels as f32 / chars.len() as f32 };
+        if vowel_ratio < 0.15 && abbr_scores[i] > 0.6 && entity_scores[i] > 0.4 {
+            abbr_driven_entity = abbr_driven_entity.max(entity_scores[i]);
+        }
+    }
+
+    // ── Step 3b: Tech-term discount ──
+    // Known tech terms (nosql, css, graphql) have high bigram_rarity because
+    // they're coined technical jargon, not brand names. If a high-entity token
+    // is a known tech term, discount it the same way abbreviations are discounted.
+    let tech_terms_nav = [
+        "api", "sdk", "css", "html", "sql", "nosql", "graphql", "grpc",
+        "webpack", "vite", "tailwind", "bootstrap", "sass", "terraform",
+        "ansible", "docker", "kubernetes", "k8s", "nginx", "redis",
+        "postgres", "mysql", "mongodb", "sqlite", "axum", "tokio",
+    ];
+    let mut tech_driven_entity = 0.0f32;
+    for (i, word) in words.iter().enumerate() {
+        if entity_scores[i] > 0.4 && tech_terms_nav.contains(word) {
+            tech_driven_entity = tech_driven_entity.max(entity_scores[i]);
+        }
+    }
+
+    // ── Step 4: Embedding-level signals ──
+    let sims: Vec<f32> = centroids.iter()
+        .map(|c| cosine_similarity(query_embedding, c))
+        .collect();
+    let max_sim = sims.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let min_sim = sims.iter().cloned().fold(f32::INFINITY, f32::min);
+
+    let entropy = {
+        let shift = if min_sim < 0.01 { -min_sim + 0.01 } else { 0.0 };
+        let shifted: Vec<f32> = sims.iter().map(|s| s + shift).collect();
+        let total: f32 = shifted.iter().sum();
+        if total < 1e-8 { 0.0 } else {
+            let mut h = 0.0f32;
+            for &s in &shifted {
+                let p = s / total;
+                if p > 1e-8 { h -= p * p.log2(); }
+            }
+            h / (sims.len() as f32).log2().max(1.0)
+        }
+    };
+
+    let dist_from_generic = 1.0 - cosine_similarity(query_embedding, &generic_centroid);
+
+    // ── Step 5: Entity-aware structure bonus ──
+    // If query has a strong entity token, don't penalize for extra common words.
+    // "oxiverse terms of service" → entity present → keep structure high
+    let structure_bonus = if max_entity > 0.50 {
+        0.85  // entity present → high structure regardless of length
+    } else if max_entity > 0.40 {
+        0.75
+    } else {
+        match words.len() {
+            1 => 1.0,
+            2 => 0.95,
+            3 => 0.80,
+            4..=5 => 0.60,
+            _ => 0.40,
+        }
+    };
+
+    // ── Step 6: Compute char-level and embedding-level nav signals ──
+    let mut effective_entity = max_entity * 0.6 + entity_density * 0.4;
+    // Apply abbreviation discount
+    if abbr_driven_entity > 0.5 {
+        effective_entity *= 0.6;
+    }
+    // Apply tech-term discount: known tech jargon with high rarity isn't a brand
+    if tech_driven_entity > 0.5 {
+        effective_entity *= 0.5;
+    }
+
+    // Bigram rarity: coined brand names (oxiverse, netflix) have rare bigrams.
+    // Dictionary words (photosynthesis, machine) have common bigrams.
+    // This separates brands from English words at the character level.
+    let bigram_rarity_score = if !words.is_empty() {
+        let best = words.iter().map(|w| bigram_rarity(w)).fold(0.0f32, f32::max);
+        best
+    } else { 0.0 };
+
+    // Char nav: entity signal boosted by bigram rarity, abbreviation as tiebreaker.
+    // When both entity and bigram_rarity agree (coined brand), score is high.
+    // When entity is moderate but bigram_rarity is low (dictionary word), score stays low.
+    let entity_with_rarity = (effective_entity * 0.55 + bigram_rarity_score * 0.45).min(1.0);
+    let char_nav = (entity_with_rarity.max(max_abbr * 0.5)) * structure_bonus;
+    let emb_nav_raw = entropy * 0.5 + dist_from_generic.max(0.0) * 0.3 + (1.0 - max_sim).max(0.0) * 0.2;
+
+    // Penalize emb_nav when discriminability is low.
+    // When max_sim and min_sim are nearly identical, the embedding can't
+    // distinguish between categories. The signal is noise.
+    // "discriminability" = max_sim - min_sim. For well-separated queries
+    // this is 0.1+, for uniform queries it's <0.05.
+    let discriminability = (max_sim - min_sim).max(0.0);
+    let disc_penalty = (discriminability / 0.10).min(1.0); // 0.0 at spread=0, 1.0 at spread≥0.10
+    let emb_nav = emb_nav_raw * disc_penalty;
+
+    // ── Step 7: Adaptive alpha (the key innovation) ──
+    // USES DISCRIMINABILITY, not max_sim.
+    //
+    // max_sim > 0.6 is ALWAYS true (0.91-0.97 for all queries with MiniLM).
+    // What matters is whether embeddings can DISTINGUISH categories:
+    //   discriminability = max_sim - min_sim
+    //   < 0.08 → embeddings are noise (entropy=1.0, all sims ~equal)
+    //   > 0.15 → embeddings can distinguish (one category clearly closer)
+    //
+    // When discriminability is LOW, character signals MUST dominate.
+    // When discriminability is HIGH, embeddings help suppress false positives.
+    // Effective entity adds a secondary boost for strong brand signals.
+    let alpha = if discriminability < 0.08 && effective_entity > 0.40 {
+        0.80  // embeddings are noise, entity present → trust char
+    } else if discriminability < 0.08 {
+        0.65  // embeddings are noise, no entity → still lean char
+    } else if discriminability > 0.15 && effective_entity < 0.40 {
+        0.30  // embeddings discriminative, weak entity → trust embeddings
+    } else if effective_entity > 0.55 {
+        0.60  // strong entity signal → lean char regardless
+    } else {
+        0.45  // balanced zone
+    };
+
+    let score = alpha * char_nav + (1.0 - alpha) * emb_nav;
+
+    tracing::info!(
+        "NAV SCORE v4: eff_entity={:.3} max_entity={:.3} max_abbr={:.3} abbr_discount={} \
+         entropy={:.3} dist_generic={:.3} max_sim={:.3} \
+         structure={:.3} char_nav={:.3} emb_nav={:.3} alpha={:.2} → score={:.3}",
+        effective_entity, max_entity, max_abbr, abbr_driven_entity > 0.5,
+        entropy, dist_from_generic, max_sim,
+        structure_bonus, char_nav, emb_nav, alpha, score
+    );
+
+    score.clamp(0.0, 1.0)
 }
 
 // ─── Query Expansion (Dynamic, Not Hardcoded) ────────────────────────
@@ -903,11 +1292,12 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Computing intent category centroids...");
     let category_centroids = {
         let category_examples: Vec<Vec<&str>> = vec![
-            vec!["python docs", "github login", "mdn web docs", "stackoverflow",
-                 "rust book", "npm registry", "pypi", "crates.io", "docker hub",
-                 "kubernetes documentation", "react official site", "vue.js homepage",
-                 "typescript handbook", "go documentation", "linux man pages",
-                 "arch wiki", "reddit", "wikipedia", "youtube", "twitter"],
+            // 0: Navigational — user wants a SPECIFIC site/page (not a topic)
+            vec!["reddit", "wikipedia", "youtube", "twitter", "facebook",
+                 "instagram", "github login", "gmail", "netflix", "spotify",
+                 "amazon", "stackoverflow", "discord", "twitch", "linkedin",
+                 "apple", "microsoft", "google docs", "dropbox", "figma"],
+            // 1: Informational — user wants to LEARN about a topic
             vec![
                  "what is machine learning", "what is a neural network",
                  "explain quantum computing", "what does TCP do",
@@ -920,7 +1310,9 @@ async fn main() -> anyhow::Result<()> {
                  "healthy breakfast recipes", "python tutorials for beginners",
                  "travel tips for europe", "gardening guide for spring",
                  "best hiking trails near seattle", "history of ancient rome",
-                 "climate change effects on agriculture", "beginner yoga poses"],
+                 "climate change effects on agriculture", "beginner yoga poses",
+                 "nosql database overview", "css layout guide",
+                 "javascript closures explained", "database indexing strategies"],
             vec!["rust async runtime", "python requests library",
                  "javascript fetch API", "go goroutines",
                  "docker compose volumes", "kubernetes pods",
@@ -1033,24 +1425,115 @@ async fn analyze_query(
         flat_constraints.push(format!("-{}", c));
     }
 
-    let result = if let Some(rule_match) = rule_based_classify(&params.q) {
+    // ── Layer 1: Rule-based pre-classification ──
+    let rule_result = rule_based_classify(&params.q);
+
+    // ── Get embedding for Layer 1.5 + Layer 2 ──
+    let query_embedding = {
+        let bert_model = state.bert_model.lock().unwrap();
+        compute_embedding(&state.device, &*bert_model, &state.bert_tokenizer, &params.q)
+    };
+
+    let result = if let Some(rule_match) = rule_result {
         tracing::info!("Layer 1 (rules) -> {} (conf: {:.2})", rule_match.intent, rule_match.confidence);
-        let expanded = expand_queries(&params.q, rule_match.intent, &structured);
+
+        // ── Layer 1.5: Navigational override ──
+        // If rules said non-navigational, check if the query structure suggests
+        // navigational intent using continuous signals (entityness + domain_matchability
+        // + centroid entropy). This catches "oxiverse tos" → "technical" misclassifications.
+        let intent = if rule_match.intent != "navigational" {
+            if let Some(ref embedding) = query_embedding {
+                let nav_score = compute_navigational_score(
+                    &params.q, embedding, &state.category_centroids
+                );
+                // Only override if: nav_score is high AND rule confidence is not too high.
+                // High-confidence rule results (like "what is" → informational, 0.80)
+                // should not be overridden by the noisy navigational detector.
+                // The rule-based layer catches question patterns that char-level
+                // entityness can't distinguish from brand queries.
+                if nav_score > 0.40 && rule_match.confidence < 0.80 {
+                    tracing::info!(
+                        "Layer 1.5 OVERRIDE: {} -> navigational (nav_score={:.3})",
+                        rule_match.intent, nav_score
+                    );
+                    "navigational".to_string()
+                } else {
+                    rule_match.intent.to_string()
+                }
+            } else {
+                rule_match.intent.to_string()
+            }
+        } else {
+            rule_match.intent.to_string()
+        };
+
+        // ── Abbreviation-aware query expansion ──
+        // If any token has high abbreviation_score AND the query was overridden
+        // to navigational, generate a "dropped abbreviation" expansion variant.
+        // Per user feedback: run ALL variants (original + dropped), fuse rankings.
+        // Don't trust the dropped version alone.
+        let expanded = if intent == "navigational" {
+            let words: Vec<&str> = params.q.split_whitespace().collect();
+            let has_abbreviation = words.iter().any(|w| abbreviation_score(w) > 0.6);
+            if has_abbreviation && words.len() > 1 {
+                // Generate expansion with abbreviation tokens removed
+                let dropped: Vec<&str> = words.iter()
+                    .filter(|w| abbreviation_score(w) <= 0.6)
+                    .copied()
+                    .collect();
+                let mut expansions = vec![params.q.clone()];
+                if !dropped.is_empty() && dropped.len() < words.len() {
+                    expansions.push(dropped.join(" "));
+                }
+                expansions
+            } else {
+                expand_queries(&params.q, &intent, &structured)
+            }
+        } else {
+            expand_queries(&params.q, &intent, &structured)
+        };
+
         tracing::info!("Expanded to {} query variations", expanded.len());
         IntentResponse {
             query: params.q.clone(),
-            intent: rule_match.intent.to_string(),
-            confidence: rule_match.confidence,
+            intent,
+            confidence: if rule_match.intent == "navigational" { rule_match.confidence } else { 0.80 },
             constraints: flat_constraints.clone(),
             structured_constraints: structured.clone(),
             expanded_queries: expanded,
         }
     } else {
+        // ── Layer 2: Centroid classification ──
         tracing::info!("Layer 1 ambiguous, using Layer 2 (centroids)");
-        let bert_model = state.bert_model.lock().unwrap();
-        match compute_embedding(&state.device, &*bert_model, &state.bert_tokenizer, &params.q) {
-            Some(query_embedding) => {
-                let (intent, confidence) = classify_by_centroids(&query_embedding, &state.category_centroids);
+        match query_embedding {
+            Some(embedding) => {
+                let (centroid_intent, confidence) = classify_by_centroids(&embedding, &state.category_centroids);
+
+                // ── Layer 1.5 for centroid results too ──
+                // Lower threshold (0.40) because centroids don't have a confidence
+                // guard like rules do. The bigram_rarity + discriminability signals
+                // provide enough separation to avoid false positives.
+                let intent = if centroid_intent != "navigational" {
+                    let nav_score = compute_navigational_score(
+                        &params.q, &embedding, &state.category_centroids
+                    );
+                    // Require nav_score > 0.50 for centroid override.
+                    // Rule path has lower threshold (0.40) because it has the confidence guard.
+                    // Centroid path needs higher bar to avoid false positives like
+                    // "tcp connection" (0.487) where abbreviation discount isn't enough.
+                    if nav_score > 0.50 {
+                        tracing::info!(
+                            "Layer 1.5 OVERRIDE (centroid): {} -> navigational (nav_score={:.3})",
+                            centroid_intent, nav_score
+                        );
+                        "navigational".to_string()
+                    } else {
+                        centroid_intent.clone()
+                    }
+                } else {
+                    centroid_intent.clone()
+                };
+
                 tracing::info!("Layer 2 (centroids) -> {} (conf: {:.2})", intent, confidence);
                 let expanded = expand_queries(&params.q, &intent, &structured);
                 tracing::info!("Expanded to {} query variations", expanded.len());

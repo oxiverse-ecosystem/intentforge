@@ -1893,15 +1893,32 @@ async fn main() {
         searxng2_url,
     });
 
-    // Prewarm: fire dummy queries to warm up SearXNG engine connections + intent engine.
-    // Without this, the first real query takes 4-5s extra for cold start.
+    // Prewarm: poll intent engine until ready (handles container restart ordering).
+    // Gateway starts fast; intent engine takes 5-15s to load BERT + compute centroids.
     let prewarm_client = state.http_client.clone();
     let prewarm_searxng2 = state.searxng2_url.clone();
     tokio::spawn(async move {
-        tracing::info!("Prewarming SearXNG + intent engine...");
+        tracing::info!("Prewarming — polling intent engine until ready...");
+        // Poll intent engine with exponential backoff until it responds
+        for attempt in 1..=20 {
+            match prewarm_client.get("http://127.0.0.1:3005/analyze?q=warmup").send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::info!("Intent engine ready after {} attempt(s)", attempt);
+                    break;
+                }
+                Ok(resp) => {
+                    tracing::warn!("Prewarm attempt {}: status {}", attempt, resp.status());
+                }
+                Err(e) => {
+                    tracing::info!("Prewarm attempt {}: {}", attempt, e);
+                }
+            }
+            let delay = std::cmp::min(500 * attempt, 5000); // 500ms, 1s, 1.5s, ... max 5s
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        // Fire SearXNG + embed warmup in parallel (non-critical)
         let mut prewarm_futs = vec![
             prewarm_client.get("http://127.0.0.1:8080/search?q=warmup&format=json&pageno=1").send(),
-            prewarm_client.get("http://127.0.0.1:3005/analyze?q=warmup").send(),
             prewarm_client.get("http://127.0.0.1:3005/embed?text=warmup").send(),
         ];
         if let Some(ref s2_url) = prewarm_searxng2 {
@@ -1971,29 +1988,45 @@ async fn handle_search(
     let q = params.q.clone();
     let q_encoded = urlencoding::encode(&q);
 
-    // 1. Run Intent Analysis and Embedding in parallel
+    // 1. Run Intent Analysis (with retry) and Embedding in parallel
     let intent_url = format!("http://127.0.0.1:3005/analyze?q={}", q_encoded);
     let embed_url = format!("http://127.0.0.1:3005/embed?text={}", q_encoded);
 
-    let (intent_res, embed_res) = tokio::join!(
-        client.get(&intent_url).send(),
-        client.get(&embed_url).send()
-    );
-
-    // 2. Process Intent & Embedding
-    let intent: IntentResponse = match intent_res {
-        Ok(resp) => {
-            let status = resp.status();
-            match resp.json::<IntentResponse>().await {
-                Ok(parsed) => parsed,
+    // Retry intent engine up to 2 extra times with backoff.
+    // Handles cold-start after container restart (model load takes 5-15s).
+    let intent_fut = async {
+        let delays = [0u64, 500, 1000]; // 0ms, 500ms, 1000ms
+        for (attempt, delay_ms) in delays.iter().enumerate() {
+            if *delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+            }
+            match client.get(&intent_url).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    match resp.json::<IntentResponse>().await {
+                        Ok(parsed) => return Ok(parsed),
+                        Err(e) => {
+                            tracing::warn!("Intent parse failed (attempt {}, status: {}): {:?}",
+                                attempt + 1, status, e);
+                        }
+                    }
+                }
                 Err(e) => {
-                    tracing::error!("Failed to parse IntentResponse (status: {}): {:?}", status, e);
-                    fallback_intent(&q)
+                    tracing::warn!("Intent Engine request failed (attempt {}): {:?}", attempt + 1, e);
                 }
             }
         }
-        Err(e) => {
-            tracing::error!("Intent Engine request failed/timed out: {:?}", e);
+        Err::<IntentResponse, ()>(())
+    };
+    let embed_fut = client.get(&embed_url).send();
+
+    let (intent_result, embed_res) = tokio::join!(intent_fut, embed_fut);
+
+    // 2. Process Intent & Embedding
+    let intent: IntentResponse = match intent_result {
+        Ok(parsed) => parsed,
+        Err(()) => {
+            tracing::error!("Intent Engine unreachable after 3 attempts — using fallback");
             fallback_intent(&q)
         }
     };
