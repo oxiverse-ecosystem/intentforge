@@ -30,7 +30,6 @@ services:
       - "8888:8888/tcp"
       - "8388:8388/tcp"
       - "8080:8080"
-      - "8081:8081"
       - "5000:5000"
       - "3000:3000"
       - "4000:4000"
@@ -76,7 +75,11 @@ services:
   tor2:
     build: ./privacy-layer/tor2
     container_name: if-dev-tor2
-    network_mode: "service:gluetun"
+    # Independent network — NOT behind gluetun VPN
+    # Tor2 provides a separate IP path for SearXNG2
+    ports:
+      - "9051:9051"
+      - "8081:8081"    # SearXNG2 accessible via tor2's network
     volumes:
       - ./privacy-layer/tor2/data:/var/lib/tor
     restart: always
@@ -115,7 +118,9 @@ services:
   searxng2:
     container_name: if-dev-searxng2
     image: searxng/searxng:latest
-    network_mode: "service:gluetun"
+    network_mode: "service:tor2"    # Routes through Tor2 (independent of gluetun VPN)
+    depends_on:
+      - tor2
     environment:
       - GRANIAN_WORKERS=4
       - SEARXNG_PORT=8081
@@ -228,7 +233,7 @@ services:
     environment:
       - INTENT_ENGINE_URL=http://localhost:3005
       - SEARXNG_URL=http://localhost:8080
-      - SEARXNG2_URL=http://localhost:8081
+      - SEARXNG2_URL=http://172.20.0.1:8081
       - CRAWLER_URL=http://localhost:5001
       - INDEXER_URL=http://localhost:6000
     volumes:
