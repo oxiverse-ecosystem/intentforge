@@ -1,11 +1,42 @@
-# torrc for tor2 — second Tor instance for parallel SearXNG throughput
+# torrc for tor2 — optimized for speed (SearXNG2 proxy)
 SocksPort 0.0.0.0:9051
 DataDirectory /var/lib/tor
 Log notice stdout
 
 # Disable Bridges
 UseBridges 0
-# ClientTransportPlugin obfs4 exec /usr/bin/lyrebird
 
-# Bridges will be included from the shared volume via entrypoint
-# %include /data/torrc.bridges
+# ══════════════════════════════════════════════════════════════
+# SPEED OPTIMIZATIONS
+# ══════════════════════════════════════════════════════════════
+
+# Single guard node — faster circuit building, less handshake overhead
+NumEntryGuards 1
+UseEntryGuards 1
+
+# Learn and enforce fast circuit build timeout
+LearnCircuitBuildTimeout 1
+CircuitBuildTimeout 15
+
+# Keep circuits alive longer for reuse (search burst pattern)
+CircuitIdleTimeout 120
+NewCircuitPeriod 30
+
+# Allow more pending circuits for parallel SearXNG engine requests
+MaxClientCircuitsPending 32
+
+# SOCKS connection handling
+SocksTimeout 10
+
+# Directory info — fetch early for faster bootstrap
+FetchDirInfoEarly 1
+FetchDirInfoExtraEarly 1
+
+# Keepalive to prevent circuit teardown
+KeepalivePeriod 60
+
+# Connection limits
+ConnLimit 1024
+
+# Prefer faster relays
+ClientPreferIPv6ORPort 1

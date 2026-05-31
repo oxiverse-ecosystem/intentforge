@@ -1,24 +1,22 @@
-# SearXNG2 settings — all engines route through Tor (port 9051)
-# This instance provides parallel search throughput via a different IP path.
-# SearXNG1 uses VPN (gluetun), SearXNG2 uses Tor (tor2).
-# Tor adds ~3-5s latency, so timeouts are higher than VPN-path SearXNG1.
+# SearXNG2 settings — Tor-optimized (speed over coverage)
+# Only engines that actually work through Tor exit nodes.
+# Blocked engines (brave, presearch, yandex) removed — they just
+# waste 3-4s each timing out with CAPTCHA/access denied.
 
 use_default_settings:
   engines:
     keep_only:
-      - bing
-      - brave
-      - startpage
-      - wikipedia
-      - mojeek
-      - yandex
-      - duckduckgo
-      - ahmia
-      - presearch
-      - marginalia
-      - bing images
+      # ── Proven fast through Tor ──
+      - bing            # 10 results, ~1.5s
+      - startpage       # 8 results, ~2s
+      - duckduckgo      # 7 results, ~2.5s
+      - mojeek          # 6 results, ~2s
+      - wikipedia       # 1-2 results, ~1s
+      # ── News (fast through Tor) ──
       - bing news
       - google news
+      # ── Images (fast through Tor) ──
+      - bing images
 
 server:
   port: 8081
@@ -39,36 +37,32 @@ search:
   default_lang: "en"
 
 outgoing:
-  request_timeout: 3.0     # Tor is slower, but still fail fast
-  max_request_timeout: 6.0
+  request_timeout: 2.5     # Tighter — we know which engines are fast
+  max_request_timeout: 5.0
   # ALL traffic goes through Tor2 (port 9051)
   networks:
     default:
       proxies:
         all://: socks5h://127.0.0.1:9051
       using_tor_proxy: true
-      retries: 1            # retries through Tor are expensive
+      retries: 0            # No retries through Tor — fail fast
     tor:
       proxies:
         all://: socks5h://127.0.0.1:9051
       using_tor_proxy: true
-      retries: 1
+      retries: 0
 
 engines:
-  # ── All engines via Tor (default network) ──
+  # ── Fast engines via Tor ──
   - name: bing
     disabled: false
-    timeout: 4.0
-
-  - name: brave
-    disabled: false
-    timeout: 4.0
+    timeout: 3.0
 
   - name: startpage
     disabled: false
-    timeout: 4.0
+    timeout: 3.0
 
-  - name: wikipedia
+  - name: duckduckgo
     disabled: false
     timeout: 3.0
 
@@ -76,40 +70,22 @@ engines:
     disabled: false
     timeout: 3.0
 
-  - name: yandex
+  - name: wikipedia
     disabled: false
-    timeout: 3.0
+    timeout: 2.5
 
-  - name: duckduckgo
-    disabled: false
-    timeout: 4.0
-
-  - name: presearch
-    disabled: false
-    timeout: 4.0
-
-  - name: marginalia
-    disabled: false
-    timeout: 5.0
-
-  # ── Onion engine via Tor ──
-  - name: ahmia
-    disabled: false
-    network: tor
-    timeout: 10.0
-
-  # ── Image & News engines via Tor ──
+  # ── Image & News via Tor ──
   - name: bing images
     engine: bing_images
     disabled: false
-    timeout: 4.0
+    timeout: 3.0
 
   - name: bing news
     engine: bing_news
     disabled: false
-    timeout: 4.0
+    timeout: 3.0
 
   - name: google news
     engine: google_news
     disabled: false
-    timeout: 4.0
+    timeout: 3.0
