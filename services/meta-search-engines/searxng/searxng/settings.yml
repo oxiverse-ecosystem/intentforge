@@ -36,7 +36,7 @@ search:
   default_lang: "en"
 
 outgoing:
-  request_timeout: 2.0    # fail fast — 6 engines in 2s beats 8 in 3.5s
+  request_timeout: 2.5    # fast engines respond in <2s, cut slow ones
   max_request_timeout: 5.0
   # Per-network routing: Tor for .onion engines, default (VPN) for regular
   networks:
