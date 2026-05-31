@@ -39,7 +39,7 @@ search:
   default_lang: "en"
 
 outgoing:
-  request_timeout: 4.0     # Fail fast on Tor — engines that can't respond in 4s aren't useful
+  request_timeout: 3.0     # Tor is slower, but still fail fast
   max_request_timeout: 6.0
   # ALL traffic goes through Tor2 (port 9051)
   networks:

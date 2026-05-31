@@ -95,7 +95,7 @@ services:
     image: searxng/searxng:latest
     network_mode: "service:gluetun"
     environment:
-      - GRANIAN_WORKERS=2
+      - GRANIAN_WORKERS=4
       - GRANIAN_HOST=0.0.0.0
     volumes:
       - ./meta-search-engines/searxng/searxng:/etc/searxng:rw
@@ -117,7 +117,7 @@ services:
     image: searxng/searxng:latest
     network_mode: "service:gluetun"
     environment:
-      - GRANIAN_WORKERS=2
+      - GRANIAN_WORKERS=4
       - SEARXNG_PORT=8081
       - GRANIAN_HOST=0.0.0.0
     volumes:
@@ -216,7 +216,7 @@ services:
       - ./intent-engine/models:/app/models
     environment:
       - RUST_LOG=info
-      - RAYON_NUM_THREADS=2
+      - RAYON_NUM_THREADS=4
     network_mode: "service:gluetun"
     restart: always
 

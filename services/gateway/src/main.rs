@@ -1870,7 +1870,7 @@ async fn handle_news(
     Json(response)
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     tracing_subscriber::fmt::init();
 
@@ -1884,9 +1884,9 @@ async fn main() {
         cache: SearchCache::new(),
         rate_limits: RateLimitTracker::new(),
         http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .pool_max_idle_per_host(10)
+            .pool_max_idle_per_host(20)
             .connect_timeout(Duration::from_secs(1))
             .build()
             .unwrap(),
