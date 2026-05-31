@@ -1,11 +1,25 @@
-# torrc
+# torrc — Tor1 (used by SearXNG1 for .onion engines)
 SocksPort 0.0.0.0:9050
 DataDirectory /var/lib/tor
 Log notice stdout
 
 # Disable Bridges
 UseBridges 0
-# ClientTransportPlugin obfs4 exec /usr/bin/lyrebird
 
-# Bridges will be included from the shared volume via entrypoint
-# %include /data/torrc.bridges
+# ══════════════════════════════════════════════════════════════
+# SPEED OPTIMIZATIONS (same as tor2)
+# ══════════════════════════════════════════════════════════════
+
+NumEntryGuards 1
+UseEntryGuards 1
+LearnCircuitBuildTimeout 1
+CircuitBuildTimeout 15
+CircuitIdleTimeout 120
+NewCircuitPeriod 30
+MaxClientCircuitsPending 32
+SocksTimeout 10
+FetchDirInfoEarly 1
+FetchDirInfoExtraEarly 1
+KeepalivePeriod 60
+ConnLimit 1024
+ClientPreferIPv6ORPort 1
