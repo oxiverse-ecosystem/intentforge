@@ -40,6 +40,9 @@ outgoing:
   max_request_timeout: 5.0
   # Per-network routing: Tor for .onion engines, default (VPN) for regular
   networks:
+    default:
+      # No proxy — traffic goes through gluetun VPN directly
+      retries: 1
     tor:
       proxies:
         all://: socks5h://127.0.0.1:9050
