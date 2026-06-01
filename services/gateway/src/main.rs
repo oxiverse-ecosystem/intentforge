@@ -29,6 +29,9 @@ struct Constraints {
     positive: Vec<String>,
     #[serde(default)]
     negative: Vec<String>,
+    /// Detected programming language from the query.
+    #[serde(default)]
+    language: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -44,6 +47,8 @@ struct IntentResponse {
     structured_constraints: Constraints,
     #[serde(default)]
     expanded_queries: Vec<String>,
+    #[serde(default)]
+    distribution: std::collections::HashMap<String, f32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -226,6 +231,8 @@ struct UnifiedResponse {
     structured_constraints: Constraints,
     #[serde(default)]
     expanded_queries: Vec<String>,
+    #[serde(default)]
+    distribution: std::collections::HashMap<String, f32>,
     results: Vec<MergedResult>,
 }
 
@@ -732,6 +739,61 @@ fn constraint_score(
         score *= 0.3 + coverage * 1.5;
     }
 
+    // Language entity constraints: when a programming language is detected in the
+    // query, boost results that mention it and penalize results mentioning a
+    // different language. This handles "Go web framework" not surfacing Python results.
+    if let Some(ref lang) = constraints.language {
+        let lang_lower = lang.to_lowercase();
+        // Known language-related terms that appear in result content when the
+        // result IS about that language. Not exhaustive — just the most common
+        // co-occurring terms.
+        let lang_aliases: &[&str] = match lang_lower.as_str() {
+            "go" => &["golang", "go ", " go,", " go.", " go/", "go-", ".go"],
+            "rust" => &["rust", "rustc", "cargo", "crate"],
+            "python" => &["python", "pip", "pypi", "django", "flask", "fastapi"],
+            "javascript" => &["javascript", "nodejs", "node.js", "npm", "yarn", "deno", "bun"],
+            "typescript" => &["typescript", "tsc", "tsx"],
+            "java" => &["java", "jdk", "jvm", "maven", "gradle", "spring"],
+            "c++" => &["c++", "cpp", "cmake", "boost"],
+            "ruby" => &["ruby", "rails", "gem", "bundler"],
+            "php" => &["php", "composer", "laravel", "symfony"],
+            "swift" => &["swift", "xcode", "swiftui", "cocoapods"],
+            "kotlin" => &["kotlin", "ktor", "gradle"],
+            _ => &[lang_lower.as_str()],
+        };
+
+        // Check if result mentions the detected language
+        let mentions_lang = lang_aliases.iter().any(|alias| text_lower.contains(alias));
+
+        // Check if result mentions a DIFFERENT language (cross-language penalty)
+        let other_languages: &[&[&str]] = &[
+            &["python", "pip", "pypi", "django", "flask"],
+            &["javascript", "nodejs", "node.js", "npm"],
+            &["typescript", "tsc"],
+            &["rust", "rustc", "cargo"],
+            &["golang", " go "],
+            &["java", "jdk", "jvm"],
+            &["ruby", "rails"],
+            &["php", "laravel"],
+            &["swift", "xcode"],
+            &["kotlin", "ktor"],
+            &["c++", "cpp"],
+        ];
+
+        let mentions_other = other_languages.iter().any(|group| {
+            // Skip the group that matches the detected language
+            let group_canonical = group[0].to_lowercase();
+            if lang_aliases.iter().any(|a| *a == group_canonical) { return false; }
+            group.iter().any(|term| text_lower.contains(term))
+        });
+
+        if mentions_lang {
+            score *= 1.3; // 30% boost for matching language
+        } else if mentions_other {
+            score *= 0.6; // 40% penalty for different language
+        }
+    }
+
     score.clamp(0.0, 2.0)
 }
 
@@ -1031,6 +1093,65 @@ impl RankingWeights {
             },
         }
     }
+
+    // Distribution-aware blending: when intent is uncertain (e.g., informational 0.41,
+    // comparison 0.38), blend ranking weights proportionally instead of hard-switching.
+    // "Intent as hint, not gate."
+    fn for_distribution(distribution: &std::collections::HashMap<String, f32>) -> Self {
+        let labels = ["informational", "technical", "navigational", "comparison", "how-to", "fresh", "transactional"];
+
+        // Get probabilities for each label (default 0 if missing)
+        let probs: Vec<f32> = labels.iter().map(|l| {
+            distribution.get(*l).copied().unwrap_or(0.0)
+        }).collect();
+
+        // If distribution is empty or all zeros, fall back to informational
+        let total: f32 = probs.iter().sum();
+        if total < 0.01 {
+            return Self::for_intent("informational");
+        }
+
+        // Compute margin: how certain is the top intent?
+        let mut sorted = probs.clone();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let margin = sorted[0] - sorted[1];
+
+        // If margin > 0.3, the classifier is confident — use the winning intent directly
+        if margin > 0.3 {
+            let (winner_idx, _) = probs.iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((0, &0.0));
+            return Self::for_intent(labels[winner_idx]);
+        }
+
+        // Otherwise, blend weights proportionally
+        let mut blended = Self::for_intent("informational"); // start with default
+        blended.rrf = 0.0;
+        blended.intent = 0.0;
+        blended.freshness = 0.0;
+        blended.authority = 0.0;
+        blended.local_bonus = 0.0;
+        blended.quality = 0.0;
+        blended.semantic = 0.0;
+        blended.consensus = 0.0;
+        blended.constraint = 0.0;
+
+        for (i, label) in labels.iter().enumerate() {
+            let w = Self::for_intent(label);
+            let p = probs[i] / total; // normalize to sum to 1
+            blended.rrf += w.rrf * p;
+            blended.intent += w.intent * p;
+            blended.freshness += w.freshness * p;
+            blended.authority += w.authority * p;
+            blended.local_bonus += w.local_bonus * p;
+            blended.quality += w.quality * p;
+            blended.semantic += w.semantic * p;
+            blended.consensus += w.consensus * p;
+            blended.constraint += w.constraint * p;
+        }
+
+        blended
+    }
 }
 
 fn compute_final_score(
@@ -1105,57 +1226,64 @@ fn strip_tracking_params(url: &str) -> String {
     }
 }
 
-// Normalizes scores to [0, 1] using robust percentile scaling.
-// Makes scores comparable across different queries (a 1.5 on one query
-// shouldn't be confused with 1.5 on another).
+// Normalizes scores to [0, 1] using rank-aware scaling that preserves
+// meaningful differentiation among top results.
+//
+// Problem with pure percentile normalization: when composite scores are in a
+// narrow range (e.g. 0.140-0.145), P99 scaling compresses all top results to
+// ~0.970 — losing rank order information entirely.
+//
+// Solution: hybrid approach that uses rank-position for the top tier (where
+// differentiation matters most) and percentile scaling for the rest.
 
 fn normalize_scores(scores: &mut [f32]) {
     let n = scores.len();
     if n < 2 {
-        return; // not enough data to normalize
+        return;
     }
 
-    // Create indexed scores for rank-based normalization
     let mut indexed: Vec<(usize, f32)> = scores.iter().enumerate().map(|(i, &s)| (i, s)).collect();
     indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Check if percentile normalization would cluster (p10-p90 range too tight)
-    let p10_idx = ((n as f32 * 0.10) as usize).min(n - 1);
-    let p90_idx = ((n as f32 * 0.90) as usize).min(n - 1);
-    let p10 = indexed[p10_idx].1;
-    let p90 = indexed[p90_idx].1;
-    let percentile_range = p90 - p10;
-
-    // Also check overall range
     let min_score = indexed[0].1;
     let max_score = indexed[n - 1].1;
     let total_range = max_score - min_score;
 
-    // Use min-max normalization with p95 as effective max to preserve
-    // granularity among top results. Results above p95 get compressed
-    // into [0.95, 1.0] band instead of all clustering at 1.0.
-    if total_range < 0.01 {
-        // All scores nearly identical — use rank-based to force spread
+    if total_range < 1e-6 {
+        // All scores identical — use pure rank-based
         for (rank, &(orig_idx, _)) in indexed.iter().enumerate() {
-            scores[orig_idx] = (rank as f32) / ((n - 1) as f32);
+            scores[orig_idx] = 1.0 - (rank as f32) / (n as f32);
         }
-    } else {
-        // Use 99th percentile as the "effective max" — this prevents top
-        // results from clustering at 1.0 while preserving differentiation
-        // among the top ~95% of results (authority, consensus, etc. matter).
-        let p99_idx = ((n as f32 * 0.99) as usize).min(n - 1);
-        let p99 = indexed[p99_idx].1;
-        let effective_range = (p99 - min_score).max(0.01);
+        return;
+    }
 
-        for score in scores.iter_mut() {
-            let raw = (*score - min_score) / effective_range;
-            if raw > 1.0 {
-                // Above p99: compress into [0.97, 1.0] band
-                let excess = (raw - 1.0).min(1.0);
-                *score = 0.97 + excess * 0.03;
-            } else {
-                *score = raw.clamp(0.0, 0.97);
-            }
+    // Hybrid normalization:
+    // - Top 3 results: rank-based with steep decay (0.99, 0.82, 0.67, ...)
+    //   Each rank loses ~17% → clear differentiation even when raw scores are close.
+    // - Rest: percentile-scaled relative to top-3 anchor range.
+    //
+    // This means rank order is ALWAYS preserved in scores, even when the raw
+    // composite difference is 0.001. The score reflects "this is the 2nd best
+    // result" not "this is 97% of the max".
+
+    let top_k = 3.min(n);
+    let top_scores: Vec<f32> = (0..top_k).map(|i| {
+        let decay = (1.0 - 0.17_f32).powi(i as i32); // 0.99, 0.82, 0.67
+        0.99 * decay
+    }).collect();
+    let anchor_floor = *top_scores.last().unwrap(); // score for kth result
+
+    // indexed is sorted ascending: index 0 = lowest score, index n-1 = highest
+    // rank 0 = worst, rank n-1 = best
+    for (rank, &(orig_idx, _)) in indexed.iter().enumerate() {
+        if rank >= n - top_k {
+            // Top-k result (highest raw scores): assign rank-based score
+            let top_rank = rank - (n - top_k); // 0, 1, 2
+            scores[orig_idx] = top_scores[top_rank];
+        } else {
+            // Remaining: percentile-scale into [0.05, anchor_floor - 0.05]
+            let percentile = rank as f32 / (n - top_k) as f32;
+            scores[orig_idx] = 0.05 + percentile * (anchor_floor - 0.10).max(0.05);
         }
     }
 }
@@ -1539,6 +1667,7 @@ fn merge_local_and_web(
     query: &str,
     intent: &str,
     constraints: &Constraints,
+    distribution: Option<&std::collections::HashMap<String, f32>>,
 ) -> Vec<MergedResult> {
     let mut merged: Vec<MergedResult> = Vec::new();
     let mut url_to_idx: HashMap<String, usize> = HashMap::new();
@@ -1611,7 +1740,11 @@ fn merge_local_and_web(
     }
 
     // 3. Apply unified ranking signals to all results
-    let weights = RankingWeights::for_intent(intent);
+    // Use distribution-aware blending when available (intent as hint, not gate)
+    let weights = match distribution {
+        Some(dist) => RankingWeights::for_distribution(dist),
+        None => RankingWeights::for_intent(intent),
+    };
 
     // Navigational domain boost: if intent is navigational and the query
     // looks like a platform name (1-2 tokens), boost results whose host
@@ -1680,6 +1813,32 @@ fn merge_local_and_web(
     // 4. Sort by score descending
     merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
+    // 4b. Position-aware domain diversity: penalize repeated domains in top slots.
+    // The global cap (MAX_PER_DOMAIN=5) prevents outright flooding, but doesn't
+    // ensure diversity in the top results. A domain with 5 great results will
+    // still dominate positions 1-5. This penalty makes the 2nd appearance of a
+    // domain score 70% and the 3rd score 49% — the algorithm naturally promotes
+    // other domains into higher slots without hard cutoffs.
+    {
+        let mut domain_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for r in merged.iter_mut() {
+            let domain = reqwest::Url::parse(&r.url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                .unwrap_or_default();
+            let count = domain_counts.entry(domain).or_insert(0);
+            *count += 1;
+            // Each appearance beyond the first gets a 0.7x penalty (compounding)
+            // 1st: 1.0, 2nd: 0.70, 3rd: 0.49, 4th: 0.34, 5th: 0.24
+            if *count > 1 {
+                let penalty = 0.7_f32.powi((*count - 1) as i32);
+                r.score *= penalty;
+            }
+        }
+        // Re-sort after diversity penalty
+        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
     // 5. Normalize scores to [0, 1]
     let mut scores: Vec<f32> = merged.iter().map(|r| r.score).collect();
     normalize_scores(&mut scores);
@@ -1721,10 +1880,107 @@ impl RateLimitTracker {
     }
 }
 
+// ─── Result Volume Tracker (Per-Engine Degradation Detection) ─────
+// Tracks rolling average of results per engine per query.
+// When an engine suddenly returns 50% fewer results than its average,
+// it's likely being rate-limited — even if SearXNG doesn't report an error.
+// This catches silent degradation that the circuit breaker misses.
+
+struct ResultVolumeTracker {
+    // engine_name → (rolling_sum, rolling_count, last_degradation_time)
+    engines: Mutex<HashMap<String, EngineVolume>>,
+    // Overall degradation tracking: timestamps of degraded queries
+    degradation_events: Mutex<Vec<Instant>>,
+}
+
+struct EngineVolume {
+    rolling_sum: f64,
+    rolling_count: f64,
+    // Exponential moving average alpha (higher = more responsive)
+    alpha: f64,
+    last_result_count: u64,
+    last_check: Instant,
+}
+
+impl ResultVolumeTracker {
+    fn new() -> Self {
+        Self {
+            engines: Mutex::new(HashMap::new()),
+            degradation_events: Mutex::new(Vec::new()),
+        }
+    }
+
+    // Record result count for an engine. Returns true if degraded.
+    fn record(&self, engine: &str, count: u64) -> bool {
+        let mut engines = self.engines.lock().unwrap();
+        let volume = engines.entry(engine.to_string()).or_insert(EngineVolume {
+            rolling_sum: 0.0,
+            rolling_count: 0.0,
+            alpha: 0.3, // responsive to recent changes
+            last_result_count: 0,
+            last_check: Instant::now(),
+        });
+
+        let count_f = count as f64;
+        let is_degraded = if volume.rolling_count >= 3.0 {
+            let avg = volume.rolling_sum / volume.rolling_count;
+            // Degraded if current < 50% of rolling average AND average is >= 3
+            // (don't flag engines that naturally return few results)
+            count_f < avg * 0.5 && avg >= 3.0
+        } else {
+            false // not enough data yet
+        };
+
+        // Update exponential moving average
+        volume.rolling_sum = volume.rolling_sum * (1.0 - volume.alpha) + count_f * volume.alpha;
+        volume.rolling_count = volume.rolling_count * (1.0 - volume.alpha) + volume.alpha;
+        volume.last_result_count = count;
+        volume.last_check = Instant::now();
+
+        if is_degraded {
+            let avg = (volume.rolling_sum / volume.rolling_count * (1.0 - volume.alpha)
+                + count_f * volume.alpha)
+                / 1.0; // approximate
+            tracing::warn!(
+                "Engine '{}' DEGRADED: {} results vs ~{:.0} avg",
+                engine, count, avg
+            );
+            // Record degradation event
+            let mut events = self.degradation_events.lock().unwrap();
+            let now = Instant::now();
+            events.retain(|e| now.duration_since(*e) < Duration::from_secs(300));
+            events.push(now);
+        }
+
+        is_degraded
+    }
+
+    // Count degradation events in the last N seconds
+    fn degradation_count(&self, window_secs: u64) -> usize {
+        let events = self.degradation_events.lock().unwrap();
+        let now = Instant::now();
+        events
+            .iter()
+            .filter(|e| now.duration_since(**e) < Duration::from_secs(window_secs))
+            .count()
+    }
+
+    // Get expected result count for an engine (rolling average)
+    fn expected_count(&self, engine: &str) -> f64 {
+        let engines = self.engines.lock().unwrap();
+        engines
+            .get(engine)
+            .filter(|v| v.rolling_count >= 2.0)
+            .map(|v| v.rolling_sum / v.rolling_count)
+            .unwrap_or(10.0) // default expectation
+    }
+}
+
 struct AppState {
     circuit: CircuitBreaker,
     cache: SearchCache,
     rate_limits: RateLimitTracker,
+    volume_tracker: ResultVolumeTracker,
     http_client: reqwest::Client,
     searxng2_url: Option<String>,
 }
@@ -1928,8 +2184,9 @@ async fn main() {
         circuit: CircuitBreaker::new(),
         cache: SearchCache::new(),
         rate_limits: RateLimitTracker::new(),
+        volume_tracker: ResultVolumeTracker::new(),
         http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))  // Must exceed SearXNG's max engine timeout (3.0s + overhead)
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .pool_max_idle_per_host(20)
             .connect_timeout(Duration::from_secs(1))
@@ -2426,6 +2683,8 @@ async fn handle_search(
     let mut url_rrf_contributions: HashMap<String, f32> = HashMap::new();
 
     // Aggregate SearXNG results from all query variations
+    // Track per-engine result counts for degradation detection
+    let mut engine_counts: HashMap<String, u64> = HashMap::new();
     for (i, searx_res) in searx_results.into_iter().enumerate() {
         let instance_key = &searx_instance_keys[i];
         match searx_res {
@@ -2433,6 +2692,10 @@ async fn handle_search(
                 tracing::info!("SearXNG variation {} returned {} results", i, searx_data.results.len());
                 circuit_ref.record_success(instance_key);
                 circuit_ref.record_results(instance_key, searx_data.results.len() as u64);
+                // Track per-engine result counts for degradation detection
+                for r in &searx_data.results {
+                    *engine_counts.entry(r.engine.clone()).or_insert(0) += 1;
+                }
                 // Track position-based RRF contribution per URL within this variation
                 // Weight by engine reliability (dynamic learning)
                 for (pos, result) in searx_data.results.into_iter().enumerate() {
@@ -2452,6 +2715,88 @@ async fn handle_search(
             Err(e) => {
                 tracing::error!("SearXNG variation {} request failed/timed out: {:?}", i, e);
                 circuit_ref.record_failure(instance_key);
+            }
+        }
+    }
+
+    // ─── Per-Engine Degradation Detection ──────────────────────────
+    // Record per-engine result counts and detect silent degradation.
+    // If an engine returns <50% of its rolling average, it's likely rate-limited.
+    let mut degraded_engines = 0usize;
+    for (engine, &count) in &engine_counts {
+        let is_degraded = state.volume_tracker.record(engine, count);
+        if is_degraded {
+            degraded_engines += 1;
+        }
+    }
+
+    // Cross-request degradation correlation: if 3+ degradation events in 5 min,
+    // trigger proactive VPN rotation before the circuit breaker even opens.
+    let recent_degradations = state.volume_tracker.degradation_count(300);
+    if recent_degradations >= 3 {
+        tracing::warn!(
+            "PROACTIVE VPN ROTATION: {} engine degradations in 5-min window",
+            recent_degradations
+        );
+        trigger_vpn_rotation(&format!("proactive_{}_degradations_5min", recent_degradations));
+    }
+
+    // Smart retry: if overall results are significantly below expected,
+    // try a different query variation on the other SearXNG instance
+    let total_results = web_results.len();
+    let expected_min = if expanded_queries.len() > 1 { 15 } else { 10 };
+    if total_results < expected_min && !expanded_queries.is_empty() && searx_base_urls.len() > 1 {
+        // Pick a query variation we didn't use yet
+        let retry_query_idx = if expanded_queries.len() > searx_fanout { searx_fanout } else { 0 };
+        if let Some(retry_eq) = expanded_queries.get(retry_query_idx) {
+            // Use the OTHER SearXNG instance
+            let retry_instance_idx = if searx_fanout == 1 { 1 } else { 0 };
+            if let Some(retry_base) = searx_base_urls.get(retry_instance_idx) {
+                let clean_eq = preprocess_searxng_query(retry_eq);
+                let retry_url = format!("{}/search?q={}&format=json&pageno=1", retry_base, urlencoding::encode(&clean_eq));
+                let retry_key = format!("searxng{}", retry_instance_idx);
+                if !circuit_ref.is_open(&retry_key) {
+                    tracing::info!(
+                        "SMART RETRY: {} results < {} expected — trying variation '{}' on instance {}",
+                        total_results, expected_min, clean_eq, retry_instance_idx
+                    );
+                    match tokio::time::timeout(
+                        Duration::from_secs(3),
+                        client_ref.get(&retry_url).send(),
+                    ).await {
+                        Ok(Ok(resp)) => {
+                            let raw = resp.text().await.unwrap_or_default();
+                            let sanitized = sanitize_json_text(&raw);
+                            if let Ok(data) = serde_json::from_str::<SearxResponse>(&sanitized) {
+                                let retry_count = data.results.len();
+                                tracing::info!("Smart retry returned {} results", retry_count);
+                                circuit_ref.record_success(&retry_key);
+                                circuit_ref.record_results(&retry_key, retry_count as u64);
+                                for (pos, result) in data.results.into_iter().enumerate() {
+                                    let engine_weight = circuit_ref.weight(&result.engine);
+                                    let normalized = {
+                                        let lower = result.url.to_lowercase();
+                                        let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                                        let no_trailing = no_fragment.trim_end_matches('/');
+                                        let no_www = no_trailing.replacen("://www.", "://", 1);
+                                        strip_tracking_params(&no_www)
+                                    };
+                                    if !url_rrf_contributions.contains_key(&normalized) {
+                                        let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
+                                        *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
+                                        web_results.push(result);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("Smart retry request failed: {:?}", e);
+                        }
+                        Err(_) => {
+                            tracing::warn!("Smart retry timed out");
+                        }
+                    }
+                }
             }
         }
     }
@@ -2497,6 +2842,14 @@ async fn handle_search(
             for (pos, r) in invidious_data.into_iter().enumerate() {
                 if r.result_type.as_deref() == Some("video") {
                     if let Some(vid) = r.video_id {
+                        let desc = r.description.unwrap_or_default();
+                        // Skip Invidious results with empty description — they provide
+                        // no content for semantic scoring and degrade result quality.
+                        // Video metadata alone (title + thumbnail) isn't useful in search.
+                        if desc.trim().is_empty() {
+                            tracing::debug!("Skipping Invidious result with empty content: {:?}", r.title);
+                            continue;
+                        }
                         let video_url = format!("https://www.youtube.com/watch?v={}", vid);
                         let normalized = {
                             let lower = video_url.to_lowercase();
@@ -2510,7 +2863,7 @@ async fn handle_search(
                         web_results.push(SearxResult {
                             title: r.title.unwrap_or_else(|| "No Title".to_string()),
                             url: video_url,
-                            content: r.description.unwrap_or_default(),
+                            content: desc,
                             engine: "invidious".to_string(),
                             score: 0.0,
                             sources: vec!["invidious".to_string()],
@@ -2645,17 +2998,25 @@ async fn handle_search(
     let semantic_scores_web: Vec<f32> = web_results.iter()
         .map(|res| semantic_relevance_score(&q, &res.title, &res.content))
         .collect();
-    let semantic_threshold = if web_results.len() > 30 { 0.15 }
-        else if web_results.len() > 20 { 0.12 }
+    // Adaptive threshold: higher when we have many results, lower when few
+    // No positional exceptions — rank #1 can still be garbage
+    let semantic_threshold = if web_results.len() > 30 { 0.18 }
+        else if web_results.len() > 20 { 0.15 }
+        else if web_results.len() > 10 { 0.12 }
         else { 0.08 };
     let mut keep_indices: Vec<usize> = Vec::new();
     for (i, &score) in semantic_scores_web.iter().enumerate() {
-        if score >= semantic_threshold || i < 5 {
+        if score >= semantic_threshold {
             keep_indices.push(i);
         }
     }
-    if keep_indices.is_empty() && !web_results.is_empty() {
-        keep_indices = (0..web_results.len().min(5)).collect();
+    // Always keep at least 3 results (but only if they have ANY relevance)
+    if keep_indices.len() < 3 && !web_results.is_empty() {
+        // Take top-3 by semantic score, even if below threshold
+        let mut scored: Vec<(usize, f32)> = semantic_scores_web.iter().enumerate()
+            .map(|(i, &s)| (i, s)).collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        keep_indices = scored.iter().take(3).map(|(i, _)| *i).collect();
     }
     web_results = keep_indices.into_iter().map(|i| web_results[i].clone()).collect();
 
@@ -2720,12 +3081,14 @@ async fn handle_search(
 
     // 8. Unified Merge: Local + Web → Single Ranked List
     // Cross-source dedup, consensus boosting, unified ranking
+    // Pass intent distribution for distribution-aware ranking (intent as hint, not gate)
     let mut results = merge_local_and_web(
         local_results,
         web_results,
         &q,
         &intent.intent,
         &intent.structured_constraints,
+        Some(&intent.distribution),
     );
 
     // Sanitize content for safe JSON serialization
@@ -2741,6 +3104,7 @@ async fn handle_search(
         constraints: intent.constraints.clone(),
         structured_constraints: intent.structured_constraints.clone(),
         expanded_queries: intent.expanded_queries.clone(),
+        distribution: intent.distribution.clone(),
         results,
     };
 
@@ -2761,6 +3125,7 @@ fn fallback_intent(q: &str) -> IntentResponse {
         constraints: vec![],
         structured_constraints: Constraints::default(),
         expanded_queries: vec![q.to_string()],
+        distribution: std::collections::HashMap::new(),
     }
 }
 

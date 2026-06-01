@@ -36,6 +36,10 @@ pub struct Constraints {
     pub positive: Vec<String>,
     #[serde(default)]
     pub negative: Vec<String>,
+    /// Detected programming language/framework from the query (e.g. "go", "python").
+    /// Used by the gateway for language-aware result scoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 // ─── API Types ───────────────────────────────────────────────────────
@@ -57,6 +61,8 @@ pub struct IntentResponse {
     pub structured_constraints: Constraints, // new: positive + negative
     #[serde(default)]
     pub expanded_queries: Vec<String>,
+    #[serde(default)]
+    pub distribution: std::collections::HashMap<String, f32>, // calibrated probability distribution
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -377,7 +383,111 @@ fn extract_constraints(query: &str) -> Constraints {
     positive.retain(|t| t.len() >= 2 && t.len() <= 50);
     negative.retain(|t| t.len() >= 2 && t.len() <= 50);
 
-    Constraints { positive, negative }
+    // ── Phase 6: Detect programming language ──
+    // Identify programming languages/frameworks mentioned in the query.
+    // This enables language-aware result scoring in the gateway.
+    // Uses context-aware detection to avoid false positives on short words.
+    let language = detect_query_language(&q_lower);
+
+    Constraints { positive, negative, language }
+}
+
+/// Detect programming language mentioned in a query.
+/// Returns the canonical language name if found, None otherwise.
+///
+/// Uses context-aware matching:
+/// - Long language names (>= 4 chars): exact word match is sufficient
+/// - Short names (go, r, c): require context clues like "X framework", "X library",
+///   "in X", "for X", "X programming", or disambiguation like "golang"
+fn detect_query_language(q_lower: &str) -> Option<String> {
+    let words: Vec<&str> = q_lower.split_whitespace().collect();
+
+    // Canonical language name → (aliases, min_confidence_without_context)
+    // Short names need context; long names are self-disambiguating.
+    let languages: &[(&str, &[&str])] = &[
+        ("go", &["go", "golang"]),
+        ("rust", &["rust"]),
+        ("python", &["python", "python3"]),
+        ("javascript", &["javascript", "js"]),
+        ("typescript", &["typescript", "ts"]),
+        ("java", &["java"]),
+        ("c++", &["c++", "cpp"]),
+        ("c#", &["c#", "csharp"]),
+        ("ruby", &["ruby"]),
+        ("php", &["php"]),
+        ("swift", &["swift"]),
+        ("kotlin", &["kotlin"]),
+        ("scala", &["scala"]),
+        ("haskell", &["haskell"]),
+        ("elixir", &["elixir"]),
+        ("clojure", &["clojure"]),
+        ("r", &["r"]),
+        ("lua", &["lua"]),
+        ("perl", &["perl"]),
+        ("dart", &["dart"]),
+        ("zig", &["zig"]),
+        ("nim", &["nim"]),
+        ("ocaml", &["ocaml"]),
+        ("erlang", &["erlang"]),
+        ("fortran", &["fortran"]),
+        ("cobol", &["cobol"]),
+        ("assembly", &["assembly", "asm"]),
+    ];
+
+    // Context clues that confirm a word is a language reference
+    let context_clues = [
+        "framework", "library", "package", "module", "crate", "tutorial",
+        "guide", "documentation", "docs", "programming", "developer",
+        "async", "http", "api", "server", "cli", "web", "backend", "frontend",
+        "install", "setup", "configure", "build", "compile", "run",
+        "performance", "benchmark", "vs", "versus", "alternative",
+        "best", "top", "learn", "course", "book", "example",
+        "syntax", "error", "debug", "test", "deploy", "migrate",
+        "database", "orm", "template", "parser", "regex",
+    ];
+
+    for &(canonical, aliases) in languages {
+        for alias in aliases {
+            // Long names (>= 4 chars): exact word match is sufficient
+            if alias.len() >= 4 {
+                if words.iter().any(|w| *w == *alias) {
+                    return Some(canonical.to_string());
+                }
+                continue;
+            }
+
+            // Short names (< 4 chars): need context clues OR other languages present
+            if !words.iter().any(|w| *w == *alias) {
+                continue;
+            }
+
+            // Check for context clues in the query
+            let has_context = words.iter().any(|w| context_clues.contains(w))
+                || q_lower.contains(&format!("{} framework", alias))
+                || q_lower.contains(&format!("{} library", alias))
+                || q_lower.contains(&format!("{} package", alias))
+                || q_lower.contains(&format!("in {}", alias))
+                || q_lower.contains(&format!("for {}", alias))
+                || q_lower.contains(&format!("with {}", alias))
+                || q_lower.contains(&format!("{} programming", alias))
+                || q_lower.contains(&format!("{} developer", alias))
+                || q_lower.contains(&format!("{} tutorial", alias))
+                || q_lower.contains(&format!("{} code", alias))
+                || q_lower.contains(&format!("{} project", alias));
+
+            // Also check if another language is mentioned (comparison context)
+            let has_other_lang = languages.iter().any(|&(other_canon, other_aliases)| {
+                if other_canon == canonical { return false; }
+                other_aliases.iter().any(|oa| words.iter().any(|w| *w == *oa))
+            });
+
+            if has_context || has_other_lang {
+                return Some(canonical.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 /// Extract multiple terms connected by "and" from a negated context.
@@ -549,20 +659,54 @@ fn question_detector(query: &str) -> IntentEvidence {
     let q = query.trim().to_lowercase();
     let mut ev = IntentEvidence::zero();
 
+    // ── How-to: procedural/action intent ──
     if q.starts_with("how to ") || q.starts_with("how do i ")
         || q.starts_with("how can i ") || q.starts_with("how do you ")
         || q.starts_with("how does ") || q.starts_with("how do ")
         || q.starts_with("steps to ") || q.starts_with("guide to ")
         || q.starts_with("tutorial ") || q.contains(" tutorial")
+        // Action verbs: user wants to accomplish something
+        || q.starts_with("implement ") || q.starts_with("build ")
+        || q.starts_with("deploy ") || q.starts_with("migrate ")
+        || q.starts_with("migrating ") || q.starts_with("set up ")
+        || q.starts_with("configure ") || q.starts_with("setup ")
+        || q.starts_with("create ") || q.starts_with("write ")
+        || q.starts_with("run ") || q.starts_with("install ")
+        || q.starts_with("setup ") || q.starts_with("configure ")
+        // "best practices" is a how-to pattern
+        || q.starts_with("best practices ") || q.contains(" best practices")
+        || q.starts_with("optimize ") || q.starts_with("debug ")
+        || q.starts_with("fix ") || q.starts_with("troubleshoot ")
     {
         ev.how_to = 0.85;
         ev.informational = 0.25;
-    } else if q.starts_with("what is ") || q.starts_with("what are ")
+    }
+    // ── Informational: question patterns ──
+    else if q.starts_with("what is ") || q.starts_with("what are ")
         || q.starts_with("what does ") || q.starts_with("explain ")
         || q.starts_with("who is ")
         || q.starts_with("define ") || q.starts_with("meaning of ")
+        // Bare "does/can/is/are" questions: "does redis support X"
+        || q.starts_with("does ") || q.starts_with("can ")
+        || q.starts_with("is ") || q.starts_with("are ")
+        || q.starts_with("was ") || q.starts_with("will ")
+        || q.starts_with("would ") || q.starts_with("could ")
+        || q.starts_with("has ") || q.starts_with("have ")
     {
         ev.informational = 0.80;
+    }
+    // ── Comparison: decision-seeking ──
+    else if q.starts_with("should i ") || q.starts_with("should we ")
+    {
+        ev.comparison = 0.70;
+        ev.informational = 0.30;
+    } else if q.starts_with("difference between ")
+        || q.starts_with("differences between ")
+        || q.starts_with("alternative to ") || q.starts_with("alternatives to ")
+        || q.starts_with("lightweight alternative")
+    {
+        ev.comparison = 0.75;
+        ev.informational = 0.25;
     } else if q.starts_with("why ") || q.starts_with("when ")
         || q.starts_with("where ")
     {
@@ -576,6 +720,9 @@ fn question_detector(query: &str) -> IntentEvidence {
         } else {
             ev.informational = 0.70;
         }
+    } else if q.starts_with("which ") {
+        ev.comparison = 0.70;
+        ev.informational = 0.30;
     }
 
     ev
@@ -657,7 +804,7 @@ fn domain_detector(query: &str) -> IntentEvidence {
         }
     }
 
-    // Single platform name match — only when query is SHORT (1-2 tokens)
+    // Single platform name match — when query is SHORT (1-2 tokens)
     // AND no competing intent signal is present.
     if words.len() <= 2 && !competing_intent {
         for word in &words {
@@ -665,6 +812,16 @@ fn domain_detector(query: &str) -> IntentEvidence {
                 ev.navigational = 0.75;
                 return ev;
             }
+        }
+    }
+
+    // First-word platform match for slightly longer queries (3-4 tokens)
+    // "figma design tool", "notion app", "github copilot"
+    // Only when no competing intent is detected.
+    if words.len() >= 2 && words.len() <= 4 && !competing_intent {
+        if known_platforms.contains(&words[0]) {
+            ev.navigational = 0.65;
+            return ev;
         }
     }
 
@@ -695,15 +852,17 @@ fn domain_detector(query: &str) -> IntentEvidence {
 
 fn tech_detector(query: &str) -> IntentEvidence {
     let q = query.trim().to_lowercase();
+    let words: Vec<&str> = q.split_whitespace().collect();
     let mut ev = IntentEvidence::zero();
 
     let tech_terms = [
         "api", "sdk", "library", "framework", "crate", "package", "module",
         "function", "method", "class", "interface", "struct", "enum",
-        "trait", "impl", "syntax", "compiler", "runtime", "debug",
-        "error", "bug", "fix", "issue", "version", "migration",
+        "trait", "syntax", "compiler", "runtime", "debug",
+        "error", "bug", "issue", "version", "migration",
         "documentation", "docs", "reference", "manpage", "engine",
         "editor", "programming", "algorithm", "data structure",
+        "knn", "vector", "search engine", "indexing",
     ];
     let tech_languages = [
         "rust", "python", "javascript", "typescript", "go", "golang",
@@ -712,28 +871,33 @@ fn tech_detector(query: &str) -> IntentEvidence {
         "react", "vue", "angular", "svelte", "nextjs", "next.js",
         "django", "flask", "fastapi", "express", "axum", "tokio",
         "docker", "kubernetes", "k8s", "linux", "git", "nginx",
-        "postgres", "mysql", "redis", "mongodb", "sqlite",
+        "postgres", "mysql", "redis", "mongodb", "sqlite", "elasticsearch",
         "css", "html", "sql", "nosql", "graphql", "grpc", "rest",
         "webpack", "vite", "tailwind", "bootstrap", "sass",
         "aws", "gcp", "azure", "terraform", "ansible",
         "tcp", "udp", "http", "https", "ssh", "ftp", "dns", "dhcp",
         "json", "yaml", "xml", "csv", "jwt", "oauth", "cors", "csrf",
+        "websocket", "grpc", "protobuf", "kafka", "rabbitmq",
     ];
 
-    let has_tech_term = tech_terms.iter().any(|t| q.contains(t));
+    // Use word boundary matching for tech_terms (not substring)
+    // to prevent "impl" matching "implement", "fix" matching "prefix", etc.
+    let has_tech_term = tech_terms.iter().any(|t| {
+        if t.contains(' ') {
+            q.contains(t)  // multi-word phrases: substring OK
+        } else {
+            words.iter().any(|w| *w == *t)  // single words: exact match
+        }
+    });
     let has_tech_lang = tech_languages.iter().any(|l| {
-        q.split_whitespace().any(|w| w == *l)
+        words.iter().any(|w| *w == *l)
     });
 
     if has_tech_term || has_tech_lang {
         ev.technical = 0.65;
-        // Tech terms with action words lean how-to
-        if q.starts_with("install ") || q.starts_with("set up ")
-            || q.starts_with("configure ") || q.starts_with("deploy ")
-            || q.starts_with("build ")
-        {
-            ev.how_to = 0.45;
-        }
+        // Note: action verbs (install, deploy, build, configure) are now
+        // handled by question_detector with higher confidence (how_to=0.85).
+        // No need to add how_to signal here — it would only dilute.
     }
 
     ev
@@ -741,11 +905,12 @@ fn tech_detector(query: &str) -> IntentEvidence {
 
 fn commercial_detector(query: &str) -> IntentEvidence {
     let q = query.trim().to_lowercase();
+    let words: Vec<&str> = q.split_whitespace().collect();
     let mut ev = IntentEvidence::zero();
 
     // Transactional signals
     if q.starts_with("buy ") || q.starts_with("download ")
-        || q.starts_with("install ") || q.starts_with("get ")
+        || q.starts_with("get ")
         || q.starts_with("purchase ") || q.starts_with("order ")
         || q.starts_with("subscribe ") || q.starts_with("sign up for ")
         || q.contains(" pricing") || q.contains(" free download")
@@ -758,6 +923,12 @@ fn commercial_detector(query: &str) -> IntentEvidence {
         || q.starts_with("best ") || q.starts_with("top ")
         || q.starts_with("compare ") || q.contains(" comparison")
         || q.starts_with("which ") || q.starts_with("better ")
+        // "alternative/recommend" patterns
+        || q.contains(" alternative") || q.contains(" alternatives")
+        || q.starts_with("recommend ") || q.starts_with("suggest ")
+        || q.starts_with("i need ") || q.starts_with("i want ")
+        // "or" between options: "X or Y"
+        || (q.contains(" or ") && words.len() <= 8)
     {
         ev.comparison = 0.75;
     }
@@ -782,6 +953,111 @@ fn freshness_detector(query: &str) -> IntentEvidence {
         || q.starts_with("new ")
     {
         ev.fresh = 0.75;
+    }
+
+    ev
+}
+
+fn exploration_detector(
+    query: &str,
+    query_embedding: &[f32],
+    centroids: &[Vec<f32>],
+) -> IntentEvidence {
+    // Exploration detector: identifies "knowledge-seeking" queries that lack
+    // explicit question words or technical terms. These are queries where the
+    // user wants to UNDERSTAND a concept, not navigate to a site or perform
+    // an action.
+    //
+    // Key insight: concept density vs entity density.
+    // "causes of 2008 financial crisis" → high concept density (abstract relationships)
+    // "github actions" → high entity density (specific product)
+    //
+    // Uses embedding similarity to informational centroid vs navigational centroid
+    // plus lexical signals for abstract relationship words.
+
+    let q = query.trim().to_lowercase();
+    let mut ev = IntentEvidence::zero();
+
+    // ── Lexical: abstract relationship / knowledge-seeking patterns ──
+    // These patterns signal "I want to understand X" without question words.
+    let exploration_patterns = [
+        // Causal: "causes of", "reasons for", "why does X happen"
+        "causes of", "reasons for", "reason for", "cause of",
+        "impact of", "effect of", "effects of", "influence of",
+        "consequences of", "results of", "outcome of",
+        // Historical: "history of", "evolution of", "origin of"
+        "history of", "evolution of", "origin of", "origins of",
+        "development of", "growth of", "rise of", "decline of",
+        // Conceptual: "theory of", "principles of", "fundamentals of"
+        "theory of", "principles of", "fundamentals of", "basics of",
+        "concept of", "notion of", "idea of", "nature of",
+        // Process: "process of", "mechanism of", "how X works"
+        "process of", "mechanism of", "dynamics of", "science of",
+        // Comparative: "relationship between", "difference between"
+        "relationship between", "connection between", "link between",
+        "comparison of", "contrast between",
+        // Overview: "overview of", "introduction to", "guide to"
+        "overview of", "introduction to", "intro to", "guide to",
+        "summary of", "analysis of", "review of", "study of",
+        // Academic: "research on", "findings on", "evidence for"
+        "research on", "findings on", "evidence for", "evidence of",
+        // Impact: "implications of", "significance of", "importance of"
+        "implications of", "significance of", "importance of",
+        "relevance of", "role of",
+    ];
+
+    let mut pattern_match = false;
+    for pattern in &exploration_patterns {
+        if q.contains(pattern) {
+            pattern_match = true;
+            break;
+        }
+    }
+
+    // Also match "X of Y" pattern where X is an abstract noun
+    // e.g., "photosynthesis process", "quantum error correction"
+    let abstract_nouns = [
+        "process", "mechanism", "theory", "principle", "concept",
+        "technique", "method", "approach", "strategy", "pattern",
+        "model", "framework", "architecture", "protocol", "algorithm",
+        "system", "structure", "function", "behavior", "dynamics",
+    ];
+    let has_abstract_noun = q.split_whitespace().any(|w| abstract_nouns.contains(&w));
+
+    // ── Embedding: compare to informational vs navigational centroids ──
+    // centroids[0] = navigational, centroids[1] = informational
+    let nav_sim = if centroids.len() > 0 {
+        cosine_similarity(query_embedding, &centroids[0])
+    } else { 0.5 };
+    let info_sim = if centroids.len() > 1 {
+        cosine_similarity(query_embedding, &centroids[1])
+    } else { 0.5 };
+
+    // Informational pull: how much closer to informational than navigational
+    let info_pull = (info_sim - nav_sim).max(0.0);
+
+    // ── Combine signals ──
+    let lexical_score: f32 = if pattern_match { 0.7 }
+        else if has_abstract_noun { 0.4 }
+        else { 0.0 };
+
+    // Embedding score: scale info_pull to [0, 1] range
+    // Typical info_pull is 0.0-0.15, so scale by 5x
+    let embedding_score = (info_pull * 5.0).clamp(0.0, 0.8);
+
+    // Combine: lexical patterns are strong signal, embedding is supporting
+    let exploration_score = if pattern_match {
+        lexical_score.max(embedding_score) // Take the stronger signal
+    } else {
+        (lexical_score * 0.6 + embedding_score * 0.4).min(0.8)
+    };
+
+    if exploration_score > 0.1 {
+        ev.informational = exploration_score;
+        tracing::info!(
+            "exploration_detector: pattern={} abstract_noun={} info_sim={:.3} nav_sim={:.3} info_pull={:.3} → info={:.3}",
+            pattern_match, has_abstract_noun, info_sim, nav_sim, info_pull, exploration_score
+        );
     }
 
     ev
@@ -1011,7 +1287,7 @@ fn evidence_classify(
     query: &str,
     query_embedding: Option<&Vec<f32>>,
     centroids: &[Vec<f32>],
-) -> (String, f32) {
+) -> (String, f32, std::collections::HashMap<String, f32>) {
     // Evidence accumulation: each detector contributes independent signals.
     // No detector can force an outcome — the final intent emerges from
     // the weighted combination of all evidence.
@@ -1029,18 +1305,40 @@ fn evidence_classify(
         IntentEvidence::zero()
     };
 
+    // Exploration detector: concept density vs entity density
+    let x_evidence = if let Some(emb) = query_embedding {
+        exploration_detector(query, emb, centroids)
+    } else {
+        IntentEvidence::zero()
+    };
+
     // Merge all detectors with their weights
     // Weights reflect how much we trust each signal type
     let mut combined = IntentEvidence::zero();
     let mut total_weight = 0.0f32;
 
+    // Adaptive tech_detector weight: when the question_detector fires with
+    // strong how-to signals (how_to >= 0.7), attenuate the tech_detector.
+    // Problem: "how to build an API in Go" → question_detector says how_to=0.85,
+    // tech_detector says technical=0.65. With fixed weights, technical wins
+    // because it accumulates from both. Solution: reduce tech weight when
+    // how_to is dominant, letting the procedural intent through.
+    let tech_weight = if q_evidence.how_to >= 0.7 {
+        0.3  // attenuated: how_to is the real intent
+    } else if q_evidence.how_to >= 0.5 {
+        0.5  // partially attenuated
+    } else {
+        0.7  // default: tech terms are a moderate signal
+    };
+
     let detectors: &[(IntentEvidence, f32)] = &[
-        (q_evidence, 1.0),   // Question patterns are very reliable
-        (d_evidence, 1.0),   // Domain/TLD patterns are very reliable
-        (t_evidence, 0.7),   // Tech terms are moderate signal
-        (c_evidence, 0.9),   // Commercial patterns are reliable
-        (f_evidence, 0.8),   // Freshness patterns are fairly reliable
-        (e_evidence, 0.6),   // Entity detection is noisier
+        (q_evidence, 1.0),        // Question patterns are very reliable
+        (d_evidence, 1.0),        // Domain/TLD patterns are very reliable
+        (t_evidence, tech_weight), // Tech terms: adaptive weight based on how-to signal
+        (c_evidence, 0.9),        // Commercial patterns are reliable
+        (f_evidence, 0.8),        // Freshness patterns are fairly reliable
+        (e_evidence, 0.6),        // Entity detection is noisier
+        (x_evidence, 0.85),       // Exploration patterns are fairly reliable
     ];
 
     for (ev, weight) in detectors {
@@ -1056,17 +1354,60 @@ fn evidence_classify(
         combined = IntentEvidence::merge(&combined, total_weight, &emb_ev, 0.4);
     }
 
-    let (intent, score) = combined.argmax();
+    // ── Confidence calibration: softmax + margin ──
+    // Raw scores are unbounded evidence sums. We need calibrated probabilities.
+    // 1. Apply softmax to convert scores to probability distribution
+    // 2. Use margin (top1 - top2) as confidence: high margin = unambiguous
+    let scores = combined.scores();
+    let max_score = scores.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
+
+    // Softmax with temperature scaling
+    // Lower temperature = sharper distribution (trusts small differences more)
+    // Raw scores are in 0.0-0.2 range, so T=0.05 amplifies 0.1 diff to ~13:1 odds
+    let temp = 0.05f32;
+    let exp_sum: f32 = scores.iter().map(|(_, s)| ((s - max_score) / temp).exp()).sum();
+    let softmax_scores: Vec<f32> = scores.iter()
+        .map(|(_, s)| ((s - max_score) / temp).exp() / exp_sum)
+        .collect();
+
+    // Build distribution map
+    let mut distribution = std::collections::HashMap::new();
+    for (i, (label, _)) in scores.iter().enumerate() {
+        distribution.insert(label.to_string(), softmax_scores[i]);
+    }
+
+    // Find top-1 and top-2 for margin confidence
+    let mut sorted_softmax = softmax_scores.clone();
+    sorted_softmax.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let top1 = sorted_softmax.first().copied().unwrap_or(0.0);
+    let top2 = sorted_softmax.get(1).copied().unwrap_or(0.0);
+    let margin = top1 - top2;
+
+    // Confidence = margin scaled to [0, 1]
+    // margin=0.0 → ambiguous (conf≈0.3)
+    // margin=0.5 → clear winner (conf≈0.8)
+    // margin=0.9 → very clear (conf≈0.98)
+    let confidence = (0.3 + margin * 0.7).clamp(0.0, 1.0);
+
+    // Winner is the highest softmax score
+    let (winner_idx, _) = softmax_scores.iter().enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((0, &0.0));
+    let intent = scores[winner_idx].0;
 
     tracing::info!(
-        "evidence_classify: nav={:.3} info={:.3} tech={:.3} how={:.3} \
-         comp={:.3} txn={:.3} fresh={:.3} → {} ({:.3})",
+        "evidence_classify: raw=[nav={:.3} info={:.3} tech={:.3} how={:.3} \
+         comp={:.3} txn={:.3} fresh={:.3}] softmax=[{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}] \
+         margin={:.3} → {} (conf={:.3})",
         combined.navigational, combined.informational, combined.technical,
         combined.how_to, combined.comparison, combined.transactional,
-        combined.fresh, intent, score
+        combined.fresh,
+        softmax_scores[0], softmax_scores[1], softmax_scores[2],
+        softmax_scores[3], softmax_scores[4], softmax_scores[5], softmax_scores[6],
+        margin, intent, confidence
     );
 
-    (intent.to_string(), score.clamp(0.0, 1.0))
+    (intent.to_string(), confidence, distribution)
 }
 
 // ─── Layer 1: Rule-Based Pre-Classifier (LEGACY — replaced by evidence detectors) ──
@@ -1743,6 +2084,220 @@ fn compute_navigational_score(
     score.clamp(0.0, 1.0)
 }
 
+// ─── Query Normalization (De-stutter, Collapse Repeats) ─────────────
+// "how how to to set configure setup redis cluster" → "configure redis cluster"
+// Removes duplicate tokens, collapses repeated n-grams, normalizes casing.
+
+fn normalize_query(query: &str) -> String {
+    let q = query.trim();
+    if q.is_empty() { return q.to_string(); }
+
+    // Step 1: Collapse repeated adjacent tokens
+    // "how how to to set" → "how to set"
+    let tokens: Vec<&str> = q.split_whitespace().collect();
+    let mut deduped: Vec<&str> = Vec::new();
+    for (i, tok) in tokens.iter().enumerate() {
+        if i == 0 || tok.to_lowercase() != tokens[i - 1].to_lowercase() {
+            deduped.push(*tok);
+        }
+    }
+
+    // Step 2: Collapse repeated adjacent bigrams
+    // "set up set up" → "set up"
+    let mut collapsed: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < deduped.len() {
+        if i + 3 < deduped.len()
+            && deduped[i].to_lowercase() == deduped[i + 2].to_lowercase()
+            && deduped[i + 1].to_lowercase() == deduped[i + 3].to_lowercase()
+        {
+            // Skip the repeated bigram
+            collapsed.push(deduped[i]);
+            collapsed.push(deduped[i + 1]);
+            i += 4; // skip both bigrams (we keep one)
+        } else {
+            collapsed.push(deduped[i]);
+            i += 1;
+        }
+    }
+
+    // Step 3: Remove filler words that appear multiple times
+    // "how to how to configure" → "how to configure"
+    let fillers: std::collections::HashSet<&str> = [
+        "how", "to", "the", "a", "an", "is", "are", "was", "were",
+        "be", "been", "being", "do", "does", "did", "will", "would",
+        "could", "should", "can", "may", "might", "shall",
+    ].iter().copied().collect();
+
+    let mut seen_filler: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut result: Vec<&str> = Vec::new();
+    for tok in collapsed {
+        let lower = tok.to_lowercase();
+        if fillers.contains(lower.as_str()) {
+            if seen_filler.contains(&lower) {
+                continue; // skip duplicate filler
+            }
+            seen_filler.insert(lower);
+        }
+        result.push(tok);
+    }
+
+    result.join(" ")
+}
+
+// ─── Query Compression (IDF-Weighted Term Extraction) ───────────────
+// For long queries (>8 words), extract the most informative terms.
+// Preserves concepts, removes syntax, preserves intent.
+// "what monitoring stack should a small startup use for kubernetes
+//  microservices running on aws" → "kubernetes monitoring stack aws startup"
+
+fn compress_query(query: &str) -> String {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.len() <= 8 {
+        return query.to_string(); // short enough, don't compress
+    }
+
+    // Stop words — common English words with low information value
+    let stop_words: std::collections::HashSet<&str> = [
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "can", "may", "might", "shall", "must",
+        "in", "on", "at", "to", "for", "of", "with", "from", "by", "as",
+        "into", "through", "during", "before", "after", "above", "below",
+        "between", "out", "off", "over", "under", "again", "further",
+        "and", "but", "or", "nor", "not", "so", "yet",
+        "i", "me", "my", "we", "our", "you", "your", "he", "she", "it",
+        "they", "them", "their", "this", "that", "these", "those",
+        "what", "which", "who", "whom", "when", "where", "why", "how",
+        "all", "each", "every", "both", "few", "more", "most", "other",
+        "some", "such", "no", "only", "own", "same", "than", "too",
+        "very", "just", "about", "above", "after", "again", "also",
+        "any", "because", "before", "being", "between", "does",
+        "during", "each", "few", "from", "further", "get", "got",
+        "here", "into", "just", "keep", "like", "make", "many",
+        "might", "more", "most", "much", "must", "never", "new",
+        "now", "old", "one", "only", "other", "our", "out", "over",
+        "own", "part", "put", "same", "see", "shall", "should",
+        "since", "still", "take", "than", "that", "their", "them",
+        "then", "there", "these", "they", "this", "those", "through",
+        "together", "too", "under", "until", "upon", "very", "was",
+        "well", "were", "what", "when", "where", "which", "while",
+        "who", "whom", "why", "will", "with", "within", "without",
+        "would", "yet", "you", "your",
+        // Question/filler patterns
+        "how", "what", "when", "where", "why", "which", "who",
+        "should", "would", "could", "can", "do", "does", "did",
+        "use", "using", "used", "set", "setup", "getting", "started",
+        "need", "want", "looking", "try", "trying", "work", "working",
+    ].iter().copied().collect();
+
+    // Technical terms — high information value, boost these
+    let tech_terms: std::collections::HashSet<&str> = [
+        "api", "sdk", "library", "framework", "crate", "package", "module",
+        "function", "method", "class", "interface", "struct", "enum",
+        "database", "db", "cache", "queue", "stream", "pipeline",
+        "server", "client", "proxy", "load", "balancer", "gateway",
+        "container", "docker", "kubernetes", "k8s", "pod", "node",
+        "cluster", "microservice", "microservices", "monolith",
+        "ci", "cd", "devops", "sre", "observability", "monitoring",
+        "logging", "tracing", "metrics", "alerting",
+        "authentication", "authorization", "auth", "oauth", "jwt",
+        "encryption", "tls", "ssl", "https", "cors", "csrf",
+        "rest", "graphql", "grpc", "websocket", "sse",
+        "react", "vue", "angular", "svelte", "nextjs", "next.js",
+        "nuxt", "remix", "astro", "gatsby",
+        "typescript", "javascript", "python", "rust", "go", "golang",
+        "java", "kotlin", "swift", "ruby", "php", "c++", "cpp", "c#",
+        "elasticsearch", "solr", "lucene", "meilisearch", "typesense",
+        "redis", "memcached", "postgres", "postgresql", "mysql",
+        "mongodb", "dynamodb", "cassandra", "cockroachdb", "sqlite",
+        "kafka", "rabbitmq", "nats", "pulsar",
+        "nginx", "apache", "caddy", "traefik", "envoy", "haproxy",
+        "terraform", "ansible", "pulumi", "cloudformation",
+        "aws", "gcp", "azure", "vercel", "netlify", "fly.io", "railway",
+        "linux", "ubuntu", "debian", "alpine", "arch",
+        "git", "github", "gitlab", "bitbucket",
+        "prometheus", "grafana", "datadog", "newrelic", "sentry",
+        "webpack", "vite", "rollup", "esbuild", "turbopack",
+        "tailwind", "bootstrap", "css", "html", "dom", "bom",
+        "http", "tcp", "udp", "ip", "dns", "dhcp",
+        "json", "yaml", "toml", "xml", "csv", "protobuf",
+        "regex", "parsing", "token", "ast", "lexer", "compiler",
+        "machine", "learning", "ml", "ai", "llm", "neural",
+        "vector", "embedding", "transformer", "attention",
+    ].iter().copied().collect();
+
+    // Score each token
+    let mut scored: Vec<(usize, &str, f32)> = Vec::new(); // (original_index, word, score)
+    for (i, word) in words.iter().enumerate() {
+        let lower = word.to_lowercase();
+        let clean: String = lower.chars().filter(|c| c.is_alphanumeric() || *c == '.' || *c == '+' || *c == '#').collect();
+
+        if clean.is_empty() { continue; }
+
+        let mut score: f32 = 0.0;
+
+        // Base score: stop words get 0, others get 1.0
+        if stop_words.contains(clean.as_str()) {
+            score = 0.0;
+        } else {
+            score = 1.0;
+        }
+
+        // Technical term boost: +2.0
+        if tech_terms.contains(clean.as_str()) {
+            score += 2.0;
+        }
+
+        // Entity boost: capitalized words (not at sentence start) or ALL CAPS
+        let is_sentence_start = i == 0 || words[i - 1].ends_with('.') || words[i - 1].ends_with('!') || words[i - 1].ends_with('?');
+        if !is_sentence_start && word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            score += 1.5; // likely proper noun / entity
+        }
+        if word.len() >= 2 && word.chars().all(|c| c.is_uppercase() || !c.is_alphabetic()) {
+            score += 1.5; // acronym (AWS, API, HTTP)
+        }
+
+        // Length heuristic: longer words tend to be more specific
+        if clean.len() >= 6 {
+            score += 0.5;
+        }
+
+        // Position bias: earlier terms slightly more important
+        let position_boost = 1.0 - (i as f32 / words.len() as f32) * 0.3;
+        score *= position_boost;
+
+        if score > 0.0 {
+            scored.push((i, *word, score));
+        }
+    }
+
+    // Sort by score descending, then by position ascending (stable)
+    scored.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+
+    // Take top N terms (8-12 depending on query length)
+    let max_terms = if words.len() > 20 { 12 } else { 8 };
+    let mut selected: Vec<(usize, &str)> = scored.iter()
+        .take(max_terms)
+        .map(|(i, w, _)| (*i, *w))
+        .collect();
+
+    // Restore original order for readability
+    selected.sort_by_key(|(i, _)| *i);
+
+    let compressed = selected.iter().map(|(_, w)| *w).collect::<Vec<&str>>().join(" ");
+
+    // If compression produced something reasonable, use it
+    if compressed.split_whitespace().count() >= 3 {
+        compressed
+    } else {
+        query.to_string() // fallback to original if compression was too aggressive
+    }
+}
+
 // ─── Query Expansion (Dynamic, Not Hardcoded) ────────────────────────
 
 fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<String> {
@@ -1991,7 +2546,24 @@ async fn main() -> anyhow::Result<()> {
                  "best hiking trails near seattle", "history of ancient rome",
                  "climate change effects on agriculture", "beginner yoga poses",
                  "nosql database overview", "css layout guide",
-                 "javascript closures explained", "database indexing strategies"],
+                 "javascript closures explained", "database indexing strategies",
+                 // Exploration patterns: concept-seeking without question words
+                 "causes of the 2008 financial crisis",
+                 "evolution of database systems",
+                 "impact of social media on politics",
+                 "history of the internet",
+                 "principles of distributed systems",
+                 "mechanism of neural network backpropagation",
+                 "theory of relativity explained",
+                 "origins of quantum mechanics",
+                 "consequences of climate change",
+                 "overview of garbage collection algorithms",
+                 "analysis of TCP congestion control",
+                 "role of mitochondria in cells",
+                 "fundamentals of cryptographic hash functions",
+                 "relationship between supply and demand",
+                 "significance of Gödel's incompleteness theorem",
+            ],
             vec!["rust async runtime", "python requests library",
                  "javascript fetch API", "go goroutines",
                  "docker compose volumes", "kubernetes pods",
@@ -2088,8 +2660,15 @@ async fn analyze_query(
         return Json(cached);
     }
 
-    // Extract constraints from the query
-    let structured = extract_constraints(&params.q);
+    // ── Step 1: Normalize query (de-stutter, collapse repeats) ──
+    // "how how to to set configure setup redis cluster" → "how to configure redis cluster"
+    let normalized = normalize_query(&params.q);
+    if normalized != params.q.trim() {
+        tracing::info!("Query normalized: {:?} → {:?}", params.q.trim(), normalized);
+    }
+
+    // Extract constraints from the NORMALIZED query
+    let structured = extract_constraints(&normalized);
     tracing::info!(
         "Constraints extracted: positive={:?}, negative={:?}",
         structured.positive, structured.negative
@@ -2105,21 +2684,30 @@ async fn analyze_query(
     }
 
     // ── Get embedding for evidence detectors ──
+    // Use ORIGINAL query for embedding (preserves semantic intent even if stuttered)
     let query_embedding = {
         let bert_model = state.bert_model.lock().unwrap();
         compute_embedding(&state.device, &*bert_model, &state.bert_tokenizer, &params.q)
     };
 
     // ── Evidence-based classification ──
-    // All detectors run independently. No cascade, no overrides.
-    // The intent emerges from weighted evidence accumulation.
-    let (intent, confidence) = evidence_classify(
-        &params.q,
+    // Use NORMALIZED query for lexical detectors (cleaner signals)
+    // Use ORIGINAL query for embedding detector (preserves semantic meaning)
+    let (intent, confidence, distribution) = evidence_classify(
+        &normalized,
         query_embedding.as_ref(),
         &state.category_centroids,
     );
 
-    let expanded = expand_queries(&params.q, &intent, &structured);
+    // ── Step 2: Compress long queries before expansion ──
+    // "what monitoring stack should a small startup use for kubernetes
+    //  microservices running on aws" → "kubernetes monitoring stack aws startup"
+    let expansion_input = compress_query(&normalized);
+    if expansion_input != normalized {
+        tracing::info!("Query compressed: {:?} → {:?}", normalized, expansion_input);
+    }
+
+    let expanded = expand_queries(&expansion_input, &intent, &structured);
     tracing::info!("Expanded to {} query variations", expanded.len());
 
     let result = IntentResponse {
@@ -2129,6 +2717,7 @@ async fn analyze_query(
         constraints: flat_constraints,
         structured_constraints: structured,
         expanded_queries: expanded,
+        distribution,
     };
 
     state.intent_cache.insert(query_norm, result.clone()).await;
