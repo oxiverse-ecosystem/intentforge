@@ -1281,11 +1281,37 @@ fn strip_tracking_params(url: &str) -> String {
 // Current approach: clamp to [0.05, 1.0]. This preserves the absolute
 // quality — a mediocre top result stays at ~0.20 while an excellent one
 // scores ~0.65. Scores below 0.05 are clamped up (essentially noise),
-// scores above 1.0 are clamped down (exceptional results with nav boosts).
+// scores above 1.0 are log-compressed into [0.95, 1.0] so the over-1.0
+// cluster (from consensus boosts, nav domain boosts) retains differentiation.
 
 fn normalize_scores(scores: &mut [f32]) {
+    // Find the raw max to detect if any scores exceed 1.0
+    let raw_max = scores.iter().cloned().fold(0.0f32, f32::max);
+    let cap = 1.0f32;
+
+    if raw_max <= cap {
+        // No overflow — just clamp the floor
+        for score in scores.iter_mut() {
+            *score = score.clamp(0.05, cap);
+        }
+        return;
+    }
+
+    // Over-1.0 cluster exists. Compress the tail into [cap - spread, cap]
+    // using log-scaling so the #1 result is still distinguishable from #2.
+    // spread = 0.05 means the #1 result gets 1.000 and the worst over-1.0
+    // result gets ~0.950 — visible but not dominant.
+    let spread = 0.05f32;
+    let log_max = (1.0 + (raw_max - cap)).ln(); // ln(1 + excess)
+
     for score in scores.iter_mut() {
-        *score = score.clamp(0.05, 1.0);
+        if *score > cap {
+            let excess = *score - cap;
+            let compressed = spread * (1.0 + excess).ln() / log_max;
+            *score = cap - spread + compressed; // maps [cap, raw_max] → [cap - spread, cap]
+        } else {
+            *score = score.clamp(0.05, cap);
+        }
     }
 }
 
@@ -1679,7 +1705,11 @@ fn merge_local_and_web(
         let no_fragment = lower.split('#').next().unwrap_or(&lower);
         let no_trailing = no_fragment.trim_end_matches('/');
         let no_www = no_trailing.replacen("://www.", "://", 1);
-        strip_tracking_params(&no_www)
+        // Strip m./mobile. prefixes: m.example.com → example.com
+        let no_mobile = no_www
+            .replacen("://m.", "://", 1)
+            .replacen("://mobile.", "://", 1);
+        strip_tracking_params(&no_mobile)
     };
 
     // 1. Add local results first (they have richer content)
@@ -1815,9 +1845,9 @@ fn merge_local_and_web(
     merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     // 4b. Position-aware domain diversity: penalize repeated domains in top slots.
-    // The global cap (MAX_PER_DOMAIN=5) prevents outright flooding, but doesn't
-    // ensure diversity in the top results. A domain with 5 great results will
-    // still dominate positions 1-5. This penalty makes the 2nd appearance of a
+    // The global cap (MAX_PER_DOMAIN=3) prevents outright flooding, but doesn't
+    // ensure diversity in the top results. A domain with 3 great results will
+    // still dominate positions 1-3. This penalty makes the 2nd appearance of a
     // domain score 70% and the 3rd score 49% — the algorithm naturally promotes
     // other domains into higher slots without hard cutoffs.
     {
@@ -2850,7 +2880,10 @@ async fn handle_search(
                                         let no_fragment = lower.split('#').next().unwrap_or(&lower);
                                         let no_trailing = no_fragment.trim_end_matches('/');
                                         let no_www = no_trailing.replacen("://www.", "://", 1);
-                                        strip_tracking_params(&no_www)
+                                        let no_mobile = no_www
+                                            .replacen("://m.", "://", 1)
+                                            .replacen("://mobile.", "://", 1);
+                                        strip_tracking_params(&no_mobile)
                                     };
                                     if !url_rrf_contributions.contains_key(&normalized) {
                                         let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
@@ -3017,18 +3050,22 @@ async fn handle_search(
     let mut unique_web_results: Vec<SearxResult> = Vec::new();
     let mut url_to_index: HashMap<String, usize> = HashMap::new(); // normalized URL -> index in unique_web_results
     let mut seen_domains = std::collections::HashMap::<String, usize>::new();
-    const MAX_PER_DOMAIN: usize = 5; // prevent single-domain dominance
+    const MAX_PER_DOMAIN: usize = 3; // prevent single-domain dominance
 
     for res in web_results {
         // Normalize URL: lowercase, strip trailing slash, strip fragment, strip www,
-        // strip tracking params (utm_*, fbclid, gclid, ref, etc.)
+        // strip mobile prefixes (m./mobile.), strip tracking params
         let normalized = {
             let lower = res.url.to_lowercase();
             let no_fragment = lower.split('#').next().unwrap_or(&lower);
             let no_trailing = no_fragment.trim_end_matches('/');
             let no_www = no_trailing.replacen("://www.", "://", 1);
+            // Strip m./mobile. prefixes: m.example.com → example.com
+            let no_mobile = no_www
+                .replacen("://m.", "://", 1)
+                .replacen("://mobile.", "://", 1);
             // Strip tracking query params
-            strip_tracking_params(&no_www)
+            strip_tracking_params(&no_mobile)
         };
 
         // Domain dedup: cap results per domain for diversity
@@ -3146,7 +3183,10 @@ async fn handle_search(
                                         let no_fragment = lower.split('#').next().unwrap_or(&lower);
                                         let no_trailing = no_fragment.trim_end_matches('/');
                                         let no_www = no_trailing.replacen("://www.", "://", 1);
-                                        strip_tracking_params(&no_www)
+                                        let no_mobile = no_www
+                                            .replacen("://m.", "://", 1)
+                                            .replacen("://mobile.", "://", 1);
+                                        strip_tracking_params(&no_mobile)
                                     };
                                     let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
                                     *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
