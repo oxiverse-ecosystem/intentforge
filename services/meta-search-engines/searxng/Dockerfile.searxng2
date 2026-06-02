@@ -1,0 +1,10 @@
+# SearXNG2 with socksio for Tor SOCKS proxy support
+# httpx 0.28+ requires socksio (not httpx_socks/python_socks) for SOCKS proxies
+FROM searxng/searxng:latest
+
+# Download and install socksio (pure Python wheel)
+RUN wget -qO /tmp/socksio.whl \
+      "https://files.pythonhosted.org/packages/37/c3/6eeb6034408dac0fa653d126c9204ade96b819c936e136c5e8a6897eee9c/socksio-1.0.0-py3-none-any.whl" && \
+    cd /tmp && unzip -o socksio.whl && \
+    cp -r socksio /usr/local/searxng/.venv/lib/python3.14/site-packages/ && \
+    rm -rf /tmp/socksio.whl /tmp/socksio /tmp/socksio-1.0.0.dist-info

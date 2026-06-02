@@ -121,7 +121,9 @@ services:
 
   searxng2:
     container_name: if-dev-searxng2
-    image: searxng/searxng:latest
+    build:
+      context: ./meta-search-engines/searxng
+      dockerfile: Dockerfile.searxng2
     network_mode: "service:tor2"    # Routes through Tor2 (independent of gluetun VPN)
     depends_on:
       - tor2
