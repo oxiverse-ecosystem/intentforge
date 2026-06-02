@@ -1981,52 +1981,74 @@ async fn handle_images(
         return Json(value);
     }
 
+    // Fan-out to both SearXNG instances in parallel (VPN + Tor)
     let searx_url = format!(
         "http://127.0.0.1:8080/search?q={}&format=json&categories=images&pageno=1",
         q_encoded
     );
 
-    let results: Vec<ImageResult> = match tokio::time::timeout(
-        Duration::from_secs(6),
-        state.http_client.get(&searx_url).send()
-    ).await {
-        Ok(Ok(resp)) => match resp.text().await {
-            Ok(raw) => {
-                let sanitized = sanitize_json_text(&raw);
-                match serde_json::from_str::<SearxImageResponse>(&sanitized) {
-                    Ok(data) => data.results.into_iter().map(|r| {
-                        let thumb = if !r.thumbnail.is_empty() { r.thumbnail.clone() }
-                            else if !r.thumbnail_src.is_empty() { r.thumbnail_src.clone() }
-                            else { r.source.clone() };
-                        ImageResult {
-                            title: r.title,
-                            url: r.url,
-                            image_url: if r.img_src.is_empty() { thumb.clone() } else { r.img_src },
-                            thumbnail_url: thumb,
-                            description: r.content,
-                            source: r.engine,
-                        }
-                    }).collect(),
-                    Err(e) => {
-                        tracing::warn!("SearXNG image parse error: {}", e);
-                        vec![]
-                    }
+    let searx2_url = state.searxng2_url.as_ref().map(|base| {
+        format!("{}/search?q={}&format=json&categories=images&pageno=1", base, q_encoded)
+    });
+
+    let parse_images = |raw: String| -> Vec<ImageResult> {
+        let sanitized = sanitize_json_text(&raw);
+        match serde_json::from_str::<SearxImageResponse>(&sanitized) {
+            Ok(data) => data.results.into_iter().map(|r| {
+                let thumb = if !r.thumbnail.is_empty() { r.thumbnail.clone() }
+                    else if !r.thumbnail_src.is_empty() { r.thumbnail_src.clone() }
+                    else { r.source.clone() };
+                ImageResult {
+                    title: r.title,
+                    url: r.url,
+                    image_url: if r.img_src.is_empty() { thumb.clone() } else { r.img_src },
+                    thumbnail_url: thumb,
+                    description: r.content,
+                    source: r.engine,
                 }
-            }
+            }).collect(),
             Err(e) => {
-                tracing::warn!("SearXNG image body read error: {}", e);
+                tracing::warn!("SearXNG image parse error: {}", e);
                 vec![]
             }
         }
-        Ok(Err(e)) => {
-            tracing::warn!("SearXNG image request error: {}", e);
-            vec![]
-        }
-        Err(_) => {
-            tracing::warn!("SearXNG image timed out after 6s");
-            vec![]
+    };
+
+    let searx1_fut = async {
+        match tokio::time::timeout(Duration::from_secs(6), state.http_client.get(&searx_url).send()).await {
+            Ok(Ok(resp)) => match resp.text().await {
+                Ok(raw) => parse_images(raw),
+                Err(e) => { tracing::warn!("SearXNG1 image body read error: {}", e); vec![] }
+            },
+            Ok(Err(e)) => { tracing::warn!("SearXNG1 image request error: {}", e); vec![] }
+            Err(_) => { tracing::warn!("SearXNG1 image timed out after 6s"); vec![] }
         }
     };
+
+    let searx2_fut = async {
+        let url = match searx2_url {
+            Some(u) => u,
+            None => return vec![],
+        };
+        match tokio::time::timeout(Duration::from_secs(8), state.http_client.get(&url).send()).await {
+            Ok(Ok(resp)) => match resp.text().await {
+                Ok(raw) => parse_images(raw),
+                Err(e) => { tracing::warn!("SearXNG2 image body read error: {}", e); vec![] }
+            },
+            Ok(Err(e)) => { tracing::warn!("SearXNG2 image request error: {}", e); vec![] }
+            Err(_) => { tracing::warn!("SearXNG2 image timed out after 8s"); vec![] }
+        }
+    };
+
+    let (mut results, tor_results) = tokio::join!(searx1_fut, searx2_fut);
+
+    // Merge Tor results — dedup by URL, prefer VPN results (faster)
+    let mut seen: std::collections::HashSet<String> = results.iter().map(|r| r.url.clone()).collect();
+    for r in tor_results {
+        if seen.insert(r.url.clone()) {
+            results.push(r);
+        }
+    }
 
     let response = serde_json::json!({
         "results": results,
@@ -2153,46 +2175,68 @@ async fn handle_news(
         return Json(value);
     }
 
+    // Fan-out to both SearXNG instances in parallel (VPN + Tor)
     let searx_url = format!(
         "http://127.0.0.1:8080/search?q={}&format=json&categories=news&pageno=1",
         q_encoded
     );
 
-    let results: Vec<NewsResult> = match tokio::time::timeout(
-        Duration::from_secs(6),
-        state.http_client.get(&searx_url).send()
-    ).await {
-        Ok(Ok(resp)) => match resp.text().await {
-            Ok(raw) => {
-                let sanitized = sanitize_json_text(&raw);
-                match serde_json::from_str::<SearxNewsResponse>(&sanitized) {
-                    Ok(data) => data.results.into_iter().map(|r| NewsResult {
-                        title: r.title,
-                        url: r.url,
-                        description: r.content,
-                        published_at: r.published_date.unwrap_or_default(),
-                        source: r.engine,
-                    }).collect(),
-                    Err(e) => {
-                        tracing::warn!("SearXNG news parse error: {}", e);
-                        vec![]
-                    }
-                }
-            }
+    let searx2_url = state.searxng2_url.as_ref().map(|base| {
+        format!("{}/search?q={}&format=json&categories=news&pageno=1", base, q_encoded)
+    });
+
+    let parse_news = |raw: String| -> Vec<NewsResult> {
+        let sanitized = sanitize_json_text(&raw);
+        match serde_json::from_str::<SearxNewsResponse>(&sanitized) {
+            Ok(data) => data.results.into_iter().map(|r| NewsResult {
+                title: r.title,
+                url: r.url,
+                description: r.content,
+                published_at: r.published_date.unwrap_or_default(),
+                source: r.engine,
+            }).collect(),
             Err(e) => {
-                tracing::warn!("SearXNG news body read error: {}", e);
+                tracing::warn!("SearXNG news parse error: {}", e);
                 vec![]
             }
         }
-        Ok(Err(e)) => {
-            tracing::warn!("SearXNG news request error: {}", e);
-            vec![]
-        }
-        Err(_) => {
-            tracing::warn!("SearXNG news timed out after 6s");
-            vec![]
+    };
+
+    let searx1_fut = async {
+        match tokio::time::timeout(Duration::from_secs(6), state.http_client.get(&searx_url).send()).await {
+            Ok(Ok(resp)) => match resp.text().await {
+                Ok(raw) => parse_news(raw),
+                Err(e) => { tracing::warn!("SearXNG1 news body read error: {}", e); vec![] }
+            },
+            Ok(Err(e)) => { tracing::warn!("SearXNG1 news request error: {}", e); vec![] }
+            Err(_) => { tracing::warn!("SearXNG1 news timed out after 6s"); vec![] }
         }
     };
+
+    let searx2_fut = async {
+        let url = match searx2_url {
+            Some(u) => u,
+            None => return vec![],
+        };
+        match tokio::time::timeout(Duration::from_secs(8), state.http_client.get(&url).send()).await {
+            Ok(Ok(resp)) => match resp.text().await {
+                Ok(raw) => parse_news(raw),
+                Err(e) => { tracing::warn!("SearXNG2 news body read error: {}", e); vec![] }
+            },
+            Ok(Err(e)) => { tracing::warn!("SearXNG2 news request error: {}", e); vec![] }
+            Err(_) => { tracing::warn!("SearXNG2 news timed out after 8s"); vec![] }
+        }
+    };
+
+    let (mut results, tor_results) = tokio::join!(searx1_fut, searx2_fut);
+
+    // Merge Tor results — dedup by URL, prefer VPN results (faster)
+    let mut seen: std::collections::HashSet<String> = results.iter().map(|r| r.url.clone()).collect();
+    for r in tor_results {
+        if seen.insert(r.url.clone()) {
+            results.push(r);
+        }
+    }
 
     let response = serde_json::json!({
         "results": results,
