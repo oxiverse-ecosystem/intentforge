@@ -1,0 +1,634 @@
+{
+  "queries": [
+    {
+      "query": "google",
+      "expected_intent": "navigational",
+      "actual_intent": "navigational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 49,
+      "engines": {
+        "unknown": 49
+      },
+      "relevance": 1.0,
+      "latency": 2409
+    },
+    {
+      "query": "youtube",
+      "expected_intent": "navigational",
+      "actual_intent": "navigational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 48,
+      "engines": {
+        "unknown": 48
+      },
+      "relevance": 1.0,
+      "latency": 1588
+    },
+    {
+      "query": "wikipedia",
+      "expected_intent": "navigational",
+      "actual_intent": "navigational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 38,
+      "engines": {
+        "unknown": 38
+      },
+      "relevance": 1.0,
+      "latency": 1516
+    },
+    {
+      "query": "github",
+      "expected_intent": "navigational",
+      "actual_intent": "navigational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 42,
+      "engines": {
+        "unknown": 42
+      },
+      "relevance": 1.0,
+      "latency": 1531
+    },
+    {
+      "query": "amazon",
+      "expected_intent": "navigational",
+      "actual_intent": "navigational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 47,
+      "engines": {
+        "unknown": 47
+      },
+      "relevance": 1.0,
+      "latency": 1533
+    },
+    {
+      "query": "netflix",
+      "expected_intent": "navigational",
+      "actual_intent": "navigational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 52,
+      "engines": {
+        "unknown": 52
+      },
+      "relevance": 1.0,
+      "latency": 1510
+    },
+    {
+      "query": "reddit",
+      "expected_intent": "navigational",
+      "actual_intent": "navigational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 50,
+      "engines": {
+        "unknown": 50
+      },
+      "relevance": 1.0,
+      "latency": 1634
+    },
+    {
+      "query": "what is quantum computing",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 44,
+      "engines": {
+        "unknown": 44
+      },
+      "relevance": 1.0,
+      "latency": 2034
+    },
+    {
+      "query": "how does photosynthesis work",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 51,
+      "engines": {
+        "unknown": 51
+      },
+      "relevance": 1.0,
+      "latency": 3010
+    },
+    {
+      "query": "python asyncio tutorial",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 45,
+      "engines": {
+        "unknown": 45
+      },
+      "relevance": 1.0,
+      "latency": 2026
+    },
+    {
+      "query": "rust programming language",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 38,
+      "engines": {
+        "unknown": 38
+      },
+      "relevance": 1.0,
+      "latency": 1847
+    },
+    {
+      "query": "machine learning explained",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 49,
+      "engines": {
+        "unknown": 49
+      },
+      "relevance": 1.0,
+      "latency": 1262
+    },
+    {
+      "query": "docker compose networking",
+      "expected_intent": "informational",
+      "actual_intent": "navigational",
+      "intent_match": false,
+      "expected_cat": "general",
+      "result_count": 47,
+      "engines": {
+        "unknown": 47
+      },
+      "relevance": 1.0,
+      "latency": 2022
+    },
+    {
+      "query": "nginx reverse proxy setup",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 53,
+      "engines": {
+        "unknown": 53
+      },
+      "relevance": 1.0,
+      "latency": 1138
+    },
+    {
+      "query": "kubernetes pod scheduling",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 37,
+      "engines": {
+        "unknown": 37
+      },
+      "relevance": 1.0,
+      "latency": 1465
+    },
+    {
+      "query": "linux cron job syntax",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 47,
+      "engines": {
+        "unknown": 47
+      },
+      "relevance": 1.0,
+      "latency": 1121
+    },
+    {
+      "query": "ssh tunnel port forwarding",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 51,
+      "engines": {
+        "unknown": 51
+      },
+      "relevance": 1.0,
+      "latency": 1058
+    },
+    {
+      "query": "what is the capital of france",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 42,
+      "engines": {
+        "unknown": 42
+      },
+      "relevance": 1.0,
+      "latency": 1148
+    },
+    {
+      "query": "difference between tcp and udp",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 51,
+      "engines": {
+        "unknown": 51
+      },
+      "relevance": 1.0,
+      "latency": 1260
+    },
+    {
+      "query": "latest tech news today",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "news",
+      "result_count": 84,
+      "engines": {
+        "unknown": 84
+      },
+      "relevance": 1.0,
+      "latency": 2245
+    },
+    {
+      "query": "nvidia stock price",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "news",
+      "result_count": 45,
+      "engines": {
+        "unknown": 45
+      },
+      "relevance": 1.0,
+      "latency": 1305
+    },
+    {
+      "query": "spacex next launch",
+      "expected_intent": "informational",
+      "actual_intent": "transactional",
+      "intent_match": false,
+      "expected_cat": "news",
+      "result_count": 38,
+      "engines": {
+        "unknown": 38
+      },
+      "relevance": 1.0,
+      "latency": 1567
+    },
+    {
+      "query": "bitcoin price today",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "news",
+      "result_count": 38,
+      "engines": {
+        "unknown": 38
+      },
+      "relevance": 1.0,
+      "latency": 1500
+    },
+    {
+      "query": "ai regulation latest",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "news",
+      "result_count": 61,
+      "engines": {
+        "unknown": 61
+      },
+      "relevance": 1.0,
+      "latency": 2068
+    },
+    {
+      "query": "sunset over ocean",
+      "expected_intent": "navigational",
+      "actual_intent": "navigational",
+      "intent_match": true,
+      "expected_cat": "images",
+      "result_count": 57,
+      "engines": {
+        "unknown": 57
+      },
+      "relevance": 1.0,
+      "latency": 1949
+    },
+    {
+      "query": "mountain landscape photography",
+      "expected_intent": "navigational",
+      "actual_intent": "informational",
+      "intent_match": false,
+      "expected_cat": "images",
+      "result_count": 81,
+      "engines": {
+        "unknown": 81
+      },
+      "relevance": 1.0,
+      "latency": 1955
+    },
+    {
+      "query": "cute puppies",
+      "expected_intent": "navigational",
+      "actual_intent": "navigational",
+      "intent_match": true,
+      "expected_cat": "images",
+      "result_count": 38,
+      "engines": {
+        "unknown": 38
+      },
+      "relevance": 0.6,
+      "latency": 2604
+    },
+    {
+      "query": "abstract digital art",
+      "expected_intent": "navigational",
+      "actual_intent": "informational",
+      "intent_match": false,
+      "expected_cat": "images",
+      "result_count": 43,
+      "engines": {
+        "unknown": 43
+      },
+      "relevance": 1.0,
+      "latency": 1332
+    },
+    {
+      "query": "city skyline night",
+      "expected_intent": "navigational",
+      "actual_intent": "navigational",
+      "intent_match": true,
+      "expected_cat": "images",
+      "result_count": 42,
+      "engines": {
+        "unknown": 42
+      },
+      "relevance": 1.0,
+      "latency": 1940
+    },
+    {
+      "query": "cooking pasta recipe",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "videos",
+      "result_count": 44,
+      "engines": {
+        "unknown": 44
+      },
+      "relevance": 1.0,
+      "latency": 1347
+    },
+    {
+      "query": "python programming tutorial",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "videos",
+      "result_count": 29,
+      "engines": {
+        "unknown": 29
+      },
+      "relevance": 1.0,
+      "latency": 1317
+    },
+    {
+      "query": "guitar lesson beginner",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "videos",
+      "result_count": 41,
+      "engines": {
+        "unknown": 41
+      },
+      "relevance": 1.0,
+      "latency": 1100
+    },
+    {
+      "query": "workout routine home",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "videos",
+      "result_count": 36,
+      "engines": {
+        "unknown": 36
+      },
+      "relevance": 1.0,
+      "latency": 1264
+    },
+    {
+      "query": "3blue1brown linear algebra",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "videos",
+      "result_count": 34,
+      "engines": {
+        "unknown": 34
+      },
+      "relevance": 1.0,
+      "latency": 1518
+    },
+    {
+      "query": "buy iphone 16 pro",
+      "expected_intent": "transactional",
+      "actual_intent": "transactional",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 47,
+      "engines": {
+        "unknown": 47
+      },
+      "relevance": 1.0,
+      "latency": 1380
+    },
+    {
+      "query": "book flight to tokyo",
+      "expected_intent": "transactional",
+      "actual_intent": "informational",
+      "intent_match": false,
+      "expected_cat": "general",
+      "result_count": 49,
+      "engines": {
+        "unknown": 49
+      },
+      "relevance": 1.0,
+      "latency": 1312
+    },
+    {
+      "query": "order pizza online",
+      "expected_intent": "transactional",
+      "actual_intent": "transactional",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 37,
+      "engines": {
+        "unknown": 37
+      },
+      "relevance": 1.0,
+      "latency": 1847
+    },
+    {
+      "query": "subscribe to netflix",
+      "expected_intent": "transactional",
+      "actual_intent": "transactional",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 44,
+      "engines": {
+        "unknown": 44
+      },
+      "relevance": 1.0,
+      "latency": 1417
+    },
+    {
+      "query": "apple",
+      "expected_intent": "navigational",
+      "actual_intent": "navigational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 42,
+      "engines": {
+        "unknown": 42
+      },
+      "relevance": 1.0,
+      "latency": 1261
+    },
+    {
+      "query": "bass",
+      "expected_intent": "informational",
+      "actual_intent": "navigational",
+      "intent_match": false,
+      "expected_cat": "general",
+      "result_count": 35,
+      "engines": {
+        "unknown": 35
+      },
+      "relevance": 1.0,
+      "latency": 1338
+    },
+    {
+      "query": "jaguar",
+      "expected_intent": "informational",
+      "actual_intent": "navigational",
+      "intent_match": false,
+      "expected_cat": "general",
+      "result_count": 37,
+      "engines": {
+        "unknown": 37
+      },
+      "relevance": 1.0,
+      "latency": 1937
+    },
+    {
+      "query": "python django rest framework cors",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 37,
+      "engines": {
+        "unknown": 37
+      },
+      "relevance": 1.0,
+      "latency": 1491
+    },
+    {
+      "query": "how to deploy react app to aws s3 cloudfront",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 43,
+      "engines": {
+        "unknown": 43
+      },
+      "relevance": 1.0,
+      "latency": 1123
+    },
+    {
+      "query": "best practices for securing nginx with letsencrypt ssl",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 27,
+      "engines": {
+        "unknown": 27
+      },
+      "relevance": 1.0,
+      "latency": 1229
+    },
+    {
+      "query": "compare postgresql vs mysql for high traffic web application",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 35,
+      "engines": {
+        "unknown": 35
+      },
+      "relevance": 1.0,
+      "latency": 1439
+    },
+    {
+      "query": "rust async runtime tokio vs async-std benchmark",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "general",
+      "result_count": 27,
+      "engines": {
+        "unknown": 27
+      },
+      "relevance": 1.0,
+      "latency": 1752
+    },
+    {
+      "query": "what happened in the 2024 us presidential election",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "news",
+      "result_count": 30,
+      "engines": {
+        "unknown": 30
+      },
+      "relevance": 1.0,
+      "latency": 3026
+    },
+    {
+      "query": "latest developments in fusion energy research 2026",
+      "expected_intent": "informational",
+      "actual_intent": "informational",
+      "intent_match": true,
+      "expected_cat": "news",
+      "result_count": 29,
+      "engines": {
+        "unknown": 29
+      },
+      "relevance": 1.0,
+      "latency": 3008
+    }
+  ],
+  "summary": {
+    "intent_accuracy": 85.4,
+    "category_accuracy": 0.0,
+    "avg_latency_ms": 1660,
+    "avg_relevance_pct": 99.2
+  }
+}
