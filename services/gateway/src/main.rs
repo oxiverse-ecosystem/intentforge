@@ -2505,10 +2505,32 @@ async fn handle_search(
             if is_open {
                 return Ok(SearxResponse { results: vec![] });
             }
+            // Per-instance timeout: 2s for the request itself, so slow backends
+            // (e.g. tor2) don't block the entire fan-out waiting for the outer 3s.
             let first: Result<SearxResponse, reqwest::Error> = async {
-                let resp = client_ref.get(&url).send().await?;
+                let resp = match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client_ref.get(&url).send()
+                ).await {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        tracing::warn!("SearXNG instance request timed out (2s): {}", &url[..url.find('?').unwrap_or(url.len())]);
+                        return Ok(SearxResponse { results: vec![] });
+                    }
+                };
                 let status = resp.status();
-                let raw = resp.text().await.unwrap_or_default();
+                let raw = match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    resp.text()
+                ).await {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        tracing::warn!("SearXNG instance body read timed out (2s)");
+                        return Ok(SearxResponse { results: vec![] });
+                    }
+                };
                 let sanitized = sanitize_json_text(&raw);
                 match serde_json::from_str::<SearxResponse>(&sanitized) {
                     Ok(data) => Ok(data),
@@ -2687,12 +2709,12 @@ async fn handle_search(
 
     let searx_fut_with_timeout = async {
         match tokio::time::timeout(
-            std::time::Duration::from_secs(3),  // SearXNG0 responds in 2-3s; cut slow fans
+            std::time::Duration::from_secs(2),  // Per-instance timeout is 2s; cut the join at 2s
             futures::future::join_all(searx_futs),
         ).await {
             Ok(results) => results,
             Err(_) => {
-                tracing::warn!("SearXNG fan-out timed out after 3s — returning partial results");
+                tracing::warn!("SearXNG fan-out timed out after 2s — returning partial results");
                 vec![]
             }
         }
@@ -2841,7 +2863,7 @@ async fn handle_search(
     }
 
     // Smart retry: if overall results are significantly below expected,
-    // try a different expanded query variation on another SearXNG instance.
+    // try a different expanded query variation on the BEST available instance.
     // The initial fan-out uses the raw query (== expanded_queries[0]) on all instances,
     // so we've used exactly 1 query variation — the retry should skip it.
     let total_results = web_results.len();
@@ -2850,8 +2872,8 @@ async fn handle_search(
         // Pick the first expanded query variation we haven't tried yet (skip index 0 = raw query)
         let retry_query_idx = if expanded_queries.len() > 1 { 1 } else { 0 };
         if let Some(retry_eq) = expanded_queries.get(retry_query_idx) {
-            // Try the second SearXNG instance (index 1) if available, else first
-            let retry_instance_idx = if searx_base_urls.len() > 1 { 1 } else { 0 };
+            // Prefer instance 0 (usually VPN/healthy) over instance 1 (often tor/degraded)
+            let retry_instance_idx = 0usize;
             if let Some(retry_base) = searx_base_urls.get(retry_instance_idx) {
                 let clean_eq = preprocess_searxng_query(retry_eq);
                 let retry_url = format!("{}/search?q={}&format=json&pageno=1", retry_base, urlencoding::encode(&clean_eq));
@@ -2862,7 +2884,7 @@ async fn handle_search(
                         total_results, expected_min, clean_eq, retry_instance_idx
                     );
                     match tokio::time::timeout(
-                        Duration::from_secs(3),
+                        Duration::from_secs(2),
                         client_ref.get(&retry_url).send(),
                     ).await {
                         Ok(Ok(resp)) => {
