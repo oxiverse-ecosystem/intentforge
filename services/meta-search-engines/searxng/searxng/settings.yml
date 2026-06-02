@@ -129,7 +129,7 @@ engines:
     brave_category: images
     categories: images
     shortcut: bri
-    disabled: false
+    disabled: true    # DISABLED: brave changed response format, crashes SearXNG (ValueError: substring not found)
     timeout: 3.5
 
   - name: openverse

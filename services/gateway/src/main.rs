@@ -1986,8 +1986,11 @@ async fn handle_images(
         q_encoded
     );
 
-    let results: Vec<ImageResult> = match state.http_client.get(&searx_url).send().await {
-        Ok(resp) => match resp.text().await {
+    let results: Vec<ImageResult> = match tokio::time::timeout(
+        Duration::from_secs(6),
+        state.http_client.get(&searx_url).send()
+    ).await {
+        Ok(Ok(resp)) => match resp.text().await {
             Ok(raw) => {
                 let sanitized = sanitize_json_text(&raw);
                 match serde_json::from_str::<SearxImageResponse>(&sanitized) {
@@ -2015,8 +2018,12 @@ async fn handle_images(
                 vec![]
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!("SearXNG image request error: {}", e);
+            vec![]
+        }
+        Err(_) => {
+            tracing::warn!("SearXNG image timed out after 6s");
             vec![]
         }
     };
@@ -2151,8 +2158,11 @@ async fn handle_news(
         q_encoded
     );
 
-    let results: Vec<NewsResult> = match state.http_client.get(&searx_url).send().await {
-        Ok(resp) => match resp.text().await {
+    let results: Vec<NewsResult> = match tokio::time::timeout(
+        Duration::from_secs(6),
+        state.http_client.get(&searx_url).send()
+    ).await {
+        Ok(Ok(resp)) => match resp.text().await {
             Ok(raw) => {
                 let sanitized = sanitize_json_text(&raw);
                 match serde_json::from_str::<SearxNewsResponse>(&sanitized) {
@@ -2174,8 +2184,12 @@ async fn handle_news(
                 vec![]
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!("SearXNG news request error: {}", e);
+            vec![]
+        }
+        Err(_) => {
+            tracing::warn!("SearXNG news timed out after 6s");
             vec![]
         }
     };
