@@ -591,6 +591,102 @@ fn is_indexworthy(title: &str, content: &str) -> bool {
     true
 }
 
+// ─── Domain Authority Score ───────────────────────────────────────
+// Algorithmic domain authority based on URL structure signals.
+// Same approach as the gateway's domain_authority_score() — TLD trust,
+// subdomain patterns, path signals, URL complexity.
+// NOT hardcoded — based on structural URL analysis.
+
+fn compute_domain_authority(url: &str) -> f32 {
+    let url_lower = url.to_lowercase();
+    let host = Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+        .unwrap_or_default();
+
+    let mut score: f32 = 0.5; // baseline for unknown domains
+
+    // ── TLD-based trust scoring (algorithmic) ──
+    if host.ends_with(".edu") || host.ends_with(".gov") || host.ends_with(".ac.uk") {
+        score += 0.3;
+    } else if host.ends_with(".org") || host.ends_with(".net") {
+        score += 0.1;
+    } else if host.rfind('.').map_or(false, |i| {
+        let tld = &host[i+1..];
+        tld.len() == 2 && tld.chars().all(|c| c.is_alphabetic())
+    }) {
+        score += 0.05;
+    }
+
+    // ── Subdomain pattern scoring ──
+    let doc_prefixes = ["docs.", "doc.", "developer.", "dev.", "learn.",
+                        "api.", "reference.", "manual.", "wiki.", "help.", "support."];
+    if doc_prefixes.iter().any(|p| host.starts_with(p)) {
+        score += 0.25;
+    }
+
+    // ── Path pattern scoring ──
+    let doc_paths = ["/docs/", "/doc/", "/api/", "/reference/", "/documentation/",
+                     "/manual/", "/guide/", "/tutorial/", "/handbook/", "/wiki/"];
+    if doc_paths.iter().any(|p| url_lower.contains(p)) {
+        score += 0.2;
+    }
+
+    // Code hosting signal: /owner/repo pattern
+    let path = Url::parse(url).ok().map(|u| u.path().to_lowercase()).unwrap_or_default();
+    let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if path_segments.len() >= 2 {
+        let has_repo_pattern = path_segments[0].len() >= 2
+            && path_segments[1].len() >= 2
+            && !path_segments[0].contains('.')
+            && !path_segments[1].contains('.');
+        if has_repo_pattern {
+            score += 0.1;
+        }
+    }
+
+    // Package registry signal: version-like patterns
+    let has_version_pattern = path_segments.iter().any(|s| {
+        s.starts_with('v') && s[1..].chars().all(|c| c.is_numeric() || c == '.') && s.len() >= 2
+    });
+    if has_version_pattern {
+        score += 0.1;
+    }
+
+    // URL complexity signals
+    let host_parts: Vec<&str> = host.split('.').collect();
+    if host_parts.len() == 2 {
+        score += 0.1; // bare domain = primary site
+    } else if host_parts.len() >= 5 {
+        score -= 0.1; // too many subdomains = CDN/UGC
+    }
+
+    if url_lower.contains('?') {
+        let query_part = url_lower.split('?').nth(1).unwrap_or("");
+        let param_count = query_part.matches('&').count();
+        if param_count > 5 {
+            score -= 0.1;
+        }
+    }
+
+    // Content farm / clickbait signals
+    let spam_patterns = ["content-farm", "clickbait", "top10best", "bestof",
+                         "listicle", "buzzfeed"];
+    if spam_patterns.iter().any(|p| url_lower.contains(p)) {
+        score -= 0.2;
+    }
+
+    // UGC signals
+    let ugc_signals = url_lower.contains("/thread/") || url_lower.contains("/question/")
+        || url_lower.contains("/post/") || url_lower.contains("/comment/")
+        || url_lower.contains("/discussion/") || url_lower.contains("/q/");
+    if ugc_signals {
+        score += 0.05;
+    }
+
+    score.clamp(0.0, 1.0)
+}
+
 // ─── Content Quality Score (for indexing) ────────────────────────────
 // Returns a 0.0-1.0 quality score to store in the index.
 // Uses Shannon entropy + alpha ratio + word length analysis.
@@ -819,12 +915,15 @@ async fn crawl_and_index(
         Err(_) => None,
     };
 
+    let authority = compute_domain_authority(&entry.url);
+
     let mut index_payload = serde_json::json!({
         "url": entry.url,
         "title": title,
         "content": cleaned_content,
         "embedding": embedding,
         "quality": quality_score as f64,
+        "authority": authority as f64,
     });
 
     // Include publication timestamp if found (enables real freshness scoring)

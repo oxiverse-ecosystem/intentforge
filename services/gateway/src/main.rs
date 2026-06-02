@@ -151,6 +151,30 @@ struct SearxNewsResponse {
     results: Vec<SearxNewsResult>,
 }
 
+// ─── Video Result (from SearXNG categories=videos) ────────────────
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SearxVideoResult {
+    #[serde(deserialize_with = "deserialize_null_as_default")]
+    title: String,
+    #[serde(deserialize_with = "deserialize_null_as_default")]
+    url: String,
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    content: String,
+    #[serde(deserialize_with = "deserialize_null_as_default")]
+    engine: String,
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    thumbnail: String,
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    img_src: String,
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    iframe_src: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SearxVideoResponse {
+    results: Vec<SearxVideoResult>,
+}
+
 // ─── API Response Shapes ──────────────────────────────────────────
 
 // Map detailed intent subtypes to standard search categories
@@ -1226,65 +1250,24 @@ fn strip_tracking_params(url: &str) -> String {
     }
 }
 
-// Normalizes scores to [0, 1] using rank-aware scaling that preserves
-// meaningful differentiation among top results.
+// Scores are already on an absolute calibrated scale from the weighted
+// multi-signal fusion — raw scores directly reflect quality:
+//   Mediocre results:  ~0.15-0.25
+//   Good results:      ~0.35-0.55
+//   Excellent results: ~0.55-0.80
 //
-// Problem with pure percentile normalization: when composite scores are in a
-// narrow range (e.g. 0.140-0.145), P99 scaling compresses all top results to
-// ~0.970 — losing rank order information entirely.
+// Previous min-max normalization mapped every query's top-1 to exactly 1.0,
+// destroying the absolute quality signal. A query with mediocre results and
+// one with excellent results both showed 1.000 for the top hit.
 //
-// Solution: hybrid approach that uses rank-position for the top tier (where
-// differentiation matters most) and percentile scaling for the rest.
+// Current approach: clamp to [0.05, 1.0]. This preserves the absolute
+// quality — a mediocre top result stays at ~0.20 while an excellent one
+// scores ~0.65. Scores below 0.05 are clamped up (essentially noise),
+// scores above 1.0 are clamped down (exceptional results with nav boosts).
 
 fn normalize_scores(scores: &mut [f32]) {
-    let n = scores.len();
-    if n < 2 {
-        return;
-    }
-
-    let mut indexed: Vec<(usize, f32)> = scores.iter().enumerate().map(|(i, &s)| (i, s)).collect();
-    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let min_score = indexed[0].1;
-    let max_score = indexed[n - 1].1;
-    let total_range = max_score - min_score;
-
-    if total_range < 1e-6 {
-        // All scores identical — use pure rank-based
-        for (rank, &(orig_idx, _)) in indexed.iter().enumerate() {
-            scores[orig_idx] = 1.0 - (rank as f32) / (n as f32);
-        }
-        return;
-    }
-
-    // Hybrid normalization:
-    // - Top 3 results: rank-based with steep decay (0.99, 0.82, 0.67, ...)
-    //   Each rank loses ~17% → clear differentiation even when raw scores are close.
-    // - Rest: percentile-scaled relative to top-3 anchor range.
-    //
-    // This means rank order is ALWAYS preserved in scores, even when the raw
-    // composite difference is 0.001. The score reflects "this is the 2nd best
-    // result" not "this is 97% of the max".
-
-    let top_k = 3.min(n);
-    let top_scores: Vec<f32> = (0..top_k).map(|i| {
-        let decay = (1.0 - 0.17_f32).powi(i as i32); // 0.99, 0.82, 0.67
-        0.99 * decay
-    }).collect();
-    let anchor_floor = *top_scores.last().unwrap(); // score for kth result
-
-    // indexed is sorted ascending: index 0 = lowest score, index n-1 = highest
-    // rank 0 = worst, rank n-1 = best
-    for (rank, &(orig_idx, _)) in indexed.iter().enumerate() {
-        if rank >= n - top_k {
-            // Top-k result (highest raw scores): assign rank-based score
-            let top_rank = rank - (n - top_k); // 0, 1, 2
-            scores[orig_idx] = top_scores[top_rank];
-        } else {
-            // Remaining: percentile-scale into [0.05, anchor_floor - 0.05]
-            let percentile = rank as f32 / (n - top_k) as f32;
-            scores[orig_idx] = 0.05 + percentile * (anchor_floor - 0.10).max(0.05);
-        }
+    for score in scores.iter_mut() {
+        *score = score.clamp(0.05, 1.0);
     }
 }
 
@@ -2065,36 +2048,76 @@ async fn handle_videos(
         return Json(value);
     }
 
+    // Query both Invidious and SearXNG (categories=videos) in parallel
     let invidious_url = format!("http://127.0.0.1:3000/api/v1/search?q={}", q_encoded);
+    let searx_video_url = format!(
+        "http://127.0.0.1:8080/search?q={}&format=json&categories=videos&pageno=1",
+        q_encoded
+    );
 
-    let results: Vec<VideoResult> = match state.http_client.get(&invidious_url).send().await {
-        Ok(resp) => match resp.json::<Vec<InvidiousResult>>().await {
-            Ok(data) => data.into_iter()
-                .filter(|r| r.result_type.as_deref() == Some("video"))
-                .filter_map(|r| {
-                    let vid = r.video_id?;
-                    let title = r.title.unwrap_or_default();
-                    let description = r.description.unwrap_or_default();
-                    Some(VideoResult {
-                        title,
-                        url: format!("https://www.youtube.com/watch?v={}", vid),
-                        description,
-                        thumbnail: format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", vid),
-                        video_id: vid,
-                        source: "invidious".to_string(),
-                    })
-                })
-                .collect(),
-            Err(e) => {
-                tracing::warn!("Invidious parse error: {}", e);
-                vec![]
+    let (invidious_fut, searx_fut) = tokio::join!(
+        async {
+            match tokio::time::timeout(Duration::from_secs(3), state.http_client.get(&invidious_url).send()).await {
+                Ok(Ok(resp)) => match resp.json::<Vec<InvidiousResult>>().await {
+                    Ok(data) => data.into_iter()
+                        .filter(|r| r.result_type.as_deref() == Some("video"))
+                        .filter_map(|r| {
+                            let vid = r.video_id?;
+                            let title = r.title.unwrap_or_default();
+                            let description = r.description.unwrap_or_default();
+                            Some(VideoResult {
+                                title,
+                                url: format!("https://www.youtube.com/watch?v={}", vid),
+                                description,
+                                thumbnail: format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", vid),
+                                video_id: vid,
+                                source: "invidious".to_string(),
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    Err(e) => { tracing::warn!("Invidious parse error: {}", e); vec![] }
+                },
+                Ok(Err(e)) => { tracing::warn!("Invidious request error: {}", e); vec![] }
+                Err(_) => { tracing::warn!("Invidious timed out after 3s"); vec![] }
             }
         },
-        Err(e) => {
-            tracing::warn!("Invidious request error: {}", e);
-            vec![]
+        async {
+            match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&searx_video_url).send()).await {
+                Ok(Ok(resp)) => match resp.text().await {
+                    Ok(raw) => {
+                        let sanitized = sanitize_json_text(&raw);
+                        match serde_json::from_str::<SearxVideoResponse>(&sanitized) {
+                            Ok(data) => data.results.into_iter().map(|r| {
+                                let thumbnail = if !r.thumbnail.is_empty() { r.thumbnail.clone() }
+                                    else if !r.img_src.is_empty() { r.img_src.clone() }
+                                    else { String::new() };
+                                VideoResult {
+                                    title: r.title,
+                                    url: r.url,
+                                    description: r.content,
+                                    video_id: String::new(),
+                                    thumbnail,
+                                    source: r.engine,
+                                }
+                            }).collect::<Vec<_>>(),
+                            Err(e) => { tracing::warn!("SearXNG video parse error: {}", e); vec![] }
+                        }
+                    }
+                    Err(e) => { tracing::warn!("SearXNG video body read error: {}", e); vec![] }
+                },
+                Ok(Err(e)) => { tracing::warn!("SearXNG video request error: {}", e); vec![] }
+                Err(_) => { tracing::warn!("SearXNG video timed out after 4s"); vec![] }
+            }
         }
-    };
+    );
+
+    // Merge results: SearXNG first (more reliable), then Invidious
+    let mut results = searx_fut;
+    results.extend(invidious_fut);
+
+    // Deduplicate by URL
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|r| seen.insert(r.url.clone()));
 
     let response = serde_json::json!({
         "results": results,
@@ -2186,7 +2209,7 @@ async fn main() {
         rate_limits: RateLimitTracker::new(),
         volume_tracker: ResultVolumeTracker::new(),
         http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))  // Must exceed SearXNG's max engine timeout (3.0s + overhead)
+            .timeout(Duration::from_secs(3))  // Engines that can't respond in 3s are degraded
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .pool_max_idle_per_host(20)
             .connect_timeout(Duration::from_secs(1))
@@ -2322,114 +2345,31 @@ async fn handle_search(
     };
     let embed_fut = client.get(&embed_url).send();
 
-    let (intent_result, embed_res) = tokio::join!(intent_fut, embed_fut);
-
-    // 2. Process Intent & Embedding
-    let intent: IntentResponse = match intent_result {
-        Ok(parsed) => parsed,
-        Err(()) => {
-            tracing::error!("Intent Engine unreachable after 3 attempts — using fallback");
-            fallback_intent(&q)
-        }
-    };
-
-    let vector: Option<Vec<f32>> = match embed_res {
-        Ok(resp) => {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                json["embedding"].as_array().map(|arr| {
-                    arr.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect()
-                })
-            } else { None }
-        },
-        Err(_) => None,
-    };
-
-    // 3. Multi-Variation Fan-Out: query SearXNG with expanded queries for broader recall
-    // The intent engine returns 2-4 query variations. We fire them all to SearXNG.
-    // This catches results that the original query phrasing might miss.
-    let expanded_queries = if intent.expanded_queries.len() > 1 {
-        intent.expanded_queries.clone()
-    } else {
-        vec![q.clone()]
-    };
-
-    // Strip negative constraint terms from expanded queries before SearXNG fan-out.
-    // "python web framework not django" → "python web framework"
-    // Sending "not django" to SearXNG pollutes results with Django pages.
-    let neg_terms: Vec<String> = intent.structured_constraints.negative.iter()
-        .map(|n| n.to_lowercase())
-        .collect();
-    let cleaned_queries: Vec<String> = expanded_queries.iter().map(|eq| {
-        if neg_terms.is_empty() { return eq.clone(); }
-        let mut words: Vec<&str> = eq.split_whitespace().collect();
-        // Remove negative constraint words and their negation triggers ("not", "except", "without", "other than")
-        let neg_triggers = ["not", "except", "without", "excluding", "other", "than"];
-        words.retain(|w| {
-            let w_lower = w.to_lowercase();
-            // Strip leading dash for comparison: "-snake" → "snake"
-            let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower).to_string();
-            !neg_terms.contains(&w_stripped) && !neg_terms.contains(&w_lower) && !neg_triggers.contains(&w_stripped.as_str()) && !neg_triggers.contains(&w_lower.as_str())
-        });
-        words.join(" ")
-    }).filter(|q| !q.trim().is_empty()).collect();
-
-    let expanded_queries = if !cleaned_queries.is_empty() { cleaned_queries } else { expanded_queries };
-    tracing::info!("Fan-out with {} query variations: {:?}", expanded_queries.len(), expanded_queries);
-
-    let freshness_keywords = ["latest", "recent", "week", "month", "today", "newest", "cve", "vulnerability"];
-    let is_freshness_query = intent.constraints.iter().any(|c| {
-        let c_low = c.to_lowercase();
-        freshness_keywords.iter().any(|&k| c_low.contains(k))
-    }) || q.to_lowercase().contains("latest") || q.to_lowercase().contains("recent")
-      || intent.intent == "fresh";
-
-    let mut indexer_query = if let Some(ref v) = vector {
-        let v_json = serde_json::to_string(v).unwrap();
-        format!("http://127.0.0.1:6000/search?q={}&vector={}&min_score=0.5", q_encoded, urlencoding::encode(&v_json))
-    } else {
-        format!("http://127.0.0.1:6000/search?q={}", q_encoded)
-    };
-
-    if is_freshness_query {
-        indexer_query.push_str("&freshness_boost=true");
-    }
-
-    // Build SearXNG URLs for expanded queries
-    // Dynamic fan-out: 1 query for freshness intents (speed > recall),
-    // 2 queries for everything else (technical, how-to, comparison, informational, etc.)
-    // to maximize recall and utilize both SearXNG instances in parallel.
-    let searx_fanout = match intent.intent.as_str() {
-        "fresh" => 1,
-        _ => 2,
-    };
+    // ─── Build engine URLs with raw query (no intent dependency) ────
+    // Engines fire immediately in parallel with intent analysis.
+    // Intent results are used post-hoc for scoring, not for query construction.
     let searx_base_urls: Vec<&str> = if state.searxng2_url.is_some() {
         vec!["http://127.0.0.1:8080", state.searxng2_url.as_deref().unwrap()]
     } else {
         vec!["http://127.0.0.1:8080"]
     };
-    tracing::info!("SearXNG fan-out: {} query(s) for intent '{}' ({} instance(s))", searx_fanout, intent.intent, searx_base_urls.len());
-    // Preprocess queries to strip trigger words that cause dictionary/shopping results
-    // For freshness queries, add time_range parameter to get recent results
-    let searx_urls: Vec<String> = expanded_queries.iter().take(searx_fanout).enumerate().map(|(i, eq)| {
-        let clean_eq = preprocess_searxng_query(eq);
-        // Round-robin across SearXNG instances: query 0 → instance 0, query 1 → instance 1
-        let base_url = searx_base_urls[i % searx_base_urls.len()];
-        let mut url = format!("{}/search?q={}&format=json&pageno=1", base_url, urlencoding::encode(&clean_eq));
-        if is_freshness_query {
-            url.push_str("&time_range=month");
-        }
-        url
+
+    // Build SearXNG URLs: one per instance, raw query (no expanded queries yet)
+    let searx_urls: Vec<String> = searx_base_urls.iter().enumerate().map(|(i, base_url)| {
+        let clean_q = preprocess_searxng_query(&q);
+        format!("{}/search?q={}&format=json&pageno=1", base_url, urlencoding::encode(&clean_q))
     }).collect();
 
     let whoogle_url = format!("http://127.0.0.1:5000/search?q={}&format=json", q_encoded);
     let invidious_url = format!("http://127.0.0.1:3000/api/v1/search?q={}", q_encoded);
+
+    let indexer_query_raw = format!("http://127.0.0.1:6000/search?q={}", q_encoded);
 
     let client_ref = &client;
     let circuit_ref = &state.circuit;
     let ratelimit_ref = &state.rate_limits;
 
     // Check circuit breaker before calling each engine
-    // Per-instance keys: SearXNG1 (gluetun) and SearXNG2 (independent) fail independently
     let searx_instance_keys: Vec<String> = searx_base_urls.iter().enumerate().map(|(i, _)| {
         format!("searxng{}", i)
     }).collect();
@@ -2441,7 +2381,7 @@ async fn handle_search(
     let invidious_open = circuit_ref.is_open("invidious");
 
     let indexer_fut = async {
-        let resp = client_ref.get(&indexer_query).send().await?;
+        let resp = client_ref.get(&indexer_query_raw).send().await?;
         let status = resp.status();
         resp.json::<Vec<IndexerResult>>().await.map_err(|e| {
             tracing::error!("Failed to parse Indexer JSON (status: {}): {:?}", status, e);
@@ -2449,8 +2389,7 @@ async fn handle_search(
         })
     };
 
-    // Fire all SearXNG variations in parallel, with retry on 0 results
-    // (VPN drops cause simultaneous failures across all engines — retry recovers)
+    // Fire all SearXNG instances in parallel with retry on 0 results
     let searx_instance_keys_ref = &searx_instance_keys;
     let searx_futs: Vec<_> = searx_urls.iter().enumerate().map(|(i, url)| {
         let url = url.clone();
@@ -2458,10 +2397,8 @@ async fn handle_search(
         let is_open = searx_instance_open[i];
         async move {
             if is_open {
-                tracing::info!("SearXNG {} circuit OPEN — skipping", instance_key);
                 return Ok(SearxResponse { results: vec![] });
             }
-            // First attempt — sanitize control chars before JSON parse
             let first: Result<SearxResponse, reqwest::Error> = async {
                 let resp = client_ref.get(&url).send().await?;
                 let status = resp.status();
@@ -2471,7 +2408,6 @@ async fn handle_search(
                     Ok(data) => Ok(data),
                     Err(e) => {
                         tracing::error!("Failed to parse SearXNG JSON (status: {}): {:?}", status, e);
-                        // Return empty response instead of error to allow retry
                         Ok(SearxResponse { results: vec![] })
                     }
                 }
@@ -2480,8 +2416,6 @@ async fn handle_search(
             match first {
                 Ok(data) if !data.results.is_empty() => Ok(data),
                 Ok(_) => {
-                    // 0 results — check if retry would help.
-                    // Skip retry for obviously malformed queries (special chars, too long, gibberish)
                     let url_lower = url.to_lowercase();
                     let q_part = url_lower.split("q=").nth(1).unwrap_or("");
                     let q_decoded = q_part.split("&").next().unwrap_or("");
@@ -2490,24 +2424,18 @@ async fn handle_search(
                     } else { 0.0 };
                     let is_malformed = q_decoded.len() > 200 || alpha_ratio < 0.3;
                     if is_malformed {
-                        tracing::info!("Skipping retry for malformed query (alpha_ratio={:.2}, len={})", alpha_ratio, q_decoded.len());
                         return Ok(SearxResponse { results: vec![] });
                     }
-                    // Retry once after 500ms for legitimate queries that returned 0 results
                     tracing::warn!("SearXNG returned 0 results, retrying in 500ms...");
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let retry: Result<SearxResponse, reqwest::Error> = async {
                         let resp = client_ref.get(&url).send().await?;
                         let status = resp.status();
-                        // Detect rate limiting (429) and trigger VPN rotation with rate-limit count
                         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                             let rl_count = ratelimit_ref.count_in_window(300);
                             ratelimit_ref.record();
                             let new_count = ratelimit_ref.count_in_window(300);
-                            tracing::warn!(
-                                "SearXNG got 429 Too Many Requests — rate-limits in 5min window: {} → {}",
-                                rl_count, new_count
-                            );
+                            tracing::warn!("SearXNG got 429 — rate-limits in 5min: {} → {}", rl_count, new_count);
                             trigger_vpn_rotation(&format!("429_rate_limit_{}", new_count));
                         }
                         let raw = resp.text().await.unwrap_or_default();
@@ -2520,7 +2448,6 @@ async fn handle_search(
                             }
                         }
                     }.await;
-                    // If retry also returned 0 results, signal VPN rotation
                     if let Ok(ref data) = retry {
                         if data.results.is_empty() {
                             tracing::warn!("SearXNG retry returned 0 results — triggering VPN rotation");
@@ -2530,9 +2457,6 @@ async fn handle_search(
                     retry
                 }
                 Err(e) => {
-                    // Don't trigger VPN rotation on connection errors — these are local
-                    // infrastructure issues (container down, port conflict), not IP blocks.
-                    // VPN rotation only helps with 429 rate limits or search engine blocks.
                     tracing::warn!("SearXNG request failed (local error, no VPN rotation): {:?}", e);
                     Err(e)
                 }
@@ -2542,66 +2466,77 @@ async fn handle_search(
 
     let whoogle_fut = async {
         if whoogle_open {
-            tracing::info!("Whoogle circuit OPEN — skipping");
             return Ok::<WhoogleResponse, anyhow::Error>(WhoogleResponse { results: vec![] });
         }
-        let resp = client_ref.get(&whoogle_url).send().await?;
-        let status = resp.status();
-        let raw_text = resp.text().await.unwrap_or_default();
-        // Parse Whoogle JSON into Value (no struct-level duplicate field rejection),
-        // then extract results manually. This avoids serde's "duplicate field" error
-        // caused by Whoogle returning both "title" and "text" keys in each result.
-        match serde_json::from_str::<serde_json::Value>(&raw_text) {
-            Ok(val) => {
-                let results: Vec<WhoogleResult> = val
-                    .get("results")
-                    .and_then(|r| r.as_array())
-                    .map(|arr| {
-                        arr.iter().filter_map(|item| {
-                            let url = item.get("href").or_else(|| item.get("link"))
-                                .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let title = item.get("title").or_else(|| item.get("text"))
-                                .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let description = item.get("content").or_else(|| item.get("desc"))
-                                .or_else(|| item.get("snippet"))
-                                .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            if url.is_empty() { return None; }
-                            Some(WhoogleResult { url, title, description: Some(description) })
-                        }).collect()
-                    })
-                    .unwrap_or_default();
-                Ok(WhoogleResponse { results })
+        match tokio::time::timeout(Duration::from_secs(2), client_ref.get(&whoogle_url).send()).await {
+            Ok(Ok(resp)) => {
+                let status = resp.status();
+                let raw_text = resp.text().await.unwrap_or_default();
+                match serde_json::from_str::<serde_json::Value>(&raw_text) {
+                    Ok(val) => {
+                        let results: Vec<WhoogleResult> = val
+                            .get("results")
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter().filter_map(|item| {
+                                    let url = item.get("href").or_else(|| item.get("link"))
+                                        .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let title = item.get("title").or_else(|| item.get("text"))
+                                        .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let description = item.get("content").or_else(|| item.get("desc"))
+                                        .or_else(|| item.get("snippet"))
+                                        .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    if url.is_empty() { return None; }
+                                    Some(WhoogleResult { url, title, description: Some(description) })
+                                }).collect()
+                            })
+                            .unwrap_or_default();
+                        Ok(WhoogleResponse { results })
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to parse Whoogle JSON (status: {}): {:?}", status, e);
+                        Err(e.into())
+                    }
+                }
             }
-            Err(e) => {
-                tracing::error!("Failed to parse Whoogle JSON (status: {}): {:?}", status, e);
+            Ok(Err(e)) => {
+                tracing::warn!("Whoogle request failed: {}", e);
                 Err(e.into())
+            }
+            Err(_) => {
+                tracing::warn!("Whoogle timed out after 2s");
+                Ok(WhoogleResponse { results: vec![] })
             }
         }
     };
 
     let invidious_fut = async {
         if invidious_open {
-            tracing::info!("Invidious circuit OPEN — skipping");
             return Ok(vec![]);
         }
-        let resp = client_ref.get(&invidious_url).send().await?;
-        let status = resp.status();
-        resp.json::<Vec<InvidiousResult>>().await.map_err(|e| {
-            tracing::error!("Failed to parse Invidious JSON (status: {}): {:?}", status, e);
-            e
-        })
+        match tokio::time::timeout(Duration::from_secs(2), client_ref.get(&invidious_url).send()).await {
+            Ok(Ok(resp)) => {
+                let status = resp.status();
+                resp.json::<Vec<InvidiousResult>>().await.map_err(|e| {
+                    tracing::error!("Failed to parse Invidious JSON (status: {}): {:?}", status, e);
+                    e
+                })
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Invidious request failed: {}", e);
+                Err(e.into())
+            }
+            Err(_) => {
+                tracing::warn!("Invidious timed out after 2s");
+                Ok(vec![])
+            }
+        }
     };
 
-    // Conditional media fan-out based on intent
+    // Conditional media fan-out based on raw query signals (no intent dependency)
     let q_lower = q.to_lowercase();
-    let is_news_intent = intent.intent.contains("news")
-        || intent.intent.contains("fresh")
-        || q_lower.contains("news")
-        || q_lower.contains("latest");
-    let is_image_intent = intent.intent.contains("image")
-        || intent.intent.contains("visual")
-        || q_lower.contains("image")
-        || q_lower.contains("photo")
+    let is_news_intent = q_lower.contains("news") || q_lower.contains("latest");
+    let is_image_intent = q_lower.contains("image") || q_lower.contains("photo")
         || q_lower.contains("picture");
 
     let news_fut = async {
@@ -2644,21 +2579,26 @@ async fn handle_search(
         }
     };
 
-    // Join all futures: indexer + all SearXNG variations + whoogle + invidious + media
-    // Like a search engine: fast engines contribute, slow ones get cut by individual timeouts
     let searx_fut_with_timeout = async {
         match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(3),  // SearXNG0 responds in 2-3s; cut slow fans
             futures::future::join_all(searx_futs),
         ).await {
             Ok(results) => results,
             Err(_) => {
-                tracing::warn!("SearXNG fan-out timed out after 5s — returning partial results");
+                tracing::warn!("SearXNG fan-out timed out after 3s — returning partial results");
                 vec![]
             }
         }
     };
-    let (indexer_res, searx_results, whoogle_res, invidious_res, news_res, image_res) = tokio::join!(
+
+    // ─── SINGLE PARALLEL JOIN: intent + engines fire simultaneously ───
+    // This eliminates the sequential intent→engines pipeline.
+    // Engines start fetching immediately; intent runs in parallel.
+    // Latency = max(intent, engines) instead of intent + engines.
+    let (intent_result, embed_res, indexer_res, searx_results, whoogle_res, invidious_res, news_res, image_res) = tokio::join!(
+        intent_fut,
+        embed_fut,
         indexer_fut,
         searx_fut_with_timeout,
         whoogle_fut,
@@ -2666,6 +2606,59 @@ async fn handle_search(
         news_fut,
         image_fut,
     );
+
+    // 2. Process Intent & Embedding (now available alongside engine results)
+    let intent: IntentResponse = match intent_result {
+        Ok(parsed) => parsed,
+        Err(()) => {
+            tracing::error!("Intent Engine unreachable after 3 attempts — using fallback");
+            fallback_intent(&q)
+        }
+    };
+
+    let vector: Option<Vec<f32>> = match embed_res {
+        Ok(resp) => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                json["embedding"].as_array().map(|arr| {
+                    arr.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect()
+                })
+            } else { None }
+        },
+        Err(_) => None,
+    };
+
+    // 3. Intent-based post-processing: freshness, expanded queries, secondary fan-out
+    let freshness_keywords = ["latest", "recent", "week", "month", "today", "newest", "cve", "vulnerability"];
+    let is_freshness_query = intent.constraints.iter().any(|c| {
+        let c_low = c.to_lowercase();
+        freshness_keywords.iter().any(|&k| c_low.contains(k))
+    }) || q.to_lowercase().contains("latest") || q.to_lowercase().contains("recent")
+      || intent.intent == "fresh";
+
+    // Secondary fan-out with expanded queries if initial results are sparse
+    let expanded_queries = if intent.expanded_queries.len() > 1 {
+        intent.expanded_queries.clone()
+    } else {
+        vec![q.clone()]
+    };
+    let neg_terms: Vec<String> = intent.structured_constraints.negative.iter()
+        .map(|n| n.to_lowercase())
+        .collect();
+    let cleaned_queries: Vec<String> = expanded_queries.iter().map(|eq| {
+        if neg_terms.is_empty() { return eq.clone(); }
+        let mut words: Vec<&str> = eq.split_whitespace().collect();
+        let neg_triggers = ["not", "except", "without", "excluding", "other", "than"];
+        words.retain(|w| {
+            let w_lower = w.to_lowercase();
+            let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower).to_string();
+            !neg_terms.contains(&w_stripped) && !neg_terms.contains(&w_lower) && !neg_triggers.contains(&w_stripped.as_str()) && !neg_triggers.contains(&w_lower.as_str())
+        });
+        words.join(" ")
+    }).filter(|q| !q.trim().is_empty()).collect();
+    let expanded_queries = if !cleaned_queries.is_empty() { cleaned_queries } else { expanded_queries };
+
+    // TODO: Secondary fan-out with expanded queries if searx_results are sparse
+    // For now, scoring uses intent-based weighting on the raw query results
 
     // 4. Process Local Results
     let mut local_results: Vec<IndexerResult> = match indexer_res {
@@ -2742,15 +2735,17 @@ async fn handle_search(
     }
 
     // Smart retry: if overall results are significantly below expected,
-    // try a different query variation on the other SearXNG instance
+    // try a different expanded query variation on another SearXNG instance.
+    // The initial fan-out uses the raw query (== expanded_queries[0]) on all instances,
+    // so we've used exactly 1 query variation — the retry should skip it.
     let total_results = web_results.len();
     let expected_min = if expanded_queries.len() > 1 { 15 } else { 10 };
     if total_results < expected_min && !expanded_queries.is_empty() && searx_base_urls.len() > 1 {
-        // Pick a query variation we didn't use yet
-        let retry_query_idx = if expanded_queries.len() > searx_fanout { searx_fanout } else { 0 };
+        // Pick the first expanded query variation we haven't tried yet (skip index 0 = raw query)
+        let retry_query_idx = if expanded_queries.len() > 1 { 1 } else { 0 };
         if let Some(retry_eq) = expanded_queries.get(retry_query_idx) {
-            // Use the OTHER SearXNG instance
-            let retry_instance_idx = if searx_fanout == 1 { 1 } else { 0 };
+            // Try the second SearXNG instance (index 1) if available, else first
+            let retry_instance_idx = if searx_base_urls.len() > 1 { 1 } else { 0 };
             if let Some(retry_base) = searx_base_urls.get(retry_instance_idx) {
                 let clean_eq = preprocess_searxng_query(retry_eq);
                 let retry_url = format!("{}/search?q={}&format=json&pageno=1", retry_base, urlencoding::encode(&clean_eq));

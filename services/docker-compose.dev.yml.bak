@@ -16,7 +16,7 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     env_file:
-      - ./privacy-layer/.env
+      - ../.env
     environment:
       - VPN_SERVICE_PROVIDER=protonvpn
       - VPN_TYPE=openvpn
@@ -99,13 +99,12 @@ services:
     container_name: if-dev-searxng
     image: searxng/searxng:latest
     network_mode: "service:gluetun"
-    depends_on:
-      - tor
     environment:
       - GRANIAN_WORKERS=4
       - GRANIAN_HOST=0.0.0.0
     volumes:
       - ./meta-search-engines/searxng/searxng:/etc/searxng:rw
+      - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
     restart: always
     cap_drop:
       - ALL
@@ -245,7 +244,7 @@ services:
     environment:
       - INTENT_ENGINE_URL=http://localhost:3005
       - SEARXNG_URL=http://localhost:8080
-      - SEARXNG2_URL=http://tor2:8081
+      - SEARXNG2_URL=http://172.20.0.1:8081
       - CRAWLER_URL=http://localhost:5001
       - INDEXER_URL=http://localhost:6000
     volumes:

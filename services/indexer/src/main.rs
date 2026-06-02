@@ -239,7 +239,7 @@ async fn handle_search(
         }
     };
 
-    let limit = 100;
+    let limit = 200; // larger pool for domain diversity filtering
     let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(limit)).unwrap();
 
     // Title-only search for boost scoring
@@ -342,7 +342,43 @@ async fn handle_search(
         })
         .collect();
 
+    // Sort by score descending
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Domain diversity: cap results per domain to prevent single-domain dominance
+    // Without this, "rust web framework" returns 10/10 from github.com
+    const MAX_PER_DOMAIN: usize = 3;
+    let mut domain_counts: HashMap<String, usize> = HashMap::new();
+    let mut diverse_results: Vec<SearchResult> = Vec::new();
+    for r in results {
+        // Extract domain without reqwest dependency: "https://sub.domain.com/path" → "sub.domain.com"
+        let domain = r.url
+            .split("://")
+            .nth(1)
+            .and_then(|s| s.split('/').next())
+            .and_then(|s| s.split(':').next())
+            .unwrap_or("")
+            .to_lowercase();
+        let count = domain_counts.entry(domain).or_insert(0);
+        if *count < MAX_PER_DOMAIN {
+            *count += 1;
+            diverse_results.push(r);
+        }
+    }
+    let mut results = diverse_results;
+
+    // Normalize scores to [0, 1] range using max-score normalization
+    // Raw RRF scores are 0.03-0.04 which is meaningless to consumers
+    if let Some(max_score) = results.iter().map(|r| r.score).fold(None, |acc, s| {
+        Some(match acc { Some(m) => s.max(m), None => s })
+    }) {
+        if max_score > 0.0 {
+            for r in results.iter_mut() {
+                r.score /= max_score;
+            }
+        }
+    }
+
     results.truncate(10);
 
     Json(results)

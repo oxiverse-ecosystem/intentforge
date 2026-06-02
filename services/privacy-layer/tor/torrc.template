@@ -7,11 +7,13 @@ Log notice stdout
 UseBridges 0
 
 # ══════════════════════════════════════════════════════════════
-# SPEED OPTIMIZATIONS (same as tor2)
+# RELIABILITY OPTIMIZATIONS (same as tor2)
 # ══════════════════════════════════════════════════════════════
 
-NumEntryGuards 1
+# Multiple guards — prevents single-guard failure cascade
+NumEntryGuards 3
 UseEntryGuards 1
+
 LearnCircuitBuildTimeout 1
 CircuitBuildTimeout 15
 CircuitIdleTimeout 120
@@ -22,4 +24,17 @@ FetchDirInfoEarly 1
 FetchDirInfoExtraEarly 1
 KeepalivePeriod 60
 ConnLimit 1024
-ClientPreferIPv6ORPort 1
+
+# Shared namespace: don't exclude guards from same subnet
+EnforceDistinctSubnets 0
+
+# Client-only — never relay
+ExitPolicy reject *:*
+ExitPolicy reject6 *:*
+
+# Don't prefer IPv6 ORPorts
+ClientPreferIPv6ORPort 0
+
+# Reduce overhead
+DirCache 0
+V3AuthoritativeDirectory 0

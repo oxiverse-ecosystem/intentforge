@@ -1,4 +1,4 @@
-# torrc for tor2 — optimized for speed (SearXNG2 proxy)
+# torrc for tor2 — optimized for reliability (SearXNG2 proxy)
 SocksPort 0.0.0.0:9051
 DataDirectory /var/lib/tor
 Log notice stdout
@@ -7,11 +7,12 @@ Log notice stdout
 UseBridges 0
 
 # ══════════════════════════════════════════════════════════════
-# SPEED OPTIMIZATIONS
+# RELIABILITY OPTIMIZATIONS (no timeout changes)
 # ══════════════════════════════════════════════════════════════
 
-# Single guard node — faster circuit building, less handshake overhead
-NumEntryGuards 1
+# Multiple guard nodes — redundancy prevents single-guard failure cascade
+# (was 1: a single slow/excluded guard broke ALL circuits)
+NumEntryGuards 3
 UseEntryGuards 1
 
 # Learn and enforce fast circuit build timeout
@@ -38,5 +39,24 @@ KeepalivePeriod 60
 # Connection limits
 ConnLimit 1024
 
-# Prefer faster relays
-ClientPreferIPv6ORPort 1
+# ══════════════════════════════════════════════════════════════
+# SHARED NAMESPACE FIXES
+# ══════════════════════════════════════════════════════════════
+
+# Don't enforce distinct subnets — all containers share gluetun's netns
+# Without this, Tor excludes guards from the same /24 → "path restriction type 2"
+EnforceDistinctSubnets 0
+
+# Never act as a relay — this is a client-only instance
+ExitPolicy reject *:*
+ExitPolicy reject6 *:*
+
+# Don't prefer IPv6 — IPv6 ORPorts cause more connection failures
+ClientPreferIPv6ORPort 0
+
+# Reduce directory overhead — we don't need to serve descriptors
+DirCache 0
+V3AuthoritativeDirectory 0
+
+# Stale consensus detection — prefer fresh consensus
+TestingTorNetwork 0

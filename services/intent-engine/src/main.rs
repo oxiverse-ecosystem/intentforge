@@ -919,8 +919,54 @@ fn commercial_detector(query: &str) -> IntentEvidence {
     }
 
     // Comparison signals
-    if q.contains(" vs ") || q.contains(" versus ")
-        || q.starts_with("best ") || q.starts_with("top ")
+    // "vs" is context-sensitive: surrounded by technical jargon → partial comparison,
+    // not a pure consumer comparison. "io_uring vs epoll for HFT" is a technical
+    // deep-dive, not "which should I buy". Consumer terms (best, cheap, buy, top)
+    // confirm pure comparison intent.
+    let has_vs = q.contains(" vs ") || q.contains(" versus ");
+
+    // Technical jargon indicators — words that signal deep implementation discussion
+    let tech_jargon = [
+        "io_uring", "epoll", "kqueue", "select", "poll", "uring",
+        "syscall", "kernel", "userspace", "latency", "throughput",
+        "hft", "benchmark", "simd", "avx", "sse", "vectorize",
+        "cache", " prefetch", "branch", "pipeline", "mutex", "lock",
+        "atomic", "memory model", "consensus", "raft", "paxos",
+        "zero-copy", "lock-free", "wait-free", "coroutine", "fiber",
+        "green thread", "stackless", "stackful", "monomorphization",
+        "vtable", "inline", "link-time", "jit", "aot", "interpreter",
+        "bytecode", "opcode", "register", "heap", "stack", "allocator",
+        "garbage collector", "gc", "arena", "bump", "slab",
+        "serialization", "protobuf", "flatbuffer", "capnproto",
+        "quic", "http3", "websocket", "grpc", "tcp", "udp",
+        "b-tree", "lsm", "bloom filter", "skip list", "red-black",
+        "io_uring", "dpdk", "xdp", "ebpf", "nvme", "spdk",
+    ];
+    let has_tech_jargon = tech_jargon.iter().any(|t| q.contains(t));
+
+    // Consumer comparison signals — user wants a recommendation, not deep analysis
+    let consumer_signals = words.iter().any(|w|
+        *w == "best" || *w == "top" || *w == "cheap" || *w == "buy"
+        || *w == "price" || *w == "pricing" || *w == "cost"
+        || *w == "beginner" || *w == "easy" || *w == "simple"
+        || *w == "popular" || *w == "recommended"
+    );
+
+    if has_vs {
+        if has_tech_jargon && !consumer_signals {
+            // Technical deep-dive: "io_uring vs epoll for HFT"
+            // Reduce comparison, boost technical — user wants implementation details
+            ev.comparison = 0.40;
+            ev.technical = 0.50;
+        } else {
+            // Pure comparison: "react vs vue", "best X vs Y"
+            ev.comparison = 0.75;
+        }
+    }
+
+    // Non-"vs" comparison patterns (not affected by tech jargon check)
+    if !has_vs && (
+        q.starts_with("best ") || q.starts_with("top ")
         || q.starts_with("compare ") || q.contains(" comparison")
         || q.starts_with("which ") || q.starts_with("better ")
         // "alternative/recommend" patterns
@@ -929,7 +975,7 @@ fn commercial_detector(query: &str) -> IntentEvidence {
         || q.starts_with("i need ") || q.starts_with("i want ")
         // "or" between options: "X or Y"
         || (q.contains(" or ") && words.len() <= 8)
-    {
+    ) {
         ev.comparison = 0.75;
     }
 
@@ -953,6 +999,89 @@ fn freshness_detector(query: &str) -> IntentEvidence {
         || q.starts_with("new ")
     {
         ev.fresh = 0.75;
+    }
+
+    ev
+}
+
+fn error_pattern_detector(query: &str) -> IntentEvidence {
+    // Detects error messages, HTTP status codes, exit codes, and system errors.
+    // When a user searches for an error, they want a SOLUTION — how-to intent.
+    // This catches queries like "exit code 137", "nginx 502 bad gateway",
+    // "deadlock detected", "OOM killed", "connection refused", etc.
+    let q = query.trim().to_lowercase();
+    let words: Vec<&str> = q.split_whitespace().collect();
+    let mut ev = IntentEvidence::zero();
+
+    // ── HTTP status codes ──
+    // "502 bad gateway", "404 not found", "500 internal server error"
+    let http_codes = [
+        "400", "401", "403", "404", "405", "408", "409", "410", "429",
+        "500", "502", "503", "504", "520", "521", "522", "523", "524",
+    ];
+    let has_http_code = words.iter().any(|w| http_codes.contains(w));
+    let has_http_context = q.contains("bad gateway") || q.contains("not found")
+        || q.contains("forbidden") || q.contains("unauthorized")
+        || q.contains("internal server error") || q.contains("gateway timeout")
+        || q.contains("service unavailable") || q.contains("too many requests");
+
+    // ── Exit codes ──
+    // "exit code 137", "exit code 1", "exit status 127", "returned 1"
+    let has_exit_code = q.contains("exit code") || q.contains("exit status")
+        || q.contains("exit code=") || q.contains("returned exit")
+        || q.contains("exit with code");
+
+    // ── System/infra errors ──
+    let error_terms = [
+        "oom", "out of memory", "killed", "segfault", "segmentation fault",
+        "deadlock", "race condition", "connection refused", "connection timed out",
+        "connection reset", "broken pipe", "no such file", "permission denied",
+        "access denied", "disk full", "no space left", "stack overflow",
+        "null pointer", "nullptr", "sigkill", "sigsegv", "sigabrt",
+        "core dumped", "panic", "fatal error", "unclean shutdown",
+    ];
+    let has_system_error = error_terms.iter().any(|t| q.contains(t));
+
+    // ── Error keywords with technical context ──
+    // "error", "exception", "failure" alone are too generic — need context
+    let has_error_keyword = words.iter().any(|w|
+        *w == "error" || *w == "exception" || *w == "failure"
+        || *w == "crash" || *w == "failing" || *w == "broken"
+        || *w == "corrupt" || *w == "timeout" || *w == "timed"
+    );
+    let has_tech_context = words.iter().any(|w|
+        *w == "nginx" || *w == "apache" || *w == "postgres" || *w == "mysql"
+        || *w == "redis" || *w == "docker" || *w == "kubernetes" || *w == "k8s"
+        || *w == "node" || *w == "python" || *w == "java" || *w == "go"
+        || *w == "rust" || *w == "linux" || *w == "ubuntu" || *w == "debian"
+        || *w == "ssh" || *w == "ssl" || *w == "tls" || *w == "dns"
+        || *w == "tcp" || *w == "http" || *w == "https" || *w == "api"
+        || *w == "pod" || *w == "container" || *w == "cluster" || *w == "server"
+    );
+
+    // ── Stack trace indicators ──
+    let has_stack_trace = q.contains("traceback") || q.contains("stack trace")
+        || q.contains("stacktrace") || q.contains("at line")
+        || q.contains("file \"") || q.contains("line number");
+
+    // ── Combine signals ──
+    if has_http_code || has_http_context {
+        // HTTP errors are strong how-to signals
+        ev.how_to = 0.80;
+        ev.technical = 0.25;
+    } else if has_exit_code {
+        ev.how_to = 0.80;
+        ev.technical = 0.20;
+    } else if has_system_error {
+        ev.how_to = 0.75;
+        ev.technical = 0.30;
+    } else if has_stack_trace {
+        ev.how_to = 0.70;
+        ev.technical = 0.35;
+    } else if has_error_keyword && has_tech_context {
+        // "python connection error" → how-to (looking for fix)
+        ev.how_to = 0.65;
+        ev.technical = 0.35;
     }
 
     ev
@@ -1297,6 +1426,7 @@ fn evidence_classify(
     let t_evidence = tech_detector(query);
     let c_evidence = commercial_detector(query);
     let f_evidence = freshness_detector(query);
+    let r_evidence = error_pattern_detector(query); // NEW: error→how-to
 
     // Entity detector needs embeddings for centroid distance signals
     let e_evidence = if let Some(emb) = query_embedding {
@@ -1337,6 +1467,7 @@ fn evidence_classify(
         (t_evidence, tech_weight), // Tech terms: adaptive weight based on how-to signal
         (c_evidence, 0.9),        // Commercial patterns are reliable
         (f_evidence, 0.8),        // Freshness patterns are fairly reliable
+        (r_evidence, 0.85),       // Error patterns: strong how-to signal
         (e_evidence, 0.6),        // Entity detection is noisier
         (x_evidence, 0.85),       // Exploration patterns are fairly reliable
     ];

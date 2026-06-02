@@ -1,0 +1,201 @@
+query,expected,predicted,confidence,correct,top_score,result_count,time_ms
+reddit,navigational,navigational,0.9639,1,0.97,5,3042
+youtube,navigational,navigational,0.9779,1,0.97,7,3026
+github,navigational,transactional,0.9636,0,0.97,6,3028
+twitter,navigational,navigational,0.9531,1,0.97,9,3036
+wikipedia,navigational,navigational,0.9785,1,0.97,15,3028
+amazon,navigational,navigational,0.9728,1,0.97,9,3044
+netflix,navigational,navigational,0.9664,1,0.97,6,2909
+stackoverflow,navigational,navigational,0.9762,1,0.97,8,3031
+linkedin,navigational,navigational,0.9551,1,0.97,11,3024
+spotify,navigational,navigational,0.9588,1,0.97,6,2008
+openai,navigational,navigational,0.9489,1,0.97,6,2031
+docker hub,navigational,technical,0.75,0,0.97,15,2007
+npm,navigational,navigational,0.9826,1,0.97,8,2025
+pypi,navigational,navigational,0.9764,1,0.97,10,2024
+crates.io,navigational,navigational,0.9,1,0.97,5,2007
+hacker news,navigational,navigational,0.9662,1,0.97,11,3010
+reddit login,navigational,navigational,0.85,1,0.97,8,3022
+gmail sign in,navigational,navigational,0.85,1,0.97,7,3006
+github login,navigational,navigational,0.85,1,0.97,7,3024
+aws console,navigational,technical,0.75,0,0.97,6,3027
+google docs,navigational,technical,0.75,0,0.97,11,3008
+google drive,navigational,navigational,0.9298,1,0.97,12,3009
+youtube music,navigational,navigational,0.9615,1,0.97,6,3006
+apple developer,navigational,fresh,0.9276,0,0.97,12,3009
+microsoft docs,navigational,technical,0.75,0,0.97,15,2018
+mdn web docs,navigational,navigational,0.75,1,0.97,10,2008
+vue.js documentation,navigational,technical,0.75,0,0.97,31,7
+rust book,navigational,technical,0.75,0,0.97,34,19
+python docs,navigational,technical,0.75,0,0.97,40,14
+react documentation,navigational,technical,0.75,0,0.97,29,4
+tailwind css docs,navigational,technical,0.75,0,0.97,37,25
+next.js docs,navigational,navigational,0.75,1,0.97,30,17
+docker documentation,navigational,technical,0.75,0,0.97,42,5
+kubernetes docs,navigational,technical,0.75,0,0.97,45,14
+terraform registry,navigational,technical,0.75,0,0.97,44,14
+vscode marketplace,navigational,transactional,0.9616,0,0.97,33,5
+figma,navigational,navigational,0.9714,1,0.97,22,15
+notion,navigational,navigational,0.9815,1,0.97,23,7
+vercel,navigational,navigational,0.9566,1,0.97,31,6
+netlify,navigational,navigational,0.9722,1,0.97,24,27
+what is quantum computing,informational,informational,0.8,1,0.97,5,23
+what is machine learning,informational,informational,0.8,1,0.97,41,4
+what is blockchain,informational,informational,0.8,1,0.97,45,19
+what is docker,informational,informational,0.8,1,0.97,40,5
+what is kubernetes,informational,informational,0.8,1,0.97,36,5
+what is graphql,informational,informational,0.8,1,0.97,15,5
+what is rest api,informational,informational,0.8,1,0.97,20,6
+what is oauth,informational,informational,0.8,1,0.97,8,6
+what is jwt,informational,informational,0.8,1,0.97,21,4
+what is websocket,informational,informational,0.8,1,0.97,30,5
+how does photosynthesis work,informational,informational,0.9374,1,0.97,20,6
+how does the internet work,informational,informational,0.9161,1,0.97,6,6
+how does gps work,informational,informational,0.9309,1,0.97,18,5
+how does encryption work,informational,informational,0.9192,1,0.97,28,5
+how does neural network work,informational,informational,0.9238,1,0.97,27,5
+explain gravity,informational,informational,0.8,1,0.97,34,6
+explain relativity,informational,informational,0.8,1,0.97,24,5
+why is the sky blue,informational,informational,0.8,1,0.97,29,21
+what causes earthquakes,informational,informational,0.8691,1,0.97,36,6
+what is dark matter,informational,informational,0.8,1,0.97,6,16
+define api,informational,informational,0.8,1,0.97,21,6
+define algorithm,informational,informational,0.8,1,0.97,6,7
+define recursion,informational,informational,0.8,1,0.97,32,9
+meaning of life,informational,informational,0.8,1,0.97,9,6
+who invented python,informational,technical,0.75,0,0.97,7,5
+when was javascript created,informational,informational,0.8,1,0.97,48,7
+what are microservices,informational,informational,0.8,1,0.97,7,14
+what is serverless,informational,informational,0.8,1,0.97,47,30
+what is ci cd,informational,informational,0.8,1,0.97,48,5
+what is devops,informational,informational,0.8,1,0.97,49,4
+what is agile methodology,informational,informational,0.8,1,0.97,49,23
+what is scrum,informational,informational,0.8,1,0.97,42,23
+what is technical debt,informational,informational,0.8,1,0.97,55,5
+what is open source,informational,informational,0.8,1,0.97,49,17
+what is linux,informational,informational,0.8,1,0.97,6,29
+what is tcp ip,informational,informational,0.8,1,0.97,22,8
+what is dns,informational,informational,0.8,1,0.97,39,7
+what is http,informational,informational,0.8,1,0.97,47,5
+what is ssl certificate,informational,informational,0.8,1,0.97,60,6
+what is load balancing,informational,informational,0.8,1,0.97,62,21
+how to tie a tie,how-to,how-to,0.9,1,0.97,33,5
+how to cook rice,how-to,how-to,0.9,1,0.97,56,16
+how to change a tire,how-to,how-to,0.9,1,0.97,60,15
+how to write a resume,how-to,how-to,0.9,1,0.97,56,6
+how to start a blog,how-to,how-to,0.9,1,0.97,57,5
+how to learn python,how-to,how-to,0.9,1,0.97,49,16
+how to learn rust,how-to,how-to,0.9,1,0.97,54,15
+how to set up docker,how-to,how-to,0.9,1,0.97,62,5
+how to deploy to aws,how-to,how-to,0.9,1,0.97,47,5
+how to configure nginx,how-to,how-to,0.9,1,0.97,62,6
+how to use git,how-to,how-to,0.9,1,0.97,60,6
+how to create a github action,how-to,how-to,0.9,1,0.97,46,5
+how to implement authentication,how-to,how-to,0.9,1,0.97,56,7
+how to optimize database queries,how-to,how-to,0.9,1,0.97,49,5
+how to set up ssl,how-to,how-to,0.9,1,0.97,49,5
+how to build a rest api,how-to,how-to,0.9,1,0.97,46,5
+how to use docker compose,how-to,how-to,0.9,1,0.97,58,6
+how to set up traefik,how-to,how-to,0.9,1,0.97,45,6
+how to configure redis,how-to,how-to,0.9,1,0.97,37,7
+how to write unit tests,how-to,how-to,0.9,1,0.97,32,5
+how to implement caching,how-to,how-to,0.9,1,0.97,30,4
+how to set up postgresql,how-to,how-to,0.9,1,0.97,23,17
+how to use tmux,how-to,how-to,0.9,1,0.97,6,4
+how to configure vim,how-to,how-to,0.9,1,0.97,38,16
+how to reverse engineer apk,how-to,how-to,0.9,1,0.97,34,3
+buy iphone 16,transactional,transactional,0.85,1,0.97,27,27
+buy macbook pro,transactional,transactional,0.85,1,0.97,23,5
+buy mechanical keyboard,transactional,transactional,0.85,1,0.97,27,4
+buy samsung galaxy s25,transactional,transactional,0.85,1,0.97,11,4
+buy domain name,transactional,transactional,0.85,1,0.97,11,2217
+buy vpn subscription,transactional,transactional,0.85,1,0.97,4,3379
+download vscode,transactional,transactional,0.85,1,0.97,9,3463
+download docker desktop,transactional,transactional,0.85,1,0.97,15,2541
+install python,transactional,transactional,0.85,1,0.97,9,2183
+install node.js,transactional,transactional,0.85,1,0.97,6,2232
+subscribe to netflix,transactional,transactional,0.85,1,0.97,7,3189
+order pizza online,transactional,transactional,0.85,1,0.97,7,3391
+book flight to london,transactional,informational,0.8665,0,0.97,6,3208
+book hotel in paris,transactional,transactional,0.8881,1,0.97,15,3214
+rent a car in tokyo,transactional,transactional,0.8443,1,0.97,9,3234
+get aws free tier,transactional,transactional,0.85,1,0.97,7,3374
+purchase github copilot,transactional,transactional,0.85,1,0.97,3,3229
+sign up for chatgpt,transactional,transactional,0.85,1,0.0,4,3349
+free download audacity,transactional,transactional,0.9606,1,0.97,12,2319
+buy linux foundation certification,transactional,transactional,0.85,1,0.97,15,2335
+order custom stickers,transactional,transactional,0.85,1,0.97,6,2271
+buy bitcoin,transactional,transactional,0.85,1,0.97,8,2198
+purchase adobe creative cloud,transactional,transactional,0.85,1,0.97,9,2197
+buy raspberry pi 5,transactional,transactional,0.85,1,0.97,11,2240
+download android studio,transactional,transactional,0.85,1,0.97,12,2201
+best laptops 2025,comparison,comparison,0.8,1,0.97,8,2017
+best phones 2025,comparison,comparison,0.8,1,0.97,50,3213
+best vpn services,comparison,comparison,0.8,1,0.97,6,3195
+best code editors,comparison,comparison,0.8,1,0.97,6,3215
+best static site generators,comparison,comparison,0.8,1,0.97,9,3210
+rust vs go,comparison,comparison,0.8,1,0.97,9,3224
+typescript vs javascript,comparison,comparison,0.8,1,0.97,7,3222
+postgres vs mysql,comparison,comparison,0.8,1,0.97,6,3350
+docker vs podman,comparison,comparison,0.8,1,0.97,15,3425
+react vs vue vs angular,comparison,comparison,0.8,1,0.97,36,3193
+nvidia vs amd gpu,comparison,comparison,0.8,1,0.97,42,2046
+mac vs linux for development,comparison,comparison,0.8,1,0.97,11,2188
+aws vs gcp vs azure,comparison,comparison,0.8,1,0.97,6,2181
+vim vs neovim vs emacs,comparison,comparison,0.8,1,0.97,7,2219
+top programming languages 2025,comparison,comparison,0.8,1,0.97,11,2270
+python programming,technical,technical,0.75,1,0.97,6,2008
+rust async runtime,technical,technical,0.75,1,0.97,6,2279
+react hooks,technical,technical,0.75,1,0.97,6,3288
+vue.js composition api,technical,technical,0.75,1,0.97,7,3222
+django models,technical,technical,0.75,1,0.97,5,3212
+flask routing,technical,technical,0.75,1,0.97,12,3259
+express middleware,technical,technical,0.75,1,0.97,8,3434
+axum extractors,technical,technical,0.75,1,0.97,5,3224
+tokio channels,technical,technical,0.75,1,0.97,9,3389
+webpack configuration,technical,technical,0.75,1,0.97,14,3216
+typescript generics,technical,technical,0.75,1,0.97,13,3247
+python decorators,technical,technical,0.75,1,0.97,9,2225
+rust lifetimes,technical,technical,0.75,1,0.97,7,2224
+go goroutines,technical,technical,0.75,1,0.97,25,1799
+css grid layout,technical,technical,0.75,1,0.97,6,2277
+deploy kubernetes cluster,how-to,technical,0.75,0,0.97,15,2310
+implement red-black tree,how-to,technical,0.75,0,0.97,7,2297
+cheapest way to send money,transactional,transactional,0.8963,1,0.97,22,2364
+best restaurants near me,comparison,comparison,0.8,1,0.97,7,3026
+weather today,fresh,fresh,0.8,1,0.97,12,3008
+flights to tokyo,transactional,informational,0.8579,0,0.97,9,3007
+python asyncio,technical,technical,0.75,1,0.97,11,3196
+quantum error correction,informational,technical,0.75,0,0.97,6,3251
+react hooks tutorial,how-to,how-to,0.9,1,0.97,6,3215
+machine learning tutorial,how-to,how-to,0.9,1,0.97,10,3007
+rust web framework,technical,technical,0.75,1,0.97,9,3248
+cheap hotels in paris,transactional,transactional,0.8551,1,0.97,30,3022
+best mechanical keyboards,comparison,comparison,0.8,1,0.97,18,1676
+what is transformer architecture,informational,informational,0.8,1,0.97,27,1765
+nginx reverse proxy,technical,technical,0.75,1,0.97,34,2019
+docker compose networking,technical,technical,0.75,1,0.97,15,2246
+kubernetes ingress,technical,technical,0.75,1,0.97,41,1732
+terraform aws setup,how-to,technical,0.75,0,0.97,35,2440
+postgresql performance tuning,how-to,comparison,0.8968,0,0.97,25,3370
+redis caching strategy,technical,technical,0.75,1,0.97,10,3414
+oauth2 implementation,how-to,technical,0.75,0,0.97,10,3526
+jwt vs session cookies,comparison,comparison,0.8,1,0.97,28,3581
+microservices vs monolith,comparison,comparison,0.8,1,0.97,20,3605
+serverless vs containers,comparison,comparison,0.8,1,0.97,5,3709
+ci cd pipeline github actions,how-to,technical,0.892,0,0.97,7,3581
+graphql vs rest api,comparison,comparison,0.8,1,0.97,7,3425
+elasticsearch tutorial,how-to,how-to,0.9,1,0.97,29,1645
+kafka vs rabbitmq,comparison,comparison,0.8,1,0.97,6,2278
+prometheus monitoring setup,how-to,how-to,0.9213,1,0.97,9,2236
+grafana dashboard tutorial,how-to,how-to,0.9,1,0.97,28,3469
+helm chart tutorial,how-to,how-to,0.9,1,0.97,28,3256
+istio service mesh,technical,technical,0.9143,1,0.97,10,2455
+grpc vs rest,comparison,comparison,0.8,1,0.97,9,2585
+webassembly tutorial,how-to,how-to,0.9,1,0.97,32,3659
+tailwind vs bootstrap,comparison,comparison,0.8,1,0.97,8,3726
+svelte vs react,comparison,comparison,0.8,1,0.97,6,3530
+next.js app router,technical,technical,0.75,1,0.97,12,3528
+bun vs node,comparison,comparison,0.8,1,0.97,31,3209
+deno vs node,comparison,comparison,0.8,1,0.97,28,3192
+linux kernel module,technical,technical,0.75,1,0.97,7,2205

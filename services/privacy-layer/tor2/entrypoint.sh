@@ -13,6 +13,19 @@ else
   echo "[tor2] Bridges disabled — starting Tor without bridges"
 fi
 
+# Clear stale Tor state on restart — prevents guard exclusion cascades
+# Old guard state + cached-microdescs from prior runs cause:
+#   "All current guards excluded by path restriction type 2"
+#   97 circuit timeouts in 35 minutes
+if [ -f /var/lib/tor/state ]; then
+  echo "[tor2] Clearing stale Tor state for clean bootstrap..."
+  rm -f /var/lib/tor/state
+  rm -f /var/lib/tor/cached-microdescs
+  rm -f /var/lib/tor/cached-microdescs.new
+  rm -f /var/lib/tor/cached-certs
+  rm -f /var/lib/tor/cached-microdesc-consensus
+fi
+
 # Fix permissions at runtime
 chown -R tor:tor /var/lib/tor
 

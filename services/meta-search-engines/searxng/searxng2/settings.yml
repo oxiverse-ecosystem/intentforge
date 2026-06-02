@@ -15,8 +15,15 @@ use_default_settings:
       # ── News (fast through Tor) ──
       - bing news
       - google news
-      # ── Images (fast through Tor) ──
+      - hackernews
+      # ── Images (multiple providers through Tor) ──
       - bing images
+      - google images
+      - duckduckgo images
+      # ── Videos through Tor ──
+      - bing videos
+      - google videos
+      - duckduckgo videos
 
 server:
   port: 8081
@@ -37,55 +44,90 @@ search:
   default_lang: "en"
 
 outgoing:
-  request_timeout: 2.5     # Tighter — we know which engines are fast
-  max_request_timeout: 5.0
+  request_timeout: 6.0     # raised from 4.0 — Tor circuits need more headroom
+  max_request_timeout: 12.0 # raised from 8.0 — some Tor exits are slow
   # ALL traffic goes through Tor2 (port 9051)
   networks:
     default:
       proxies:
         all://: socks5h://127.0.0.1:9051
       using_tor_proxy: true
-      retries: 0            # No retries through Tor — fail fast
+      retries: 1            # One retry through Tor — circuits can stall
     tor:
       proxies:
         all://: socks5h://127.0.0.1:9051
       using_tor_proxy: true
-      retries: 0
+      retries: 1
 
 engines:
-  # ── Fast engines via Tor ──
+  # ── Fast engines via Tor (higher timeouts for Tor latency) ──
   - name: bing
     disabled: false
-    timeout: 3.0
+    timeout: 5.0
 
   - name: startpage
     disabled: false
-    timeout: 3.0
+    timeout: 5.0
 
   - name: duckduckgo
     disabled: false
-    timeout: 3.0
+    timeout: 5.0
 
   - name: mojeek
     disabled: false
-    timeout: 3.0
+    timeout: 5.0
 
   - name: wikipedia
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
-  # ── Image & News via Tor ──
+  # ── Image engines via Tor (multiple for redundancy) ──
   - name: bing images
     engine: bing_images
     disabled: false
-    timeout: 3.0
+    timeout: 5.0
 
+  - name: google images
+    engine: google_images
+    disabled: false
+    timeout: 5.0
+
+  - name: duckduckgo images
+    engine: duckduckgo_extra
+    ddg_category: images
+    shortcut: ddi
+    disabled: false
+    timeout: 5.0
+
+  # ── News via Tor ──
   - name: bing news
     engine: bing_news
     disabled: false
-    timeout: 3.0
+    timeout: 5.0
 
   - name: google news
     engine: google_news
     disabled: false
-    timeout: 3.0
+    timeout: 5.0
+
+  - name: hackernews
+    disabled: false
+    timeout: 5.0
+
+  # ── Video engines via Tor ──
+  - name: bing videos
+    engine: bing_videos
+    disabled: false
+    timeout: 5.0
+
+  - name: google videos
+    engine: google_videos
+    disabled: false
+    timeout: 5.0
+
+  - name: duckduckgo videos
+    engine: duckduckgo_extra
+    ddg_category: videos
+    shortcut: ddv
+    disabled: false
+    timeout: 5.0
