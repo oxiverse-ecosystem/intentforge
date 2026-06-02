@@ -25,9 +25,38 @@ const INTENT_CATEGORIES: &[&str] = &[
     "fresh",
 ];
 
+// ─── Entity Roles (Query Graph IR) ────────────────────────────────
+// Instead of flat positive/negative constraints, entities have semantic roles
+// that determine how they're used in expansion, retrieval, and ranking.
+//
+// "alternative to notion"    → notion is Reference (find things LIKE it)
+// "better than chatgpt"      → chatgpt is Comparison (benchmark against)
+// "without django"           → django is Exclusion (exclude from results)
+// "nginx reverse proxy"      → nginx is Target (the thing we're searching about)
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityRole {
+    /// The primary subject of the search
+    Target,
+    /// "things like X", "alternative to X" — find similar things
+    Reference,
+    /// "better than X", "faster than X" — benchmark against
+    Comparison,
+    /// "without X", "not X", "except X" — exclude from results
+    Exclusion,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct QueryEntity {
+    pub text: String,
+    pub role: EntityRole,
+}
+
 // ─── Structured Constraints ──────────────────────────────────────────
 // Positive: terms the results MUST include/relate to
 // Negative: terms the results MUST NOT include/relate to
+// Entities: semantic entities with roles (Query Graph IR)
 // Extracted algorithmically from query syntax, not hardcoded.
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -36,7 +65,11 @@ pub struct Constraints {
     pub positive: Vec<String>,
     #[serde(default)]
     pub negative: Vec<String>,
-    /// Detected programming language/framework from the query (e.g. "go", "python").
+    /// Semantic entities with roles — the Query Graph IR.
+    /// Replaces the flat positive/negative model with structured entity semantics.
+    #[serde(default)]
+    pub entities: Vec<QueryEntity>,
+    /// Detected programming language from the query.
     /// Used by the gateway for language-aware result scoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
@@ -111,12 +144,29 @@ fn extract_constraints(query: &str) -> Constraints {
     // ── Phase 1: Extract explicit negative constraints ──
     // Handles: "NOT X", "-X", "without X", "except X", "excluding X"
     // Also handles conjunctive lists: "excluding X and Y and Z"
+    //
+    // IMPORTANT: "alternative to X" and "similar to X" are NOT negative.
+    // They indicate a Reference entity (find things LIKE X).
+    // "better than X", "faster than X" indicate a Comparison entity.
 
     let negative_markers = [
         " not ", " -", " without ", " except ", " excluding ",
         " but not ", " other than ", " minus ", " besides ", " no ",
+    ];
+
+    // Reference patterns: "alternative to X" means find things LIKE X, not exclude X
+    let reference_markers = [
         " alternative to ", " alternatives to ",
-        " instead of ", " replacement for ",
+        " similar to ", " like ", " comparable to ",
+        " replacement for ", " substitute for ",
+        " competitor of ", " competitors of ",
+    ];
+
+    // Comparison patterns: "better than X" means benchmark against X
+    let comparison_markers = [
+        " better than ", " faster than ", " cheaper than ",
+        " lighter than ", " easier than ", " simpler than ",
+        " more performant than ", " more efficient than ",
     ];
 
     // Also match negative markers at the start of the query (no leading space)
@@ -173,6 +223,60 @@ fn extract_constraints(query: &str) -> Constraints {
                 for term in terms {
                     if !term.is_empty() && term.len() > 1 {
                         negative.push(term);
+                    }
+                }
+            }
+            search_from = after_marker;
+        }
+    }
+
+    // ── Phase 1b: Extract Reference entities ──
+    // "alternative to X" → X is a Reference (find things LIKE X)
+    // These are NOT negative constraints — they're the seed for similarity search.
+    let mut entities: Vec<QueryEntity> = Vec::new();
+
+    for marker in &reference_markers {
+        let mut search_from = 0;
+        while let Some(pos) = q_lower[search_from..].find(marker) {
+            let abs_pos = search_from + pos;
+            let after_marker = abs_pos + marker.len();
+            if after_marker < q_lower.len() {
+                let remaining = &q[after_marker..];
+                let term = extract_constraint_term(remaining, 2);
+                if !term.is_empty() && term.len() > 1 {
+                    // Don't add as negative — add as Reference entity
+                    entities.push(QueryEntity {
+                        text: term.clone(),
+                        role: EntityRole::Reference,
+                    });
+                    // Also add as positive constraint so it's included in search
+                    if !positive.contains(&term) {
+                        positive.push(term);
+                    }
+                }
+            }
+            search_from = after_marker;
+        }
+    }
+
+    // ── Phase 1c: Extract Comparison entities ──
+    // "better than X" → X is a Comparison (benchmark against X)
+    for marker in &comparison_markers {
+        let mut search_from = 0;
+        while let Some(pos) = q_lower[search_from..].find(marker) {
+            let abs_pos = search_from + pos;
+            let after_marker = abs_pos + marker.len();
+            if after_marker < q_lower.len() {
+                let remaining = &q[after_marker..];
+                let term = extract_constraint_term(remaining, 2);
+                if !term.is_empty() && term.len() > 1 {
+                    entities.push(QueryEntity {
+                        text: term.clone(),
+                        role: EntityRole::Comparison,
+                    });
+                    // Also add as positive constraint so it's included in search
+                    if !positive.contains(&term) {
+                        positive.push(term);
                     }
                 }
             }
@@ -389,7 +493,18 @@ fn extract_constraints(query: &str) -> Constraints {
     // Uses context-aware detection to avoid false positives on short words.
     let language = detect_query_language(&q_lower);
 
-    Constraints { positive, negative, language }
+    // ── Phase 7: Promote negative terms to Exclusion entities ──
+    // Any term that wasn't already captured as Reference/Comparison gets Exclusion role.
+    for neg_term in &negative {
+        if !entities.iter().any(|e| e.text == *neg_term) {
+            entities.push(QueryEntity {
+                text: neg_term.clone(),
+                role: EntityRole::Exclusion,
+            });
+        }
+    }
+
+    Constraints { positive, negative, entities, language }
 }
 
 /// Detect programming language mentioned in a query.
@@ -2318,7 +2433,7 @@ fn compress_query(query: &str) -> String {
         // Question/filler patterns
         "how", "what", "when", "where", "why", "which", "who",
         "should", "would", "could", "can", "do", "does", "did",
-        "use", "using", "used", "set", "setup", "getting", "started",
+        "use", "using", "used", "getting", "started",
         "need", "want", "looking", "try", "trying", "work", "working",
     ].iter().copied().collect();
 
@@ -2442,10 +2557,36 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
     let neg_set: std::collections::HashSet<String> = constraints.negative.iter()
         .map(|n| n.to_lowercase())
         .collect();
+    // NOTE: "alternative", "alternatives" are NOT negative triggers.
+    // "alternative to X" means find things LIKE X — the Reference entity handles this.
     let neg_triggers: std::collections::HashSet<&str> = [
         "not", "no", "without", "except", "excluding", "but", "minus",
-        "other", "than", "alternative", "alternatives", "instead",
+        "other", "than", "instead",
     ].iter().copied().collect();
+
+    // ── Query Graph IR: Extract Reference entities ──
+    // Reference entities are things like "notion" in "alternative to notion".
+    // They need special expansion: "apps like X", "X competitor", "X replacement".
+    let reference_entities: Vec<&QueryEntity> = constraints.entities.iter()
+        .filter(|e| e.role == EntityRole::Reference)
+        .collect();
+
+    // If we have Reference entities, generate similarity-based expansions
+    if !reference_entities.is_empty() {
+        for entity in &reference_entities {
+            let ref_text = entity.text.to_lowercase();
+            // "apps like notion"
+            expansions.push(format!("apps like {}", ref_text));
+            // "notion competitor"
+            expansions.push(format!("{} competitor", ref_text));
+            // "notion alternative open source"
+            expansions.push(format!("{} alternative open source", ref_text));
+            // "self-hosted notion replacement"
+            expansions.push(format!("self-hosted {} replacement", ref_text));
+            // "free alternative to notion"
+            expansions.push(format!("free alternative to {}", ref_text));
+        }
+    }
 
     let core = extract_core_topic(&q_lower, intent);
     let core_trimmed = core.trim();

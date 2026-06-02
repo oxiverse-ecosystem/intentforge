@@ -29,9 +29,27 @@ struct Constraints {
     positive: Vec<String>,
     #[serde(default)]
     negative: Vec<String>,
+    /// Semantic entities with roles (Query Graph IR)
+    #[serde(default)]
+    entities: Vec<QueryEntity>,
     /// Detected programming language from the query.
     #[serde(default)]
     language: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum EntityRole {
+    Target,
+    Reference,
+    Comparison,
+    Exclusion,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct QueryEntity {
+    text: String,
+    role: EntityRole,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -3051,6 +3069,100 @@ async fn handle_search(
     let semantic_scores_web: Vec<f32> = web_results.iter()
         .map(|res| semantic_relevance_score(&q, &res.title, &res.content))
         .collect();
+
+    // ── Relative Relevance: detect garbage clusters ──
+    // Instead of fixed thresholds, compute the score distribution.
+    // If all scores are uniformly low (garbage cluster), retry with expanded queries
+    // instead of returning junk.
+    let (best_score, mean_score, score_variance) = if !semantic_scores_web.is_empty() {
+        let best = semantic_scores_web.iter().cloned().fold(0.0f32, f32::max);
+        let mean = semantic_scores_web.iter().sum::<f32>() / semantic_scores_web.len() as f32;
+        let variance = semantic_scores_web.iter()
+            .map(|s| (s - mean).powi(2))
+            .sum::<f32>() / semantic_scores_web.len() as f32;
+        (best, mean, variance)
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+
+    // Confidence = best_score - mean_score
+    // High confidence: best result is much better than average (clear signal)
+    // Low confidence: all results are similarly bad (garbage cluster)
+    let relevance_confidence = best_score - mean_score;
+    let is_garbage_cluster = best_score < 0.15 && mean_score < 0.10;
+
+    tracing::info!(
+        "Relevance distribution: best={:.3}, mean={:.3}, var={:.3}, confidence={:.3}, garbage_cluster={}",
+        best_score, mean_score, score_variance, relevance_confidence, is_garbage_cluster
+    );
+
+    // If we detected a garbage cluster AND have expanded queries to try, retry
+    if is_garbage_cluster && expanded_queries.len() > 1 && !all_searx_open {
+        tracing::warn!(
+            "GARBAGE CLUSTER DETECTED (best={:.3}, mean={:.3}) — retrying with expanded queries",
+            best_score, mean_score
+        );
+        // Try each expanded query variation (skip index 0 = raw query already tried)
+        for (eq_idx, eq) in expanded_queries.iter().enumerate().skip(1) {
+            if eq_idx > 3 { break; } // limit retries
+            let clean_eq = preprocess_searxng_query(eq);
+            if clean_eq.to_lowercase() == q.to_lowercase() { continue; } // skip duplicates
+            for (inst_idx, base_url) in searx_base_urls.iter().enumerate() {
+                let retry_url = format!(
+                    "{}/search?q={}&format=json&pageno=1",
+                    base_url, urlencoding::encode(&clean_eq)
+                );
+                let retry_key = format!("searxng{}", inst_idx);
+                if circuit_ref.is_open(&retry_key) { continue; }
+                tracing::info!("Retry variation '{}' on instance {}", clean_eq, inst_idx);
+                match tokio::time::timeout(Duration::from_secs(3), client_ref.get(&retry_url).send()).await {
+                    Ok(Ok(resp)) => {
+                        let raw = resp.text().await.unwrap_or_default();
+                        let sanitized = sanitize_json_text(&raw);
+                        if let Ok(data) = serde_json::from_str::<SearxResponse>(&sanitized) {
+                            let retry_scores: Vec<f32> = data.results.iter()
+                                .map(|r| semantic_relevance_score(&q, &r.title, &r.content))
+                                .collect();
+                            let retry_best = retry_scores.iter().cloned().fold(0.0f32, f32::max);
+                            let retry_mean = if !retry_scores.is_empty() {
+                                retry_scores.iter().sum::<f32>() / retry_scores.len() as f32
+                            } else { 0.0 };
+                            tracing::info!(
+                                "Retry variation '{}' got {} results, best={:.3}, mean={:.3}",
+                                clean_eq, data.results.len(), retry_best, retry_mean
+                            );
+                            // If this variation is significantly better, use it
+                            if retry_best > best_score + 0.1 || retry_mean > mean_score + 0.1 {
+                                tracing::info!(
+                                    "Retry variation '{}' is BETTER — replacing results",
+                                    clean_eq
+                                );
+                                circuit_ref.record_success(&retry_key);
+                                circuit_ref.record_results(&retry_key, data.results.len() as u64);
+                                for (pos, result) in data.results.into_iter().enumerate() {
+                                    let engine_weight = circuit_ref.weight(&result.engine);
+                                    let normalized = {
+                                        let lower = result.url.to_lowercase();
+                                        let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                                        let no_trailing = no_fragment.trim_end_matches('/');
+                                        let no_www = no_trailing.replacen("://www.", "://", 1);
+                                        strip_tracking_params(&no_www)
+                                    };
+                                    let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
+                                    *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
+                                    web_results.push(result);
+                                }
+                                // Re-score after adding new results
+                                break; // stop retrying this variation
+                            }
+                        }
+                    }
+                    _ => {} // timeout or error — skip
+                }
+            }
+        }
+    }
+
     // Adaptive threshold: higher when we have many results, lower when few
     // No positional exceptions — rank #1 can still be garbage
     let semantic_threshold = if web_results.len() > 30 { 0.18 }
