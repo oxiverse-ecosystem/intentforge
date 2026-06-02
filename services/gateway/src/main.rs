@@ -2651,10 +2651,15 @@ async fn handle_search(
         if whoogle_open {
             return Ok::<WhoogleResponse, anyhow::Error>(WhoogleResponse { results: vec![] });
         }
-        match tokio::time::timeout(Duration::from_secs(2), client_ref.get(&whoogle_url).send()).await {
-            Ok(Ok(resp)) => {
-                let status = resp.status();
-                let raw_text = resp.text().await.unwrap_or_default();
+        let resp = match tokio::time::timeout(Duration::from_secs(2), client_ref.get(&whoogle_url).send()).await {
+            Ok(Ok(r)) => r,
+            _ => return Ok(WhoogleResponse { results: vec![] }),
+        };
+        let status = resp.status();
+        let raw_text = match tokio::time::timeout(Duration::from_secs(2), resp.text()).await {
+            Ok(Ok(t)) => t,
+            _ => return Ok(WhoogleResponse { results: vec![] }),
+        };
                 match serde_json::from_str::<serde_json::Value>(&raw_text) {
                     Ok(val) => {
                         let results: Vec<WhoogleResult> = val
@@ -2678,39 +2683,28 @@ async fn handle_search(
                     }
                     Err(e) => {
                         tracing::error!("Failed to parse Whoogle JSON (status: {}): {:?}", status, e);
-                        Err(e.into())
+                        Ok(WhoogleResponse { results: vec![] })
                     }
                 }
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("Whoogle request failed: {}", e);
-                Err(e.into())
-            }
-            Err(_) => {
-                tracing::warn!("Whoogle timed out after 2s");
-                Ok(WhoogleResponse { results: vec![] })
-            }
-        }
     };
 
     let invidious_fut = async {
         if invidious_open {
-            return Ok(vec![]);
+            return Ok::<Vec<InvidiousResult>, anyhow::Error>(vec![]);
         }
-        match tokio::time::timeout(Duration::from_secs(2), client_ref.get(&invidious_url).send()).await {
-            Ok(Ok(resp)) => {
-                let status = resp.status();
-                resp.json::<Vec<InvidiousResult>>().await.map_err(|e| {
-                    tracing::error!("Failed to parse Invidious JSON (status: {}): {:?}", status, e);
-                    e
-                })
-            }
+        let resp = match tokio::time::timeout(Duration::from_secs(2), client_ref.get(&invidious_url).send()).await {
+            Ok(Ok(r)) => r,
+            _ => return Ok::<Vec<InvidiousResult>, anyhow::Error>(vec![]),
+        };
+        let status = resp.status();
+        match tokio::time::timeout(Duration::from_secs(2), resp.json::<Vec<InvidiousResult>>()).await {
+            Ok(Ok(data)) => Ok(data),
             Ok(Err(e)) => {
-                tracing::warn!("Invidious request failed: {}", e);
-                Err(e.into())
+                tracing::error!("Failed to parse Invidious JSON (status: {}): {:?}", status, e);
+                Ok(vec![])
             }
             Err(_) => {
-                tracing::warn!("Invidious timed out after 2s");
+                tracing::warn!("Invidious JSON read timed out after 2s");
                 Ok(vec![])
             }
         }
