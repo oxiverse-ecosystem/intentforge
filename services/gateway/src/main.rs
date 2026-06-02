@@ -3095,6 +3095,9 @@ async fn handle_search(
     }
 
     // Quality gate: filter garbage local results
+    // Apply semantic relevance filter to indexer results too — prevents
+    // irrelevant crawled pages (guitar lessons for "bass") from dominating
+    // when web results are sparse or filtered.
     local_results.retain(|r| {
         let title_ok = r.title.len() > 5;
         let url_lower = r.url.to_lowercase();
@@ -3105,7 +3108,13 @@ async fn handle_search(
             && !url_lower.contains("/signup")
             && !url_lower.contains("/account")
             && !url_lower.contains("/cookie");
-        title_ok && not_error
+        // Semantic relevance: same scoring as web results
+        let sem_score = semantic_relevance_score(&q, &r.title, &r.content);
+        let sem_ok = sem_score >= 0.12;  // slightly lower threshold than web (0.18) since local has richer content
+        if title_ok && not_error && !sem_ok {
+            tracing::debug!("Indexer result filtered (sem={:.3}): {}", sem_score, &r.title[..r.title.len().min(50)]);
+        }
+        title_ok && not_error && sem_ok
     });
 
     // 7. Feed Meta-Search Results into Crawl Queue
