@@ -1,5 +1,7 @@
 # torrc for tor2 — optimized for reliability (SearXNG2 proxy)
 SocksPort 0.0.0.0:9051
+ControlPort 0.0.0.0:9052
+HashedControlPassword 16:B70C1E480C610ED5604D61339FA15016B824A8A0052832441BC893A4FB
 DataDirectory /var/lib/tor
 Log notice stdout
 

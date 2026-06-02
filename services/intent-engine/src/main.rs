@@ -9,7 +9,7 @@ use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
@@ -116,8 +116,29 @@ pub struct AppState {
     pub device: Device,
     pub intent_cache: Cache<String, IntentResponse>,
     pub embed_cache: Cache<String, Vec<f32>>,
-    pub category_centroids: Vec<Vec<f32>>,
 }
+
+// ─── Linear Probe Weights ──────────────────────────────────────────
+// Trained via logistic regression on all-MiniLM-L6-v2 embeddings
+// using calibration_benchmark_200.csv. No hardcoded patterns.
+// Retrain: python3 services/intent-engine/train_linear_probe.py
+
+#[derive(Debug, Deserialize, Clone)]
+struct IntentWeights {
+    labels: Vec<String>,
+    weights: Vec<Vec<f64>>,
+    bias: Vec<f64>,
+    temperature: f64,
+    confidence: ConfidenceConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ConfidenceConfig {
+    base: f64,
+    margin_multiplier: f64,
+}
+
+static CONFIG: OnceLock<IntentWeights> = OnceLock::new();
 
 // ─── Constraint Extraction (Algorithmic) ────────────────────────────
 // Extracts positive and negative constraints from natural language queries.
@@ -177,7 +198,16 @@ fn extract_constraints(query: &str) -> Constraints {
         "minus ", "besides ", "no ",
     ];
 
-    // Process start-of-string markers first
+    // Reference markers at the start of the query (no leading space)
+    // "alternative to notion" → notion is a Reference entity
+    let reference_start_markers = [
+        "alternative to ", "alternatives to ",
+        "similar to ", "comparable to ",
+        "replacement for ", "substitute for ",
+        "competitor of ", "competitors of ",
+    ]; // Note: "like " is omitted — too common as a non-reference word
+
+    // Process start-of-string markers first (negatives)
     for marker in &negative_start_markers {
         if q_lower.starts_with(marker) {
             let remaining = &q[marker.len()..];
@@ -234,6 +264,25 @@ fn extract_constraints(query: &str) -> Constraints {
     // "alternative to X" → X is a Reference (find things LIKE X)
     // These are NOT negative constraints — they're the seed for similarity search.
     let mut entities: Vec<QueryEntity> = Vec::new();
+
+    // Process start-of-string reference markers first
+    // "alternative to notion" → match without leading space
+    for marker in &reference_start_markers {
+        if q_lower.starts_with(marker) {
+            let remaining = &q[marker.len()..];
+            let term = extract_constraint_term(remaining, 2);
+            if !term.is_empty() && term.len() > 1 {
+                entities.push(QueryEntity {
+                    text: term.clone(),
+                    role: EntityRole::Reference,
+                });
+                if !positive.contains(&term) {
+                    positive.push(term);
+                }
+            }
+            break; // only one start marker can match
+        }
+    }
 
     for marker in &reference_markers {
         let mut search_from = 0;
@@ -705,1123 +754,60 @@ fn extract_constraint_term(text: &str, max_words: usize) -> String {
 }
 
 
-// ─── Evidence-Based Intent Classification ──────────────────────────
-// Replaces the cascade of IF rule THEN intent with an evidence accumulator.
-// Each detector contributes independent signals across all 7 intent categories.
-// The final intent emerges from the weighted combination — no single detector
-// can force an outcome, and competing signals coexist.
+// ─── Linear Probe Classifier ──────────────────────────────────────
+// Trained via logistic regression on all-MiniLM-L6-v2 embeddings.
+// Weights loaded from config/intent_weights.json at startup.
 
-#[derive(Clone, Debug)]
-struct IntentEvidence {
-    navigational: f32,
-    informational: f32,
-    technical: f32,
-    how_to: f32,
-    comparison: f32,
-    transactional: f32,
-    fresh: f32,
-}
-
-impl IntentEvidence {
-    fn zero() -> Self {
-        Self {
-            navigational: 0.0, informational: 0.0, technical: 0.0,
-            how_to: 0.0, comparison: 0.0, transactional: 0.0, fresh: 0.0,
-        }
-    }
-
-    fn scores(&self) -> [(&'static str, f32); 7] {
-        [
-            ("navigational", self.navigational),
-            ("informational", self.informational),
-            ("technical", self.technical),
-            ("how-to", self.how_to),
-            ("comparison", self.comparison),
-            ("transactional", self.transactional),
-            ("fresh", self.fresh),
-        ]
-    }
-
-    fn argmax(&self) -> (&'static str, f32) {
-        self.scores().iter()
-            .cloned()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap_or(("informational", 0.0))
-    }
-
-    fn merge(a: &Self, weight_a: f32, b: &Self, weight_b: f32) -> Self {
-        let total = weight_a + weight_b;
-        if total < 1e-8 { return a.clone(); }
-        let wa = weight_a / total;
-        let wb = weight_b / total;
-        Self {
-            navigational:    a.navigational    * wa + b.navigational    * wb,
-            informational:   a.informational   * wa + b.informational   * wb,
-            technical:       a.technical        * wa + b.technical       * wb,
-            how_to:          a.how_to           * wa + b.how_to          * wb,
-            comparison:      a.comparison       * wa + b.comparison      * wb,
-            transactional:   a.transactional    * wa + b.transactional   * wb,
-            fresh:           a.fresh            * wa + b.fresh           * wb,
-        }
-    }
-}
-
-// ─── Individual Detectors ─────────────────────────────────────────
-// Each detector returns IntentEvidence with scores across all categories.
-// Detectors are independent — no detector reads another's output.
-
-fn question_detector(query: &str) -> IntentEvidence {
-    let q = query.trim().to_lowercase();
-    let mut ev = IntentEvidence::zero();
-
-    // ── How-to: procedural/action intent ──
-    if q.starts_with("how to ") || q.starts_with("how do i ")
-        || q.starts_with("how can i ") || q.starts_with("how do you ")
-        || q.starts_with("how does ") || q.starts_with("how do ")
-        || q.starts_with("steps to ") || q.starts_with("guide to ")
-        || q.starts_with("tutorial ") || q.contains(" tutorial")
-        // Action verbs: user wants to accomplish something
-        || q.starts_with("implement ") || q.starts_with("build ")
-        || q.starts_with("deploy ") || q.starts_with("migrate ")
-        || q.starts_with("migrating ") || q.starts_with("set up ")
-        || q.starts_with("configure ") || q.starts_with("setup ")
-        || q.starts_with("create ") || q.starts_with("write ")
-        || q.starts_with("run ") || q.starts_with("install ")
-        || q.starts_with("setup ") || q.starts_with("configure ")
-        // "best practices" is a how-to pattern
-        || q.starts_with("best practices ") || q.contains(" best practices")
-        || q.starts_with("optimize ") || q.starts_with("debug ")
-        || q.starts_with("fix ") || q.starts_with("troubleshoot ")
-    {
-        ev.how_to = 0.85;
-        ev.informational = 0.25;
-    }
-    // ── Informational: question patterns ──
-    else if q.starts_with("what is ") || q.starts_with("what are ")
-        || q.starts_with("what does ") || q.starts_with("explain ")
-        || q.starts_with("who is ")
-        || q.starts_with("define ") || q.starts_with("meaning of ")
-        // Bare "does/can/is/are" questions: "does redis support X"
-        || q.starts_with("does ") || q.starts_with("can ")
-        || q.starts_with("is ") || q.starts_with("are ")
-        || q.starts_with("was ") || q.starts_with("will ")
-        || q.starts_with("would ") || q.starts_with("could ")
-        || q.starts_with("has ") || q.starts_with("have ")
-    {
-        ev.informational = 0.80;
-    }
-    // ── Comparison: decision-seeking ──
-    else if q.starts_with("should i ") || q.starts_with("should we ")
-    {
-        ev.comparison = 0.70;
-        ev.informational = 0.30;
-    } else if q.starts_with("difference between ")
-        || q.starts_with("differences between ")
-        || q.starts_with("alternative to ") || q.starts_with("alternatives to ")
-        || q.starts_with("lightweight alternative")
-    {
-        ev.comparison = 0.75;
-        ev.informational = 0.25;
-    } else if q.starts_with("why ") || q.starts_with("when ")
-        || q.starts_with("where ")
-    {
-        // "why use rust over c++" — "why" can be informational or comparison.
-        // If "vs"/"over"/"better" present, lean comparison.
-        if q.contains(" vs ") || q.contains(" versus ") || q.contains(" over ")
-            || q.contains(" better ") || q.starts_with("which ")
-        {
-            ev.comparison = 0.65;
-            ev.informational = 0.35;
-        } else {
-            ev.informational = 0.70;
-        }
-    } else if q.starts_with("which ") {
-        ev.comparison = 0.70;
-        ev.informational = 0.30;
-    }
-
-    ev
-}
-
-fn domain_detector(query: &str) -> IntentEvidence {
-    let q = query.trim().to_lowercase();
-    let words: Vec<&str> = q.split_whitespace().collect();
-    let mut ev = IntentEvidence::zero();
-
-    // TLD patterns: strongest navigational signal
-    if q.contains(".com") || q.contains(".org") || q.contains(".net")
-        || q.contains(".io") || q.contains(".dev") || q.contains(".rs")
-        || q.contains(".py") || q.contains(".go") || q.contains(".edu")
-        || q.contains(".gov")
-    {
-        ev.navigational = 0.90;
-        return ev;
-    }
-
-    // Detect competing intent signals — when these are present,
-    // the user is asking ABOUT a platform, not going TO it.
-    let has_how_to = q.starts_with("how to ") || q.starts_with("how do i ")
-        || q.starts_with("how can i ") || q.starts_with("how do you ")
-        || q.starts_with("steps to ") || q.starts_with("guide to ")
-        || q.starts_with("tutorial ") || q.contains(" tutorial");
-    let has_question = q.starts_with("what is ") || q.starts_with("what are ")
-        || q.starts_with("what does ") || q.starts_with("explain ")
-        || q.starts_with("why ") || q.starts_with("define ");
-    let has_comparison = q.contains(" vs ") || q.contains(" versus ")
-        || q.starts_with("best ") || q.starts_with("top ")
-        || q.starts_with("compare ") || q.starts_with("which ");
-    let has_transactional = q.starts_with("buy ") || q.starts_with("download ")
-        || q.starts_with("install ") || q.starts_with("purchase ")
-        || q.contains(" pricing") || q.contains(" price");
-    let has_fresh = q.contains("latest") || q.contains("recent")
-        || q.contains("newest") || q.contains("new ");
-
-    let competing_intent = has_how_to || has_question || has_comparison
-        || has_transactional || has_fresh;
-
-    // Known platform destinations
-    let known_platforms: &[&str] = &[
-        "github", "gitlab", "bitbucket", "stackoverflow", "stackexchange",
-        "reddit", "twitter", "x", "facebook", "instagram", "linkedin",
-        "youtube", "twitch", "discord", "slack", "notion", "figma",
-        "dribbble", "behance", "medium", "substack", "mastodon",
-        "docker", "npm", "pypi", "crates", "rubygems",
-        "vercel", "netlify", "heroku", "digitalocean", "linode",
-        "stripe", "twilio", "sendgrid", "mailchimp",
-        "jira", "confluence", "trello", "asana", "linear",
-        "spotify", "netflix", "hulu", "plex",
-        "wikipedia", "wikimedia", "archive",
-        "google", "bing", "duckduckgo",
-        "apple", "microsoft", "amazon", "aws", "gcp", "azure",
-        "openai", "anthropic", "huggingface",
-    ];
-
-    let known_compound: &[(&str, &str)] = &[
-        ("docker", "hub"), ("docker", "desktop"),
-        ("aws", "console"), ("gcp", "console"), ("azure", "portal"),
-        ("google", "docs"), ("google", "drive"), ("google", "cloud"),
-        ("github", "actions"), ("github", "pages"), ("github", "copilot"),
-        ("apple", "music"), ("apple", "tv"),
-        ("microsoft", "teams"), ("microsoft", "365"),
-        ("stack", "overflow"), ("stack", "exchange"),
-    ];
-
-    // Check compound matches first
-    if words.len() >= 2 {
-        for (a, b) in known_compound {
-            if words.contains(a) && words.contains(b) {
-                // When competing intent is present, reduce navigational signal.
-                // "how to use docker hub" → nav=0.30, not 0.85
-                // "docker hub" alone → nav=0.85
-                ev.navigational = if competing_intent { 0.30 } else { 0.85 };
-                return ev;
-            }
-        }
-    }
-
-    // Single platform name match — when query is SHORT (1-2 tokens)
-    // AND no competing intent signal is present.
-    if words.len() <= 2 && !competing_intent {
-        for word in &words {
-            if known_platforms.contains(word) {
-                ev.navigational = 0.75;
-                return ev;
-            }
-        }
-    }
-
-    // First-word platform match for slightly longer queries (3-4 tokens)
-    // "figma design tool", "notion app", "github copilot"
-    // Only when no competing intent is detected.
-    if words.len() >= 2 && words.len() <= 4 && !competing_intent {
-        if known_platforms.contains(&words[0]) {
-            ev.navigational = 0.65;
-            return ev;
-        }
-    }
-
-    // Platform mentioned in longer query with competing intent → weak signal
-    if competing_intent {
-        for word in &words {
-            if known_platforms.contains(word) {
-                ev.navigational = ev.navigational.max(0.25);
-            }
-        }
-    }
-
-    // Explicit navigational keywords
-    if q.starts_with("official ") || q.contains(" homepage")
-        || q.contains(" login") || q.contains(" sign in")
-        || q.contains(" sign up") || q.starts_with("go to ")
-        || q.starts_with("open ")
-    {
-        ev.navigational = 0.80;
-    } else if q.contains("terms of service") || q.contains("privacy policy")
-        || q.ends_with(" tos") || q.contains(" tos ")
-    {
-        ev.navigational = 0.75;
-    }
-
-    ev
-}
-
-fn tech_detector(query: &str) -> IntentEvidence {
-    let q = query.trim().to_lowercase();
-    let words: Vec<&str> = q.split_whitespace().collect();
-    let mut ev = IntentEvidence::zero();
-
-    let tech_terms = [
-        "api", "sdk", "library", "framework", "crate", "package", "module",
-        "function", "method", "class", "interface", "struct", "enum",
-        "trait", "syntax", "compiler", "runtime", "debug",
-        "error", "bug", "issue", "version", "migration",
-        "documentation", "docs", "reference", "manpage", "engine",
-        "editor", "programming", "algorithm", "data structure",
-        "knn", "vector", "search engine", "indexing",
-    ];
-    let tech_languages = [
-        "rust", "python", "javascript", "typescript", "go", "golang",
-        "java", "c++", "cpp", "swift", "kotlin", "ruby",
-        "php", "haskell", "elixir", "scala",
-        "react", "vue", "angular", "svelte", "nextjs", "next.js",
-        "django", "flask", "fastapi", "express", "axum", "tokio",
-        "docker", "kubernetes", "k8s", "linux", "git", "nginx",
-        "postgres", "mysql", "redis", "mongodb", "sqlite", "elasticsearch",
-        "css", "html", "sql", "nosql", "graphql", "grpc", "rest",
-        "webpack", "vite", "tailwind", "bootstrap", "sass",
-        "aws", "gcp", "azure", "terraform", "ansible",
-        "tcp", "udp", "http", "https", "ssh", "ftp", "dns", "dhcp",
-        "json", "yaml", "xml", "csv", "jwt", "oauth", "cors", "csrf",
-        "websocket", "grpc", "protobuf", "kafka", "rabbitmq",
-    ];
-
-    // Use word boundary matching for tech_terms (not substring)
-    // to prevent "impl" matching "implement", "fix" matching "prefix", etc.
-    let has_tech_term = tech_terms.iter().any(|t| {
-        if t.contains(' ') {
-            q.contains(t)  // multi-word phrases: substring OK
-        } else {
-            words.iter().any(|w| *w == *t)  // single words: exact match
-        }
-    });
-    let has_tech_lang = tech_languages.iter().any(|l| {
-        words.iter().any(|w| *w == *l)
-    });
-
-    if has_tech_term || has_tech_lang {
-        ev.technical = 0.65;
-        // Note: action verbs (install, deploy, build, configure) are now
-        // handled by question_detector with higher confidence (how_to=0.85).
-        // No need to add how_to signal here — it would only dilute.
-    }
-
-    ev
-}
-
-fn commercial_detector(query: &str) -> IntentEvidence {
-    let q = query.trim().to_lowercase();
-    let words: Vec<&str> = q.split_whitespace().collect();
-    let mut ev = IntentEvidence::zero();
-
-    // Transactional signals
-    if q.starts_with("buy ") || q.starts_with("download ")
-        || q.starts_with("get ")
-        || q.starts_with("purchase ") || q.starts_with("order ")
-        || q.starts_with("subscribe ") || q.starts_with("sign up for ")
-        || q.contains(" pricing") || q.contains(" free download")
-    {
-        ev.transactional = 0.80;
-    }
-
-    // Comparison signals
-    // "vs" is context-sensitive: surrounded by technical jargon → partial comparison,
-    // not a pure consumer comparison. "io_uring vs epoll for HFT" is a technical
-    // deep-dive, not "which should I buy". Consumer terms (best, cheap, buy, top)
-    // confirm pure comparison intent.
-    let has_vs = q.contains(" vs ") || q.contains(" versus ");
-
-    // Technical jargon indicators — words that signal deep implementation discussion
-    let tech_jargon = [
-        "io_uring", "epoll", "kqueue", "select", "poll", "uring",
-        "syscall", "kernel", "userspace", "latency", "throughput",
-        "hft", "benchmark", "simd", "avx", "sse", "vectorize",
-        "cache", " prefetch", "branch", "pipeline", "mutex", "lock",
-        "atomic", "memory model", "consensus", "raft", "paxos",
-        "zero-copy", "lock-free", "wait-free", "coroutine", "fiber",
-        "green thread", "stackless", "stackful", "monomorphization",
-        "vtable", "inline", "link-time", "jit", "aot", "interpreter",
-        "bytecode", "opcode", "register", "heap", "stack", "allocator",
-        "garbage collector", "gc", "arena", "bump", "slab",
-        "serialization", "protobuf", "flatbuffer", "capnproto",
-        "quic", "http3", "websocket", "grpc", "tcp", "udp",
-        "b-tree", "lsm", "bloom filter", "skip list", "red-black",
-        "io_uring", "dpdk", "xdp", "ebpf", "nvme", "spdk",
-    ];
-    let has_tech_jargon = tech_jargon.iter().any(|t| q.contains(t));
-
-    // Consumer comparison signals — user wants a recommendation, not deep analysis
-    let consumer_signals = words.iter().any(|w|
-        *w == "best" || *w == "top" || *w == "cheap" || *w == "buy"
-        || *w == "price" || *w == "pricing" || *w == "cost"
-        || *w == "beginner" || *w == "easy" || *w == "simple"
-        || *w == "popular" || *w == "recommended"
-    );
-
-    if has_vs {
-        if has_tech_jargon && !consumer_signals {
-            // Technical deep-dive: "io_uring vs epoll for HFT"
-            // Reduce comparison, boost technical — user wants implementation details
-            ev.comparison = 0.40;
-            ev.technical = 0.50;
-        } else {
-            // Pure comparison: "react vs vue", "best X vs Y"
-            ev.comparison = 0.75;
-        }
-    }
-
-    // Non-"vs" comparison patterns (not affected by tech jargon check)
-    if !has_vs && (
-        q.starts_with("best ") || q.starts_with("top ")
-        || q.starts_with("compare ") || q.contains(" comparison")
-        || q.starts_with("which ") || q.starts_with("better ")
-        // "alternative/recommend" patterns
-        || q.contains(" alternative") || q.contains(" alternatives")
-        || q.starts_with("recommend ") || q.starts_with("suggest ")
-        || q.starts_with("i need ") || q.starts_with("i want ")
-        // "or" between options: "X or Y"
-        || (q.contains(" or ") && words.len() <= 8)
-    ) {
-        ev.comparison = 0.75;
-    }
-
-    ev
-}
-
-fn freshness_detector(query: &str) -> IntentEvidence {
-    let q = query.trim().to_lowercase();
-    let mut ev = IntentEvidence::zero();
-
-    let has_year = q.split_whitespace().any(|w| {
-        w.len() == 4 && w.chars().all(|c| c.is_ascii_digit())
-            && w.parse::<u32>().map_or(false, |y| y >= 2020 && y <= 2040)
-    });
-    if q.contains("latest") || q.contains("recent") || q.contains("newest")
-        || q.contains("today") || q.contains("this week")
-        || q.contains("this month") || has_year || q.starts_with("news ")
-        || q.contains(" update") || q.contains(" release")
-        || q.contains(" changes") || q.contains(" changelog")
-        || q.contains(" cve") || q.contains(" vulnerability")
-        || q.starts_with("new ")
-    {
-        ev.fresh = 0.75;
-    }
-
-    ev
-}
-
-fn error_pattern_detector(query: &str) -> IntentEvidence {
-    // Detects error messages, HTTP status codes, exit codes, and system errors.
-    // When a user searches for an error, they want a SOLUTION — how-to intent.
-    // This catches queries like "exit code 137", "nginx 502 bad gateway",
-    // "deadlock detected", "OOM killed", "connection refused", etc.
-    let q = query.trim().to_lowercase();
-    let words: Vec<&str> = q.split_whitespace().collect();
-    let mut ev = IntentEvidence::zero();
-
-    // ── HTTP status codes ──
-    // "502 bad gateway", "404 not found", "500 internal server error"
-    let http_codes = [
-        "400", "401", "403", "404", "405", "408", "409", "410", "429",
-        "500", "502", "503", "504", "520", "521", "522", "523", "524",
-    ];
-    let has_http_code = words.iter().any(|w| http_codes.contains(w));
-    let has_http_context = q.contains("bad gateway") || q.contains("not found")
-        || q.contains("forbidden") || q.contains("unauthorized")
-        || q.contains("internal server error") || q.contains("gateway timeout")
-        || q.contains("service unavailable") || q.contains("too many requests");
-
-    // ── Exit codes ──
-    // "exit code 137", "exit code 1", "exit status 127", "returned 1"
-    let has_exit_code = q.contains("exit code") || q.contains("exit status")
-        || q.contains("exit code=") || q.contains("returned exit")
-        || q.contains("exit with code");
-
-    // ── System/infra errors ──
-    let error_terms = [
-        "oom", "out of memory", "killed", "segfault", "segmentation fault",
-        "deadlock", "race condition", "connection refused", "connection timed out",
-        "connection reset", "broken pipe", "no such file", "permission denied",
-        "access denied", "disk full", "no space left", "stack overflow",
-        "null pointer", "nullptr", "sigkill", "sigsegv", "sigabrt",
-        "core dumped", "panic", "fatal error", "unclean shutdown",
-    ];
-    let has_system_error = error_terms.iter().any(|t| q.contains(t));
-
-    // ── Error keywords with technical context ──
-    // "error", "exception", "failure" alone are too generic — need context
-    let has_error_keyword = words.iter().any(|w|
-        *w == "error" || *w == "exception" || *w == "failure"
-        || *w == "crash" || *w == "failing" || *w == "broken"
-        || *w == "corrupt" || *w == "timeout" || *w == "timed"
-    );
-    let has_tech_context = words.iter().any(|w|
-        *w == "nginx" || *w == "apache" || *w == "postgres" || *w == "mysql"
-        || *w == "redis" || *w == "docker" || *w == "kubernetes" || *w == "k8s"
-        || *w == "node" || *w == "python" || *w == "java" || *w == "go"
-        || *w == "rust" || *w == "linux" || *w == "ubuntu" || *w == "debian"
-        || *w == "ssh" || *w == "ssl" || *w == "tls" || *w == "dns"
-        || *w == "tcp" || *w == "http" || *w == "https" || *w == "api"
-        || *w == "pod" || *w == "container" || *w == "cluster" || *w == "server"
-    );
-
-    // ── Stack trace indicators ──
-    let has_stack_trace = q.contains("traceback") || q.contains("stack trace")
-        || q.contains("stacktrace") || q.contains("at line")
-        || q.contains("file \"") || q.contains("line number");
-
-    // ── Combine signals ──
-    if has_http_code || has_http_context {
-        // HTTP errors are strong how-to signals
-        ev.how_to = 0.80;
-        ev.technical = 0.25;
-    } else if has_exit_code {
-        ev.how_to = 0.80;
-        ev.technical = 0.20;
-    } else if has_system_error {
-        ev.how_to = 0.75;
-        ev.technical = 0.30;
-    } else if has_stack_trace {
-        ev.how_to = 0.70;
-        ev.technical = 0.35;
-    } else if has_error_keyword && has_tech_context {
-        // "python connection error" → how-to (looking for fix)
-        ev.how_to = 0.65;
-        ev.technical = 0.35;
-    }
-
-    ev
-}
-
-fn exploration_detector(
-    query: &str,
+fn linear_classify(
     query_embedding: &[f32],
-    centroids: &[Vec<f32>],
-) -> IntentEvidence {
-    // Exploration detector: identifies "knowledge-seeking" queries that lack
-    // explicit question words or technical terms. These are queries where the
-    // user wants to UNDERSTAND a concept, not navigate to a site or perform
-    // an action.
-    //
-    // Key insight: concept density vs entity density.
-    // "causes of 2008 financial crisis" → high concept density (abstract relationships)
-    // "github actions" → high entity density (specific product)
-    //
-    // Uses embedding similarity to informational centroid vs navigational centroid
-    // plus lexical signals for abstract relationship words.
+    weights: &IntentWeights,
+) -> (String, f32, std::collections::HashMap<String, f32>) {
+    let n_classes = weights.labels.len();
+    let dim = weights.weights[0].len();
 
-    let q = query.trim().to_lowercase();
-    let mut ev = IntentEvidence::zero();
-
-    // ── Lexical: abstract relationship / knowledge-seeking patterns ──
-    // These patterns signal "I want to understand X" without question words.
-    let exploration_patterns = [
-        // Causal: "causes of", "reasons for", "why does X happen"
-        "causes of", "reasons for", "reason for", "cause of",
-        "impact of", "effect of", "effects of", "influence of",
-        "consequences of", "results of", "outcome of",
-        // Historical: "history of", "evolution of", "origin of"
-        "history of", "evolution of", "origin of", "origins of",
-        "development of", "growth of", "rise of", "decline of",
-        // Conceptual: "theory of", "principles of", "fundamentals of"
-        "theory of", "principles of", "fundamentals of", "basics of",
-        "concept of", "notion of", "idea of", "nature of",
-        // Process: "process of", "mechanism of", "how X works"
-        "process of", "mechanism of", "dynamics of", "science of",
-        // Comparative: "relationship between", "difference between"
-        "relationship between", "connection between", "link between",
-        "comparison of", "contrast between",
-        // Overview: "overview of", "introduction to", "guide to"
-        "overview of", "introduction to", "intro to", "guide to",
-        "summary of", "analysis of", "review of", "study of",
-        // Academic: "research on", "findings on", "evidence for"
-        "research on", "findings on", "evidence for", "evidence of",
-        // Impact: "implications of", "significance of", "importance of"
-        "implications of", "significance of", "importance of",
-        "relevance of", "role of",
-    ];
-
-    let mut pattern_match = false;
-    for pattern in &exploration_patterns {
-        if q.contains(pattern) {
-            pattern_match = true;
-            break;
+    let mut logits = weights.bias.clone();
+    for c in 0..n_classes {
+        for j in 0..dim.min(query_embedding.len()) {
+            logits[c] += weights.weights[c][j] * query_embedding[j] as f64;
         }
     }
 
-    // Also match "X of Y" pattern where X is an abstract noun
-    // e.g., "photosynthesis process", "quantum error correction"
-    let abstract_nouns = [
-        "process", "mechanism", "theory", "principle", "concept",
-        "technique", "method", "approach", "strategy", "pattern",
-        "model", "framework", "architecture", "protocol", "algorithm",
-        "system", "structure", "function", "behavior", "dynamics",
-    ];
-    let has_abstract_noun = q.split_whitespace().any(|w| abstract_nouns.contains(&w));
-
-    // ── Embedding: compare to informational vs navigational centroids ──
-    // centroids[0] = navigational, centroids[1] = informational
-    let nav_sim = if centroids.len() > 0 {
-        cosine_similarity(query_embedding, &centroids[0])
-    } else { 0.5 };
-    let info_sim = if centroids.len() > 1 {
-        cosine_similarity(query_embedding, &centroids[1])
-    } else { 0.5 };
-
-    // Informational pull: how much closer to informational than navigational
-    let info_pull = (info_sim - nav_sim).max(0.0);
-
-    // ── Combine signals ──
-    let lexical_score: f32 = if pattern_match { 0.7 }
-        else if has_abstract_noun { 0.4 }
-        else { 0.0 };
-
-    // Embedding score: scale info_pull to [0, 1] range
-    // Typical info_pull is 0.0-0.15, so scale by 5x
-    let embedding_score = (info_pull * 5.0).clamp(0.0, 0.8);
-
-    // Combine: lexical patterns are strong signal, embedding is supporting
-    let exploration_score = if pattern_match {
-        lexical_score.max(embedding_score) // Take the stronger signal
-    } else {
-        (lexical_score * 0.6 + embedding_score * 0.4).min(0.8)
-    };
-
-    if exploration_score > 0.1 {
-        ev.informational = exploration_score;
-        tracing::info!(
-            "exploration_detector: pattern={} abstract_noun={} info_sim={:.3} nav_sim={:.3} info_pull={:.3} → info={:.3}",
-            pattern_match, has_abstract_noun, info_sim, nav_sim, info_pull, exploration_score
-        );
-    }
-
-    ev
-}
-
-fn entity_detector(
-    query: &str,
-    query_embedding: &[f32],
-    centroids: &[Vec<f32>],
-) -> IntentEvidence {
-    // Entity detection using character-level signals (bigram rarity,
-    // abbreviation patterns, concept fraction). This is the evidence-based
-    // replacement for the old Layer 1.5 navigational override.
-    //
-    // Instead of IF score > threshold THEN navigational, it contributes
-    // a navigational signal that competes with other evidence.
-
-    let q_lower = query.trim().to_lowercase();
-    let words: Vec<&str> = q_lower.split_whitespace().collect();
-    let mut ev = IntentEvidence::zero();
-    if words.is_empty() { return ev; }
-
-    // ── Per-token character analysis ──
-    let mut entity_scores: Vec<f32> = Vec::new();
-    let mut abbr_scores: Vec<f32> = Vec::new();
-    for word in &words {
-        entity_scores.push(token_entityness(word));
-        abbr_scores.push(abbreviation_score(word));
-    }
-
-    let max_entity: f32 = entity_scores.iter().cloned().fold(0.0f32, f32::max);
-    let entity_density: f32 = entity_scores.iter().sum::<f32>()
-        / entity_scores.len().max(1) as f32;
-    let max_abbr: f32 = abbr_scores.iter().cloned().fold(0.0f32, f32::max);
-
-    // ── Abbreviation discount ──
-    let mut abbr_driven = false;
-    for (i, word) in words.iter().enumerate() {
-        let chars: Vec<char> = word.chars().collect();
-        let vowels = chars.iter().filter(|c| "aeiou".contains(**c)).count();
-        let vratio = if chars.is_empty() { 0.0 } else { vowels as f32 / chars.len() as f32 };
-        if vratio < 0.15 && abbr_scores[i] > 0.6 && entity_scores[i] > 0.4 {
-            abbr_driven = true;
-        }
-    }
-
-    // ── Tech-term discount ──
-    let tech_terms_nav = [
-        "api", "sdk", "css", "html", "sql", "nosql", "graphql", "grpc",
-        "webpack", "vite", "tailwind", "bootstrap", "sass", "terraform",
-        "ansible", "docker", "kubernetes", "k8s", "nginx", "redis",
-        "postgres", "mysql", "mongodb", "sqlite", "axum", "tokio",
-    ];
-    let mut tech_driven = false;
-    for (i, word) in words.iter().enumerate() {
-        if entity_scores[i] > 0.4 && tech_terms_nav.contains(word) {
-            tech_driven = true;
-        }
-    }
-
-    // ── Bigram rarity ──
-    let best_rarity = words.iter()
-        .map(|w| bigram_rarity(w))
-        .fold(0.0f32, f32::max);
-
-    // ── Concept fraction ──
-    let stopwords = ["what", "is", "are", "the", "a", "an", "how", "to", "do", "does",
-                     "can", "for", "in", "on", "of", "and", "or", "vs", "versus",
-                     "best", "top", "cheap", "buy", "price", "near", "me", "free",
-                     "online", "download", "install", "use", "using"];
-    let mut concept_tokens = 0usize;
-    let mut total_tokens = 0usize;
-    for (i, word) in words.iter().enumerate() {
-        if stopwords.contains(word) { continue; }
-        if abbr_scores[i] > 0.5 { continue; }
-        total_tokens += 1;
-        let rarity = bigram_rarity(word);
-        if rarity < 0.90 {
-            concept_tokens += 1;
-        }
-    }
-    let concept_fraction = if total_tokens > 0 {
-        concept_tokens as f32 / total_tokens as f32
-    } else { 0.0 };
-    let entity_only_factor = (1.0 - concept_fraction).max(0.0);
-
-    // ── Embedding signals ──
-    let sims: Vec<f32> = centroids.iter()
-        .map(|c| cosine_similarity(query_embedding, c))
-        .collect();
-    let max_sim = sims.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let min_sim = sims.iter().cloned().fold(f32::INFINITY, f32::min);
-    let discriminability = (max_sim - min_sim).max(0.0);
-
-    let dim = centroids.first().map(|c| c.len()).unwrap_or(384);
-    let mut generic_centroid = vec![0.0f32; dim];
-    for centroid in centroids {
-        for (i, v) in centroid.iter().enumerate() { generic_centroid[i] += v; }
-    }
-    let n = centroids.len() as f32;
-    if n > 0.0 {
-        for v in generic_centroid.iter_mut() { *v /= n; }
-        let norm: f32 = generic_centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 1e-8 { for v in generic_centroid.iter_mut() { *v /= norm; } }
-    }
-    let dist_from_generic = 1.0 - cosine_similarity(query_embedding, &generic_centroid);
-
-    let entropy = {
-        let shift = if min_sim < 0.01 { -min_sim + 0.01 } else { 0.0 };
-        let shifted: Vec<f32> = sims.iter().map(|s| s + shift).collect();
-        let total: f32 = shifted.iter().sum();
-        if total < 1e-8 { 0.0 } else {
-            let mut h = 0.0f32;
-            for &s in &shifted {
-                let p = s / total;
-                if p > 1e-8 { h -= p * p.log2(); }
-            }
-            h / (sims.len() as f32).log2().max(1.0)
-        }
-    };
-
-    // ── Combine into navigational evidence ──
-    let mut effective_entity = max_entity * 0.6 + entity_density * 0.4;
-    if abbr_driven { effective_entity *= 0.6; }
-    if tech_driven { effective_entity *= 0.5; }
-
-    let entity_with_rarity = (effective_entity * 0.55 + best_rarity * 0.45).min(1.0);
-    let char_nav = entity_with_rarity.max(max_abbr * 0.5);
-    let emb_nav_raw = entropy * 0.5 + dist_from_generic.max(0.0) * 0.3
-        + (1.0 - max_sim).max(0.0) * 0.2;
-    let disc_penalty = (discriminability / 0.10).min(1.0);
-    let emb_nav = emb_nav_raw * disc_penalty;
-
-    let alpha = if discriminability < 0.08 && effective_entity > 0.40 { 0.80 }
-        else if discriminability < 0.08 { 0.65 }
-        else if discriminability > 0.15 && effective_entity < 0.40 { 0.30 }
-        else if effective_entity > 0.55 { 0.60 }
-        else { 0.45 };
-
-    let nav_raw = alpha * char_nav + (1.0 - alpha) * emb_nav;
-    let nav_score = nav_raw * entity_only_factor;
-
-    ev.navigational = nav_score.clamp(0.0, 1.0);
-
-    tracing::info!(
-        "entity_detector: eff_entity={:.3} best_rarity={:.3} concepts={}/{} \
-         alpha={:.2} disc={:.3} → nav={:.3}",
-        effective_entity, best_rarity, concept_tokens, total_tokens,
-        alpha, discriminability, ev.navigational
-    );
-
-    ev
-}
-
-fn embedding_detector(
-    query_embedding: &[f32],
-    centroids: &[Vec<f32>],
-) -> IntentEvidence {
-    // Pure embedding signal: cosine similarity to each category centroid.
-    // Uses softmax with temperature to amplify small differences in the
-    // 0.91-0.97 similarity range that MiniLM produces.
-
-    let mut ev = IntentEvidence::zero();
-    let sims: Vec<f32> = centroids.iter()
-        .map(|c| cosine_similarity(query_embedding, c))
-        .collect();
-
-    if sims.is_empty() { return ev; }
-
-    let max_sim = sims.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let min_sim = sims.iter().cloned().fold(f32::INFINITY, f32::min);
-    let discriminability = (max_sim - min_sim).max(0.0);
-
-    // Softmax with temperature to amplify small differences.
-    // Uses log-sum-exp trick for numerical stability.
-    // Lower temperature = sharper distribution (trusts small differences more).
-    let temp = 0.01f32;
-    let max_s = sims.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let shifted: Vec<f32> = sims.iter().map(|s| (s - max_s) / temp).collect();
-    let exp_shifted: Vec<f32> = shifted.iter().map(|s| s.exp()).collect();
-    let exp_sum: f32 = exp_shifted.iter().sum();
-    let softmax: Vec<f32> = if exp_sum > 1e-8 {
+    let temp = weights.temperature as f64;
+    let max_logit = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let shifted: Vec<f64> = logits.iter().map(|l| (l - max_logit) / temp).collect();
+    let exp_shifted: Vec<f64> = shifted.iter().map(|s| s.exp()).collect();
+    let exp_sum: f64 = exp_shifted.iter().sum();
+    let probs: Vec<f64> = if exp_sum > 1e-12 {
         exp_shifted.iter().map(|e| e / exp_sum).collect()
     } else {
-        vec![1.0 / sims.len() as f32; sims.len()]
+        vec![1.0 / n_classes as f64; n_classes]
     };
 
-    // Confidence scaling: how much the best category stands out.
-    // disc < 0.05 → weak signal, scale down
-    // disc > 0.10 → strong signal, use full softmax
-    let confidence = (discriminability / 0.08).clamp(0.2, 1.0);
-
-    let categories = [
-        "navigational", "informational", "technical",
-        "how-to", "comparison", "transactional", "fresh",
-    ];
-
-    for (i, cat) in categories.iter().enumerate() {
-        if i < softmax.len() {
-            let score = softmax[i] * confidence;
-            match *cat {
-                "navigational" => ev.navigational = score,
-                "informational" => ev.informational = score,
-                "technical" => ev.technical = score,
-                "how-to" => ev.how_to = score,
-                "comparison" => ev.comparison = score,
-                "transactional" => ev.transactional = score,
-                "fresh" => ev.fresh = score,
-                _ => {}
-            }
-        }
-    }
-
-    tracing::info!(
-        "embedding_detector: max_sim={:.4} disc={:.4} confidence={:.3} softmax=[{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}]",
-        max_sim, discriminability, confidence,
-        softmax.get(0).unwrap_or(&0.0), softmax.get(1).unwrap_or(&0.0),
-        softmax.get(2).unwrap_or(&0.0), softmax.get(3).unwrap_or(&0.0),
-        softmax.get(4).unwrap_or(&0.0), softmax.get(5).unwrap_or(&0.0),
-        softmax.get(6).unwrap_or(&0.0)
-    );
-
-    ev
-}
-
-fn evidence_classify(
-    query: &str,
-    query_embedding: Option<&Vec<f32>>,
-    centroids: &[Vec<f32>],
-) -> (String, f32, std::collections::HashMap<String, f32>) {
-    // Evidence accumulation: each detector contributes independent signals.
-    // No detector can force an outcome — the final intent emerges from
-    // the weighted combination of all evidence.
-
-    let q_evidence = question_detector(query);
-    let d_evidence = domain_detector(query);
-    let t_evidence = tech_detector(query);
-    let c_evidence = commercial_detector(query);
-    let f_evidence = freshness_detector(query);
-    let r_evidence = error_pattern_detector(query); // NEW: error→how-to
-
-    // Entity detector needs embeddings for centroid distance signals
-    let e_evidence = if let Some(emb) = query_embedding {
-        entity_detector(query, emb, centroids)
-    } else {
-        IntentEvidence::zero()
-    };
-
-    // Exploration detector: concept density vs entity density
-    let x_evidence = if let Some(emb) = query_embedding {
-        exploration_detector(query, emb, centroids)
-    } else {
-        IntentEvidence::zero()
-    };
-
-    // Merge all detectors with their weights
-    // Weights reflect how much we trust each signal type
-    let mut combined = IntentEvidence::zero();
-    let mut total_weight = 0.0f32;
-
-    // Adaptive tech_detector weight: when the question_detector fires with
-    // strong how-to signals (how_to >= 0.7), attenuate the tech_detector.
-    // Problem: "how to build an API in Go" → question_detector says how_to=0.85,
-    // tech_detector says technical=0.65. With fixed weights, technical wins
-    // because it accumulates from both. Solution: reduce tech weight when
-    // how_to is dominant, letting the procedural intent through.
-    let tech_weight = if q_evidence.how_to >= 0.7 {
-        0.3  // attenuated: how_to is the real intent
-    } else if q_evidence.how_to >= 0.5 {
-        0.5  // partially attenuated
-    } else {
-        0.7  // default: tech terms are a moderate signal
-    };
-
-    let detectors: &[(IntentEvidence, f32)] = &[
-        (q_evidence, 1.0),        // Question patterns are very reliable
-        (d_evidence, 1.0),        // Domain/TLD patterns are very reliable
-        (t_evidence, tech_weight), // Tech terms: adaptive weight based on how-to signal
-        (c_evidence, 0.9),        // Commercial patterns are reliable
-        (f_evidence, 0.8),        // Freshness patterns are fairly reliable
-        (r_evidence, 0.85),       // Error patterns: strong how-to signal
-        (e_evidence, 0.6),        // Entity detection is noisier
-        (x_evidence, 0.85),       // Exploration patterns are fairly reliable
-    ];
-
-    for (ev, weight) in detectors {
-        if *weight > 0.0 {
-            combined = IntentEvidence::merge(&combined, total_weight, ev, *weight);
-            total_weight += *weight;
-        }
-    }
-
-    // Embedding detector (if available) as tiebreaker
-    if let Some(emb) = query_embedding {
-        let emb_ev = embedding_detector(emb, centroids);
-        combined = IntentEvidence::merge(&combined, total_weight, &emb_ev, 0.4);
-    }
-
-    // ── Confidence calibration: softmax + margin ──
-    // Raw scores are unbounded evidence sums. We need calibrated probabilities.
-    // 1. Apply softmax to convert scores to probability distribution
-    // 2. Use margin (top1 - top2) as confidence: high margin = unambiguous
-    let scores = combined.scores();
-    let max_score = scores.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
-
-    // Softmax with temperature scaling
-    // Lower temperature = sharper distribution (trusts small differences more)
-    // Raw scores are in 0.0-0.2 range, so T=0.05 amplifies 0.1 diff to ~13:1 odds
-    let temp = 0.05f32;
-    let exp_sum: f32 = scores.iter().map(|(_, s)| ((s - max_score) / temp).exp()).sum();
-    let softmax_scores: Vec<f32> = scores.iter()
-        .map(|(_, s)| ((s - max_score) / temp).exp() / exp_sum)
-        .collect();
-
-    // Build distribution map
     let mut distribution = std::collections::HashMap::new();
-    for (i, (label, _)) in scores.iter().enumerate() {
-        distribution.insert(label.to_string(), softmax_scores[i]);
+    for (i, label) in weights.labels.iter().enumerate() {
+        distribution.insert(label.clone(), probs[i] as f32);
     }
 
-    // Find top-1 and top-2 for margin confidence
-    let mut sorted_softmax = softmax_scores.clone();
-    sorted_softmax.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let top1 = sorted_softmax.first().copied().unwrap_or(0.0);
-    let top2 = sorted_softmax.get(1).copied().unwrap_or(0.0);
+    let mut sorted: Vec<(usize, f64)> = probs.iter().enumerate().map(|(i, p)| (i, *p)).collect();
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let (winner_idx, top1) = sorted[0];
+    let top2 = sorted.get(1).map(|(_, p)| *p).unwrap_or(0.0);
     let margin = top1 - top2;
+    let intent = weights.labels[winner_idx].clone();
 
-    // Confidence = margin scaled to [0, 1]
-    // margin=0.0 → ambiguous (conf≈0.3)
-    // margin=0.5 → clear winner (conf≈0.8)
-    // margin=0.9 → very clear (conf≈0.98)
-    let confidence = (0.3 + margin * 0.7).clamp(0.0, 1.0);
-
-    // Winner is the highest softmax score
-    let (winner_idx, _) = softmax_scores.iter().enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or((0, &0.0));
-    let intent = scores[winner_idx].0;
+    let conf = &weights.confidence;
+    let confidence = (conf.base as f32 + margin as f32 * conf.margin_multiplier as f32).clamp(0.0, 1.0);
 
     tracing::info!(
-        "evidence_classify: raw=[nav={:.3} info={:.3} tech={:.3} how={:.3} \
-         comp={:.3} txn={:.3} fresh={:.3}] softmax=[{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}] \
-         margin={:.3} → {} (conf={:.3})",
-        combined.navigational, combined.informational, combined.technical,
-        combined.how_to, combined.comparison, combined.transactional,
-        combined.fresh,
-        softmax_scores[0], softmax_scores[1], softmax_scores[2],
-        softmax_scores[3], softmax_scores[4], softmax_scores[5], softmax_scores[6],
-        margin, intent, confidence
+        "linear_classify: intent={} (conf={:.3}) margin={:.3} probs=[{}]",
+        intent, confidence, margin,
+        weights.labels.iter().enumerate().map(|(i, l)| format!("{}={:.3}", l, probs[i])).collect::<Vec<_>>().join(" ")
     );
 
-    (intent.to_string(), confidence, distribution)
+    (intent, confidence, distribution)
 }
 
-// ─── Layer 1: Rule-Based Pre-Classifier (LEGACY — replaced by evidence detectors) ──
 
-#[allow(dead_code)]
-struct RuleMatch {
-    intent: &'static str,
-    confidence: f32,
-}
-
-#[allow(dead_code)]
-fn rule_based_classify(query: &str) -> Option<RuleMatch> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return Some(RuleMatch { intent: "informational", confidence: 0.5 });
-    }
-
-    // ── Navigational: user wants a specific site/page ──
-    if q.contains(".com") || q.contains(".org") || q.contains(".net")
-        || q.contains(".io") || q.contains(".dev") || q.contains(".rs")
-        || q.contains(".py") || q.contains(".go") || q.contains(".edu")
-        || q.contains(".gov")
-    {
-        return Some(RuleMatch { intent: "navigational", confidence: 0.9 });
-    }
-    if q.starts_with("official ") || q.contains(" homepage")
-        || q.contains(" login") || q.contains(" sign in")
-        || q.contains(" sign up") || q.starts_with("go to ")
-        || q.starts_with("open ")
-    {
-        return Some(RuleMatch { intent: "navigational", confidence: 0.85 });
-    }
-    // Legal/policy pages: "oxiverse terms of service", "github privacy policy"
-    // These are navigational — user wants a specific site's legal page.
-    // Question patterns (what is, explain) are checked above and take priority.
-    if q.contains("terms of service") || q.contains("privacy policy")
-        || q.ends_with(" tos") || q.contains(" tos ")
-    {
-        return Some(RuleMatch { intent: "navigational", confidence: 0.80 });
-    }
-
-    // ── How-To ──
-    if q.starts_with("how to ") || q.starts_with("how do i ")
-        || q.starts_with("how can i ") || q.starts_with("how do you ")
-        || q.starts_with("steps to ") || q.starts_with("guide to ")
-        || q.starts_with("tutorial ") || q.contains(" tutorial")
-    {
-        return Some(RuleMatch { intent: "how-to", confidence: 0.9 });
-    }
-
-    // ── Transactional ──
-    if q.starts_with("buy ") || q.starts_with("download ")
-        || q.starts_with("install ") || q.starts_with("get ")
-        || q.starts_with("purchase ") || q.starts_with("order ")
-        || q.starts_with("subscribe ") || q.starts_with("sign up for ")
-        || q.contains(" pricing") || q.contains(" free download")
-    {
-        return Some(RuleMatch { intent: "transactional", confidence: 0.85 });
-    }
-
-    // ── Comparison ──
-    if q.contains(" vs ") || q.contains(" versus ")
-        || q.starts_with("best ") || q.starts_with("top ")
-        || q.starts_with("compare ") || q.contains(" comparison")
-        || q.starts_with("which ") || q.starts_with("better ")
-    {
-        return Some(RuleMatch { intent: "comparison", confidence: 0.8 });
-    }
-
-    // ── Fresh/News ──
-    // Algorithmic year detection: any 4-digit number in [2020, 2040] range
-    let has_year = q.split_whitespace().any(|w| {
-        w.len() == 4 && w.chars().all(|c| c.is_ascii_digit())
-            && w.parse::<u32>().map_or(false, |y| y >= 2020 && y <= 2040)
-    });
-    if q.contains("latest") || q.contains("recent") || q.contains("newest")
-        || q.contains("today") || q.contains("this week")
-        || q.contains("this month") || has_year || q.starts_with("news ")
-        || q.contains(" update") || q.contains(" release")
-        || q.contains(" cve") || q.contains(" vulnerability")
-    {
-        return Some(RuleMatch { intent: "fresh", confidence: 0.8 });
-    }
-
-    // ── Informational (question patterns) ──
-    // Must be checked BEFORE technical — "what is python" should be
-    // informational, not technical, even though "python" is a tech term.
-    if q.starts_with("what is ") || q.starts_with("what are ")
-        || q.starts_with("what does ") || q.starts_with("explain ")
-        || q.starts_with("why ") || q.starts_with("when ")
-        || q.starts_with("where ") || q.starts_with("who is ")
-        || q.starts_with("define ") || q.starts_with("meaning of ")
-    {
-        return Some(RuleMatch { intent: "informational", confidence: 0.8 });
-    }
-
-    // ── Technical ──
-    let tech_terms = [
-        "api", "sdk", "library", "framework", "crate", "package", "module",
-        "function", "method", "class", "interface", "struct", "enum",
-        "trait", "impl", "syntax", "compiler", "runtime", "debug",
-        "error", "bug", "fix", "issue", "version", "migration",
-        "documentation", "docs", "reference", "manpage", "engine",
-        "editor", "programming", "algorithm", "data structure",
-    ];
-    let tech_languages = [
-        "rust", "python", "javascript", "typescript", "go", "golang",
-        "java", "c++", "cpp", "swift", "kotlin", "ruby",
-        "php", "haskell", "elixir", "scala",
-        "react", "vue", "angular", "svelte", "nextjs", "next.js",
-        "django", "flask", "fastapi", "express", "axum", "tokio",
-        "docker", "kubernetes", "k8s", "linux", "git", "nginx",
-        "postgres", "mysql", "redis", "mongodb", "sqlite",
-        "css", "html", "sql", "nosql", "graphql", "grpc", "rest",
-        "webpack", "vite", "tailwind", "bootstrap", "sass",
-        "aws", "gcp", "azure", "terraform", "ansible",
-        "tcp", "udp", "http", "https", "ssh", "ftp", "dns", "dhcp",
-        "json", "yaml", "xml", "csv", "jwt", "oauth", "cors", "csrf",
-    ];
-
-    let has_tech_term = tech_terms.iter().any(|t| q.contains(t));
-    let has_tech_lang = tech_languages.iter().any(|l| {
-        q.split_whitespace().any(|w| w == *l)
-    });
-
-    if has_tech_term || has_tech_lang {
-        return Some(RuleMatch { intent: "technical", confidence: 0.75 });
-    }
-
-    // No strong signal → Layer 2
-    None
-}
-
-// ─── Layer 2: Embedding Centroid Classifier (~2ms) ──────────────────
-
-fn compute_centroid(model: &BertModel, tokenizer: &Tokenizer, device: &Device, examples: &[&str]) -> Vec<f32> {
-    let dim = 384; // MiniLM-L6-v2
-    let mut sum = vec![0.0f32; dim];
-    let mut count = 0usize;
-
-    for text in examples {
-        if let Some(emb) = compute_embedding(device, model, tokenizer, text) {
-            for (i, v) in emb.iter().enumerate() {
-                sum[i] += v;
-            }
-            count += 1;
-        }
-    }
-
-    if count == 0 {
-        return vec![0.0; dim];
-    }
-
-    // Average
-    for v in sum.iter_mut() {
-        *v /= count as f32;
-    }
-
-    // L2 normalize
-    let norm: f32 = sum.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 1e-8 {
-        for v in sum.iter_mut() {
-            *v /= norm;
-        }
-    }
-
-    sum
-}
 
 fn compute_embedding(device: &Device, model: &BertModel, tokenizer: &Tokenizer, text: &str) -> Option<Vec<f32>> {
     let tokens = tokenizer.encode(text, true).ok()?;
@@ -2769,6 +1755,17 @@ fn extract_year(text: &str) -> Option<&str> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
+    // ── Load linear probe weights ──
+    let config_path = "./config/intent_weights.json";
+    tracing::info!("Loading linear probe weights from {}...", config_path);
+    let config: IntentWeights = serde_json::from_reader(
+        std::fs::File::open(config_path)
+            .map_err(|e| anyhow::anyhow!("Failed to open weights {}: {}", config_path, e))?
+    ).map_err(|e| anyhow::anyhow!("Failed to parse weights {}: {}", config_path, e))?;
+    CONFIG.set(config)
+        .map_err(|_| anyhow::anyhow!("CONFIG already initialized"))?;
+    tracing::info!("Linear probe weights loaded successfully");
+
     let device = Device::Cpu;
 
     let bert_path = "./models/model.safetensors";
@@ -2795,97 +1792,6 @@ async fn main() -> anyhow::Result<()> {
     let bert_tokenizer = Tokenizer::from_file(bert_tokenizer_path)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    tracing::info!("Computing intent category centroids...");
-    let category_centroids = {
-        let category_examples: Vec<Vec<&str>> = vec![
-            // 0: Navigational — user wants a SPECIFIC site/page (not a topic)
-            vec!["reddit", "wikipedia", "youtube", "twitter", "facebook",
-                 "instagram", "github login", "gmail", "netflix", "spotify",
-                 "amazon", "stackoverflow", "discord", "twitch", "linkedin",
-                 "apple", "microsoft", "google docs", "dropbox", "figma"],
-            // 1: Informational — user wants to LEARN about a topic
-            vec![
-                 "what is machine learning", "what is a neural network",
-                 "explain quantum computing", "what does TCP do",
-                 "how does a compiler work", "what is the internet",
-                 "why is the sky blue", "what is photosynthesis",
-                 "define algorithm", "meaning of recursion",
-                 "what are design patterns", "what is REST API",
-                 "explain blockchain", "what is DNS", "how wifi works",
-                 // Non-question informational: seeking content/info without question words
-                 "healthy breakfast recipes", "python tutorials for beginners",
-                 "travel tips for europe", "gardening guide for spring",
-                 "best hiking trails near seattle", "history of ancient rome",
-                 "climate change effects on agriculture", "beginner yoga poses",
-                 "nosql database overview", "css layout guide",
-                 "javascript closures explained", "database indexing strategies",
-                 // Exploration patterns: concept-seeking without question words
-                 "causes of the 2008 financial crisis",
-                 "evolution of database systems",
-                 "impact of social media on politics",
-                 "history of the internet",
-                 "principles of distributed systems",
-                 "mechanism of neural network backpropagation",
-                 "theory of relativity explained",
-                 "origins of quantum mechanics",
-                 "consequences of climate change",
-                 "overview of garbage collection algorithms",
-                 "analysis of TCP congestion control",
-                 "role of mitochondria in cells",
-                 "fundamentals of cryptographic hash functions",
-                 "relationship between supply and demand",
-                 "significance of Gödel's incompleteness theorem",
-            ],
-            vec!["rust async runtime", "python requests library",
-                 "javascript fetch API", "go goroutines",
-                 "docker compose volumes", "kubernetes pods",
-                 "react hooks useState", "django ORM queries",
-                 "tokio spawn", "axum extractors",
-                 "postgres indexes", "redis pub sub",
-                 "nginx reverse proxy", "git rebase vs merge",
-                 "typescript generics", "cargo features"],
-            vec!["how to install rust", "how to set up docker",
-                 "how to deploy to aws", "how to create a git branch",
-                 "how to use async await", "how to configure nginx",
-                 "how to write unit tests", "how to build a REST API",
-                 "how to connect to postgres", "how to set up ci cd",
-                 "how to implement authentication", "how to use redis cache",
-                 "how to optimize sql queries", "how to handle errors in rust",
-                 "how to create a react app"],
-            vec!["rust vs go performance", "react vs vue",
-                 "postgres vs mysql", "docker vs kubernetes",
-                 "best programming language 2026",
-                 "top web frameworks", "compare aws vs gcp",
-                 "which database to use", "best ide for python",
-                 "typescript vs javascript", "nginx vs apache",
-                 "grpc vs rest", "mongodb vs postgresql",
-                 "kubernetes vs docker swarm", "vim vs neovim"],
-            vec!["buy mechanical keyboard", "download vscode",
-                 "install python", "get started with rust",
-                 "purchase domain name", "subscribe to spotify",
-                 "sign up for github", "order pizza online",
-                 "buy cloud hosting", "download docker desktop",
-                 "install ubuntu", "get ssl certificate",
-                 "purchase api key", "subscribe to newsletter",
-                 "buy raspberry pi"],
-            vec!["latest rust release", "new python version",
-                 "cve 2026", "security vulnerability update",
-                 "recent ai news", "today's tech news",
-                 "this week in programming", "new javascript framework",
-                 "latest docker update", "rust 1.80 release",
-                 "python 3.13 features", "react 19 changes",
-                 "linux kernel update", "github copilot news",
-                 "ai regulation 2026"],
-        ];
-
-        let mut centroids = Vec::new();
-        for examples in &category_examples {
-            centroids.push(compute_centroid(&bert_model, &bert_tokenizer, &device, examples));
-        }
-        tracing::info!("Centroids computed for {} categories", centroids.len());
-        centroids
-    };
-
     let intent_cache = Cache::builder()
         .max_capacity(2000)
         .time_to_live(Duration::from_secs(3600))
@@ -2902,7 +1808,6 @@ async fn main() -> anyhow::Result<()> {
         device,
         intent_cache,
         embed_cache,
-        category_centroids,
     });
 
     let app = Router::new()
@@ -2912,7 +1817,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3005));
-    tracing::info!("Intent Engine listening on {} (rules + centroids + constraint extraction)", addr);
+    tracing::info!("Intent Engine listening on {} (linear probe + constraint extraction)", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -2955,21 +1860,22 @@ async fn analyze_query(
         flat_constraints.push(format!("-{}", c));
     }
 
-    // ── Get embedding for evidence detectors ──
-    // Use ORIGINAL query for embedding (preserves semantic intent even if stuttered)
+    // ── Get embedding for linear probe ──
     let query_embedding = {
         let bert_model = state.bert_model.lock().unwrap();
         compute_embedding(&state.device, &*bert_model, &state.bert_tokenizer, &params.q)
     };
 
-    // ── Evidence-based classification ──
-    // Use NORMALIZED query for lexical detectors (cleaner signals)
-    // Use ORIGINAL query for embedding detector (preserves semantic meaning)
-    let (intent, confidence, distribution) = evidence_classify(
-        &normalized,
-        query_embedding.as_ref(),
-        &state.category_centroids,
-    );
+    // ── Linear probe classification ──
+    // Uses logistic regression weights trained on calibration_benchmark_200.csv
+    let weights = CONFIG.get().expect("weights not loaded");
+    let (intent, confidence, distribution) = query_embedding.as_ref()
+        .map(|emb| linear_classify(emb, weights))
+        .unwrap_or_else(|| {
+            let mut d = std::collections::HashMap::new();
+            d.insert("informational".to_string(), 1.0);
+            ("informational".to_string(), 0.3, d)
+        });
 
     // ── Step 2: Compress long queries before expansion ──
     // "what monitoring stack should a small startup use for kubernetes

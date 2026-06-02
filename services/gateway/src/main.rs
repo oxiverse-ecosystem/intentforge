@@ -839,33 +839,28 @@ fn constraint_score(
     score.clamp(0.0, 2.0)
 }
 
-// ─── VPN Signal Writer ──────────────────────────────────────────────
-// Writes a signal file to trigger VPN rotation when rate limiting is detected.
-// The vpn-rotator container watches this file.
+// ─── IP Rotation ────────────────────────────────────────────────────
+// Rotates both gluetun VPN and tor2 circuit to get fresh exit IPs.
+// Called on CAPTCHA detection, rate limiting, and periodically every 10 minutes.
 
 fn trigger_vpn_rotation(reason: &str) {
     tracing::info!("VPN rotation triggered: {}", reason);
-    // Write signal to shared bind-mount directory (legacy, for vpn-rotator script)
     let signal_dir = "/tmp/vpn-signals";
     let signal_path = format!("{}/rotate_signal", signal_dir);
     let _ = std::fs::create_dir_all(signal_dir);
     let _ = std::fs::write(&signal_path, reason);
-    // Direct VPN control via Gluetun API (gateway shares gluetun's network namespace)
     std::thread::spawn(move || {
         let client = reqwest::blocking::Client::new();
-        // Stop VPN
         let _ = client.put("http://127.0.0.1:8000/v1/vpn/status")
             .json(&serde_json::json!({"status": "stopped"}))
             .timeout(std::time::Duration::from_secs(10))
             .send();
         std::thread::sleep(std::time::Duration::from_secs(5));
-        // Start VPN
         let _ = client.put("http://127.0.0.1:8000/v1/vpn/status")
             .json(&serde_json::json!({"status": "running"}))
             .timeout(std::time::Duration::from_secs(10))
             .send();
         std::thread::sleep(std::time::Duration::from_secs(15));
-        // Verify new IP
         if let Ok(resp) = client.get("http://127.0.0.1:8000/v1/publicip/ip")
             .timeout(std::time::Duration::from_secs(10))
             .send()
@@ -875,6 +870,43 @@ fn trigger_vpn_rotation(reason: &str) {
             }
         }
     });
+}
+
+fn rotate_tor_circuit() {
+    tracing::info!("Rotating tor2 circuit (SIGNAL NEWNYM)");
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        if let Ok(mut stream) = std::net::TcpStream::connect("tor2:9052") {
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            // Consume initial "250 OK" banner
+            let mut banner = String::new();
+            let _ = reader.read_line(&mut banner);
+            writeln!(stream, "AUTHENTICATE \"intentforge_rotate\"").ok();
+            let mut resp = String::new();
+            let _ = reader.read_line(&mut resp);
+            if resp.starts_with("250") {
+                writeln!(stream, "SIGNAL NEWNYM").ok();
+                let mut newnym_resp = String::new();
+                let _ = reader.read_line(&mut newnym_resp);
+                if newnym_resp.starts_with("250") {
+                    tracing::info!("tor2 circuit rotated successfully");
+                } else {
+                    tracing::warn!("tor2 NEWNYM response: {}", newnym_resp.trim());
+                }
+            } else {
+                tracing::warn!("tor2 auth response: {}", resp.trim());
+            }
+        } else {
+            tracing::warn!("Could not connect to tor2:9052 for circuit rotation");
+        }
+    });
+}
+
+fn rotate_all_ips(reason: &str) {
+    tracing::info!("Rotating ALL IPs (gluetun VPN + tor2): {}", reason);
+    trigger_vpn_rotation(reason);
+    rotate_tor_circuit();
 }
 
 // ─── Simple Stemming (English Plurals) ──────────────────────────────
@@ -2360,6 +2392,16 @@ async fn main() {
         tracing::info!("Prewarm complete");
     });
 
+    // Periodic IP rotation every 10 minutes — rotates both gluetun VPN and tor2 circuit
+    // to prevent CAPTCHA accumulation and avoid search engine rate-limiting patterns.
+    let periodic_reason = "periodic_10min_rotation";
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await; // 10 min
+            rotate_all_ips(periodic_reason);
+        }
+    });
+
     let app = Router::new()
         .route("/", get(|| async { "IntentForge-v2 Gateway" }))
         .route("/health", get(|| async { "OK" }))
@@ -2554,32 +2596,45 @@ async fn handle_search(
                     if is_malformed {
                         return Ok(SearxResponse { results: vec![] });
                     }
-                    tracing::warn!("SearXNG returned 0 results, retrying in 500ms...");
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tracing::info!("SearXNG returned 0 results, retrying immediately...");
                     let retry: Result<SearxResponse, reqwest::Error> = async {
-                        let resp = client_ref.get(&url).send().await?;
-                        let status = resp.status();
-                        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                            let rl_count = ratelimit_ref.count_in_window(300);
-                            ratelimit_ref.record();
-                            let new_count = ratelimit_ref.count_in_window(300);
-                            tracing::warn!("SearXNG got 429 — rate-limits in 5min: {} → {}", rl_count, new_count);
-                            trigger_vpn_rotation(&format!("429_rate_limit_{}", new_count));
-                        }
-                        let raw = resp.text().await.unwrap_or_default();
-                        let sanitized = sanitize_json_text(&raw);
-                        match serde_json::from_str::<SearxResponse>(&sanitized) {
-                            Ok(data) => Ok(data),
-                            Err(e) => {
-                                tracing::error!("SearXNG retry parse failed (status: {}): {:?}", status, e);
-                                Ok(SearxResponse { results: vec![] })
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            client_ref.get(&url).send()
+                        ).await {
+                            Ok(Ok(resp)) => {
+                                let status = resp.status();
+                                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                                    let rl_count = ratelimit_ref.count_in_window(300);
+                                    ratelimit_ref.record();
+                                    let new_count = ratelimit_ref.count_in_window(300);
+                                    tracing::warn!("SearXNG got 429 — rate-limits in 5min: {} → {}", rl_count, new_count);
+                                    rotate_all_ips(&format!("429_rate_limit_{}", new_count));
+                                }
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    resp.text()
+                                ).await {
+                                    Ok(Ok(raw)) => {
+                                        let sanitized = sanitize_json_text(&raw);
+                                        match serde_json::from_str::<SearxResponse>(&sanitized) {
+                                            Ok(data) => Ok(data),
+                                            Err(e) => {
+                                                tracing::error!("SearXNG retry parse failed (status: {}): {:?}", status, e);
+                                                Ok(SearxResponse { results: vec![] })
+                                            }
+                                        }
+                                    }
+                                    _ => Ok(SearxResponse { results: vec![] })
+                                }
                             }
+                            _ => Ok(SearxResponse { results: vec![] })
                         }
                     }.await;
                     if let Ok(ref data) = retry {
                         if data.results.is_empty() {
-                            tracing::warn!("SearXNG retry returned 0 results — triggering VPN rotation");
-                            trigger_vpn_rotation("zero_results_after_retry");
+                            tracing::warn!("SearXNG retry returned 0 results — triggering IP rotation");
+                            rotate_all_ips("zero_results_after_retry");
                         }
                     }
                     retry
@@ -2675,8 +2730,14 @@ async fn handle_search(
             "http://127.0.0.1:8080/search?q={}&format=json&categories=news&pageno=1",
             q_encoded
         );
-        let resp = client_ref.get(&news_url).send().await?;
-        let raw = resp.text().await.unwrap_or_default();
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(2), client_ref.get(&news_url).send()).await {
+            Ok(Ok(r)) => r,
+            _ => return Ok(SearxNewsResponse { results: vec![] }),
+        };
+        let raw = match tokio::time::timeout(std::time::Duration::from_secs(2), resp.text()).await {
+            Ok(Ok(t)) => t,
+            _ => return Ok(SearxNewsResponse { results: vec![] }),
+        };
         let sanitized = sanitize_json_text(&raw);
         match serde_json::from_str::<SearxNewsResponse>(&sanitized) {
             Ok(data) => Ok(data),
@@ -2695,8 +2756,14 @@ async fn handle_search(
             "http://127.0.0.1:8080/search?q={}&format=json&categories=images&pageno=1",
             q_encoded
         );
-        let resp = client_ref.get(&image_url).send().await?;
-        let raw = resp.text().await.unwrap_or_default();
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(2), client_ref.get(&image_url).send()).await {
+            Ok(Ok(r)) => r,
+            _ => return Ok(SearxImageResponse { results: vec![] }),
+        };
+        let raw = match tokio::time::timeout(std::time::Duration::from_secs(2), resp.text()).await {
+            Ok(Ok(t)) => t,
+            _ => return Ok(SearxImageResponse { results: vec![] }),
+        };
         let sanitized = sanitize_json_text(&raw);
         match serde_json::from_str::<SearxImageResponse>(&sanitized) {
             Ok(data) => Ok(data),
@@ -2859,7 +2926,7 @@ async fn handle_search(
             "PROACTIVE VPN ROTATION: {} engine degradations in 5-min window",
             recent_degradations
         );
-        trigger_vpn_rotation(&format!("proactive_{}_degradations_5min", recent_degradations));
+        rotate_all_ips(&format!("proactive_{}_degradations_5min", recent_degradations));
     }
 
     // Smart retry: if overall results are significantly below expected,
