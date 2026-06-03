@@ -1618,16 +1618,16 @@ impl CircuitBreaker {
         health.last_failure = Some(Instant::now());
         health.total_failures += 1;
 
-        // Exponential backoff: 15s, 30s, 60s, ... capped at 5 min
-        if health.consecutive_failures >= 2 {
-            let backoff_secs = 15u64 * 2u64.pow(health.consecutive_failures.saturating_sub(2));
-            let backoff = Duration::from_secs(backoff_secs.min(300));
-            health.open_until = Some(Instant::now() + backoff);
-            tracing::warn!(
-                "Circuit OPEN for engine '{}' — {} failures, backing off {:?}",
-                engine, health.consecutive_failures, backoff
-            );
-        }
+        // Immediate backoff on first failure, exponential after that
+        // First failure: 15s, second: 30s, third: 60s, ... capped at 5 min
+        // This prevents every request from waiting for timeouts when an engine is down.
+        let backoff_secs = 15u64 * 2u64.pow(health.consecutive_failures.saturating_sub(1));
+        let backoff = Duration::from_secs(backoff_secs.min(300));
+        health.open_until = Some(Instant::now() + backoff);
+        tracing::warn!(
+            "Circuit OPEN for engine '{}' — {} failures, backing off {:?}",
+            engine, health.consecutive_failures, backoff
+        );
     }
 
     // Record how many results an engine returned (for weight calculation)
@@ -2347,7 +2347,7 @@ async fn main() {
         rate_limits: RateLimitTracker::new(),
         volume_tracker: ResultVolumeTracker::new(),
         http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))  // Engines that can't respond in 3s are degraded
+            .timeout(Duration::from_secs(10))  // Allow up to 10s for external engines (VPN/Tor overhead)
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .pool_max_idle_per_host(20)
             .connect_timeout(Duration::from_secs(1))
@@ -2529,12 +2529,30 @@ async fn handle_search(
     let invidious_open = circuit_ref.is_open("invidious");
 
     let indexer_fut = async {
-        let resp = client_ref.get(&indexer_query_raw).send().await?;
-        let status = resp.status();
-        resp.json::<Vec<IndexerResult>>().await.map_err(|e| {
-            tracing::error!("Failed to parse Indexer JSON (status: {}): {:?}", status, e);
-            e
-        })
+        match tokio::time::timeout(Duration::from_secs(2), client_ref.get(&indexer_query_raw).send()).await {
+            Ok(Ok(resp)) => {
+                let status = resp.status();
+                match tokio::time::timeout(Duration::from_secs(2), resp.json::<Vec<IndexerResult>>()).await {
+                    Ok(Ok(data)) => Ok(data),
+                    Ok(Err(e)) => {
+                        tracing::error!("Failed to parse Indexer JSON (status: {}): {:?}", status, e);
+                        Err(e)
+                    }
+                    Err(_) => {
+                        tracing::warn!("Indexer JSON read timed out after 2s");
+                        Ok(vec![])
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Indexer request failed: {:?}", e);
+                Err(e)
+            }
+            Err(_) => {
+                tracing::warn!("Indexer request timed out after 2s — using empty results");
+                Ok(vec![])
+            }
+        }
     };
 
     // Fire all SearXNG instances in parallel with retry on 0 results
@@ -2836,7 +2854,7 @@ async fn handle_search(
     let cleaned_queries: Vec<String> = expanded_queries.iter().map(|eq| {
         if neg_terms.is_empty() { return eq.clone(); }
         let mut words: Vec<&str> = eq.split_whitespace().collect();
-        let neg_triggers = ["not", "except", "without", "excluding", "other", "than"];
+        let neg_triggers = ["not", "nor", "except", "without", "excluding", "other", "than"];
         words.retain(|w| {
             let w_lower = w.to_lowercase();
             let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower).to_string();
@@ -2858,6 +2876,42 @@ async fn handle_search(
         }
     };
 
+    // 4b. Re-query indexer with BERT embedding for semantic vector search
+    // The initial indexer call (parallel fan-out) ran without the embedding
+    // because it wasn't available yet. Re-query with the vector for RRF fusion
+    // of BM25 + semantic similarity, giving better results for natural language queries.
+    if let Some(ref vec) = vector {
+        let vec_str = serde_json::to_string(vec).unwrap_or_default();
+        let indexer_url_vec = format!(
+            "http://127.0.0.1:6000/search?q={}&vector={}",
+            q_encoded,
+            urlencoding::encode(&vec_str)
+        );
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            client.get(&indexer_url_vec).send()
+        ).await {
+            Ok(Ok(resp)) => {
+                match tokio::time::timeout(Duration::from_secs(2), resp.json::<Vec<IndexerResult>>()).await {
+                    Ok(Ok(vec_results)) => {
+                        if !vec_results.is_empty() {
+                            tracing::info!(
+                                "Vector-enhanced indexer returned {} results (vs {} BM25-only)",
+                                vec_results.len(),
+                                local_results.len()
+                            );
+                            local_results = vec_results;
+                        }
+                    }
+                    Ok(Err(e)) => tracing::warn!("Vector indexer JSON parse error: {:?}", e),
+                    Err(_) => tracing::warn!("Vector indexer JSON read timed out"),
+                }
+            }
+            Ok(Err(e)) => tracing::warn!("Vector indexer request failed: {:?}", e),
+            Err(_) => tracing::warn!("Vector indexer re-query timed out"),
+        }
+    }
+
     // 5. Aggregate Web Results from all sources
     let mut web_results: Vec<SearxResult> = Vec::new();
     // Track per-URL RRF contributions from each source's ranked position
@@ -2871,15 +2925,20 @@ async fn handle_search(
         let instance_key = &searx_instance_keys[i];
         match searx_res {
             Ok(searx_data) => {
-                tracing::info!("SearXNG variation {} returned {} results", i, searx_data.results.len());
-                circuit_ref.record_success(instance_key);
-                circuit_ref.record_results(instance_key, searx_data.results.len() as u64);
-                // Track per-engine result counts for degradation detection
-                for r in &searx_data.results {
-                    *engine_counts.entry(r.engine.clone()).or_insert(0) += 1;
+                let n = searx_data.results.len();
+                tracing::info!("SearXNG variation {} returned {} results", i, n);
+                if n > 0 {
+                    circuit_ref.record_success(instance_key);
+                    circuit_ref.record_results(instance_key, n as u64);
+                    for r in &searx_data.results {
+                        *engine_counts.entry(r.engine.clone()).or_insert(0) += 1;
+                    }
+                } else {
+                    // 0 results ≠ failure — the instance is healthy but returned no
+                    // matches (e.g. niche query, all engines temporarily suspended).
+                    // Only record actual errors (timeout, connection refused) as failures.
+                    // This prevents niche queries from cascading the circuit to 300s.
                 }
-                // Track position-based RRF contribution per URL within this variation
-                // Weight by engine reliability (dynamic learning)
                 for (pos, result) in searx_data.results.into_iter().enumerate() {
                     let engine_weight = circuit_ref.weight(&result.engine);
                     let normalized = {
@@ -2990,9 +3049,14 @@ async fn handle_search(
 
     match whoogle_res {
         Ok(whoogle_data) => {
-            tracing::info!("Whoogle returned {} results", whoogle_data.results.len());
-            circuit_ref.record_success("whoogle");
-            circuit_ref.record_results("whoogle", whoogle_data.results.len() as u64);
+            let n = whoogle_data.results.len();
+            tracing::info!("Whoogle returned {} results", n);
+            if n > 0 {
+                circuit_ref.record_success("whoogle");
+                circuit_ref.record_results("whoogle", n as u64);
+            } else {
+                // 0 results ≠ failure — only connection/parse errors are failures
+            }
             let whoogle_weight = circuit_ref.weight("whoogle");
             for (pos, r) in whoogle_data.results.into_iter().enumerate() {
                 let normalized = {
@@ -3022,9 +3086,14 @@ async fn handle_search(
 
     match invidious_res {
         Ok(invidious_data) => {
-            tracing::info!("Invidious returned {} results", invidious_data.len());
-            circuit_ref.record_success("invidious");
-            circuit_ref.record_results("invidious", invidious_data.len() as u64);
+            let n = invidious_data.len();
+            tracing::info!("Invidious returned {} results", n);
+            if n > 0 {
+                circuit_ref.record_success("invidious");
+                circuit_ref.record_results("invidious", n as u64);
+            } else {
+                // 0 results ≠ failure — only connection/parse errors are failures
+            }
             let invidious_weight = circuit_ref.weight("invidious");
             for (pos, r) in invidious_data.into_iter().enumerate() {
                 if r.result_type.as_deref() == Some("video") {

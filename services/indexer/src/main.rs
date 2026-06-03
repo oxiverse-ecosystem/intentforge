@@ -33,7 +33,7 @@ struct IngestRequest {
     quality: Option<f64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct SearchParams {
     q: String,
     #[serde(default)]
@@ -55,7 +55,7 @@ struct SearchResult {
     content: String,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -205,181 +205,183 @@ async fn handle_search(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
 ) -> Json<Vec<SearchResult>> {
-    let searcher = state.reader.searcher();
-    let url_field = state.schema.get_field("url").unwrap();
-    let title_field = state.schema.get_field("title").unwrap();
-    let timestamp_field = state.schema.get_field("timestamp").unwrap();
-    let embedding_field = state.schema.get_field("embedding").unwrap();
-    let authority_field = state.schema.get_field("authority").unwrap();
-    let content_field = state.schema.get_field("content").unwrap();
+    let state_clone = state.clone();
+    let q = params.q.clone();
+    let vector = params.vector.clone();
+    let min_score = params.min_score;
+    let freshness_boost = params.freshness_boost;
 
-    let query_vector: Option<Vec<f32>> = params.vector.and_then(|v_str| {
-        serde_json::from_str::<Vec<f32>>(&v_str).ok()
-    });
+    let results = tokio::task::spawn_blocking(move || {
+        let searcher = state_clone.reader.searcher();
+        let url_field = state_clone.schema.get_field("url").unwrap();
+        let title_field = state_clone.schema.get_field("title").unwrap();
+        let timestamp_field = state_clone.schema.get_field("timestamp").unwrap();
+        let embedding_field = state_clone.schema.get_field("embedding").unwrap();
+        let authority_field = state_clone.schema.get_field("authority").unwrap();
+        let content_field = state_clone.schema.get_field("content").unwrap();
 
-    let query_parser = tantivy::query::QueryParser::for_index(&state.index, vec![title_field, state.schema.get_field("content").unwrap()]);
-    // Also create a title-only parser for title boost scoring
-    let title_query_parser = tantivy::query::QueryParser::for_index(&state.index, vec![title_field]);
+        let query_vector: Option<Vec<f32>> = vector.and_then(|v_str| {
+            serde_json::from_str::<Vec<f32>>(&v_str).ok()
+        });
 
-    let query = if params.q.is_empty() {
-        Box::new(tantivy::query::AllQuery) as Box<dyn tantivy::query::Query>
-    } else {
-        match query_parser.parse_query(&params.q) {
-            Ok(q) => q,
-            Err(_) => Box::new(tantivy::query::AllQuery) as Box<dyn tantivy::query::Query>,
-        }
-    };
+        let query_parser = tantivy::query::QueryParser::for_index(&state_clone.index, vec![title_field, state_clone.schema.get_field("content").unwrap()]);
+        let title_query_parser = tantivy::query::QueryParser::for_index(&state_clone.index, vec![title_field]);
 
-    let title_query = if params.q.is_empty() {
-        Box::new(tantivy::query::AllQuery) as Box<dyn tantivy::query::Query>
-    } else {
-        match title_query_parser.parse_query(&params.q) {
-            Ok(q) => q,
-            Err(_) => Box::new(tantivy::query::AllQuery) as Box<dyn tantivy::query::Query>,
-        }
-    };
+        let query: Box<dyn tantivy::query::Query> = if q.is_empty() {
+            Box::new(tantivy::query::AllQuery)
+        } else {
+            match query_parser.parse_query(&q) {
+                Ok(q) => q,
+                Err(_) => Box::new(tantivy::query::AllQuery),
+            }
+        };
 
-    let limit = 200; // larger pool for domain diversity filtering
-    let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(limit)).unwrap();
+        let title_query: Box<dyn tantivy::query::Query> = if q.is_empty() {
+            Box::new(tantivy::query::AllQuery)
+        } else {
+            match title_query_parser.parse_query(&q) {
+                Ok(q) => q,
+                Err(_) => Box::new(tantivy::query::AllQuery),
+            }
+        };
 
-    // Title-only search for boost scoring
-    let title_hits: std::collections::HashSet<String> = searcher.search(&title_query, &tantivy::collector::TopDocs::with_limit(limit))
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(_, addr)| {
-            searcher.doc::<TantivyDocument>(addr).ok()
-                .and_then(|d| d.get_first(url_field).and_then(|v| v.as_str()).map(|s| s.to_string()))
-        })
-        .collect();
+        let limit = 200;
+        let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(limit)).unwrap_or_default();
 
-    let mut bm25_ranked = Vec::new();
-    let mut semantic_ranked = Vec::new();
-    let mut metadata: HashMap<String, (String, u64, f64, String)> = HashMap::new(); // url -> (title, timestamp, authority, content)
-    let mut urls_without_embeddings = std::collections::HashSet::new();
-    
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let threshold = params.min_score.unwrap_or(0.75);
+        let title_hits: std::collections::HashSet<String> = searcher.search(&title_query, &tantivy::collector::TopDocs::with_limit(limit))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, addr)| {
+                searcher.doc::<TantivyDocument>(addr).ok()
+                    .and_then(|d| d.get_first(url_field).and_then(|v| v.as_str()).map(|s| s.to_string()))
+            })
+            .collect();
 
-    let mut semantic_pass_urls = std::collections::HashSet::new();
-    let is_semantic = query_vector.is_some();
+        let mut bm25_ranked = Vec::new();
+        let mut semantic_ranked = Vec::new();
+        let mut metadata: HashMap<String, (String, u64, f64, String)> = HashMap::new();
+        let mut urls_without_embeddings = std::collections::HashSet::new();
 
-    for (_score, doc_address) in top_docs {
-        let retrieved_doc: TantivyDocument = searcher.doc(doc_address).unwrap();
-        let url = retrieved_doc.get_first(url_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let title = retrieved_doc.get_first(title_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let timestamp = retrieved_doc.get_first(timestamp_field).and_then(|v| v.as_u64()).unwrap_or(0);
-        let authority = retrieved_doc.get_first(authority_field).and_then(|v| v.as_f64()).unwrap_or(0.5);
-        let content = retrieved_doc.get_first(content_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        
-        metadata.insert(url.clone(), (title.clone(), timestamp, authority, content));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let threshold = min_score.unwrap_or(0.75);
 
-        let mut has_embedding = false;
-        if let Some(ref q_vec) = query_vector {
-            if let Some(doc_bytes) = retrieved_doc.get_first(embedding_field).and_then(|v| v.as_bytes()) {
-                let doc_vec: Vec<f32> = doc_bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                    .collect();
-                
-                if doc_vec.len() == q_vec.len() {
-                    has_embedding = true;
-                    let dot_product: f32 = q_vec.iter().zip(doc_vec.iter()).map(|(a, b)| a * b).sum();
-                    if dot_product >= threshold {
-                        semantic_ranked.push((url.clone(), dot_product, title.clone(), timestamp));
-                        semantic_pass_urls.insert(url.clone());
+        let mut semantic_pass_urls = std::collections::HashSet::new();
+        let is_semantic = query_vector.is_some();
+
+        for (_score, doc_address) in top_docs {
+            let Ok(retrieved_doc) = searcher.doc::<TantivyDocument>(doc_address) else { continue; };
+            let url = retrieved_doc.get_first(url_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let title = retrieved_doc.get_first(title_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let timestamp = retrieved_doc.get_first(timestamp_field).and_then(|v| v.as_u64()).unwrap_or(0);
+            let authority = retrieved_doc.get_first(authority_field).and_then(|v| v.as_f64()).unwrap_or(0.5);
+            let content = retrieved_doc.get_first(content_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+            metadata.insert(url.clone(), (title.clone(), timestamp, authority, content));
+
+            let mut has_embedding = false;
+            if let Some(ref q_vec) = query_vector {
+                if let Some(doc_bytes) = retrieved_doc.get_first(embedding_field).and_then(|v| v.as_bytes()) {
+                    if doc_bytes.len() % 4 == 0 {
+                        let doc_vec: Vec<f32> = doc_bytes
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+
+                        if doc_vec.len() == q_vec.len() {
+                            has_embedding = true;
+                            let dot_product: f32 = q_vec.iter().zip(doc_vec.iter()).map(|(a, b)| a * b).sum();
+                            if dot_product >= threshold {
+                                semantic_ranked.push((url.clone(), dot_product, title.clone(), timestamp));
+                                semantic_pass_urls.insert(url.clone());
+                            }
+                        }
                     }
                 }
             }
-        }
-        
-        if !has_embedding {
-            urls_without_embeddings.insert(url.clone());
-        }
-        
-        // Only add to BM25 rank if it's not a semantic search OR if it passed semantic threshold
-        // If it's NOT a semantic search, we add everything.
-        // If it IS a semantic search, we only add it if it has an embedding AND passed, OR if it has NO embedding (fallback)
-        if !is_semantic || semantic_pass_urls.contains(&url) || !has_embedding {
-             bm25_ranked.push(url.clone());
-        }
-    }
 
-    semantic_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let k = 60.0;
-    let mut rrf_scores: HashMap<String, f32> = HashMap::new();
-
-    for (rank, url) in bm25_ranked.iter().enumerate() {
-        if is_semantic && !semantic_pass_urls.contains(url) && !urls_without_embeddings.contains(url) { continue; }
-        *rrf_scores.entry(url.clone()).or_insert(0.0) += 1.0 / (k + (rank + 1) as f32);
-    }
-
-    for (rank, (url, _sim, _title, _ts)) in semantic_ranked.iter().enumerate() {
-        *rrf_scores.entry(url.clone()).or_insert(0.0) += 1.0 / (k + (rank + 1) as f32);
-    }
-
-    let mut results: Vec<SearchResult> = rrf_scores
-        .into_iter()
-        .map(|(url, score)| {
-            let (title, ts, auth, content) = metadata.get(&url).cloned().unwrap_or(("No Title".to_string(), 0, 0.5, String::new()));
-            let mut final_score = score;
-            if params.freshness_boost.unwrap_or(false) && ts > 0 {
-                let age = now.saturating_sub(ts);
-                let scale = 86400.0 * 7.0;
-                let boost = scale / (scale + age as f32);
-                final_score *= 1.0 + (boost * 0.5);
-            }
-            // Authority boost: pages with higher authority get a 0-30% boost
-            final_score *= 1.0 + (auth as f32 * 0.3);
-
-            // Title boost: results where the query matches the title get 2x boost
-            // This is a much stronger relevance signal than content-only matches
-            if title_hits.contains(&url) {
-                final_score *= 2.0;
+            if !has_embedding {
+                urls_without_embeddings.insert(url.clone());
             }
 
-            SearchResult { url, title, score: final_score, authority: auth as f32, content: if content.len() > 500 { content.chars().take(500).collect() } else { content } }
-        })
-        .collect();
-
-    // Sort by score descending
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Domain diversity: cap results per domain to prevent single-domain dominance
-    // Without this, "rust web framework" returns 10/10 from github.com
-    const MAX_PER_DOMAIN: usize = 3;
-    let mut domain_counts: HashMap<String, usize> = HashMap::new();
-    let mut diverse_results: Vec<SearchResult> = Vec::new();
-    for r in results {
-        // Extract domain without reqwest dependency: "https://sub.domain.com/path" → "sub.domain.com"
-        let domain = r.url
-            .split("://")
-            .nth(1)
-            .and_then(|s| s.split('/').next())
-            .and_then(|s| s.split(':').next())
-            .unwrap_or("")
-            .to_lowercase();
-        let count = domain_counts.entry(domain).or_insert(0);
-        if *count < MAX_PER_DOMAIN {
-            *count += 1;
-            diverse_results.push(r);
-        }
-    }
-    let mut results = diverse_results;
-
-    // Normalize scores to [0, 1] range using max-score normalization
-    // Raw RRF scores are 0.03-0.04 which is meaningless to consumers
-    if let Some(max_score) = results.iter().map(|r| r.score).fold(None, |acc, s| {
-        Some(match acc { Some(m) => s.max(m), None => s })
-    }) {
-        if max_score > 0.0 {
-            for r in results.iter_mut() {
-                r.score /= max_score;
+            if !is_semantic || semantic_pass_urls.contains(&url) || !has_embedding {
+                bm25_ranked.push(url.clone());
             }
         }
-    }
 
-    results.truncate(10);
+        semantic_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let k = 60.0;
+        let mut rrf_scores: HashMap<String, f32> = HashMap::new();
+
+        for (rank, url) in bm25_ranked.iter().enumerate() {
+            if is_semantic && !semantic_pass_urls.contains(url) && !urls_without_embeddings.contains(url) { continue; }
+            *rrf_scores.entry(url.clone()).or_insert(0.0) += 1.0 / (k + (rank + 1) as f32);
+        }
+
+        for (rank, (url, _sim, _title, _ts)) in semantic_ranked.iter().enumerate() {
+            *rrf_scores.entry(url.clone()).or_insert(0.0) += 1.0 / (k + (rank + 1) as f32);
+        }
+
+        let mut results: Vec<SearchResult> = rrf_scores
+            .into_iter()
+            .map(|(url, score)| {
+                let (title, ts, auth, content) = metadata.get(&url).cloned().unwrap_or(("No Title".to_string(), 0, 0.5, String::new()));
+                let mut final_score = score;
+                if freshness_boost.unwrap_or(false) && ts > 0 {
+                    let age = now.saturating_sub(ts);
+                    let scale = 86400.0 * 7.0;
+                    let boost = scale / (scale + age as f32);
+                    final_score *= 1.0 + (boost * 0.5);
+                }
+                final_score *= 1.0 + (auth as f32 * 0.3);
+
+                if title_hits.contains(&url) {
+                    final_score *= 2.0;
+                }
+
+                SearchResult {
+                    url, title,
+                    score: final_score,
+                    authority: auth as f32,
+                    content: if content.len() > 500 { content.chars().take(500).collect() } else { content },
+                }
+            })
+            .collect();
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+        const MAX_PER_DOMAIN: usize = 3;
+        let mut domain_counts: HashMap<String, usize> = HashMap::new();
+        let mut diverse_results: Vec<SearchResult> = Vec::new();
+        for r in results {
+            let domain = r.url
+                .split("://")
+                .nth(1)
+                .and_then(|s| s.split('/').next())
+                .and_then(|s| s.split(':').next())
+                .unwrap_or("")
+                .to_lowercase();
+            let count = domain_counts.entry(domain).or_insert(0);
+            if *count < MAX_PER_DOMAIN {
+                *count += 1;
+                diverse_results.push(r);
+            }
+        }
+        let mut results = diverse_results;
+
+        if let Some(max_score) = results.iter().map(|r| r.score).fold(None, |acc, s| {
+            Some(match acc { Some(m) => s.max(m), None => s })
+        }) {
+            if max_score > 0.0 {
+                for r in results.iter_mut() {
+                    r.score /= max_score;
+                }
+            }
+        }
+
+        results.truncate(10);
+        results
+    }).await.unwrap_or_default();
 
     Json(results)
 }

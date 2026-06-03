@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokenizers::Tokenizer;
+use tokio::sync::Semaphore;
 
 // ─── Intent Categories (legacy, kept for reference) ────────────────
 #[allow(dead_code)]
@@ -116,6 +117,7 @@ pub struct AppState {
     pub device: Device,
     pub intent_cache: Cache<String, IntentResponse>,
     pub embed_cache: Cache<String, Vec<f32>>,
+    pub bert_semaphore: Semaphore,
 }
 
 // ─── Linear Probe Weights ──────────────────────────────────────────
@@ -171,7 +173,7 @@ fn extract_constraints(query: &str) -> Constraints {
     // "better than X", "faster than X" indicate a Comparison entity.
 
     let negative_markers = [
-        " not ", " -", " without ", " except ", " excluding ",
+        " not ", " nor ", " -", " without ", " except ", " excluding ",
         " but not ", " other than ", " minus ", " besides ", " no ",
     ];
 
@@ -1751,7 +1753,7 @@ fn extract_year(text: &str) -> Option<&str> {
 
 // ─── Main ────────────────────────────────────────────────────────────
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -1808,6 +1810,7 @@ async fn main() -> anyhow::Result<()> {
         device,
         intent_cache,
         embed_cache,
+        bert_semaphore: Semaphore::new(2),
     });
 
     let app = Router::new()
@@ -1860,10 +1863,15 @@ async fn analyze_query(
         flat_constraints.push(format!("-{}", c));
     }
 
-    // ── Get embedding for linear probe ──
+    // ── Get embedding for linear probe (offloaded to blocking thread pool) ──
     let query_embedding = {
-        let bert_model = state.bert_model.lock().unwrap();
-        compute_embedding(&state.device, &*bert_model, &state.bert_tokenizer, &params.q)
+        let _permit = state.bert_semaphore.acquire().await.unwrap();
+        let state_clone = state.clone();
+        let query_text = params.q.clone();
+        tokio::task::spawn_blocking(move || {
+            let bert_model = state_clone.bert_model.lock().unwrap();
+            compute_embedding(&state_clone.device, &*bert_model, &state_clone.bert_tokenizer, &query_text)
+        }).await.unwrap_or(None)
     };
 
     // ── Linear probe classification ──
@@ -1915,9 +1923,14 @@ async fn embed_text(
     }
 
     let embedding_vec = {
-        let bert_model = state.bert_model.lock().unwrap();
-        compute_embedding(&state.device, &*bert_model, &state.bert_tokenizer, &params.text)
-            .unwrap_or_else(|| vec![0.0; 384])
+        let _permit = state.bert_semaphore.acquire().await.unwrap();
+        let state_clone = state.clone();
+        let text = params.text.clone();
+        tokio::task::spawn_blocking(move || {
+            let bert_model = state_clone.bert_model.lock().unwrap();
+            compute_embedding(&state_clone.device, &*bert_model, &state_clone.bert_tokenizer, &text)
+                .unwrap_or_else(|| vec![0.0; 384])
+        }).await.unwrap_or_else(|_| vec![0.0; 384])
     };
 
     state.embed_cache.insert(text_norm, embedding_vec.clone()).await;
