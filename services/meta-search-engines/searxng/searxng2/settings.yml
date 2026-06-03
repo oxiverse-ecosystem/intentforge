@@ -1,7 +1,6 @@
 # SearXNG2 settings — Tor-optimized (speed over coverage)
 # Only engines that actually work through Tor exit nodes.
-# Blocked engines (brave, presearch, yandex) removed — they just
-# waste 3-4s each timing out with CAPTCHA/access denied.
+# Brave: clearnet 429 through Tor exits, so we use brave-onion engine.
 # DuckDuckGo WEB: uses custom onion engine pointing to the onion
 # service at duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion
 # DuckDuckGo images/videos: still use clearnet through Tor exit nodes
@@ -9,7 +8,8 @@
 use_default_settings:
   engines:
     keep_only:
-      # ── Proven fast through Tor ──
+      # ── Tor-fast engines ──
+      - brave           # clearnet works through Tor, ~0.5s
       - bing            # 10 results, ~1.5s
       - startpage       # 8 results, ~2s
       - mojeek          # 6 results, ~2s
@@ -70,6 +70,21 @@ engines:
   - name: startpage
     disabled: false
     timeout: 5.0
+
+  # Brave clearnet through Tor is unreliable (429 rate-limited). Disable the
+  # default clearnet instance and use the custom brave-onion engine instead.
+  - name: brave
+    disabled: true
+
+  # Brave via onion service — consistently works through Tor (3-4s, ~20 results).
+  - name: brave-onion
+    engine: brave
+    base_url: "https://search.brave4u7jddbv7cyviptqjc7jusxh72uik7zt6adtckl5f4nwy2v72qd.onion/"
+    disabled: false
+    shortcut: brv
+    timeout: 8.0
+    categories: general
+    network: default
 
   # DDG via onion service — avoids CAPTCHA on Tor exit nodes
   - name: duckduckgo-onion
