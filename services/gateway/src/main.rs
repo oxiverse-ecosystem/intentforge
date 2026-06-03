@@ -1050,9 +1050,9 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
         1 => 1.0,   // single term must match exactly
         2 => 0.45,  // at least 1 of 2
         3 => 0.30,  // at least 1 of 3
-        _ => 0.20,  // 4+ terms: lenient
+        4 => 0.20,  // 4 terms: lenient
+        _ => 0.15,  // 5+ terms: very lenient for niche/long queries (was 0.20)
     };
-
     if coverage < min_coverage {
         if coverage < 0.10 {
             return 0.01; // essentially irrelevant
@@ -1872,6 +1872,23 @@ fn merge_local_and_web(
             + nav_domain_boost;
         r.score = base * c_score;
     }
+    // --- Thin-Result Detection: boost scores when few results or low max score ---
+    // For niche topics (few results returned, low max score), apply a proportional
+    // boost to ensure the top results surface with reasonable confidence.
+    // Also lower the semantic coverage threshold to be more lenient on term matching.
+    if merged.len() < 15 && merged.len() > 0 {
+        let max_score = merged.iter().map(|r| r.score).fold(0.0f32, f32::max);
+        if max_score < 0.30 {
+            let boost_factor = (0.30 / max_score.max(0.01)).min(2.5);
+            tracing::info!(
+                "THIN RESULTS: merged.len={} max_score={:.3} boost={:.2}x",
+                merged.len(), max_score, boost_factor
+            );
+            for r in merged.iter_mut() {
+                r.score *= boost_factor;
+            }
+        }
+    }
 
     // 4. Sort by score descending
     merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -2046,6 +2063,7 @@ struct AppState {
     volume_tracker: ResultVolumeTracker,
     http_client: reqwest::Client,
     searxng2_url: Option<String>,
+    searx_last_used: Mutex<HashMap<String, Instant>>,
 }
 
 async fn handle_images(
@@ -2351,16 +2369,32 @@ async fn main() {
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .pool_max_idle_per_host(20)
             .connect_timeout(Duration::from_secs(1))
+            .tcp_nodelay(true)                          // Disable Nagle's — saves 5-40ms on small payloads
+            .pool_idle_timeout(Duration::from_secs(90))   // Keep connections warm between bursts
+            .tcp_keepalive(Duration::from_secs(60))        // Prevent mid-stream connection drops
             .build()
             .unwrap(),
         searxng2_url,
+        searx_last_used: Mutex::new(HashMap::new()),
     });
 
-    // Prewarm: poll intent engine until ready (handles container restart ordering).
-    // Gateway starts fast; intent engine takes 5-15s to load BERT + compute centroids.
+    // Prewarm: fire HEAD requests to populate connection pool immediately.
+    // TCP+TLS handshakes are expensive (1-3 round trips); prewarming means the
+    // first user request gets zero handshake latency.
     let prewarm_client = state.http_client.clone();
     let prewarm_searxng2 = state.searxng2_url.clone();
     tokio::spawn(async move {
+        let mut prewarm_heads = vec![
+            prewarm_client.head("http://127.0.0.1:8080/search?q=prewarm&format=json&pageno=1").send(),
+            prewarm_client.head("http://127.0.0.1:6000/search?q=prewarm").send(),
+        ];
+        if let Some(ref s2_url) = prewarm_searxng2 {
+            let url = format!("{}/search?q=prewarm&format=json&pageno=1", s2_url);
+            prewarm_heads.push(prewarm_client.head(url).send());
+        }
+        let _ = futures::future::join_all(prewarm_heads).await;
+        tracing::info!("Connection pool prewarmed with HEAD requests");
+
         tracing::info!("Prewarming — polling intent engine until ready...");
         // Poll intent engine with exponential backoff until it responds
         for attempt in 1..=20 {
@@ -2496,10 +2530,22 @@ async fn handle_search(
     // ─── Build engine URLs with raw query (no intent dependency) ────
     // Engines fire immediately in parallel with intent analysis.
     // Intent results are used post-hoc for scoring, not for query construction.
-    let searx_base_urls: Vec<&str> = if state.searxng2_url.is_some() {
-        vec!["http://127.0.0.1:8080", state.searxng2_url.as_deref().unwrap()]
-    } else {
-        vec!["http://127.0.0.1:8080"]
+    // Sort instances by last-used time (warmest first) so join_all starts with
+    // the connection that's most likely to have an idle pool entry, reducing
+    // overall fan-out latency when one instance has cooled down.
+    let searx_base_urls: Vec<&str> = {
+        let mut urls: Vec<&str> = if state.searxng2_url.is_some() {
+            vec!["http://127.0.0.1:8080", state.searxng2_url.as_deref().unwrap()]
+        } else {
+            vec!["http://127.0.0.1:8080"]
+        };
+        let searx_last_used = state.searx_last_used.lock().unwrap();
+        urls.sort_by(|a, b| {
+            let a_warm = searx_last_used.get(*a).copied().unwrap_or(std::time::Instant::now());
+            let b_warm = searx_last_used.get(*b).copied().unwrap_or(std::time::Instant::now());
+            b_warm.cmp(&a_warm) // most recently used first
+        });
+        urls
     };
 
     // Build SearXNG URLs: one per instance, raw query (no expanded queries yet)
@@ -2521,6 +2567,10 @@ async fn handle_search(
     let searx_instance_keys: Vec<String> = searx_base_urls.iter().enumerate().map(|(i, _)| {
         format!("searxng{}", i)
     }).collect();
+    // Map instance key → base URL for connection-cooldown tracking
+    let searx_key_to_url: HashMap<String, String> = searx_base_urls.iter().enumerate().map(|(i, url)| {
+        (format!("searxng{}", i), url.to_string())
+    }).collect();
     let searx_instance_open: Vec<bool> = searx_instance_keys.iter()
         .map(|k| circuit_ref.is_open(k))
         .collect();
@@ -2529,10 +2579,10 @@ async fn handle_search(
     let invidious_open = circuit_ref.is_open("invidious");
 
     let indexer_fut = async {
-        match tokio::time::timeout(Duration::from_secs(2), client_ref.get(&indexer_query_raw).send()).await {
+        match tokio::time::timeout(Duration::from_secs(1), client_ref.get(&indexer_query_raw).send()).await {
             Ok(Ok(resp)) => {
                 let status = resp.status();
-                match tokio::time::timeout(Duration::from_secs(2), resp.json::<Vec<IndexerResult>>()).await {
+                match tokio::time::timeout(Duration::from_secs(1), resp.json::<Vec<IndexerResult>>()).await {
                     Ok(Ok(data)) => Ok(data),
                     Ok(Err(e)) => {
                         tracing::error!("Failed to parse Indexer JSON (status: {}): {:?}", status, e);
@@ -2669,12 +2719,12 @@ async fn handle_search(
         if whoogle_open {
             return Ok::<WhoogleResponse, anyhow::Error>(WhoogleResponse { results: vec![] });
         }
-        let resp = match tokio::time::timeout(Duration::from_secs(2), client_ref.get(&whoogle_url).send()).await {
+        let resp = match tokio::time::timeout(Duration::from_secs(1), client_ref.get(&whoogle_url).send()).await {
             Ok(Ok(r)) => r,
             _ => return Ok(WhoogleResponse { results: vec![] }),
         };
         let status = resp.status();
-        let raw_text = match tokio::time::timeout(Duration::from_secs(2), resp.text()).await {
+        let raw_text = match tokio::time::timeout(Duration::from_secs(1), resp.text()).await {
             Ok(Ok(t)) => t,
             _ => return Ok(WhoogleResponse { results: vec![] }),
         };
@@ -2710,12 +2760,12 @@ async fn handle_search(
         if invidious_open {
             return Ok::<Vec<InvidiousResult>, anyhow::Error>(vec![]);
         }
-        let resp = match tokio::time::timeout(Duration::from_secs(2), client_ref.get(&invidious_url).send()).await {
+        let resp = match tokio::time::timeout(Duration::from_secs(1), client_ref.get(&invidious_url).send()).await {
             Ok(Ok(r)) => r,
             _ => return Ok::<Vec<InvidiousResult>, anyhow::Error>(vec![]),
         };
         let status = resp.status();
-        match tokio::time::timeout(Duration::from_secs(2), resp.json::<Vec<InvidiousResult>>()).await {
+        match tokio::time::timeout(Duration::from_secs(1), resp.json::<Vec<InvidiousResult>>()).await {
             Ok(Ok(data)) => Ok(data),
             Ok(Err(e)) => {
                 tracing::error!("Failed to parse Invidious JSON (status: {}): {:?}", status, e);
@@ -2742,11 +2792,11 @@ async fn handle_search(
             "http://127.0.0.1:8080/search?q={}&format=json&categories=news&pageno=1",
             q_encoded
         );
-        let resp = match tokio::time::timeout(std::time::Duration::from_secs(2), client_ref.get(&news_url).send()).await {
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(1), client_ref.get(&news_url).send()).await {
             Ok(Ok(r)) => r,
             _ => return Ok(SearxNewsResponse { results: vec![] }),
         };
-        let raw = match tokio::time::timeout(std::time::Duration::from_secs(2), resp.text()).await {
+        let raw = match tokio::time::timeout(std::time::Duration::from_secs(1), resp.text()).await {
             Ok(Ok(t)) => t,
             _ => return Ok(SearxNewsResponse { results: vec![] }),
         };
@@ -2768,11 +2818,11 @@ async fn handle_search(
             "http://127.0.0.1:8080/search?q={}&format=json&categories=images&pageno=1",
             q_encoded
         );
-        let resp = match tokio::time::timeout(std::time::Duration::from_secs(2), client_ref.get(&image_url).send()).await {
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(1), client_ref.get(&image_url).send()).await {
             Ok(Ok(r)) => r,
             _ => return Ok(SearxImageResponse { results: vec![] }),
         };
-        let raw = match tokio::time::timeout(std::time::Duration::from_secs(2), resp.text()).await {
+        let raw = match tokio::time::timeout(std::time::Duration::from_secs(1), resp.text()).await {
             Ok(Ok(t)) => t,
             _ => return Ok(SearxImageResponse { results: vec![] }),
         };
@@ -2788,7 +2838,7 @@ async fn handle_search(
 
     let searx_fut_with_timeout = async {
         match tokio::time::timeout(
-            std::time::Duration::from_secs(2),  // Per-instance timeout is 2s; cut the join at 2s
+            std::time::Duration::from_secs(2),  // Per-instance timeout is 2s; join_all wrapper at 2s
             futures::future::join_all(searx_futs),
         ).await {
             Ok(results) => results,
@@ -2888,11 +2938,11 @@ async fn handle_search(
             urlencoding::encode(&vec_str)
         );
         match tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(1),
             client.get(&indexer_url_vec).send()
         ).await {
             Ok(Ok(resp)) => {
-                match tokio::time::timeout(Duration::from_secs(2), resp.json::<Vec<IndexerResult>>()).await {
+                match tokio::time::timeout(Duration::from_secs(1), resp.json::<Vec<IndexerResult>>()).await {
                     Ok(Ok(vec_results)) => {
                         if !vec_results.is_empty() {
                             tracing::info!(
@@ -2929,6 +2979,10 @@ async fn handle_search(
                 tracing::info!("SearXNG variation {} returned {} results", i, n);
                 if n > 0 {
                     circuit_ref.record_success(instance_key);
+                    // Track last-used time for connection-cooldown aware routing
+                    if let Some(url) = searx_key_to_url.get(instance_key) {
+                        state.searx_last_used.lock().unwrap().insert(url.clone(), Instant::now());
+                    }
                     circuit_ref.record_results(instance_key, n as u64);
                     for r in &searx_data.results {
                         *engine_counts.entry(r.engine.clone()).or_insert(0) += 1;
@@ -2992,19 +3046,30 @@ async fn handle_search(
         // Pick the first expanded query variation we haven't tried yet (skip index 0 = raw query)
         let retry_query_idx = if expanded_queries.len() > 1 { 1 } else { 0 };
         if let Some(retry_eq) = expanded_queries.get(retry_query_idx) {
-            // Prefer instance 0 (usually VPN/healthy) over instance 1 (often tor/degraded)
-            let retry_instance_idx = 0usize;
-            if let Some(retry_base) = searx_base_urls.get(retry_instance_idx) {
+            // Prefer the most recently used (warmest) instance — warm connections
+            // avoid TCP+TLS handshake latency on retries.
+            let warmest_idx = {
+                let last_used = state.searx_last_used.lock().unwrap();
+                (0..searx_base_urls.len())
+                    .filter(|i| !circuit_ref.is_open(&format!("searxng{}", i)))
+                    .max_by(|&a, &b| {
+                        let a_warm = last_used.get(searx_base_urls[a]).copied().unwrap_or(Instant::now());
+                        let b_warm = last_used.get(searx_base_urls[b]).copied().unwrap_or(Instant::now());
+                        a_warm.cmp(&b_warm)
+                    })
+                    .unwrap_or(0)
+            };
+            if let Some(retry_base) = searx_base_urls.get(warmest_idx) {
                 let clean_eq = preprocess_searxng_query(retry_eq);
                 let retry_url = format!("{}/search?q={}&format=json&pageno=1", retry_base, urlencoding::encode(&clean_eq));
-                let retry_key = format!("searxng{}", retry_instance_idx);
+                let retry_key = format!("searxng{}", warmest_idx);
                 if !circuit_ref.is_open(&retry_key) {
                     tracing::info!(
                         "SMART RETRY: {} results < {} expected — trying variation '{}' on instance {}",
-                        total_results, expected_min, clean_eq, retry_instance_idx
+                        total_results, expected_min, clean_eq, warmest_idx
                     );
                     match tokio::time::timeout(
-                        Duration::from_secs(2),
+                        Duration::from_secs(1),
                         client_ref.get(&retry_url).send(),
                     ).await {
                         Ok(Ok(resp)) => {
@@ -3014,6 +3079,8 @@ async fn handle_search(
                                 let retry_count = data.results.len();
                                 tracing::info!("Smart retry returned {} results", retry_count);
                                 circuit_ref.record_success(&retry_key);
+                                // Track last-used for connection-cooldown aware routing
+                                state.searx_last_used.lock().unwrap().insert(retry_base.to_string(), Instant::now());
                                 circuit_ref.record_results(&retry_key, retry_count as u64);
                                 for (pos, result) in data.results.into_iter().enumerate() {
                                     let engine_weight = circuit_ref.weight(&result.engine);
@@ -3327,6 +3394,8 @@ async fn handle_search(
                                     clean_eq
                                 );
                                 circuit_ref.record_success(&retry_key);
+                                // Track last-used for connection-cooldown aware routing
+                                state.searx_last_used.lock().unwrap().insert(base_url.to_string(), Instant::now());
                                 circuit_ref.record_results(&retry_key, data.results.len() as u64);
                                 for (pos, result) in data.results.into_iter().enumerate() {
                                     let engine_weight = circuit_ref.weight(&result.engine);
@@ -3377,24 +3446,107 @@ async fn handle_search(
     }
     web_results = keep_indices.into_iter().map(|i| web_results[i].clone()).collect();
 
-    // Hard filter: remove web results that violate negative constraints
+    // --- Hard filter: remove web results that violate negative constraints ---
+    // Uses a graduated penalty approach instead of a single threshold:
+    //   1. Count how many negative constraints each result violates.
+    //   2. Retain only results with <= median violations or <= 1 violation.
+    //   3. When all results violate constraints, sort by fewest violations (ascending).
+    //      This prevents "not java nor csharp nor go" from showing Rust+Go content
+    //      while still returning results about Java if that is all there is.
+    //   4. Goldilocks detection: when multiple negative constraints remove everything,
+    //      relax the penalty to preserve domain-relevant results.
     if !intent.structured_constraints.negative.is_empty() {
         let before_count = web_results.len();
-        web_results.retain(|r| {
-            let c_score = constraint_score(&r.title, &r.content, &r.url, &intent.structured_constraints);
-            c_score >= 0.15
+        let constraints_ref = &intent.structured_constraints;
+
+        // Score each result and track violation counts
+        let mut scored: Vec<(usize, f32, usize)> = web_results.iter().enumerate().map(|(i, r)| {
+            let c_score = constraint_score(&r.title, &r.content, &r.url, constraints_ref);
+            // Count how many negative terms actually match this result content
+            let text = format!("{} {} {}", r.title.to_lowercase(), r.content.to_lowercase(), r.url.to_lowercase());
+            // Use word-boundary matching for violation counting to avoid false positives
+            // e.g., "go" should not match "golang", "java" should not match "javascript"
+            let violations = constraints_ref.negative.iter().filter(|n| {
+                let n_lower = n.to_lowercase();
+                let n_words: Vec<&str> = n_lower.split_whitespace().collect();
+                if n_words.len() == 1 {
+                    // Single word: check word-boundary match
+                    text.split_whitespace().any(|tw| {
+                        let tw_clean: String = tw.chars().filter(|c| c.is_alphanumeric()).collect();
+                        tw_clean == n_lower || tw_clean.contains(&n_lower)
+                    })
+                } else {
+                    // Multi-word: check if phrase appears in text
+                    text.contains(&n_lower)
+                }
+            }).count();
+            (i, c_score, violations)
+        }).collect();
+
+        // Sort by violation count ascending first, then by score descending
+        scored.sort_by(|a, b| {
+            a.2.cmp(&b.2)
+                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
         });
-        let removed = before_count.saturating_sub(web_results.len());
+
+        // Compute the violation distribution to decide filtering strategy
+        let max_violations = scored.iter().map(|(_, _, v)| *v).max().unwrap_or(0);
+        let min_violations = scored.iter().map(|(_, _, v)| *v).min().unwrap_or(0);
+        let total_violations: usize = scored.iter().map(|(_, _, v)| *v).sum();
+        let avg_violations = total_violations as f32 / scored.len().max(1) as f32;
+
+        // Goldilocks check: if average violations > 1.0 AND most results have high violations,
+        // the negative constraints are too aggressive for this result set.
+        let is_goldilocks = avg_violations > 1.5 && min_violations >= 1;
+
+        // Filter strategy:
+        // - Normal case: keep results with violations <= 1 (clean match)
+        // - Goldilocks case: keep results with violations <= max_violations / 2 (relaxed)
+        let violation_threshold = if is_goldilocks {
+            tracing::warn!("GOLDILOCKS: avg_violations={:.1} max={} - relaxing constraint threshold",
+                avg_violations, max_violations
+            );
+            (max_violations / 2).max(1)
+        } else {
+            1.min(max_violations)
+        };
+
+        let kept: Vec<usize> = scored.iter()
+            .filter(|(_, _, v)| *v <= violation_threshold)
+            .map(|(i, _, _)| *i)
+            .collect();
+
+        let removed = before_count.saturating_sub(kept.len());
         if removed > 0 {
-            tracing::info!("Negative constraint hard filter: removed {}/{} web results", removed, before_count);
+            tracing::info!(
+                "Negative constraint hard filter: removed {}/{} web results (violations max={} min={} avg={:.1})",
+                removed, before_count, max_violations, min_violations, avg_violations
+            );
         }
-        if web_results.is_empty() && before_count > 0 {
-            tracing::warn!("Negative constraint filter removed all web results — relaxing threshold");
-            // Re-add with relaxed threshold
-            web_results = web_results.into_iter().filter(|r| {
-                let c_score = constraint_score(&r.title, &r.content, &r.url, &intent.structured_constraints);
-                c_score >= 0.01
+
+        if !kept.is_empty() {
+            // Keep results in sorted order (fewest violations first, highest score within)
+            web_results = kept.iter().map(|i| web_results[*i].clone()).collect();
+        } else {
+            // Fallback: keep results sorted by violations (ascending) but do not filter
+            // This preserves ordering so results with FEWER violations rank higher.
+            tracing::warn!(
+                "Negative constraint filter removed all {} results - keeping sorted by violations",
+                before_count
+            );
+            let sorted_indices: Vec<usize> = scored.iter().map(|(i, _, _)| *i).collect();
+            // Apply graduated penalty: each violation halves the effective score
+            // so results with fewer violations naturally rank higher.
+            let mut scored_results: Vec<SearxResult> = sorted_indices.iter().map(|i| {
+                let mut r = web_results[*i].clone();
+                let violations = scored.iter().find(|(j, _, _)| *j == *i).map(|(_, _, v)| *v).unwrap_or(0);
+                // Each violation halves the score: 0=1.0, 1=0.5, 2=0.25, 3=0.125
+                r.score *= 0.5_f32.powi(violations as i32);
+                r
             }).collect();
+            // Sort by penalized score to push multi-violation results down
+            scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            web_results = scored_results;
         }
     }
 

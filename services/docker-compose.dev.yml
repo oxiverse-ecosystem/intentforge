@@ -16,7 +16,7 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     env_file:
-      - ./privacy-layer/.env
+      - ../.env
     environment:
       - VPN_SERVICE_PROVIDER=protonvpn
       - VPN_TYPE=openvpn

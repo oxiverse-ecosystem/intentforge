@@ -2723,9 +2723,9 @@
     0.14701880514621735,
     -0.06264357268810272
   ],
-  "temperature": 0.05,
+  "temperature": 1.0,
   "confidence": {
-    "base": 0.3,
-    "margin_multiplier": 0.8
+    "base": 0.1,
+    "margin_multiplier": 1.5
   }
 }
