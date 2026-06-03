@@ -145,24 +145,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  whoogle:
-    container_name: if-whoogle
-    image: benbusby/whoogle-search:latest
-    network_mode: "service:gluetun"
-    restart: always
-    environment:
-      - WHOOGLE_CONFIG_HTTPS=0
-      - WHOOGLE_CONFIG_THEME=dark
-      - WHOOGLE_CONFIG_SEARCH_LANGUAGE=lang_en
-      - WHOOGLE_CONFIG_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
-    volumes:
-      - ./meta-search-engines/whoogle/torrc:/etc/tor/torrc:ro
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
   invidious-db:
     container_name: if-invidious-db
     image: postgres:14-alpine
@@ -250,7 +232,6 @@ services:
       - indexer
       - searxng
       - searxng2
-      - whoogle
       - invidious
     restart: always
 

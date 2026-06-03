@@ -18,7 +18,7 @@ Thumbs.db
 
 # Secrets — NEVER commit .env files
 .env
-services/privacy-layer/.env
+tmp/
 
 # Runtime data
 services/privacy-layer/tor/data/
@@ -34,3 +34,4 @@ __pycache__/
 # Hermes agent state
 .hermes/plans/
 docs/plans/
+ROADMAP.md

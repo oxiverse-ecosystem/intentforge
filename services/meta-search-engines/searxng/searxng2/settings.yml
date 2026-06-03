@@ -2,6 +2,9 @@
 # Only engines that actually work through Tor exit nodes.
 # Blocked engines (brave, presearch, yandex) removed — they just
 # waste 3-4s each timing out with CAPTCHA/access denied.
+# DuckDuckGo WEB: uses custom onion engine pointing to the onion
+# service at duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion
+# DuckDuckGo images/videos: still use clearnet through Tor exit nodes
 
 use_default_settings:
   engines:
@@ -9,7 +12,6 @@ use_default_settings:
       # ── Proven fast through Tor ──
       - bing            # 10 results, ~1.5s
       - startpage       # 8 results, ~2s
-      - duckduckgo      # 7 results, ~2.5s
       - mojeek          # 6 results, ~2s
       - wikipedia       # 1-2 results, ~1s
       # ── News (fast through Tor) ──
@@ -69,9 +71,15 @@ engines:
     disabled: false
     timeout: 5.0
 
-  - name: duckduckgo
+  # DDG via onion service — avoids CAPTCHA on Tor exit nodes
+  - name: duckduckgo-onion
+    engine: duckduckgo
+    ddg_url: "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/html/"
     disabled: false
-    timeout: 5.0
+    shortcut: ddo
+    timeout: 8.0
+    categories: general
+    network: default  # use the default network's SOCKS5 proxy for .onion
 
   - name: mojeek
     disabled: false

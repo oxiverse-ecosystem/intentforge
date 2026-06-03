@@ -87,20 +87,6 @@ struct SearxResult {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct WhoogleResult {
-    #[serde(alias = "href", alias = "link")]
-    url: String,
-    title: String,
-    #[serde(alias = "desc", alias = "snippet", default)]
-    description: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct WhoogleResponse {
-    results: Vec<WhoogleResult>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
 struct InvidiousResult {
     #[serde(alias = "type")]
     result_type: Option<String>,
@@ -255,7 +241,7 @@ struct MergedResult {
     #[serde(default)]
     authority: f32,
     #[serde(default)]
-    sources: Vec<String>,  // e.g. ["local", "bing", "brave", "whoogle"]
+    sources: Vec<String>,  // e.g. ["local", "bing", "brave"]
     #[serde(default)]
     is_local: bool,
 }
@@ -2554,7 +2540,6 @@ async fn handle_search(
         format!("{}/search?q={}&format=json&pageno=1", base_url, urlencoding::encode(&clean_q))
     }).collect();
 
-    let whoogle_url = format!("http://127.0.0.1:5000/search?q={}&format=json", q_encoded);
     let invidious_url = format!("http://127.0.0.1:3000/api/v1/search?q={}", q_encoded);
 
     let indexer_query_raw = format!("http://127.0.0.1:6000/search?q={}", q_encoded);
@@ -2575,7 +2560,6 @@ async fn handle_search(
         .map(|k| circuit_ref.is_open(k))
         .collect();
     let all_searx_open = searx_instance_open.iter().all(|&o| o);
-    let whoogle_open = circuit_ref.is_open("whoogle");
     let invidious_open = circuit_ref.is_open("invidious");
 
     let indexer_fut = async {
@@ -2615,29 +2599,29 @@ async fn handle_search(
             if is_open {
                 return Ok(SearxResponse { results: vec![] });
             }
-            // Per-instance timeout: 2s for the request itself, so slow backends
-            // (e.g. tor2) don't block the entire fan-out waiting for the outer 3s.
+            // Per-instance timeout: 3s for the request itself, giving VPN engines (3.0s)
+            // enough headroom while keeping Tor retries within the 5s outer wrapper.
             let first: Result<SearxResponse, reqwest::Error> = async {
                 let resp = match tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_secs(3),
                     client_ref.get(&url).send()
                 ).await {
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
-                        tracing::warn!("SearXNG instance request timed out (2s): {}", &url[..url.find('?').unwrap_or(url.len())]);
+                        tracing::warn!("SearXNG instance request timed out (3s): {}", &url[..url.find('?').unwrap_or(url.len())]);
                         return Ok(SearxResponse { results: vec![] });
                     }
                 };
                 let status = resp.status();
                 let raw = match tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_secs(3),
                     resp.text()
                 ).await {
                     Ok(Ok(t)) => t,
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
-                        tracing::warn!("SearXNG instance body read timed out (2s)");
+                        tracing::warn!("SearXNG instance body read timed out (3s)");
                         return Ok(SearxResponse { results: vec![] });
                     }
                 };
@@ -2667,7 +2651,7 @@ async fn handle_search(
                     tracing::info!("SearXNG returned 0 results, retrying immediately...");
                     let retry: Result<SearxResponse, reqwest::Error> = async {
                         match tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
+                            std::time::Duration::from_secs(3),
                             client_ref.get(&url).send()
                         ).await {
                             Ok(Ok(resp)) => {
@@ -2680,7 +2664,7 @@ async fn handle_search(
                                     rotate_all_ips(&format!("429_rate_limit_{}", new_count));
                                 }
                                 match tokio::time::timeout(
-                                    std::time::Duration::from_secs(2),
+                                    std::time::Duration::from_secs(3),
                                     resp.text()
                                 ).await {
                                     Ok(Ok(raw)) => {
@@ -2715,57 +2699,16 @@ async fn handle_search(
         }
     }).collect();
 
-    let whoogle_fut = async {
-        if whoogle_open {
-            return Ok::<WhoogleResponse, anyhow::Error>(WhoogleResponse { results: vec![] });
-        }
-        let resp = match tokio::time::timeout(Duration::from_secs(1), client_ref.get(&whoogle_url).send()).await {
-            Ok(Ok(r)) => r,
-            _ => return Ok(WhoogleResponse { results: vec![] }),
-        };
-        let status = resp.status();
-        let raw_text = match tokio::time::timeout(Duration::from_secs(1), resp.text()).await {
-            Ok(Ok(t)) => t,
-            _ => return Ok(WhoogleResponse { results: vec![] }),
-        };
-                match serde_json::from_str::<serde_json::Value>(&raw_text) {
-                    Ok(val) => {
-                        let results: Vec<WhoogleResult> = val
-                            .get("results")
-                            .and_then(|r| r.as_array())
-                            .map(|arr| {
-                                arr.iter().filter_map(|item| {
-                                    let url = item.get("href").or_else(|| item.get("link"))
-                                        .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                    let title = item.get("title").or_else(|| item.get("text"))
-                                        .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                    let description = item.get("content").or_else(|| item.get("desc"))
-                                        .or_else(|| item.get("snippet"))
-                                        .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                    if url.is_empty() { return None; }
-                                    Some(WhoogleResult { url, title, description: Some(description) })
-                                }).collect()
-                            })
-                            .unwrap_or_default();
-                        Ok(WhoogleResponse { results })
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to parse Whoogle JSON (status: {}): {:?}", status, e);
-                        Ok(WhoogleResponse { results: vec![] })
-                    }
-                }
-    };
-
     let invidious_fut = async {
         if invidious_open {
             return Ok::<Vec<InvidiousResult>, anyhow::Error>(vec![]);
         }
-        let resp = match tokio::time::timeout(Duration::from_secs(1), client_ref.get(&invidious_url).send()).await {
+        let resp = match tokio::time::timeout(Duration::from_secs(2), client_ref.get(&invidious_url).send()).await {
             Ok(Ok(r)) => r,
             _ => return Ok::<Vec<InvidiousResult>, anyhow::Error>(vec![]),
         };
         let status = resp.status();
-        match tokio::time::timeout(Duration::from_secs(1), resp.json::<Vec<InvidiousResult>>()).await {
+        match tokio::time::timeout(Duration::from_secs(2), resp.json::<Vec<InvidiousResult>>()).await {
             Ok(Ok(data)) => Ok(data),
             Ok(Err(e)) => {
                 tracing::error!("Failed to parse Invidious JSON (status: {}): {:?}", status, e);
@@ -2838,12 +2781,12 @@ async fn handle_search(
 
     let searx_fut_with_timeout = async {
         match tokio::time::timeout(
-            std::time::Duration::from_secs(2),  // Per-instance timeout is 2s; join_all wrapper at 2s
+            std::time::Duration::from_secs(5),  // Outer wrapper must exceed per-instance 2s to avoid canceling slow instances (e.g. Tor)
             futures::future::join_all(searx_futs),
         ).await {
             Ok(results) => results,
             Err(_) => {
-                tracing::warn!("SearXNG fan-out timed out after 2s — returning partial results");
+                tracing::warn!("SearXNG fan-out timed out after 5s — returning partial results");
                 vec![]
             }
         }
@@ -2853,12 +2796,11 @@ async fn handle_search(
     // This eliminates the sequential intent→engines pipeline.
     // Engines start fetching immediately; intent runs in parallel.
     // Latency = max(intent, engines) instead of intent + engines.
-    let (intent_result, embed_res, indexer_res, searx_results, whoogle_res, invidious_res, news_res, image_res) = tokio::join!(
+    let (intent_result, embed_res, indexer_res, searx_results, invidious_res, news_res, image_res) = tokio::join!(
         intent_fut,
         embed_fut,
         indexer_fut,
         searx_fut_with_timeout,
-        whoogle_fut,
         invidious_fut,
         news_fut,
         image_fut,
@@ -3069,11 +3011,14 @@ async fn handle_search(
                         total_results, expected_min, clean_eq, warmest_idx
                     );
                     match tokio::time::timeout(
-                        Duration::from_secs(1),
+                        Duration::from_secs(3),
                         client_ref.get(&retry_url).send(),
                     ).await {
                         Ok(Ok(resp)) => {
-                            let raw = resp.text().await.unwrap_or_default();
+                            let raw = match tokio::time::timeout(Duration::from_secs(3), resp.text()).await {
+                                Ok(Ok(t)) => t,
+                                _ => String::new(),
+                            };
                             let sanitized = sanitize_json_text(&raw);
                             if let Ok(data) = serde_json::from_str::<SearxResponse>(&sanitized) {
                                 let retry_count = data.results.len();
@@ -3111,43 +3056,6 @@ async fn handle_search(
                     }
                 }
             }
-        }
-    }
-
-    match whoogle_res {
-        Ok(whoogle_data) => {
-            let n = whoogle_data.results.len();
-            tracing::info!("Whoogle returned {} results", n);
-            if n > 0 {
-                circuit_ref.record_success("whoogle");
-                circuit_ref.record_results("whoogle", n as u64);
-            } else {
-                // 0 results ≠ failure — only connection/parse errors are failures
-            }
-            let whoogle_weight = circuit_ref.weight("whoogle");
-            for (pos, r) in whoogle_data.results.into_iter().enumerate() {
-                let normalized = {
-                    let lower = r.url.to_lowercase();
-                    let no_fragment = lower.split('#').next().unwrap_or(&lower);
-                    let no_trailing = no_fragment.trim_end_matches('/');
-                    let no_www = no_trailing.replacen("://www.", "://", 1);
-                    strip_tracking_params(&no_www)
-                };
-                let rrf_contrib = whoogle_weight / (60.0 + (pos + 1) as f32);
-                *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
-                web_results.push(SearxResult {
-                    title: r.title,
-                    url: r.url,
-                    content: r.description.unwrap_or_default(),
-                    engine: "whoogle".to_string(),
-                    score: 0.0,
-                    sources: vec!["whoogle".to_string()],
-                });
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Whoogle request failed/timed out: {:?}", e);
-            circuit_ref.record_failure("whoogle");
         }
     }
 
