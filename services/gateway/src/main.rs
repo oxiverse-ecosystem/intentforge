@@ -606,6 +606,13 @@ fn constraint_score(
     url: &str,
     constraints: &Constraints,
 ) -> f32 {
+
+    let text_lower = format!(
+        "{} {} {}",
+        title.to_lowercase(),
+        content.to_lowercase(),
+        url.to_lowercase()
+    );
     if constraints.positive.is_empty() && constraints.negative.is_empty() {
         return 1.0; // no constraints = no penalty
     }
@@ -761,10 +768,53 @@ fn constraint_score(
             }
         }
         // Coverage: fraction of positive constraints matched
-        let coverage = matched as f32 / constraints.positive.len() as f32;
-        // Scale: 0% coverage = 0.3x (penalty), 100% coverage = 1.8x (strong boost)
-        // This ensures results matching user-specified requirements rank prominently
-        score *= 0.3 + coverage * 1.5;
+        let positive_count = constraints.positive.len() as f32;
+        let coverage = matched as f32 / positive_count;
+
+        // Positive boost is a bi-criteria score biased toward multi-signal hits:
+        // - Coverage pressure: fraction of positives matched.
+        // - Width pressure: concrete multi-positive hits beat single-token matches from broad docs.
+        // Coverage dominates for small positive sets; width lifts tighter topical candidates.
+
+        let mut coverage_pressure = coverage;
+        let mut width_pressure = if positive_count > 1.0 {
+            (matched as f32 / positive_count).sqrt()
+        } else {
+            matched as f32 / positive_count
+        };
+
+        // Soft fallback: when no positive matched, treat the result as if it matched the
+        // query semantically. This prevents narrow positive sets from producing zero-pressure
+        // text and turning ordering into a metadata lottery. It is NOT a fake match:
+        // it is a last-resort boost based on query-to-document similarity.
+        if matched == 0 {
+            let url_tokens: Vec<&str> = url.split_whitespace().collect();
+            let title_tokens: Vec<&str> = title.split_whitespace().collect();
+            if !url_tokens.is_empty() || !title_tokens.is_empty() {
+                let mut similarity_gap = 0.0f32;
+                if !url_tokens.is_empty() {
+                    if let Ok(parsed_url) = reqwest::Url::parse(url) {
+                        if let Some(host) = parsed_url.host_str() {
+                            let host_lower = host.to_lowercase();
+                            let matching = url_tokens.iter().filter(|t| host_lower.contains(*t)).count();
+                            similarity_gap = (matching as f32 / url_tokens.len() as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                }
+                let q_reuse: f32 = semantic_relevance_score(url, &title, &content);
+                let similar = (similarity_gap * 0.45 + q_reuse * 0.55).clamp(0.0, 1.0);
+                coverage_pressure = coverage_pressure.max(similar * 0.12);
+                width_pressure = width_pressure.max(similar * 0.12);
+            }
+        }
+
+        let blended_coverage = coverage_pressure * 0.70 + width_pressure * 0.30;
+
+        // Scale: 0% coverage -> 0.35x
+        //         100% coverage -> 1.9x
+        // Mapping is monotonic, but at least one positive match with high coverage
+        // becomes a strong discriminator vs zero-match passthrough.
+        score *= 0.35 + blended_coverage * 1.55;
     }
 
     // Language entity constraints: when a programming language is detected in the
@@ -925,9 +975,28 @@ fn stem(word: &str) -> String {
 // NOT just keyword overlap — proper information retrieval scoring.
 
 fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
+    // Early exit: if both title and content are empty/too short, return 0.01
+    let title_trimmed = title.trim();
+    let content_trimmed = content.trim();
+    if title_trimmed.is_empty() && content_trimmed.len() < 10 {
+        return 0.01;
+    }
+    // Early exit: if title is meaningful but content is empty, score based on title only
+    // (skip full TF-IDF scoring that would return 0 anyway)
+    if content_trimmed.len() < 10 {
+        let q_lower = query.to_lowercase();
+        let t_lower = title_trimmed.to_lowercase();
+        let q_words: Vec<&str> = q_lower.split_whitespace().collect();
+        let matched = q_words.iter().filter(|w| w.len() > 2 && t_lower.contains(**w)).count();
+        if matched > 0 {
+            return (matched as f32 / q_words.iter().filter(|w| w.len() > 2).count().max(1) as f32).clamp(0.01, 0.5);
+        }
+        return 0.01;
+    }
+
     let q_lower = query.to_lowercase();
-    let t_lower = title.to_lowercase();
-    let c_lower = content.to_lowercase();
+    let t_lower = title_trimmed.to_lowercase();
+    let c_lower = content_trimmed.to_lowercase();
 
     // Extract topic terms (skip stop words and very short words)
     let stop_words: std::collections::HashSet<&str> = [
@@ -1041,9 +1110,9 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
     };
     if coverage < min_coverage {
         if coverage < 0.10 {
-            return 0.01; // essentially irrelevant
+            return 0.01;
         }
-        return (combined * 0.3).clamp(0.0, 0.15);
+        return (combined * coverage * 0.6).clamp(0.0, combined.min(0.18));
     }
 
     combined.clamp(0.0, 1.0)
@@ -1810,8 +1879,10 @@ fn merge_local_and_web(
         } else { None }
     } else { None };
 
+    let mut _max_semantic: f32 = 0.0; // tracked for thin-result gate
     for r in merged.iter_mut() {
         let semantic = semantic_relevance_score(query, &r.title, &r.content);
+        if semantic > _max_semantic { _max_semantic = semantic; }
         let intent_boost = calculate_intent_boost(&r.url, &r.title, query, intent);
         let freshness = freshness_score(&r.url, intent);
         let quality = content_quality_score(&r.content);
@@ -1864,15 +1935,25 @@ fn merge_local_and_web(
     // Also lower the semantic coverage threshold to be more lenient on term matching.
     if merged.len() < 15 && merged.len() > 0 {
         let max_score = merged.iter().map(|r| r.score).fold(0.0f32, f32::max);
-        if max_score < 0.30 {
+        // Semantic relevance gate: only apply thin-result boost if at least one result
+        // has minimum semantic relevance to the query. This prevents garbage results
+        // (local index misses with negative constraint hits) from being amplified.
+        // Use cached max_semantic from scoring loop (avoids recomputing all scores)
+        let max_semantic = _max_semantic;
+        if max_score < 0.30 && max_semantic > 0.05 {
             let boost_factor = (0.30 / max_score.max(0.01)).min(2.5);
             tracing::info!(
-                "THIN RESULTS: merged.len={} max_score={:.3} boost={:.2}x",
-                merged.len(), max_score, boost_factor
+                "THIN RESULTS: merged.len={} max_score={:.3} max_sem={:.3} boost={:.2}x",
+                merged.len(), max_score, max_semantic, boost_factor
             );
             for r in merged.iter_mut() {
                 r.score *= boost_factor;
             }
+        } else if max_score < 0.30 {
+            tracing::info!(
+                "THIN RESULTS SKIPPED (garbage gate): merged.len={} max_score={:.3} max_sem={:.3}",
+                merged.len(), max_score, max_semantic
+            );
         }
     }
 
@@ -2780,9 +2861,44 @@ async fn handle_search(
     };
 
     let searx_fut_with_timeout = async {
+        use futures::future::FutureExt;
         match tokio::time::timeout(
-            std::time::Duration::from_secs(5),  // Outer wrapper must exceed per-instance 2s to avoid canceling slow instances (e.g. Tor)
-            futures::future::join_all(searx_futs),
+            std::time::Duration::from_secs(5),
+            async {
+                // Pair each future with its original instance index so downstream
+                // can map results back to searx_instance_keys after select_all reordering.
+                let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<SearxResponse, reqwest::Error>)> + Send>>> =
+                    searx_futs.into_iter().enumerate().map(|(i, f)| {
+                        f.map(move |r| (i, r)).boxed()
+                    }).collect();
+                let mut results: Vec<(usize, Result<SearxResponse, reqwest::Error>)> = Vec::new();
+                let min_early_return: usize = 8;
+
+                while !futs.is_empty() {
+                    let ((orig_idx, result), _idx, remaining) = futures::future::select_all(futs).await;
+                    futs = remaining;
+
+                    match result {
+                        Ok(data) => {
+                            let count = data.results.len();
+                            results.push((orig_idx, Ok(data)));
+                            if count >= min_early_return {
+                                tracing::info!(
+                                    "SearXNG early return: {} results >= {}, skipping {} remaining instance(s)",
+                                    count, min_early_return, futs.len()
+                                );
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("SearXNG instance error (idx={}): {:?}", orig_idx, e);
+                            results.push((orig_idx, Err(e)));
+                        }
+                    }
+                }
+
+                results
+            }
         ).await {
             Ok(results) => results,
             Err(_) => {
@@ -2840,21 +2956,7 @@ async fn handle_search(
     } else {
         vec![q.clone()]
     };
-    let neg_terms: Vec<String> = intent.structured_constraints.negative.iter()
-        .map(|n| n.to_lowercase())
-        .collect();
-    let cleaned_queries: Vec<String> = expanded_queries.iter().map(|eq| {
-        if neg_terms.is_empty() { return eq.clone(); }
-        let mut words: Vec<&str> = eq.split_whitespace().collect();
-        let neg_triggers = ["not", "nor", "except", "without", "excluding", "other", "than"];
-        words.retain(|w| {
-            let w_lower = w.to_lowercase();
-            let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower).to_string();
-            !neg_terms.contains(&w_stripped) && !neg_terms.contains(&w_lower) && !neg_triggers.contains(&w_stripped.as_str()) && !neg_triggers.contains(&w_lower.as_str())
-        });
-        words.join(" ")
-    }).filter(|q| !q.trim().is_empty()).collect();
-    let expanded_queries = if !cleaned_queries.is_empty() { cleaned_queries } else { expanded_queries };
+    tracing::info!(target:"expansion.debug", expanded=?expanded_queries.iter().take(3).collect::<Vec<_>>(), query=%q, "primary expanded queries");
 
     // TODO: Secondary fan-out with expanded queries if searx_results are sparse
     // For now, scoring uses intent-based weighting on the raw query results
@@ -2913,12 +3015,12 @@ async fn handle_search(
     // Aggregate SearXNG results from all query variations
     // Track per-engine result counts for degradation detection
     let mut engine_counts: HashMap<String, u64> = HashMap::new();
-    for (i, searx_res) in searx_results.into_iter().enumerate() {
-        let instance_key = &searx_instance_keys[i];
+    for (orig_idx, searx_res) in searx_results.into_iter() {
+        let instance_key = &searx_instance_keys[orig_idx];
         match searx_res {
             Ok(searx_data) => {
                 let n = searx_data.results.len();
-                tracing::info!("SearXNG variation {} returned {} results", i, n);
+                tracing::info!("SearXNG variation {} returned {} results", orig_idx, n);
                 if n > 0 {
                     circuit_ref.record_success(instance_key);
                     // Track last-used time for connection-cooldown aware routing
@@ -2950,7 +3052,7 @@ async fn handle_search(
                 }
             }
             Err(e) => {
-                tracing::error!("SearXNG variation {} request failed/timed out: {:?}", i, e);
+                tracing::error!("SearXNG variation {} request failed/timed out: {:?}", orig_idx, e);
                 circuit_ref.record_failure(instance_key);
             }
         }
@@ -3458,6 +3560,68 @@ async fn handle_search(
         }
     }
 
+    if !intent.structured_constraints.negative.is_empty() {
+        let before_count = web_results.len();
+        let negative_norm: Vec<String> = intent
+            .structured_constraints
+            .negative
+            .iter()
+            .map(|n| n.to_lowercase())
+            .collect();
+
+        web_results.retain(|r| {
+            let text = format!("{} {} {}", r.title, r.content, r.url);
+            let text_lower = text.to_lowercase();
+            let text_normalized = {
+                let chars: Vec<char> = text_lower.chars().collect();
+                let mut out = String::with_capacity(chars.len());
+                for (i, &c) in chars.iter().enumerate() {
+                    if c == '.' || c == '-' || c == '_' {
+                        if i > 0
+                            && i + 1 < chars.len()
+                            && chars[i-1].is_alphanumeric()
+                            && chars[i+1].is_alphanumeric()
+                        {
+                        } else {
+                            out.push(c);
+                        }
+                    } else {
+                        out.push(c);
+                    }
+                }
+                out
+            };
+
+            let should_keep = negative_norm.iter().all(|neg| {
+                let neg_lower = neg.to_lowercase();
+                let words: Vec<&str> = neg_lower.split_whitespace().collect();
+                if words.len() == 1 {
+                    let neg_clean: String = neg_lower.chars().filter(|c| c.is_alphanumeric()).collect();
+                    !(text_lower.split_whitespace().any(|w| {
+                        let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                        w_clean.starts_with(&neg_clean) || w_clean.contains(&neg_clean)
+                    }) || text_normalized.contains(&neg_clean))
+                } else {
+                    let joined = words.join(" ");
+                    !(text_lower.contains(&joined) || text_normalized.contains(&joined))
+                }
+            });
+
+            if !should_keep {
+                tracing::info!("HARD NEGATIVE DROP (pre-merge WEB ONLY): result removed because negative constraint matched");
+            }
+            should_keep
+        });
+
+        let removed = before_count.saturating_sub(web_results.len());
+        if removed > 0 {
+            tracing::info!(
+                "Negative constraint hard filter: removed {}/{} web results (hard gate)",
+                removed, before_count
+            );
+        }
+    }
+
     // Quality gate: filter garbage local results
     // Apply semantic relevance filter to indexer results too — prevents
     // irrelevant crawled pages (guitar lessons for "bass") from dominating
@@ -3516,6 +3680,71 @@ async fn handle_search(
         &intent.structured_constraints,
         Some(&intent.distribution),
     );
+
+    // 8b. Post-merge hard negative filter: apply negative constraints to ALL results
+    // (local + web). The pre-merge filter only catches web results; local index
+    // results that match negative terms must also be removed here.
+    if !intent.structured_constraints.negative.is_empty() {
+        let before_count = results.len();
+        let negative_norm: Vec<String> = intent
+            .structured_constraints
+            .negative
+            .iter()
+            .map(|n| n.to_lowercase())
+            .collect();
+
+        results.retain(|r| {
+            let text = format!("{} {} {}", r.title, r.content, r.url);
+            let text_lower = text.to_lowercase();
+            let text_normalized = {
+                let chars: Vec<char> = text_lower.chars().collect();
+                let mut out = String::with_capacity(chars.len());
+                for (i, &c) in chars.iter().enumerate() {
+                    if c == '.' || c == '-' || c == '_' {
+                        if i > 0
+                            && i + 1 < chars.len()
+                            && chars[i-1].is_alphanumeric()
+                            && chars[i+1].is_alphanumeric()
+                        {
+                        } else {
+                            out.push(c);
+                        }
+                    } else {
+                        out.push(c);
+                    }
+                }
+                out
+            };
+
+            let should_keep = negative_norm.iter().all(|neg| {
+                let neg_lower = neg.to_lowercase();
+                let words: Vec<&str> = neg_lower.split_whitespace().collect();
+                if words.len() == 1 {
+                    let neg_clean: String = neg_lower.chars().filter(|c| c.is_alphanumeric()).collect();
+                    !(text_lower.split_whitespace().any(|w| {
+                        let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                        w_clean.starts_with(&neg_clean) || w_clean.contains(&neg_clean)
+                    }) || text_normalized.contains(&neg_clean))
+                } else {
+                    let joined = words.join(" ");
+                    !(text_lower.contains(&joined) || text_normalized.contains(&joined))
+                }
+            });
+
+            if !should_keep {
+                tracing::info!("HARD NEGATIVE DROP (post-merge): result \"{}\" (local={}) removed because negative constraint matched", &r.title[..r.title.len().min(50)], r.is_local);
+            }
+            should_keep
+        });
+
+        let removed = before_count.saturating_sub(results.len());
+        if removed > 0 {
+            tracing::info!(
+                "Negative constraint hard filter: removed {}/{} merged results (hard gate, post-merge)",
+                removed, before_count
+            );
+        }
+    }
 
     // Sanitize content for safe JSON serialization
     for r in results.iter_mut() {
