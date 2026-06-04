@@ -600,6 +600,64 @@ fn content_quality_score(text: &str) -> f32 {
 // NOT hardcoded — constraints come from the query itself.
 // Score range: 0.0 (violates negative) to 1.0 (matches all positives, no negatives)
 
+
+// ─── Alternative-Listing Page Detection (Algorithmic) ────────────────
+// When a query uses negative constraints like "not React not Vue",
+// alternative-listing pages ("Top 10 React Alternatives") are HIGHLY
+// relevant but get penalized because they mention the excluded term.
+// This function detects such pages using structural signals:
+//   - Title patterns: "alternative", "vs", "best N", "comparison"
+//   - URL path patterns: "/alternatives/", "/vs/", "/compare/"
+//   - Content richness: longer content suggests a curated list, not a landing page
+// Returns 0.0 (not alternative) to 1.0 (strongly alternative).
+// No hardcoded domains — purely algorithmic.
+
+fn is_alternative_listing_page(title: &str, url: &str, content: &str) -> f32 {
+    let title_lower = title.to_lowercase();
+    let url_lower = url.to_lowercase();
+
+    // Signal A: Title contains comparison/alternative markers (strongest signal)
+    let title_signal = {
+        let strong_patterns = [
+            "alternative", "alternatives", "alternative to",
+            " vs ", " versus ", "compared", "comparison",
+            "replace", "replacement", "migrate from", "migrating from",
+            "instead of", "switching from", "moving from",
+        ];
+        if strong_patterns.iter().any(|p| title_lower.contains(p)) {
+            1.0
+        } else {
+            // Weaker title signals: "top N X", "best N X" patterns
+            let weak_patterns = ["top ", "best ", "review", "guide to ", "list of "];
+            if weak_patterns.iter().any(|p| title_lower.contains(p)) {
+                0.6
+            } else {
+                0.0
+            }
+        }
+    };
+
+    // Signal B: URL path contains comparison markers
+    let url_alt_patterns = [
+        "/alternative", "/alternatives", "/alternative-to",
+        "/vs/", "/compare", "/comparison",
+        "/top-", "/best-", "/reviews/", "/review/",
+    ];
+    let url_signal_raw = url_alt_patterns.iter()
+        .filter(|p| url_lower.contains(*p))
+        .count() as f32;
+    let url_signal = (url_signal_raw * 0.35).min(0.7);
+
+    // Signal C: Content richness — alternative pages tend to have substantial content
+    let content_signal = if content.len() > 500 { 0.3 }
+        else if content.len() > 200 { 0.15 }
+        else { 0.0 };
+
+    // Blend with title as dominant signal
+    (title_signal * 0.70 + url_signal * 0.20 + content_signal * 0.10).clamp(0.0, 1.0)
+}
+
+
 fn constraint_score(
     title: &str,
     content: &str,
@@ -607,12 +665,6 @@ fn constraint_score(
     constraints: &Constraints,
 ) -> f32 {
 
-    let text_lower = format!(
-        "{} {} {}",
-        title.to_lowercase(),
-        content.to_lowercase(),
-        url.to_lowercase()
-    );
     if constraints.positive.is_empty() && constraints.negative.is_empty() {
         return 1.0; // no constraints = no penalty
     }
@@ -722,14 +774,46 @@ fn constraint_score(
             || text_lower.contains(&neg_lower) || text_normalized.contains(&neg_normalized)
         };
         if matched {
-            // Penalty scales gradually with constraint count to avoid compounding:
-            // 1 constraint: 0.02 (98% penalty — severe for single exclusions)
-            // 2 constraints: 0.10 per violation (0.10^2 = 0.01 if both hit)
-            // 3 constraints: 0.16 per violation (0.16^3 = 0.004 if all hit)
-            // 4+ constraints: 0.20 per violation (0.20^4 = 0.002 if all hit)
-            // This prevents score collapse while still heavily penalizing violations.
-            let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
-            tracing::info!("CONSTRAINT HIT: '{}' in title='{}' → penalty={}", neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())], penalty);
+            // Check if this result is an alternative-listing/comparison page.
+            // Such pages mention excluded terms in a referential context
+            // (e.g., "Top 10 Prometheus Alternatives") and should NOT be
+            // heavily penalized — they're HIGHLY relevant for "not X" queries.
+            let alt_score = is_alternative_listing_page(title, url, content);
+
+            let penalty = if alt_score > 0.3 {
+                // Alternative-listing page: mention of excluded term is contextual.
+                // Exception: if the URL IS the official domain of the excluded term,
+                // apply a moderate penalty even if title seems alternative.
+                let neg_normal: String = neg_lower.chars().filter(|c| c.is_alphanumeric()).collect();
+                let is_official = if let Ok(parsed) = reqwest::Url::parse(url) {
+                    if let Some(host) = parsed.host_str() {
+                        let host_lower = host.to_lowercase();
+                        host_lower == format!("{}.com", &neg_normal)
+                            || host_lower == format!("www.{}.com", &neg_normal)
+                            || host_lower == format!("{}.io", &neg_normal)
+                            || host_lower == format!("{}.org", &neg_normal)
+                    } else { false }
+                } else { false };
+                if is_official && alt_score < 0.6 {
+                    // Official site: moderate penalty (still penalized but less severe)
+                    (0.08 + (neg_count - 1.0) * 0.08).clamp(0.08, 0.30)
+                } else {
+                    // Third-party alternative page: very mild penalty
+                    // High alt_score = barely any penalty (keep the result)
+                    // Low alt_score but still > 0.3 = partial penalty
+                    (0.50 + alt_score * 0.40).min(0.90)
+                }
+            } else {
+                // Standard penalty scales gradually with constraint count:
+                // 1 constraint: 0.02 (98% penalty)
+                // 2 constraints: 0.10 per violation (0.10^2 = 0.01 if both hit)
+                // 3 constraints: 0.16 per violation
+                // 4+ constraints: 0.20 per violation
+                (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20)
+            };
+            tracing::info!("CONSTRAINT HIT: '{}' in '{}' → penalty={:.4} alt_score={:.3}",
+                neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                penalty, alt_score);
             score *= penalty;
         } else {
             tracing::info!("CONSTRAINT MISS: '{}' not in '{}'", neg, &text_lower[..text_lower.char_indices().nth(60).map(|(i,_)| i).unwrap_or(text_lower.len())]);
@@ -3570,6 +3654,15 @@ async fn handle_search(
             .collect();
 
         web_results.retain(|r| {
+            // Alternative-listing page check: if the result is a comparison/
+            // alternative page, keep it even if it mentions excluded terms.
+            // This prevents "Top 10 Prometheus Alternatives" from being
+            // dropped for queries like "monitoring not prometheus".
+            let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
+            if alt_score > 0.3 {
+                return true; // keep alternative-listing pages regardless of negative terms
+            }
+
             let text = format!("{} {} {}", r.title, r.content, r.url);
             let text_lower = text.to_lowercase();
             let text_normalized = {
@@ -3608,7 +3701,7 @@ async fn handle_search(
             });
 
             if !should_keep {
-                tracing::info!("HARD NEGATIVE DROP (pre-merge WEB ONLY): result removed because negative constraint matched");
+                tracing::info!("HARD NEGATIVE DROP (pre-merge WEB ONLY): result removed because negative constraint matched (not alt page)");
             }
             should_keep
         });
@@ -3694,6 +3787,13 @@ async fn handle_search(
             .collect();
 
         results.retain(|r| {
+            // Alternative-listing page check: keep comparison/alternative pages
+            // even if they mention excluded terms (they are HIGHLY relevant).
+            let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
+            if alt_score > 0.3 {
+                return true;
+            }
+
             let text = format!("{} {} {}", r.title, r.content, r.url);
             let text_lower = text.to_lowercase();
             let text_normalized = {
@@ -3732,7 +3832,8 @@ async fn handle_search(
             });
 
             if !should_keep {
-                tracing::info!("HARD NEGATIVE DROP (post-merge): result \"{}\" (local={}) removed because negative constraint matched", &r.title[..r.title.len().min(50)], r.is_local);
+                tracing::info!("HARD NEGATIVE DROP (post-merge): result \"{}\" (local={}) removed because negative constraint matched (not alt page)",
+                    &r.title[..r.title.len().min(50)], r.is_local);
             }
             should_keep
         });

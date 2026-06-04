@@ -1,0 +1,134 @@
+{
+  "excluding pytorch tensorflow mxnet": {
+    "status": 200,
+    "intent": "technical",
+    "confidence": 0.1557856947183609,
+    "category": "informational",
+    "positive": [
+      "mxnet",
+      "tensorflow"
+    ],
+    "negative": [
+      "pytorch"
+    ],
+    "top_title": "What is TensorFlow? The machine learning library explained | InfoWorld",
+    "top_url": "https://www.infoworld.com/article/2255099/what-is-tensorflow-the-machine-learning-library-explained.html",
+    "count": 39
+  },
+  "without luks or zfs": {
+    "status": 200,
+    "intent": "comparison",
+    "confidence": 0.109945476,
+    "category": "informational",
+    "positive": [
+      "zfs"
+    ],
+    "negative": [
+      "luks"
+    ],
+    "top_title": "LVM Vs. ZFS: Which Volume Manager Is Best When Using Linux",
+    "top_url": "https://cloudzy.com/blog/lvm-vs-zfs/",
+    "count": 36
+  },
+  "type safety in rust": {
+    "status": 200,
+    "intent": "technical",
+    "confidence": 0.46614304184913635,
+    "category": "informational",
+    "positive": [
+      "rust",
+      "safety"
+    ],
+    "negative": [],
+    "top_title": "Type safety in Rust · Jake Roggenbuck",
+    "top_url": "https://jr0.org/posts/type-safety-in-rust/",
+    "count": 46
+  },
+  "high performance async runtime in rust": {
+    "status": 200,
+    "intent": "comparison",
+    "confidence": 0.17245042324066162,
+    "category": "informational",
+    "positive": [
+      "async",
+      "high",
+      "performance",
+      "rust"
+    ],
+    "negative": [],
+    "top_title": "Rust Async Runtime Battle: Glommio vs Monoio Performance...",
+    "top_url": "https://www.mmtool.top/blog/rust-async-runtime-glommio-monoio-comparison",
+    "count": 52
+  },
+  "comprehensive production ready event driven microservices architecture using kubernetes docker containers grpc kafka event streaming postgresql for persistence redis for caching prometheus for metrics grafana for dashboards jaeger for distributed tracing with circuit breakers rate limiters and retries": {
+    "status": 200,
+    "intent": "comparison",
+    "confidence": 0.5555040836334229,
+    "category": "informational",
+    "positive": [
+      "circuit breakers",
+      "persistence redis",
+      "retries"
+    ],
+    "negative": [],
+    "top_title": "Building Event-Driven Microservices in Go with Kafka: Production...",
+    "top_url": "https://reintech.io/blog/building-event-driven-microservices-go-kafka",
+    "count": 24
+  },
+  "latest CVE vulnerabilities affecting openssl 3 branch after 2024": {
+    "status": 200,
+    "intent": "comparison",
+    "confidence": 0.5686901211738586,
+    "category": "informational",
+    "positive": [
+      "affecting",
+      "branch",
+      "cve",
+      "latest",
+      "openssl",
+      "vulnerabilities"
+    ],
+    "negative": [],
+    "top_title": "OpenSSL 3.0 Vulnerabilities: CVE 2022-3786 and CVE 2022-3602",
+    "top_url": "https://www.varindia.com/news/openssl-30-vulnerabilities-cve-20223786-and-cve-20223602",
+    "count": 45
+  },
+  "linux filesystem encryption without luks or zfs": {
+    "status": 200,
+    "intent": "transactional",
+    "confidence": 0.29577454924583435,
+    "category": "transactional",
+    "positive": [
+      "encryption",
+      "filesystem",
+      "linux",
+      "zfs"
+    ],
+    "negative": [
+      "luks"
+    ],
+    "top_title": "File System Encryption in Linux: A Comprehensive Guide",
+    "top_url": "https://linuxvox.com/blog/file-system-encryption-linux/",
+    "count": 42
+  },
+  "portable database engine for embedded devices without postgres without mysql": {
+    "status": 200,
+    "intent": "how-to",
+    "confidence": 0.13150550425052643,
+    "category": "informational",
+    "positive": [
+      "devices",
+      "embedded",
+      "embedded devices",
+      "engine",
+      "portable"
+    ],
+    "negative": [
+      "mysql",
+      "postgres"
+    ],
+    "top_title": "6 Database Engines to Consider for Your Next Project",
+    "top_url": "https://www.makeuseof.com/database-engines-to-consider/",
+    "count": 30
+  }
+}

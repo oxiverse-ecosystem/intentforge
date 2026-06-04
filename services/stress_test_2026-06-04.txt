@@ -1,0 +1,121 @@
+INTENTFORGE v2 STRESS TEST 2026-06-04T13:57:28.981743
+========================================================================================================================
+
+
+SUMMARY
+-------
+Status: 51 ok / 0 err
+Latency: min=1420.1ms max=2529.6ms mean=1843.8ms
+  p50=2014.8ms p90=2038.1ms p95=2044.9ms p99=2529.6ms
+Std dev: 265.4ms
+Results: min=8 max=68 mean=34.2
+Empty:   0
+Thin(1-3): 0
+Sources: [('bing', 51), ('yandex', 51), ('startpage', 50), ('duckduckgo', 36), ('local', 30), ('duckduckgo-onion', 16), ('brave', 10), ('mojeek', 5), ('invidious', 1)]
+Intents: {'comparison': 21, 'how-to': 19, 'technical': 7, 'transactional': 4}
+
+
+DETAILED ROWS
+------------------------------------------------------------------------------------------------------------------------
+  [200]  2529.6ms | technical      | conf=0.561 |  38 res | top_score=1.000 | Using SQLite | SeaORM 🐚 An async & dynamic ORM for
+    +['async', 'rust', 'sqlite'] | -[] | entities=[] | lang=rust
+  [200]  2044.9ms | how-to         | conf=0.279 |  29 res | top_score=1.000 | FastAPI Tutorial: Build High-Performance REST APIs
+    +['fastapi', 'python'] | -[] | entities=[] | lang=python
+  [200]  2029.3ms | technical      | conf=0.139 |  39 res | top_score=1.000 | Docker Compose Volumes | Compile N Run
+    +['compose', 'docker', 'volumes'] | -[] | entities=[] | lang=None
+  [200]  2526.9ms | comparison     | conf=0.632 |  47 res | top_score=0.707 | Best Rust Web Frameworks (2024) - Rustfinity
+    +['built-in metrics', 'high performance', 'type safety'] | -[] | entities=[] | lang=rust
+  [200]  2021.1ms | how-to         | conf=0.658 |  49 res | top_score=0.830 | Which Machine Learning Python Libraries Support GP
+    +['GPU support', 'large scale'] | -[] | entities=[] | lang=python
+  [200]  2041.6ms | how-to         | conf=0.282 |  50 res | top_score=0.643 | How to Build a Production-Grade Distributed Chatro
+    +['distributed', 'fault', 'go', 'grade', 'observability', 'systems', 'tolerance'] | -[] | entities=[] | lang=None
+  [200]  2044.9ms | technical      | conf=0.638 |  53 res | top_score=1.000 | 1-Introduction to Reactivity - Building a Reactive
+    +['frontend frameworks'] | -[] | entities=[] | lang=typescript
+  [200]  2038.1ms | technical      | conf=0.504 |  32 res | top_score=0.915 | Python : FastAPI with Type Hints for Data Validati
+    +['fast', 'hints', 'python', 'type hints', 'web'] | -['django', 'flask'] | entities=[{'role': 'exclusion', 'text': 'django'}, {'role': 'exclusion', 'text': 'flask'}] | lang=python
+  [200]  2037.9ms | technical      | conf=0.312 |  61 res | top_score=0.609 | Which JavaScript backend framework or runtime is b
+    +['backend', 'javascript', 'scalable'] | -['nodejs'] | entities=[{'role': 'exclusion', 'text': 'nodejs'}] | lang=javascript
+  [200]  2024.4ms | how-to         | conf=0.250 |  68 res | top_score=0.797 | PostgreSQL Performance Tuning: Indexing, Query Opt
+    +['indexing', 'performance', 'postgresql', 'tuning'] | -['mysql'] | entities=[{'role': 'exclusion', 'text': 'mysql'}] | lang=None
+  [200]  2020.0ms | how-to         | conf=0.644 |  37 res | top_score=0.699 | 30 Linux Sysadmin Tools You Didn't Know You Needed
+    +['linux', 'monitoring', 'sysadmin', 'system monitoring', 'tools'] | -['nagios'] | entities=[{'role': 'exclusion', 'text': 'nagios'}] | lang=None
+  [200]  1780.9ms | comparison     | conf=0.165 |  34 res | top_score=0.600 | GitHub - WasmEdge/WasmEdge: WasmEdge is a lightwei
+    +['edge', 'edge functions', 'functions', 'webassembly', 'workers'] | -['cloudflare'] | entities=[{'role': 'exclusion', 'text': 'cloudflare'}] | lang=None
+  [200]  1580.1ms | how-to         | conf=0.121 |  33 res | top_score=0.678 | Best Laptops for AI Development and Machine Learni
+    +['development', 'laptop', 'learning', 'machine', 'machine learning', 'silicon'] | -['apple'] | entities=[{'role': 'exclusion', 'text': 'apple'}] | lang=None
+  [200]  1602.3ms | how-to         | conf=0.496 |  40 res | top_score=0.532 | The Ultimate Guide to Machine Learning Frameworks 
+    +['cpu', 'gpu', 'learning', 'machine', 'mxnet', 'scalable', 'support', 'tensorflow', 'training'] | -['pytorch'] | entities=[{'role': 'exclusion', 'text': 'pytorch'}] | lang=None
+  [200]  1838.3ms | transactional  | conf=0.281 |  19 res | top_score=0.658 | File System Encryption in Linux: A Comprehensive G
+    +['encryption', 'filesystem', 'linux'] | -['luks', 'zfs'] | entities=[{'role': 'exclusion', 'text': 'luks'}, {'role': 'exclusion', 'text': 'zfs'}] | lang=None
+  [200]  1671.0ms | how-to         | conf=0.165 |  38 res | top_score=0.674 | Best Open Source Video Transcoders 2026
+    +['accelerated', 'hardware', 'transcoder', 'video'] | -['ffmpeg'] | entities=[{'role': 'exclusion', 'text': 'ffmpeg'}] | lang=None
+  [200]  1698.1ms | how-to         | conf=0.289 |  33 res | top_score=0.719 | Swetrix: Open Source Privacy First Cookieless Web 
+    +['analytics', 'cookie', 'open', 'source', 'web'] | -['plausible'] | entities=[{'role': 'exclusion', 'text': 'plausible'}] | lang=None
+  [200]  1465.1ms | how-to         | conf=0.132 |  21 res | top_score=0.522 | SQLite Database: A Complete Guide for Developers (
+    +['devices', 'embedded', 'embedded devices', 'engine', 'portable'] | -['mysql', 'postgres'] | entities=[{'role': 'exclusion', 'text': 'mysql'}, {'role': 'exclusion', 'text': 'postgres'}] | lang=None
+  [200]  1513.4ms | how-to         | conf=0.654 |  29 res | top_score=0.917 | How to Build a Rate Limiter with Redis in Go - one
+    +['distributed', 'golang', 'implement', 'limiter', 'rate', 'redis', 'sliding', 'window'] | -[] | entities=[] | lang=go
+  [200]  1535.2ms | technical      | conf=0.199 |  29 res | top_score=0.775 | rust - When should you use Tokio's `spawn_blocking
+    +['sync IO'] | -[] | entities=[] | lang=rust
+  [200]  1611.2ms | comparison     | conf=1.000 |  32 res | top_score=0.699 | BSON vs JSON: Complete Comparison Guide 2025
+    +['benchmarks', 'bson', 'difference', 'json', 'mongodb', 'performance'] | -[] | entities=[] | lang=None
+  [200]  1510.9ms | comparison     | conf=0.230 |  32 res | top_score=0.775 | Rust: Can a Struct Own Data and Hold a Reference..
+    +['borrow', 'causes', 'checker', 'referential', 'reject', 'rust', 'self', 'structs'] | -[] | entities=[] | lang=rust
+  [200]  1463.8ms | comparison     | conf=0.759 |  26 res | top_score=0.506 | ipfixprobe/src/plugins/input/dpdk/README.md at mas
+    +['avoid', 'dpdk', 'hugepages', 'kernel', 'overhead', 'require'] | -[] | entities=[] | lang=None
+  [200]  2031.2ms | comparison     | conf=0.739 |  32 res | top_score=0.821 | SQLite WAL Mode, Connection Pooling, and... — MVP 
+    +['concurrent readers'] | -[] | entities=[] | lang=None
+  [200]  1941.1ms | comparison     | conf=0.749 |  32 res | top_score=0.833 | PostgreSQL vs MySQL in 2026: Performance, Features
+    +['high write'] | -[] | entities=[] | lang=None
+  [200]  2017.6ms | comparison     | conf=0.774 |  30 res | top_score=0.790 | Battle of Backend! Golang vs Rust vs Python - Whic
+    +['axum', 'benchmark', 'fastapi', 'gin', 'golang', 'latency', 'python', 'rust', 'throughput'] | -[] | entities=[] | lang=go
+  [200]  2017.5ms | comparison     | conf=0.962 |  36 res | top_score=0.842 | Claude 4.6 Opus vs OpenAI o3 2026: The Data-Backed
+    +['benchmarks', 'claude', 'compare', 'o3', 'openai', 'opus', 'reasoning'] | -[] | entities=[] | lang=None
+  [200]  1544.7ms | comparison     | conf=0.731 |  29 res | top_score=0.849 | Aurora Serverless v2 vs RDS: when to use which - D
+    +['aurora', 'aws', 'performance', 'rds', 'scale', 'serverless'] | -[] | entities=[] | lang=None
+  [200]  2036.9ms | comparison     | conf=0.569 |  29 res | top_score=0.532 | OpenSSL 3.0 Vulnerabilities: CVE 2022-3786 and CVE
+    +['affecting', 'branch', 'cve', 'latest', 'openssl', 'vulnerabilities'] | -[] | entities=[] | lang=None
+  [200]  2020.1ms | comparison     | conf=0.184 |  29 res | top_score=0.772 | Python 3.14 Release – Key Features, PEPs & Updates
+    +['314', 'added', 'features', 'newest', 'python', 'release'] | -[] | entities=[] | lang=python
+  [200]  2037.8ms | comparison     | conf=0.629 |  29 res | top_score=0.837 | Drop Order Changes Randomly Between Async Boundari
+    +['async', 'changes', 'drop', 'order', 'recent', 'rust', 'tokio'] | -[] | entities=[] | lang=rust
+  [200]  2014.8ms | how-to         | conf=0.165 |  33 res | top_score=0.638 | The Ten Most Common Kubernetes Security Misconfigu
+    +['90', 'advisories', 'days', 'kubernetes', 'security'] | -[] | entities=[] | lang=None
+  [200]  1792.9ms | comparison     | conf=0.775 |  46 res | top_score=0.817 | Event-Driven Microservices with Streaming SQL | Ri
+    +['event streaming', 'postgres'] | -[] | entities=[] | lang=None
+  [200]  1520.7ms | comparison     | conf=0.484 |  32 res | top_score=0.892 | Traefik 3.1 vs NGINX Ingress: Load Balancer Perfor
+    +['balancer', 'ingress', 'kubernetes', 'load', 'nginx', 'performance', 'traefik'] | -[] | entities=[] | lang=None
+  [200]  1551.8ms | comparison     | conf=0.517 |  33 res | top_score=0.803 | AWS Lambda vs Google Cloud Functions Performance
+    +['aws', 'cloud', 'cold', 'functions', 'lambda', 'latency', 'optimization', 'start'] | -[] | entities=[] | lang=None
+  [200]  2017.8ms | comparison     | conf=0.771 |  32 res | top_score=0.830 | Monorepo vs. Polyrepo for Microservices: Decision 
+    +['microservices teams'] | -[] | entities=[] | lang=None
+  [200]  1601.5ms | comparison     | conf=0.768 |  30 res | top_score=0.783 | REST vs WebSockets | JuheAPI Blog
+    +['real time'] | -[] | entities=[] | lang=None
+  [200]  1580.7ms | how-to         | conf=0.251 |  37 res | top_score=0.745 | Best Search Engines for Internet Privacy 2026 | Ny
+    +['engine', 'search'] | -['ads', 'javascript', 'tracking'] | entities=[{'role': 'exclusion', 'text': 'ads'}, {'role': 'exclusion', 'text': 'javascript'}, {'role': 'exclusion', 'text': 'tracking'}] | lang=javascript
+  [200]  2019.9ms | how-to         | conf=0.550 |   8 res | top_score=0.630 | If Celery Bores You, Here are Some Alternative Tas
+    +['queue', 'task'] | -['rabbitmq', 'redis'] | entities=[{'role': 'exclusion', 'text': 'rabbitmq'}, {'role': 'exclusion', 'text': 'redis'}] | lang=None
+  [200]  1791.6ms | how-to         | conf=0.230 |  15 res | top_score=0.743 | Static site generator without posts - General Web 
+    +['site', 'static'] | -['nextjs', 'react', 'vue'] | entities=[{'role': 'exclusion', 'text': 'nextjs'}, {'role': 'exclusion', 'text': 'react'}, {'role': 'exclusion', 'text': 'vue'}] | lang=None
+  [200]  1711.2ms | how-to         | conf=0.668 |  32 res | top_score=0.722 | 10 Best Log Aggregation Tools in 2026: A DevOps...
+    +['aggregation', 'log'] | -['elasticsearch', 'opensearch'] | entities=[{'role': 'exclusion', 'text': 'elasticsearch'}, {'role': 'exclusion', 'text': 'opensearch'}] | lang=None
+  [200]  2037.0ms | how-to         | conf=0.264 |  29 res | top_score=0.779 | How Does the HyperLogLog Algorithm Work? A Beginne
+    +['algorithm', 'cardinality', 'estimation', 'hyperloglog', 'probabilistic'] | -[] | entities=[] | lang=None
+  [200]  2019.2ms | comparison     | conf=0.138 |  34 res | top_score=0.576 | Linux 4.11 - Linux-Kernel Archive
+    +['411', 'fast', 'implementation', 'kernel', 'linux', 'open', 'tcp'] | -[] | entities=[] | lang=None
+  [200]  1542.2ms | how-to         | conf=0.366 |  31 res | top_score=0.843 | Vector Search with FAISS: Approximate Nearest Neig
+    +['approximate', 'faiss', 'hnsw', 'index', 'nearest', 'neighbor', 'vector'] | -[] | entities=[] | lang=None
+  [200]  1420.1ms | technical      | conf=0.339 |  37 res | top_score=0.738 | Why asynchronous Rust doesn't work - Hacker News
+    +['async', 'drop', 'guaranteed', 'pin', 'projection', 'referential', 'rust', 'self'] | -[] | entities=[] | lang=rust
+  [200]  1482.4ms | comparison     | conf=0.221 |  33 res | top_score=0.664 | Groth16 vs Plonk: ZK-SNARK Proof System Selection
+    +['complexity', 'groth16', 'knowledge', 'plonk', 'proof', 'systems', 'verification', 'zero'] | -[] | entities=[] | lang=None
+  [200]  2021.9ms | comparison     | conf=0.739 |  36 res | top_score=0.699 | io_uring: Transforming Linux Async I/O Performance
+    +['high concurrency'] | -[] | entities=[] | lang=None
+  [200]  1550.7ms | transactional  | conf=0.155 |  39 res | top_score=0.868 | Buy AMD Ryzen™ 9 9950X Desktop Processor Direct on
+    +['9950x', 'amd', 'buy', 'ryzen'] | -[] | entities=[] | lang=None
+  [200]  2032.2ms | transactional  | conf=0.602 |  43 res | top_score=0.866 | Apple MacBook Pro 16 inch Laptop Apple M4 Pro chip
+    +['16', 'apple', 'buy', 'inch', 'm4', 'macbook', 'pro'] | -[] | entities=[] | lang=None
+  [200]  2029.0ms | transactional  | conf=1.000 |  37 res | top_score=0.907 | Where to Buy Raspberry Pi in 2026: Official Retail
+    +['buy', 'pi', 'raspberry', 'stock'] | -[] | entities=[] | lang=None
+  [200]  2022.6ms | how-to         | conf=0.135 |  13 res | top_score=0.300 | Event-Driven Microservices Guide (2026) | TurboDoc
+    +['circuit breakers', 'persistence redis', 'retries'] | -[] | entities=[] | lang=None

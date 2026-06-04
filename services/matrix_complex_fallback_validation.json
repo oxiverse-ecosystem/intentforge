@@ -1,0 +1,2151 @@
+[
+  {
+    "query": "python async web framework not django not flask",
+    "response": {
+      "category": "informational",
+      "confidence": 0.9628254,
+      "constraints": [
+        "+async",
+        "+python",
+        "+web",
+        "-django",
+        "-flask"
+      ],
+      "distribution": {
+        "comparison": 0.10136596,
+        "fresh": 0.005621548,
+        "how-to": 0.10349613,
+        "informational": 0.028176041,
+        "navigational": 0.030106224,
+        "technical": 0.6787131,
+        "transactional": 0.052521028
+      },
+      "expanded_queries": [
+        "python async web framework not django not flask",
+        "python async web framework documentation"
+      ],
+      "intent": "technical",
+      "results": [
+        {
+          "authority": 1.0,
+          "content": "Host standard web files without a Python framework. Start Command: python -m http.server 8000. Internal Port: 8000.A pure async Python web server that goes fast. Start Command: sanic main:app. Internal Port: 8000.",
+          "is_local": false,
+          "score": 1.0,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Python web Applications Examples | Python Online Documentation",
+          "url": "https://pythononline.net/docs/app-examples/"
+        },
+        {
+          "authority": 0.90000004,
+          "content": "Learn Python's async programming, event loop, and async web development from a JavaScript developer's perspective.",
+          "is_local": false,
+          "score": 0.9761001,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Python Asynchronous Programming",
+          "url": "https://langshift.dev/en/docs/js2py/module-04-async-programming"
+        },
+        {
+          "authority": 1.0,
+          "content": "Bocadillo is a modern Python web framework that provides a sane toolkit for building performant web applications and services using asynchronous programming. It is compatible with Python 3.6+ and MIT-licensed. Want to get started? Read the documentation! Key figures.",
+          "is_local": false,
+          "score": 0.99526227,
+          "sources": [
+            "yandex"
+          ],
+          "title": "How I Built A Python Web Framework And Became... - DEV Community",
+          "url": "https://dev.to/bocadillo/how-i-built-a-python-web-framework-and-became-an-open-source-maintainer-3okd"
+        },
+        {
+          "authority": 0.6,
+          "content": "Modern async frameworks in Python and servers talk to each other using a spec called ASGI, which we must touch on first. We can use it as a filter to find async-first web servers and frameworks after that. ASGI: Asynchronous Server Gateway Interface.",
+          "is_local": false,
+          "score": 0.94526196,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Python Async Web Servers and Frameworks \u2013 SuperFastPython",
+          "url": "https://superfastpython.com/python-async-web-servers-and-frameworks/"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "Quart is an async Python web application framework. Using Quart you can, render and serve HTML templates, write (RESTful) JSON APIs, serve WebSockets, stream request and response data, do pretty much anything over the HTTP or WebSocket protocols.",
+          "is_local": false,
+          "score": 0.94309807,
+          "sources": [
+            "duckduckgo"
+          ],
+          "title": "Quart: An async Python micro framework for building web ... - GitHub",
+          "url": "https://github.com/pallets/quart"
+        },
+        {
+          "authority": 0.85,
+          "content": "asyncio is a library to write concurrent code using the async/await syntax. asyncio is used as a foundation for multiple Python asynchronous frameworks that provide high-performance network and web-servers, database connection libraries, distributed task queues, etc. asyncio is often a perfect fit for IO-bound and high-level structured network code.",
+          "is_local": false,
+          "score": 0.9305662,
+          "sources": [
+            "startpage"
+          ],
+          "title": "asyncio \u2014 Asynchronous I/O \u2014 Python 3.14.5 documentation",
+          "url": "https://docs.python.org/3/library/asyncio.html"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "Asynchronous programming is a first-class citizen in Python now. If you're a web developer, there are amazing frameworks you can choose from! As of writing, asynchronous is no more just a buzzword in the Python community. With the release of its asyncio library in 3.5 version, Python acknowledged the impact of Node.js on web development and introduce two new keywords into the language ...",
+          "is_local": false,
+          "score": 0.9138669,
+          "sources": [
+            "duckduckgo"
+          ],
+          "title": "Top 9 Asynchronous Web Frameworks for Python - Geekflare",
+          "url": "https://geekflare.com/dev/python-asynchronous-web-frameworks/"
+        },
+        {
+          "authority": 0.5,
+          "content": "This tutorial will demonstrate the reasons why Robyn was created, the technical decisions behind Robyn, the increased performance by using the Rust runtime, ...",
+          "is_local": false,
+          "score": 0.8966981,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Robyn: An Async Python Web Framework with Rust... - YouTube",
+          "url": "https://www.youtube.com/watch?v=Ay18x9Qiq5k"
+        },
+        {
+          "authority": 0.5,
+          "content": "Sanic is a Python 3.7+ web server and web framework that\u2019s written to go fast. It allows the \u2026Press enter or click to view image in full size. @app.post(\"/\") async def post_student(request): student = request.json in_memory_student_db.append(student) return response.json(student).",
+          "is_local": false,
+          "score": 0.89566195,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Introducing Sanic: The Async Python Web Framework | Medium",
+          "url": "https://mausamadh.medium.com/how-to-crud-using-sanic-7e774781db06"
+        },
+        {
+          "authority": 0.5,
+          "content": "Apr 29, 2021 ... 257 votes, 40 comments. I think its important here to point at that these benchmarks really shouldn't be used to choose your framework.",
+          "is_local": false,
+          "score": 0.89493585,
+          "sources": [
+            "startpage"
+          ],
+          "title": "Async Python Web Frameworks comparison 2021-04-29 - Reddit",
+          "url": "https://www.reddit.com/r/Python/comments/n10m8w/async_python_web_frameworks_comparison_20210429/"
+        },
+        {
+          "authority": 0.6,
+          "content": "\u26a1 The lightning-fast asynchronous Python web framework Simple and lightweight Intuitive API with smart defaults and no bloat allows you to get straight to work building your app.",
+          "is_local": false,
+          "score": 0.8841444,
+          "sources": [
+            "duckduckgo"
+          ],
+          "title": "Sanic User Guide - The lightning-fast asynchronous Python web framework",
+          "url": "https://sanic.dev/en/"
+        },
+        {
+          "authority": 0.85,
+          "content": "Asynchronous HTTP Client/Server for asyncio and Python. Current version is ... Server example:\u00b6. from aiohttp import web async def handle(request): name = request\u00a0...",
+          "is_local": false,
+          "score": 0.88254446,
+          "sources": [
+            "startpage"
+          ],
+          "title": "Welcome to AIOHTTP \u2014 aiohttp 3.14.0 documentation",
+          "url": "https://docs.aiohttp.org/"
+        },
+        {
+          "authority": 0.5,
+          "content": "Toggle navigation Pyramid Home Documentation Add-ons Community Enter the Tomb Powered by Pyramid Sponsors Events Artwork Feeds Pyramid The Start Small , Finish Big Stay Finished Framework Projects with ambition start small but finish big and must stay finished . You need a Python web framework that supports your decisions , by artisans for artisans . Quick Start from wsgiref.simple_server import make_server from pyramid.config import Configurator from pyramid.response import Response def hello_w",
+          "is_local": true,
+          "score": 0.86429,
+          "sources": [
+            "local"
+          ],
+          "title": "Welcome to Pyramid, a Python Web Framework",
+          "url": "https://trypyramid.com/?ref=apidog.com"
+        },
+        {
+          "authority": 0.90000004,
+          "content": "Robyn is the fastest Python web framework, combining Python's simplicity with Rust's performance. Whether you're building APIs, web services, or full-stack applications, Robyn makes it easy to get started and scale. Quick Start. Install Robyn and create your first application in minutes",
+          "is_local": false,
+          "score": 0.8498539,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Getting Started | Robyn Framework",
+          "url": "https://robyn.tech/documentation/en/api_reference/getting_started"
+        },
+        {
+          "authority": 0.6,
+          "content": "Introduction Starlette is a lightweight ASGI framework/toolkit, which is ideal for building async web services in Python. It is production-ready, and gives you the following: A lightweight, low-complexity HTTP web framework. WebSocket support. In-process background tasks. Startup and shutdown events. Test client built on httpx.",
+          "is_local": false,
+          "score": 0.8477484,
+          "sources": [
+            "duckduckgo"
+          ],
+          "title": "Introduction - Starlette",
+          "url": "https://starlette.dev/"
+        },
+        {
+          "authority": 0.55,
+          "content": "Starlette is a lightweight ASGI framework/toolkit, which is ideal for building async web services in Python. It is production-ready, and gives you the following: A lightweight, low-complexity HTTP web framework. WebSocket support. In-process background tasks.",
+          "is_local": false,
+          "score": 0.8317484,
+          "sources": [
+            "yandex"
+          ],
+          "title": "The little ASGI library that shines. - Starlette",
+          "url": "https://www.starlette.io/"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "Tornado is a Python web framework and asynchronous networking library, originally developed at FriendFeed. By using non-blocking network I/O, Tornado can scale to tens of thousands of open connections, making it ideal for long polling, WebSockets, and other applications that require a long-lived connection to each user.",
+          "is_local": false,
+          "score": 0.82443917,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Tornado Web Server \u2014 Tornado 6.5.6 documentation",
+          "url": "https://www.tornadoweb.org/en/stable/index.html"
+        },
+        {
+          "authority": 0.65000004,
+          "content": "ASGI Documentation ASGI (Asynchronous Server Gateway Interface) is a spiritual successor to WSGI, intended to provide a standard interface between async-capable Python web servers, frameworks, and applications.",
+          "is_local": false,
+          "score": 0.81854445,
+          "sources": [
+            "duckduckgo"
+          ],
+          "title": "ASGI Documentation \u2014 ASGI 3.0 documentation - Read the Docs",
+          "url": "https://asgi.readthedocs.io/en/latest/"
+        },
+        {
+          "authority": 0.55,
+          "content": "A web spider that wants to fetch lots of pages in parallel, a web server that needs to juggle lots of downloads and websocket connections at the same time\u00a0...",
+          "is_local": false,
+          "score": 0.8158843,
+          "sources": [
+            "startpage"
+          ],
+          "title": "Trio: a friendly Python library for async concurrency ... - Read the Docs",
+          "url": "https://trio.readthedocs.io/"
+        },
+        {
+          "authority": 0.6,
+          "content": "May 4, 2020 ... ... documentation at once. I'm facinated by Julia's type system, I r ... Similarly to Python's async await, node js' await/Promise etc. This\u00a0...",
+          "is_local": false,
+          "score": 0.8011427,
+          "sources": [
+            "startpage"
+          ],
+          "title": "Which async web server should I use? - Julia Discourse",
+          "url": "https://discourse.julialang.org/t/which-async-web-server-should-i-use/38755"
+        },
+        {
+          "authority": 0.6,
+          "content": "Jul 30, 2025 ... The asyncio package is billed by the Python documentation as a library to write concurrent code. However, async I/O isn't threading or\u00a0...",
+          "is_local": false,
+          "score": 0.72222257,
+          "sources": [
+            "startpage"
+          ],
+          "title": "Python's asyncio: A Hands-On Walkthrough \u2013 Real Python",
+          "url": "https://realpython.com/async-io-python/"
+        },
+        {
+          "authority": 0.5,
+          "content": "Modern versions of Python have support for \"asynchronous code\" using something called \"coroutines\", with async and await syntax. Let's see that phrase by parts\u00a0...",
+          "is_local": false,
+          "score": 0.67688876,
+          "sources": [
+            "startpage"
+          ],
+          "title": "Concurrency and async / await - FastAPI",
+          "url": "https://fastapi.tiangolo.com/async/"
+        },
+        {
+          "authority": 0.6,
+          "content": "Welcome to the LearnPython.org interactive Python tutorial. Whether you are an experienced programmer or not, this website is intended for everyone who wishes to learn the Python \u2026",
+          "is_local": false,
+          "score": 0.6702835,
+          "sources": [
+            "bing"
+          ],
+          "title": "Learn Python - Free Interactive Python Tutorial",
+          "url": "https://www.learnpython.org/"
+        },
+        {
+          "authority": 0.5,
+          "content": "Learn Python Python is a popular programming language. Python can be used on a server to create web applications. Python is easy to learn - You will enjoy it!",
+          "is_local": false,
+          "score": 0.66916424,
+          "sources": [
+            "bing"
+          ],
+          "title": "Python Tutorial - W3Schools",
+          "url": "https://www.w3schools.com/python/"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "Robyn, a fast async web framework with a rust runtime. options: -h, --help show this help message and exit --processes PROCESSES. Choose the number of processes.",
+          "is_local": false,
+          "score": 0.6467353,
+          "sources": [
+            "yandex"
+          ],
+          "title": "GitHub - sparckles/Robyn: Robyn is a Super Fast Async Python Web...",
+          "url": "https://github.com/sparckles/Robyn"
+        },
+        {
+          "authority": 0.75,
+          "content": "Bocadillo is an ASGI web framework designed to help you build, test and deploy web APIs as easily as possible. It focuses on modularity, has thorough documentation, and integrates seamlessly with third-party async libraries. Real-time capable.",
+          "is_local": false,
+          "score": 0.6149453,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Introduction | Bocadillo",
+          "url": "https://bocadilloproject.github.io/guide/"
+        },
+        {
+          "authority": 0.6,
+          "content": "\u26a1 The lightning-fast asynchronous Python web framework# \u00b7 Simple and lightweight# \u00b7 Unopinionated and flexible# \u00b7 Performant and scalable# \u00b7 Production ready#.",
+          "is_local": false,
+          "score": 0.58784455,
+          "sources": [
+            "startpage"
+          ],
+          "title": "Sanic User Guide - The lightning-fast asynchronous Python web ...",
+          "url": "https://sanic.dev/"
+        },
+        {
+          "authority": 0.6,
+          "content": "Robyn is a high-performance async Python web framework powered by a Rust runtime. Build fast, scalable web applications with Python's simplicity and Rust's\u00a0...",
+          "is_local": false,
+          "score": 0.58754563,
+          "sources": [
+            "startpage"
+          ],
+          "title": "Robyn - A Fast, Innovator Friendly, and Community Driven Python ...",
+          "url": "https://robyn.tech/"
+        },
+        {
+          "authority": 0.5,
+          "content": "Welcome to AIOHTTP \u00b6 Asynchronous HTTP Client/Server for asyncio and Python. Current version is 3.13.5. Key Features \u00b6 Supports both Client and HTTP Server . Supports both Server WebSockets and Client WebSockets out-of-the-box without the Callback Hell. Web-server has Middlewares , Signals and pluggable routing. Client supports middleware for customizing request/response processing. Library Installation \u00b6 $ pip install aiohttp For speeding up DNS resolving by client API you may install aiodns as",
+          "is_local": true,
+          "score": 0.519194,
+          "sources": [
+            "local"
+          ],
+          "title": "Welcome to AIOHTTP \u2014 aiohttp 3.13.5 documentation",
+          "url": "https://docs.aiohttp.org/en/stable/index.html?ref=apidog.com"
+        },
+        {
+          "authority": 0.90000004,
+          "content": "Python supports multiple programming paradigms but with an emphasis on object-oriented programming and dynamic typing. Guido van Rossum began working on Python in the late 1980s as a successor to \u2026",
+          "is_local": false,
+          "score": 0.513305,
+          "sources": [
+            "bing"
+          ],
+          "title": "Python (programming language) - Wikipedia",
+          "url": "https://en.wikipedia.org/wiki/Python_(programming_language)"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "Python Playground: An online IDE to practice Python programming. Write, edit & run code online. Suitable for all skill levels. Try now.",
+          "is_local": false,
+          "score": 0.4725314,
+          "sources": [
+            "bing"
+          ],
+          "title": "Python Playground - Programiz",
+          "url": "https://programiz.pro/ide/python"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "May 8, 2026 \u00b7 In this section, we\u2019ll cover the basics of Python programming, including installation, writing first program, understanding comments and working with variables, keywords and operators.",
+          "is_local": false,
+          "score": 0.4725314,
+          "sources": [
+            "bing"
+          ],
+          "title": "Python Tutorial - GeeksforGeeks",
+          "url": "https://www.geeksforgeeks.org/python/python-programming-language-tutorial/"
+        },
+        {
+          "authority": 0.6,
+          "content": "Python was created in the early 1990s by Guido van Rossum at Stichting Mathematisch Centrum in the Netherlands as a successor of a language called ABC. Guido remains Python\u2019s principal author, \u2026",
+          "is_local": false,
+          "score": 0.45214456,
+          "sources": [
+            "bing"
+          ],
+          "title": "Download Python | Python.org",
+          "url": "https://www.python.org/downloads/"
+        },
+        {
+          "authority": 0.6,
+          "content": "Write and run your Python code using our online compiler. Enjoy additional features like code sharing, dark mode, and support for multiple programming languages.",
+          "is_local": false,
+          "score": 0.45214456,
+          "sources": [
+            "bing"
+          ],
+          "title": "Online Python Compiler (Interpreter) - Programiz",
+          "url": "https://www.programiz.com/python-programming/online-compiler/"
+        },
+        {
+          "authority": 0.6,
+          "content": "Python is an easy to learn, powerful programming language. It has efficient high-level data structures and a simple but effective approach to object-oriented programming.",
+          "is_local": false,
+          "score": 0.45214456,
+          "sources": [
+            "bing"
+          ],
+          "title": "Python 3.13 - Free download and install on Windows | Microsoft Store",
+          "url": "https://apps.microsoft.com/detail/9pnrbtzxmb4z"
+        },
+        {
+          "authority": 0.5,
+          "content": "Python, which was initially developed by Guido van Rossum and made available to the public in 1991, is currently one of the most widely used general-purpose programming languages.",
+          "is_local": false,
+          "score": 0.4317578,
+          "sources": [
+            "bing"
+          ],
+          "title": "Online Python - IDE, Editor, Compiler, Interpreter",
+          "url": "https://www.online-python.com/"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "ASGI (Asynchronous Server Gateway Interface) - A spiritual successor to WSGI, intended to provide a standard interface between async-capable Python web servers, frameworks, and applications.",
+          "is_local": false,
+          "score": 0.4089405,
+          "sources": [
+            "startpage"
+          ],
+          "title": "GitHub - timofurrer/awesome-asyncio: A curated list of awesome Python ...",
+          "url": "https://github.com/timofurrer/awesome-asyncio"
+        },
+        {
+          "authority": 0.6,
+          "content": "1 day ago \u00b7 Learn Python online: Python tutorials for developers of all skill levels, Python books and courses, Python news, code examples, articles, and more.",
+          "is_local": false,
+          "score": 0.3165012,
+          "sources": [
+            "bing"
+          ],
+          "title": "Python Tutorials \u2013 Real Python",
+          "url": "https://realpython.com/"
+        },
+        {
+          "authority": 0.5,
+          "content": "Meet Django Django is a high-level Python web framework that encourages rapid development and clean, pragmatic design. Built by experienced developers, it takes care of much of the hassle of web development, so you can focus on writing your app without needing to reinvent the wheel. It\u2019s free and open source. Ridiculously fast. Django was designed to help developers take applications from concept to completion as quickly as possible. Reassuringly secure. Django takes security seriously and helps",
+          "is_local": true,
+          "score": 0.070930466,
+          "sources": [
+            "local"
+          ],
+          "title": "The web framework for perfectionists with deadlines | Django",
+          "url": "https://www.djangoproject.com/?ref=apidog.com"
+        },
+        {
+          "authority": 0.5,
+          "content": "Navigation index modules | next | Flask Documentation (3.1.x) \u00bb Welcome to Flask Welcome to Flask \u00b6 Welcome to Flask\u2019s documentation. Flask is a lightweight WSGI web application framework. It is designed to make getting started quick and easy, with the ability to scale up to complex applications. Get started with Installation and then get an overview with the Quickstart . There is also a more detailed Tutorial that shows how to create a small but complete application with Flask. Common patterns ",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "Welcome to Flask \u2014 Flask Documentation (3.1.x)",
+          "url": "https://flask.palletsprojects.com/en/stable/?ref=apidog.com"
+        }
+      ],
+      "structured_constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "django"
+          },
+          {
+            "role": "exclusion",
+            "text": "flask"
+          }
+        ],
+        "language": "python",
+        "negative": [
+          "django",
+          "flask"
+        ],
+        "positive": [
+          "async",
+          "python",
+          "web"
+        ]
+      }
+    }
+  },
+  {
+    "query": "reactive ui library not react not angular not jquery",
+    "response": {
+      "category": "informational",
+      "confidence": 0.4967843,
+      "constraints": [
+        "+reactive",
+        "+ui",
+        "-angular",
+        "-jquery",
+        "-react"
+      ],
+      "distribution": {
+        "comparison": 0.15029912,
+        "fresh": 0.007925512,
+        "how-to": 0.19125806,
+        "informational": 0.070725605,
+        "navigational": 0.057880018,
+        "technical": 0.45578095,
+        "transactional": 0.06613075
+      },
+      "expanded_queries": [
+        "reactive ui library react angular jquery",
+        "reactive library documentation"
+      ],
+      "intent": "technical",
+      "results": [
+        {
+          "authority": 0.70000005,
+          "content": "(function () { try { let logShown = false; function setUwu(isUwu) { try { if (isUwu) { localStorage.setItem('uwu', true); document.documentElement.classList.add('uwu'); if (!logShown) { console.log('uwu mode! turn off with ?uwu=0'); console.log('logo credit to @sawaratsuki1004 via https://github.com/SAWARATSUKI/KawaiiLogos'); logShown = true; } } else { localStorage.removeItem('uwu'); document.documentElement.classList.remove('uwu'); console.log('uwu mode off. turn on with ?uwu'); } } catch (err",
+          "is_local": true,
+          "score": 0.051033556,
+          "sources": [
+            "local"
+          ],
+          "title": "Not Found \u2013 React",
+          "url": "https://react.dev/blog/2022/12/13/react-server-components"
+        },
+        {
+          "authority": 0.5,
+          "content": "0 React vs Angular vs Vue: Which Frontend Library is Best? WP Webify Choosing a frontend framework can feel like picking your favorite superhero. Each one has powers. Each one has fans. And each one promises to save your project. But when it comes to React vs Angular vs Vue , which one really wins? Let\u2019s break it down in a fun and simple way. No boring lectures. No complicated jargon. Just clear explanations and practical advice. TL;DR: React is flexible and widely used. Angular is powerful and ",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "React vs Angular vs Vue: Which Frontend Library is Best?",
+          "url": "https://www.wpwebify.com/blog/react-vs-angular-vs-vue-which-frontend-library-is-best/"
+        },
+        {
+          "authority": 0.5,
+          "content": "The 2025 Frontend Framework Showdown Explore React, Angular, and Vue to find the best match for your project\u2019s future. Let\u2019s Connect Home Blog A Quick Comparison: React vs Angular vs Vue Content React vs. Angular vs. Vue.js: Choosing the Best JavaScript Framework for Your Project React.js: The Flexible Library Angular: The Full-Fledged Framework Vue.js: The Lightweight Contender Head-to-Head Comparison: React vs Angular vs Vue When to choose React JS? What is the future of JavaScript frameworks?",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "React vs Angular vs Vue: Which Framework Should You choose?",
+          "url": "https://www.techformation.io/blog/react-vs-angular-vs-vue-js"
+        },
+        {
+          "authority": 0.5,
+          "content": "What You'll Learn React vs Angular vs Vue 2026: Major Differences Recommendations for Startups vs Enterprises Casestudies Frequently Asked Questions (FAQ) As 2025 comes to a close, choosing the top frontend framework is essential to success for both startups and enterprises. React vs Angular vs Vue 2026: each framework offers unique advantages. With the latest releases of React 19, Next.js 15, Vue 3.5, and Angular 20, the competition has increased. The enterprises and startups must take into acc",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "React vs Angular vs Vue Performance Benchmarks 2026 - Enqcode blog",
+          "url": "https://enqcode.com/blog/react-angular-vue-performance-benchmarks-2026"
+        },
+        {
+          "authority": 0.5,
+          "content": "Home \u203a Blog \u203a Frontend Development Engineering 17 min read React vs. Angular vs. Vue in 2026: Which Framework is the Right Choice for Your Project? Choosing a frontend framework in 2026? We compare React, Angular, and Vue across performance, scalability, and talent availability to help you pick the right stack. Published: March 27, 2026 \u00b7 Updated: April 8, 2026 Technically reviewed by: Oleksii S. | Chileap C. | Siddharth K. 44.5K SHARES Table of contents 1 . Understanding the 2026 Framework Land",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "React vs. Angular vs. Vue in 2026: Which Framework is Right for Your Project?",
+          "url": "https://softaims.com/blog/react-vs-angular-vs-vue-2026"
+        },
+        {
+          "authority": 0.5,
+          "content": "try { if(localStorage) { let currentUser = localStorage.getItem('current_user'); if (currentUser) { currentUser = JSON.parse(currentUser); if (currentUser.id === 2775308) { document.getElementById('article-show-container').classList.add('current-user-is-article-author'); } } } } catch (e) { console.error(e); } Kafeel Ahmad Posted on Dec 31, 2025 Angular vs React vs Vue: Which Should You Learn in 2026? # javascript # react # angular # vue If you're stepping into front-end development \u2014 or even if",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "Angular vs React vs Vue: Which Should You Learn in 2026? - DEV Community",
+          "url": "https://dev.to/kafeel-ahmad/angular-vs-react-vs-vue-which-should-you-learn-in-2026-1ocg"
+        },
+        {
+          "authority": 0.5,
+          "content": "React vs Angular vs Vue Performance in 2025 React Masters 4 min read \u00b7 Apr 1, 2025 -- Listen Share Choosing the right JavaScript framework is crucial for building fast and scalable web applications. React, Angular, and Vue are the three most popular front-end frameworks, each with its strengths and weaknesses. In 2025, developers continue to debate which framework offers the best performance. This article provides a clear and practical comparison of React, Angular, and Vue in terms of performanc",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "React vs Angular vs Vue Performance in 2025 | by React Masters | Medium",
+          "url": "https://medium.com/@reactmasters.in/react-vs-angular-vs-vue-performance-in-2025-7590f673494b"
+        },
+        {
+          "authority": 0.5,
+          "content": "Home Solutions About Insights Contact The 2025 Tech Stack Dilemma: React vs Vue vs Angular for Enterprise Applications Choosing the right JavaScript framework isn't just a technical decision. It's a strategic choice that can define your career trajectory, influence the success of your projects, and impact your team's productivity for years to come. In 2025, the frontend landscape has matured significantly, yet the question remains: React, Vue, or Angular? If you're a developer standing at this c",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "The 2025 Tech Stack Dilemma: React vs Vue vs Angular for Enterprise Applications",
+          "url": "https://www.codertrove.com/articles/2025-tech-stack-dilemma-react-vs-vue-vs-angular-for-enterprise-application"
+        },
+        {
+          "authority": 0.5,
+          "content": "Collapse Feed Dashboard Wallet Learn Achievements Network Refer Rewards SharpGPT Premium Contribute Article Blog Video Ebook Interview Question Register Login // Get references to the elements const hoverTarget = document.getElementById('ctl00_mainleft_userProfImg'); const hiddenDiv = document.getElementById('userLinks'); // Add event listeners for mouse enter and leave if (hoverTarget != null) { hoverTarget.addEventListener('mouseenter', () => { // Show the hidden div when mouse enters hiddenDi",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "Angular vs React vs Vue in 2025: Which Framework Wins for Enterprise Projects?",
+          "url": "https://www.c-sharpcorner.com/article/angular-vs-react-vs-vue-in-2025-which-framework-wins-for-enterprise-projects/"
+        },
+        {
+          "authority": 0.5,
+          "content": "<iframe src=\"https://www.googletagmanager.com/ns.html?id=GTM-PVXF6XNW\" height=\"0\" width=\"0\" style=\"display: none; visibility: hidden;\"></iframe> !function(){try{var d=document.documentElement,c=d.classList;c.remove('light','dark');var e=localStorage.getItem('theme');if('system'===e||(!e&&false)){var t='(prefers-color-scheme: dark)',m=window.matchMedia(t);if(m.media!==t||m.matches){d.style.colorScheme = 'dark';c.add('dark')}else{d.style.colorScheme = 'light';c.add('light')}}else if(e){c.add(e|| '",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "Comparison Between Blazor vs Angular vs React vs Vue | Angular Minds",
+          "url": "https://www.angularminds.com/blog/comparison-between-blazor-vs-angular-vs-react-vs-vue"
+        }
+      ],
+      "structured_constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "angular"
+          },
+          {
+            "role": "exclusion",
+            "text": "jquery"
+          },
+          {
+            "role": "exclusion",
+            "text": "react"
+          }
+        ],
+        "language": null,
+        "negative": [
+          "angular",
+          "jquery",
+          "react"
+        ],
+        "positive": [
+          "reactive",
+          "ui"
+        ]
+      }
+    }
+  },
+  {
+    "query": "game engine besides unity besides godot besides unreal",
+    "response": {
+      "category": "informational",
+      "confidence": 0.20378876,
+      "constraints": [
+        "+engine",
+        "+game",
+        "-godot",
+        "-unity",
+        "-unreal"
+      ],
+      "distribution": {
+        "comparison": 0.29070014,
+        "fresh": 0.014407754,
+        "how-to": 0.2177383,
+        "informational": 0.06736131,
+        "navigational": 0.007278792,
+        "technical": 0.18100606,
+        "transactional": 0.22150764
+      },
+      "expanded_queries": [
+        "game engine besides unity besides godot besides unreal"
+      ],
+      "intent": "comparison",
+      "results": [
+        {
+          "authority": 0.5,
+          "content": "The best programming language for game development depends on which engine you want to use. In 2026, with AI coding assistants making syntax easier to pick up than ever, the real decision is whether you're building for AAA studios, indie platforms, or the web. C++ dominates high-performance console and PC games, C# covers Unity and Godot, and GDScript gets beginners shipping faster than anything else. Below, I've ranked all eight languages with honest pros, cons, and the exact engine each one un",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "The 8 Best Programming Languages for Game Development",
+          "url": "https://hackr.io/blog/best-programming-language-for-games"
+        }
+      ],
+      "structured_constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "godot"
+          },
+          {
+            "role": "exclusion",
+            "text": "unity"
+          },
+          {
+            "role": "exclusion",
+            "text": "unreal"
+          }
+        ],
+        "language": null,
+        "negative": [
+          "godot",
+          "unity",
+          "unreal"
+        ],
+        "positive": [
+          "engine",
+          "game"
+        ]
+      }
+    }
+  },
+  {
+    "query": "java dependency injection framework besides spring besides dagger besides guice",
+    "response": {
+      "category": "informational",
+      "confidence": 0.13279912,
+      "constraints": [
+        "+dependency",
+        "+injection",
+        "+java",
+        "-dagger",
+        "-guice",
+        "-spring"
+      ],
+      "distribution": {
+        "comparison": 0.37404993,
+        "fresh": 0.0042178375,
+        "how-to": 0.35218385,
+        "informational": 0.021638466,
+        "navigational": 0.0020052448,
+        "technical": 0.20741919,
+        "transactional": 0.0384855
+      },
+      "expanded_queries": [
+        "java dependency injection framework besides spring besides dagger"
+      ],
+      "intent": "comparison",
+      "results": [
+        {
+          "authority": 0.70000005,
+          "content": "Why Dimension-DI? Dimension-DI is a lightweight, runtime-oriented dependency injection container designed for simplicity and performance. It delivers the essential features you need without the complexity: Standards-Based: Uses JSR-330 (@Inject, @Named) for clean, constructor-injected code.",
+          "is_local": false,
+          "score": 0.684445,
+          "sources": [
+            "duckduckgo-onion"
+          ],
+          "title": "GitHub - akardapolov/dimension-di: Ultra-lightweight Java DI framework ...",
+          "url": "https://github.com/akardapolov/dimension-di"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "PicoContainer is a lightweight, minimalistic IoC container for Java applications. It is designed for simplicity, offering basic dependency injection capabilities without the complexity of larger frameworks.",
+          "is_local": false,
+          "score": 0.6596561,
+          "sources": [
+            "brave"
+          ],
+          "title": "Top 5 Java Libraries for Achieving Inversion of Control in Your Projects",
+          "url": "https://medium.com/@AlexanderObregon/top-5-java-libraries-for-achieving-inversion-of-control-in-your-projects-94f1dee6d701"
+        },
+        {
+          "authority": 0.65000004,
+          "content": "Dependency Injection (DI) is a design pattern that allows for loose coupling between components by externalizing the dependencies of an object.Configure the DI framework to scan and load the plugins",
+          "is_local": false,
+          "score": 0.65811074,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Implementing plugin-based architecture with Dependency Injection in...",
+          "url": "https://colinchjava.github.io/2023-09-23/18-59-59-439626-implementing-plugin-based-architecture-with-dependency-injection-in-java/"
+        },
+        {
+          "authority": 0.5,
+          "content": "",
+          "is_local": false,
+          "score": 0.560159,
+          "sources": [
+            "brave"
+          ],
+          "title": "r/java on Reddit: Best dependency injection framework?",
+          "url": "https://www.reddit.com/r/java/comments/1fibln8/best_dependency_injection_framework/"
+        },
+        {
+          "authority": 0.90000004,
+          "content": "Dependency injection is often used alongside specialized frameworks, known as 'containers', to facilitate program composition. PetManager gets injected into PetController and PetRepository gets injected into PetManager.",
+          "is_local": false,
+          "score": 0.5419617,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Dependency injection - Wikipedia",
+          "url": "https://en.wikipedia.org/wiki/Dependency_injection"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "Like if I say we are relying too much on mobile phones than it means we are dependent on them. So before getting to dependency injections, first let\u2019s understand what a dependency in programming means.",
+          "is_local": false,
+          "score": 0.5221758,
+          "sources": [
+            "yandex"
+          ],
+          "title": "A quick intro to Dependency Injection: what it is, and when to use it",
+          "url": "https://www.freecodecamp.org/news/a-quick-intro-to-dependency-injection-what-it-is-and-when-to-use-it-7578c84fa88f/"
+        },
+        {
+          "authority": 0.5,
+          "content": "<!-- try { if (location.href.indexOf('is-external=true') == -1) { parent.document.title=\"WebSocketHttpRequestHandler (Spring Framework 4.3.23.RELEASE API)\"; } } catch(err) { } //--> var methods = {\"i0\":10,\"i1\":10,\"i2\":10,\"i3\":10,\"i4\":10,\"i5\":10,\"i6\":10,\"i7\":10,\"i8\":10}; var tabs = {65535:[\"t0\",\"All Methods\"],2:[\"t2\",\"Instance Methods\"],8:[\"t4\",\"Concrete Methods\"]}; var altColor = \"altColor\"; var rowColor = \"rowColor\"; var tableTab = \"tableTab\"; var activeTableTab = \"activeTableTab\"; <div>JavaScr",
+          "is_local": true,
+          "score": 0.059559274,
+          "sources": [
+            "local"
+          ],
+          "title": "WebSocketHttpRequestHandler (Spring Framework 4.3.23.RELEASE API)",
+          "url": "https://docs.spring.io/spring-framework/docs/4.3.23.RELEASE/javadoc-api/org/springframework/web/socket/server/support/WebSocketHttpRequestHandler.html"
+        },
+        {
+          "authority": 0.5,
+          "content": "<!-- try { if (location.href.indexOf('is-external=true') == -1) { parent.document.title=\"SockJsHttpRequestHandler (Spring Framework 4.3.23.RELEASE API)\"; } } catch(err) { } //--> var methods = {\"i0\":10,\"i1\":10,\"i2\":10,\"i3\":10,\"i4\":10,\"i5\":10,\"i6\":10,\"i7\":10}; var tabs = {65535:[\"t0\",\"All Methods\"],2:[\"t2\",\"Instance Methods\"],8:[\"t4\",\"Concrete Methods\"]}; var altColor = \"altColor\"; var rowColor = \"rowColor\"; var tableTab = \"tableTab\"; var activeTableTab = \"activeTableTab\"; <div>JavaScript is disa",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "SockJsHttpRequestHandler (Spring Framework 4.3.23.RELEASE API)",
+          "url": "https://docs.spring.io/spring-framework/docs/4.3.23.RELEASE/javadoc-api/org/springframework/web/socket/sockjs/support/SockJsHttpRequestHandler.html"
+        },
+        {
+          "authority": 0.5,
+          "content": "<!-- try { if (location.href.indexOf('is-external=true') == -1) { parent.document.title=\"Message (Spring Framework 4.3.23.RELEASE API)\"; } } catch(err) { } //--> var methods = {\"i0\":6,\"i1\":6}; var tabs = {65535:[\"t0\",\"All Methods\"],2:[\"t2\",\"Instance Methods\"],4:[\"t3\",\"Abstract Methods\"]}; var altColor = \"altColor\"; var rowColor = \"rowColor\"; var tableTab = \"tableTab\"; var activeTableTab = \"activeTableTab\"; <div>JavaScript is disabled on your browser.</div> Skip navigation links Overview Package ",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "Message (Spring Framework 4.3.23.RELEASE API)",
+          "url": "https://docs.spring.io/spring-framework/docs/4.3.23.RELEASE/javadoc-api/org/springframework/messaging/Message.html"
+        },
+        {
+          "authority": 0.5,
+          "content": "Spring Framework's Migration from Jira to GitHub Issues Engineering | Rossen Stoyanchev | January 15, 2019 | 8 min read | ... The Spring Framework has migrated its entire history of issues from Jira to GitHub. The goal of this blog post is to provide you with context and details about this move. Migration Details The entire 15+ year history of every Spring Framework issue, and every comment, has been imported into GitHub. There is a lot to consider in such a move, so let's take a tour and go ove",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "Spring Framework's Migration from Jira to GitHub Issues",
+          "url": "https://jira.spring.io/browse/SEC-2501"
+        }
+      ],
+      "structured_constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "dagger"
+          },
+          {
+            "role": "exclusion",
+            "text": "guice"
+          },
+          {
+            "role": "exclusion",
+            "text": "spring"
+          }
+        ],
+        "language": "java",
+        "negative": [
+          "dagger",
+          "guice",
+          "spring"
+        ],
+        "positive": [
+          "dependency",
+          "injection",
+          "java"
+        ]
+      }
+    }
+  },
+  {
+    "query": "rust async runtime not tokio not async-std not smol",
+    "response": {
+      "category": "informational",
+      "confidence": 0.64095914,
+      "constraints": [
+        "+async",
+        "+rust",
+        "-async-std",
+        "-smol",
+        "-tokio"
+      ],
+      "distribution": {
+        "comparison": 0.2579343,
+        "fresh": 0.004269741,
+        "how-to": 0.050992332,
+        "informational": 0.03344373,
+        "navigational": 0.014987569,
+        "technical": 0.6185737,
+        "transactional": 0.019798594
+      },
+      "expanded_queries": [
+        "rust async runtime tokio async-std smol",
+        "rust async runtime documentation"
+      ],
+      "intent": "technical",
+      "results": [
+        {
+          "authority": 0.5,
+          "content": "When to Use Async Runtimes in Rust Concurrency and When Not Apr 18, 2025 # Rust James Reed Infrastructure Engineer \u00b7 Leapcell This post is also available in \u65e5\u672c\u8a9e , \ud55c\uad6d\uc5b4 , and Deutsch Rust's asynchronous runtimes are extremely useful in a variety of scenarios, especially in high-concurrency and high-performance I/O-intensive applications. Below are some common use cases for Rust async runtimes: Network Programming Web servers and clients : Handling a large number of concurrent connections is a key ",
+          "is_local": true,
+          "score": 0.97802836,
+          "sources": [
+            "local"
+          ],
+          "title": "When to Use Async Runtimes in Rust Concurrency and When Not | Leapcell",
+          "url": "https://leapcell.io/blog/when-to-use-async-runtimes-in-rust-concurrency"
+        },
+        {
+          "authority": 0.5,
+          "content": "May 4, 2022 ... Python didn't have an async runtime until recently and relied upon libraries. Also rust doesn't have a fat runtime like .net and is more like c\u00a0...",
+          "is_local": false,
+          "score": 0.88312256,
+          "sources": [
+            "startpage"
+          ],
+          "title": "Why does Rust not have a standard async runtime? - Reddit",
+          "url": "https://www.reddit.com/r/rust/comments/ui7ayd/why_does_rust_not_have_a_standard_async_runtime/"
+        },
+        {
+          "authority": 0.5,
+          "content": "That's really the heart of it. If it was really just a runtime, it wouldn't matter what implementation you plugged in \u00b7 I understand it's hard and lot of work went into this, but let's face this. This article is right:",
+          "is_local": false,
+          "score": 0.82544494,
+          "sources": [
+            "brave"
+          ],
+          "title": "The State of Async Rust: Runtimes | Hacker News",
+          "url": "https://news.ycombinator.com/item?id=37639896"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "If we run cargo t , it complains that the test function \" is not async \" , and that the await \" only allowed inside `async` functions and ...",
+          "is_local": false,
+          "score": 0.81420994,
+          "sources": [
+            "mojeek"
+          ],
+          "title": "Rust unit testing: asynchronous code | Jorge Ortiz-Fuentes'",
+          "url": "https://jorgeortiz.dev/posts/rust_unit_testing_async_code/"
+        },
+        {
+          "authority": 0.65000004,
+          "content": "To run a Future in Rust, there is a need for an asynchronous runtime. This runtime is usually called the executor. The executor is a machinery that is tasked with the management of all the resources required for executing futures.",
+          "is_local": false,
+          "score": 0.7936722,
+          "sources": [
+            "yandex"
+          ],
+          "title": "A Neophyte's Introduction to the async/await landscape in Rust",
+          "url": "https://www.geekabyte.io/2022/05/a-neophytes-introduction-to-asyncawait.html"
+        },
+        {
+          "authority": 0.90000004,
+          "content": "Rust supports multiple programming paradigms. It was influenced by ideas from functional programming, including immutability, \u2026",
+          "is_local": false,
+          "score": 0.63960785,
+          "sources": [
+            "bing"
+          ],
+          "title": "Rust (programming language) - Wikipedia",
+          "url": "https://en.wikipedia.org/wiki/Rust_(programming_language)"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "Rust is blazingly fast and memory-efficient: with no runtime or garbage collector, it can power performance-critical services, run on \u2026",
+          "is_local": false,
+          "score": 0.61975664,
+          "sources": [
+            "bing"
+          ],
+          "title": "Rust Programming Language",
+          "url": "https://rust-lang.org/"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "This is the main source code repository for Rust. It contains the compiler, standard library, and documentation.",
+          "is_local": false,
+          "score": 0.58880156,
+          "sources": [
+            "bing"
+          ],
+          "title": "rust-lang / rust: Empowering everyone to build reliable and ... - GitHub",
+          "url": "https://github.com/rust-lang/rust"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "The Rust Foundation is the nonprofit steward of the Rust programming language and its vibrant open source community. Learn more \u2026",
+          "is_local": false,
+          "score": 0.58880156,
+          "sources": [
+            "bing"
+          ],
+          "title": "The Rust Foundation - Official",
+          "url": "https://rustfoundation.org/"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "Dec 2, 2025 \u00b7 Survive and thrive with Rust\u2014a gripping multiplayer survival game where you gather resources, build bases, and face \u2026",
+          "is_local": false,
+          "score": 0.58880156,
+          "sources": [
+            "bing"
+          ],
+          "title": "Download Rust for Windows and macOS | Gizmodo",
+          "url": "https://gizmodo.com/download/rust"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "Rust is a survival game where you start naked on a beach with a rock, a torch, and a dream. That dream usually lasts about 47 \u2026",
+          "is_local": false,
+          "score": 0.58880156,
+          "sources": [
+            "bing"
+          ],
+          "title": "Rust - Steam Community",
+          "url": "https://steamcommunity.com/app/252490"
+        },
+        {
+          "authority": 0.65000004,
+          "content": "To install Rust, download and run rustup\u2011init.exe then follow the onscreen instructions. You may also need the Visual Studio \u2026",
+          "is_local": false,
+          "score": 0.5761,
+          "sources": [
+            "bing"
+          ],
+          "title": "rustup.rs - The Rust toolchain installer",
+          "url": "https://rustup.rs/"
+        },
+        {
+          "authority": 0.6,
+          "content": "The only aim in Rust is to survive. Everything wants you to die - the island\u2019s wildlife, other inhabitants, the environment, and other \u2026",
+          "is_local": false,
+          "score": 0.5633984,
+          "sources": [
+            "bing"
+          ],
+          "title": "Rust on Steam",
+          "url": "https://store.steampowered.com/app/252490/Rust/"
+        },
+        {
+          "authority": 0.6,
+          "content": "RustHelp is a community\u2011driven Rust wiki and toolkit built by passionate Rust players to help others explore every part of the game. Discover Rust skins, track item store releases, analyze skin \u2026",
+          "is_local": false,
+          "score": 0.5633984,
+          "sources": [
+            "bing"
+          ],
+          "title": "Rust Wiki - Items, Raid Calculator, Crosshair, Skins | RustHelp",
+          "url": "https://rusthelp.com/"
+        },
+        {
+          "authority": 0.6,
+          "content": "AI should write rust and only rust ;) \u2014 by Patrick Gray \u2014 Seattle Rust User Group, January 2026 4.9K views \u2022 4 months ago 45:43",
+          "is_local": false,
+          "score": 0.5633984,
+          "sources": [
+            "bing"
+          ],
+          "title": "Rust Programming Language - YouTube",
+          "url": "https://www.youtube.com/channel/UCaYhcUwRBNscFNUKTjgPFiA"
+        },
+        {
+          "authority": 0.5,
+          "content": "The only aim in Rust is to survive. Everything wants you to die - the island\u2019s wildlife and other inhabitants, the environment, other \u2026",
+          "is_local": false,
+          "score": 0.53799534,
+          "sources": [
+            "bing"
+          ],
+          "title": "Rust \u2014 Explore, Build and Survive",
+          "url": "https://rust.facepunch.com/"
+        },
+        {
+          "authority": 0.5,
+          "content": "May 7, 2026 \u00b7 Rust is about resource management, base-building, and combat. This action game features an extensive crafting \u2026",
+          "is_local": false,
+          "score": 0.53799534,
+          "sources": [
+            "bing"
+          ],
+          "title": "Rust - Download",
+          "url": "https://rust.en.softonic.com/"
+        },
+        {
+          "authority": 0.5,
+          "content": "Rust is a popular programming language used to build everything from web servers to game engines. Rust is known for being very fast, and is similar to C and C++ in language.",
+          "is_local": false,
+          "score": 0.53799534,
+          "sources": [
+            "bing"
+          ],
+          "title": "Rust Tutorial - W3Schools",
+          "url": "https://www.w3schools.com/rust/index.php"
+        },
+        {
+          "authority": 0.5,
+          "content": "",
+          "is_local": false,
+          "score": 0.47500074,
+          "sources": [
+            "brave"
+          ],
+          "title": "r/rust on Reddit: Pasts - A No-Std Compatible Async Runtime",
+          "url": "https://www.reddit.com/r/rust/comments/v9qgo8/pasts_a_nostd_compatible_async_runtime/"
+        },
+        {
+          "authority": 0.95000005,
+          "content": "Learn API Docs Blog TABLE OF CONTENTS Tokio Tutorial Overview Setup Hello Tokio Spawning Shared state Channels I/O Framing Async in depth Select Streams Topics Bridging with sync code Graceful Shutdown Getting started with Tracing Next steps with Tracing Unit Testing Glossary API documentation Hello Tokio We will get started by writing a very basic Tokio application. It will connect to the Mini-Redis server, set the value of the key hello to world . It will then read back the key. This will be d",
+          "is_local": true,
+          "score": 0.18304496,
+          "sources": [
+            "local"
+          ],
+          "title": "Hello Tokio | Tokio - An asynchronous Rust runtime",
+          "url": "https://tokio.rs/tokio/tutorial/hello-tokio"
+        },
+        {
+          "authority": 0.5,
+          "content": "Rust has become a go-to language for building high-performance systems, and a big part of that story is async programming. If you have written any network code, web servers, or concurrent applications in Rust, you have probably encountered Tokio. It is the most widely used async runtime in the Rust ecosystem, powering everything from microservices to databases. This guide walks through the practical aspects of using Tokio - from basic setup to advanced patterns like channels and timeouts. By the",
+          "is_local": true,
+          "score": 0.17034721,
+          "sources": [
+            "local"
+          ],
+          "title": "\n         How to Use Tokio for Async Runtime in Rust\n    ",
+          "url": "https://oneuptime.com/blog/post/2026-02-01-rust-tokio-async-runtime/view"
+        },
+        {
+          "authority": 0.5,
+          "content": "Docs.rs { \"name\": \"smol\", \"version\": \"2.0.2\" } smol-2.0.2 Platform aarch64-apple-darwin aarch64-unknown-linux-gnu i686-pc-windows-msvc x86_64-pc-windows-msvc x86_64-unknown-linux-gnu Feature flags docs.rs About docs.rs Badges Builds Metadata Shorthand URLs Download Rustdoc JSON Build queue Privacy policy Rust Rust website The Book Standard Library API Reference Rust by Example The Cargo Guide Clippy Documentation smol 2.0.2 A small and fast async runtime Crate Source Builds Feature flags Documen",
+          "is_local": true,
+          "score": 0.15274572,
+          "sources": [
+            "local"
+          ],
+          "title": "smol 2.0.2 - Docs.rs",
+          "url": "https://docs.rs/crate/smol/latest"
+        },
+        {
+          "authority": 0.5,
+          "content": "try { if(localStorage) { let currentUser = localStorage.getItem('current_user'); if (currentUser) { currentUser = JSON.parse(currentUser); if (currentUser.id === 3245022) { document.getElementById('article-show-container').classList.add('current-user-is-article-author'); } } } } catch (e) { console.error(e); } Ashish Sharda Posted on Jul 7, 2025 Choosing Your Async Runtime in Rust: Tokio vs. async-std (2025 Edition) # rust # programming # tokio # developer If you're building high-performance asy",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "Choosing Your Async Runtime in Rust: Tokio vs. async-std (2025 Edition) - DEV Community",
+          "url": "https://dev.to/ashish_sharda_a540db2e50e/choosing-your-async-runtime-in-rust-tokio-vs-async-std-2025-edition-12j9"
+        },
+        {
+          "authority": 0.5,
+          "content": "Async Programming in Rust \u2014 Exploring Tokio and Async-std Alexander Obregon 4 min read \u00b7 May 24, 2023 -- 1 Listen Share Image Source Introduction Asynchronous programming allows tasks to be performed concurrently, which can significantly improve the performance of your applications. In this article, we\u2019ll explore async programming in Rust and focus on two popular libraries \u2014 Tokio and Async-std. Understanding Asynchronous Programming In traditional synchronous programming, tasks are performed on",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "Rust Async Programming: Tokio & Async-std | Medium",
+          "url": "https://medium.com/@AlexanderObregon/async-programming-in-rust-exploring-tokio-and-async-std-97d4b524cef0"
+        },
+        {
+          "authority": 0.5,
+          "content": "Member-only story Choosing Your Async Champion: Tokio vs. async-std in 2025 Ashish Sharda 6 min read \u00b7 Jul 7, 2025 -- 1 Listen Share Rust\u2019s promise of fearless concurrency and unparalleled performance has made it a darling for systems programming, web services, and beyond. At the heart of building high-performance, non-blocking applications in Rust lies asynchronous programming, powered by \u201cruntimes.\u201d These unsung heroes manage the execution of your async code, scheduling tasks, handling I/O, an",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "Choosing Your Async Champion: Tokio vs. async-std in 2025 | by Ashish Sharda | Rustaceans | Medium",
+          "url": "https://medium.com/@ashishjsharda/choosing-your-async-champion-tokio-vs-async-std-in-2025-a142d3899b66"
+        },
+        {
+          "authority": 0.5,
+          "content": "Hacker News new | past | comments | ask | show | jobs | submit login ithkuil on Oct 3, 2020 | parent | context | favorite | on: Rust Starter Kit 2020 I'm learning rust and tokio vs async-std confuses me: if I have a library that uses tokio (e.g. tonic grpc), can I use a library that uses async-std and mix calls to functions of those two libraries in the same function? dathinab on Oct 6, 2020 | next [\u2013] No, through in some cases yes. There is also a `tokio02` feature which let's you run tokio ins",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "I'm learning rust and tokio vs async-std confuses me: if I have a library that u... | Hacker News",
+          "url": "https://news.ycombinator.com/item?id=24675155"
+        },
+        {
+          "authority": 0.5,
+          "content": "{ \"@context\": \"https://schema.org\", \"@type\": \"Article\", \"mainEntityOfPage\": { \"@type\": \"WebPage\", \"@id\": \"https://toxigon.com/comparing-tokio-with-other-async-runtimes-in-rust\" }, \"headline\": \"Tokio vs Other Rust Async Runtimes: Which One Should You Use in 2026?\", \"image\": { \"@type\": \"ImageObject\", \"url\": \"https://toxigon.com/image/A-futuristic-digital-landscape-with-four-distinct-pathways-representing-Tokio-async-std-smol-and-glommio-each-glowing-with-unique-colors-and-leading-to-different-type",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "Tokio vs Other Rust Async Runtimes: Which One Should You - Toxigon",
+          "url": "https://toxigon.com/comparing-tokio-with-other-async-runtimes-in-rust"
+        },
+        {
+          "authority": 0.5,
+          "content": "Hacker News new | past | comments | ask | show | jobs | submit login dathinab on Oct 3, 2020 | parent | context | favorite | on: Rust Starter Kit 2020 Missing: `async-std` Which provides a interface like the std library but async. (Through tokio copied a lot of this by now). It uses the same execution implementation as `smol` and generally most of the code from it is shared with `smol` through internal dependencies like `async-executor`. Through lie tokio it's a bit bigger then `smol` which affe",
+          "is_local": true,
+          "score": 0.05,
+          "sources": [
+            "local"
+          ],
+          "title": "Missing: `async-std` Which provides a interface like the std library but async. ... | Hacker News",
+          "url": "https://news.ycombinator.com/item?id=24672360"
+        }
+      ],
+      "structured_constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "async-std"
+          },
+          {
+            "role": "exclusion",
+            "text": "smol"
+          },
+          {
+            "role": "exclusion",
+            "text": "tokio"
+          }
+        ],
+        "language": "rust",
+        "negative": [
+          "async-std",
+          "smol",
+          "tokio"
+        ],
+        "positive": [
+          "async",
+          "rust"
+        ]
+      }
+    }
+  },
+  {
+    "query": "observability stack not datadog not newrelic not dynatrace",
+    "response": {
+      "category": "informational",
+      "confidence": 0.1275939,
+      "constraints": [
+        "+observability",
+        "+stack",
+        "-datadog",
+        "-dynatrace",
+        "-newrelic"
+      ],
+      "distribution": {
+        "comparison": 0.28922382,
+        "fresh": 0.010229391,
+        "how-to": 0.20419346,
+        "informational": 0.30761975,
+        "navigational": 0.030751886,
+        "technical": 0.048810937,
+        "transactional": 0.10917075
+      },
+      "expanded_queries": [
+        "observability stack not datadog not newrelic not dynatrace",
+        "observability stack not datadog not newrelic not dynatrace explained"
+      ],
+      "intent": "informational",
+      "results": [
+        {
+          "authority": 0.70000005,
+          "content": "New Relic is a veteran in the APM space that has evolved into a full-stack observability platform covering APM, infrastructure, logs, browser and mobile monitoring, and more.",
+          "is_local": false,
+          "score": 0.6520804,
+          "sources": [
+            "yandex"
+          ],
+          "title": "The 8 Best Application Performance Monitoring (APM) Tools... | Rollbar",
+          "url": "https://rollbar.com/blog/best-apm-tools/"
+        },
+        {
+          "authority": 0.65000004,
+          "content": "Observability gives IT organizations true visibility across the many data sources in cloud-native environments. The three pillars of observability are logs, metrics, and traces. Full-stack observability \u2026",
+          "is_local": false,
+          "score": 0.57521844,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is Observability? | A Comprehensive Observability Guide",
+          "url": "https://www.elastic.co/what-is/observability"
+        },
+        {
+          "authority": 0.5,
+          "content": "Site24x7\u2019s full-stack observability goes beyond traditional monitoring by offering a unified, AI-powered platform that delivers real-time insights ...",
+          "is_local": false,
+          "score": 0.568684,
+          "sources": [
+            "mojeek"
+          ],
+          "title": "Full-Stack Observability Platform | Get visibility into your",
+          "url": "https://www.site24x7.com/full-stack-observability.html"
+        },
+        {
+          "authority": 0.5,
+          "content": "Full-stack, OpenTelementry-based observability with logs, metrics and traces, gives you comprehensive visibility into the health and performance of ...",
+          "is_local": false,
+          "score": 0.568684,
+          "sources": [
+            "mojeek"
+          ],
+          "title": "Explore Full-Stack Observability Essentials",
+          "url": "https://resources.businessinfopro.com/lp/explore-full-stack-observability-essentials-0303.html"
+        },
+        {
+          "authority": 0.6,
+          "content": "Observability and traditional monitoring are related but traditional monitoring tools focus on known failures while observability provides visibility into system behavior to help identify and diagnose new \u2026",
+          "is_local": false,
+          "score": 0.4188064,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is Data Observability? - Databricks",
+          "url": "https://www.databricks.com/blog/what-is-data-observability"
+        },
+        {
+          "authority": 0.90000004,
+          "content": "Observability Observability is a measure of how well internal states of a system can be inferred from knowledge of its external outputs. In control theory, the observability and controllability of a linear \u2026",
+          "is_local": false,
+          "score": 0.418474,
+          "sources": [
+            "bing"
+          ],
+          "title": "Observability - Wikipedia",
+          "url": "https://en.wikipedia.org/wiki/Observability"
+        },
+        {
+          "authority": 0.90000004,
+          "content": "Observability is a measure of how well internal states of a system can be inferred from knowledge of its external outputs. In control theory, the observability and controllability of a linear system are \u2026",
+          "is_local": false,
+          "score": 0.418474,
+          "sources": [
+            "bing"
+          ],
+          "title": "Observability - Wikipedia",
+          "url": "https://en.m.wikipedia.org/wiki/Observability"
+        },
+        {
+          "authority": 0.5,
+          "content": "Open Source Alternative The Open-Source SigNoz Alternative Complete observability vs open-source APM platform Start free \u2014 no credit card See it in action Self-host for free or use our cloud. No vendor lock-in. SigNoz SigNoz is an excellent open-source observability platform focused on logs, metrics, and traces. Built on ClickHouse for high performance with a self-hosted community edition available. It's a strong alternative to proprietary APM tools with transparent, open-source development. Exc",
+          "is_local": true,
+          "score": 0.38651428,
+          "sources": [
+            "local"
+          ],
+          "title": "SigNoz Alternative - OneUptime | Open Source | 2026 Comparison",
+          "url": "https://oneuptime.com/compare/signoz"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "Jul 23, 2025 \u00b7 Observability means we can understand how a system works based on the information it produces, like logs, measurements, and traces. As cloud systems have become more complicated, \u2026",
+          "is_local": false,
+          "score": 0.37360042,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is Observability? - GeeksforGeeks",
+          "url": "https://www.geeksforgeeks.org/devops/what-is-observability/"
+        },
+        {
+          "authority": 0.6,
+          "content": "Nov 13, 2024 \u00b7 Observability is the ability to understand the internal state or condition of a complex system based solely on knowledge of its external outputs, specifically its telemetry.",
+          "is_local": false,
+          "score": 0.36589104,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is observability? - IBM",
+          "url": "https://www.ibm.com/think/topics/observability"
+        },
+        {
+          "authority": 0.6,
+          "content": "Feb 6, 2026 \u00b7 Observability tools can help identify events that indicate the changes of state in applications, hardware, software, cloud instances, or other technologies. Once an observability \u2026",
+          "is_local": false,
+          "score": 0.36589104,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is observability? - Red Hat",
+          "url": "https://www.redhat.com/en/topics/devops/what-is-observability"
+        },
+        {
+          "authority": 0.6,
+          "content": "Feb 11, 2026 \u00b7 Learn about observability and why it's important, including benefits and challenges. Discover the pillars of observability and how to implement them.",
+          "is_local": false,
+          "score": 0.36589104,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is observability? The ultimate guide for IT teams - TechTarget",
+          "url": "https://www.techtarget.com/searchitoperations/definition/observability"
+        },
+        {
+          "authority": 0.6,
+          "content": "Learn why observability is key for managing system health and behavior, and discover ways to optimize observability outcomes.",
+          "is_local": false,
+          "score": 0.36589104,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is observability? - Cloudflare",
+          "url": "https://www.cloudflare.com/learning/performance/what-is-observability/"
+        },
+        {
+          "authority": 0.6,
+          "content": "Observability is the measure of how well you can understand your system's internal state based on its external outputs (metrics, traces, and logs). It is the foundational \"safety net\" that allows next-gen \u2026",
+          "is_local": false,
+          "score": 0.36589104,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is observability? - Google Cloud",
+          "url": "https://cloud.google.com/discover/what-is-observability"
+        },
+        {
+          "authority": 0.6,
+          "content": "In simple terms, observability helps you understand what\u2019s happening inside your systems by analyzing the data those systems produce. Modern observability practices have evolved to meet the demands \u2026",
+          "is_local": false,
+          "score": 0.36589104,
+          "sources": [
+            "bing"
+          ],
+          "title": "What Is Observability? Pillars, Use Cases & AI | Snowflake",
+          "url": "https://www.snowflake.com/en/fundamentals/observability/"
+        },
+        {
+          "authority": 0.5,
+          "content": "Communicate downtime and promptly notify customers about your service status. ... I do not see another monitoring tool that could even come close to ...",
+          "is_local": false,
+          "score": 0.35818172,
+          "sources": [
+            "mojeek"
+          ],
+          "title": "Digital Experience Monitoring & Observability Platform: Site24x7",
+          "url": "https://social.site24x7.com:443/"
+        },
+        {
+          "authority": 0.5,
+          "content": "SaaS Companies Built by SaaS for SaaS Your customers expect 99.99% uptime. So should you. Observability built by SaaS engineers, for SaaS companies. Monitor multi-tenant apps, track customer experience, and catch issues before they become churned customers. Get started free Schedule Demo Multi-tenant ready 99.99% SLA SOC 2 Type II @keyframes scroll { 0% { transform: translateX(0); } 100% { transform: translateX(-50%); } } .logo-marquee { display: flex; width: max-content; animation: scroll 45s l",
+          "is_local": true,
+          "score": 0.27056,
+          "sources": [
+            "local"
+          ],
+          "title": "OneUptime for SaaS | Scale with Complete Visibility",
+          "url": "https://oneuptime.com/industries/saas"
+        }
+      ],
+      "structured_constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "datadog"
+          },
+          {
+            "role": "exclusion",
+            "text": "dynatrace"
+          },
+          {
+            "role": "exclusion",
+            "text": "newrelic"
+          }
+        ],
+        "language": null,
+        "negative": [
+          "datadog",
+          "dynatrace",
+          "newrelic"
+        ],
+        "positive": [
+          "observability",
+          "stack"
+        ]
+      }
+    }
+  },
+  {
+    "query": "headless cms not wordpress not drupal not joomla",
+    "response": {
+      "category": "informational",
+      "confidence": 0.11865766,
+      "constraints": [
+        "+cms",
+        "+headless",
+        "-drupal",
+        "-joomla",
+        "-wordpress"
+      ],
+      "distribution": {
+        "comparison": 0.23054503,
+        "fresh": 0.010431113,
+        "how-to": 0.19712323,
+        "informational": 0.03537495,
+        "navigational": 0.21810658,
+        "technical": 0.20711952,
+        "transactional": 0.10129958
+      },
+      "expanded_queries": [
+        "headless cms not wordpress not drupal not joomla"
+      ],
+      "intent": "comparison",
+      "results": [
+        {
+          "authority": 0.70000005,
+          "content": "The difference here is pretty noticeable; a pure headless content management system does not include the front end.",
+          "is_local": false,
+          "score": 0.8614753,
+          "sources": [
+            "mojeek"
+          ],
+          "title": "What is a Headless CMS? | Alokai",
+          "url": "https://alokai.com/blog/headless-cms"
+        },
+        {
+          "authority": 0.8000001,
+          "content": "ElmapiCMS is a modern, self-hosted, AI-powered headless CMS built with Laravel, React, TypeScript, Inertia.js, and Tailwind CSS. It\u2019s designed to be fast, flexible, and developer-friendly. Generate, translate, and enhance content with built-in AI.",
+          "is_local": false,
+          "score": 0.79374284,
+          "sources": [
+            "yandex"
+          ],
+          "title": "ElmapiCMS - AI-Powered Self-Hosted Headless CMS... | CodeCanyon",
+          "url": "https://codecanyon.net/item/elmapicms-headless-cms-for-building-content-api/34931567"
+        },
+        {
+          "authority": 0.8000001,
+          "content": "Browse free open source Headless CMS and projects for Windows below. Use the toggles on the left to filter open source Headless CMS by OS, license, language, programming language, and project status.",
+          "is_local": false,
+          "score": 0.79374284,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Best Open Source Windows Headless CMS 2026",
+          "url": "https://sourceforge.net/directory/headless-cms/windows/"
+        },
+        {
+          "authority": 0.5,
+          "content": "You're building something for a volunteer community, which means at some point you'll be gone and somebody will be wondering how the heck to manage the site with this \"custom\" setup that they can't figure out with chatgpt or a youtube video \u00b7 Set them up for the future, not for the now.",
+          "is_local": false,
+          "score": 0.7589282,
+          "sources": [
+            "brave"
+          ],
+          "title": "Ask HN: Looking for headless CMS recommendation | Hacker News",
+          "url": "https://news.ycombinator.com/item?id=45081752"
+        },
+        {
+          "authority": 0.6,
+          "content": "Built with TypeScript and React, Payload is an open-source headless CMS and application framework. Build anything.your content as vector embeddings, that can be used as a custom chat bot. define schema code snippets.",
+          "is_local": false,
+          "score": 0.75707966,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Payload: The Next.js Headless CMS and App Framework",
+          "url": "https://payloadcms.com/"
+        },
+        {
+          "authority": 0.6,
+          "content": "A traditional CMS couples the front-end and back-end systems, whereas a headless CMS decouples them. One disadvantage of a traditional CMS approach is that it prevents large and small businesses from having a multichannel presence.",
+          "is_local": false,
+          "score": 0.75406873,
+          "sources": [
+            "brave"
+          ],
+          "title": "Headless CMS explained: What you need to know before you choose | Contentstack",
+          "url": "https://www.contentstack.com/cms-guides/headless-cms-explained-a-comprehensive-guide"
+        },
+        {
+          "authority": 0.5,
+          "content": "",
+          "is_local": false,
+          "score": 0.6330287,
+          "sources": [
+            "brave"
+          ],
+          "title": "r/webdev on Reddit: Any headless CMS recommendations?",
+          "url": "https://www.reddit.com/r/webdev/comments/1p0m749/any_headless_cms_recommendations/"
+        },
+        {
+          "authority": 0.90000004,
+          "content": "Headless guitar A Strandberg Boden8, an eight-string, multi-scale headless guitar. A headless guitar is an electric guitar or bass made without a traditional headstock.",
+          "is_local": false,
+          "score": 0.49773982,
+          "sources": [
+            "bing"
+          ],
+          "title": "Headless guitar - Wikipedia",
+          "url": "https://en.wikipedia.org/wiki/Headless_guitar"
+        },
+        {
+          "authority": 0.8,
+          "content": "Apr 18, 2026 \u00b7 Headless Horseman is a bundle that was published in the marketplace by Roblox on October 31, 2013. It can usually be purchased for 31,000 Robux during October. It is inspired by the \u2026",
+          "is_local": false,
+          "score": 0.48595643,
+          "sources": [
+            "bing"
+          ],
+          "title": "Headless Horseman - Roblox Wiki",
+          "url": "https://roblox.fandom.com/wiki/Catalog:Headless_Horseman"
+        },
+        {
+          "authority": 0.6,
+          "content": "May 8, 2026 \u00b7 Learn what headless means for your business, and what\u2019s in store for the everyday technology you use.",
+          "is_local": false,
+          "score": 0.4753613,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is Headless? Don\u2019t Lose Your Head, SMBs: It\u2019s a Good Thing",
+          "url": "https://www.salesforce.com/blog/small-business/headless-software/"
+        },
+        {
+          "authority": 0.65000004,
+          "content": "Watch Headless (2015) free starring Shane Beasley, Kaden Miller, Kelsey Carlisle and directed by Arthur Cullipher. Stream Headless free with Plex today!",
+          "is_local": false,
+          "score": 0.42493004,
+          "sources": [
+            "bing"
+          ],
+          "title": "Watch Headless (2015) Full Movie Free on Plex - Plex",
+          "url": "https://watch.plex.tv/movie/headless-2015-1"
+        },
+        {
+          "authority": 0.6,
+          "content": "Customize your avatar with the Headless Horseman and millions of other items. Mix & match this bundle with other items to create an avatar that is unique to you!",
+          "is_local": false,
+          "score": 0.4190383,
+          "sources": [
+            "bing"
+          ],
+          "title": "Headless Horseman - Roblox",
+          "url": "https://www.roblox.com/bundles/201/Headless-Horseman"
+        },
+        {
+          "authority": 0.6,
+          "content": "Completely unstyled, fully accessible UI components, designed to integrate beautifully with Tailwind CSS.",
+          "is_local": false,
+          "score": 0.4190383,
+          "sources": [
+            "bing"
+          ],
+          "title": "Headless UI - Unstyled, fully accessible UI components",
+          "url": "https://headlessui.com/"
+        },
+        {
+          "authority": 0.6,
+          "content": "HeadlessUSA is the world's leading provider of parts and services for Steinberger guitars and headless instruments.",
+          "is_local": false,
+          "score": 0.4190383,
+          "sources": [
+            "bing"
+          ],
+          "title": "HeadlessUSA",
+          "url": "https://headlessusa.com/"
+        },
+        {
+          "authority": 0.6,
+          "content": "May 26, 2026 \u00b7 The meaning of HEADLESS is having no head. How to use headless in a sentence.",
+          "is_local": false,
+          "score": 0.4190383,
+          "sources": [
+            "bing"
+          ],
+          "title": "HEADLESS Definition & Meaning - Merriam-Webster",
+          "url": "https://www.merriam-webster.com/dictionary/headless"
+        },
+        {
+          "authority": 0.5,
+          "content": "Apr 22, 2026 \u00b7 Headless guitars are back and more popular than ever! It\u2019s pretty incredible to see their spike in popularity over three decades after being first conceptualized and built by American creator \u2026",
+          "is_local": false,
+          "score": 0.4072549,
+          "sources": [
+            "bing"
+          ],
+          "title": "17 Best Headless Guitars in 2026 (All Budgets) - Guitar Lobby",
+          "url": "https://www.guitarlobby.com/best-headless-guitars/"
+        },
+        {
+          "authority": 0.5,
+          "content": "Aug 30, 2023 \u00b7 People are using the New Roblox UGC Bundle update to get Free HEADLESS With NEW AVATARS..People thought the new head bundle that gives free headless was Bill...",
+          "is_local": false,
+          "score": 0.4072549,
+          "sources": [
+            "bing"
+          ],
+          "title": "How to get FAKE HEADLESS for pretty much FREE! - YouTube",
+          "url": "https://www.youtube.com/watch?v=kJmELZSk4F8"
+        }
+      ],
+      "structured_constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "drupal"
+          },
+          {
+            "role": "exclusion",
+            "text": "joomla"
+          },
+          {
+            "role": "exclusion",
+            "text": "wordpress"
+          }
+        ],
+        "language": null,
+        "negative": [
+          "drupal",
+          "joomla",
+          "wordpress"
+        ],
+        "positive": [
+          "cms",
+          "headless"
+        ]
+      }
+    }
+  },
+  {
+    "query": "api gateway not kong not apigee not tyk",
+    "response": {
+      "category": "transactional",
+      "confidence": 0.35798618,
+      "constraints": [
+        "+gateway",
+        "-apigee",
+        "-kong",
+        "-tyk"
+      ],
+      "distribution": {
+        "comparison": 0.18079466,
+        "fresh": 0.006569209,
+        "how-to": 0.110403314,
+        "informational": 0.073236994,
+        "navigational": 0.09318673,
+        "technical": 0.18190916,
+        "transactional": 0.35389996
+      },
+      "expanded_queries": [
+        "api gateway not kong not apigee not tyk"
+      ],
+      "intent": "transactional",
+      "results": [
+        {
+          "authority": 0.70000005,
+          "content": "An API gateway is the runtime component that sits between API consumers and your backend services. It handles request routing, authentication, rate limiting, and protocol translation. An API management platform is broader \u2014 it includes the gateway plus a developer portal, analytics, lifecycle governance, and monetization tooling. Modern platforms like Zuplo combine both in a single product.",
+          "is_local": false,
+          "score": 0.75294423,
+          "sources": [
+            "brave"
+          ],
+          "title": "Best API Gateways in 2026: A Developer's Guide to Choosing the Right Solution - Zuplo",
+          "url": "https://zuplo.com/learning-center/best-api-gateways-2026"
+        },
+        {
+          "authority": 0.6,
+          "content": "The API Gateway can provide many different benefits that the back-end services may not be able to handle. ... API may have SSN but most clients should ...",
+          "is_local": false,
+          "score": 0.736683,
+          "sources": [
+            "mojeek"
+          ],
+          "title": "Introduction to API Gateways | Integration Broker | The Missing",
+          "url": "https://ib.books.cedarhillsgroup.com/apigateways/intro/"
+        },
+        {
+          "authority": 0.5,
+          "content": "Mar 5, 2019 ... My understanding is that AWS Api gateway has a hard limit on the timeout of 60 seconds. Not sure what timeout settings are available for other\u00a0...",
+          "is_local": false,
+          "score": 0.7216949,
+          "sources": [
+            "startpage"
+          ],
+          "title": "API Gateway - build or buy? : r/microservices - Reddit",
+          "url": "https://www.reddit.com/r/microservices/comments/ax536g/api_gateway_build_or_buy/"
+        },
+        {
+          "authority": 0.5,
+          "content": "",
+          "is_local": false,
+          "score": 0.425999,
+          "sources": [
+            "brave"
+          ],
+          "title": "r/golang on Reddit: API Gateway, How are you all doing it?",
+          "url": "https://www.reddit.com/r/golang/comments/zz3iht/api_gateway_how_are_you_all_doing_it/"
+        },
+        {
+          "authority": 1.0,
+          "content": "Apr 15, 2025 \u00b7 In technical terms, an API is a set of rules and tools that lets one application request data or services from another. For example, when you use a weather app to check the forecast, the app \u2026",
+          "is_local": false,
+          "score": 0.12910356,
+          "sources": [
+            "bing"
+          ],
+          "title": "What Are APIs? A Beginner's Guide (with examples) - DEV Community",
+          "url": "https://dev.to/icornea/what-are-apis-a-beginners-guide-with-examples-4ok8"
+        },
+        {
+          "authority": 0.5,
+          "content": "Products Learn Download Pricing API Hub Apidog Europe Launch App Viewpoint Tutorials Effective Strategies Product Updates Software Reviews All Software Reviews Software Reviews Best Crypto APIs for Trading Bots and AI Agents Automated trading systems are becoming significantly more sophisticated. What once relied mostly on simple rule-based scripts is now evolving into intelligent systems capable of monitoring wallets, analyzing on-chain activity, reacting to market volatility, and coordinating ",
+          "is_local": true,
+          "score": 0.12721333,
+          "sources": [
+            "local"
+          ],
+          "title": "Software Reviews | Apidog Blog",
+          "url": "https://apidog.com/blog/software-reviews/"
+        },
+        {
+          "authority": 0.90000004,
+          "content": "An API is often made up of different parts which act as tools or services that are available to the programmer. A program or a programmer that uses one of these parts is said to call that portion of \u2026",
+          "is_local": false,
+          "score": 0.12615746,
+          "sources": [
+            "bing"
+          ],
+          "title": "API - Wikipedia",
+          "url": "https://en.wikipedia.org/wiki/API"
+        },
+        {
+          "authority": 0.5,
+          "content": "<!-- try { if (location.href.indexOf('is-external=true') == -1) { parent.document.title=\"WebSocketHttpRequestHandler (Spring Framework 4.3.23.RELEASE API)\"; } } catch(err) { } //--> var methods = {\"i0\":10,\"i1\":10,\"i2\":10,\"i3\":10,\"i4\":10,\"i5\":10,\"i6\":10,\"i7\":10,\"i8\":10}; var tabs = {65535:[\"t0\",\"All Methods\"],2:[\"t2\",\"Instance Methods\"],8:[\"t4\",\"Concrete Methods\"]}; var altColor = \"altColor\"; var rowColor = \"rowColor\"; var tableTab = \"tableTab\"; var activeTableTab = \"activeTableTab\"; <div>JavaScr",
+          "is_local": true,
+          "score": 0.124945104,
+          "sources": [
+            "local"
+          ],
+          "title": "WebSocketHttpRequestHandler (Spring Framework 4.3.23.RELEASE API)",
+          "url": "https://docs.spring.io/spring-framework/docs/4.3.23.RELEASE/javadoc-api/org/springframework/web/socket/server/support/WebSocketHttpRequestHandler.html"
+        },
+        {
+          "authority": 0.8,
+          "content": "API stands for Application Programming Interface. In the context of APIs, the word Application refers to any software with a distinct function. Interface can be thought of as a contract of service between two \u2026",
+          "is_local": false,
+          "score": 0.12321138,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is an API? - Application Programming Interfaces Explained - AWS",
+          "url": "https://aws.amazon.com/what-is/api/"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "Dec 15, 2025 \u00b7 API architectures define how systems communicate and exchange data, each offering different levels of flexibility, performance, and structure based on application needs.",
+          "is_local": false,
+          "score": 0.120265305,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is an API (Application Programming Interface)",
+          "url": "https://www.geeksforgeeks.org/software-testing/what-is-an-api/"
+        },
+        {
+          "authority": 0.70000005,
+          "content": "API stands for application programming interface. If you\u2019re looking for a concise API meaning, it\u2019s this: a set of rules and definitions that let software systems communicate with each other. Think of an API as \u2026",
+          "is_local": false,
+          "score": 0.120265305,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is an API? - GitHub",
+          "url": "https://github.com/resources/articles/what-is-an-api"
+        },
+        {
+          "authority": 0.6,
+          "content": "The American Petroleum Institute (API) is the only national trade association that represents all aspects of America\u2019s oil and natural gas industry. Our more than 600 corporate members, from the largest \u2026",
+          "is_local": false,
+          "score": 0.11731921,
+          "sources": [
+            "bing"
+          ],
+          "title": "American Petroleum Institute | API",
+          "url": "https://www.api.org/"
+        },
+        {
+          "authority": 0.6,
+          "content": "Ready to build your next API? Dive into best practices, tools, and cloud-native strategies with a focus on Google Cloud's capabilities for APIs.",
+          "is_local": false,
+          "score": 0.11731921,
+          "sources": [
+            "bing"
+          ],
+          "title": "Developing APIs: A comprehensive guide | Google Cloud",
+          "url": "https://cloud.google.com/discover/what-is-api-development"
+        },
+        {
+          "authority": 0.6,
+          "content": "Apr 9, 2024 \u00b7 An API is a set of rules or protocols that enables software applications to communicate with each other to exchange data, features and functionality.",
+          "is_local": false,
+          "score": 0.11731921,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is an API (application programming interface)? - IBM",
+          "url": "https://www.ibm.com/think/topics/api"
+        },
+        {
+          "authority": 0.5,
+          "content": "Developers use APIs to bridge the gaps between small, discrete chunks of code in order to create applications that are powerful, resilient, secure, and able to meet user needs. Even though you can't \u2026",
+          "is_local": false,
+          "score": 0.114373125,
+          "sources": [
+            "bing"
+          ],
+          "title": "What is an API? A Beginner's Guide to APIs | Postman",
+          "url": "https://www.postman.com/what-is-an-api/"
+        },
+        {
+          "authority": 0.5,
+          "content": "<!-- try { if (location.href.indexOf('is-external=true') == -1) { parent.document.title=\"SockJsHttpRequestHandler (Spring Framework 4.3.23.RELEASE API)\"; } } catch(err) { } //--> var methods = {\"i0\":10,\"i1\":10,\"i2\":10,\"i3\":10,\"i4\":10,\"i5\":10,\"i6\":10,\"i7\":10}; var tabs = {65535:[\"t0\",\"All Methods\"],2:[\"t2\",\"Instance Methods\"],8:[\"t4\",\"Concrete Methods\"]}; var altColor = \"altColor\"; var rowColor = \"rowColor\"; var tableTab = \"tableTab\"; var activeTableTab = \"activeTableTab\"; <div>JavaScript is disa",
+          "is_local": true,
+          "score": 0.08746157,
+          "sources": [
+            "local"
+          ],
+          "title": "SockJsHttpRequestHandler (Spring Framework 4.3.23.RELEASE API)",
+          "url": "https://docs.spring.io/spring-framework/docs/4.3.23.RELEASE/javadoc-api/org/springframework/web/socket/sockjs/support/SockJsHttpRequestHandler.html"
+        },
+        {
+          "authority": 0.5,
+          "content": "",
+          "is_local": false,
+          "score": 0.05,
+          "sources": [
+            "brave"
+          ],
+          "title": "r/devops on Reddit: need advice on the best api management tools 2026 for scaling based on last year's performance",
+          "url": "https://www.reddit.com/r/devops/comments/1q63nv4/need_advice_on_the_best_api_management_tools_2026/"
+        }
+      ],
+      "structured_constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "apigee"
+          },
+          {
+            "role": "exclusion",
+            "text": "kong"
+          },
+          {
+            "role": "exclusion",
+            "text": "tyk"
+          }
+        ],
+        "language": null,
+        "negative": [
+          "apigee",
+          "kong",
+          "tyk"
+        ],
+        "positive": [
+          "gateway"
+        ]
+      }
+    }
+  },
+  {
+    "query": "time-series database not influxdb not prometheus",
+    "response": {
+      "category": "informational",
+      "confidence": 0.2688535,
+      "constraints": [
+        "+time-series",
+        "-influxdb",
+        "-prometheus"
+      ],
+      "distribution": {
+        "comparison": 0.2101131,
+        "fresh": 0.01742519,
+        "how-to": 0.32268208,
+        "informational": 0.1730878,
+        "navigational": 0.04278307,
+        "technical": 0.08032331,
+        "transactional": 0.15358545
+      },
+      "expanded_queries": [
+        "time-series database not influxdb not prometheus",
+        "time-series database tutorial"
+      ],
+      "intent": "how-to",
+      "results": [
+        {
+          "authority": 0.70000005,
+          "content": "Time-based querying: Timeseries databases provide specialized functions and operators for querying data based on time intervals or ranges. This makes it easy to retrieve and analyze data over specific periods of time.",
+          "is_local": false,
+          "score": 0.6052255,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Timeseries Databases. A timeseries database is a type of | Medium",
+          "url": "https://medium.com/@anoobblogger/timeseries-databases-b9d4a22a8147"
+        },
+        {
+          "authority": 0.6,
+          "content": "Time Series Databases (TSDB) are designed to store and analyze event data, time series, or time-stamped data, often streamed from IoT devices, and enables graphing, monitoring and analyzing changes over time.",
+          "is_local": false,
+          "score": 0.59244764,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Best Time Series Databases 2025 | TrustRadius",
+          "url": "https://www.trustradius.com/categories/time-series-databases"
+        },
+        {
+          "authority": 0.5,
+          "content": "SQLite is All You Need for Durable Workflows 2026-05-29 DBOS recently argued that Postgres is all you need for durable execution : if you already trust your database, you do not need a separate orchestration tier. I agree with the direction, and I think the idea can be pushed further. For a large class of durable systems, SQLite is all you need. The Durable Part Durable execution is often discussed as if it requires durable infrastructure. In many cases it does not. The durable part is the workf",
+          "is_local": true,
+          "score": 0.1311873,
+          "sources": [
+            "local"
+          ],
+          "title": "\n\n\n\nSQLite is All You Need for Durable Workflows\n- Blog\n",
+          "url": "https://obeli.sk/blog/sqlite-is-all-you-need-for-durable-workflows/"
+        },
+        {
+          "authority": 0.6,
+          "content": "If you appreciate the hard work or want to be consistent with the course, Please \ud835\udc2c\ud835\udc2e\ud835\udc1b\ud835\udc2c\ud835\udc1c\ud835\udc2b\ud835\udc22\ud835\udc1b\ud835\udc1e - https://www.youtube.com/@KeertiPurswani\ud835\udc02\ud835\udc21\ud835\udc1e\ud835\udc1c\ud835\udc24\ud835\udc28\ud835\udc2e\ud835\udc2d...",
+          "is_local": false,
+          "score": 0.10945407,
+          "sources": [
+            "yandex"
+          ],
+          "title": "Time Series Databases - Easiest explanation with examples - YouTube",
+          "url": "https://www.youtube.com/shorts/wH0U9kvQEsg"
+        }
+      ],
+      "structured_constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "influxdb"
+          },
+          {
+            "role": "exclusion",
+            "text": "prometheus"
+          }
+        ],
+        "language": null,
+        "negative": [
+          "influxdb",
+          "prometheus"
+        ],
+        "positive": [
+          "time-series"
+        ]
+      }
+    }
+  },
+  {
+    "query": "low-code automation not zapier not make not n8n",
+    "response": {
+      "category": "informational",
+      "confidence": 0.1253855,
+      "constraints": [
+        "+automation",
+        "+low-code",
+        "-make",
+        "-n8n",
+        "-zapier"
+      ],
+      "distribution": {
+        "comparison": 0.24203566,
+        "fresh": 0.008256456,
+        "how-to": 0.21675742,
+        "informational": 0.12045332,
+        "navigational": 0.03128614,
+        "technical": 0.156099,
+        "transactional": 0.225112
+      },
+      "expanded_queries": [
+        "low-code automation not zapier not make not n8n"
+      ],
+      "intent": "comparison",
+      "results": [
+        {
+          "authority": 0.5,
+          "content": "#hunit_6a170db506f6f { background-image: url('https://browserstack.wpenginepowered.com/wp-content/uploads/2025/07/Bg-without-dash.webp'); } @media (max-width: 640px) { #hunit_6a170db506f6f { background-image: url('https://browserstack.wpenginepowered.com/wp-content/uploads/2025/07/Bg-without-dash-640x275.webp'); } } AI-driven Low-code testing that actually works Create automated tests 10\u00d7 faster using a best-in-class test recorder and AI. Reduce maintenance with self-healing AI and automation be",
+          "is_local": true,
+          "score": 0.72588307,
+          "sources": [
+            "local"
+          ],
+          "title": "BrowserStack Low-Code Test Automation for QA Teams | BrowserStack",
+          "url": "https://www.browserstack.com/low-code-automation"
+        },
+        {
+          "authority": 0.5,
+          "content": "Discover new features coming to Power Platform and Copilot Studio in our online update event. Register now Power Apps Transform your business with modern, AI-first applications. Rapidly build and deploy full-stack applications, governed at enterprise scale and powered by AI. Try for free Take a guided tour Features Features Use cases Analyst reports Pricing Solutions Partners Customer stories Resources FAQ Next steps Sign in Try for free Sign in Try for free FEATURES Build enterprise solutions E",
+          "is_local": true,
+          "score": 0.41524005,
+          "sources": [
+            "local"
+          ],
+          "title": "Microsoft Power Apps: Low-Code AI App Builder | Microsoft",
+          "url": "https://www.microsoft.com/en-us/power-platform/products/power-apps"
+        }
+      ],
+      "structured_constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "make"
+          },
+          {
+            "role": "exclusion",
+            "text": "n8n"
+          },
+          {
+            "role": "exclusion",
+            "text": "zapier"
+          }
+        ],
+        "language": null,
+        "negative": [
+          "make",
+          "n8n",
+          "zapier"
+        ],
+        "positive": [
+          "automation",
+          "low-code"
+        ]
+      }
+    }
+  }
+]

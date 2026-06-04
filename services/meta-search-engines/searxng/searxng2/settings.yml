@@ -48,6 +48,9 @@ search:
 outgoing:
   request_timeout: 6.0     # raised from 4.0 — Tor circuits need more headroom
   max_request_timeout: 12.0 # raised from 8.0 — some Tor exits are slow
+  enable_http2: true       # HTTP/2 multiplexing for engines that support it
+  pool_maxsize: 20         # increase per-host connection pool from default 10
+  keepalive_expiry: 30     # keep idle connections alive longer (default 5s)
   # ALL traffic goes through Tor2 (port 9051)
   networks:
     default:

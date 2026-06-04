@@ -1,0 +1,1031 @@
+{
+  "timestamp": "2026-06-04T11:49:46.146875Z",
+  "queries": [
+    {
+      "query": "distributed task queue for python not celery",
+      "http_status": null,
+      "error": null,
+      "status": 200,
+      "intent": "how-to",
+      "confidence": 0.29208916425704956,
+      "constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "celery"
+          }
+        ],
+        "language": "python",
+        "negative": [
+          "celery"
+        ],
+        "positive": [
+          "distributed",
+          "python",
+          "queue",
+          "task"
+        ]
+      },
+      "verification": {
+        "count": 26,
+        "hits": {
+          "title": 25,
+          "url": 0,
+          "content": 0,
+          "none": 1
+        },
+        "violations": [],
+        "included_examples": [
+          {
+            "title": "Orchestrating Distributed Task Queues with Temporal and Python for ...",
+            "url": "https://martinuke0.github.io/posts/2026-03-24-orchestrating-distributed-task-queues-with-temporal-and-python-for-resilient-agentic-microservices/",
+            "score": 0.9470680952072144,
+            "negative_match": [],
+            "positive_title": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_url": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_content": [
+              "distributed",
+              "queue",
+              "task"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "GitHub - vduseev/raquel: Distributed task queues for Python using SQL and no orchestrator. Simple. Reliable. Flexible. Transparent. \u00b7 GitHub",
+            "url": "https://github.com/vduseev/raquel",
+            "score": 0.9375474452972412,
+            "negative_match": [],
+            "positive_title": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_url": [],
+            "positive_content": [
+              "queue",
+              "task"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Building a Distributed Task Queue with Python and Redis | by J. | Medium",
+            "url": "https://medium.com/@jurajpuchky/building-a-distributed-task-queue-with-python-and-redis-0103139de41f",
+            "score": 0.9238494634628296,
+            "negative_match": [],
+            "positive_title": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_url": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_content": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Developing an Asynchronous Task Queue in Python | TestDriven.io",
+            "url": "https://testdriven.io/blog/developing-an-asynchronous-task-queue-in-python/",
+            "score": 0.9234841465950012,
+            "negative_match": [],
+            "positive_title": [
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_url": [
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_content": [
+              "python",
+              "queue",
+              "task"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Distributed Task Queue with Python and R Example",
+            "url": "https://www.linkedin.com/pulse/distributed-task-queue-python-r-example-jaehyeon-kim",
+            "score": 0.9075364470481873,
+            "negative_match": [],
+            "positive_title": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_url": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_content": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Building a Distributed Task Queue in Python - Java Code Geeks",
+            "url": "https://www.javacodegeeks.com/2022/09/building-a-distributed-task-queue-in-python.html",
+            "score": 0.903124213218689,
+            "negative_match": [],
+            "positive_title": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_url": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_content": [
+              "queue",
+              "task"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Python: Distributed task queue for different specific workers - Stack Overflow",
+            "url": "https://stackoverflow.com/questions/54308524/python-distributed-task-queue-for-different-specific-workers",
+            "score": 0.9013691544532776,
+            "negative_match": [],
+            "positive_title": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_url": [
+              "distributed",
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_content": [
+              "python",
+              "queue",
+              "task"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Choosing The Right Python Task Queue - Judoscale",
+            "url": "https://judoscale.com/blog/choose-python-task-queue",
+            "score": 0.8932473063468933,
+            "negative_match": [],
+            "positive_title": [
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_url": [
+              "python",
+              "queue",
+              "task"
+            ],
+            "positive_content": [
+              "python",
+              "queue",
+              "task"
+            ],
+            "verdict": "OK"
+          }
+        ]
+      }
+    },
+    {
+      "query": "linux firewall gui with vlan support excluding ufw",
+      "http_status": null,
+      "error": null,
+      "status": 200,
+      "intent": "comparison",
+      "confidence": 0.11621762067079544,
+      "constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "ufw"
+          }
+        ],
+        "language": null,
+        "negative": [
+          "ufw"
+        ],
+        "positive": [
+          "firewall",
+          "gui",
+          "linux",
+          "support",
+          "vlan",
+          "vlan support"
+        ]
+      },
+      "verification": {
+        "count": 0,
+        "hits": {
+          "title": 0,
+          "url": 0,
+          "content": 0,
+          "none": 0
+        },
+        "violations": [],
+        "included_examples": []
+      }
+    },
+    {
+      "query": "self-hosted analytics alternative to google analytics privacy-focused excluding matomo",
+      "http_status": null,
+      "error": null,
+      "status": 200,
+      "intent": "how-to",
+      "confidence": 0.4476495087146759,
+      "constraints": {
+        "entities": [
+          {
+            "role": "reference",
+            "text": "google analytics"
+          },
+          {
+            "role": "exclusion",
+            "text": "matomo"
+          }
+        ],
+        "language": null,
+        "negative": [
+          "matomo"
+        ],
+        "positive": [
+          "analytics",
+          "google",
+          "google analytics",
+          "privacy-focused",
+          "self-hosted"
+        ]
+      },
+      "verification": {
+        "count": 1,
+        "hits": {
+          "title": 0,
+          "url": 0,
+          "content": 0,
+          "none": 1
+        },
+        "violations": [],
+        "included_examples": [
+          {
+            "title": "SigNoz Alternative - OneUptime | Open Source | 2026 Comparison",
+            "url": "https://oneuptime.com/compare/signoz",
+            "score": 0.30000001192092896,
+            "negative_match": [],
+            "positive_title": [],
+            "positive_url": [],
+            "positive_content": [
+              "self hosted"
+            ],
+            "verdict": "NO_POSITIVE_SIGNAL"
+          }
+        ]
+      }
+    },
+    {
+      "query": "rust async web framework without actix deadline-first pricing model",
+      "http_status": null,
+      "error": null,
+      "status": 200,
+      "intent": "comparison",
+      "confidence": 0.10198891162872314,
+      "constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "actix"
+          }
+        ],
+        "language": "rust",
+        "negative": [
+          "actix"
+        ],
+        "positive": [
+          "async",
+          "deadline-first",
+          "model",
+          "pricing",
+          "rust",
+          "web"
+        ]
+      },
+      "verification": {
+        "count": 20,
+        "hits": {
+          "title": 19,
+          "url": 0,
+          "content": 0,
+          "none": 1
+        },
+        "violations": [],
+        "included_examples": [
+          {
+            "title": "Asynchronous \u2014 list of Rust libraries/crates // Lib.rs",
+            "url": "https://lib.rs/asynchronous",
+            "score": 0.7075192332267761,
+            "negative_match": [],
+            "positive_title": [
+              "async",
+              "rust"
+            ],
+            "positive_url": [
+              "async"
+            ],
+            "positive_content": [
+              "async",
+              "model",
+              "rust",
+              "web"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Rust Async Web Framework Performance... - DEV Community",
+            "url": "https://dev.to/member_bf115bc6/rust-async-web-framework-performance-breakthrough7621-1n11",
+            "score": 0.6940371990203857,
+            "negative_match": [],
+            "positive_title": [
+              "async",
+              "rust",
+              "web"
+            ],
+            "positive_url": [
+              "async",
+              "rust",
+              "web"
+            ],
+            "positive_content": [
+              "rust",
+              "web"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Understanding Pin in Rust Async for Web Developers | Leapcell",
+            "url": "https://leapcell.io/blog/understanding-pin-in-rust-async-for-web-developers",
+            "score": 0.6937656998634338,
+            "negative_match": [],
+            "positive_title": [
+              "async",
+              "rust",
+              "web"
+            ],
+            "positive_url": [
+              "async",
+              "rust",
+              "web"
+            ],
+            "positive_content": [],
+            "verdict": "OK"
+          },
+          {
+            "title": "Module 5: Async Rust \u2014 intro to Tokio, async/await, writing... | Medium",
+            "url": "https://medium.com/@ed.wacc1995/module-5-async-rust-intro-to-tokio-async-await-writing-an-async-service-e3313d5b1779",
+            "score": 0.5482571721076965,
+            "negative_match": [],
+            "positive_title": [
+              "async",
+              "rust"
+            ],
+            "positive_url": [
+              "async",
+              "rust"
+            ],
+            "positive_content": [
+              "async",
+              "rust",
+              "web"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Best Rust Web Frameworks (2024) - rustfinity.com",
+            "url": "https://www.rustfinity.com/blog/best-rust-web-frameworks",
+            "score": 0.5154667496681213,
+            "negative_match": [],
+            "positive_title": [
+              "rust",
+              "web"
+            ],
+            "positive_url": [
+              "rust",
+              "web"
+            ],
+            "positive_content": [
+              "rust",
+              "web"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Can someone explain to me what a good use-case for Rust would ...",
+            "url": "https://news.ycombinator.com/item?id=18545171",
+            "score": 0.5114816427230835,
+            "negative_match": [],
+            "positive_title": [
+              "rust"
+            ],
+            "positive_url": [],
+            "positive_content": [
+              "async",
+              "rust",
+              "web"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "flosse/rust-web-framework-comparison - GitHub",
+            "url": "https://github.com/flosse/rust-web-framework-comparison",
+            "score": 0.49543142318725586,
+            "negative_match": [],
+            "positive_title": [
+              "rust",
+              "web"
+            ],
+            "positive_url": [
+              "rust",
+              "web"
+            ],
+            "positive_content": [
+              "rust",
+              "web"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Async Rust can be a pleasure to work with (without `Send + Sync...)",
+            "url": "https://emschwartz.me/async-rust-can-be-a-pleasure-to-work-with-without-send-sync-static/",
+            "score": 0.46562451124191284,
+            "negative_match": [],
+            "positive_title": [
+              "async",
+              "rust"
+            ],
+            "positive_url": [
+              "async",
+              "rust"
+            ],
+            "positive_content": [
+              "rust"
+            ],
+            "verdict": "OK"
+          }
+        ]
+      }
+    },
+    {
+      "query": "open source cms without wordpress multilingual",
+      "http_status": null,
+      "error": null,
+      "status": 200,
+      "intent": "how-to",
+      "confidence": 0.26717057824134827,
+      "constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "wordpress"
+          }
+        ],
+        "language": null,
+        "negative": [
+          "wordpress"
+        ],
+        "positive": [
+          "cms",
+          "multilingual",
+          "open",
+          "source"
+        ]
+      },
+      "verification": {
+        "count": 23,
+        "hits": {
+          "title": 20,
+          "url": 0,
+          "content": 0,
+          "none": 3
+        },
+        "violations": [],
+        "included_examples": [
+          {
+            "title": "cms without database creation free download - SourceForge",
+            "url": "https://sourceforge.net/directory/?q=cms%20without%20database%20creation",
+            "score": 0.8076966404914856,
+            "negative_match": [],
+            "positive_title": [
+              "cms",
+              "source"
+            ],
+            "positive_url": [
+              "cms",
+              "source"
+            ],
+            "positive_content": [
+              "cms",
+              "multilingual",
+              "open",
+              "source"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Top 6 Open Source CMS Platforms in 2026 - strapi.io",
+            "url": "https://strapi.io/blog/open-source-cms-platforms",
+            "score": 0.712364673614502,
+            "negative_match": [],
+            "positive_title": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "positive_url": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "positive_content": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "The Best 10+ Open Source Headless CMS 2025 - DEV Community",
+            "url": "https://dev.to/themeselection/the-best-10-open-source-headless-cms-40hf",
+            "score": 0.6574029326438904,
+            "negative_match": [],
+            "positive_title": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "positive_url": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "positive_content": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Drupal.org | The Open Source CMS for Digital Innovation",
+            "url": "https://new.drupal.org/",
+            "score": 0.648114800453186,
+            "negative_match": [],
+            "positive_title": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "positive_url": [],
+            "positive_content": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "12 Free Open-Source Content Management... - Practical Ecommerce",
+            "url": "https://www.practicalecommerce.com/open-source-content-management-systems",
+            "score": 0.6453250050544739,
+            "negative_match": [],
+            "positive_title": [
+              "open",
+              "source"
+            ],
+            "positive_url": [
+              "open",
+              "source"
+            ],
+            "positive_content": [
+              "cms",
+              "multilingual",
+              "open",
+              "source"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Free Open Source CMS :: Open Source CMS, Free PHP CMS",
+            "url": "https://subrion.org/",
+            "score": 0.6329793930053711,
+            "negative_match": [],
+            "positive_title": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "positive_url": [],
+            "positive_content": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Zenario: open source CMS for websites, databases and extranets",
+            "url": "https://zenar.io/",
+            "score": 0.6289086937904358,
+            "negative_match": [],
+            "positive_title": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "positive_url": [],
+            "positive_content": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "19 Best Open Source CMS for Creating Websites - It's FOSS",
+            "url": "https://itsfoss.com/open-source-cms/",
+            "score": 0.6218421459197998,
+            "negative_match": [],
+            "positive_title": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "positive_url": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "positive_content": [
+              "cms",
+              "open",
+              "source"
+            ],
+            "verdict": "OK"
+          }
+        ]
+      }
+    },
+    {
+      "query": "vector database for ai not pinecone managed",
+      "http_status": null,
+      "error": null,
+      "status": 200,
+      "intent": "how-to",
+      "confidence": 0.5366483330726624,
+      "constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "pinecone"
+          }
+        ],
+        "language": null,
+        "negative": [
+          "pinecone"
+        ],
+        "positive": [
+          "ai",
+          "managed",
+          "vector"
+        ]
+      },
+      "verification": {
+        "count": 14,
+        "hits": {
+          "title": 13,
+          "url": 0,
+          "content": 0,
+          "none": 1
+        },
+        "violations": [],
+        "included_examples": [
+          {
+            "title": "Best Vector Databases for AI Applications in 2026",
+            "url": "https://scopir.com/posts/best-vector-databases-ai-applications-2026/",
+            "score": 0.5601003170013428,
+            "negative_match": [],
+            "positive_title": [
+              "ai",
+              "vector"
+            ],
+            "positive_url": [
+              "ai",
+              "vector"
+            ],
+            "positive_content": [
+              "ai",
+              "vector"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "DigitalOcean\u2019s GPU cloud platform for AI workloads",
+            "url": "https://www.digitalocean.com/solutions/gpu-cloud-platform",
+            "score": 0.5488659143447876,
+            "negative_match": [],
+            "positive_title": [
+              "ai"
+            ],
+            "positive_url": [],
+            "positive_content": [
+              "ai",
+              "managed"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Managed Network File Storage for AI workloads",
+            "url": "https://www.digitalocean.com/pricing/network-file-storage",
+            "score": 0.3825750946998596,
+            "negative_match": [],
+            "positive_title": [
+              "ai",
+              "managed"
+            ],
+            "positive_url": [],
+            "positive_content": [
+              "ai",
+              "managed"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Vector (mathematics and physics) - Wikipedia",
+            "url": "https://en.wikipedia.org/wiki/Vector_%28mathematics_and_physics%29",
+            "score": 0.34481024742126465,
+            "negative_match": [],
+            "positive_title": [
+              "vector"
+            ],
+            "positive_url": [
+              "vector"
+            ],
+            "positive_content": [
+              "vector"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Exciting Work Opportunities for Students | Vector Marketing",
+            "url": "https://www.vectormarketing.com/app/work-for-students",
+            "score": 0.3075363039970398,
+            "negative_match": [],
+            "positive_title": [
+              "vector"
+            ],
+            "positive_url": [
+              "vector"
+            ],
+            "positive_content": [
+              "vector"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Vector | Welcome",
+            "url": "https://www.vector.com/int/en/",
+            "score": 0.3014737069606781,
+            "negative_match": [],
+            "positive_title": [
+              "vector"
+            ],
+            "positive_url": [
+              "vector"
+            ],
+            "positive_content": [],
+            "verdict": "OK"
+          },
+          {
+            "title": "Free Vector Images - Download & Edit Online | Magnific (formerly \u2026",
+            "url": "https://www.magnific.com/vectors",
+            "score": 0.30117425322532654,
+            "negative_match": [],
+            "positive_title": [
+              "vector"
+            ],
+            "positive_url": [
+              "vector"
+            ],
+            "positive_content": [
+              "vector"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Vectors Introduction for Beginners - YouTube",
+            "url": "https://www.youtube.com/watch?v=BYARjX1neao",
+            "score": 0.30117425322532654,
+            "negative_match": [],
+            "positive_title": [
+              "vector"
+            ],
+            "positive_url": [],
+            "positive_content": [
+              "vector"
+            ],
+            "verdict": "OK"
+          }
+        ]
+      }
+    },
+    {
+      "query": "javascript framework besides react typescript",
+      "http_status": null,
+      "error": null,
+      "status": 200,
+      "intent": "technical",
+      "confidence": 0.41284289956092834,
+      "constraints": {
+        "entities": [
+          {
+            "role": "exclusion",
+            "text": "react"
+          }
+        ],
+        "language": "javascript",
+        "negative": [
+          "react"
+        ],
+        "positive": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "verification": {
+        "count": 17,
+        "hits": {
+          "title": 14,
+          "url": 0,
+          "content": 0,
+          "none": 3
+        },
+        "violations": [],
+        "included_examples": [
+          {
+            "title": "Strapi - Open-Source TypeScript Headless CMS for Next.js, Astro...",
+            "url": "https://strapi.io/",
+            "score": 0.6967970132827759,
+            "negative_match": [],
+            "positive_title": [
+              "typescript"
+            ],
+            "positive_url": [],
+            "positive_content": [
+              "javascript",
+              "typescript"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "JavaScript - MDN Web Docs",
+            "url": "https://developer.mozilla.org/en-US/docs/Web/JavaScript",
+            "score": 0.6725075840950012,
+            "negative_match": [],
+            "positive_title": [
+              "javascript"
+            ],
+            "positive_url": [
+              "javascript"
+            ],
+            "positive_content": [
+              "javascript"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "JavaScript in Visual Studio Code",
+            "url": "https://code.visualstudio.com/Docs/languages/javascript",
+            "score": 0.6390904784202576,
+            "negative_match": [],
+            "positive_title": [
+              "javascript"
+            ],
+            "positive_url": [
+              "javascript"
+            ],
+            "positive_content": [
+              "javascript"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "12 Best JavaScript Frameworks for Web Apps in 2026",
+            "url": "https://www.alphonsolabs.com/best-javascript-frameworks-web-apps-2026/",
+            "score": 0.6141005158424377,
+            "negative_match": [],
+            "positive_title": [
+              "javascript"
+            ],
+            "positive_url": [
+              "javascript"
+            ],
+            "positive_content": [
+              "javascript"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Stimulus: A modest JavaScript framework for the HTML you already...",
+            "url": "https://stimulus.hotwired.dev/",
+            "score": 0.6141005158424377,
+            "negative_match": [],
+            "positive_title": [
+              "javascript"
+            ],
+            "positive_url": [],
+            "positive_content": [
+              "javascript"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Advantages of Using Svelte over Other Frontend Frameworks | Blog",
+            "url": "https://cubettech.com/resources/blog/advantages-of-using-svelte-over-other-frontend-frameworks/",
+            "score": 0.6043397188186646,
+            "negative_match": [],
+            "positive_title": [],
+            "positive_url": [],
+            "positive_content": [
+              "javascript"
+            ],
+            "verdict": "NO_POSITIVE_SIGNAL"
+          },
+          {
+            "title": "JavaScript - Wikipedia",
+            "url": "https://en.wikipedia.org/wiki/JavaScript",
+            "score": 0.5949221849441528,
+            "negative_match": [],
+            "positive_title": [
+              "javascript"
+            ],
+            "positive_url": [
+              "javascript"
+            ],
+            "positive_content": [
+              "javascript"
+            ],
+            "verdict": "OK"
+          },
+          {
+            "title": "Node.js or Deno?: The Battle of Javascript Runtimes",
+            "url": "https://www.bairesdev.com/blog/node-js-or-deno-the-battle-of-javascript-runtimes/",
+            "score": 0.590490996837616,
+            "negative_match": [],
+            "positive_title": [
+              "javascript"
+            ],
+            "positive_url": [
+              "javascript"
+            ],
+            "positive_content": [
+              "javascript"
+            ],
+            "verdict": "OK"
+          }
+        ]
+      }
+    }
+  ]
+}

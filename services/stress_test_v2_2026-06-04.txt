@@ -1,0 +1,123 @@
+INTENTFORGE v2 STRESS TEST v2 2026-06-04T22:10:13.594503
+========================================================================================================================
+
+=== CLASS BREAKDOWN ===
+
+SUMMARY
+-------
+Status: 34 ok / 0 err
+Latency: min=1170.6ms max=2916.2ms mean=1562.4ms
+  p50=1435.3ms p90=1945.7ms p95=2554.9ms p99=2916.2ms
+Std dev: 382.1ms
+Results: min=0 max=32 mean=6.4
+Empty:   4
+Thin(1-3): 10
+Sources: [('bing', 23), ('yandex', 20), ('local', 13), ('duckduckgo', 6), ('brave', 5), ('mojeek', 1)]
+Intents: {'how-to': 16, 'comparison': 10, 'transactional': 5, 'technical': 2, 'informational': 1}
+Degraded: 0 | Warnings: 0
+
+DETAILED ROWS
+------------------------------------------------------------------------------------------------------------------------
+  [200]  2554.9ms | comparison     | conf=0.152 |  32 res | top_score=0.630 | Replication, Clustering, and Connection Pooling - PostgreSQL wiki
+    +['conflict', 'conflict resolution', 'distributed', 'mysql', 'postgresql', 'replication', 'resolution', 'streaming'] | -['mysql'] | entities=[{'role': 'exclusion', 'text': 'MySQL'}] | lang=None
+  [200]  1547.9ms | technical      | conf=0.411 |  24 res | top_score=0.838 | encrypted-dns — Rust application // Lib.rs
+    +['dns', 'encrypted', 'openssl', 'resolver', 'rust'] | -['openssl', 'boringtun'] | entities=[{'role': 'exclusion', 'text': 'OpenSSL'}, {'role': 'exclusion', 'text': 'boringtun'}] | lang=rust
+  [200]  1255.1ms | technical      | conf=0.375 |   0 res | top_score=0.000 | 
+    +['caching', 'go', 'layer', 'memcached', 'redis', 'redis-compatible'] | -['memcached', 'redis'] | entities=[{'role': 'exclusion', 'text': 'Memcached'}, {'role': 'exclusion', 'text': 'Redis'}] | lang=go
+  [200]  1448.6ms | how-to         | conf=0.765 |   4 res | top_score=0.480 | Self-Hosted Product Analytics: The Insider's Guide
+    +['analytics', 'google', 'plausible', 'self-hosted'] | -['google', 'plausible'] | entities=[{'role': 'exclusion', 'text': 'Google'}, {'role': 'exclusion', 'text': 'Plausible'}] | lang=None
+  [200]  1945.7ms | comparison     | conf=0.126 |   7 res | top_score=0.366 | Edge Computing in 2026: How to Deploy AI Models... | Medium
+    +['cloudflare', 'deno', 'edge', 'webassembly-based', 'workers'] | -['cloudflare', 'deno'] | entities=[{'role': 'exclusion', 'text': 'Cloudflare'}, {'role': 'exclusion', 'text': 'Deno'}] | lang=None
+  [200]  1872.1ms | how-to         | conf=0.139 |  10 res | top_score=0.380 | How to Build a Blog Using a Static Site Generator and a CDN
+    +['gatsby', 'next js', 'react', 'site', 'static', 'vue'] | -['gatsby', 'next', 'react', 'vue'] | entities=[{'role': 'exclusion', 'text': 'Gatsby'}, {'role': 'exclusion', 'text': 'Next'}, {'role': 'exclusion', 'text': 'React'}, {'role': 'exclusion', 'text': 'Vue'}] | lang=None
+  [200]  1868.4ms | how-to         | conf=0.431 |   8 res | top_score=0.324 | GitHub - codepr/tasq: A simple task queue implementation to enqeu
+    +['celery', 'kafka', 'queue', 'rabbitmq', 'redis', 'task'] | -['celery', 'kafka', 'rabbitmq', 'redis'] | entities=[{'role': 'exclusion', 'text': 'Celery'}, {'role': 'exclusion', 'text': 'Kafka'}, {'role': 'exclusion', 'text': 'RabbitMQ'}, {'role': 'exclusion', 'text': 'Redis'}] | lang=None
+  [200]  1946.6ms | how-to         | conf=0.954 |   6 res | top_score=0.359 | 8 Best Free Open Source Log Management Tools (2026) - SigNoz
+    +['elasticsearch', 'log', 'management', 'opensearch', 'splunk'] | -['elasticsearch', 'opensearch', 'splunk'] | entities=[{'role': 'exclusion', 'text': 'Elasticsearch'}, {'role': 'exclusion', 'text': 'OpenSearch'}, {'role': 'exclusion', 'text': 'Splunk'}] | lang=None
+  [200]  1849.2ms | how-to         | conf=0.154 |   0 res | top_score=0.000 | 
+    +['bun', 'deno', 'javascript', 'node js'] | -['bun', 'deno', 'node'] | entities=[{'role': 'exclusion', 'text': 'Bun'}, {'role': 'exclusion', 'text': 'Deno'}, {'role': 'exclusion', 'text': 'Node'}] | lang=javascript
+  [200]  1873.6ms | how-to         | conf=0.774 |   0 res | top_score=0.000 | 
+    +['pinecone', 'qdrant', 'vector', 'weaviate'] | -['pinecone', 'qdrant', 'weaviate'] | entities=[{'role': 'exclusion', 'text': 'Pinecone'}, {'role': 'exclusion', 'text': 'Qdrant'}, {'role': 'exclusion', 'text': 'Weaviate'}] | lang=None
+  [200]  1826.9ms | comparison     | conf=0.362 |   7 res | top_score=0.387 | Best Object Storage Solutions for Startups of 2025 - Reviews
+    +['cloud', 'minio', 'object', 's3', 'storage', 'swift', 'wasabi'] | -['minio', 's3', 'swift', 'wasabi'] | entities=[{'role': 'exclusion', 'text': 'MinIO'}, {'role': 'exclusion', 'text': 'S3'}, {'role': 'exclusion', 'text': 'Swift'}, {'role': 'exclusion', 'text': 'Wasabi'}] | lang=None
+  [200]  1249.8ms | how-to         | conf=1.000 |   1 res | top_score=0.300 | 12 DevOps Platforms for Startups Compared
+    +['actions', 'ci', 'ci/cd', 'github', 'gitlab', 'jenkins'] | -['github', 'gitlab', 'jenkins'] | entities=[{'role': 'exclusion', 'text': 'GitHub'}, {'role': 'exclusion', 'text': 'GitLab'}, {'role': 'exclusion', 'text': 'Jenkins'}] | lang=None
+  [200]  1408.3ms | how-to         | conf=0.231 |   8 res | top_score=0.335 | Apache APISIX - Open Source API Gateway & AI Gateway
+    +['aws', 'gateway', 'kong', 'tyk'] | -['aws', 'kong', 'tyk'] | entities=[{'role': 'exclusion', 'text': 'AWS'}, {'role': 'exclusion', 'text': 'Kong'}, {'role': 'exclusion', 'text': 'Tyk'}] | lang=None
+  [200]  1616.7ms | transactional  | conf=0.200 |   1 res | top_score=0.364 | Exploring the Best Data Warehouse Alternatives in 2026
+    +['bigquery', 'data', 'redshift', 'snowflake', 'warehouse'] | -['bigquery', 'redshift', 'snowflake'] | entities=[{'role': 'exclusion', 'text': 'BigQuery'}, {'role': 'exclusion', 'text': 'Redshift'}, {'role': 'exclusion', 'text': 'Snowflake'}] | lang=None
+  [200]  1278.2ms | comparison     | conf=0.152 |   7 res | top_score=0.300 | GitHub - cloudstreet-dev/Event-Driven-Architecture: A deep dive i
+    +['broker', 'kafka', 'message', 'nats', 'pulsar', 'rabbitmq'] | -['kafka', 'nats', 'pulsar', 'rabbitmq'] | entities=[{'role': 'exclusion', 'text': 'Kafka'}, {'role': 'exclusion', 'text': 'NATS'}, {'role': 'exclusion', 'text': 'Pulsar'}, {'role': 'exclusion', 'text': 'RabbitMQ'}] | lang=None
+  [200]  1323.7ms | how-to         | conf=0.678 |  10 res | top_score=0.300 | How to Set Up a Managed Database for Your Web App | MindStudio
+    +['cassandra', 'dynamodb', 'mongodb', 'nosql'] | -['cassandra', 'dynamodb', 'mongodb'] | entities=[{'role': 'exclusion', 'text': 'Cassandra'}, {'role': 'exclusion', 'text': 'DynamoDB'}, {'role': 'exclusion', 'text': 'MongoDB'}] | lang=None
+  [200]  1253.0ms | how-to         | conf=1.000 |   0 res | top_score=0.000 | 
+    +['datadog', 'grafana', 'monitoring', 'prometheus', 'relic', 'stack'] | -['datadog', 'grafana', 'new', 'prometheus'] | entities=[{'role': 'exclusion', 'text': 'Datadog'}, {'role': 'exclusion', 'text': 'Grafana'}, {'role': 'exclusion', 'text': 'New'}, {'role': 'exclusion', 'text': 'Prometheus'}] | lang=None
+  [200]  1470.5ms | comparison     | conf=0.338 |   3 res | top_score=0.300 | Honduras CDN | 5 content delivery networks
+    +['akamai', 'cdn', 'cloudflare', 'edge', 'fastly', 'imperva'] | -['akamai', 'cloudflare', 'fastly', 'imperva'] | entities=[{'role': 'exclusion', 'text': 'Akamai'}, {'role': 'exclusion', 'text': 'Cloudflare'}, {'role': 'exclusion', 'text': 'Fastly'}, {'role': 'exclusion', 'text': 'Imperva'}] | lang=None
+  [200]  1373.0ms | how-to         | conf=0.589 |   7 res | top_score=0.302 | OpenTelemetry
+    +['honeycomb', 'jaeger', 'observability', 'zipkin'] | -['honeycomb', 'jaeger', 'zipkin'] | entities=[{'role': 'exclusion', 'text': 'Honeycomb'}, {'role': 'exclusion', 'text': 'Jaeger'}, {'role': 'exclusion', 'text': 'Zipkin'}] | lang=None
+  [200]  1423.9ms | comparison     | conf=0.132 |   2 res | top_score=0.384 | GHCR: Complete Guide to GitHub Container Registry in April 2026
+    +['container', 'docker', 'ecr', 'gcr', 'hub', 'quay', 'registry'] | -['docker', 'ecr', 'gcr', 'quay'] | entities=[{'role': 'exclusion', 'text': 'Docker'}, {'role': 'exclusion', 'text': 'ECR'}, {'role': 'exclusion', 'text': 'GCR'}, {'role': 'exclusion', 'text': 'Quay'}] | lang=None
+  [200]  1435.3ms | comparison     | conf=0.197 |   5 res | top_score=0.403 | GitHub - dhamaniasad/HeadlessBrowsers: A list of (almost) all...
+    +['blink', 'browser', 'engine', 'gecko', 'webkit'] | -['blink', 'gecko', 'webkit'] | entities=[{'role': 'exclusion', 'text': 'Blink'}, {'role': 'exclusion', 'text': 'Gecko'}, {'role': 'exclusion', 'text': 'WebKit'}] | lang=None
+  [200]  1420.3ms | how-to         | conf=0.245 |   4 res | top_score=0.319 | LicheePi 4A Review: The Best Open Source RISC-V SBC?
+    +['beaglebone', 'board', 'linux', 'pi', 'pine64', 'raspberry', 'risc-v'] | -['beaglebone', 'pine64', 'raspberry'] | entities=[{'role': 'exclusion', 'text': 'BeagleBone'}, {'role': 'exclusion', 'text': 'Pine64'}, {'role': 'exclusion', 'text': 'Raspberry'}] | lang=None
+  [200]  1351.6ms | how-to         | conf=0.478 |   7 res | top_score=0.520 | Understanding `build.zig`: A Practical Introduction to Zig's Buil
+    +['bazel', 'build', 'cmake', 'meson', 'zig'] | -['bazel', 'cmake', 'meson'] | entities=[{'role': 'exclusion', 'text': 'Bazel'}, {'role': 'exclusion', 'text': 'CMake'}, {'role': 'exclusion', 'text': 'Meson'}] | lang=zig
+  [200]  1291.9ms | transactional  | conf=0.385 |   1 res | top_score=0.300 | How To Install Ubuntu Linux 24.04 Without USB Drive - YouTube
+    +['btrfs', 'f2fs', 'filesystem', 'memory-safe', 'xfs'] | -['btrfs', 'f2fs', 'xfs'] | entities=[{'role': 'exclusion', 'text': 'Btrfs'}, {'role': 'exclusion', 'text': 'F2FS'}, {'role': 'exclusion', 'text': 'XFS'}] | lang=None
+  [200]  1276.0ms | transactional  | conf=0.630 |   5 res | top_score=0.338 | LibP2P: Modular Peer-to-Peer Networking | Source Developer Portal
+    +['bittorrent', 'dat', 'hypercore', 'ipfs', 'peer-to-peer', 'protocol'] | -['bittorrent', 'dat', 'hypercore', 'ipfs'] | entities=[{'role': 'exclusion', 'text': 'BitTorrent'}, {'role': 'exclusion', 'text': 'Dat'}, {'role': 'exclusion', 'text': 'Hypercore'}, {'role': 'exclusion', 'text': 'IPFS'}] | lang=None
+  [200]  1462.1ms | how-to         | conf=1.000 |  30 res | top_score=0.395 | Comparing Kubernetes operators for PostgreSQL. Part 2 ... - Palar
+    +['build', 'fault-tolerant', 'hat', 'inventory', 'kubernetes', 'logical', 'operators', 'postgresql', 'red', 'replication'] | -['red'] | entities=[{'role': 'exclusion', 'text': 'Red'}] | lang=None
+  [200]  2916.2ms | informational  | conf=0.213 |   3 res | top_score=0.086 | WHY | English meaning - Cambridge Dictionary
+    +['so_reuseport enabled', 'drop', 'enabled', 'kernel', 'linux', 'napi', 'packets', 'so_reuseport', 'tcp'] | -['napi', 'busy-poll'] | entities=[{'role': 'exclusion', 'text': 'NAPI'}, {'role': 'exclusion', 'text': 'busy-poll'}] | lang=None
+  [200]  1178.8ms | comparison     | conf=1.000 |   3 res | top_score=0.090 | Home - Tradeoffs
+    +['high-performance packet'] | -[] | entities=[] | lang=None
+  [200]  1170.6ms | comparison     | conf=1.000 |   3 res | top_score=0.099 | Chose vs Choose | Meaning, Difference & Synonyms - LanguageTool
+    +['globally distributed'] | -[] | entities=[] | lang=None
+  [200]  1348.6ms | comparison     | conf=1.000 |   3 res | top_score=0.100 | Apple Inc. - Wikipedia
+    +['on-device llm'] | -[] | entities=[] | lang=None
+  [200]  1679.7ms | how-to         | conf=0.652 |   5 res | top_score=0.300 | SigNoz Alternative - OneUptime | Open Source | 2026 Comparison
+    +['github without', 'bitbucket', 'gitea', 'github', 'gitlab', 'open-source'] | -['bitbucket', 'gitlab', 'gitea'] | entities=[{'role': 'reference', 'text': 'GitHub without'}, {'role': 'exclusion', 'text': 'Bitbucket'}, {'role': 'exclusion', 'text': 'GitLab'}, {'role': 'exclusion', 'text': 'Gitea'}] | lang=None
+  [200]  1573.0ms | how-to         | conf=0.523 |   5 res | top_score=0.300 | Google Password Manager - Manage Your Passwords Safely & Easily
+    +['1password', 'bitwarden', 'dashlane', 'lastpass', 'manager', 'password'] | -['1password', 'bitwarden', 'dashlane', 'lastpass'] | entities=[{'role': 'exclusion', 'text': '1Password'}, {'role': 'exclusion', 'text': 'Bitwarden'}, {'role': 'exclusion', 'text': 'Dashlane'}, {'role': 'exclusion', 'text': 'LastPass'}] | lang=None
+  [200]  1388.7ms | transactional  | conf=0.215 |   4 res | top_score=0.300 | Google Fit
+    +['fitbit', 'fitness', 'garmin', 'oura', 'tracker', 'whoop'] | -['fitbit', 'garmin', 'oura', 'whoop'] | entities=[{'role': 'exclusion', 'text': 'Fitbit'}, {'role': 'exclusion', 'text': 'Garmin'}, {'role': 'exclusion', 'text': 'Oura'}, {'role': 'exclusion', 'text': 'WHOOP'}] | lang=None
+  [200]  1243.6ms | transactional  | conf=0.136 |   3 res | top_score=0.300 | SMART criteria - Wikipedia
+    +['assistant', 'home', 'hub', 'hubitat', 'openhab', 'smart', 'smartthings'] | -['home', 'hubitat', 'smartthings', 'openhab'] | entities=[{'role': 'exclusion', 'text': 'Home'}, {'role': 'exclusion', 'text': 'Hubitat'}, {'role': 'exclusion', 'text': 'SmartThings'}, {'role': 'exclusion', 'text': 'openHAB'}] | lang=None
+
+=== NEGATIVE CONSTRAINT COMPLIANCE ===
+  [OK] neg=['mysql'] | top='Replication, Clustering, and Connection Pooling - Postg'
+  [OK] neg=['openssl', 'boringtun'] | top='encrypted-dns — Rust application // Lib.rs'
+  [OK] neg=['memcached', 'redis'] | top=''
+  [OK] neg=['google', 'plausible'] | top='Self-Hosted Product Analytics: The Insider's Guide'
+  [OK] neg=['cloudflare', 'deno'] | top='Edge Computing in 2026: How to Deploy AI Models... | Me'
+  [OK] neg=['gatsby', 'next', 'react', 'vue'] | top='How to Build a Blog Using a Static Site Generator and a'
+  [OK] neg=['celery', 'kafka', 'rabbitmq', 'redis'] | top='GitHub - codepr/tasq: A simple task queue implementatio'
+  [OK] neg=['elasticsearch', 'opensearch', 'splunk'] | top='8 Best Free Open Source Log Management Tools (2026) - S'
+  [OK] neg=['bun', 'deno', 'node'] | top=''
+  [OK] neg=['pinecone', 'qdrant', 'weaviate'] | top=''
+  [OK] neg=['minio', 's3', 'swift', 'wasabi'] | top='Best Object Storage Solutions for Startups of 2025 - Re'
+  [OK] neg=['github', 'gitlab', 'jenkins'] | top='12 DevOps Platforms for Startups Compared'
+  [OK] neg=['aws', 'kong', 'tyk'] | top='Apache APISIX - Open Source API Gateway & AI Gateway'
+  [OK] neg=['bigquery', 'redshift', 'snowflake'] | top='Exploring the Best Data Warehouse Alternatives in 2026'
+  [OK] neg=['kafka', 'nats', 'pulsar', 'rabbitmq'] | top='GitHub - cloudstreet-dev/Event-Driven-Architecture: A d'
+  [OK] neg=['cassandra', 'dynamodb', 'mongodb'] | top='How to Set Up a Managed Database for Your Web App | Min'
+  [OK] neg=['datadog', 'grafana', 'new', 'prometheus'] | top=''
+  [OK] neg=['akamai', 'cloudflare', 'fastly', 'imperva'] | top='Honduras CDN | 5 content delivery networks'
+  [OK] neg=['honeycomb', 'jaeger', 'zipkin'] | top='OpenTelemetry'
+  [OK] neg=['docker', 'ecr', 'gcr', 'quay'] | top='GHCR: Complete Guide to GitHub Container Registry in Ap'
+  [OK] neg=['blink', 'gecko', 'webkit'] | top='GitHub - dhamaniasad/HeadlessBrowsers: A list of (almos'
+  [OK] neg=['beaglebone', 'pine64', 'raspberry'] | top='LicheePi 4A Review: The Best Open Source RISC-V SBC?'
+  [OK] neg=['bazel', 'cmake', 'meson'] | top='Understanding `build.zig`: A Practical Introduction to '
+  [OK] neg=['btrfs', 'f2fs', 'xfs'] | top='How To Install Ubuntu Linux 24.04 Without USB Drive - Y'
+  [OK] neg=['bittorrent', 'dat', 'hypercore', 'ipfs'] | top='LibP2P: Modular Peer-to-Peer Networking | Source Develo'
+  [OK] neg=['red'] | top='Comparing Kubernetes operators for PostgreSQL. Part 2 .'
+  [OK] neg=['napi', 'busy-poll'] | top='WHY | English meaning - Cambridge Dictionary'
+  [OK] neg=['bitbucket', 'gitlab', 'gitea'] | top='SigNoz Alternative - OneUptime | Open Source | 2026 Com'
+  [OK] neg=['1password', 'bitwarden', 'dashlane', 'lastpass'] | top='Google Password Manager - Manage Your Passwords Safely '
+  [OK] neg=['fitbit', 'garmin', 'oura', 'whoop'] | top='Google Fit'
+  [OK] neg=['home', 'hubitat', 'smartthings', 'openhab'] | top='SMART criteria - Wikipedia'
+
+=== DEGRADED/WARNING QUERIES ===

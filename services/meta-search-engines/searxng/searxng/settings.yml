@@ -50,6 +50,9 @@ search:
 outgoing:
   request_timeout: 3.0    # raised from 2.5s — give engines more room
   max_request_timeout: 6.0
+  enable_http2: true       # HTTP/2 multiplexing for engines that support it
+  pool_maxsize: 20         # increase per-host connection pool from default 10
+  keepalive_expiry: 30     # keep idle connections alive longer (default 5s)
   # Per-network routing: Tor for .onion engines, default (VPN) for regular
   networks:
     default:
@@ -65,15 +68,15 @@ engines:
   # ── Primary engines (via VPN/Gluetun) ──
   - name: bing
     disabled: false
-    timeout: 3.0
+    timeout: 2.5
 
   - name: brave
     disabled: false
-    timeout: 3.0
+    timeout: 2.5
 
   - name: startpage
     disabled: false
-    timeout: 3.0
+    timeout: 2.5
 
   - name: wikipedia
     disabled: false
@@ -90,7 +93,7 @@ engines:
   # ── New engines (via VPN) ──
   - name: duckduckgo
     disabled: false
-    timeout: 3.0
+    timeout: 2.5
 
   - name: presearch
     disabled: true    # DISABLED: getting 403 rate-limited (suspended 300s), causes cascading timeouts

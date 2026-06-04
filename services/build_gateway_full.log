@@ -1,0 +1,147 @@
+ Image services-indexer Building 
+ Image services-crawler Building 
+ Image services-intent-engine Building 
+ Image services-tor2 Building 
+ Image services-tor Building 
+ Image services-searxng2 Building 
+ Image services-gateway Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 3.72kB done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 612B done
+#2 WARN: FromAsCasing: 'as' and 'FROM' keywords' casing do not match (line 1)
+#2 DONE 0.0s
+
+#3 [auth] library/rust:pull token for registry-1.docker.io
+#3 DONE 0.0s
+
+#4 [auth] library/debian:pull token for registry-1.docker.io
+#4 DONE 0.0s
+
+#5 [internal] load metadata for docker.io/library/debian:bookworm-slim
+#5 ...
+
+#6 [internal] load metadata for docker.io/library/rust:1.88-slim-bookworm
+#6 DONE 1.6s
+
+#5 [internal] load metadata for docker.io/library/debian:bookworm-slim
+#5 DONE 1.6s
+
+#7 [internal] load .dockerignore
+#7 transferring context: 80B done
+#7 DONE 0.0s
+
+#8 [stage-1 1/4] FROM docker.io/library/debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb
+#8 resolve docker.io/library/debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb 0.0s done
+#8 DONE 0.1s
+
+#9 [builder 1/8] FROM docker.io/library/rust:1.88-slim-bookworm@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89
+#9 resolve docker.io/library/rust:1.88-slim-bookworm@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 0.0s done
+#9 DONE 0.1s
+
+#10 [internal] load build context
+#10 transferring context: 164.62kB 0.0s done
+#10 DONE 0.0s
+
+#11 [builder 2/8] WORKDIR /usr/src/gateway
+#11 CACHED
+
+#12 [builder 3/8] COPY Cargo.toml ./
+#12 CACHED
+
+#13 [builder 4/8] RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+#13 CACHED
+
+#14 [builder 5/8] RUN mkdir src && echo "fn main() {}" > src/main.rs
+#14 CACHED
+
+#15 [builder 6/8] RUN cargo build --release
+#15 CACHED
+
+#16 [builder 7/8] COPY src ./src
+#16 DONE 0.1s
+
+#17 [builder 8/8] RUN touch src/main.rs && cargo build --release
+#17 0.618    Compiling gateway v0.1.0 (/usr/src/gateway)
+#17 0.899 error[E0425]: cannot find value `q` in this scope
+#17 0.899    --> src/main.rs:784:27
+#17 0.899     |
+#17 0.899 784 |             let q_lower = q.to_lowercase();
+#17 0.899     |                           ^ not found in this scope
+#17 0.899 
+#17 0.899 error[E0425]: cannot find value `q` in this scope
+#17 0.899    --> src/main.rs:795:62
+#17 0.899     |
+#17 0.899 795 |                 let q_reuse: f32 = semantic_relevance_score(&q, &title, &content);
+#17 0.899     |                                                              ^ not found in this scope
+#17 0.899 
+#17 1.420 warning: unused variable: `is_freshness_query`
+#17 1.420     --> src/main.rs:2872:9
+#17 1.420      |
+#17 1.420 2872 |     let is_freshness_query = intent.constraints.iter().any(|c| {
+#17 1.420      |         ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_is_freshness_query`
+#17 1.420      |
+#17 1.420      = note: `#[warn(unused_variables)]` on by default
+#17 1.420 
+#17 1.420 warning: variable `degraded_engines` is assigned to, but never used
+#17 1.420     --> src/main.rs:2989:13
+#17 1.420      |
+#17 1.420 2989 |     let mut degraded_engines = 0usize;
+#17 1.420      |             ^^^^^^^^^^^^^^^^
+#17 1.420      |
+#17 1.420      = note: consider using `_degraded_engines` instead
+#17 1.420 
+#17 1.487 warning: unused variable: `i`
+#17 1.487     --> src/main.rs:2579:76
+#17 1.487      |
+#17 1.487 2579 |     let searx_urls: Vec<String> = searx_base_urls.iter().enumerate().map(|(i, base_url)| {
+#17 1.487      |                                                                            ^ help: if this is intentional, prefix it with an underscore: `_i`
+#17 1.487 
+#17 1.500 warning: unused variable: `instance_key`
+#17 1.500     --> src/main.rs:2637:13
+#17 1.500      |
+#17 1.500 2637 |         let instance_key = searx_instance_keys_ref[i].clone();
+#17 1.500      |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_instance_key`
+#17 1.500 
+#17 2.854 For more information about this error, try `rustc --explain E0425`.
+#17 2.873 warning: `gateway` (bin "gateway") generated 4 warnings
+#17 2.873 error: could not compile `gateway` (bin "gateway") due to 2 previous errors; 4 warnings emitted
+#17 ERROR: process "/bin/sh -c touch src/main.rs && cargo build --release" did not complete successfully: exit code: 101
+------
+ > [builder 8/8] RUN touch src/main.rs && cargo build --release:
+1.487 
+1.500 warning: unused variable: `instance_key`
+1.500     --> src/main.rs:2637:13
+1.500      |
+1.500 2637 |         let instance_key = searx_instance_keys_ref[i].clone();
+1.500      |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_instance_key`
+1.500 
+2.854 For more information about this error, try `rustc --explain E0425`.
+2.873 warning: `gateway` (bin "gateway") generated 4 warnings
+2.873 error: could not compile `gateway` (bin "gateway") due to 2 previous errors; 4 warnings emitted
+------
+Dockerfile:10
+
+--------------------
+
+   8 |     RUN cargo build --release
+
+   9 |     COPY src ./src
+
+  10 | >>> RUN touch src/main.rs && cargo build --release
+
+  11 |     
+
+  12 |     FROM debian:bookworm-slim
+
+--------------------
+
+failed to solve: process "/bin/sh -c touch src/main.rs && cargo build --release" did not complete successfully: exit code: 101
+
+
+
+View build details: docker-desktop://dashboard/build/default/default/1pmtmceopdtle0cuayrsippki
+
+EXIT=1

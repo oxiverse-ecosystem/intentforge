@@ -1,0 +1,202 @@
+{
+  "label": "fixed-baseline",
+  "queries": [
+    {
+      "query": "distributed task queue for python not celery",
+      "positive": [
+        "d i s t r i b u t e d",
+        "p y t h o n",
+        "q u e u e",
+        "t a s k"
+      ],
+      "negative": [
+        "c e l e r y"
+      ],
+      "top": [
+        {
+          "score": 0.9470681,
+          "title": "Orchestrating Distributed Task Queues with Temporal and Python for ...",
+          "url": "https://martinuke0.github.io/posts/2026-03-24-orchestrating-distributed-task-queues-with-temporal-and-python-for-resilient-agentic-microservices/"
+        },
+        {
+          "score": 0.93754745,
+          "title": "GitHub - vduseev/raquel: Distributed task queues for Python using SQL and no orchestrator. Simple. Reliable. Flexible. Transparent. \u00b7 GitHub",
+          "url": "https://github.com/vduseev/raquel"
+        },
+        {
+          "score": 0.92384946,
+          "title": "Building a Distributed Task Queue with Python and Redis | by J. | Medium",
+          "url": "https://medium.com/@jurajpuchky/building-a-distributed-task-queue-with-python-and-redis-0103139de41f"
+        }
+      ],
+      "count": 26
+    },
+    {
+      "query": "linux firewall gui with vlan support excluding ufw",
+      "positive": [
+        "f i r e w a l l",
+        "g u i",
+        "l i n u x",
+        "s u p p o r t",
+        "v l a n",
+        "v l a n s u p p o r t"
+      ],
+      "negative": [
+        "u f w"
+      ],
+      "top": [
+        {
+          "score": 0.46584755,
+          "title": "Firewalls and Vlans for a linux router - Super User",
+          "url": "https://superuser.com/questions/1431638/firewalls-and-vlans-for-a-linux-router"
+        },
+        {
+          "score": 0.42683908,
+          "title": "A Sysadmin\u2019s Technical Guide to Firewalls for Linux",
+          "url": "https://arphost.com/firewalls-for-linux/"
+        }
+      ],
+      "count": 2
+    },
+    {
+      "query": "self-hosted analytics alternative to google analytics privacy-focused excluding matomo",
+      "positive": [
+        "a n a l y t i c s",
+        "g o o g l e",
+        "g o o g l e a n a l y t i c s",
+        "p r i v a c y f o c u s e d",
+        "s e l f h o s t e d"
+      ],
+      "negative": [
+        "m a t o m o"
+      ],
+      "top": [
+        {
+          "score": 0.3,
+          "title": "SigNoz Alternative - OneUptime | Open Source | 2026 Comparison",
+          "url": "https://oneuptime.com/compare/signoz"
+        }
+      ],
+      "count": 1
+    },
+    {
+      "query": "rust async web framework without actix deadline-first pricing model",
+      "positive": [
+        "a s y n c",
+        "d e a d l i n e f i r s t",
+        "m o d e l",
+        "p r i c i n g",
+        "r u s t",
+        "w e b"
+      ],
+      "negative": [
+        "a c t i x"
+      ],
+      "top": [
+        {
+          "score": 0.70751923,
+          "title": "Asynchronous \u2014 list of Rust libraries/crates // Lib.rs",
+          "url": "https://lib.rs/asynchronous"
+        },
+        {
+          "score": 0.6940372,
+          "title": "Rust Async Web Framework Performance... - DEV Community",
+          "url": "https://dev.to/member_bf115bc6/rust-async-web-framework-performance-breakthrough7621-1n11"
+        },
+        {
+          "score": 0.6937657,
+          "title": "Understanding Pin in Rust Async for Web Developers | Leapcell",
+          "url": "https://leapcell.io/blog/understanding-pin-in-rust-async-for-web-developers"
+        }
+      ],
+      "count": 20
+    },
+    {
+      "query": "open source cms without wordpress multilingual",
+      "positive": [
+        "c m s",
+        "m u l t i l i n g u a l",
+        "o p e n",
+        "s o u r c e"
+      ],
+      "negative": [
+        "w o r d p r e s s"
+      ],
+      "top": [
+        {
+          "score": 0.80769664,
+          "title": "cms without database creation free download - SourceForge",
+          "url": "https://sourceforge.net/directory/?q=cms%20without%20database%20creation"
+        },
+        {
+          "score": 0.7123647,
+          "title": "Top 6 Open Source CMS Platforms in 2026 - strapi.io",
+          "url": "https://strapi.io/blog/open-source-cms-platforms"
+        },
+        {
+          "score": 0.65740293,
+          "title": "The Best 10+ Open Source Headless CMS 2025 - DEV Community",
+          "url": "https://dev.to/themeselection/the-best-10-open-source-headless-cms-40hf"
+        }
+      ],
+      "count": 23
+    },
+    {
+      "query": "vector database for ai not pinecone managed",
+      "positive": [
+        "a i",
+        "m a n a g e d",
+        "v e c t o r"
+      ],
+      "negative": [
+        "p i n e c o n e"
+      ],
+      "top": [
+        {
+          "score": 0.5601003,
+          "title": "Best Vector Databases for AI Applications in 2026",
+          "url": "https://scopir.com/posts/best-vector-databases-ai-applications-2026/"
+        },
+        {
+          "score": 0.5488659,
+          "title": "DigitalOcean\u2019s GPU cloud platform for AI workloads",
+          "url": "https://www.digitalocean.com/solutions/gpu-cloud-platform"
+        },
+        {
+          "score": 0.3825751,
+          "title": "Managed Network File Storage for AI workloads",
+          "url": "https://www.digitalocean.com/pricing/network-file-storage"
+        }
+      ],
+      "count": 14
+    },
+    {
+      "query": "javascript framework besides react typescript",
+      "positive": [
+        "j a v a s c r i p t",
+        "t y p e s c r i p t"
+      ],
+      "negative": [
+        "r e a c t"
+      ],
+      "top": [
+        {
+          "score": 0.696797,
+          "title": "Strapi - Open-Source TypeScript Headless CMS for Next.js, Astro...",
+          "url": "https://strapi.io/"
+        },
+        {
+          "score": 0.6725076,
+          "title": "JavaScript - MDN Web Docs",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/JavaScript"
+        },
+        {
+          "score": 0.6390905,
+          "title": "JavaScript in Visual Studio Code",
+          "url": "https://code.visualstudio.com/Docs/languages/javascript"
+        }
+      ],
+      "count": 17
+    }
+  ]
+}

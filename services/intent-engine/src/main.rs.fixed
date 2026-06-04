@@ -548,6 +548,10 @@ fn extract_constraints(query: &str) -> Constraints {
     positive.retain(|t| t.len() >= 2 && t.len() <= 50);
     negative.retain(|t| t.len() >= 2 && t.len() <= 50);
 
+    // ── Phase 6: Detect programming language ──
+    // Identify programming languages/frameworks mentioned in the query.
+    // This enables language-aware result scoring in the gateway.
+    // Uses context-aware detection to avoid false positives on short words.
     let language = detect_query_language(&q_lower);
 
     // ── Phase 7: Promote negative terms to Exclusion entities ──
@@ -605,10 +609,6 @@ fn detect_query_language(q_lower: &str) -> Option<String> {
         ("ruby", &["ruby"]),
         ("php", &["php"]),
         ("swift", &["swift"]),
-        // Disambiguation for "swift" when it appears in storage context:
-        // OpenStack Swift (object storage) is NOT the Swift programming language.
-        // Storage context clues: ring, container, object storage, cluster, proxy, account
-        // These are checked in detect_query_language via additional context logic below.
         ("kotlin", &["kotlin"]),
         ("scala", &["scala"]),
         ("haskell", &["haskell"]),
@@ -644,18 +644,6 @@ fn detect_query_language(q_lower: &str) -> Option<String> {
             // Long names (>= 4 chars): exact word match is sufficient
             if alias.len() >= 4 {
                 if words.iter().any(|w| *w == *alias) {
-                    // Disambiguation: "swift" in OpenStack storage context is NOT a programming language.
-                    // Check for storage-related terms that indicate OpenStack Swift object storage.
-                    if *alias == "swift" {
-                        let storage_context = ["ring", "container", "object", "storage", "cluster",
-                            "proxy", "account", "tenant", "replication", "consistency",
-                            "openstack", "keystone", "glance", "nova", "cinder", "horizon",
-                            "swiftstack", "mid-range", "midrange", "block", "backup",
-                            "availability zone", "storage policy", "object-store"];
-                        if storage_context.iter().any(|sc| q_lower.contains(sc)) {
-                            return None; // This is OpenStack Swift, not the programming language
-                        }
-                    }
                     return Some(canonical.to_string());
                 }
                 continue;
