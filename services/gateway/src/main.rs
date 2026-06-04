@@ -648,10 +648,25 @@ fn is_alternative_listing_page(title: &str, url: &str, content: &str) -> f32 {
         .count() as f32;
     let url_signal = (url_signal_raw * 0.35).min(0.7);
 
-    // Signal C: Content richness — alternative pages tend to have substantial content
-    let content_signal = if content.len() > 500 { 0.3 }
-        else if content.len() > 200 { 0.15 }
-        else { 0.0 };
+    // Signal C: Content contains alternative-listing patterns
+    // Scan first 500 chars of content for comparison/alternative keywords.
+    // This catches pages where the title isnt explicit but the body is a
+    // comparison list (e.g. "What Is Docker Hub?" -> body lists alternatives).
+    let content_alt_patterns = [
+        "alternatives", "alternative to", "compared to", "comparison",
+        "vs ", "versus", "instead of", "migrate from", "replacement for",
+        "top ", "pros and cons", "options", "not recommended",
+    ];
+    let content_signal = if content.len() > 100 {
+        let content_prefix: String = content.chars().take(500).collect();
+        let content_lower = content_prefix.to_lowercase();
+        let matches = content_alt_patterns.iter()
+            .filter(|p| content_lower.contains(*p))
+            .count() as f32;
+        (matches * 0.06).min(0.25)
+    } else {
+        0.0
+    };
 
     // Blend with title as dominant signal
     (title_signal * 0.70 + url_signal * 0.20 + content_signal * 0.10).clamp(0.0, 1.0)
@@ -794,8 +809,21 @@ fn constraint_score(
                             || host_lower == format!("{}.org", &neg_normal)
                     } else { false }
                 } else { false };
-                if is_official && alt_score < 0.6 {
-                    // Official site: moderate penalty (still penalized but less severe)
+                // Term-density check: count how many times the excluded term
+                // appears in the content. High density (>2% of words) means the
+                // page is primarily a tutorial/guide ABOUT that tool, not an
+                // alternative listing. Override the alt-aware penalty.
+                let content_td = content.to_lowercase();
+                let term_count = content_td.matches(&neg_lower).count() as f32;
+                let total_words = content_td.split_whitespace().count().max(1) as f32;
+                let term_density = term_count / total_words;
+
+                if term_density > 0.02 {
+                    // High term density: page is primarily about the excluded tool.
+                    // Apply a moderate penalty between non-alt and alt levels.
+                    (0.30 + (neg_count - 1.0) * 0.10).clamp(0.20, 0.50)
+                } else if is_official && alt_score < 0.6 {
+                    // Official site with weak alt signal: moderate penalty
                     (0.08 + (neg_count - 1.0) * 0.08).clamp(0.08, 0.30)
                 } else {
                     // Third-party alternative page: very mild penalty
@@ -3847,6 +3875,39 @@ async fn handle_search(
         }
     }
 
+
+    // 8c. Post-filter re-ranking: boost results whose titles do not contain
+    // excluded terms. This ensures genuinely clean results (no negative term
+    // in title) outrank alternative-listing pages kept by the hard filter.
+    // Alternative pages mentioning excluded terms are still present but pushed
+    // below results that already satisfy the constraint cleanly.
+    if !intent.structured_constraints.negative.is_empty() && !results.is_empty() {
+        let neg_refs: Vec<&str> = intent.structured_constraints.negative
+            .iter().map(|s| s.as_str()).collect();
+        for r in results.iter_mut() {
+            let title_lower = r.title.to_lowercase();
+            let has_neg_in_title = neg_refs.iter().any(|n| {
+                let n_lower = n.to_lowercase();
+                let n_words: Vec<&str> = n_lower.split_whitespace().collect();
+                if n_words.len() == 1 {
+                    title_lower.split_whitespace().any(|tw| {
+                        let tw_clean: String = tw.chars().filter(|c| c.is_alphanumeric()).collect();
+                        let n_clean: String = n_lower.chars().filter(|c| c.is_alphanumeric()).collect();
+                        tw_clean == n_clean || tw_clean.starts_with(&n_clean)
+                    })
+                } else {
+                    let joined = n_words.join(" ");
+                    title_lower.contains(&joined)
+                }
+            });
+            // Boost clean results by 25% so they outrank alt pages with similar scores
+            if !has_neg_in_title {
+                r.score *= 1.25;
+            }
+        }
+        // Re-sort by final score
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    }
     // Sanitize content for safe JSON serialization
     for r in results.iter_mut() {
         r.title = sanitize_text_content(&r.title);
