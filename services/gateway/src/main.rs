@@ -20,7 +20,8 @@ where D: serde::Deserializer<'de> {
 
 #[derive(Deserialize)]
 struct SearchParams {
-    q: String,
+    #[serde(default)]
+    q: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1842,6 +1843,11 @@ impl CircuitBreaker {
 // Caches (query, intent) → aggregated results for 5 minutes.
 // Avoids hammering meta-search engines for repeated queries.
 
+/// Maximum number of cached query responses. Bounds memory under sustained traffic;
+/// oldest entries are evicted by `inserted_at` when the cap is exceeded. LRU-by-age,
+/// not access time — the access pattern is read-heavy with rare repeats, so age is a
+/// good proxy for staleness without per-get bookkeeping.
+const SEARCH_CACHE_MAX_ENTRIES: usize = 10_000;
 struct SearchCache {
     entries: Mutex<HashMap<String, CacheEntry>>,
 }
@@ -1879,6 +1885,22 @@ impl SearchCache {
 
         // Evict expired entries to prevent unbounded growth
         entries.retain(|_, e| e.inserted_at.elapsed() < e.ttl);
+
+        // Cap total entries. Evict the oldest by `inserted_at` until under the cap.
+        // Iterating the full map is O(n) but n is bounded by SEARCH_CACHE_MAX_ENTRIES,
+        // so worst case is ~10k string comparisons on each put — acceptable for a
+        // background-quality cache.
+        if entries.len() > SEARCH_CACHE_MAX_ENTRIES {
+            let to_evict = entries.len() - SEARCH_CACHE_MAX_ENTRIES;
+            let mut by_age: Vec<(Instant, String)> = entries
+                .iter()
+                .map(|(k, e)| (e.inserted_at, k.clone()))
+                .collect();
+            by_age.sort_by_key(|(t, _)| *t);
+            for (_, k) in by_age.into_iter().take(to_evict) {
+                entries.remove(&k);
+            }
+        }
     }
 }
 
@@ -2248,14 +2270,26 @@ struct AppState {
 async fn handle_images(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
-) -> Json<serde_json::Value> {
-    let q = params.q.clone();
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
     let q_encoded = urlencoding::encode(&q);
+
+    // Guard: missing or empty `q` — return 400 with the documented body.
+    if q.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Missing or empty query parameter 'q'",
+                "results": [],
+                "count": 0,
+            })),
+        );
+    }
 
     let cache_key = format!("images:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return Json(value);
+        return (axum::http::StatusCode::OK, Json(value));
     }
 
     // Fan-out to both SearXNG instances in parallel (VPN + Tor)
@@ -2338,20 +2372,32 @@ async fn handle_images(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    Json(response)
+    (axum::http::StatusCode::OK, Json(response))
 }
 
 async fn handle_videos(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
-) -> Json<serde_json::Value> {
-    let q = params.q.clone();
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
     let q_encoded = urlencoding::encode(&q);
+
+    // Guard: missing or empty `q` — return 400 with the documented body.
+    if q.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Missing or empty query parameter 'q'",
+                "results": [],
+                "count": 0,
+            })),
+        );
+    }
 
     let cache_key = format!("videos:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return Json(value);
+        return (axum::http::StatusCode::OK, Json(value));
     }
 
     // Query both Invidious and SearXNG (categories=videos) in parallel
@@ -2436,20 +2482,32 @@ async fn handle_videos(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    Json(response)
+    (axum::http::StatusCode::OK, Json(response))
 }
 
 async fn handle_news(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
-) -> Json<serde_json::Value> {
-    let q = params.q.clone();
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
     let q_encoded = urlencoding::encode(&q);
+
+    // Guard: missing or empty `q` — return 400 with the documented body.
+    if q.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Missing or empty query parameter 'q'",
+                "results": [],
+                "count": 0,
+            })),
+        );
+    }
 
     let cache_key = format!("news:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return Json(value);
+        return (axum::http::StatusCode::OK, Json(value));
     }
 
     // Fan-out to both SearXNG instances in parallel (VPN + Tor)
@@ -2526,7 +2584,7 @@ async fn handle_news(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    Json(response)
+    (axum::http::StatusCode::OK, Json(response))
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -2637,7 +2695,7 @@ async fn handle_search(
     Query(params): Query<SearchParams>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     // 0. Validate query — reject empty or whitespace-only queries
-    let q_trimmed = params.q.trim();
+    let q_trimmed = params.q.as_deref().unwrap_or("").trim();
     if q_trimmed.is_empty() {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -2648,13 +2706,13 @@ async fn handle_search(
             })),
         );
     }
-    // Reject queries that are only special characters (no alphanumeric content)
-    let alpha_count = q_trimmed.chars().filter(|c| c.is_alphanumeric()).count();
+    // Reject queries that have no letters (digits/symbols only).
+    let alpha_count = q_trimmed.chars().filter(|c| c.is_alphabetic()).count();
     if alpha_count == 0 {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "Query must contain at least one alphanumeric character",
+                "error": "Query must contain at least one alphabetic character",
                 "results": [],
                 "count": 0,
             })),
@@ -2662,16 +2720,16 @@ async fn handle_search(
     }
 
     // 0b. Check cache first (5-min TTL)
-    let cache_key = format!("{}:{}", params.q.to_lowercase().trim(), "all");
+    let cache_key = format!("{}:{}", q_trimmed.to_lowercase(), "all");
     if let Some(cached) = state.cache.get(&cache_key) {
-        tracing::info!("Cache hit for query: {}", params.q);
+        tracing::info!("Cache hit for query: {}", q_trimmed);
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
         return (axum::http::StatusCode::OK, Json(value));
     }
     // Use shared HTTP client from AppState (connection pooling across requests)
     let client = state.http_client.clone();
 
-    let q = params.q.clone();
+    let q = q_trimmed.to_string();
     let q_encoded = urlencoding::encode(&q);
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel
@@ -2782,7 +2840,7 @@ async fn handle_search(
         }
     };
 
-    // Fire all SearXNG instances in parallel with retry on 0 results
+    // Fire all SearXNG instances in parallel. No retry on 0 results — IP rotation only.
     let searx_instance_keys_ref = &searx_instance_keys;
     let searx_futs: Vec<_> = searx_urls.iter().enumerate().map(|(i, url)| {
         let url = url.clone();
@@ -2807,6 +2865,14 @@ async fn handle_search(
                     }
                 };
                 let status = resp.status();
+                // Detect 429 from first attempt — rotate IP instead of retrying the same query.
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    let rl_count = ratelimit_ref.count_in_window(300);
+                    ratelimit_ref.record();
+                    let new_count = ratelimit_ref.count_in_window(300);
+                    tracing::warn!("SearXNG got 429 — rate-limits in 5min: {} → {}", rl_count, new_count);
+                    rotate_all_ips(&format!("429_rate_limit_{}", new_count));
+                }
                 let raw = match tokio::time::timeout(
                     std::time::Duration::from_secs(3),
                     resp.text()
@@ -2831,6 +2897,7 @@ async fn handle_search(
             match first {
                 Ok(data) if !data.results.is_empty() => Ok(data),
                 Ok(_) => {
+                    // Reject malformed/garbage queries early — they never return results.
                     let url_lower = url.to_lowercase();
                     let q_part = url_lower.split("q=").nth(1).unwrap_or("");
                     let q_decoded = q_part.split("&").next().unwrap_or("");
@@ -2841,48 +2908,9 @@ async fn handle_search(
                     if is_malformed {
                         return Ok(SearxResponse { results: vec![] });
                     }
-                    tracing::info!("SearXNG returned 0 results, retrying immediately...");
-                    let retry: Result<SearxResponse, reqwest::Error> = async {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(3),
-                            client_ref.get(&url).send()
-                        ).await {
-                            Ok(Ok(resp)) => {
-                                let status = resp.status();
-                                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                                    let rl_count = ratelimit_ref.count_in_window(300);
-                                    ratelimit_ref.record();
-                                    let new_count = ratelimit_ref.count_in_window(300);
-                                    tracing::warn!("SearXNG got 429 — rate-limits in 5min: {} → {}", rl_count, new_count);
-                                    rotate_all_ips(&format!("429_rate_limit_{}", new_count));
-                                }
-                                match tokio::time::timeout(
-                                    std::time::Duration::from_secs(3),
-                                    resp.text()
-                                ).await {
-                                    Ok(Ok(raw)) => {
-                                        let sanitized = sanitize_json_text(&raw);
-                                        match serde_json::from_str::<SearxResponse>(&sanitized) {
-                                            Ok(data) => Ok(data),
-                                            Err(e) => {
-                                                tracing::error!("SearXNG retry parse failed (status: {}): {:?}", status, e);
-                                                Ok(SearxResponse { results: vec![] })
-                                            }
-                                        }
-                                    }
-                                    _ => Ok(SearxResponse { results: vec![] })
-                                }
-                            }
-                            _ => Ok(SearxResponse { results: vec![] })
-                        }
-                    }.await;
-                    if let Ok(ref data) = retry {
-                        if data.results.is_empty() {
-                            tracing::warn!("SearXNG retry returned 0 results — triggering IP rotation");
-                            rotate_all_ips("zero_results_after_retry");
-                        }
-                    }
-                    retry
+                    // No retry on 0 results: a second identical query is almost certain
+                    // to return the same empty payload. Saves up to 3s of wasted latency.
+                    Ok(SearxResponse { results: vec![] })
                 }
                 Err(e) => {
                     tracing::warn!("SearXNG request failed (local error, no VPN rotation): {:?}", e);
@@ -3953,15 +3981,27 @@ fn fallback_intent(q: &str) -> IntentResponse {
 async fn handle_search_fast(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
-) -> Json<serde_json::Value> {
-    let q = params.q.clone();
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
     let q_encoded = urlencoding::encode(&q);
+
+    // Guard: missing or empty `q` — return 400 with the documented body.
+    if q.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Missing or empty query parameter 'q'",
+                "results": [],
+                "count": 0,
+            })),
+        );
+    }
 
     // Check cache first
     let cache_key = format!("fast:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return Json(value);
+        return (axum::http::StatusCode::OK, Json(value));
     }
 
     // Query local index only — no network calls except to indexer
@@ -3999,5 +4039,5 @@ async fn handle_search_fast(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    Json(response)
+    (axum::http::StatusCode::OK, Json(response))
 }
