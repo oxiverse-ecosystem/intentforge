@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
+use tower_http::timeout::TimeoutLayer;
 
 // ─── API Types ───────────────────────────────────────────────────────
 
@@ -2682,7 +2683,7 @@ async fn main() {
         .route("/images", get(handle_images))
         .route("/videos", get(handle_videos))
         .route("/news", get(handle_news))
-        .with_state(state);
+        .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
     tracing::info!("Gateway listening on {} (circuit-breaker + cache)", addr);
@@ -3822,14 +3823,21 @@ async fn handle_search(
     // 8. Unified Merge: Local + Web → Single Ranked List
     // Cross-source dedup, consensus boosting, unified ranking
     // Pass intent distribution for distribution-aware ranking (intent as hint, not gate)
-    let mut results = merge_local_and_web(
-        local_results,
-        web_results,
-        &q,
-        &intent.intent,
-        &intent.structured_constraints,
-        Some(&intent.distribution),
-    );
+    // Clone data for CPU-intensive scoring on blocking thread
+    let q_clone = q.clone();
+    let intent_clone = intent.intent.clone();
+    let constraints_clone = intent.structured_constraints.clone();
+    let distribution_clone = intent.distribution.clone();
+    let mut results = tokio::task::spawn_blocking(move || {
+        merge_local_and_web(
+            local_results,
+            web_results,
+            &q_clone,
+            &intent_clone,
+            &constraints_clone,
+            Some(&distribution_clone),
+        )
+    }).await.unwrap();
 
     // 8b. Post-merge hard negative filter: apply negative constraints to ALL results
     // (local + web). The pre-merge filter only catches web results; local index
