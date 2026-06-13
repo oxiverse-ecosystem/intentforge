@@ -506,11 +506,38 @@ fn calculate_intent_boost(url: &str, title: &str, query: &str, intent: &str) -> 
             }
         }
         "transactional" => {
-            if url_lower.contains("/download") || url_lower.contains("/pricing")
+            // E-commerce / product page patterns: direct purchase paths
+            let tx_url_match = url_lower.contains("/download") || url_lower.contains("/pricing")
                 || url_lower.contains("/signup") || url_lower.contains("/store")
                 || url_lower.contains("/shop") || url_lower.contains("/buy")
-            {
+                // E-commerce product page patterns (amazon, ebay, aliexpress, etc.)
+                || url_lower.contains("/dp/") || url_lower.contains("/product/")
+                || url_lower.contains("/item/") || url_lower.contains("/products/")
+                || url_lower.contains("/pd/") || url_lower.contains("/gp/product/")
+                || url_lower.contains("/details/")
+                // Extended marketplace patterns
+                || url_lower.contains("/offer") || url_lower.contains("/deal")
+                || url_lower.contains("/cart") || url_lower.contains("/checkout")
+                || url_lower.contains("/basket") || url_lower.contains("/order")
+                || url_lower.contains("/merchant") || url_lower.contains("/seller")
+                || url_lower.contains("/review/") || url_lower.contains("/price")
+                // Common e-commerce TLD patterns
+                || url_lower.contains("amazon.com") || url_lower.contains("ebay.com")
+                || url_lower.contains("walmart.com") || url_lower.contains("bestbuy.com")
+                || url_lower.contains("etsy.com") || url_lower.contains("alibaba.com")
+                || url_lower.contains("newegg.com") || url_lower.contains("target.com");
+            if tx_url_match {
                 boost += 0.5;
+            }
+            // Title signals: "buy", "price", "shop", "order", "deal" in the title
+            let tx_title_match = title_lower.contains("price") || title_lower.contains("order now")
+                || title_lower.contains("add to cart") || title_lower.contains("on sale")
+                || title_lower.contains("buy now") || title_lower.contains("shop now")
+                || title_lower.contains("best price") || title_lower.contains("free shipping")
+                || title_lower.contains("discount") || title_lower.contains("coupon")
+                || title_lower.contains("limited offer") || title_lower.contains("deal");
+            if tx_title_match {
+                boost += 0.4; // stronger boost for transactional title signals
             }
         }
         _ => {}
@@ -832,7 +859,7 @@ fn constraint_score(
                     // Third-party alternative page: very mild penalty
                     // High alt_score = barely any penalty (keep the result)
                     // Low alt_score but still > 0.3 = partial penalty
-                    (0.50 + alt_score * 0.40).min(0.90)
+                    (0.15 + alt_score * 0.25).min(0.50)
                 }
             } else {
                 // Standard penalty scales gradually with constraint count:
@@ -1324,6 +1351,17 @@ impl RankingWeights {
                 consensus: 0.18,
                 constraint: 0.25,
             },
+            "transactional" => Self {
+                rrf: 0.06,
+                intent: 0.10,      // higher — reward product page structure detection
+                freshness: 0.03,
+                authority: 0.10,   // boost — e-commerce domains are authoritative for shopping
+                local_bonus: 0.02,
+                quality: 0.08,     // boost — reward structured product content
+                semantic: 0.22,
+                consensus: 0.18,
+                constraint: 0.21,
+            },
             _ => Self {  // informational, default
                 rrf: 0.06,
                 intent: 0.05,
@@ -1361,7 +1399,7 @@ impl RankingWeights {
         let margin = sorted[0] - sorted[1];
 
         // If margin > 0.3, the classifier is confident — use the winning intent directly
-        if margin > 0.3 {
+        if margin > 0.15 {
             let (winner_idx, _) = probs.iter().enumerate()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap_or((0, &0.0));
@@ -1615,6 +1653,28 @@ fn preprocess_searxng_query(query: &str) -> String {
     // Preserve dotted names like "node.js", "deno.js", "c++" — don't strip dots
     // that are part of technology names
     cleaned
+}
+
+// Simple negation-word stripper for the initial fan-out (no intent engine needed).
+// Detects common negation patterns and strips trigger words to produce a clean query
+// that search engines can actually return results for. Used to generate extra SearXNG
+// URLs in the initial parallel fan-out, avoiding a sequential retry step.
+fn simple_negation_strip(query: &str) -> Option<String> {
+    let neg_triggers: std::collections::HashSet<&str> = [
+        "not", "no", "without", "except", "excluding", "besides", "minus",
+        "other", "than", "nor",
+    ].iter().copied().collect();
+    let words: Vec<&str> = query.split_whitespace()
+        .filter(|w| {
+            let w_lower = w.to_lowercase();
+            !neg_triggers.contains(w_lower.as_str()) && !w_lower.starts_with("-")
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() || words.len() == query.split_whitespace().count() {
+        return None; // nothing stripped, or everything stripped
+    }
+    Some(words.join(" "))
 }
 
 // ─── JSON Key Deduplication ────────────────────────────────────────
@@ -2122,6 +2182,31 @@ fn merge_local_and_web(
         merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     }
 
+    // 4c. Source-level diversity boost: boost results from underrepresented engine sources.
+    // Count how many results each engine source contributed, then boost results from
+    // sources that contributed fewer than the median. This promotes multi-engine diversity.
+    {
+        let mut source_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for r in &merged {
+            for s in &r.sources {
+                *source_counts.entry(s.to_lowercase()).or_insert(0) += 1;
+            }
+        }
+        if source_counts.len() > 1 {
+            let total_sources = source_counts.len();
+            let total_results = merged.len();
+            let median_per_source = (total_results as f32 / total_sources as f32).ceil();
+            for r in merged.iter_mut() {
+                let is_underrepresented = r.sources.iter().any(|s| {
+                    source_counts.get(&s.to_lowercase()).copied().unwrap_or(0) as f32 <= median_per_source * 0.5
+                });
+                if is_underrepresented {
+                    r.score *= 1.25; // 25% boost for underrepresented sources (now includes instance-level diversity)
+                }
+            }
+        }
+    }
+
     // 5. Normalize scores to [0, 1]
     let mut scores: Vec<f32> = merged.iter().map(|r| r.score).collect();
     normalize_scores(&mut scores);
@@ -2267,6 +2352,9 @@ struct AppState {
     http_client: reqwest::Client,
     searxng2_url: Option<String>,
     searx_last_used: Mutex<HashMap<String, Instant>>,
+    /// In-flight request deduplication: tracks identical queries in flight so
+    /// concurrent duplicate requests share one SearXNG fetch instead of N.
+    in_flight: Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<String>>>>,
 }
 
 async fn handle_images(
@@ -2615,6 +2703,7 @@ async fn main() {
             .unwrap(),
         searxng2_url,
         searx_last_used: Mutex::new(HashMap::new()),
+        in_flight: Mutex::new(HashMap::new()),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -2728,6 +2817,31 @@ async fn handle_search(
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
         return (axum::http::StatusCode::OK, Json(value));
     }
+    // 0c. Request deduplication: if another task is already fetching this query, wait for it
+    let dedup_rx = {
+        let mut in_flight = state.in_flight.lock();
+        if let Some(senders) = in_flight.get_mut(&cache_key) {
+            tracing::info!("DEDUP: another request in-flight for '{}', subscribing", q_trimmed);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            senders.push(tx);
+            Some(rx)
+        } else {
+            in_flight.insert(cache_key.clone(), vec![]);
+            None
+        }
+    };
+    if let Some(rx) = dedup_rx {
+        tracing::info!("DEDUP: waiting for in-flight query '{}' to complete", q_trimmed);
+        match rx.await {
+            Ok(response_json) => {
+                let value: serde_json::Value = serde_json::from_str(&response_json).unwrap_or(serde_json::json!({}));
+                return (axum::http::StatusCode::OK, Json(value));
+            }
+            Err(_) => {
+                tracing::warn!("DEDUP: sender dropped, processing query ourselves");
+            }
+        }
+    }
     // Use shared HTTP client from AppState (connection pooling across requests)
     let client = state.http_client.clone();
 
@@ -2787,11 +2901,40 @@ async fn handle_search(
         urls
     };
 
-    // Build SearXNG URLs: one per instance, raw query (no expanded queries yet)
-    let searx_urls: Vec<String> = searx_base_urls.iter().enumerate().map(|(i, base_url)| {
+    // Build SearXNG URLs: raw query + optional negation-stripped variant per instance.
+    // The stripped query fires in parallel with the raw query, avoiding a separate retry
+    // step for negative-only queries like "not django" (which return 0 results as-is).
+    // Detection is heuristic-only (no intent engine dependency) since this runs before
+    // the intent join.
+    let has_neg_pattern = q.starts_with("not ") || q.starts_with("no ")
+        || q.starts_with("without ") || q.starts_with("except ")
+        || q.starts_with("excluding ") || q.starts_with("minus ")
+        || q.starts_with("-") || q.contains(" not ") || q.contains(" no ")
+        || q.contains(" -");
+    let stripped_override: Option<String> = if has_neg_pattern {
+        simple_negation_strip(&q).filter(|s| {
+            let processed = preprocess_searxng_query(s);
+            !processed.is_empty() && processed != preprocess_searxng_query(&q)
+        })
+    } else { None };
+
+    let mut searx_urls: Vec<String> = Vec::new();
+    let mut searx_instance_keys: Vec<String> = Vec::new();
+    for (i, base_url) in searx_base_urls.iter().enumerate() {
+        let key = format!("searxng{}", i);
+        // Raw query URL
         let clean_q = preprocess_searxng_query(&q);
-        format!("{}/search?q={}&format=json&pageno=1", base_url, urlencoding::encode(&clean_q))
-    }).collect();
+        searx_urls.push(format!("{}/search?q={}&format=json&pageno=1", base_url, urlencoding::encode(&clean_q)));
+        searx_instance_keys.push(key.clone());
+        // Stripped query URL (same instance, runs in parallel)
+        if let Some(ref stripped) = stripped_override {
+            let clean_stripped = preprocess_searxng_query(stripped);
+            if !clean_stripped.is_empty() {
+                searx_urls.push(format!("{}/search?q={}&format=json&pageno=1", base_url, urlencoding::encode(&clean_stripped)));
+                searx_instance_keys.push(key);
+            }
+        }
+    }
 
     let invidious_url = format!("http://127.0.0.1:3000/api/v1/search?q={}", q_encoded);
 
@@ -2801,14 +2944,11 @@ async fn handle_search(
     let circuit_ref = &state.circuit;
     let ratelimit_ref = &state.rate_limits;
 
-    // Check circuit breaker before calling each engine
-    let searx_instance_keys: Vec<String> = searx_base_urls.iter().enumerate().map(|(i, _)| {
-        format!("searxng{}", i)
-    }).collect();
     // Map instance key → base URL for connection-cooldown tracking
     let searx_key_to_url: HashMap<String, String> = searx_base_urls.iter().enumerate().map(|(i, url)| {
         (format!("searxng{}", i), url.to_string())
     }).collect();
+    // Circuit check for each SearXNG request (raw + stripped variants share same key)
     let searx_instance_open: Vec<bool> = searx_instance_keys.iter()
         .map(|k| circuit_ref.is_open(k))
         .collect();
@@ -3005,7 +3145,7 @@ async fn handle_search(
     let searx_fut_with_timeout = async {
         use futures::future::FutureExt;
         match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(3),
             async {
                 // Pair each future with its original instance index so downstream
                 // can map results back to searx_instance_keys after select_all reordering.
@@ -3054,7 +3194,7 @@ async fn handle_search(
     // This eliminates the sequential intent→engines pipeline.
     // Engines start fetching immediately; intent runs in parallel.
     // Latency = max(intent, engines) instead of intent + engines.
-    let (intent_result, embed_res, indexer_res, searx_results, invidious_res, news_res, image_res) = tokio::join!(
+    let (intent_result, embed_res, indexer_res, mut searx_results, mut invidious_res, mut news_res, mut image_res) = tokio::join!(
         intent_fut,
         embed_fut,
         indexer_fut,
@@ -3063,15 +3203,84 @@ async fn handle_search(
         news_fut,
         image_fut,
     );
+    // If query has ONLY negative constraints, keep results for constraint scoring
+    let only_negative = !intent_result.as_ref().unwrap().structured_constraints.negative.is_empty()
+        && intent_result.as_ref().unwrap().structured_constraints.positive.is_empty();
+    if only_negative {
+        let before = searx_results.len()
+            + match &invidious_res { Ok(v) => v.len(), Err(_) => 0 }
+            + match &news_res { Ok(v) => v.results.len(), Err(_) => 0 }
+            + match &image_res { Ok(v) => v.results.len(), Err(_) => 0 };
+        tracing::info!("ONLY NEGATIVE: {} web results — keeping for constraint scoring", before);
+    }
+
 
     // 2. Process Intent & Embedding (now available alongside engine results)
-    let intent: IntentResponse = match intent_result {
+    let mut intent: IntentResponse = match intent_result {
         Ok(parsed) => parsed,
         Err(()) => {
             tracing::error!("Intent Engine unreachable after 3 attempts — using fallback");
             fallback_intent(&q)
         }
     };
+
+    // ─── Rule-based intent overrides for known misclassification patterns ───
+    // Fire when the linear probe has low confidence (<0.30) — the model is guessing,
+    // so pattern-based heuristics beat random chance.
+    {
+        let q_lower = q.to_lowercase();
+        let only_negative_pattern = !intent.structured_constraints.negative.is_empty()
+            && intent.structured_constraints.positive.is_empty();
+
+        // Override 1: only-negative queries classified as navigational → informational
+        // e.g. "not django" (conf=0.24, classified navigational — should be informational)
+        if only_negative_pattern && intent.intent.as_str() != "informational" && intent.confidence < 0.30 {
+            tracing::info!(
+                "INTENT OVERRIDE: only-negative '{}' was '{}' (conf={:.3}) → informational",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "informational".to_string();
+            intent.confidence = intent.confidence.max(0.35);
+            // Boost informational in the distribution for correct RankingWeights blending
+            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+            let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
+            intent.distribution.insert("informational".to_string(), info_prob + nav_prob * 0.5);
+            intent.distribution.insert("navigational".to_string(), nav_prob * 0.5);
+        }
+
+        // Override 2: "latest X news" with low confidence → boost fresh distribution
+        // e.g. "latest ai news today" (conf=0.12, classified navigational — should be fresh)
+        if !only_negative_pattern && intent.confidence < 0.30 {
+            let has_news_signal = q_lower.contains("latest") || q_lower.contains("recent")
+                || q_lower.contains("breaking") || q_lower.contains("headline");
+            let has_topic_signal = q_lower.contains("news") || q_lower.contains("update")
+                || q_lower.contains("today") || q_lower.contains("this week");
+            if has_news_signal && has_topic_signal {
+                let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
+                let current_prob = intent.distribution.get(&intent.intent).copied().unwrap_or(0.0);
+                if fresh_prob + 0.1 > current_prob {
+                    tracing::info!(
+                        "INTENT OVERRIDE: news query '{}' was '{}' (conf={:.3}) — boosting fresh (fresh={:.3})",
+                        q, intent.intent, intent.confidence, fresh_prob
+                    );
+                    intent.distribution.insert("fresh".to_string(), fresh_prob + 0.15);
+                }
+            }
+        }
+
+        // Override 3: "other than X" with low confidence → boost comparison + technical
+        // e.g. "programming language other than java" (conf=0.12, technical is correct base)
+        if q_lower.contains("other than") && intent.confidence < 0.20 {
+            tracing::info!(
+                "INTENT OVERRIDE: 'other than' query '{}' was '{}' (conf={:.3}) — boosting comparison/technical",
+                q, intent.intent, intent.confidence
+            );
+            let comp = intent.distribution.get("comparison").copied().unwrap_or(0.0);
+            let tech = intent.distribution.get("technical").copied().unwrap_or(0.0);
+            intent.distribution.insert("comparison".to_string(), comp + 0.1);
+            intent.distribution.insert("technical".to_string(), tech + 0.1);
+        }
+    }
 
     let vector: Option<Vec<f32>> = match embed_res {
         Ok(resp) => {
@@ -3097,6 +3306,48 @@ async fn handle_search(
         intent.expanded_queries.clone()
     } else {
         vec![q.clone()]
+    };
+    // When query has ONLY negative constraints ("not X not Y"), SearXNG searched with
+    // the raw query including negative terms. Strip negation trigger words to create a
+    // clean query and prepend it to expanded_queries so the retry re-fetches with clean terms.
+    // IMPORTANT: only strip negation trigger words, NOT the negated content terms themselves.
+    // The negated terms ARE the core topic ("not django" → search "django") — the constraint
+    // system handles exclusion via is_alternative_listing_page detection + graduated penalties.
+    let stripped_query: Option<String> = if only_negative {
+        let stop_words: std::collections::HashSet<&str> = ["not", "no", "without", "except",
+            "excluding", "besides", "minus", "other", "than", "nor", "-"].iter().copied().collect();
+        let words: Vec<&str> = q.split_whitespace()
+            .filter(|w| {
+                let w_lower = w.to_lowercase();
+                !stop_words.contains(w_lower.as_str())
+                    && !w_lower.starts_with("-")
+            })
+            .collect();
+        let original_len = q.split_whitespace().count();
+        if !words.is_empty() && words.len() < original_len {
+            let cleaned = words.join(" ");
+            tracing::info!("ONLY NEGATIVE: stripped query '{:?}' -> '{}'", q, cleaned);
+            Some(cleaned)
+        } else { None }
+    } else { None };
+    // For negative-only queries, also generate alternative-seeking variations so the
+    // retry actually fetches pages like "Django vs Flask" instead of just Django's docs.
+    let alt_queries: Vec<String> = if let Some(ref s_q) = stripped_query {
+        let mut alts = Vec::new();
+        alts.push(format!("{} alternatives", s_q));
+        alts.push(format!("alternatives to {}", s_q));
+        alts.push(format!("{} vs", s_q));
+        alts
+    } else {
+        Vec::new()
+    };
+    let expanded_queries = if let Some(ref s_q) = stripped_query {
+        let mut eq = vec![s_q.clone()];
+        eq.extend(alt_queries);
+        eq.extend(expanded_queries);
+        eq
+    } else {
+        expanded_queries
     };
     tracing::info!(target:"expansion.debug", expanded=?expanded_queries.iter().take(3).collect::<Vec<_>>(), query=%q, "primary expanded queries");
 
@@ -3190,7 +3441,13 @@ async fn handle_search(
                     };
                     let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
                     *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
-                    web_results.push(result);
+                    // Tag result with its SearXNG instance for source diversity tracking
+                    let mut instance_tagged = result;
+                    let instance_tag = format!("instance_{}", instance_key.trim_start_matches("searxng"));
+                    if !instance_tagged.sources.contains(&instance_tag) {
+                        instance_tagged.sources.push(instance_tag);
+                    }
+                    web_results.push(instance_tagged);
                 }
             }
             Err(e) => {
@@ -3222,84 +3479,113 @@ async fn handle_search(
         rotate_all_ips(&format!("proactive_{}_degradations_5min", recent_degradations));
     }
 
-    // Smart retry: if overall results are significantly below expected,
-    // try a different expanded query variation on the BEST available instance.
-    // The initial fan-out uses the raw query (== expanded_queries[0]) on all instances,
-    // so we've used exactly 1 query variation — the retry should skip it.
+    // ─── Parallel retry: fire all expanded query variations on all instances ───
+    // Replaces the old sequential smart retry + garbage cluster retry pattern.
+    // Instead of retrying one variation at a time on one instance (O(N×timeout)),
+    // fire ALL variations on ALL instances in parallel and race them with select_all.
+    // This turns sequential (3 × 3s = 9s worst) into parallel (2s flat).
     let total_results = web_results.len();
-    let expected_min = if expanded_queries.len() > 1 { 15 } else { 10 };
-    if total_results < expected_min && !expanded_queries.is_empty() && searx_base_urls.len() > 1 {
-        // Pick the first expanded query variation we haven't tried yet (skip index 0 = raw query)
-        let retry_query_idx = if expanded_queries.len() > 1 { 1 } else { 0 };
-        if let Some(retry_eq) = expanded_queries.get(retry_query_idx) {
-            // Prefer the most recently used (warmest) instance — warm connections
-            // avoid TCP+TLS handshake latency on retries.
-            let warmest_idx = {
-                let last_used = state.searx_last_used.lock();
-                (0..searx_base_urls.len())
-                    .filter(|i| !circuit_ref.is_open(&format!("searxng{}", i)))
-                    .max_by(|&a, &b| {
-                        let a_warm = last_used.get(searx_base_urls[a]).copied().unwrap_or(Instant::now());
-                        let b_warm = last_used.get(searx_base_urls[b]).copied().unwrap_or(Instant::now());
-                        a_warm.cmp(&b_warm)
-                    })
-                    .unwrap_or(0)
-            };
-            if let Some(retry_base) = searx_base_urls.get(warmest_idx) {
-                let clean_eq = preprocess_searxng_query(retry_eq);
-                let retry_url = format!("{}/search?q={}&format=json&pageno=1", retry_base, urlencoding::encode(&clean_eq));
-                let retry_key = format!("searxng{}", warmest_idx);
-                if !circuit_ref.is_open(&retry_key) {
-                    tracing::info!(
-                        "SMART RETRY: {} results < {} expected — trying variation '{}' on instance {}",
-                        total_results, expected_min, clean_eq, warmest_idx
-                    );
-                    match tokio::time::timeout(
-                        Duration::from_secs(3),
-                        client_ref.get(&retry_url).send(),
+    let expected_min = if only_negative { 5 } else if expanded_queries.len() > 1 { 15 } else { 10 };
+    let needs_more_results = total_results < expected_min || (only_negative && searx_base_urls.len() > 1);
+
+    // Count-based retry (no relevance needed yet — fires before Invidious/news/image)
+    if needs_more_results && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
+        let mut retry_futs = Vec::new();
+        let retry_timeout = Duration::from_secs(2); // shorter than initial 3s
+        for (eq_idx, eq) in expanded_queries.iter().enumerate().skip(1) {
+            if eq_idx > 3 { break; } // limit variations
+            let clean_eq = preprocess_searxng_query(eq);
+            if clean_eq.to_lowercase() == q.to_lowercase() { continue; } // skip duplicate
+            for (inst_idx, base_url) in searx_base_urls.iter().enumerate() {
+                let retry_key = format!("searxng{}", inst_idx);
+                if circuit_ref.is_open(&retry_key) { continue; }
+                let retry_url = format!(
+                    "{}/search?q={}&format=json&pageno=1",
+                    base_url, urlencoding::encode(&clean_eq)
+                );
+                let client = client_ref.clone();
+                let key = retry_key.clone();
+                let url_for_log = retry_url[..retry_url.find('?').unwrap_or(retry_url.len())].to_string();
+                retry_futs.push(Box::pin(async move {
+                    let result: Result<SearxResponse, String> = match tokio::time::timeout(
+                        retry_timeout,
+                        client.get(&retry_url).send(),
                     ).await {
                         Ok(Ok(resp)) => {
-                            let raw = match tokio::time::timeout(Duration::from_secs(3), resp.text()).await {
+                            let raw = match tokio::time::timeout(Duration::from_secs(2), resp.text()).await {
                                 Ok(Ok(t)) => t,
-                                _ => String::new(),
+                                _ => return (inst_idx, key, url_for_log, Err("retry body read timeout".into())),
                             };
                             let sanitized = sanitize_json_text(&raw);
-                            if let Ok(data) = serde_json::from_str::<SearxResponse>(&sanitized) {
-                                let retry_count = data.results.len();
-                                tracing::info!("Smart retry returned {} results", retry_count);
-                                circuit_ref.record_success(&retry_key);
-                                // Track last-used for connection-cooldown aware routing
-                                state.searx_last_used.lock().insert(retry_base.to_string(), Instant::now());
-                                circuit_ref.record_results(&retry_key, retry_count as u64);
-                                for (pos, result) in data.results.into_iter().enumerate() {
-                                    let engine_weight = circuit_ref.weight(&result.engine);
-                                    let normalized = {
-                                        let lower = result.url.to_lowercase();
-                                        let no_fragment = lower.split('#').next().unwrap_or(&lower);
-                                        let no_trailing = no_fragment.trim_end_matches('/');
-                                        let no_www = no_trailing.replacen("://www.", "://", 1);
-                                        let no_mobile = no_www
-                                            .replacen("://m.", "://", 1)
-                                            .replacen("://mobile.", "://", 1);
-                                        strip_tracking_params(&no_mobile)
-                                    };
-                                    if !url_rrf_contributions.contains_key(&normalized) {
-                                        let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
-                                        *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
-                                        web_results.push(result);
-                                    }
-                                }
+                            match serde_json::from_str::<SearxResponse>(&sanitized) {
+                                Ok(data) => Ok(data),
+                                Err(e) => Err(format!("retry parse error: {:?}", e)),
                             }
                         }
-                        Ok(Err(e)) => {
-                            tracing::warn!("Smart retry request failed: {:?}", e);
+                        Ok(Err(e)) => Err(format!("retry request error: {:?}", e)),
+                        Err(_) => Err("retry timeout".into()),
+                    };
+                    (inst_idx, key, url_for_log, result)
+                }));
+            }
+        }
+
+        if !retry_futs.is_empty() {
+            tracing::info!(
+                "PARALLEL RETRY: {} results < {} expected (or garbage/neg), firing {} retry variation(s)",
+                total_results, expected_min, retry_futs.len()
+            );
+            let mut pending = retry_futs;
+            let mut retry_new_count = 0usize;
+            let min_early = 5; // early return if 5+ new unique results
+
+            while !pending.is_empty() && retry_new_count < min_early {
+                let ((inst_idx, retry_key, _url_str, result), _idx, remaining) =
+                    futures::future::select_all(pending).await;
+                pending = remaining;
+
+                match result {
+                    Ok(data) if !data.results.is_empty() => {
+                        tracing::info!("Parallel retry on instance {} returned {} results", inst_idx, data.results.len());
+                        circuit_ref.record_success(&retry_key);
+                        if let Some(base_url) = searx_base_urls.get(inst_idx) {
+                            state.searx_last_used.lock().insert(base_url.to_string(), Instant::now());
                         }
-                        Err(_) => {
-                            tracing::warn!("Smart retry timed out");
+                        circuit_ref.record_results(&retry_key, data.results.len() as u64);
+                        for (pos, result) in data.results.into_iter().enumerate() {
+                            let engine_weight = circuit_ref.weight(&result.engine);
+                            let normalized = {
+                                let lower = result.url.to_lowercase();
+                                let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                                let no_trailing = no_fragment.trim_end_matches('/');
+                                let no_www = no_trailing.replacen("://www.", "://", 1);
+                                let no_mobile = no_www.replacen("://m.", "://", 1).replacen("://mobile.", "://", 1);
+                                strip_tracking_params(&no_mobile)
+                            };
+                            if !url_rrf_contributions.contains_key(&normalized) {
+                                let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
+                                *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
+                                // Tag retry results with their SearXNG instance
+                                let mut instance_tagged = result;
+                                let instance_tag = format!("instance_{}", retry_key.trim_start_matches("searxng"));
+                                if !instance_tagged.sources.contains(&instance_tag) {
+                                    instance_tagged.sources.push(instance_tag);
+                                }
+                                web_results.push(instance_tagged);
+                                retry_new_count += 1;
+                            }
                         }
+                    }
+                    Ok(_) => {} // 0 results — skip
+                    Err(e) => {
+                        tracing::warn!("Parallel retry failed on instance {}: {}", inst_idx, e);
+                        circuit_ref.record_failure(&retry_key);
                     }
                 }
             }
+            // Drop remaining pending futures (cancels in-flight requests)
+            drop(pending);
+            tracing::info!("Parallel retry collected {} new unique results", retry_new_count);
         }
     }
 
@@ -3497,83 +3783,22 @@ async fn handle_search(
     // High confidence: best result is much better than average (clear signal)
     // Low confidence: all results are similarly bad (garbage cluster)
     let relevance_confidence = best_score - mean_score;
-    let is_garbage_cluster = best_score < 0.15 && mean_score < 0.10;
+    // For only-negative queries, skip garbage cluster — few results are expected
+    // due to constraint filtering, not because the query itself is garbage.
+    let is_garbage_cluster = !only_negative && best_score < 0.15 && mean_score < 0.10;
 
     tracing::info!(
         "Relevance distribution: best={:.3}, mean={:.3}, var={:.3}, confidence={:.3}, garbage_cluster={}",
         best_score, mean_score, score_variance, relevance_confidence, is_garbage_cluster
     );
 
-    // If we detected a garbage cluster AND have expanded queries to try, retry
-    if is_garbage_cluster && expanded_queries.len() > 1 && !all_searx_open {
+    // Garbage cluster detected — log for telemetry but don't retry sequentially.
+    // The parallel retry above already fired all expanded query variations.
+    if is_garbage_cluster {
         tracing::warn!(
-            "GARBAGE CLUSTER DETECTED (best={:.3}, mean={:.3}) — retrying with expanded queries",
+            "GARBAGE CLUSTER (best={:.3}, mean={:.3}) — parallel retry already fired all variations",
             best_score, mean_score
         );
-        // Try each expanded query variation (skip index 0 = raw query already tried)
-        for (eq_idx, eq) in expanded_queries.iter().enumerate().skip(1) {
-            if eq_idx > 3 { break; } // limit retries
-            let clean_eq = preprocess_searxng_query(eq);
-            if clean_eq.to_lowercase() == q.to_lowercase() { continue; } // skip duplicates
-            for (inst_idx, base_url) in searx_base_urls.iter().enumerate() {
-                let retry_url = format!(
-                    "{}/search?q={}&format=json&pageno=1",
-                    base_url, urlencoding::encode(&clean_eq)
-                );
-                let retry_key = format!("searxng{}", inst_idx);
-                if circuit_ref.is_open(&retry_key) { continue; }
-                tracing::info!("Retry variation '{}' on instance {}", clean_eq, inst_idx);
-                match tokio::time::timeout(Duration::from_secs(3), client_ref.get(&retry_url).send()).await {
-                    Ok(Ok(resp)) => {
-                        let raw = resp.text().await.unwrap_or_default();
-                        let sanitized = sanitize_json_text(&raw);
-                        if let Ok(data) = serde_json::from_str::<SearxResponse>(&sanitized) {
-                            let retry_scores: Vec<f32> = data.results.iter()
-                                .map(|r| semantic_relevance_score(&q, &r.title, &r.content))
-                                .collect();
-                            let retry_best = retry_scores.iter().cloned().fold(0.0f32, f32::max);
-                            let retry_mean = if !retry_scores.is_empty() {
-                                retry_scores.iter().sum::<f32>() / retry_scores.len() as f32
-                            } else { 0.0 };
-                            tracing::info!(
-                                "Retry variation '{}' got {} results, best={:.3}, mean={:.3}",
-                                clean_eq, data.results.len(), retry_best, retry_mean
-                            );
-                            // If this variation is significantly better, use it
-                            if retry_best > best_score + 0.1 || retry_mean > mean_score + 0.1 {
-                                tracing::info!(
-                                    "Retry variation '{}' is BETTER — replacing results",
-                                    clean_eq
-                                );
-                                circuit_ref.record_success(&retry_key);
-                                // Track last-used for connection-cooldown aware routing
-                                state.searx_last_used.lock().insert(base_url.to_string(), Instant::now());
-                                circuit_ref.record_results(&retry_key, data.results.len() as u64);
-                                for (pos, result) in data.results.into_iter().enumerate() {
-                                    let engine_weight = circuit_ref.weight(&result.engine);
-                                    let normalized = {
-                                        let lower = result.url.to_lowercase();
-                                        let no_fragment = lower.split('#').next().unwrap_or(&lower);
-                                        let no_trailing = no_fragment.trim_end_matches('/');
-                                        let no_www = no_trailing.replacen("://www.", "://", 1);
-                                        let no_mobile = no_www
-                                            .replacen("://m.", "://", 1)
-                                            .replacen("://mobile.", "://", 1);
-                                        strip_tracking_params(&no_mobile)
-                                    };
-                                    let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
-                                    *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
-                                    web_results.push(result);
-                                }
-                                // Re-score after adding new results
-                                break; // stop retrying this variation
-                            }
-                        }
-                    }
-                    _ => {} // timeout or error — skip
-                }
-            }
-        }
     }
 
     // Adaptive threshold: higher when we have many results, lower when few
@@ -3791,7 +4016,8 @@ async fn handle_search(
         let sem_score = semantic_relevance_score(&q, &r.title, &r.content);
         let sem_ok = sem_score >= 0.12;  // slightly lower threshold than web (0.18) since local has richer content
         if title_ok && not_error && !sem_ok {
-            tracing::debug!("Indexer result filtered (sem={:.3}): {}", sem_score, &r.title[..r.title.len().min(50)]);
+            let trimmed: String = r.title.chars().take(50).collect();
+            tracing::debug!("Indexer result filtered (sem={:.3}): {}", sem_score, trimmed);
         }
         title_ok && not_error && sem_ok
     });
@@ -3850,12 +4076,69 @@ async fn handle_search(
             .iter()
             .map(|n| n.to_lowercase())
             .collect();
+    // TITLE-ONLY HARD PENALTY: apply score reduction to results whose title
+    // directly contains an excluded term. Relaxed for alt-listing pages.
+    for r in results.iter_mut() {
+        let title_lower = r.title.to_lowercase();
+        let has_neg_in_title = negative_norm.iter().any(|nt| {
+            title_lower.split_whitespace().any(|w| {
+                let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                let n_clean: String = nt.chars().filter(|c| c.is_alphanumeric()).collect();
+                w_clean == n_clean || w_clean.contains(&n_clean)
+            })
+        });
+        if has_neg_in_title {
+            let alt = is_alternative_listing_page(&r.title, &r.url, &r.content);
+            if alt > 0.6 {
+                // Strong alt-listing page — mild penalty only
+                r.score *= 0.50;
+                let trimmed: String = r.title.chars().take(40).collect();
+                tracing::info!("TITLE HARD PENALTY (RELAXED): alt={:.2} for '{}' -> score *= 0.50", alt, trimmed);
+            } else if alt > 0.3 {
+                // Moderate alt-listing page — moderate penalty
+                r.score *= 0.20;
+                let trimmed: String = r.title.chars().take(40).collect();
+                tracing::info!("TITLE HARD PENALTY (MODERATE): alt={:.2} for '{}' -> score *= 0.20", alt, trimmed);
+            } else {
+                r.score *= 0.01;
+                tracing::info!("TITLE HARD PENALTY: title contains excluded term -> score *= 0.01");
+            }
+        }
+    }
 
+    // For negative-only queries ("not django"), skip the hard removal retain filter.
+    // All search results for the negated term will mention it — removing them all
+    // leaves zero results. Instead, rely on the title penalty + constraint scoring
+    // (applied in score_rerank) to appropriately demote results about the excluded topic.
+    // Queries with BOTH positive and negative constraints (e.g. "python framework not django")
+    // still use the hard filter since there are non-excluded results to keep.
+    if only_negative {
+        tracing::info!(
+            "ONLY NEGATIVE: skipping hard removal for {} results (title penalty + constraint scoring will penalize instead)",
+            before_count
+        );
+    } else {
         results.retain(|r| {
             // Alternative-listing page check: keep comparison/alternative pages
             // even if they mention excluded terms (they are HIGHLY relevant).
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
             if alt_score > 0.3 {
+                // Even for alt-listing pages, check if the TITLE directly contains
+                // an excluded term. If so, remove it - the page is primarily about
+                // the excluded technology, not a genuine alternative listing.
+                let title_lower_alt = r.title.to_lowercase();
+                let title_has_neg = negative_norm.iter().any(|nt| {
+                    title_lower_alt.split_whitespace().any(|w| {
+                        let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                        let n_clean: String = nt.chars().filter(|c| c.is_alphanumeric()).collect();
+                        w_clean == n_clean
+                            || (n_clean.len() >= 3 && w_clean.starts_with(&n_clean)
+                                && n_clean.len() as f32 / w_clean.len() as f32 >= 0.6)
+                    })
+                });
+                if title_has_neg {
+                    return false; // Remove even though alt-listing page
+                }
                 return true;
             }
 
@@ -3898,11 +4181,24 @@ async fn handle_search(
 
             if !should_keep {
                 tracing::info!("HARD NEGATIVE DROP (post-merge): result \"{}\" (local={}) removed because negative constraint matched (not alt page)",
-                    &r.title[..r.title.len().min(50)], r.is_local);
+                    &r.title.chars().take(50).collect::<String>(), r.is_local);
+            } else {
+                // TITLE-ONLY HARD CHECK: even if alt page, demote by 90% if title contains excluded term
+                let title_lower = r.title.to_lowercase();
+                for nt_after in &negative_norm {
+                    if title_lower.split_whitespace().any(|w| {
+                        let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                        w_clean == *nt_after || w_clean.contains(nt_after.as_str())
+                    }) {
+                        // Score penalty moved to separate loop before retain
+                        tracing::info!("TITLE HARD PENALTY: title contains excluded term -> score *= 0.01 (penalty applied in separate loop)");
+                        break;
+                    }
+                }
             }
             should_keep
         });
-
+    }
         let removed = before_count.saturating_sub(results.len());
         if removed > 0 {
             tracing::info!(
@@ -3911,7 +4207,6 @@ async fn handle_search(
             );
         }
     }
-
 
     // 8c. Post-filter re-ranking: boost results whose titles do not contain
     // excluded terms. This ensures genuinely clean results (no negative term
@@ -3965,7 +4260,17 @@ async fn handle_search(
     // Cache for 5 minutes — but never cache empty results
     let response_json = serde_json::to_string(&response).unwrap_or_default();
     if !response.results.is_empty() {
+        let cache_key_clone = cache_key.clone();
+        let response_clone = response_json.clone();
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
+        // Notify any dedup waiters that the result is ready
+        let waiters = state.in_flight.lock().remove(&cache_key_clone).unwrap_or_default();
+        if !waiters.is_empty() {
+            tracing::info!("DEDUP: notifying {} waiter(s) for '{}'", waiters.len(), q_trimmed);
+            for sender in waiters {
+                let _ = sender.send(response_clone.clone());
+            }
+        }
     }
 
     (axum::http::StatusCode::OK, Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({}))))

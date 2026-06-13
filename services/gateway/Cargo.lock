@@ -334,6 +334,7 @@ dependencies = [
  "anyhow",
  "axum",
  "futures",
+ "parking_lot",
  "regex",
  "reqwest",
  "serde",
@@ -1404,6 +1405,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "pin-project-lite",
+ "tokio",
  "tower-layer",
  "tower-service",
 ]
