@@ -186,6 +186,8 @@ services:
       context: ./indexer
       dockerfile: Dockerfile
     container_name: if-dev-indexer
+    mem_limit: 256m
+    mem_reservation: 128m
     volumes:
       - ./indexer/index_data:/app/index_data
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
@@ -197,6 +199,8 @@ services:
       context: ./crawler
       dockerfile: Dockerfile
     container_name: if-dev-crawler
+    mem_limit: 256m
+    mem_reservation: 128m
     network_mode: "service:gluetun"
     volumes:
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
@@ -211,6 +215,8 @@ services:
       context: ./intent-engine
       dockerfile: Dockerfile
     container_name: if-dev-intent-engine
+    mem_limit: 256m
+    mem_reservation: 128m
     volumes:
       - ./intent-engine/models:/app/models
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
@@ -225,6 +231,8 @@ services:
       context: ./gateway
       dockerfile: Dockerfile
     container_name: if-dev-gateway
+    mem_limit: 512m
+    mem_reservation: 256m
     environment:
       - INTENT_ENGINE_URL=http://localhost:3005
       - SEARXNG_URL=http://localhost:8080

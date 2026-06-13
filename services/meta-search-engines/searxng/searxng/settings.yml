@@ -48,8 +48,8 @@ search:
   default_lang: "en"
 
 outgoing:
-  request_timeout: 3.0    # raised from 2.5s — give engines more room
-  max_request_timeout: 6.0
+  request_timeout: 2.0    # reduced from 3.0s — faster failures, no cascading timeouts
+  max_request_timeout: 4.0
   enable_http2: true       # HTTP/2 multiplexing for engines that support it
   pool_maxsize: 20         # increase per-host connection pool from default 10
   keepalive_expiry: 30     # keep idle connections alive longer (default 5s)
@@ -68,40 +68,40 @@ engines:
   # ── Primary engines (via VPN/Gluetun) ──
   - name: bing
     disabled: false
-    timeout: 2.5
+    timeout: 1.5
 
   - name: brave
     disabled: false
-    timeout: 2.5
+    timeout: 1.5
 
   - name: startpage
     disabled: false
-    timeout: 2.5
+    timeout: 1.5
 
   - name: wikipedia
     disabled: false
-    timeout: 2.0
+    timeout: 1.5
 
   - name: mojeek
     disabled: false
-    timeout: 2.5
+    timeout: 1.5
 
   - name: yandex
     disabled: false
-    timeout: 2.5
+    timeout: 1.5
 
   # ── New engines (via VPN) ──
   - name: duckduckgo
     disabled: false
-    timeout: 2.5
+    timeout: 1.5
 
   - name: presearch
     disabled: true    # DISABLED: getting 403 rate-limited (suspended 300s), causes cascading timeouts
-    timeout: 2.0
+    timeout: 1.5
 
   - name: marginalia
     disabled: false
-    timeout: 2.5
+    timeout: 1.5
 
   # ── Onion engines (via Tor SOCKS5) ──
   - name: ahmia

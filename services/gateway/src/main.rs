@@ -6,7 +6,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 // ─── API Types ───────────────────────────────────────────────────────
@@ -1745,7 +1746,7 @@ impl CircuitBreaker {
     }
 
     fn is_open(&self, engine: &str) -> bool {
-        let engines = self.engines.lock().unwrap();
+        let engines = self.engines.lock();
         if let Some(health) = engines.get(engine) {
             if let Some(until) = health.open_until {
                 return Instant::now() < until;
@@ -1755,7 +1756,7 @@ impl CircuitBreaker {
     }
 
     fn record_success(&self, engine: &str) {
-        let mut engines = self.engines.lock().unwrap();
+        let mut engines = self.engines.lock();
         let health = engines.entry(engine.to_string()).or_insert(EngineHealth {
             consecutive_failures: 0,
             last_failure: None,
@@ -1772,7 +1773,7 @@ impl CircuitBreaker {
     }
 
     fn record_failure(&self, engine: &str) {
-        let mut engines = self.engines.lock().unwrap();
+        let mut engines = self.engines.lock();
         let health = engines.entry(engine.to_string()).or_insert(EngineHealth {
             consecutive_failures: 0,
             last_failure: None,
@@ -1800,7 +1801,7 @@ impl CircuitBreaker {
 
     // Record how many results an engine returned (for weight calculation)
     fn record_results(&self, engine: &str, count: u64) {
-        let mut engines = self.engines.lock().unwrap();
+        let mut engines = self.engines.lock();
         let health = engines.entry(engine.to_string()).or_insert(EngineHealth {
             consecutive_failures: 0,
             last_failure: None,
@@ -1820,7 +1821,7 @@ impl CircuitBreaker {
     //   - Unreliable engines (low success rate): down to 0.5
     // This is used to boost/penalize RRF contributions from each engine.
     fn weight(&self, engine: &str) -> f32 {
-        let engines = self.engines.lock().unwrap();
+        let engines = self.engines.lock();
         if let Some(health) = engines.get(engine) {
             let total = health.total_successes + health.total_failures;
             if total < 5 {
@@ -1866,7 +1867,7 @@ impl SearchCache {
     }
 
     fn get(&self, key: &str) -> Option<String> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock();
         if let Some(entry) = entries.get(key) {
             if entry.inserted_at.elapsed() < entry.ttl {
                 return Some(entry.response_json.clone());
@@ -1876,7 +1877,7 @@ impl SearchCache {
     }
 
     fn put(&self, key: String, response_json: String, ttl: Duration) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         entries.insert(key, CacheEntry {
             response_json,
             inserted_at: Instant::now(),
@@ -2147,7 +2148,7 @@ impl RateLimitTracker {
     }
 
     fn record(&self) {
-        let mut events = self.events.lock().unwrap();
+        let mut events = self.events.lock();
         let now = Instant::now();
         // Prune events older than 5 minutes
         events.retain(|e| now.duration_since(*e) < Duration::from_secs(300));
@@ -2155,7 +2156,7 @@ impl RateLimitTracker {
     }
 
     fn count_in_window(&self, window_secs: u64) -> usize {
-        let events = self.events.lock().unwrap();
+        let events = self.events.lock();
         let now = Instant::now();
         events.iter().filter(|e| now.duration_since(**e) < Duration::from_secs(window_secs)).count()
     }
@@ -2193,7 +2194,7 @@ impl ResultVolumeTracker {
 
     // Record result count for an engine. Returns true if degraded.
     fn record(&self, engine: &str, count: u64) -> bool {
-        let mut engines = self.engines.lock().unwrap();
+        let mut engines = self.engines.lock();
         let volume = engines.entry(engine.to_string()).or_insert(EngineVolume {
             rolling_sum: 0.0,
             rolling_count: 0.0,
@@ -2227,7 +2228,7 @@ impl ResultVolumeTracker {
                 engine, count, avg
             );
             // Record degradation event
-            let mut events = self.degradation_events.lock().unwrap();
+            let mut events = self.degradation_events.lock();
             let now = Instant::now();
             events.retain(|e| now.duration_since(*e) < Duration::from_secs(300));
             events.push(now);
@@ -2238,7 +2239,7 @@ impl ResultVolumeTracker {
 
     // Count degradation events in the last N seconds
     fn degradation_count(&self, window_secs: u64) -> usize {
-        let events = self.degradation_events.lock().unwrap();
+        let events = self.degradation_events.lock();
         let now = Instant::now();
         events
             .iter()
@@ -2248,7 +2249,7 @@ impl ResultVolumeTracker {
 
     // Get expected result count for an engine (rolling average)
     fn expected_count(&self, engine: &str) -> f64 {
-        let engines = self.engines.lock().unwrap();
+        let engines = self.engines.lock();
         engines
             .get(engine)
             .filter(|v| v.rolling_count >= 2.0)
@@ -2604,7 +2605,7 @@ async fn main() {
         http_client: reqwest::Client::builder()
             .timeout(Duration::from_secs(10))  // Allow up to 10s for external engines (VPN/Tor overhead)
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .pool_max_idle_per_host(20)
+            .pool_max_idle_per_host(128)
             .connect_timeout(Duration::from_secs(1))
             .tcp_nodelay(true)                          // Disable Nagle's — saves 5-40ms on small payloads
             .pool_idle_timeout(Duration::from_secs(90))   // Keep connections warm between bursts
@@ -2776,7 +2777,7 @@ async fn handle_search(
         } else {
             vec!["http://127.0.0.1:8080"]
         };
-        let searx_last_used = state.searx_last_used.lock().unwrap();
+        let searx_last_used = state.searx_last_used.lock();
         urls.sort_by(|a, b| {
             let a_warm = searx_last_used.get(*a).copied().unwrap_or(std::time::Instant::now());
             let b_warm = searx_last_used.get(*b).copied().unwrap_or(std::time::Instant::now());
@@ -3165,7 +3166,7 @@ async fn handle_search(
                     circuit_ref.record_success(instance_key);
                     // Track last-used time for connection-cooldown aware routing
                     if let Some(url) = searx_key_to_url.get(instance_key) {
-                        state.searx_last_used.lock().unwrap().insert(url.clone(), Instant::now());
+                        state.searx_last_used.lock().insert(url.clone(), Instant::now());
                     }
                     circuit_ref.record_results(instance_key, n as u64);
                     for r in &searx_data.results {
@@ -3233,7 +3234,7 @@ async fn handle_search(
             // Prefer the most recently used (warmest) instance — warm connections
             // avoid TCP+TLS handshake latency on retries.
             let warmest_idx = {
-                let last_used = state.searx_last_used.lock().unwrap();
+                let last_used = state.searx_last_used.lock();
                 (0..searx_base_urls.len())
                     .filter(|i| !circuit_ref.is_open(&format!("searxng{}", i)))
                     .max_by(|&a, &b| {
@@ -3267,7 +3268,7 @@ async fn handle_search(
                                 tracing::info!("Smart retry returned {} results", retry_count);
                                 circuit_ref.record_success(&retry_key);
                                 // Track last-used for connection-cooldown aware routing
-                                state.searx_last_used.lock().unwrap().insert(retry_base.to_string(), Instant::now());
+                                state.searx_last_used.lock().insert(retry_base.to_string(), Instant::now());
                                 circuit_ref.record_results(&retry_key, retry_count as u64);
                                 for (pos, result) in data.results.into_iter().enumerate() {
                                     let engine_weight = circuit_ref.weight(&result.engine);
@@ -3545,7 +3546,7 @@ async fn handle_search(
                                 );
                                 circuit_ref.record_success(&retry_key);
                                 // Track last-used for connection-cooldown aware routing
-                                state.searx_last_used.lock().unwrap().insert(base_url.to_string(), Instant::now());
+                                state.searx_last_used.lock().insert(base_url.to_string(), Instant::now());
                                 circuit_ref.record_results(&retry_key, data.results.len() as u64);
                                 for (pos, result) in data.results.into_iter().enumerate() {
                                     let engine_weight = circuit_ref.weight(&result.engine);
