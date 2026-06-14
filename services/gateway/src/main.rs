@@ -202,6 +202,8 @@ struct ImageResult {
     #[serde(default)]
     description: String,
     source: String,
+    #[serde(default)]
+    score: f32
 }
 
 #[derive(Serialize)]
@@ -216,6 +218,8 @@ struct VideoResult {
     thumbnail: String,
     #[serde(default)]
     source: String,
+    #[serde(default)]
+    score: f32
 }
 
 #[derive(Serialize)]
@@ -227,6 +231,8 @@ struct NewsResult {
     #[serde(default)]
     published_at: String,
     source: String,
+    #[serde(default)]
+    score: f32
 }
 
 // ─── Merged Result (Unified Local + Web) ─────────────────────────────
@@ -1014,7 +1020,7 @@ fn constraint_score(
         }
     }
 
-    score.clamp(0.0, 2.0)
+    score.clamp(0.0, 1.0)
 }
 
 // ─── IP Rotation ────────────────────────────────────────────────────
@@ -2399,6 +2405,14 @@ async fn handle_images(
                 let thumb = if !r.thumbnail.is_empty() { r.thumbnail.clone() }
                     else if !r.thumbnail_src.is_empty() { r.thumbnail_src.clone() }
                     else { r.source.clone() };
+                let img_title = &r.title;
+                let img_content = &r.content;
+                let img_tokens: Vec<&str> = q.split_whitespace()
+                    .filter(|w| w.len() > 2)
+                    .collect();
+                let img_tm = img_tokens.iter().filter(|t| img_title.to_lowercase().contains(*t)).count();
+                let img_cm = img_tokens.iter().filter(|t| img_content.to_lowercase().contains(*t)).count();
+                let img_score = 0.5 + (img_tm as f32 * 0.15) + (img_cm as f32 * 0.05);
                 ImageResult {
                     title: r.title,
                     url: r.url,
@@ -2406,6 +2420,7 @@ async fn handle_images(
                     thumbnail_url: thumb,
                     description: r.content,
                     source: r.engine,
+                    score: img_score.min(1.0),
                 }
             }).collect(),
             Err(e) => {
@@ -2416,7 +2431,7 @@ async fn handle_images(
     };
 
     let searx1_fut = async {
-        match tokio::time::timeout(Duration::from_secs(6), state.http_client.get(&searx_url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&searx_url).send()).await {
             Ok(Ok(resp)) => match resp.text().await {
                 Ok(raw) => parse_images(raw),
                 Err(e) => { tracing::warn!("SearXNG1 image body read error: {}", e); vec![] }
@@ -2514,6 +2529,7 @@ async fn handle_videos(
                                 thumbnail: format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", vid),
                                 video_id: vid,
                                 source: "invidious".to_string(),
+                                score: 0.5,
                             })
                         })
                         .collect::<Vec<_>>(),
@@ -2524,7 +2540,7 @@ async fn handle_videos(
             }
         },
         async {
-            match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&searx_video_url).send()).await {
+            match tokio::time::timeout(Duration::from_secs(3), state.http_client.get(&searx_video_url).send()).await {
                 Ok(Ok(resp)) => match resp.text().await {
                     Ok(raw) => {
                         let sanitized = sanitize_json_text(&raw);
@@ -2533,6 +2549,14 @@ async fn handle_videos(
                                 let thumbnail = if !r.thumbnail.is_empty() { r.thumbnail.clone() }
                                     else if !r.img_src.is_empty() { r.img_src.clone() }
                                     else { String::new() };
+                                let vid_title = &r.title;
+                                let vid_content = &r.content;
+                                let vid_tokens: Vec<&str> = q.split_whitespace()
+                                    .filter(|w| w.len() > 2)
+                                    .collect();
+                                let vid_tm = vid_tokens.iter().filter(|t| vid_title.to_lowercase().contains(*t)).count();
+                                let vid_cm = vid_tokens.iter().filter(|t| vid_content.to_lowercase().contains(*t)).count();
+                                let vid_score = 0.5 + (vid_tm as f32 * 0.15) + (vid_cm as f32 * 0.05);
                                 VideoResult {
                                     title: r.title,
                                     url: r.url,
@@ -2540,6 +2564,7 @@ async fn handle_videos(
                                     video_id: String::new(),
                                     thumbnail,
                                     source: r.engine,
+                                    score: vid_score.min(1.0),
                                 }
                             }).collect::<Vec<_>>(),
                             Err(e) => { tracing::warn!("SearXNG video parse error: {}", e); vec![] }
@@ -2613,12 +2638,21 @@ async fn handle_news(
     let parse_news = |raw: String| -> Vec<NewsResult> {
         let sanitized = sanitize_json_text(&raw);
         match serde_json::from_str::<SearxNewsResponse>(&sanitized) {
-            Ok(data) => data.results.into_iter().map(|r| NewsResult {
-                title: r.title,
-                url: r.url,
-                description: r.content,
-                published_at: r.published_date.unwrap_or_default(),
-                source: r.engine,
+            Ok(data) => data.results.into_iter().map(|r| {
+                let news_tokens: Vec<&str> = q.split_whitespace()
+                    .filter(|w| w.len() > 2)
+                    .collect();
+                let news_tm = news_tokens.iter().filter(|t| r.title.to_lowercase().contains(*t)).count();
+                let news_cm = news_tokens.iter().filter(|t| r.content.to_lowercase().contains(*t)).count();
+                let news_score = 0.5 + (news_tm as f32 * 0.15) + (news_cm as f32 * 0.05);
+                NewsResult {
+                    title: r.title,
+                    url: r.url,
+                    description: r.content,
+                    published_at: r.published_date.unwrap_or_default(),
+                    source: r.engine,
+                    score: news_score.min(1.0),
+                }
             }).collect(),
             Err(e) => {
                 tracing::warn!("SearXNG news parse error: {}", e);
@@ -2772,7 +2806,7 @@ async fn main() {
         .route("/images", get(handle_images))
         .route("/videos", get(handle_videos))
         .route("/news", get(handle_news))
-        .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
+        .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(10)));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
     tracing::info!("Gateway listening on {} (circuit-breaker + cache)", addr);
@@ -2855,7 +2889,7 @@ async fn handle_search(
     // Retry intent engine up to 2 extra times with backoff.
     // Handles cold-start after container restart (model load takes 5-15s).
     let intent_fut = async {
-        let delays = [0u64, 500, 1000]; // 0ms, 500ms, 1000ms
+        let delays = [0u64, 200, 400]; // 0ms, 200ms, 400ms
         for (attempt, delay_ms) in delays.iter().enumerate() {
             if *delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
@@ -3184,7 +3218,7 @@ async fn handle_search(
         ).await {
             Ok(results) => results,
             Err(_) => {
-                tracing::warn!("SearXNG fan-out timed out after 5s — returning partial results");
+                tracing::warn!("SearXNG fan-out timed out after 3s — returning partial results");
                 vec![]
             }
         }
@@ -3333,10 +3367,10 @@ async fn handle_search(
     // For negative-only queries, also generate alternative-seeking variations so the
     // retry actually fetches pages like "Django vs Flask" instead of just Django's docs.
     let alt_queries: Vec<String> = if let Some(ref s_q) = stripped_query {
+        // Single alt query is faster and enough for SearXNG to find alternative listings.
+        // Multiple variations (3+) double SearXNG fan-out to 6+ URLs, increasing latency.
         let mut alts = Vec::new();
         alts.push(format!("{} alternatives", s_q));
-        alts.push(format!("alternatives to {}", s_q));
-        alts.push(format!("{} vs", s_q));
         alts
     } else {
         Vec::new()
@@ -3493,7 +3527,7 @@ async fn handle_search(
         let mut retry_futs = Vec::new();
         let retry_timeout = Duration::from_secs(2); // shorter than initial 3s
         for (eq_idx, eq) in expanded_queries.iter().enumerate().skip(1) {
-            if eq_idx > 3 { break; } // limit variations
+            if eq_idx > 1 { break; } // limit to 1 retry variation (was 3)
             let clean_eq = preprocess_searxng_query(eq);
             if clean_eq.to_lowercase() == q.to_lowercase() { continue; } // skip duplicate
             for (inst_idx, base_url) in searx_base_urls.iter().enumerate() {
@@ -3929,7 +3963,7 @@ async fn handle_search(
 
     if !intent.structured_constraints.negative.is_empty() {
         let before_count = web_results.len();
-        let negative_norm: Vec<String> = intent
+        let mut negative_norm: Vec<String> = intent
             .structured_constraints
             .negative
             .iter()
@@ -4054,7 +4088,117 @@ async fn handle_search(
     let intent_clone = intent.intent.clone();
     let constraints_clone = intent.structured_constraints.clone();
     let distribution_clone = intent.distribution.clone();
-    let mut results = tokio::task::spawn_blocking(move || {
+    
+    // Apply hard negative filter to web_results for only-negative queries:
+    // Drop results whose domain matches the excluded term's official site.
+    // This runs after ALL SearXNG sources (initial + retry) are combined.
+    // Also checks the raw query for negation words as a fallback (intent engine may
+    // misclassify "not react" as positive constraint "+react" instead of negative).
+    // Check for negation words in the raw query as a fallback.
+    // The intent engine may misclassify "not react" as positive constraint "+react"
+    // instead of negative. When query_has_negation is true, we derive negative terms
+    // directly from the raw query by parsing words that follow negation markers.
+    let query_has_negation = q.starts_with("not ") || q.starts_with("no ")
+        || q.starts_with("without ") || q.contains(" not ") || q.contains(" -");
+    
+    // Extract negative terms from the original query string (bypasses intent engine)
+    // Handles: "not react not vue" → ["react", "vue"]
+    //          "without node not django" → ["node", "django"]
+    //          "not prometheus not grafana not datadog" → ["prometheus", "grafana", "datadog"]
+    let query_neg_terms: Vec<String> = if query_has_negation {
+        let q_lower = q.to_lowercase();
+        let negation_markers = ["not ", "no ", "without "];
+        let mut terms: Vec<String> = Vec::new();
+        let words: Vec<&str> = q_lower.split_whitespace().collect();
+        for (i, word) in words.iter().enumerate() {
+            // Check if this word is a negation marker
+            let neg_words: [&str; 3] = ["no", "not", "without"];
+            let is_neg = negation_markers.iter().any(|m| *m == format!("{} ", word))
+                || neg_words.contains(word)
+                || word.starts_with("-");
+            if is_neg {
+                // Grab the next word (unless it's also a negation marker)
+                if i + 1 < words.len() {
+                    let next = words[i + 1];
+                    let next_is_neg = negation_markers.iter().any(|m| *m == format!("{} ", next))
+                        || neg_words.contains(&next)
+                        || next.starts_with("-");
+                    if !next_is_neg && next.len() >= 2 {
+                        let clean: String = next.chars().filter(|c| c.is_alphanumeric()).collect();
+                        if !terms.contains(&clean) && !clean.is_empty() {
+                            terms.push(clean);
+                        }
+                    }
+                }
+            }
+        }
+        terms
+    } else {
+        vec![]
+    };
+    
+    // Fallback: if query_has_negation but intent engine put terms in positive instead of negative,
+    // use the query-derived terms. If the intent engine correctly classified them as negative,
+    // use those (they may have cleaner normalization).
+    let has_only_negative = if query_has_negation {
+        // Query has negation words — use query-derived terms regardless of intent engine
+        if !query_neg_terms.is_empty() {
+            true
+        } else {
+            // Fall through to intent-engine check
+            !intent.structured_constraints.negative.is_empty()
+                && intent.structured_constraints.positive.is_empty()
+        }
+    } else {
+        // Standard check: both negatives present and positives absent
+        !intent.structured_constraints.negative.is_empty()
+            && intent.structured_constraints.positive.is_empty()
+    };
+    
+    // Use query-derived terms when available (they're more reliable for negation),
+    // otherwise fall back to intent engine's negative constraints.
+    let neg_terms: Vec<String> = if !query_neg_terms.is_empty() {
+        query_neg_terms.clone()
+    } else {
+        intent.structured_constraints.negative.iter()
+            .map(|n| n.to_lowercase())
+            .collect()
+    };
+    if has_only_negative {
+        let before = web_results.len();
+        web_results.retain(|item| {
+            if let Ok(parsed) = reqwest::Url::parse(&item.url) {
+                if let Some(host) = parsed.host_str() {
+                    let host_lower = host.to_lowercase();
+                    for neg in &neg_terms {
+                        let neg_clean: String = neg.chars().filter(|c| c.is_alphanumeric()).collect();
+                        if neg_clean.len() >= 3 {
+                            if host_lower == format!("{}.com", neg_clean)
+                                || host_lower == format!("www.{}.com", neg_clean)
+                                || host_lower == format!("{}.org", neg_clean)
+                                || host_lower == format!("{}.io", neg_clean)
+                                || host_lower == format!("{}.dev", neg_clean)
+                                || host_lower == format!("{}.net", neg_clean)
+                                || host_lower.starts_with(&format!("{}.", neg_clean))
+                                || host_lower.contains(&format!(".{}", neg_clean))
+                            {
+                                tracing::info!("ONLY NEGATIVE FILTER: dropping '{}' (host={} matches term '{}')",
+                                    item.url, host_lower, neg_clean);
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            true
+        });
+        let dropped = before - web_results.len();
+        if dropped > 0 {
+            tracing::info!("ONLY NEGATIVE FILTER: dropped {} results from {} (official domain matches)", dropped, before);
+        }
+    }
+    
+let mut results = tokio::task::spawn_blocking(move || {
         merge_local_and_web(
             local_results,
             web_results,
@@ -4068,14 +4212,26 @@ async fn handle_search(
     // 8b. Post-merge hard negative filter: apply negative constraints to ALL results
     // (local + web). The pre-merge filter only catches web results; local index
     // results that match negative terms must also be removed here.
-    if !intent.structured_constraints.negative.is_empty() {
+    // Uses both intent engine's negative constraints AND query-derived terms
+    // (for when intent engine misclassifies "not react" as positive "+react").
+    let has_neg_constraints = !intent.structured_constraints.negative.is_empty()
+        || !query_neg_terms.is_empty();
+    if has_neg_constraints {
         let before_count = results.len();
-        let negative_norm: Vec<String> = intent
+        let mut negative_norm: Vec<String> = intent
             .structured_constraints
             .negative
             .iter()
             .map(|n| n.to_lowercase())
             .collect();
+        // Add query-derived negative terms (from fallback parsing) to catch cases
+        // where the intent engine misclassified negation as positive constraints.
+        // query_neg_terms is defined above in the pre-merge B3 filter section.
+        for qt in &query_neg_terms {
+            if !negative_norm.contains(qt) {
+                negative_norm.push(qt.to_lowercase());
+            }
+        }
     // TITLE-ONLY HARD PENALTY: apply score reduction to results whose title
     // directly contains an excluded term. Relaxed for alt-listing pages.
     for r in results.iter_mut() {
