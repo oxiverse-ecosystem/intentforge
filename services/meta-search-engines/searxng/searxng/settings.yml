@@ -7,11 +7,8 @@ use_default_settings:
       - startpage
       - wikipedia
       - mojeek
-      - yandex
-      - duckduckgo
-      - ahmia
-      - presearch
       - marginalia
+      # (removed duckduckgo + yandex: CAPTCHA'd/blocked through ProtonVPN 80%+ of the time)
       # ── Image engines (multiple providers for redundancy) ──
       - bing images
       - google images
@@ -87,12 +84,12 @@ engines:
     timeout: 1.5
 
   - name: yandex
-    disabled: false
+    disabled: true   # DISABLED: blocked through non-Russian VPN IPs, always times out
     timeout: 1.5
 
   # ── New engines (via VPN) ──
   - name: duckduckgo
-    disabled: false
+    disabled: true   # DISABLED: CAPTCHA'd through ProtonVPN exit IPs 80%+ of the time
     timeout: 1.5
 
   - name: presearch

@@ -3532,6 +3532,9 @@ async fn handle_search(
             if clean_eq.to_lowercase() == q.to_lowercase() { continue; } // skip duplicate
             for (inst_idx, base_url) in searx_base_urls.iter().enumerate() {
                 let retry_key = format!("searxng{}", inst_idx);
+                // Skip SearXNG2 (Tor) on retry — Tor is 2-3x slower and wont produce
+                // faster or meaningfully different results for the same query.
+                if inst_idx > 0 { continue; }
                 if circuit_ref.is_open(&retry_key) { continue; }
                 let retry_url = format!(
                     "{}/search?q={}&format=json&pageno=1",
