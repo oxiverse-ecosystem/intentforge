@@ -279,12 +279,45 @@ struct UnifiedResponse {
 
 fn domain_authority_score(url: &str) -> f32 {
     let url_lower = url.to_lowercase();
-    let host = reqwest::Url::parse(url)
-        .ok()
+    let parsed = reqwest::Url::parse(url).ok();
+    let host = parsed.as_ref()
         .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
         .unwrap_or_default();
+    let path = parsed.as_ref()
+        .map(|u| u.path().to_lowercase())
+        .unwrap_or_default();
+    let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let n_segments = path_segments.len();
 
     let mut score: f32 = 0.5; // baseline for unknown domains
+
+    // ── Structural URL authority for reference/research content ──
+    // Deep, descriptive paths (long segments, many hyphens, numeric IDs) indicate
+    // database-driven reference content (reports, documentation, catalogs) which
+    // carries inherent authority. Purely structural — no keyword or domain lists.
+    if n_segments >= 2 {
+        let total_chars: usize = path_segments.iter().map(|s| s.len()).sum();
+        let total_hyphens: usize = path_segments.iter().map(|s| s.matches('-').count()).sum();
+        let avg_seg_len = total_chars as f32 / n_segments as f32;
+
+        // Deep, descriptive path with many hyphens → reference/report content
+        // Examples: /privacy-search-engine-market-size-share-trends-analysis
+        if n_segments >= 3 && avg_seg_len > 12.0 && total_hyphens >= 3 {
+            score += 0.35;
+        }
+        // Numeric-heavy segments → database-driven pages (authoritative reports)
+        let has_numeric_segment = path_segments.iter().any(|s| {
+            let numeric_count = s.chars().filter(|c| c.is_numeric()).count();
+            s.len() >= 6 && numeric_count >= s.len() / 2
+        });
+        if n_segments >= 3 && has_numeric_segment {
+            score = score.max(0.75); // floor at high authority
+        }
+        // Moderate depth with long segments → structured content
+        if n_segments >= 2 && avg_seg_len > 15.0 {
+            score += 0.20;
+        }
+    }
 
     // ── TLD-based trust scoring (algorithmic) ──
     // Institutional TLDs: highest trust
@@ -320,9 +353,7 @@ fn domain_authority_score(url: &str) -> f32 {
     }
 
     // Code hosting signal: path contains repo-like structure
-    let path = reqwest::Url::parse(url).ok().map(|u| u.path().to_lowercase()).unwrap_or_default();
-    let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if path_segments.len() >= 2 {
+    if n_segments >= 2 {
         // Looks like /owner/repo pattern (code hosting)
         let has_repo_pattern = path_segments[0].len() >= 2
             && path_segments[1].len() >= 2
@@ -423,6 +454,38 @@ fn freshness_score(url: &str, intent: &str) -> f32 {
         || url_lower.contains("/api/") || url_lower.contains("/reference/")
     {
         estimated_age_hours = estimated_age_hours.max(168.0);
+    }
+
+    // Structural URL analysis for static/reference content detection.
+    // Deep, descriptive paths (long segments, high hyphen density) are characteristic
+    // of reference content (reports, documentation) that remains relevant for years.
+    // This is purely structural — no keyword lists or domain names.
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        let path = parsed.path().to_lowercase();
+        let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let n_segments = path_segments.len();
+
+        if n_segments >= 2 {
+            let total_chars: usize = path_segments.iter().map(|s| s.len()).sum();
+            let total_hyphens: usize = path_segments.iter().map(|s| s.matches('-').count()).sum();
+            let avg_seg_len = total_chars as f32 / n_segments as f32;
+
+            // Deep, descriptive path with many hyphens → reference/report content
+            // Examples: /privacy-search-engine-market-size-share-trends-2025-2026
+            // These URLs have: n_segments≥2, avg_seg_len>15, total_hyphens≥3
+            if n_segments >= 3 && avg_seg_len > 12.0 && total_hyphens >= 3 {
+                estimated_age_hours = estimated_age_hours.min(1.0);
+            }
+            // Deep path with numeric-heavy segments = database-driven pages (reports, catalogs)
+            if n_segments >= 3 {
+                let has_numeric_segment = path_segments.iter().any(|s| {
+                    s.len() >= 6 && s.chars().filter(|c| c.is_numeric()).count() >= s.len() / 2
+                });
+                if has_numeric_segment {
+                    estimated_age_hours = estimated_age_hours.min(1.0);
+                }
+            }
+        }
     }
 
     // Exponential decay: score = exp(-age / half_life)
@@ -1248,13 +1311,17 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
     let combined = unigram_combined * 0.8 + bigram_score * 0.2;
 
     // Adaptive coverage threshold: shorter queries need higher per-term match rate
-    // to avoid false positives. Longer queries can tolerate partial matches.
+    // to avoid false positives. Longer queries can tolerate partial matches but
+    // not too lenient — a single term match on a 5-term query means the result
+    // barely touches the topic. Dictionary definitions of a single word ("deploy")
+    // should not pass for "how to deploy fastapi with postgres on ubuntu".
     let min_coverage = match query_terms.len() {
         1 => 1.0,   // single term must match exactly
         2 => 0.45,  // at least 1 of 2
         3 => 0.30,  // at least 1 of 3
-        4 => 0.20,  // 4 terms: lenient
-        _ => 0.15,  // 5+ terms: very lenient for niche/long queries (was 0.20)
+        4 => 0.25,  // at least 1 of 4 (was 0.20 — tightened)
+        5 => 0.25,  // at least 2 of 5 (was 0.15 — tightened for dictionary definition prevention)
+        _ => 0.20,  // 6+ terms (was 0.15)
     };
     if coverage < min_coverage {
         if coverage < 0.10 {
@@ -1637,18 +1704,35 @@ fn preprocess_searxng_query(query: &str) -> String {
         "best", "top", "good", "bad", "new", "old", "big", "small",
         "great", "awesome", "cool", "popular", "powerful", "amazing",
     ].iter().copied().collect();
+
+    // Action verbs that trigger dictionary/definition results on Bing/Google
+    // when used as standalone nouns: "deploy" → dictionary definition of "deploy",
+    // "install" → documentation for installing unrelated software, etc.
+    // Only stripped when the query has enough remaining content (>3 words).
+    let action_verbs: std::collections::HashSet<&str> = [
+        "deploy", "implement", "configure", "setup", "install", "migrate",
+        "optimize", "compile", "debug", "integrate", "initialize", "instantiate",
+        "provision", "orchestrate", "containerize", "virtualize",
+        "download", "upload", "import", "export", "backup", "restore",
+        "monitor", "observe", "instrument", "profile", "benchmark",
+    ].iter().copied().collect();
     
     let words: Vec<&str> = cleaned.split_whitespace().collect();
-    if words.len() > 2 {
-        // Only strip noise adjectives if the query has enough remaining content
+    if words.len() > 3 {
+        // Strip noise adjectives
         let filtered: Vec<&str> = words.iter()
             .filter(|w| !noise_adjectives.contains(*w))
             .copied()
             .collect();
-        if filtered.len() >= 2 {
+        // Strip action verbs that trigger dictionary results
+        let filtered: Vec<&str> = filtered.iter()
+            .filter(|w| !action_verbs.contains(*w))
+            .copied()
+            .collect();
+        if filtered.len() >= 3 {
             cleaned = filtered.join(" ");
         }
-        // If stripping would leave < 2 words, keep original (query is too short)
+        // If stripping would leave < 3 words, keep original (query is too short)
     }
     
     // If cleaned is empty or too short, fall back to original
@@ -2086,8 +2170,73 @@ fn merge_local_and_web(
         let semantic = semantic_relevance_score(query, &r.title, &r.content);
         if semantic > _max_semantic { _max_semantic = semantic; }
         let intent_boost = calculate_intent_boost(&r.url, &r.title, query, intent);
-        let freshness = freshness_score(&r.url, intent);
-        let quality = content_quality_score(&r.content);
+        let mut freshness = freshness_score(&r.url, intent);
+        let mut quality = content_quality_score(&r.content);
+
+        // Local index artifact gate: if a local result has near-zero semantic relevance
+        // to the query, it's an irrelevant local page (e.g., a different project's README
+        // that happens to contain one matching term). Crush its quality score so it sinks
+        // below web search results.
+        if r.is_local && semantic < 0.12 {
+            quality *= 0.05;
+        }
+
+        // Dictionary/definition site penalty: detect definition pages algorithmically
+        // via content structure (phonetic notation, part-of-speech labels, brevity)
+        // rather than hardcoded domain lists. This catches any dictionary/glossary site
+        // regardless of domain.
+        let is_definition_site = {
+            let title_lower = r.title.to_lowercase();
+            let content_prefix = r.content.chars().take(300).collect::<String>().to_lowercase();
+            let title_words: Vec<&str> = title_lower.split_whitespace().collect();
+            // Definition pages have characteristic content structure:
+            // - Phonetic notation: /ˈwɜːd/ or /wɜrd/ patterns (slashes with phonetic chars)
+            let has_phonetic = content_prefix.contains("/ˈ") || content_prefix.contains("/ˌ")
+                || content_prefix.contains("/'") || content_prefix.contains("/-");
+            // - Part-of-speech labels at content start
+            let has_pos_label = content_prefix.starts_with("noun")
+                || content_prefix.starts_with("verb")
+                || content_prefix.starts_with("adjective")
+                || content_prefix.starts_with("adverb")
+                || content_prefix.starts_with("preposition")
+                || content_prefix.starts_with("conjunction")
+                || content_prefix.starts_with("interjection")
+                || content_prefix.starts_with("pronoun")
+                || content_prefix.starts_with("determiner")
+                || content_prefix.starts_with("abbreviation");
+            // - Very short content snippet (< 200 chars) with single-word title matching URL path
+            let content_is_short = r.content.len() < 200;
+            let short_title = title_words.len() <= 3;
+            let has_single_segment_path = reqwest::Url::parse(&r.url)
+                .ok()
+                .map(|u| {
+                    let segs: Vec<&str> = u.path().split('/').filter(|s| !s.is_empty()).collect();
+                    segs.len() <= 2 && u.path().chars().filter(|&c| c == '-').count() <= 1
+                })
+                .unwrap_or(false);
+            (has_phonetic || has_pos_label) && short_title
+                || has_pos_label && content_is_short
+                || has_phonetic && has_single_segment_path
+        };
+        // Only penalize when the query is NOT about definitions (no "define", "meaning", "definition" in query)
+        let q_lower_check = query.to_lowercase();
+        let is_definition_query = q_lower_check.contains("define")
+            || q_lower_check.contains("definition")
+            || q_lower_check.contains("meaning of")
+            || q_lower_check.contains("what does")
+            || q_lower_check.contains("what is");
+        if is_definition_site && !is_definition_query {
+            // Heavy penalty — dictionary definitions are useless for technical queries
+            // Override quality to near-zero so these results sink to the bottom
+            quality *= 0.10;
+            // Also reduce freshness since definition content is static
+            freshness *= 0.20;
+            tracing::info!(
+                "DICTIONARY SITE PENALTY: '{}' → quality*0.10, freshness*0.20",
+                r.url.chars().take(60).collect::<String>()
+            );
+        }
+
         let c_score = constraint_score(&r.title, &r.content, &r.url, constraints);
         let consensus = consensus_score(&r.sources);
 
@@ -2134,7 +2283,9 @@ fn merge_local_and_web(
     // --- Thin-Result Detection: boost scores when few results or low max score ---
     // For niche topics (few results returned, low max score), apply a proportional
     // boost to ensure the top results surface with reasonable confidence.
-    // Also lower the semantic coverage threshold to be more lenient on term matching.
+    // GATE: only boost if the best result has MULTIPLE query term matches (not just one).
+    // This prevents garbage results (dictionary definitions, single-word match pages)
+    // from being amplified to the top.
     if merged.len() < 15 && merged.len() > 0 {
         let max_score = merged.iter().map(|r| r.score).fold(0.0f32, f32::max);
         // Semantic relevance gate: only apply thin-result boost if at least one result
@@ -2143,13 +2294,35 @@ fn merge_local_and_web(
         // Use cached max_semantic from scoring loop (avoids recomputing all scores)
         let max_semantic = _max_semantic;
         if max_score < 0.30 && max_semantic > 0.05 {
-            let boost_factor = (0.30 / max_score.max(0.01)).min(2.5);
-            tracing::info!(
-                "THIN RESULTS: merged.len={} max_score={:.3} max_sem={:.3} boost={:.2}x",
-                merged.len(), max_score, max_semantic, boost_factor
-            );
-            for r in merged.iter_mut() {
-                r.score *= boost_factor;
+            // ADDITIONAL GATE: Check if the best-scoring result matches at least 2 unique
+            // query terms (after stemming). Single-term matches are usually dictionary
+            // definitions or tangentially related content that shouldn't be amplified.
+            let query_terms_raw: Vec<&str> = query.split_whitespace()
+                .filter(|w| w.len() > 2)
+                .collect();
+            let has_good_result = merged.iter().any(|r| {
+                let t_lower = r.title.to_lowercase();
+                let c_lower = r.content.to_lowercase();
+                let match_count = query_terms_raw.iter()
+                    .filter(|qt| t_lower.contains(*qt) || c_lower.contains(*qt))
+                    .count();
+                let min_terms = (query_terms_raw.len().min(5) / 2).max(2); // at least 2 terms or half of query
+                match_count >= min_terms
+            });
+            if has_good_result {
+                let boost_factor = (0.30 / max_score.max(0.01)).min(2.5);
+                tracing::info!(
+                    "THIN RESULTS: merged.len={} max_score={:.3} max_sem={:.3} boost={:.2}x",
+                    merged.len(), max_score, max_semantic, boost_factor
+                );
+                for r in merged.iter_mut() {
+                    r.score *= boost_factor;
+                }
+            } else {
+                tracing::info!(
+                    "THIN RESULTS SKIPPED (no multi-term match): merged.len={} max_score={:.3} max_sem={:.3}",
+                    merged.len(), max_score, max_semantic
+                );
             }
         } else if max_score < 0.30 {
             tracing::info!(
@@ -3282,19 +3455,42 @@ async fn handle_search(
             intent.distribution.insert("navigational".to_string(), nav_prob * 0.5);
         }
 
-        // Override 2: "latest X news" with low confidence → boost fresh distribution
-        // e.g. "latest ai news today" (conf=0.12, classified navigational — should be fresh)
+        // Override 2: "latest X news" with low confidence → force fresh intent
+        // e.g. "latest ai news today" (conf=0.12, classified comparison — should be fresh)
+        // The linear probe has a strong comparison bias (bias=2.03) and fresh bias=-1.72,
+        // so ambiguous queries with news signals need explicit override.
         if !only_negative_pattern && intent.confidence < 0.30 {
             let has_news_signal = q_lower.contains("latest") || q_lower.contains("recent")
-                || q_lower.contains("breaking") || q_lower.contains("headline");
+                || q_lower.contains("breaking") || q_lower.contains("headline")
+                || q_lower.contains("new ") || q_lower.contains("newest")
+                || q_lower.contains("cve-") || q_lower.contains("vulnerability");
             let has_topic_signal = q_lower.contains("news") || q_lower.contains("update")
-                || q_lower.contains("today") || q_lower.contains("this week");
+                || q_lower.contains("today") || q_lower.contains("this week")
+                || q_lower.contains("2026") || q_lower.contains("2025");
+            // Strong signal: both news signal AND topic signal present with low confidence
             if has_news_signal && has_topic_signal {
+                tracing::info!(
+                    "INTENT OVERRIDE (STRONG): news query '{}' was '{}' (conf={:.3}) — forcing fresh",
+                    q, intent.intent, intent.confidence
+                );
+                intent.intent = "fresh".to_string();
+                intent.confidence = 0.45;
+                // Reshape distribution: fresh gets the top probability
+                let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
+                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+                intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
+                // Boost informational as secondary intent (for ranking weight blending)
+                let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+                intent.distribution.insert("informational".to_string(), info_prob + 0.15);
+            }
+            // Weak signal: only topic signal (e.g. "2026" year without news keywords)
+            // Just boost fresh distribution, don't force intent
+            else if q_lower.contains("2026") || q_lower.contains("2025") {
                 let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
                 let current_prob = intent.distribution.get(&intent.intent).copied().unwrap_or(0.0);
-                if fresh_prob + 0.1 > current_prob {
+                if fresh_prob + 0.15 > current_prob {
                     tracing::info!(
-                        "INTENT OVERRIDE: news query '{}' was '{}' (conf={:.3}) — boosting fresh (fresh={:.3})",
+                        "INTENT OVERRIDE (WEAK): year query '{}' was '{}' (conf={:.3}) — boosting fresh (fresh={:.3})",
                         q, intent.intent, intent.confidence, fresh_prob
                     );
                     intent.distribution.insert("fresh".to_string(), fresh_prob + 0.15);

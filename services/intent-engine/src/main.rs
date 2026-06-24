@@ -458,9 +458,10 @@ fn extract_constraints(query: &str) -> Constraints {
     // "python web framework not django" → remaining: [python, web, framework] → +python
     // "rust async web framework" (no markers) → remaining: [rust, async, web, framework] → +rust, +async
     // "lightweight javascript bundler" → remaining: [lightweight, javascript, bundler] → +lightweight, +javascript
-    // Fires when: (a) positive list is empty (no markers matched), OR
-    //              (b) negatives exist but few positives (marker-based missed them).
-    if positive.is_empty() || (!negative.is_empty() && positive.len() < 2) {
+    // Fires when Phase 2 marker-based extraction produced fewer than 3 terms.
+    // Phase 2 often stops early at stop words (e.g. "with postgres on ubuntu 22.04"
+    // extracts only "+postgres" because "on" terminates term extraction).
+    if positive.len() < 3 {
         let stop_words: std::collections::HashSet<&str> = [
             "the","a","an","in","on","for","with","using","from","to",
             "and","or","of","is","are","was","were","be","been","has","have","had",
@@ -1561,8 +1562,9 @@ fn compress_query(query: &str) -> String {
             .then(a.0.cmp(&b.0))
     });
 
-    // Take top N terms (8-12 depending on query length)
-    let max_terms = if words.len() > 20 { 12 } else { 8 };
+    // Take top N terms (10-14 depending on query length)
+    // 8 was too aggressive — dropping terms like "self" from "self hosted" hurts SearXNG matching
+    let max_terms = if words.len() > 20 { 14 } else { 10 };
     let mut selected: Vec<(usize, &str)> = scored.iter()
         .take(max_terms)
         .map(|(i, w, _)| (*i, *w))
@@ -1714,9 +1716,14 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
         }
         "fresh" => {
             let temporal = ["latest","recent","newest","today","this week","this month","new"];
+            let year = extract_year(&q_lower).unwrap_or("2026");
             let mut core_words: Vec<&str> = Vec::new();
             for w in &words {
                 if !temporal.iter().any(|t| *t == *w) && w.len() > 2 {
+                    // Skip year tokens to avoid "2026 2026" duplication
+                    if w.len() == 4 && w.starts_with("20") && w.parse::<u32>().ok().map_or(false, |y| (2020..=2029).contains(&y)) {
+                        continue;
+                    }
                     let w_lower = w.to_lowercase();
                     let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower);
                     if !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
@@ -1728,7 +1735,7 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
             }
             if !core_words.is_empty() {
                 let core_str = core_words.join(" ");
-                expansions.push(format!("{} 2026", core_str));
+                expansions.push(format!("{} {}", core_str, year));
                 expansions.push(format!("{} update", core_str));
                 if core_str.contains("release") || core_str.contains("version") {
                     expansions.push(format!("{} changelog", core_str));
