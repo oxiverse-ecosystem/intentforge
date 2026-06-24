@@ -3604,12 +3604,24 @@ async fn handle_search(
     } else { None };
     // For negative-only queries, also generate alternative-seeking variations so the
     // retry actually fetches pages like "Django vs Flask" instead of just Django's docs.
+    // IMPORTANT: strip negated content terms from the alternatives query, not just the
+    // negation trigger words. Otherwise "search engine alternatives" becomes
+    // "search engine google bing duckduck brave alternatives" — passing excluded terms
+    // as positive search signals that return listicles about the excluded tools.
     let alt_queries: Vec<String> = if let Some(ref s_q) = stripped_query {
-        // Single alt query is faster and enough for SearXNG to find alternative listings.
-        // Multiple variations (3+) double SearXNG fan-out to 6+ URLs, increasing latency.
-        let mut alts = Vec::new();
-        alts.push(format!("{} alternatives", s_q));
-        alts
+        let neg_terms: std::collections::HashSet<&str> = intent.structured_constraints.negative.iter()
+            .flat_map(|n| n.split_whitespace())
+            .collect();
+        let clean_words: Vec<&str> = s_q.split_whitespace()
+            .filter(|w| !neg_terms.contains(w))
+            .collect();
+        if clean_words.len() >= 2 {
+            let clean_alt = clean_words.join(" ");
+            vec![format!("{} alternatives", clean_alt)]
+        } else {
+            // Fallback: if too few terms remain, keep the original stripped query
+            vec![format!("{} alternatives", s_q)]
+        }
     } else {
         Vec::new()
     };

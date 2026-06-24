@@ -1636,6 +1636,7 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
             if core_trimmed.len() > 3 {
                 // Filter stop words to get meaningful topic words for variations
                 let howto_stop = ["a","an","the","to","for","in","on","of","and","or","is","are","with","from","by"];
+                let mut seen_topic = std::collections::HashSet::new();
                 let topic_words: Vec<&str> = core_trimmed.split_whitespace()
                     .filter(|w| w.len() > 1 && !howto_stop.contains(w) && !w.parse::<f64>().is_ok())
                     .filter(|w| {
@@ -1644,6 +1645,7 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
                         !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
                             && !neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str())
                     })
+                    .filter(|w| seen_topic.insert(w.to_lowercase()))
                     .collect();
                 if topic_words.len() >= 2 {
                     // Cap at 5 words to keep queries concise for SearXNG
@@ -1685,6 +1687,7 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
             let stop = ["the","a","an","in","on","for","with","using","from","to","and","or","of","is","are",
                         "excluding","without","except","other","than",
                         "not","no","but","minus"];
+            let mut seen_topic = std::collections::HashSet::new();
             let topic_words: Vec<&str> = words.iter()
                 .filter(|w| w.len() > 2 && !stop.contains(w))
                 .filter(|w| {
@@ -1694,6 +1697,8 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
                     !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
                         && !neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str())
                 })
+                // Dedup to avoid "orm orm" when a word appears before and after a negated term
+                .filter(|w| seen_topic.insert(w.to_lowercase()))
                 .copied()
                 .collect();
             if topic_words.len() >= 2 {
@@ -1751,11 +1756,47 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
         _ => {}
     }
 
+    // ── Negative-aware "alternatives" expansion ──
+    // When the query has negative constraints (e.g., "not django not sqlalchemy"),
+    // generate an expansion that excludes both negation triggers AND the negated terms,
+    // then frames as "alternatives". Without this, the gateway bypass strips only
+    // trigger words and passes excluded terms as positive search signals.
+    if !constraints.negative.is_empty() && reference_entities.is_empty() {
+        let neg_word_set: std::collections::HashSet<&str> = constraints.negative.iter()
+            .flat_map(|n| n.split_whitespace())
+            .collect();
+        let mut seen_alt = std::collections::HashSet::new();
+        let alt_words: Vec<&str> = words.iter()
+            .filter(|w| w.len() > 1)
+            .filter(|w| {
+                let w_lower = w.to_lowercase();
+                let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower);
+                !neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str())
+                    && !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
+                    && !neg_word_set.contains(w_stripped) && !neg_word_set.contains(w_lower.as_str())
+            })
+            .filter(|w| seen_alt.insert(w.to_lowercase()))
+            .copied()
+            .collect();
+        if !alt_words.is_empty() {
+            let alt_text = alt_words.join(" ");
+            // Check if any existing expansion already conveys "alternatives"
+            let has_alt_concept = expansions.iter().any(|e| {
+                let e_low = e.to_lowercase();
+                e_low.contains("alternative") || e_low.contains("instead of")
+                    || e_low.contains("replacement") || e_low.contains("competitor")
+            });
+            if !has_alt_concept {
+                expansions.push(format!("{} alternatives", alt_text));
+            }
+        }
+    }
+
     let mut seen = std::collections::HashSet::new();
     let mut unique = Vec::new();
     for exp in expansions {
         let key = exp.to_lowercase();
-        if seen.insert(key) && unique.len() < 2 {
+        if seen.insert(key) {
             unique.push(exp);
         }
     }
