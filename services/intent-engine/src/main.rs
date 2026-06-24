@@ -1436,10 +1436,27 @@ fn normalize_query(query: &str) -> String {
 //  microservices running on aws" → "kubernetes monitoring stack aws startup"
 
 fn compress_query(query: &str) -> String {
+    compress_query_with_negatives(query, &[])
+}
+
+/// Compress a long query to its most informative terms, excluding any
+/// negative constraint terms. This is critical because the naive
+/// compress_query strips "not" (a stop word) but keeps the terms after
+/// "not" — making search engines search FOR the excluded items.
+fn compress_query_with_negatives(query: &str, negative: &[String]) -> String {
     let words: Vec<&str> = query.split_whitespace().collect();
     if words.len() <= 8 {
         return query.to_string(); // short enough, don't compress
     }
+
+    // Build a set of negative terms to exclude from compressed output.
+    // Each negative constraint may be multi-word ("google workspace"), so
+    // we collect individual words from all constraints.
+    let neg_word_set: std::collections::HashSet<String> = negative.iter()
+        .flat_map(|n| n.to_lowercase().split_whitespace()
+            .map(|w| w.to_string())
+            .collect::<Vec<_>>())
+        .collect();
 
     // Stop words — common English words with low information value
     let stop_words: std::collections::HashSet<&str> = [
@@ -1515,6 +1532,11 @@ fn compress_query(query: &str) -> String {
     // Score each token
     let mut scored: Vec<(usize, &str, f32)> = Vec::new(); // (original_index, word, score)
     for (i, word) in words.iter().enumerate() {
+        // Skip words that appear in negative constraints
+        let word_lower = word.to_lowercase();
+        if !negative.is_empty() && neg_word_set.contains(&word_lower) {
+            continue;
+        }
         let lower = word.to_lowercase();
         let clean: String = lower.chars().filter(|c| c.is_alphanumeric() || *c == '.' || *c == '+' || *c == '#').collect();
 
@@ -1580,7 +1602,14 @@ fn compress_query(query: &str) -> String {
     if compressed.split_whitespace().count() >= 3 {
         compressed
     } else {
-        query.to_string() // fallback to original if compression was too aggressive
+        // Fallback: if negative filtering made the query too short, try
+        // compression without negatives (better than returning the original
+        // which includes negation noise).
+        if !negative.is_empty() {
+            compress_query(query)
+        } else {
+            query.to_string()
+        }
     }
 }
 
@@ -1761,6 +1790,39 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
     // generate an expansion that excludes both negation triggers AND the negated terms,
     // then frames as "alternatives". Without this, the gateway bypass strips only
     // trigger words and passes excluded terms as positive search signals.
+    //
+    // ALSO: when negative constraints dominate, add a stripped version of the
+    // ORIGINAL query (without any negated terms) as an expansion so search engines
+    // can actually find relevant results instead of searching for excluded items.
+    if !constraints.negative.is_empty() && reference_entities.is_empty() {
+        // Always add the negation-stripped original as the FIRST expansion after
+        // the original query. This ensures search engines search for what the user
+        // actually wants, not the things they want to exclude.
+        let neg_set_lower: std::collections::HashSet<String> = constraints.negative.iter()
+            .flat_map(|n| n.to_lowercase().split_whitespace()
+                .map(|w| w.to_string())
+                .collect::<Vec<_>>())
+            .collect();
+        let stripped_core: Vec<&str> = words.iter()
+            .filter(|w| {
+                let w_lower = w.to_lowercase();
+                let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower);
+                !neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str())
+                    && !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
+                    && !neg_set_lower.contains(w_stripped) && !neg_set_lower.contains(&w_lower)
+            })
+            .copied()
+            .collect();
+        if !stripped_core.is_empty() {
+            let stripped_query = stripped_core.join(" ");
+            if stripped_query != q && !expansions.contains(&stripped_query) {
+                // Insert right after the original so it's the primary fallback
+                expansions.insert(1, stripped_query.clone());
+            }
+        }
+    }
+
+    // ── Negative-aware "alternatives" expansion ──
     if !constraints.negative.is_empty() && reference_entities.is_empty() {
         let neg_word_set: std::collections::HashSet<&str> = constraints.negative.iter()
             .flat_map(|n| n.split_whitespace())
@@ -1986,9 +2048,11 @@ async fn analyze_query(
     // ── Step 2: Compress long queries before expansion ──
     // "what monitoring stack should a small startup use for kubernetes
     //  microservices running on aws" → "kubernetes monitoring stack aws startup"
-    let expansion_input = compress_query(&normalized);
+    // Uses negative-aware compression so excluded terms ("not chrome")
+    // don't leak into the compressed query and pollute search results.
+    let expansion_input = compress_query_with_negatives(&normalized, &structured.negative);
     if expansion_input != normalized {
-        tracing::info!("Query compressed: {:?} → {:?}", normalized, expansion_input);
+        tracing::info!("Query compressed: {:?} → {:?} (negation-aware)", normalized, expansion_input);
     }
 
     let expanded = expand_queries(&expansion_input, &intent, &structured);

@@ -1734,25 +1734,40 @@ fn preprocess_searxng_query(query: &str) -> String {
 }
 
 // Simple negation-word stripper for the initial fan-out (no intent engine needed).
-// Detects common negation patterns and strips trigger words to produce a clean query
-// that search engines can actually return results for. Used to generate extra SearXNG
-// URLs in the initial parallel fan-out, avoiding a sequential retry step.
+// Detects common negation patterns and strips trigger words AND the content terms
+// immediately following them. This prevents negated terms (e.g., "chrome" in
+// "browser not chrome") from leaking into the search query and polluting results.
+// Example: "browser not chrome not edge" → "browser"
 fn simple_negation_strip(query: &str) -> Option<String> {
     let neg_triggers: std::collections::HashSet<&str> = [
         "not", "no", "without", "except", "excluding", "besides", "minus",
         "other", "than", "nor",
     ].iter().copied().collect();
-    let words: Vec<&str> = query.split_whitespace()
-        .filter(|w| {
-            let w_lower = w.to_lowercase();
-            !neg_triggers.contains(w_lower.as_str()) && !w_lower.starts_with("-")
-        })
-        .filter(|w| !w.is_empty())
-        .collect();
-    if words.is_empty() || words.len() == query.split_whitespace().count() {
-        return None; // nothing stripped, or everything stripped
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let mut result: Vec<&str> = Vec::new();
+    let mut skip_next = false;
+    for w in &words {
+        let w_lower = w.to_lowercase();
+        let is_neg_trigger = neg_triggers.contains(w_lower.as_str()) || w_lower.starts_with("-");
+        if is_neg_trigger {
+            // Skip the trigger word AND the next word (the negated content)
+            skip_next = true;
+            continue;
+        }
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        result.push(w);
     }
-    Some(words.join(" "))
+    if result.len() == words.len() {
+        return None; // nothing stripped
+    }
+    let cleaned = result.join(" ");
+    if cleaned.is_empty() {
+        return None; // everything was stripped
+    }
+    Some(cleaned)
 }
 
 // ─── JSON Key Deduplication ────────────────────────────────────────
@@ -2169,11 +2184,33 @@ fn merge_local_and_web(
             quality *= 0.05;
         }
 
-        // Local index topic coherence: prevent domain mismatch where local results
-        // match on generic web terms (e.g., "web", "framework") but not the query's
-        // distinctive topic term (e.g., "rust" query returning a Python article).
-        // Extract distinctive query terms and verify at least one appears in the result.
-        if r.is_local && quality > 0.01 {
+        // Topic coherence: prevent domain mismatch where results match on generic
+        // web terms (e.g., "web", "framework") but not the query's distinctive topic
+        // term (e.g., "productivity suite" query returning a sports article).
+        // Applies to BOTH local and web results, with a stronger penalty for local
+        // results (which should have richer content) and a gentler penalty for web
+        // results (which may have shorter snippets).
+        //
+        // The distinctive terms are words ≥3 chars that are NOT stop words AND NOT
+        // generic web domain terms. This catches the "football scores" collapse:
+        //   query="productivity suite not google workspace not ..."
+        //   positive=["productivity", "suite", "open", "source"]
+        //   distinctive=["productivity", "suite"] ← neither is a generic web term
+        // If a result contains neither "productivity" nor "suite", it's off-topic.
+        //
+        // Also check negative constraints: if the query excludes certain items,
+        // the result should be ABOUT alternatives to those items. A result that
+        // mentions none of the positive AND none of the negative terms is suspicious
+        // (it's probably off-topic content that just happened to slip through).
+        if quality > 0.01 {
+            // Also build a set of negative constraint words — if a result mentions
+            // NONE of the positive AND NONE of the negative, it's likely off-topic.
+            let mut neg_word_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for n in &constraints.negative {
+                for w in n.to_lowercase().split_whitespace() {
+                    neg_word_set.insert(w.to_string());
+                }
+            }
             let generic_web_terms: std::collections::HashSet<&str> = [
                 "web", "framework", "library", "lib", "tool", "tools",
                 "app", "apps", "application", "applications",
@@ -2211,14 +2248,41 @@ fn merge_local_and_web(
                 .copied()
                 .collect();
 
+            let title_lower = r.title.to_lowercase();
+            let content_lower = r.content.to_lowercase();
+
             if !distinctive_terms.is_empty() {
-                let title_lower = r.title.to_lowercase();
-                let content_lower = r.content.to_lowercase();
-                let any_match = distinctive_terms.iter().any(|t| {
+                let any_distinctive_match = distinctive_terms.iter().any(|t| {
                     title_lower.contains(t) || content_lower.contains(t)
                 });
-                if !any_match {
-                    quality *= 0.01;
+
+                if !any_distinctive_match {
+                    // Also check: does the result mention ANY negative constraint word?
+                    // If the query has negatives ("not X"), results that don't mention
+                    // X AND don't mention the distinctive positive terms are probably
+                    // off-topic garbage (e.g., football scores for a productivity query).
+                    if !constraints.negative.is_empty() && !neg_word_set.is_empty() {
+                        let title_content = format!("{} {}", title_lower, content_lower);
+                        let mentions_negative = neg_word_set.iter().any(|n| title_content.contains(n.as_str()));
+                        if !mentions_negative {
+                            // No distinctive positive AND no negative = completely off-topic
+                            quality *= if r.is_local { 0.01 } else { 0.05 };
+                        } else {
+                            // Mentions negative terms but not positive = borderline
+                            quality *= if r.is_local { 0.05 } else { 0.10 };
+                        }
+                    } else {
+                        // No negative constraints — just no positive match
+                        quality *= if r.is_local { 0.01 } else { 0.08 };
+                    }
+                }
+            } else if !constraints.negative.is_empty() && !neg_word_set.is_empty() {
+                // No distinctive positive terms found (query is all generics + negatives).
+                // Check if result mentions any negative term — if not, it's off-topic.
+                let title_content = format!("{} {}", title_lower, content_lower);
+                let mentions_negative = neg_word_set.iter().any(|n| title_content.contains(n.as_str()));
+                if !mentions_negative {
+                    quality *= if r.is_local { 0.10 } else { 0.20 };
                 }
             }
         }
@@ -3585,43 +3649,33 @@ async fn handle_search(
     // IMPORTANT: only strip negation trigger words, NOT the negated content terms themselves.
     // The negated terms ARE the core topic ("not django" → search "django") — the constraint
     // system handles exclusion via is_alternative_listing_page detection + graduated penalties.
-    let stripped_query: Option<String> = if only_negative {
-        let stop_words: std::collections::HashSet<&str> = ["not", "no", "without", "except",
-            "excluding", "besides", "minus", "other", "than", "nor", "-"].iter().copied().collect();
-        let words: Vec<&str> = q.split_whitespace()
-            .filter(|w| {
-                let w_lower = w.to_lowercase();
-                !stop_words.contains(w_lower.as_str())
-                    && !w_lower.starts_with("-")
-            })
-            .collect();
-        let original_len = q.split_whitespace().count();
-        if !words.is_empty() && words.len() < original_len {
-            let cleaned = words.join(" ");
-            tracing::info!("ONLY NEGATIVE: stripped query '{:?}' -> '{}'", q, cleaned);
-            Some(cleaned)
-        } else { None }
-    } else { None };
-    // For negative-only queries, also generate alternative-seeking variations so the
-    // retry actually fetches pages like "Django vs Flask" instead of just Django's docs.
-    // IMPORTANT: strip negated content terms from the alternatives query, not just the
-    // negation trigger words. Otherwise "search engine alternatives" becomes
-    // "search engine google bing duckduck brave alternatives" — passing excluded terms
-    // as positive search signals that return listicles about the excluded tools.
-    let alt_queries: Vec<String> = if let Some(ref s_q) = stripped_query {
-        let neg_terms: std::collections::HashSet<&str> = intent.structured_constraints.negative.iter()
-            .flat_map(|n| n.split_whitespace())
-            .collect();
-        let clean_words: Vec<&str> = s_q.split_whitespace()
-            .filter(|w| !neg_terms.contains(w))
-            .collect();
-        if clean_words.len() >= 2 {
-            let clean_alt = clean_words.join(" ");
-            vec![format!("{} alternatives", clean_alt)]
-        } else {
-            // Fallback: if too few terms remain, keep the original stripped query
-            vec![format!("{} alternatives", s_q)]
+    let stripped_query: Option<String> = if !intent.structured_constraints.negative.is_empty() {
+        // Use the same simple_negation_strip function that the initial
+        // SearXNG fan-out uses—strips both trigger words AND the negated
+        // content terms immediately following them.
+        // Example: "browser not chrome not edge" → "browser"
+        let stripped = simple_negation_strip(&q);
+        if let Some(ref s) = stripped {
+            tracing::info!("ONLY NEGATIVE: stripped query '{:?}' -> '{}'", q, s);
         }
+        stripped
+    } else { None };
+    // Generate alternative-seeking variations so the retry actually fetches
+    // pages like alternatives-listing articles instead of the excluded tools' official pages.
+    // The stripped_query already excludes negated content terms via simple_negation_strip,
+    // so "browser not chrome not edge" becomes "browser". From there we generate multiple
+    // alternative-seeking variations of the core topic plus per-excluded-term queries.
+    let alt_queries: Vec<String> = if let Some(ref s_q) = stripped_query {
+        let mut alts = Vec::new();
+        alts.push(format!("{} alternatives", s_q));
+        alts.push(format!("{} comparison", s_q));
+        for neg in &intent.structured_constraints.negative {
+            alts.push(format!("alternative to {}", neg));
+            if alts.len() >= 6 { break; }
+        }
+        alts.push(format!("best {} 2026", s_q));
+        alts.push(format!("top {} 2026", s_q));
+        alts
     } else {
         Vec::new()
     };
@@ -3776,15 +3830,17 @@ async fn handle_search(
     if needs_more_results && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
         let mut retry_futs = Vec::new();
         let retry_timeout = Duration::from_secs(2); // shorter than initial 3s
+        let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 6 } else { 3 };
         for (eq_idx, eq) in expanded_queries.iter().enumerate().skip(1) {
-            if eq_idx > 1 { break; } // limit to 1 retry variation (was 3)
+            if eq_idx > max_variations { break; }
             let clean_eq = preprocess_searxng_query(eq);
             if clean_eq.to_lowercase() == q.to_lowercase() { continue; } // skip duplicate
             for (inst_idx, base_url) in searx_base_urls.iter().enumerate() {
                 let retry_key = format!("searxng{}", inst_idx);
-                // Skip SearXNG2 (Tor) on retry — Tor is 2-3x slower and wont produce
-                // faster or meaningfully different results for the same query.
-                if inst_idx > 0 { continue; }
+                // For negative-only queries, fire on ALL instances (including Tor)
+                // to maximize the chance of finding alternative-listing pages.
+                // For normal queries, only use VPN instance (SearXNG1) for speed.
+                if !only_negative && intent.structured_constraints.negative.is_empty() && inst_idx > 0 { continue; }
                 if circuit_ref.is_open(&retry_key) { continue; }
                 let retry_url = format!(
                     "{}/search?q={}&format=json&pageno=1",
@@ -4506,15 +4562,17 @@ let mut results = tokio::task::spawn_blocking(move || {
         if has_neg_in_title {
             let alt = is_alternative_listing_page(&r.title, &r.url, &r.content);
             if alt > 0.6 {
-                // Strong alt-listing page — mild penalty only
+                // Strong alt-listing page - no title penalty needed (constraint_score
+                // already applies the single alt-page penalty). Pages like
+                // "Top 10 Chrome Alternatives" are highly relevant despite
+                // mentioning excluded terms in their title.
+                let trimmed: String = r.title.chars().take(40).collect();
+                tracing::info!("TITLE PENALTY SKIPPED (strong alt): alt={:.2} for '{}'", alt, trimmed);
+            } else if alt > 0.3 {
+                // Moderate alt-listing page - mild penalty only
                 r.score *= 0.50;
                 let trimmed: String = r.title.chars().take(40).collect();
-                tracing::info!("TITLE HARD PENALTY (RELAXED): alt={:.2} for '{}' -> score *= 0.50", alt, trimmed);
-            } else if alt > 0.3 {
-                // Moderate alt-listing page — moderate penalty
-                r.score *= 0.20;
-                let trimmed: String = r.title.chars().take(40).collect();
-                tracing::info!("TITLE HARD PENALTY (MODERATE): alt={:.2} for '{}' -> score *= 0.20", alt, trimmed);
+                tracing::info!("TITLE HARD PENALTY (MODERATE): alt={:.2} for '{}' -> score *= 0.50", alt, trimmed);
             } else {
                 r.score *= 0.01;
                 tracing::info!("TITLE HARD PENALTY: title contains excluded term -> score *= 0.01");
@@ -4528,9 +4586,9 @@ let mut results = tokio::task::spawn_blocking(move || {
     // (applied in score_rerank) to appropriately demote results about the excluded topic.
     // Queries with BOTH positive and negative constraints (e.g. "python framework not django")
     // still use the hard filter since there are non-excluded results to keep.
-    if only_negative {
+    if !intent.structured_constraints.negative.is_empty() || !query_neg_terms.is_empty() {
         tracing::info!(
-            "ONLY NEGATIVE: skipping hard removal for {} results (title penalty + constraint scoring will penalize instead)",
+            "NEGATIVE CONSTRAINT: skipping hard removal for {} results (title penalty + constraint scoring will penalize instead)",
             before_count
         );
     } else {
