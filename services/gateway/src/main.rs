@@ -822,6 +822,15 @@ fn constraint_score(
         }
         out
     };
+    // Check once if this is an alternative-listing page (comparison/vs/alternatives).
+    // Alt pages naturally mention excluded terms in referential context, so they
+    // get a SINGLE flat penalty regardless of how many excluded terms they mention.
+    // Regular pages get per-term multiplicative penalties.
+    let alt_score = is_alternative_listing_page(title, url, content);
+    let is_alt_page = alt_score > 0.3;
+    let mut any_negative_matched = false;
+    let mut hit_count = 0u32;
+
     for neg in &constraints.negative {
         let neg_lower = neg.to_lowercase();
         let neg_normalized: String = neg_lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
@@ -888,63 +897,40 @@ fn constraint_score(
             || text_lower.contains(&neg_lower) || text_normalized.contains(&neg_normalized)
         };
         if matched {
-            // Check if this result is an alternative-listing/comparison page.
-            // Such pages mention excluded terms in a referential context
-            // (e.g., "Top 10 Prometheus Alternatives") and should NOT be
-            // heavily penalized — they're HIGHLY relevant for "not X" queries.
-            let alt_score = is_alternative_listing_page(title, url, content);
-
-            let penalty = if alt_score > 0.3 {
-                // Alternative-listing page: mention of excluded term is contextual.
-                // Exception: if the URL IS the official domain of the excluded term,
-                // apply a moderate penalty even if title seems alternative.
-                let neg_normal: String = neg_lower.chars().filter(|c| c.is_alphanumeric()).collect();
-                let is_official = if let Ok(parsed) = reqwest::Url::parse(url) {
-                    if let Some(host) = parsed.host_str() {
-                        let host_lower = host.to_lowercase();
-                        host_lower == format!("{}.com", &neg_normal)
-                            || host_lower == format!("www.{}.com", &neg_normal)
-                            || host_lower == format!("{}.io", &neg_normal)
-                            || host_lower == format!("{}.org", &neg_normal)
-                    } else { false }
-                } else { false };
-                // Term-density check: count how many times the excluded term
-                // appears in the content. High density (>2% of words) means the
-                // page is primarily a tutorial/guide ABOUT that tool, not an
-                // alternative listing. Override the alt-aware penalty.
-                let content_td = content.to_lowercase();
-                let term_count = content_td.matches(&neg_lower).count() as f32;
-                let total_words = content_td.split_whitespace().count().max(1) as f32;
-                let term_density = term_count / total_words;
-
-                if term_density > 0.02 {
-                    // High term density: page is primarily about the excluded tool.
-                    // Apply a moderate penalty between non-alt and alt levels.
-                    (0.30 + (neg_count - 1.0) * 0.10).clamp(0.20, 0.50)
-                } else if is_official && alt_score < 0.6 {
-                    // Official site with weak alt signal: moderate penalty
-                    (0.08 + (neg_count - 1.0) * 0.08).clamp(0.08, 0.30)
-                } else {
-                    // Third-party alternative page: very mild penalty
-                    // High alt_score = barely any penalty (keep the result)
-                    // Low alt_score but still > 0.3 = partial penalty
-                    (0.15 + alt_score * 0.25).min(0.50)
-                }
-            } else {
-                // Standard penalty scales gradually with constraint count:
+            hit_count += 1;
+            any_negative_matched = true;
+            if !is_alt_page {
+                // Non-alt pages: apply per-term multiplicative penalty.
+                // Standard penalty scales with total constraint count:
                 // 1 constraint: 0.02 (98% penalty)
                 // 2 constraints: 0.10 per violation (0.10^2 = 0.01 if both hit)
                 // 3 constraints: 0.16 per violation
                 // 4+ constraints: 0.20 per violation
-                (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20)
-            };
-            tracing::info!("CONSTRAINT HIT: '{}' in '{}' → penalty={:.4} alt_score={:.3}",
-                neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
-                penalty, alt_score);
-            score *= penalty;
+                let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
+                tracing::info!("CONSTRAINT HIT: '{}' in '{}' → penalty={:.4} (non-alt)",
+                    neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                    penalty);
+                score *= penalty;
+            }
         } else {
             tracing::info!("CONSTRAINT MISS: '{}' not in '{}'", neg, &text_lower[..text_lower.char_indices().nth(60).map(|(i,_)| i).unwrap_or(text_lower.len())]);
         }
+    }
+
+    if any_negative_matched && is_alt_page {
+        // Alt pages get one single flat penalty regardless of how many excluded
+        // terms they mention. This prevents "Django vs FastAPI vs Flask: Which to
+        // Choose" (which mentions all 3) from getting compounded 0.175^3 = 0.005.
+        // The alt_score measures how strongly this page is an alternative listing
+        // (comparison vs titles, URL patterns, content patterns).
+        // High alt_score → barely penalized: alt_score=0.7 → 0.175 single hit
+        // Low alt_score → moderate: alt_score=0.3 → 0.225 single hit
+        let alt_penalty = (0.15 + alt_score * 0.25).min(0.50);
+        tracing::info!(
+            "ALT PAGE NEGATIVE PENALTY: {} hits, alt_score={:.3} → single penalty={:.4}",
+            hit_count, alt_score, alt_penalty
+        );
+        score *= alt_penalty;
     }
 
     // Positive constraints: boost for each match (fuzzy matching)
@@ -1319,9 +1305,11 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
         1 => 1.0,   // single term must match exactly
         2 => 0.45,  // at least 1 of 2
         3 => 0.30,  // at least 1 of 3
-        4 => 0.25,  // at least 1 of 4 (was 0.20 — tightened)
-        5 => 0.25,  // at least 2 of 5 (was 0.15 — tightened for dictionary definition prevention)
-        _ => 0.20,  // 6+ terms (was 0.15)
+        4 => 0.25,  // at least 1 of 4
+        5 => 0.25,  // at least 2 of 5
+        6 => 0.20,  // at least 2 of 6
+        7 => 0.20,  // at least 2 of 7
+        _ => 0.25,  // 8+ terms: need at least 3 of 8+ to prevent 2-term surface matches
     };
     if coverage < min_coverage {
         if coverage < 0.10 {
@@ -4072,24 +4060,31 @@ async fn handle_search(
         // Score each result and track violation counts
         let mut scored: Vec<(usize, f32, usize)> = web_results.iter().enumerate().map(|(i, r)| {
             let c_score = constraint_score(&r.title, &r.content, &r.url, constraints_ref);
-            // Count how many negative terms actually match this result content
-            let text = format!("{} {} {}", r.title.to_lowercase(), r.content.to_lowercase(), r.url.to_lowercase());
-            // Use word-boundary matching for violation counting to avoid false positives
-            // e.g., "go" should not match "golang", "java" should not match "javascript"
-            let violations = constraints_ref.negative.iter().filter(|n| {
-                let n_lower = n.to_lowercase();
-                let n_words: Vec<&str> = n_lower.split_whitespace().collect();
-                if n_words.len() == 1 {
-                    // Single word: check word-boundary match
-                    text.split_whitespace().any(|tw| {
-                        let tw_clean: String = tw.chars().filter(|c| c.is_alphanumeric()).collect();
-                        tw_clean == n_lower || tw_clean.contains(&n_lower)
-                    })
-                } else {
-                    // Multi-word: check if phrase appears in text
-                    text.contains(&n_lower)
-                }
-            }).count();
+            // Check if this is an alternative-listing page (comparison, vs, alternatives)
+            // BEFORE counting violations — alt pages naturally mention excluded terms
+            // in comparative context ("Django vs FastAPI vs Flask: Which to Choose").
+            let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
+            // Count how many negative terms actually match this result content.
+            // Skip violation counting for alternative-listing pages: their mention of
+            // excluded terms is referential, not topical. The soft filter would otherwise
+            // drop them before the alt-aware hard filter can preserve them.
+            let violations = if alt_score > 0.3 {
+                0
+            } else {
+                let text = format!("{} {} {}", r.title.to_lowercase(), r.content.to_lowercase(), r.url.to_lowercase());
+                constraints_ref.negative.iter().filter(|n| {
+                    let n_lower = n.to_lowercase();
+                    let n_words: Vec<&str> = n_lower.split_whitespace().collect();
+                    if n_words.len() == 1 {
+                        text.split_whitespace().any(|tw| {
+                            let tw_clean: String = tw.chars().filter(|c| c.is_alphanumeric()).collect();
+                            tw_clean == n_lower || tw_clean.contains(&n_lower)
+                        })
+                    } else {
+                        text.contains(&n_lower)
+                    }
+                }).count()
+            };
             (i, c_score, violations)
         }).collect();
 
