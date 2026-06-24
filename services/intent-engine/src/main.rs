@@ -1478,6 +1478,7 @@ fn compress_query(query: &str) -> String {
     // Technical terms — high information value, boost these
     let tech_terms: std::collections::HashSet<&str> = [
         "api", "sdk", "library", "framework", "crate", "package", "module",
+        "price", "pricing", "cost", "cheap", "affordable", "budget", "deal", "deals", "offer", "offers", "discount",
         "function", "method", "class", "interface", "struct", "enum",
         "database", "db", "cache", "queue", "stream", "pipeline",
         "server", "client", "proxy", "load", "balancer", "gateway",

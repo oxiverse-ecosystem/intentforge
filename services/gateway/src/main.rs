@@ -2169,6 +2169,60 @@ fn merge_local_and_web(
             quality *= 0.05;
         }
 
+        // Local index topic coherence: prevent domain mismatch where local results
+        // match on generic web terms (e.g., "web", "framework") but not the query's
+        // distinctive topic term (e.g., "rust" query returning a Python article).
+        // Extract distinctive query terms and verify at least one appears in the result.
+        if r.is_local && quality > 0.01 {
+            let generic_web_terms: std::collections::HashSet<&str> = [
+                "web", "framework", "library", "lib", "tool", "tools",
+                "app", "apps", "application", "applications",
+                "guide", "guides", "tutorial", "tutorials",
+                "docs", "doc", "documentation", "example", "examples",
+                "reference", "server", "client",
+                "best", "top", "review", "reviews",
+                "using", "getting", "started", "introduction", "overview",
+            ].iter().copied().collect();
+            let stop_words: std::collections::HashSet<&str> = [
+                "the", "a", "an", "is", "are", "was", "were", "be", "been",
+                "have", "has", "had", "do", "does", "did", "will", "would",
+                "can", "may", "might", "shall", "must", "could", "should",
+                "in", "on", "at", "to", "for", "of", "with", "from", "by",
+                "and", "but", "or", "nor", "not", "so", "yet",
+                "this", "that", "these", "those", "it", "its",
+                "what", "which", "who", "whom", "when", "where", "why", "how",
+                "all", "each", "every", "both", "few", "more", "most", "other",
+                "some", "such", "no", "only", "own", "same", "than", "too",
+                "very", "just", "about", "also", "any", "because", "before",
+                "after", "during", "between", "through", "under", "over",
+                "again", "then", "there", "here", "into", "upon", "within",
+                "without", "out", "off", "up", "down",
+            ].iter().copied().collect();
+
+            let q_words: Vec<&str> = query.split_whitespace().collect();
+            let distinctive_terms: Vec<&str> = q_words.iter()
+                .filter(|w| {
+                    let lower = w.to_lowercase();
+                    lower.len() >= 3
+                        && !stop_words.contains(lower.as_str())
+                        && !generic_web_terms.contains(lower.as_str())
+                        && !lower.chars().all(|c| c.is_ascii_digit())
+                })
+                .copied()
+                .collect();
+
+            if !distinctive_terms.is_empty() {
+                let title_lower = r.title.to_lowercase();
+                let content_lower = r.content.to_lowercase();
+                let any_match = distinctive_terms.iter().any(|t| {
+                    title_lower.contains(t) || content_lower.contains(t)
+                });
+                if !any_match {
+                    quality *= 0.01;
+                }
+            }
+        }
+
         // Dictionary/definition site penalty: detect definition pages algorithmically
         // via content structure (phonetic notation, part-of-speech labels, brevity)
         // rather than hardcoded domain lists. This catches any dictionary/glossary site
