@@ -214,7 +214,7 @@ fn extract_constraints(query: &str) -> Constraints {
         if q_lower.starts_with(marker) {
             let remaining = &q[marker.len()..];
             // Preserve phrases if possible for negatives.
-            let term = extract_constraint_term(remaining, 2);
+            let term = extract_constraint_term(remaining, 3);
             if !term.is_empty() && term.len() > 1 {
                 negative.push(term);
             }
@@ -250,7 +250,7 @@ fn extract_constraints(query: &str) -> Constraints {
                 }
                 let remaining = &q[after_marker..];
                 // Extract multiple terms connected by "and"
-                let terms = extract_conjunctive_terms(remaining, 1);
+                let terms = extract_conjunctive_terms(remaining, 3);
                 for term in terms {
                     if !term.is_empty() && term.len() > 1 {
                         negative.push(term);
@@ -504,7 +504,38 @@ fn extract_constraints(query: &str) -> Constraints {
             }
         }
 
-        let neg_set: std::collections::HashSet<String> = negative.iter().cloned().collect();
+        let mut neg_set: std::collections::HashSet<String> = negative.iter().cloned().collect();
+        // Also add individual words from multi-word negatives to prevent leakage.
+        // "django orm" -> also add "django" and "orm" so Phase 5 doesn't
+        // add them back as positives.
+                // Also add individual words from multi-word negatives to prevent leakage,
+        // BUT only if the word doesn't appear elsewhere in the query as a standalone
+        // term. This prevents removing legitimate positives: in "python async orm
+        // not django orm", "orm" appears twice (positive + negative context) so it
+        // stays positive, but "django" only appears in the negative phrase so it's
+        // excluded from positives.
+        let word_counts: std::collections::HashMap<String, usize> = {
+            let mut counts = std::collections::HashMap::new();
+            for w in q_lower.split_whitespace() {
+                let clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                if !clean.is_empty() {
+                    *counts.entry(clean).or_insert(0) += 1;
+                }
+            }
+            counts
+        };
+        for neg in &negative {
+            if neg.split_whitespace().count() > 1 {
+                for word in neg.split_whitespace() {
+                    let wl = word.to_lowercase();
+                    // Only add to neg_set if the word appears only once in the query
+                    // (i.e., only within the negative phrase, not as a standalone positive)
+                    if word_counts.get(&wl).copied().unwrap_or(0) <= 1 {
+                        neg_set.insert(wl);
+                    }
+                }
+            }
+        }
         let pos_set: std::collections::HashSet<String> = positive.iter().cloned().collect();
 
         // Extract candidate topic words from the query
@@ -756,11 +787,19 @@ fn extract_constraint_term(text: &str, max_words: usize) -> String {
         "off", "set", "how", "what", "where", "when", "why", "which", "who",
         "programming", "framework", "library", "language", "tool", "database",
         "server", "client", "application", "app", "software", "system",
-        "platform", "service", "tutorial", "guide", "documentation", "docs"];
+        "platform", "service", "tutorial", "guide", "documentation", "docs",
+        "2026", "2025", "2024", "2023", "2022", "2021", "2020",
+        "privacy", "private", "secure", "security",
+        "small", "startup", "startups", "indie",
+        "open-source", "opensource", "foss", "floss", "free", "libre",
+        "self-hosted", "selfhosted", "offline", "local",
+        "lightweight", "minimal", "minimalist",
+        "ubuntu", "debian", "linux", "mac", "macos", "windows", "android", "ios",
+    ];
     // Allow constraints to absorb one fewer stop word after the first term
     // so multi-word constraints like "type safety" aren't broken by "safety".
     if max_words > 1 {
-        let mut extra = [
+        let extra = [
             "fast","modern","quick","lightweight","simple","easy","powerful",
             "popular","efficient","cheap","free","secure","safe","reliable",
             "scalable","flexible","extensible","portable","robust","minimal",
@@ -1443,20 +1482,86 @@ fn compress_query(query: &str) -> String {
 /// negative constraint terms. This is critical because the naive
 /// compress_query strips "not" (a stop word) but keeps the terms after
 /// "not" — making search engines search FOR the excluded items.
-fn compress_query_with_negatives(query: &str, negative: &[String]) -> String {
-    let words: Vec<&str> = query.split_whitespace().collect();
-    if words.len() <= 8 {
-        return query.to_string(); // short enough, don't compress
+fn strip_negations_from_query(query: &str, negative: &[String]) -> String {
+    let mut cleaned_words: Vec<String> = query.split_whitespace().map(|s| s.to_string()).collect();
+    let neg_triggers: std::collections::HashSet<String> = [
+        "not", "nor", "no", "without", "except", "excluding", "minus", "besides", "other", "than", "but", "-"
+    ].iter().map(|s| s.to_string()).collect();
+
+    // Sort negatives by word count descending to remove longer phrases first
+    let mut sorted_negatives = negative.to_vec();
+    sorted_negatives.sort_by(|a, b| b.split_whitespace().count().cmp(&a.split_whitespace().count()));
+
+    for neg in &sorted_negatives {
+        let neg_words: Vec<String> = neg.to_lowercase().split_whitespace().map(|s| s.to_string()).collect();
+        if neg_words.is_empty() {
+            continue;
+        }
+
+        // Try to find the sequence of neg_words in cleaned_words
+        let mut i = 0;
+        while i + neg_words.len() <= cleaned_words.len() {
+            let matches = neg_words.iter().enumerate().all(|(idx, word)| {
+                let qw = cleaned_words[i + idx].to_lowercase();
+                let qw_clean: String = qw.chars().filter(|c| c.is_alphanumeric()).collect();
+                let w_clean: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
+                qw_clean == w_clean || qw_clean.contains(&w_clean)
+            });
+
+            if matches {
+                // Look backwards for a negation trigger
+                let mut remove_start = i;
+                if i > 0 {
+                    let prev_word = cleaned_words[i - 1].to_lowercase();
+                    let prev_clean: String = prev_word.chars().filter(|c| c.is_alphanumeric() || *c == '-').collect();
+                    if neg_triggers.contains(&prev_clean) || prev_clean == "-" {
+                        remove_start = i - 1;
+                        // Handle "but not", "other than" etc.
+                        if remove_start > 0 {
+                            let prev_prev_word = cleaned_words[remove_start - 1].to_lowercase();
+                            let prev_prev_clean: String = prev_prev_word.chars().filter(|c| c.is_alphanumeric()).collect();
+                            if (prev_prev_clean == "but" && prev_clean == "not")
+                                || (prev_prev_clean == "other" && prev_clean == "than")
+                            {
+                                remove_start = remove_start - 1;
+                            }
+                        }
+                    }
+                }
+                
+                // Remove the range of words
+                cleaned_words.drain(remove_start..(i + neg_words.len()));
+                // Reset search index
+                i = 0;
+            } else {
+                i += 1;
+            }
+        }
     }
 
-    // Build a set of negative terms to exclude from compressed output.
-    // Each negative constraint may be multi-word ("google workspace"), so
-    // we collect individual words from all constraints.
-    let neg_word_set: std::collections::HashSet<String> = negative.iter()
-        .flat_map(|n| n.to_lowercase().split_whitespace()
-            .map(|w| w.to_string())
-            .collect::<Vec<_>>())
-        .collect();
+    cleaned_words.join(" ")
+}
+
+/// Compress a long query to its most informative terms, excluding any
+/// negative constraint terms. This is critical because the naive
+/// compress_query strips "not" (a stop word) but keeps the terms after
+/// "not" — making search engines search FOR the excluded items.
+fn compress_query_with_negatives(query: &str, negative: &[String]) -> String {
+    let cleaned_query = if !negative.is_empty() {
+        let stripped = strip_negations_from_query(query, negative);
+        if stripped.trim().is_empty() {
+            query.to_string()
+        } else {
+            stripped
+        }
+    } else {
+        query.to_string()
+    };
+
+    let words: Vec<&str> = cleaned_query.split_whitespace().collect();
+    if words.len() <= 8 {
+        return cleaned_query; // short enough, don't compress
+    }
 
     // Stop words — common English words with low information value
     let stop_words: std::collections::HashSet<&str> = [
@@ -1532,24 +1637,16 @@ fn compress_query_with_negatives(query: &str, negative: &[String]) -> String {
     // Score each token
     let mut scored: Vec<(usize, &str, f32)> = Vec::new(); // (original_index, word, score)
     for (i, word) in words.iter().enumerate() {
-        // Skip words that appear in negative constraints
-        let word_lower = word.to_lowercase();
-        if !negative.is_empty() && neg_word_set.contains(&word_lower) {
-            continue;
-        }
         let lower = word.to_lowercase();
         let clean: String = lower.chars().filter(|c| c.is_alphanumeric() || *c == '.' || *c == '+' || *c == '#').collect();
 
         if clean.is_empty() { continue; }
 
-        let mut score: f32 = 0.0;
-
-        // Base score: stop words get 0, others get 1.0
-        if stop_words.contains(clean.as_str()) {
-            score = 0.0;
+        let mut score: f32 = if stop_words.contains(clean.as_str()) {
+            0.0
         } else {
-            score = 1.0;
-        }
+            1.0
+        };
 
         // Technical term boost: +2.0
         if tech_terms.contains(clean.as_str()) {
@@ -1598,18 +1695,11 @@ fn compress_query_with_negatives(query: &str, negative: &[String]) -> String {
 
     let compressed = selected.iter().map(|(_, w)| *w).collect::<Vec<&str>>().join(" ");
 
-    // If compression produced something reasonable, use it
-    if compressed.split_whitespace().count() >= 3 {
+    // If compression produced something reasonable, use it, otherwise fall back to cleaned_query
+    if !compressed.trim().is_empty() {
         compressed
     } else {
-        // Fallback: if negative filtering made the query too short, try
-        // compression without negatives (better than returning the original
-        // which includes negation noise).
-        if !negative.is_empty() {
-            compress_query(query)
-        } else {
-            query.to_string()
-        }
+        cleaned_query
     }
 }
 
@@ -1620,6 +1710,15 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
     let q_lower = q.to_lowercase();
     let words: Vec<&str> = q_lower.split_whitespace().collect();
     let mut expansions = vec![q.to_string()]; // always include original
+
+    // A word is positive if it is present in the input query (which is already negation-stripped)
+    let is_positive = |w: &str| -> bool {
+        let w_clean: String = w.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
+        words.iter().any(|qw| {
+            let qw_clean: String = qw.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
+            qw_clean == w_clean
+        })
+    };
 
     // Build set of negative constraint terms to exclude from expansions
     // "not django" should NOT generate "django documentation" as an expansion
@@ -1671,7 +1770,8 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
                     .filter(|w| {
                         let w_lower = w.to_lowercase();
                         let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower);
-                        !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
+                        (!neg_set.contains(w_stripped) || is_positive(w_stripped))
+                            && (!neg_set.contains(&w_lower) || is_positive(&w_lower))
                             && !neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str())
                     })
                     .filter(|w| seen_topic.insert(w.to_lowercase()))
@@ -1723,7 +1823,8 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
                     // Filter out negative constraint terms from expansions
                     let w_lower = w.to_lowercase();
                     let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower);
-                    !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
+                    (!neg_set.contains(w_stripped) || is_positive(w_stripped))
+                        && (!neg_set.contains(&w_lower) || is_positive(&w_lower))
                         && !neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str())
                 })
                 // Dedup to avoid "orm orm" when a word appears before and after a negated term
@@ -1754,14 +1855,15 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
             let year = extract_year(&q_lower).unwrap_or("2026");
             let mut core_words: Vec<&str> = Vec::new();
             for w in &words {
-                if !temporal.iter().any(|t| *t == *w) && w.len() > 2 {
+                if !temporal.iter().any(|t| *t == *w) && w.len() >= 2 {
                     // Skip year tokens to avoid "2026 2026" duplication
                     if w.len() == 4 && w.starts_with("20") && w.parse::<u32>().ok().map_or(false, |y| (2020..=2029).contains(&y)) {
                         continue;
                     }
                     let w_lower = w.to_lowercase();
                     let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower);
-                    if !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
+                    if (!neg_set.contains(w_stripped) || is_positive(w_stripped))
+                        && (!neg_set.contains(&w_lower) || is_positive(&w_lower))
                         && !neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str())
                     {
                         core_words.push(w);
@@ -1807,9 +1909,11 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
             .filter(|w| {
                 let w_lower = w.to_lowercase();
                 let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower);
-                !neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str())
-                    && !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
-                    && !neg_set_lower.contains(w_stripped) && !neg_set_lower.contains(&w_lower)
+                (!neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str()))
+                    && (!neg_set.contains(w_stripped) || is_positive(w_stripped))
+                    && (!neg_set.contains(&w_lower) || is_positive(&w_lower))
+                    && (!neg_set_lower.contains(w_stripped) || is_positive(w_stripped))
+                    && (!neg_set_lower.contains(&w_lower) || is_positive(&w_lower))
             })
             .copied()
             .collect();
@@ -1834,8 +1938,10 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
                 let w_lower = w.to_lowercase();
                 let w_stripped = w_lower.strip_prefix('-').unwrap_or(&w_lower);
                 !neg_triggers.contains(w_stripped) && !neg_triggers.contains(w_lower.as_str())
-                    && !neg_set.contains(w_stripped) && !neg_set.contains(&w_lower)
-                    && !neg_word_set.contains(w_stripped) && !neg_word_set.contains(w_lower.as_str())
+                    && (!neg_set.contains(w_stripped) || is_positive(w_stripped))
+                    && (!neg_set.contains(&w_lower) || is_positive(&w_lower))
+                    && (!neg_word_set.contains(w_stripped) || is_positive(w_stripped))
+                    && (!neg_word_set.contains(w_lower.as_str()) || is_positive(w_lower.as_str()))
             })
             .filter(|w| seen_alt.insert(w.to_lowercase()))
             .copied()

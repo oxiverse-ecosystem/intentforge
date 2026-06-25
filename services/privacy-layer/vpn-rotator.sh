@@ -106,6 +106,9 @@ get_min_interval() {
         health_check_failed*)
             echo "$MIN_INTERVAL_HEALTHFAIL"
             ;;
+        periodic_10min_rotation*)
+            echo "500"
+            ;;
         *)
             echo "$MIN_INTERVAL_FORCED"
             ;;
@@ -182,6 +185,7 @@ while true; do
     if [ -f "$SIGNAL_FILE" ]; then
         reason=$(cat "$SIGNAL_FILE" 2>/dev/null || echo "unknown")
         echo "$(date -u) [vpn-rotator] Signal detected: $reason"
+        rm -f "$SIGNAL_FILE"
         
         # Track rate-limit events
         if echo "$reason" | grep -q "429\|rate_limit"; then

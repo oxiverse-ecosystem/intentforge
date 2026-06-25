@@ -39,10 +39,10 @@ search:
     - html
     - json
   suspended_times:
-    SearxEngineAccessDenied: 300
-    SearxEngineCaptcha: 600
-    SearxEngineTooManyRequests: 120
-    SearxEngineTimeout: 60
+    SearxEngineAccessDenied: 0
+    SearxEngineCaptcha: 0
+    SearxEngineTooManyRequests: 0
+    SearxEngineTimeout: 0
   default_lang: "en"
 
 outgoing:

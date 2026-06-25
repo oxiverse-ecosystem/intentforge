@@ -504,7 +504,7 @@ fn calculate_intent_boost(url: &str, title: &str, query: &str, intent: &str) -> 
 
     let query_terms: Vec<&str> = query_lower
         .split_whitespace()
-        .filter(|w| w.len() > 2)
+        .filter(|w| w.len() >= 2)
         .collect();
 
     let mut boost: f32 = 1.0;
@@ -632,12 +632,30 @@ fn content_quality_score(text: &str) -> f32 {
 
     let mut score: f32 = 1.0;
 
+    // Filter out JSON/URL junk before scoring
+    let words: Vec<&str> = text.split_whitespace()
+        .filter(|w| {
+            !w.starts_with("http")
+                && !w.contains("@type")
+                && !w.contains("@context")
+                && !w.contains("\":")
+                && !(w.len() > 25 && (w.contains('/') || w.contains('{') || w.contains('"') || w.contains('_') || w.contains(':')))
+        })
+        .collect();
+
+    let clean_text = words.join(" ");
+    let eval_text = if clean_text.trim().len() >= 20 {
+        &clean_text
+    } else {
+        text
+    };
+
     // Shannon entropy — measures information content
     // Natural language: 3.5-5.0 bits/char. Gibberish: <2.5 or >6.5
     let entropy = {
         let mut freq = [0u32; 128];
         let mut total = 0u32;
-        for ch in text.chars() {
+        for ch in eval_text.chars() {
             if (ch as usize) < 128 {
                 freq[ch as usize] += 1;
                 total += 1;
@@ -663,8 +681,8 @@ fn content_quality_score(text: &str) -> f32 {
     }
 
     // Alpha ratio — natural language is >60% alphabetic
-    let alpha_count = text.chars().filter(|c| c.is_alphabetic()).count();
-    let alpha_ratio = alpha_count as f32 / text.len().max(1) as f32;
+    let alpha_count = eval_text.chars().filter(|c| c.is_alphabetic()).count();
+    let alpha_ratio = alpha_count as f32 / eval_text.len().max(1) as f32;
     if alpha_ratio < 0.4 {
         score *= 0.3; // too many non-alpha chars
     }
@@ -772,6 +790,55 @@ fn is_alternative_listing_page(title: &str, url: &str, content: &str) -> f32 {
 }
 
 
+fn expand_negative_synonyms(term: &str) -> Vec<String> {
+    let mut expanded = vec![term.to_lowercase()];
+    let term_lower = term.to_lowercase();
+    match term_lower.as_str() {
+        "aws" => {
+            expanded.push("amazon".to_string());
+            expanded.push("amazon web services".to_string());
+        }
+        "gcp" => {
+            expanded.push("google cloud".to_string());
+            expanded.push("google cloud platform".to_string());
+            expanded.push("google".to_string());
+        }
+        "azure" => {
+            expanded.push("microsoft azure".to_string());
+            expanded.push("microsoft cloud".to_string());
+            expanded.push("microsoft".to_string());
+        }
+        "google workspace" | "google workspace..." => {
+            expanded.push("gsuite".to_string());
+            expanded.push("g suite".to_string());
+            expanded.push("google docs".to_string());
+            expanded.push("google sheets".to_string());
+            expanded.push("google slides".to_string());
+            expanded.push("google drive".to_string());
+        }
+        "microsoft 365" | "office 365" => {
+            expanded.push("m365".to_string());
+            expanded.push("o365".to_string());
+            expanded.push("office365".to_string());
+            expanded.push("microsoft365".to_string());
+            expanded.push("microsoft office".to_string());
+            expanded.push("word online".to_string());
+            expanded.push("excel online".to_string());
+        }
+        "big tech" => {
+            expanded.push("google".to_string());
+            expanded.push("microsoft".to_string());
+            expanded.push("apple".to_string());
+            expanded.push("amazon".to_string());
+            expanded.push("meta".to_string());
+            expanded.push("facebook".to_string());
+        }
+        _ => {}
+    }
+    expanded
+}
+
+
 fn constraint_score(
     title: &str,
     content: &str,
@@ -807,7 +874,15 @@ fn constraint_score(
         }
         out
     };
-    let neg_count = constraints.negative.len() as f32;
+    let mut expanded_negatives: Vec<String> = Vec::new();
+    for neg in &constraints.negative {
+        for syn in expand_negative_synonyms(neg) {
+            if !expanded_negatives.contains(&syn) {
+                expanded_negatives.push(syn);
+            }
+        }
+    }
+    let neg_count = expanded_negatives.len() as f32;
     // Pre-normalize title for constraint matching
     let title_lower = title.to_lowercase();
     let title_normalized: String = {
@@ -831,7 +906,7 @@ fn constraint_score(
     let mut any_negative_matched = false;
     let mut hit_count = 0u32;
 
-    for neg in &constraints.negative {
+    for neg in &expanded_negatives {
         let neg_lower = neg.to_lowercase();
         let neg_normalized: String = neg_lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
         let neg_words: Vec<&str> = neg_lower.split_whitespace().collect();
@@ -852,29 +927,8 @@ fn constraint_score(
                 w_clean == neg_normalized || w_clean.contains(&neg_normalized)
             })
             || (neg_normalized.len() >= 3 && title_normalized.contains(&neg_normalized))
-            // Content matching: word boundary match in first 500 chars to limit noise
-            || {
-                let content_prefix: String = content.chars().take(500).collect();
-                let content_lower = content_prefix.to_lowercase();
-                content_lower.split_whitespace().any(|w| {
-                    w == neg_lower
-                    || w.trim_matches(|c: char| !c.is_alphanumeric()) == neg_lower
-                    || {
-                        let w_alpha: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
-                        w_alpha == neg_normalized
-                        // Compound-word awareness: "tailwindcss" starts with "tailwind"
-                        // Length ratio guard: constraint must be ≥60% of word length to avoid
-                        // false positives like "reactive" matching "react"
-                        || (w_alpha.len() > neg_normalized.len()
-                            && neg_normalized.len() >= 3
-                            && w_alpha.starts_with(&neg_normalized)
-                            && neg_normalized.len() as f32 / w_alpha.len() as f32 >= 0.6)
-                        || w_alpha.contains(&neg_normalized)
-                    }
-                })
-            }
             // URL path matching (e.g., github.com/reactjs, geeksforgeeks.org/reactjs/)
-            || text_lower.split('/').any(|segment| {
+            || url.to_lowercase().split('/').any(|segment| {
                 let seg = segment.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
                 seg == neg_lower
                 || {
@@ -892,9 +946,9 @@ fn constraint_score(
                 }
             })
         } else {
-            // Multi-word: check title first, then content
+            // Multi-word: check title first, then URL
             title_lower.contains(&neg_lower) || title_normalized.contains(&neg_normalized)
-            || text_lower.contains(&neg_lower) || text_normalized.contains(&neg_normalized)
+            || url.to_lowercase().contains(&neg_lower)
         };
         if matched {
             hit_count += 1;
@@ -925,7 +979,17 @@ fn constraint_score(
         // (comparison vs titles, URL patterns, content patterns).
         // High alt_score → barely penalized: alt_score=0.7 → 0.175 single hit
         // Low alt_score → moderate: alt_score=0.3 → 0.225 single hit
-        let alt_penalty = (0.15 + alt_score * 0.25).min(0.50);
+        // Scale alt penalty by exclusion count: more exclusions = stricter penalty.
+        // A page listing 5 excluded engines is much less relevant than one listing 1.
+        let neg_exclusion_count = constraints.negative.len() as f32;
+        let alt_penalty_base = if neg_exclusion_count >= 4.0 {
+            0.25 // very strict for 4+ exclusions
+        } else if neg_exclusion_count >= 2.0 {
+            0.20 // moderate for 2-3 exclusions
+        } else {
+            0.15 // standard for single exclusion
+        };
+        let alt_penalty = (alt_penalty_base + alt_score * 0.25).min(0.50);
         tracing::info!(
             "ALT PAGE NEGATIVE PENALTY: {} hits, alt_score={:.3} → single penalty={:.4}",
             hit_count, alt_score, alt_penalty
@@ -1184,9 +1248,9 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
         let q_lower = query.to_lowercase();
         let t_lower = title_trimmed.to_lowercase();
         let q_words: Vec<&str> = q_lower.split_whitespace().collect();
-        let matched = q_words.iter().filter(|w| w.len() > 2 && t_lower.contains(**w)).count();
+        let matched = q_words.iter().filter(|w| w.len() >= 2 && t_lower.contains(**w)).count();
         if matched > 0 {
-            return (matched as f32 / q_words.iter().filter(|w| w.len() > 2).count().max(1) as f32).clamp(0.01, 0.5);
+            return (matched as f32 / q_words.iter().filter(|w| w.len() >= 2).count().max(1) as f32).clamp(0.01, 0.5);
         }
         return 0.01;
     }
@@ -1211,7 +1275,7 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
     let tokenize = |text: &str| -> Vec<String> {
         text.split_whitespace()
             .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
-            .filter(|w| w.len() > 2 && !stop_words.contains(w.as_str()))
+            .filter(|w| w.len() >= 2 && !stop_words.contains(w.as_str()))
             .map(|w| stem(&w))
             .collect()
     };
@@ -1497,38 +1561,6 @@ impl RankingWeights {
     }
 }
 
-fn compute_final_score(
-    rank_score: f32,
-    intent_boost: f32,
-    freshness: f32,
-    authority: f32,
-    is_local: bool,
-    quality: f32,
-    semantic: f32,
-    consensus: f32,
-    constraint: f32,
-    weights: &RankingWeights,
-) -> f32 {
-    let local = if is_local { 1.0 } else { 0.0 };
-
-    let base_score = (weights.rrf * rank_score)
-        + (weights.intent * intent_boost)
-        + (weights.freshness * freshness)
-        + (weights.authority * authority)
-        + (weights.local_bonus * local)
-        + (weights.quality * quality)
-        + (weights.semantic * semantic)
-        + (weights.consensus * consensus);
-
-    // Constraint score acts as a GLOBAL multiplier:
-    // - 1.0 = no constraints or all satisfied
-    // - <1.0 = negative constraint violated (severe penalty)
-    // - 0.5-1.3 = positive constraint coverage
-    // This ensures negative constraints actually demote violating results
-    // instead of only affecting the small constraint weight component.
-    base_score * constraint
-}
-
 // ─── Cross-Query Score Normalization ────────────────────────────────
 // Strip tracking/query params from URLs for better dedup.
 // Handles utm_*, fbclid, gclid, ref, srsltid, etc.
@@ -1743,23 +1775,42 @@ fn simple_negation_strip(query: &str) -> Option<String> {
         "not", "no", "without", "except", "excluding", "besides", "minus",
         "other", "than", "nor",
     ].iter().copied().collect();
+
+    let preserved_words: std::collections::HashSet<&str> = [
+        "2026", "2025", "2024", "2023", "2022", "2021", "2020",
+        "privacy", "private", "secure", "security",
+        "small", "startup", "startups", "indie",
+        "open-source", "opensource", "foss", "floss", "free", "libre",
+        "self-hosted", "selfhosted", "offline", "local",
+        "lightweight", "minimal", "minimalist",
+        "ubuntu", "debian", "linux", "mac", "macos", "windows", "android", "ios",
+    ].iter().copied().collect();
+
     let words: Vec<&str> = query.split_whitespace().collect();
     let mut result: Vec<&str> = Vec::new();
-    let mut skip_next = false;
+    let mut in_negation = false;
+
     for w in &words {
         let w_lower = w.to_lowercase();
+        let clean_w = w_lower.trim_matches(|c: char| !c.is_alphanumeric());
+
         let is_neg_trigger = neg_triggers.contains(w_lower.as_str()) || w_lower.starts_with("-");
         if is_neg_trigger {
-            // Skip the trigger word AND the next word (the negated content)
-            skip_next = true;
+            in_negation = true;
             continue;
         }
-        if skip_next {
-            skip_next = false;
+
+        if in_negation {
+            if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
+                in_negation = false;
+                result.push(w);
+            }
             continue;
         }
+
         result.push(w);
     }
+
     if result.len() == words.len() {
         return None; // nothing stripped
     }
@@ -1769,6 +1820,7 @@ fn simple_negation_strip(query: &str) -> Option<String> {
     }
     Some(cleaned)
 }
+
 
 // ─── JSON Key Deduplication ────────────────────────────────────────
 // Removes duplicate keys from JSON objects. Keeps the LAST value for each key.
@@ -2153,12 +2205,14 @@ fn merge_local_and_web(
         None => RankingWeights::for_intent(intent),
     };
 
+    let clean_query = simple_negation_strip(query).unwrap_or_else(|| query.to_string());
+
     // Navigational domain boost: if intent is navigational and the query
     // looks like a platform name (1-2 tokens), boost results whose host
     // matches the query. This fixes "github" → github.com subpages being
     // ranked below irrelevant content.
     let nav_query_domain: Option<String> = if intent == "navigational" {
-        let q_words: Vec<&str> = query.split_whitespace().collect();
+        let q_words: Vec<&str> = clean_query.split_whitespace().collect();
         if q_words.len() <= 2 {
             // Check if query looks like a domain name (no spaces, alphanumeric)
             let joined = q_words.join("").to_lowercase();
@@ -2170,9 +2224,9 @@ fn merge_local_and_web(
 
     let mut _max_semantic: f32 = 0.0; // tracked for thin-result gate
     for r in merged.iter_mut() {
-        let semantic = semantic_relevance_score(query, &r.title, &r.content);
+        let semantic = semantic_relevance_score(&clean_query, &r.title, &r.content);
         if semantic > _max_semantic { _max_semantic = semantic; }
-        let intent_boost = calculate_intent_boost(&r.url, &r.title, query, intent);
+        let intent_boost = calculate_intent_boost(&r.url, &r.title, &clean_query, intent);
         let mut freshness = freshness_score(&r.url, intent);
         let mut quality = content_quality_score(&r.content);
 
@@ -2207,8 +2261,10 @@ fn merge_local_and_web(
             // NONE of the positive AND NONE of the negative, it's likely off-topic.
             let mut neg_word_set: std::collections::HashSet<String> = std::collections::HashSet::new();
             for n in &constraints.negative {
-                for w in n.to_lowercase().split_whitespace() {
-                    neg_word_set.insert(w.to_string());
+                for syn in expand_negative_synonyms(n) {
+                    for w in syn.split_whitespace() {
+                        neg_word_set.insert(w.to_string());
+                    }
                 }
             }
             let generic_web_terms: std::collections::HashSet<&str> = [
@@ -2236,7 +2292,7 @@ fn merge_local_and_web(
                 "without", "out", "off", "up", "down",
             ].iter().copied().collect();
 
-            let q_words: Vec<&str> = query.split_whitespace().collect();
+            let q_words: Vec<&str> = clean_query.split_whitespace().collect();
             let distinctive_terms: Vec<&str> = q_words.iter()
                 .filter(|w| {
                     let lower = w.to_lowercase();
@@ -2343,6 +2399,22 @@ fn merge_local_and_web(
             );
         }
 
+        // Wikidata penalty: Wikidata is a machine database, not a human-readable search result.
+        let url_lower = r.url.to_lowercase();
+        let is_wikidata = url_lower.contains("wikidata.org");
+        if is_wikidata {
+            quality *= 0.05;
+            r.authority *= 0.1;
+        }
+
+        // Wikipedia/Wikidata generic concept penalty for negative queries:
+        // If a query has negative constraints (e.g. "search engine not google"), the user is looking
+        // for specific alternatives, not a generic encyclopedia page about the concept.
+        if !constraints.negative.is_empty() && (url_lower.contains("wikipedia.org") || url_lower.contains("wikidata.org")) {
+            quality *= 0.15;
+            r.authority *= 0.2;
+        }
+
         let c_score = constraint_score(&r.title, &r.content, &r.url, constraints);
         let consensus = consensus_score(&r.sources);
 
@@ -2376,7 +2448,8 @@ fn merge_local_and_web(
         } else { 0.0 };
 
         let local_bonus = if r.is_local { 1.0 } else { 0.0 };
-        let base = (weights.semantic * semantic)
+        let base = (weights.rrf * r.score)
+            + (weights.semantic * semantic)
             + (weights.intent * intent_boost)
             + (weights.freshness * freshness)
             + (weights.authority * r.authority)
@@ -2384,7 +2457,25 @@ fn merge_local_and_web(
             + (weights.consensus * consensus)
             + (weights.local_bonus * local_bonus)
             + nav_domain_boost;
-        r.score = base * c_score;
+
+        let mut generic_penalty = 1.0f32;
+        if !constraints.negative.is_empty() && (url_lower.contains("wikipedia.org") || url_lower.contains("wikidata.org")) {
+            // encyclopedia fallback is undesirable when user explicitly seeks niche alternatives
+            // Scale by exclusion count: more exclusions = stronger penalty
+            let wiki_penalty = match constraints.negative.len() {
+                1 => 0.20,
+                2 => 0.08,
+                3 => 0.04,
+                _ => 0.02, // 4+ exclusions: almost certainly wrong to show encyclopedia
+            };
+            generic_penalty *= wiki_penalty;
+        }
+        if url_lower.contains("wikidata.org") {
+            // Wikidata is a machine database, not human readable search result
+            generic_penalty *= 0.10;
+        }
+
+        r.score = base * c_score * generic_penalty;
     }
     // --- Thin-Result Detection: boost scores when few results or low max score ---
     // For niche topics (few results returned, low max score), apply a proportional
@@ -2404,7 +2495,7 @@ fn merge_local_and_web(
             // query terms (after stemming). Single-term matches are usually dictionary
             // definitions or tangentially related content that shouldn't be amplified.
             let query_terms_raw: Vec<&str> = query.split_whitespace()
-                .filter(|w| w.len() > 2)
+                .filter(|w| w.len() >= 2)
                 .collect();
             let has_good_result = merged.iter().any(|r| {
                 let t_lower = r.title.to_lowercase();
@@ -2618,15 +2709,6 @@ impl ResultVolumeTracker {
             .count()
     }
 
-    // Get expected result count for an engine (rolling average)
-    fn expected_count(&self, engine: &str) -> f64 {
-        let engines = self.engines.lock();
-        engines
-            .get(engine)
-            .filter(|v| v.rolling_count >= 2.0)
-            .map(|v| v.rolling_sum / v.rolling_count)
-            .unwrap_or(10.0) // default expectation
-    }
 }
 
 struct AppState {
@@ -2687,7 +2769,7 @@ async fn handle_images(
                 let img_title = &r.title;
                 let img_content = &r.content;
                 let img_tokens: Vec<&str> = q.split_whitespace()
-                    .filter(|w| w.len() > 2)
+                    .filter(|w| w.len() >= 2)
                     .collect();
                 let img_tm = img_tokens.iter().filter(|t| img_title.to_lowercase().contains(*t)).count();
                 let img_cm = img_tokens.iter().filter(|t| img_content.to_lowercase().contains(*t)).count();
@@ -2919,7 +3001,7 @@ async fn handle_news(
         match serde_json::from_str::<SearxNewsResponse>(&sanitized) {
             Ok(data) => data.results.into_iter().map(|r| {
                 let news_tokens: Vec<&str> = q.split_whitespace()
-                    .filter(|w| w.len() > 2)
+                    .filter(|w| w.len() >= 2)
                     .collect();
                 let news_tm = news_tokens.iter().filter(|t| r.title.to_lowercase().contains(*t)).count();
                 let news_cm = news_tokens.iter().filter(|t| r.content.to_lowercase().contains(*t)).count();
@@ -3251,7 +3333,13 @@ async fn handle_search(
 
     let invidious_url = format!("http://127.0.0.1:3000/api/v1/search?q={}", q_encoded);
 
-    let indexer_query_raw = format!("http://127.0.0.1:6000/search?q={}", q_encoded);
+    let indexer_q = if let Some(ref stripped) = stripped_override {
+        stripped.clone()
+    } else {
+        q.clone()
+    };
+    let indexer_q_encoded = urlencoding::encode(&indexer_q);
+    let indexer_query_raw = format!("http://127.0.0.1:6000/search?q={}", indexer_q_encoded);
 
     let client_ref = &client;
     let circuit_ref = &state.circuit;
@@ -3296,10 +3384,8 @@ async fn handle_search(
     };
 
     // Fire all SearXNG instances in parallel. No retry on 0 results — IP rotation only.
-    let searx_instance_keys_ref = &searx_instance_keys;
     let searx_futs: Vec<_> = searx_urls.iter().enumerate().map(|(i, url)| {
         let url = url.clone();
-        let instance_key = searx_instance_keys_ref[i].clone();
         let is_open = searx_instance_open[i];
         async move {
             if is_open {
@@ -3457,57 +3543,48 @@ async fn handle_search(
 
     let searx_fut_with_timeout = async {
         use futures::future::FutureExt;
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            async {
-                // Pair each future with its original instance index so downstream
-                // can map results back to searx_instance_keys after select_all reordering.
-                let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<SearxResponse, reqwest::Error>)> + Send>>> =
-                    searx_futs.into_iter().enumerate().map(|(i, f)| {
-                        f.map(move |r| (i, r)).boxed()
-                    }).collect();
-                let mut results: Vec<(usize, Result<SearxResponse, reqwest::Error>)> = Vec::new();
-                let min_early_return: usize = 8;
+        // No outer timeout wrapper — per-instance 3s timeouts handle slow instances.
+        // An outer timeout would discard SearXNG1's results when SearXNG2 is slow (data loss).
+        // Pair each future with its original instance index so downstream
+        // can map results back to searx_instance_keys after select_all reordering.
+        let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<SearxResponse, reqwest::Error>)> + Send>>> =
+            searx_futs.into_iter().enumerate().map(|(i, f)| {
+                f.map(move |r| (i, r)).boxed()
+            }).collect();
+        let mut results: Vec<(usize, Result<SearxResponse, reqwest::Error>)> = Vec::new();
+        let min_early_return: usize = if has_neg_pattern { 50 } else { 8 };
 
-                while !futs.is_empty() {
-                    let ((orig_idx, result), _idx, remaining) = futures::future::select_all(futs).await;
-                    futs = remaining;
+        while !futs.is_empty() {
+            let ((orig_idx, result), _idx, remaining) = futures::future::select_all(futs).await;
+            futs = remaining;
 
-                    match result {
-                        Ok(data) => {
-                            let count = data.results.len();
-                            results.push((orig_idx, Ok(data)));
-                            if count >= min_early_return {
-                                tracing::info!(
-                                    "SearXNG early return: {} results >= {}, skipping {} remaining instance(s)",
-                                    count, min_early_return, futs.len()
-                                );
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("SearXNG instance error (idx={}): {:?}", orig_idx, e);
-                            results.push((orig_idx, Err(e)));
-                        }
+            match result {
+                Ok(data) => {
+                    let count = data.results.len();
+                    results.push((orig_idx, Ok(data)));
+                    if count >= min_early_return {
+                        tracing::info!(
+                            "SearXNG early return: {} results >= {}, skipping {} remaining instance(s)",
+                            count, min_early_return, futs.len()
+                        );
+                        break;
                     }
                 }
-
-                results
-            }
-        ).await {
-            Ok(results) => results,
-            Err(_) => {
-                tracing::warn!("SearXNG fan-out timed out after 3s — returning partial results");
-                vec![]
+                Err(e) => {
+                    tracing::warn!("SearXNG instance error (idx={}): {:?}", orig_idx, e);
+                    results.push((orig_idx, Err(e)));
+                }
             }
         }
+
+        results
     };
 
     // ─── SINGLE PARALLEL JOIN: intent + engines fire simultaneously ───
     // This eliminates the sequential intent→engines pipeline.
     // Engines start fetching immediately; intent runs in parallel.
     // Latency = max(intent, engines) instead of intent + engines.
-    let (intent_result, embed_res, indexer_res, mut searx_results, mut invidious_res, mut news_res, mut image_res) = tokio::join!(
+    let (intent_result, embed_res, indexer_res, searx_results, invidious_res, news_res, image_res) = tokio::join!(
         intent_fut,
         embed_fut,
         indexer_fut,
@@ -3516,18 +3593,6 @@ async fn handle_search(
         news_fut,
         image_fut,
     );
-    // If query has ONLY negative constraints, keep results for constraint scoring
-    let only_negative = !intent_result.as_ref().unwrap().structured_constraints.negative.is_empty()
-        && intent_result.as_ref().unwrap().structured_constraints.positive.is_empty();
-    if only_negative {
-        let before = searx_results.len()
-            + match &invidious_res { Ok(v) => v.len(), Err(_) => 0 }
-            + match &news_res { Ok(v) => v.results.len(), Err(_) => 0 }
-            + match &image_res { Ok(v) => v.results.len(), Err(_) => 0 };
-        tracing::info!("ONLY NEGATIVE: {} web results — keeping for constraint scoring", before);
-    }
-
-
     // 2. Process Intent & Embedding (now available alongside engine results)
     let mut intent: IntentResponse = match intent_result {
         Ok(parsed) => parsed,
@@ -3536,6 +3601,17 @@ async fn handle_search(
             fallback_intent(&q)
         }
     };
+
+    // If query has ONLY negative constraints, keep results for constraint scoring
+    let only_negative = !intent.structured_constraints.negative.is_empty()
+        && intent.structured_constraints.positive.is_empty();
+    if only_negative {
+        let before = searx_results.len()
+            + match &invidious_res { Ok(v) => v.len(), Err(_) => 0 }
+            + match &news_res { Ok(v) => v.results.len(), Err(_) => 0 }
+            + match &image_res { Ok(v) => v.results.len(), Err(_) => 0 };
+        tracing::info!("ONLY NEGATIVE: {} web results — keeping for constraint scoring", before);
+    }
 
     // ─── Rule-based intent overrides for known misclassification patterns ───
     // Fire when the linear probe has low confidence (<0.30) — the model is guessing,
@@ -3629,13 +3705,6 @@ async fn handle_search(
         Err(_) => None,
     };
 
-    // 3. Intent-based post-processing: freshness, expanded queries, secondary fan-out
-    let freshness_keywords = ["latest", "recent", "week", "month", "today", "newest", "cve", "vulnerability"];
-    let is_freshness_query = intent.constraints.iter().any(|c| {
-        let c_low = c.to_lowercase();
-        freshness_keywords.iter().any(|&k| c_low.contains(k))
-    }) || q.to_lowercase().contains("latest") || q.to_lowercase().contains("recent")
-      || intent.intent == "fresh";
 
     // Secondary fan-out with expanded queries if initial results are sparse
     let expanded_queries = if intent.expanded_queries.len() > 1 {
@@ -3707,9 +3776,15 @@ async fn handle_search(
     // of BM25 + semantic similarity, giving better results for natural language queries.
     if let Some(ref vec) = vector {
         let vec_str = serde_json::to_string(vec).unwrap_or_default();
+        let indexer_q = if let Some(ref stripped) = stripped_override {
+            stripped.clone()
+        } else {
+            q.clone()
+        };
+        let indexer_q_encoded = urlencoding::encode(&indexer_q);
         let indexer_url_vec = format!(
             "http://127.0.0.1:6000/search?q={}&vector={}",
-            q_encoded,
+            indexer_q_encoded,
             urlencoding::encode(&vec_str)
         );
         match tokio::time::timeout(
@@ -3798,12 +3873,8 @@ async fn handle_search(
     // ─── Per-Engine Degradation Detection ──────────────────────────
     // Record per-engine result counts and detect silent degradation.
     // If an engine returns <50% of its rolling average, it's likely rate-limited.
-    let mut degraded_engines = 0usize;
     for (engine, &count) in &engine_counts {
-        let is_degraded = state.volume_tracker.record(engine, count);
-        if is_degraded {
-            degraded_engines += 1;
-        }
+        let _ = state.volume_tracker.record(engine, count);
     }
 
     // Cross-request degradation correlation: if 3+ degradation events in 5 min,
@@ -3880,7 +3951,7 @@ async fn handle_search(
             );
             let mut pending = retry_futs;
             let mut retry_new_count = 0usize;
-            let min_early = 5; // early return if 5+ new unique results
+            let min_early = if only_negative || !intent.structured_constraints.negative.is_empty() { 40 } else { 5 };
 
             while !pending.is_empty() && retry_new_count < min_early {
                 let ((inst_idx, retry_key, _url_str, result), _idx, remaining) =
@@ -4097,6 +4168,28 @@ async fn handle_search(
             unique_web_results.push(result);
         }
     }
+    for res in &mut unique_web_results {
+        let normalized = {
+            let lower = res.url.to_lowercase();
+            let no_fragment = lower.split('#').next().unwrap_or(&lower);
+            let no_trailing = no_fragment.trim_end_matches('/');
+            let no_www = no_trailing.replacen("://www.", "://", 1);
+            let no_mobile = no_www.replacen("://m.", "://", 1).replacen("://mobile.", "://", 1);
+            strip_tracking_params(&no_mobile)
+        };
+        if let Some(&rrf_score) = url_rrf_contributions.get(&normalized) {
+            res.score = rrf_score;
+        }
+    }
+    if let Some(max_rrf) = unique_web_results.iter().map(|r| r.score).fold(None, |acc, s| {
+        Some(match acc { Some(m) => s.max(m), None => s })
+    }) {
+        if max_rrf > 0.0 {
+            for r in &mut unique_web_results {
+                r.score /= max_rrf;
+            }
+        }
+    }
     let mut web_results = unique_web_results;
 
     tracing::info!("After dedup: {} unique web results", web_results.len());
@@ -4193,7 +4286,7 @@ async fn handle_search(
             let violations = if alt_score > 0.3 {
                 0
             } else {
-                let text = format!("{} {} {}", r.title.to_lowercase(), r.content.to_lowercase(), r.url.to_lowercase());
+                let text = format!("{} {} {}", r.title.to_lowercase(), r.url.to_lowercase(), r.content.chars().take(300).collect::<String>());
                 constraints_ref.negative.iter().filter(|n| {
                     let n_lower = n.to_lowercase();
                     let n_words: Vec<&str> = n_lower.split_whitespace().collect();
@@ -4279,12 +4372,14 @@ async fn handle_search(
 
     if !intent.structured_constraints.negative.is_empty() {
         let before_count = web_results.len();
-        let mut negative_norm: Vec<String> = intent
-            .structured_constraints
-            .negative
-            .iter()
-            .map(|n| n.to_lowercase())
-            .collect();
+        let mut negative_norm: Vec<String> = Vec::new();
+        for n in &intent.structured_constraints.negative {
+            for syn in expand_negative_synonyms(n) {
+                if !negative_norm.contains(&syn) {
+                    negative_norm.push(syn);
+                }
+            }
+        }
 
         web_results.retain(|r| {
             // Alternative-listing page check: if the result is a comparison/
@@ -4296,7 +4391,7 @@ async fn handle_search(
                 return true; // keep alternative-listing pages regardless of negative terms
             }
 
-            let text = format!("{} {} {}", r.title, r.content, r.url);
+            let text = format!("{} {} {}", r.title, r.url, r.content.chars().take(300).collect::<String>());
             let text_lower = text.to_lowercase();
             let text_normalized = {
                 let chars: Vec<char> = text_lower.chars().collect();
@@ -4456,20 +4551,8 @@ async fn handle_search(
     // Fallback: if query_has_negation but intent engine put terms in positive instead of negative,
     // use the query-derived terms. If the intent engine correctly classified them as negative,
     // use those (they may have cleaner normalization).
-    let has_only_negative = if query_has_negation {
-        // Query has negation words — use query-derived terms regardless of intent engine
-        if !query_neg_terms.is_empty() {
-            true
-        } else {
-            // Fall through to intent-engine check
-            !intent.structured_constraints.negative.is_empty()
-                && intent.structured_constraints.positive.is_empty()
-        }
-    } else {
-        // Standard check: both negatives present and positives absent
-        !intent.structured_constraints.negative.is_empty()
-            && intent.structured_constraints.positive.is_empty()
-    };
+    let has_only_negative = intent.structured_constraints.positive.is_empty()
+        && (!intent.structured_constraints.negative.is_empty() || !query_neg_terms.is_empty());
     
     // Use query-derived terms when available (they're more reliable for negation),
     // otherwise fall back to intent engine's negative constraints.
@@ -4480,13 +4563,21 @@ async fn handle_search(
             .map(|n| n.to_lowercase())
             .collect()
     };
+    let mut neg_terms_expanded: Vec<String> = Vec::new();
+    for nt in &neg_terms {
+        for syn in expand_negative_synonyms(nt) {
+            if !neg_terms_expanded.contains(&syn) {
+                neg_terms_expanded.push(syn);
+            }
+        }
+    }
     if has_only_negative {
         let before = web_results.len();
         web_results.retain(|item| {
             if let Ok(parsed) = reqwest::Url::parse(&item.url) {
                 if let Some(host) = parsed.host_str() {
                     let host_lower = host.to_lowercase();
-                    for neg in &neg_terms {
+                    for neg in &neg_terms_expanded {
                         let neg_clean: String = neg.chars().filter(|c| c.is_alphanumeric()).collect();
                         if neg_clean.len() >= 3 {
                             if host_lower == format!("{}.com", neg_clean)
@@ -4548,6 +4639,15 @@ let mut results = tokio::task::spawn_blocking(move || {
                 negative_norm.push(qt.to_lowercase());
             }
         }
+        let mut negative_norm_expanded: Vec<String> = Vec::new();
+        for n in &negative_norm {
+            for syn in expand_negative_synonyms(n) {
+                if !negative_norm_expanded.contains(&syn) {
+                    negative_norm_expanded.push(syn);
+                }
+            }
+        }
+        let negative_norm = negative_norm_expanded;
     // TITLE-ONLY HARD PENALTY: apply score reduction to results whose title
     // directly contains an excluded term. Relaxed for alt-listing pages.
     for r in results.iter_mut() {
@@ -4586,7 +4686,7 @@ let mut results = tokio::task::spawn_blocking(move || {
     // (applied in score_rerank) to appropriately demote results about the excluded topic.
     // Queries with BOTH positive and negative constraints (e.g. "python framework not django")
     // still use the hard filter since there are non-excluded results to keep.
-    if !intent.structured_constraints.negative.is_empty() || !query_neg_terms.is_empty() {
+    if has_only_negative {
         tracing::info!(
             "NEGATIVE CONSTRAINT: skipping hard removal for {} results (title penalty + constraint scoring will penalize instead)",
             before_count
@@ -4597,26 +4697,10 @@ let mut results = tokio::task::spawn_blocking(move || {
             // even if they mention excluded terms (they are HIGHLY relevant).
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
             if alt_score > 0.3 {
-                // Even for alt-listing pages, check if the TITLE directly contains
-                // an excluded term. If so, remove it - the page is primarily about
-                // the excluded technology, not a genuine alternative listing.
-                let title_lower_alt = r.title.to_lowercase();
-                let title_has_neg = negative_norm.iter().any(|nt| {
-                    title_lower_alt.split_whitespace().any(|w| {
-                        let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
-                        let n_clean: String = nt.chars().filter(|c| c.is_alphanumeric()).collect();
-                        w_clean == n_clean
-                            || (n_clean.len() >= 3 && w_clean.starts_with(&n_clean)
-                                && n_clean.len() as f32 / w_clean.len() as f32 >= 0.6)
-                    })
-                });
-                if title_has_neg {
-                    return false; // Remove even though alt-listing page
-                }
                 return true;
             }
 
-            let text = format!("{} {} {}", r.title, r.content, r.url);
+            let text = format!("{} {}", r.title, r.url);
             let text_lower = text.to_lowercase();
             let text_normalized = {
                 let chars: Vec<char> = text_lower.chars().collect();
@@ -4734,16 +4818,14 @@ let mut results = tokio::task::spawn_blocking(move || {
     // Cache for 5 minutes — but never cache empty results
     let response_json = serde_json::to_string(&response).unwrap_or_default();
     if !response.results.is_empty() {
-        let cache_key_clone = cache_key.clone();
-        let response_clone = response_json.clone();
-        state.cache.put(cache_key, response_json, Duration::from_secs(300));
-        // Notify any dedup waiters that the result is ready
-        let waiters = state.in_flight.lock().remove(&cache_key_clone).unwrap_or_default();
-        if !waiters.is_empty() {
-            tracing::info!("DEDUP: notifying {} waiter(s) for '{}'", waiters.len(), q_trimmed);
-            for sender in waiters {
-                let _ = sender.send(response_clone.clone());
-            }
+        state.cache.put(cache_key.clone(), response_json.clone(), Duration::from_secs(300));
+    }
+    // Notify any dedup waiters that the result is ready (even if empty, to prevent hanging)
+    let waiters = state.in_flight.lock().remove(&cache_key).unwrap_or_default();
+    if !waiters.is_empty() {
+        tracing::info!("DEDUP: notifying {} waiter(s) for '{}'", waiters.len(), q_trimmed);
+        for sender in waiters {
+            let _ = sender.send(response_json.clone());
         }
     }
 
