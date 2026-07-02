@@ -17,3 +17,5 @@ tower-http = { version = "0.5", features = ["cors", "timeout"] }
 futures = "0.3"
 regex = "1"
 parking_lot = "0.12"
+maxminddb = { version = "0.29", features = ["mmap"] }
+rand = "0.8"

@@ -10,7 +10,12 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tower_http::timeout::TimeoutLayer;
+use axum::http::HeaderMap;
+use std::net::IpAddr;
 
+mod spell;
+mod geoloc;
+mod dictionary;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -271,6 +276,12 @@ struct UnifiedResponse {
     #[serde(default)]
     distribution: std::collections::HashMap<String, f32>,
     results: Vec<MergedResult>,
+    /// IP geolocation of the requesting client (if GeoLite2 database available)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    geo_location: Option<geoloc::GeoLocation>,
+    /// If the original query was spell-corrected, the corrected version
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spell_corrected_query: Option<String>,
 }
 
 // ─── Domain Authority (Fully Algorithmic) ────────────────────────────
@@ -2735,6 +2746,10 @@ struct AppState {
     /// In-flight request deduplication: tracks identical queries in flight so
     /// concurrent duplicate requests share one SearXNG fetch instead of N.
     in_flight: Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<String>>>>,
+    /// SymSpell + LinSpell spelling correction index (built at startup)
+    spell_index: spell::SymSpellIndex,
+    /// Optional MaxMind GeoLite2 IP geolocation lookup
+    geo_locator: Option<geoloc::GeoLocator>,
 }
 
 async fn handle_images(
@@ -3112,6 +3127,8 @@ async fn main() {
         searxng2_url,
         searx_last_used: Mutex::new(HashMap::new()),
         in_flight: Mutex::new(HashMap::new()),
+        spell_index: spell::SymSpellIndex::build(),
+        geo_locator: geoloc::GeoLocator::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -3192,6 +3209,7 @@ async fn main() {
 async fn handle_search(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
+    headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     // 0. Validate query — reject empty or whitespace-only queries
     let q_trimmed = params.q.as_deref().unwrap_or("").trim();
@@ -3225,6 +3243,12 @@ async fn handle_search(
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
         return (axum::http::StatusCode::OK, Json(value));
     }
+    // 0b.5: Spelling correction — correct misspellings before fan-out
+    let (q_corrected, mut spell_changed) = spell::correct_query(&state.spell_index, q_trimmed);
+    if spell_changed {
+        tracing::info!("Spell-corrected query: '{}' -> '{}'", q_trimmed, q_corrected);
+    }
+
     // 0c. Request deduplication: if another task is already fetching this query, wait for it
     let dedup_rx = {
         let mut in_flight = state.in_flight.lock();
@@ -3253,8 +3277,20 @@ async fn handle_search(
     // Use shared HTTP client from AppState (connection pooling across requests)
     let client = state.http_client.clone();
 
-    let q = q_trimmed.to_string();
+    let q = if spell_changed { q_corrected } else { q_trimmed.to_string() };
     let q_encoded = urlencoding::encode(&q);
+
+    // Extract client IP for geolocation (from X-Forwarded-For or X-Real-IP headers)
+    let client_ip: Option<IpAddr> = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next().map(|s| s.trim()))
+        .and_then(|ip| ip.parse().ok())
+        .or_else(|| {
+            headers.get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|ip| ip.parse().ok())
+        });
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel
     let intent_url = format!("http://127.0.0.1:3005/analyze?q={}", q_encoded);
@@ -4818,6 +4854,22 @@ let mut results = tokio::task::spawn_blocking(move || {
         r.content = sanitize_text_content(&r.content);
     }
 
+    // 8. Validate spelling correction against actual search result signals.
+    // If the original (pre-correction) words appear more frequently in result
+    // titles/URLs than the corrected words, the correction was likely wrong.
+    // This provides a web-data-driven safety net on top of the dictionary.
+    if spell_changed {
+        let titles: Vec<String> = results.iter().map(|r| r.title.clone()).collect();
+        let urls: Vec<String> = results.iter().map(|r| r.url.clone()).collect();
+        if !spell::validate_correction(q_trimmed, &q, &titles, &urls) {
+            tracing::info!(
+                "Spell correction reverted by result validation: original='{}' corrected='{}'",
+                q_trimmed, q
+            );
+            spell_changed = false;
+        }
+    }
+
     let response = UnifiedResponse {
         intent: intent.intent.clone(),
         category: parent_category(&intent.intent),
@@ -4827,6 +4879,10 @@ let mut results = tokio::task::spawn_blocking(move || {
         expanded_queries: intent.expanded_queries.clone(),
         distribution: intent.distribution.clone(),
         results,
+        geo_location: client_ip.and_then(|ip| {
+            state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
+        }),
+        spell_corrected_query: if spell_changed { Some(q.clone()) } else { None },
     };
 
     // Cache for 5 minutes — but never cache empty results

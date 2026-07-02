@@ -212,6 +212,19 @@ services:
     network_mode: "service:gluetun"
     restart: always
 
+  geolite2-updater:
+    build:
+      context: ./geolite2-updater
+      dockerfile: Dockerfile
+    container_name: if-geolite2-updater
+    environment:
+      - MAXMIND_LICENSE_KEY=${MAXMIND_LICENSE_KEY}
+      - GATEWAY_CONTAINER_NAME=if-gateway
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - geolite2-data:/data
+    restart: always
+
   gateway:
     build:
       context: ./gateway
@@ -225,6 +238,7 @@ services:
       - INDEXER_URL=http://localhost:6000
     volumes:
       - ./shared-signals:/tmp/vpn-signals
+      - geolite2-data:/var/lib/geolite2:ro
     network_mode: "service:gluetun"
     depends_on:
       - intent-engine
@@ -258,3 +272,4 @@ services:
 
 volumes:
   invidious-db-data:
+  geolite2-data:
