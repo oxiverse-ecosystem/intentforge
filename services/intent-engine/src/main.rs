@@ -795,6 +795,7 @@ fn extract_constraint_term(text: &str, max_words: usize) -> String {
         "self-hosted", "selfhosted", "offline", "local",
         "lightweight", "minimal", "minimalist",
         "ubuntu", "debian", "linux", "mac", "macos", "windows", "android", "ios",
+        "not", "nor", "no", "without", "except", "excluding", "minus", "besides", "instead",
     ];
     // Allow constraints to absorb one fewer stop word after the first term
     // so multi-word constraints like "type safety" aren't broken by "safety".

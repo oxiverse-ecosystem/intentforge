@@ -1618,14 +1618,27 @@ fn strip_tracking_params(url: &str) -> String {
 // cluster (from consensus boosts, nav domain boosts) retains differentiation.
 
 fn normalize_scores(scores: &mut [f32]) {
+    if scores.is_empty() {
+        return;
+    }
     // Find the raw max to detect if any scores exceed 1.0
     let raw_max = scores.iter().cloned().fold(0.0f32, f32::max);
     let cap = 1.0f32;
 
+    if raw_max <= 0.0 {
+        return;
+    }
+
     if raw_max <= cap {
-        // No overflow — just clamp the floor
+        // High quality top result on restrictive query -> scale up to 0.85 - 1.00 range
+        let target_max = if raw_max >= 0.25 {
+            0.85 + (raw_max - 0.25) * 0.15 / 0.75 // maps 0.25 -> 0.85, 1.0 -> 1.0
+        } else {
+            raw_max
+        };
+        let multiplier = target_max / raw_max;
         for score in scores.iter_mut() {
-            *score = score.clamp(0.05, cap);
+            *score = (*score * multiplier).clamp(0.05, cap);
         }
         return;
     }
@@ -3395,13 +3408,13 @@ async fn handle_search(
             // enough headroom while keeping Tor retries within the 5s outer wrapper.
             let first: Result<SearxResponse, reqwest::Error> = async {
                 let resp = match tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
+                    std::time::Duration::from_secs(6),
                     client_ref.get(&url).send()
                 ).await {
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
-                        tracing::warn!("SearXNG instance request timed out (3s): {}", &url[..url.find('?').unwrap_or(url.len())]);
+                        tracing::warn!("SearXNG instance request timed out (6s): {}", &url[..url.find('?').unwrap_or(url.len())]);
                         return Ok(SearxResponse { results: vec![] });
                     }
                 };
@@ -3415,7 +3428,7 @@ async fn handle_search(
                     rotate_all_ips(&format!("429_rate_limit_{}", new_count));
                 }
                 let raw = match tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
+                    std::time::Duration::from_secs(5),
                     resp.text()
                 ).await {
                     Ok(Ok(t)) => t,
@@ -3900,7 +3913,7 @@ async fn handle_search(
     // Count-based retry (no relevance needed yet — fires before Invidious/news/image)
     if needs_more_results && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
         let mut retry_futs = Vec::new();
-        let retry_timeout = Duration::from_secs(2); // shorter than initial 3s
+        let retry_timeout = Duration::from_secs(4); // shorter than initial 6s
         let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 6 } else { 3 };
         for (eq_idx, eq) in expanded_queries.iter().enumerate().skip(1) {
             if eq_idx > max_variations { break; }
@@ -3926,7 +3939,7 @@ async fn handle_search(
                         client.get(&retry_url).send(),
                     ).await {
                         Ok(Ok(resp)) => {
-                            let raw = match tokio::time::timeout(Duration::from_secs(2), resp.text()).await {
+                            let raw = match tokio::time::timeout(Duration::from_secs(3), resp.text()).await {
                                 Ok(Ok(t)) => t,
                                 _ => return (inst_idx, key, url_for_log, Err("retry body read timeout".into())),
                             };
@@ -4798,8 +4811,9 @@ let mut results = tokio::task::spawn_blocking(move || {
         // Re-sort by final score
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     }
-    // Sanitize content for safe JSON serialization
+    // Sanitize content and clamp final score for safe JSON serialization and API spec conformance
     for r in results.iter_mut() {
+        r.score = r.score.clamp(0.05, 1.0);
         r.title = sanitize_text_content(&r.title);
         r.content = sanitize_text_content(&r.content);
     }
