@@ -24,6 +24,7 @@ const INTENT_CATEGORIES: &[&str] = &[
     "comparison",
     "transactional",
     "fresh",
+    "local",
 ];
 
 // ─── Entity Roles (Query Graph IR) ────────────────────────────────
@@ -1883,6 +1884,35 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
         "navigational" => {
             if !q_lower.contains("official") {
                 expansions.push(format!("official {}", q));
+            }
+        }
+        "local" => {
+            // For local intent, generate queries that work well for geo-aware search.
+            // Preserve "near me" patterns if present, otherwise focus on the core topic.
+            let without_near = q_lower
+                .strip_suffix("near me").or_else(|| q_lower.strip_suffix("near me?"))
+                .or_else(|| q_lower.strip_suffix("nearby"))
+                .or_else(|| q_lower.strip_suffix(" open now"))
+                .or_else(|| q_lower.strip_suffix(" tonight"))
+                .or_else(|| q_lower.strip_suffix(" today"))
+                .or_else(|| q_lower.strip_suffix("this weekend"))
+                .map(|s| s.trim())
+                .unwrap_or(&q_lower);
+            if !without_near.is_empty() && without_near != q_lower {
+                expansions.push(without_near.to_string());
+            }
+            // Add directional variants
+            if q_lower.contains(" near ") || q_lower.contains("nearby") {
+                expansions.push(format!("{} nearby", without_near));
+            }
+            // Extract "in <place>" and add location-focused variant
+            if let Some(in_idx) = q_lower.rfind(" in ") {
+                let place = q_lower[in_idx + 4..].trim();
+                let topic = q_lower[..in_idx].trim();
+                if !place.is_empty() && !topic.is_empty() {
+                    expansions.push(format!("{} near {}", topic, place));
+                    expansions.push(format!("{} {}", topic, place));
+                }
             }
         }
         _ => {}

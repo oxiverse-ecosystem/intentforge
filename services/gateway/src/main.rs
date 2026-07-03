@@ -3432,6 +3432,7 @@ async fn handle_search(
         }
     }
     // Use shared HTTP client from AppState (connection pooling across requests)
+    let search_start = std::time::Instant::now();
     let client = state.http_client.clone();
 
     let q = if spell_changed { q_corrected } else { q_trimmed.to_string() };
@@ -3460,31 +3461,49 @@ async fn handle_search(
 
     // Retry intent engine up to 2 extra times with backoff.
     // Handles cold-start after container restart (model load takes 5-15s).
+    // Wrapped in an overall 800ms timeout to prevent local engine delays.
     let intent_fut = async {
         let delays = [0u64, 200, 400]; // 0ms, 200ms, 400ms
-        for (attempt, delay_ms) in delays.iter().enumerate() {
-            if *delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
-            }
-            match client.get(&intent_url).send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    match resp.json::<IntentResponse>().await {
-                        Ok(parsed) => return Ok(parsed),
-                        Err(e) => {
-                            tracing::warn!("Intent parse failed (attempt {}, status: {}): {:?}",
-                                attempt + 1, status, e);
+        let res = tokio::time::timeout(std::time::Duration::from_millis(800), async {
+            for (attempt, delay_ms) in delays.iter().enumerate() {
+                if *delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+                }
+                match client.get(&intent_url).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        match resp.json::<IntentResponse>().await {
+                            Ok(parsed) => return Ok(parsed),
+                            Err(e) => {
+                                tracing::warn!("Intent parse failed (attempt {}, status: {}): {:?}",
+                                    attempt + 1, status, e);
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("Intent Engine request failed (attempt {}): {:?}", attempt + 1, e);
+                    Err(e) => {
+                        tracing::warn!("Intent Engine request failed (attempt {}): {:?}", attempt + 1, e);
+                    }
                 }
             }
+            Err::<IntentResponse, ()>(())
+        }).await;
+        match res {
+            Ok(inner) => inner,
+            Err(_) => {
+                tracing::warn!("Intent Engine request timed out overall (800ms)");
+                Err::<IntentResponse, ()>(())
+            }
         }
-        Err::<IntentResponse, ()>(())
     };
-    let embed_fut = client.get(&embed_url).send();
+    let embed_fut = async {
+        match tokio::time::timeout(std::time::Duration::from_millis(800), client.get(&embed_url).send()).await {
+            Ok(Ok(resp)) => Some(resp),
+            _ => {
+                tracing::warn!("Embedding request timed out or failed (800ms)");
+                None
+            }
+        }
+    };
 
     // ─── Build engine URLs with raw query (no intent dependency) ────
     // Engines fire immediately in parallel with intent analysis.
@@ -3676,19 +3695,19 @@ async fn handle_search(
         if invidious_open {
             return Ok::<Vec<InvidiousResult>, anyhow::Error>(vec![]);
         }
-        let resp = match tokio::time::timeout(Duration::from_secs(2), client_ref.get(&invidious_url).send()).await {
+        let resp = match tokio::time::timeout(Duration::from_millis(800), client_ref.get(&invidious_url).send()).await {
             Ok(Ok(r)) => r,
             _ => return Ok::<Vec<InvidiousResult>, anyhow::Error>(vec![]),
         };
         let status = resp.status();
-        match tokio::time::timeout(Duration::from_secs(2), resp.json::<Vec<InvidiousResult>>()).await {
+        match tokio::time::timeout(Duration::from_millis(800), resp.json::<Vec<InvidiousResult>>()).await {
             Ok(Ok(data)) => Ok(data),
             Ok(Err(e)) => {
                 tracing::error!("Failed to parse Invidious JSON (status: {}): {:?}", status, e);
                 Ok(vec![])
             }
             Err(_) => {
-                tracing::warn!("Invidious JSON read timed out after 2s");
+                tracing::warn!("Invidious JSON read timed out after 800ms");
                 Ok(vec![])
             }
         }
@@ -3707,11 +3726,11 @@ async fn handle_search(
         let news_url = searxng_url_with_categories(
             "http://127.0.0.1:8080", &q, "news", geo_location.as_ref()
         );
-        let resp = match tokio::time::timeout(std::time::Duration::from_secs(1), client_ref.get(&news_url).send()).await {
+        let resp = match tokio::time::timeout(std::time::Duration::from_millis(800), client_ref.get(&news_url).send()).await {
             Ok(Ok(r)) => r,
             _ => return Ok(SearxNewsResponse { results: vec![] }),
         };
-        let raw = match tokio::time::timeout(std::time::Duration::from_secs(1), resp.text()).await {
+        let raw = match tokio::time::timeout(std::time::Duration::from_millis(800), resp.text()).await {
             Ok(Ok(t)) => t,
             _ => return Ok(SearxNewsResponse { results: vec![] }),
         };
@@ -3732,11 +3751,11 @@ async fn handle_search(
         let image_url = searxng_url_with_categories(
             "http://127.0.0.1:8080", &q, "images", geo_location.as_ref()
         );
-        let resp = match tokio::time::timeout(std::time::Duration::from_secs(1), client_ref.get(&image_url).send()).await {
+        let resp = match tokio::time::timeout(std::time::Duration::from_millis(800), client_ref.get(&image_url).send()).await {
             Ok(Ok(r)) => r,
             _ => return Ok(SearxImageResponse { results: vec![] }),
         };
-        let raw = match tokio::time::timeout(std::time::Duration::from_secs(1), resp.text()).await {
+        let raw = match tokio::time::timeout(std::time::Duration::from_millis(800), resp.text()).await {
             Ok(Ok(t)) => t,
             _ => return Ok(SearxImageResponse { results: vec![] }),
         };
@@ -3752,39 +3771,45 @@ async fn handle_search(
 
     let searx_fut_with_timeout = async {
         use futures::future::FutureExt;
-        // No outer timeout wrapper — per-instance 3s timeouts handle slow instances.
-        // An outer timeout would discard SearXNG1's results when SearXNG2 is slow (data loss).
-        // Pair each future with its original instance index so downstream
-        // can map results back to searx_instance_keys after select_all reordering.
         let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<SearxResponse, reqwest::Error>)> + Send>>> =
             searx_futs.into_iter().enumerate().map(|(i, f)| {
                 f.map(move |r| (i, r)).boxed()
             }).collect();
-        let mut results: Vec<(usize, Result<SearxResponse, reqwest::Error>)> = Vec::new();
         let min_early_return: usize = 15;
 
-        while !futs.is_empty() {
-            let ((orig_idx, result), _idx, remaining) = futures::future::select_all(futs).await;
-            futs = remaining;
+        // Use a thread-safe shared mutex to preserve results if the timeout triggers
+        let results_shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let results_inner = results_shared.clone();
 
-            match result {
-                Ok(data) => {
-                    let count = data.results.len();
-                    results.push((orig_idx, Ok(data)));
-                    if count >= min_early_return {
-                        tracing::info!(
-                            "SearXNG early return: {} results >= {}, skipping {} remaining instance(s)",
-                            count, min_early_return, futs.len()
-                        );
-                        break;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1800), async move {
+            while !futs.is_empty() {
+                let ((orig_idx, result), _idx, remaining) = futures::future::select_all(futs).await;
+                futs = remaining;
+
+                match result {
+                    Ok(data) => {
+                        let count = data.results.len();
+                        results_inner.lock().unwrap().push((orig_idx, Ok(data)));
+                        if count >= min_early_return {
+                            tracing::info!(
+                                "SearXNG early return: {} results >= {}, skipping {} remaining instance(s)",
+                                count, min_early_return, futs.len()
+                            );
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("SearXNG instance error (idx={}): {:?}", orig_idx, e);
+                        results_inner.lock().unwrap().push((orig_idx, Err(e)));
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("SearXNG instance error (idx={}): {:?}", orig_idx, e);
-                    results.push((orig_idx, Err(e)));
-                }
             }
-        }
+        }).await;
+
+        let results = {
+            let mut guard = results_shared.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
 
         results
     };
@@ -3937,14 +3962,14 @@ async fn handle_search(
     }
 
     let vector: Option<Vec<f32>> = match embed_res {
-        Ok(resp) => {
+        Some(resp) => {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
                 json["embedding"].as_array().map(|arr| {
                     arr.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect()
                 })
             } else { None }
         },
-        Err(_) => None,
+        None => None,
     };
 
 
@@ -4203,61 +4228,90 @@ async fn handle_search(
         }
 
         if !retry_futs.is_empty() {
-            tracing::info!(
-                "PARALLEL RETRY: {} results < {} expected (or garbage/neg), firing {} retry variation(s)",
-                total_results, expected_min, retry_futs.len()
-            );
-            let mut pending = retry_futs;
-            let mut retry_new_count = 0usize;
-            let min_early = if only_negative || !intent.structured_constraints.negative.is_empty() { 40 } else { 5 };
+            let elapsed = search_start.elapsed();
+            let limit = Duration::from_millis(1900); // 1.9s overall target limit
+            if elapsed >= limit {
+                tracing::warn!("Retry skipped: elapsed time ({:?}) already exceeds target deadline ({:?})", elapsed, limit);
+            } else {
+                let retry_budget = limit - elapsed;
+                tracing::info!(
+                    "PARALLEL RETRY: {} results < {} expected, firing {} retry variation(s) with budget {:?}",
+                    total_results, expected_min, retry_futs.len(), retry_budget
+                );
 
-            while !pending.is_empty() && retry_new_count < min_early {
-                let ((inst_idx, retry_key, _url_str, result), _idx, remaining) =
-                    futures::future::select_all(pending).await;
-                pending = remaining;
+                let mut pending = retry_futs;
+                let mut retry_new_count = 0usize;
+                let min_early = if only_negative || !intent.structured_constraints.negative.is_empty() { 40 } else { 5 };
 
-                match result {
-                    Ok(data) if !data.results.is_empty() => {
-                        tracing::info!("Parallel retry on instance {} returned {} results", inst_idx, data.results.len());
-                        circuit_ref.record_success(&retry_key);
-                        if let Some(base_url) = searx_base_urls.get(inst_idx) {
-                            state.searx_last_used.lock().insert(base_url.to_string(), Instant::now());
+                // Thread-safe shared state to collect retry outcomes
+                let results_shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let results_inner = results_shared.clone();
+
+                let _ = tokio::time::timeout(retry_budget, async move {
+                    while !pending.is_empty() && retry_new_count < min_early {
+                        let ((inst_idx, retry_key, url_for_log, result), _idx, remaining) =
+                            futures::future::select_all(pending).await;
+                        pending = remaining;
+
+                        match &result {
+                            Ok(data) => {
+                                retry_new_count += data.results.len();
+                            }
+                            _ => {}
                         }
-                        circuit_ref.record_results(&retry_key, data.results.len() as u64);
-                        for (pos, result) in data.results.into_iter().enumerate() {
-                            let engine_weight = circuit_ref.weight(&result.engine);
-                            let normalized = {
-                                let lower = result.url.to_lowercase();
-                                let no_fragment = lower.split('#').next().unwrap_or(&lower);
-                                let no_trailing = no_fragment.trim_end_matches('/');
-                                let no_www = no_trailing.replacen("://www.", "://", 1);
-                                let no_mobile = no_www.replacen("://m.", "://", 1).replacen("://mobile.", "://", 1);
-                                strip_tracking_params(&no_mobile)
-                            };
-                            if !url_rrf_contributions.contains_key(&normalized) {
-                                let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
-                                *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
-                                // Tag retry results with their SearXNG instance
-                                let mut instance_tagged = result;
-                                let instance_tag = format!("instance_{}", retry_key.trim_start_matches("searxng"));
-                                if !instance_tagged.sources.contains(&instance_tag) {
-                                    instance_tagged.sources.push(instance_tag);
+                        results_inner.lock().unwrap().push((inst_idx, retry_key, url_for_log, result));
+                    }
+                }).await;
+
+                // Process gathered retry results synchronously
+                let retry_results = {
+                    let mut guard = results_shared.lock().unwrap();
+                    std::mem::take(&mut *guard)
+                };
+
+                let mut final_retry_count = 0usize;
+                for (inst_idx, retry_key, _url_str, result) in retry_results {
+                    match result {
+                        Ok(data) if !data.results.is_empty() => {
+                            tracing::info!("Parallel retry on instance {} returned {} results", inst_idx, data.results.len());
+                            circuit_ref.record_success(&retry_key);
+                            if let Some(base_url) = searx_base_urls.get(inst_idx) {
+                                state.searx_last_used.lock().insert(base_url.to_string(), Instant::now());
+                            }
+                            circuit_ref.record_results(&retry_key, data.results.len() as u64);
+                            for (pos, result) in data.results.into_iter().enumerate() {
+                                let engine_weight = circuit_ref.weight(&result.engine);
+                                let normalized = {
+                                    let lower = result.url.to_lowercase();
+                                    let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                                    let no_trailing = no_fragment.trim_end_matches('/');
+                                    let no_www = no_trailing.replacen("://www.", "://", 1);
+                                    let no_mobile = no_www.replacen("://m.", "://", 1).replacen("://mobile.", "://", 1);
+                                    strip_tracking_params(&no_mobile)
+                                };
+                                if !url_rrf_contributions.contains_key(&normalized) {
+                                    let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
+                                    *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
+                                    // Tag retry results with their SearXNG instance
+                                    let mut instance_tagged = result;
+                                    let instance_tag = format!("instance_{}", retry_key.trim_start_matches("searxng"));
+                                    if !instance_tagged.sources.contains(&instance_tag) {
+                                        instance_tagged.sources.push(instance_tag);
+                                    }
+                                    web_results.push(instance_tagged);
+                                    final_retry_count += 1;
                                 }
-                                web_results.push(instance_tagged);
-                                retry_new_count += 1;
                             }
                         }
-                    }
-                    Ok(_) => {} // 0 results — skip
-                    Err(e) => {
-                        tracing::warn!("Parallel retry failed on instance {}: {}", inst_idx, e);
-                        circuit_ref.record_failure(&retry_key);
+                        Ok(_) => {} // 0 results — skip
+                        Err(e) => {
+                            tracing::warn!("Parallel retry failed on instance {}: {}", inst_idx, e);
+                            circuit_ref.record_failure(&retry_key);
+                        }
                     }
                 }
+                tracing::info!("Parallel retry collected {} new unique results", final_retry_count);
             }
-            // Drop remaining pending futures (cancels in-flight requests)
-            drop(pending);
-            tracing::info!("Parallel retry collected {} new unique results", retry_new_count);
         }
     }
 

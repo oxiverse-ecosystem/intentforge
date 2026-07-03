@@ -37,6 +37,46 @@ pub(crate) struct GeoLocation {
     pub time_zone: Option<String>,
 }
 
+impl GeoLocation {
+    /// Derive a BCP-47 language tag from the geolocation (e.g. "en-US", "de-DE").
+    /// Used to pass language hints to search engines.
+    pub(crate) fn language_tag(&self) -> Option<String> {
+        self.country_code.as_ref().map(|cc| {
+            let lang = match cc.as_str() {
+                "DE" => "de", "AT" => "de", "CH" => "de",
+                "FR" => "fr", "BE" => "fr", "CA" => "fr",
+                "ES" => "es", "MX" => "es", "AR" => "es",
+                "IT" => "it",
+                "PT" => "pt", "BR" => "pt",
+                "NL" => "nl",
+                "RU" => "ru",
+                "JP" => "ja",
+                "CN" | "TW" => "zh",
+                "KR" | "KP" => "ko",
+                "SA" | "AE" | "EG" => "ar",
+                "TR" => "tr",
+                "PL" => "pl",
+                "SE" | "NO" | "DK" => "da",
+                "FI" => "fi",
+                "GR" => "el",
+                "CZ" => "cs",
+                "HU" => "hu",
+                "RO" => "ro",
+                "UA" => "uk",
+                "IL" => "he",
+                "TH" => "th",
+                "VN" => "vi",
+                "ID" => "id",
+                "MY" => "ms",
+                "PH" => "tl",
+                "IN" | "GB" | "IE" | "AU" | "NZ" | "ZA" | "SG" | "HK" => "en",
+                _ => "en",
+            };
+            format!("{}-{}", lang, cc)
+        })
+    }
+}
+
 /// Thread-safe GeoLite2 reader
 pub(crate) struct GeoLocator {
     reader: Arc<Reader<Vec<u8>>>,
