@@ -193,7 +193,7 @@ struct SearxVideoResponse {
 fn parent_category(intent: &str) -> String {
     match intent {
         "navigational" => "navigational",
-        "informational" | "technical" | "how-to" | "comparison" | "fresh" => "informational",
+        "informational" | "technical" | "how-to" | "comparison" | "fresh" | "local" => "informational",
         "transactional" => "transactional",
         _ => "informational",
     }.to_string()
@@ -1498,6 +1498,17 @@ impl RankingWeights {
                 consensus: 0.18,
                 constraint: 0.21,
             },
+            "local" => Self {
+                rrf: 0.05,
+                intent: 0.06,
+                freshness: 0.14,   // boost — local results are time-sensitive (hours, events)
+                authority: 0.04,
+                local_bonus: 0.14, // strong boost — local index results are very relevant
+                quality: 0.05,
+                semantic: 0.20,
+                consensus: 0.16,
+                constraint: 0.16,
+            },
             _ => Self {  // informational, default
                 rrf: 0.06,
                 intent: 0.05,
@@ -1516,7 +1527,7 @@ impl RankingWeights {
     // comparison 0.38), blend ranking weights proportionally instead of hard-switching.
     // "Intent as hint, not gate."
     fn for_distribution(distribution: &std::collections::HashMap<String, f32>) -> Self {
-        let labels = ["informational", "technical", "navigational", "comparison", "how-to", "fresh", "transactional"];
+        let labels = ["informational", "technical", "navigational", "comparison", "how-to", "fresh", "transactional", "local"];
 
         // Get probabilities for each label (default 0 if missing)
         let probs: Vec<f32> = labels.iter().map(|l| {
@@ -1670,6 +1681,105 @@ fn normalize_scores(scores: &mut [f32]) {
             *score = score.clamp(0.05, cap);
         }
     }
+}
+
+// ─── Search URL Builder with Location Support ──────────────────────
+
+/// Build a SearXNG search URL with optional geolocation parameters.
+/// Appends `source_country` and `language` when location data is available.
+fn searxng_url(base: &str, query: &str, geo: Option<&geoloc::GeoLocation>) -> String {
+    searxng_url_with_categories(base, query, "", geo)
+}
+
+/// Build a SearXNG URL with optional categories (news, images, videos) and geolocation.
+fn searxng_url_with_categories(base: &str, query: &str, categories: &str, geo: Option<&geoloc::GeoLocation>) -> String {
+    let encoded = urlencoding::encode(query);
+    let cat = if categories.is_empty() { String::new() } else { format!("&categories={}", categories) };
+    let mut url = format!("{}/search?q={}&format=json{}&pageno=1", base, encoded, cat);
+    if let Some(g) = geo {
+        if let Some(ref cc) = g.country_code {
+            url.push_str(&format!("&source_country={}", cc.to_lowercase()));
+        }
+        if let Some(ref lang_tag) = g.language_tag() {
+            url.push_str(&format!("&language={}", lang_tag));
+        }
+    }
+    url
+}
+
+/// Score how relevant a search result is to the user's geographic location.
+/// Checks if the result title, content, or URL mentions the user's country,
+/// region, or city. Returns a boost between 0.0 and 0.25.
+fn geo_relevance_score(title: &str, content: &str, url: &str, geo: &geoloc::GeoLocation) -> f32 {
+    let preview = content.chars().take(500).collect::<String>().to_lowercase();
+    let text = format!("{} {} {}", title.to_lowercase(), preview, url.to_lowercase());
+    let mut boost: f32 = 0.0;
+
+    if let Some(ref country) = geo.country_name {
+        if text.contains(&country.to_lowercase()) {
+            boost = boost.max(0.10);
+        }
+    }
+    if let Some(ref code) = geo.country_code {
+        let code_lower = code.to_lowercase();
+        if url.to_lowercase().ends_with(&format!(".{}", code_lower))
+            || url.to_lowercase().contains(&format!("/{}", code_lower))
+        {
+            boost = boost.max(0.12);
+        }
+    }
+
+    if let Some(ref region) = geo.region {
+        if text.contains(&region.to_lowercase()) {
+            boost = boost.max(0.20);
+        }
+    }
+
+    if let Some(ref city) = geo.city {
+        if text.contains(&city.to_lowercase()) {
+            boost = boost.max(0.25);
+        }
+    }
+
+    boost
+}
+
+/// Detect if a search query has local intent (seeking nearby/nearby results).
+/// Returns `true` if the query contains signals like "near me", "nearby", etc.
+fn has_local_intent(query: &str) -> bool {
+    let lower = query.to_lowercase();
+    lower.contains(" near me")
+        || lower.starts_with("near me")
+        || lower.contains("nearby")
+        || lower.contains("close to me")
+        || lower.contains(" around me")
+        || lower.starts_with("around me")
+        || lower.contains(" near ")
+        || lower.contains(" in ") && (
+            lower.ends_with(" area")
+            || lower.ends_with(" region")
+            || lower.ends_with(" neighbourhood")
+            || lower.ends_with(" neighborhood")
+        )
+}
+
+/// If the query has local intent, expand it with the user's city/region context.
+fn localize_query(query: &str, geo: &geoloc::GeoLocation) -> Option<String> {
+    if !has_local_intent(query) {
+        return None;
+    }
+    let location = match (&geo.city, &geo.region, &geo.country_code) {
+        (Some(city), _, _) => city.clone(),
+        (None, Some(region), _) => region.clone(),
+        (None, None, Some(cc)) => cc.clone(),
+        _ => return None,
+    };
+    let localized = format!("{} {}", query, location);
+    // Don't return if it's essentially the same query
+    if localized.to_lowercase() == query.to_lowercase() {
+        return None;
+    }
+    Some(localized)
 }
 
 // ─── Text Content Sanitizer ───────────────────────────────────────
@@ -2147,6 +2257,7 @@ fn merge_local_and_web(
     intent: &str,
     constraints: &Constraints,
     distribution: Option<&std::collections::HashMap<String, f32>>,
+    geo_location: Option<&geoloc::GeoLocation>,
 ) -> Vec<MergedResult> {
     let mut merged: Vec<MergedResult> = Vec::new();
     let mut url_to_idx: HashMap<String, usize> = HashMap::new();
@@ -2472,6 +2583,9 @@ fn merge_local_and_web(
         } else { 0.0 };
 
         let local_bonus = if r.is_local { 1.0 } else { 0.0 };
+        // Geo-relevance boost: boost results that mention the user's country, region, or city.
+        // Higher boost for city-level matches (0.25) than country-level (0.10).
+        let geo_boost = geo_location.map(|g| geo_relevance_score(&r.title, &r.content, &r.url, g)).unwrap_or(0.0);
         let base = (weights.rrf * r.score)
             + (weights.semantic * semantic)
             + (weights.intent * intent_boost)
@@ -2480,7 +2594,8 @@ fn merge_local_and_web(
             + (weights.quality * quality)
             + (weights.consensus * consensus)
             + (weights.local_bonus * local_bonus)
-            + nav_domain_boost;
+            + nav_domain_boost
+            + geo_boost;
 
         let mut generic_penalty = 1.0f32;
         if !constraints.negative.is_empty() && (url_lower.contains("wikipedia.org") || url_lower.contains("wikidata.org")) {
@@ -2755,9 +2870,9 @@ struct AppState {
 async fn handle_images(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
+    headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
-    let q_encoded = urlencoding::encode(&q);
 
     // Guard: missing or empty `q` — return 400 with the documented body.
     if q.is_empty() {
@@ -2777,14 +2892,28 @@ async fn handle_images(
         return (axum::http::StatusCode::OK, Json(value));
     }
 
+    // Resolve client geolocation for location-aware image search
+    let geo_location: Option<geoloc::GeoLocation> = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next().map(|s| s.trim()))
+        .and_then(|ip| ip.parse().ok())
+        .or_else(|| {
+            headers.get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|ip| ip.parse().ok())
+        })
+        .and_then(|ip| {
+            state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
+        });
+
     // Fan-out to both SearXNG instances in parallel (VPN + Tor)
-    let searx_url = format!(
-        "http://127.0.0.1:8080/search?q={}&format=json&categories=images&pageno=1",
-        q_encoded
+    let searx_url = searxng_url_with_categories(
+        "http://127.0.0.1:8080", &q, "images", geo_location.as_ref()
     );
 
     let searx2_url = state.searxng2_url.as_ref().map(|base| {
-        format!("{}/search?q={}&format=json&categories=images&pageno=1", base, q_encoded)
+        searxng_url_with_categories(base, &q, "images", geo_location.as_ref())
     });
 
     let parse_images = |raw: String| -> Vec<ImageResult> {
@@ -2826,7 +2955,7 @@ async fn handle_images(
                 Err(e) => { tracing::warn!("SearXNG1 image body read error: {}", e); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG1 image request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG1 image timed out after 6s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG1 image timed out after 4s"); vec![] }
         }
     };
 
@@ -2835,13 +2964,13 @@ async fn handle_images(
             Some(u) => u,
             None => return vec![],
         };
-        match tokio::time::timeout(Duration::from_secs(8), state.http_client.get(&url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(5), state.http_client.get(&url).send()).await {
             Ok(Ok(resp)) => match resp.text().await {
                 Ok(raw) => parse_images(raw),
                 Err(e) => { tracing::warn!("SearXNG2 image body read error: {}", e); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG2 image request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG2 image timed out after 8s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG2 image timed out after 5s"); vec![] }
         }
     };
 
@@ -2872,9 +3001,9 @@ async fn handle_images(
 async fn handle_videos(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
+    headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
-    let q_encoded = urlencoding::encode(&q);
 
     // Guard: missing or empty `q` — return 400 with the documented body.
     if q.is_empty() {
@@ -2894,11 +3023,25 @@ async fn handle_videos(
         return (axum::http::StatusCode::OK, Json(value));
     }
 
+    // Resolve client geolocation for location-aware video search
+    let geo_location: Option<geoloc::GeoLocation> = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next().map(|s| s.trim()))
+        .and_then(|ip| ip.parse().ok())
+        .or_else(|| {
+            headers.get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|ip| ip.parse().ok())
+        })
+        .and_then(|ip| {
+            state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
+        });
+
     // Query both Invidious and SearXNG (categories=videos) in parallel
-    let invidious_url = format!("http://127.0.0.1:3000/api/v1/search?q={}", q_encoded);
-    let searx_video_url = format!(
-        "http://127.0.0.1:8080/search?q={}&format=json&categories=videos&pageno=1",
-        q_encoded
+    let invidious_url = format!("http://127.0.0.1:3000/api/v1/search?q={}", urlencoding::encode(&q));
+    let searx_video_url = searxng_url_with_categories(
+        "http://127.0.0.1:8080", &q, "videos", geo_location.as_ref()
     );
 
     let (invidious_fut, searx_fut) = tokio::join!(
@@ -2992,9 +3135,9 @@ async fn handle_videos(
 async fn handle_news(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
+    headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
-    let q_encoded = urlencoding::encode(&q);
 
     // Guard: missing or empty `q` — return 400 with the documented body.
     if q.is_empty() {
@@ -3014,14 +3157,28 @@ async fn handle_news(
         return (axum::http::StatusCode::OK, Json(value));
     }
 
+    // Resolve client geolocation for location-aware news search
+    let geo_location: Option<geoloc::GeoLocation> = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next().map(|s| s.trim()))
+        .and_then(|ip| ip.parse().ok())
+        .or_else(|| {
+            headers.get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|ip| ip.parse().ok())
+        })
+        .and_then(|ip| {
+            state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
+        });
+
     // Fan-out to both SearXNG instances in parallel (VPN + Tor)
-    let searx_url = format!(
-        "http://127.0.0.1:8080/search?q={}&format=json&categories=news&pageno=1",
-        q_encoded
+    let searx_url = searxng_url_with_categories(
+        "http://127.0.0.1:8080", &q, "news", geo_location.as_ref()
     );
 
     let searx2_url = state.searxng2_url.as_ref().map(|base| {
-        format!("{}/search?q={}&format=json&categories=news&pageno=1", base, q_encoded)
+        searxng_url_with_categories(base, &q, "news", geo_location.as_ref())
     });
 
     let parse_news = |raw: String| -> Vec<NewsResult> {
@@ -3051,13 +3208,13 @@ async fn handle_news(
     };
 
     let searx1_fut = async {
-        match tokio::time::timeout(Duration::from_secs(6), state.http_client.get(&searx_url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&searx_url).send()).await {
             Ok(Ok(resp)) => match resp.text().await {
                 Ok(raw) => parse_news(raw),
                 Err(e) => { tracing::warn!("SearXNG1 news body read error: {}", e); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG1 news request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG1 news timed out after 6s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG1 news timed out after 4s"); vec![] }
         }
     };
 
@@ -3066,13 +3223,13 @@ async fn handle_news(
             Some(u) => u,
             None => return vec![],
         };
-        match tokio::time::timeout(Duration::from_secs(8), state.http_client.get(&url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(5), state.http_client.get(&url).send()).await {
             Ok(Ok(resp)) => match resp.text().await {
                 Ok(raw) => parse_news(raw),
                 Err(e) => { tracing::warn!("SearXNG2 news body read error: {}", e); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG2 news request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG2 news timed out after 8s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG2 news timed out after 5s"); vec![] }
         }
     };
 
@@ -3197,7 +3354,7 @@ async fn main() {
         .route("/images", get(handle_images))
         .route("/videos", get(handle_videos))
         .route("/news", get(handle_news))
-        .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(10)));
+        .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(20)));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
     tracing::info!("Gateway listening on {} (circuit-breaker + cache)", addr);
@@ -3291,6 +3448,11 @@ async fn handle_search(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|ip| ip.parse().ok())
         });
+    // Look up geolocation immediately — used for SearXNG URL construction,
+    // ranking geo-boost, and local query expansion.
+    let geo_location: Option<geoloc::GeoLocation> = client_ip.and_then(|ip| {
+        state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
+    });
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel
     let intent_url = format!("http://127.0.0.1:3005/analyze?q={}", q_encoded);
@@ -3366,15 +3528,15 @@ async fn handle_search(
     let mut searx_instance_keys: Vec<String> = Vec::new();
     for (i, base_url) in searx_base_urls.iter().enumerate() {
         let key = format!("searxng{}", i);
-        // Raw query URL
+        // Raw query URL (with geolocation parameters)
         let clean_q = preprocess_searxng_query(&q);
-        searx_urls.push(format!("{}/search?q={}&format=json&pageno=1", base_url, urlencoding::encode(&clean_q)));
+        searx_urls.push(searxng_url(base_url, &clean_q, geo_location.as_ref()));
         searx_instance_keys.push(key.clone());
         // Stripped query URL (same instance, runs in parallel)
         if let Some(ref stripped) = stripped_override {
             let clean_stripped = preprocess_searxng_query(stripped);
             if !clean_stripped.is_empty() {
-                searx_urls.push(format!("{}/search?q={}&format=json&pageno=1", base_url, urlencoding::encode(&clean_stripped)));
+                searx_urls.push(searxng_url(base_url, &clean_stripped, geo_location.as_ref()));
                 searx_instance_keys.push(key);
             }
         }
@@ -3440,17 +3602,17 @@ async fn handle_search(
             if is_open {
                 return Ok(SearxResponse { results: vec![] });
             }
-            // Per-instance timeout: 3s for the request itself, giving VPN engines (3.0s)
-            // enough headroom while keeping Tor retries within the 5s outer wrapper.
+            // Per-instance timeout: matches SearXNG's outgoing.request_timeout (8s)
+            // so VPN/Tor engines have enough headroom to respond.
             let first: Result<SearxResponse, reqwest::Error> = async {
                 let resp = match tokio::time::timeout(
-                    std::time::Duration::from_secs(6),
+                    std::time::Duration::from_secs(5),
                     client_ref.get(&url).send()
                 ).await {
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
-                        tracing::warn!("SearXNG instance request timed out (6s): {}", &url[..url.find('?').unwrap_or(url.len())]);
+                        tracing::warn!("SearXNG instance request timed out (5s): {}", &url[..url.find('?').unwrap_or(url.len())]);
                         return Ok(SearxResponse { results: vec![] });
                     }
                 };
@@ -3464,7 +3626,7 @@ async fn handle_search(
                     rotate_all_ips(&format!("429_rate_limit_{}", new_count));
                 }
                 let raw = match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(3),
                     resp.text()
                 ).await {
                     Ok(Ok(t)) => t,
@@ -3542,9 +3704,8 @@ async fn handle_search(
         if !is_news_intent || all_searx_open {
             return Ok(SearxNewsResponse { results: vec![] }) as Result<SearxNewsResponse, anyhow::Error>;
         }
-        let news_url = format!(
-            "http://127.0.0.1:8080/search?q={}&format=json&categories=news&pageno=1",
-            q_encoded
+        let news_url = searxng_url_with_categories(
+            "http://127.0.0.1:8080", &q, "news", geo_location.as_ref()
         );
         let resp = match tokio::time::timeout(std::time::Duration::from_secs(1), client_ref.get(&news_url).send()).await {
             Ok(Ok(r)) => r,
@@ -3568,9 +3729,8 @@ async fn handle_search(
         if !is_image_intent || all_searx_open {
             return Ok(SearxImageResponse { results: vec![] }) as Result<SearxImageResponse, anyhow::Error>;
         }
-        let image_url = format!(
-            "http://127.0.0.1:8080/search?q={}&format=json&categories=images&pageno=1",
-            q_encoded
+        let image_url = searxng_url_with_categories(
+            "http://127.0.0.1:8080", &q, "images", geo_location.as_ref()
         );
         let resp = match tokio::time::timeout(std::time::Duration::from_secs(1), client_ref.get(&image_url).send()).await {
             Ok(Ok(r)) => r,
@@ -3601,7 +3761,7 @@ async fn handle_search(
                 f.map(move |r| (i, r)).boxed()
             }).collect();
         let mut results: Vec<(usize, Result<SearxResponse, reqwest::Error>)> = Vec::new();
-        let min_early_return: usize = if has_neg_pattern { 50 } else { 8 };
+        let min_early_return: usize = 15;
 
         while !futs.is_empty() {
             let ((orig_idx, result), _idx, remaining) = futures::future::select_all(futs).await;
@@ -3741,6 +3901,39 @@ async fn handle_search(
             intent.distribution.insert("comparison".to_string(), comp + 0.1);
             intent.distribution.insert("technical".to_string(), tech + 0.1);
         }
+
+        // Override 4: local intent signals with low confidence → boost local in distribution
+        // e.g. "pizza near me" (conf=0.12, classified comparison → should be local)
+        let has_local_keywords = q_lower.contains(" near me") || q_lower.starts_with("near me")
+            || q_lower.contains("nearby") || q_lower.contains(" in ")
+            || q_lower.contains("close to");
+        if has_local_keywords && intent.intent.as_str() != "local" && intent.confidence < 0.50 {
+            let local_prob = intent.distribution.get("local").copied().unwrap_or(0.0);
+            if local_prob < 0.15 {
+                tracing::info!(
+                    "INTENT OVERRIDE: local-signal query '{}' was '{}' (conf={:.3}) — boosting local",
+                    q, intent.intent, intent.confidence
+                );
+                // Shift probability from the current top intent to local
+                let current_top = intent.distribution.iter()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(k, _)| k.clone())
+                    .unwrap_or_default();
+                let top_prob = intent.distribution.get(&current_top).copied().unwrap_or(0.0);
+                let shift = top_prob * 0.3;
+                intent.distribution.insert(current_top.clone(), top_prob - shift);
+                intent.distribution.insert("local".to_string(), local_prob + shift);
+                // If boosted local becomes the highest, set intent to local
+                let new_local = intent.distribution.get("local").copied().unwrap_or(0.0);
+                let new_top = intent.distribution.iter()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0.0);
+                if new_local >= new_top {
+                    intent.intent = "local".to_string();
+                }
+            }
+        }
     }
 
     let vector: Option<Vec<f32>> = match embed_res {
@@ -3802,6 +3995,25 @@ async fn handle_search(
         eq.extend(alt_queries);
         eq.extend(expanded_queries);
         eq
+    } else {
+        expanded_queries
+    };
+    // Location-aware query expansion: use semantic "local" intent from the engine
+    // (BERT-based classifier), falling back to keyword detection when confidence is low.
+    let is_local_intent = intent.intent.as_str() == "local" && intent.confidence >= 0.20
+        || intent.intent.as_str() != "local" && has_local_intent(&q);
+    let expanded_queries = if let Some(ref geo) = geo_location {
+        if is_local_intent {
+            let mut eq = expanded_queries;
+            if let Some(localized) = localize_query(&q, geo) {
+                tracing::info!("LOCAL INTENT (semantic={}): expanding query '{}' with location -> '{}'",
+                    intent.intent == "local", q, localized);
+                eq.push(localized);
+            }
+            eq
+        } else {
+            expanded_queries
+        }
     } else {
         expanded_queries
     };
@@ -3949,7 +4161,7 @@ async fn handle_search(
     // Count-based retry (no relevance needed yet — fires before Invidious/news/image)
     if needs_more_results && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
         let mut retry_futs = Vec::new();
-        let retry_timeout = Duration::from_secs(4); // shorter than initial 6s
+        let retry_timeout = Duration::from_secs(4); // shorter than initial 5s
         let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 6 } else { 3 };
         for (eq_idx, eq) in expanded_queries.iter().enumerate().skip(1) {
             if eq_idx > max_variations { break; }
@@ -3962,10 +4174,7 @@ async fn handle_search(
                 // For normal queries, only use VPN instance (SearXNG1) for speed.
                 if !only_negative && intent.structured_constraints.negative.is_empty() && inst_idx > 0 { continue; }
                 if circuit_ref.is_open(&retry_key) { continue; }
-                let retry_url = format!(
-                    "{}/search?q={}&format=json&pageno=1",
-                    base_url, urlencoding::encode(&clean_eq)
-                );
+                let retry_url = searxng_url(base_url, &clean_eq, geo_location.as_ref());
                 let client = client_ref.clone();
                 let key = retry_key.clone();
                 let url_for_log = retry_url[..retry_url.find('?').unwrap_or(retry_url.len())].to_string();
@@ -4548,6 +4757,7 @@ async fn handle_search(
     let intent_clone = intent.intent.clone();
     let constraints_clone = intent.structured_constraints.clone();
     let distribution_clone = intent.distribution.clone();
+    let geo_clone = geo_location.clone();
     
     // Apply hard negative filter to web_results for only-negative queries:
     // Drop results whose domain matches the excluded term's official site.
@@ -4620,9 +4830,28 @@ async fn handle_search(
             }
         }
     }
+    // For only-negative queries, skip the domain-based hard filter.
+    // The title penalty (score *= 0.01) + constraint scoring already demotes
+    // results from excluded domains. Hard-removing ALL results from e.g.
+    // djangoproject.com for "not django" leaves zero results since search
+    // engines treat "not" as a stop word and return the official site.
+    // Additionally, check if any result contains a positive term — if so,
+    // keep it regardless of domain, since it IS about the user's topic.
     if has_only_negative {
         let before = web_results.len();
+        let has_positive_terms = !intent.structured_constraints.positive.is_empty();
         web_results.retain(|item| {
+            // If result contains a positive term, skip domain filter entirely.
+            if has_positive_terms {
+                let text = format!("{} {}", item.title, item.url).to_lowercase();
+                let any_positive = intent.structured_constraints.positive.iter().any(|pt| {
+                    let pt_clean: String = pt.chars().filter(|c| c.is_alphanumeric()).collect();
+                    pt_clean.len() >= 3 && text.contains(&pt_clean)
+                });
+                if any_positive {
+                    return true;
+                }
+            }
             if let Ok(parsed) = reqwest::Url::parse(&item.url) {
                 if let Some(host) = parsed.host_str() {
                     let host_lower = host.to_lowercase();
@@ -4662,6 +4891,7 @@ let mut results = tokio::task::spawn_blocking(move || {
             &intent_clone,
             &constraints_clone,
             Some(&distribution_clone),
+            geo_clone.as_ref(),
         )
     }).await.unwrap();
 
@@ -4735,12 +4965,19 @@ let mut results = tokio::task::spawn_blocking(move || {
     // (applied in score_rerank) to appropriately demote results about the excluded topic.
     // Queries with BOTH positive and negative constraints (e.g. "python framework not django")
     // still use the hard filter since there are non-excluded results to keep.
+    // BUT: if a result contains ANY positive term, skip hard removal — the title penalty
+    // already demotes it. This prevents removing genuinely relevant results that merely
+    // mention the excluded term in passing (e.g. "cars not suv" removes all car results
+    // because they all mention "SUV").
     if has_only_negative {
         tracing::info!(
             "NEGATIVE CONSTRAINT: skipping hard removal for {} results (title penalty + constraint scoring will penalize instead)",
             before_count
         );
     } else {
+        let pos_terms: Vec<String> = intent.structured_constraints.positive.iter()
+            .map(|p| p.to_lowercase())
+            .collect();
         results.retain(|r| {
             // Alternative-listing page check: keep comparison/alternative pages
             // even if they mention excluded terms (they are HIGHLY relevant).
@@ -4749,8 +4986,16 @@ let mut results = tokio::task::spawn_blocking(move || {
                 return true;
             }
 
+            // If result contains any positive term, skip hard removal — let title penalty handle it.
             let text = format!("{} {}", r.title, r.url);
             let text_lower = text.to_lowercase();
+            if pos_terms.iter().any(|pt| {
+                let pt_clean: String = pt.chars().filter(|c| c.is_alphanumeric()).collect();
+                pt_clean.len() >= 3 && text_lower.contains(&pt_clean)
+            }) {
+                return true;
+            }
+
             let text_normalized = {
                 let chars: Vec<char> = text_lower.chars().collect();
                 let mut out = String::with_capacity(chars.len());
@@ -4879,9 +5124,7 @@ let mut results = tokio::task::spawn_blocking(move || {
         expanded_queries: intent.expanded_queries.clone(),
         distribution: intent.distribution.clone(),
         results,
-        geo_location: client_ip.and_then(|ip| {
-            state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
-        }),
+        geo_location,
         spell_corrected_query: if spell_changed { Some(q.clone()) } else { None },
     };
 

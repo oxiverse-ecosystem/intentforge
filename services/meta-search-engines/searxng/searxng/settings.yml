@@ -35,8 +35,7 @@ search:
   formats:
     - html
     - json
-  # Auto-suspend engines on errors to avoid wasting time on retries.
-  # SearXNG will re-enable them after the cooldown period.
+  # Auto-suspend engines disabled (set to 0) because gateway and vpn-rotator handle IP rotation dynamically.
   suspended_times:
     SearxEngineAccessDenied: 0
     SearxEngineCaptcha: 0
@@ -45,8 +44,8 @@ search:
   default_lang: "en"
 
 outgoing:
-  request_timeout: 4.0    # increased from 2.0s for slow VPN connections
-  max_request_timeout: 8.0
+  request_timeout: 4.0
+  max_request_timeout: 6.0
   enable_http2: true       # HTTP/2 multiplexing for engines that support it
   pool_maxsize: 20         # increase per-host connection pool from default 10
   keepalive_expiry: 30     # keep idle connections alive longer (default 5s)
@@ -58,47 +57,48 @@ outgoing:
     tor:
       proxies:
         all://: socks5h://127.0.0.1:9050
-      using_tor_proxy: true
+      using_tor_proxy: false
       retries: 2
 
 engines:
   # ── Primary engines (via VPN/Gluetun) ──
+  # ── Primary engines (via VPN/Gluetun) ──
   - name: bing
     disabled: false
-    timeout: 3.5
+    timeout: 4.0
 
   - name: brave
     disabled: false
-    timeout: 3.5
+    timeout: 4.0
 
   - name: startpage
     disabled: false
-    timeout: 3.5
+    timeout: 4.0
 
   - name: wikipedia
     disabled: false
-    timeout: 3.5
+    timeout: 4.0
 
   - name: mojeek
     disabled: false
-    timeout: 3.5
+    timeout: 4.0
 
   - name: yandex
     disabled: true   # DISABLED: blocked through non-Russian VPN IPs, always times out
-    timeout: 3.5
+    timeout: 4.0
 
   # ── New engines (via VPN) ──
   - name: duckduckgo
     disabled: true   # DISABLED: CAPTCHA'd through ProtonVPN exit IPs 80%+ of the time
-    timeout: 3.5
+    timeout: 4.0
 
   - name: presearch
     disabled: true    # DISABLED: getting 403 rate-limited (suspended 300s), causes cascading timeouts
-    timeout: 3.5
+    timeout: 4.0
 
   - name: marginalia
     disabled: false
-    timeout: 3.5
+    timeout: 4.0
 
   # ── Onion engines (via Tor SOCKS5) ──
   - name: ahmia
@@ -110,19 +110,19 @@ engines:
   - name: bing images
     engine: bing_images
     disabled: false
-    timeout: 3.5
+    timeout: 4.0
 
   - name: google images
     engine: google_images
     disabled: false
-    timeout: 3.5
+    timeout: 4.0
 
   - name: duckduckgo images
     engine: duckduckgo_extra
     ddg_category: images
     shortcut: ddi
     disabled: false
-    timeout: 3.5
+    timeout: 4.0
 
   - name: brave images
     engine: brave
@@ -130,43 +130,43 @@ engines:
     categories: images
     shortcut: bri
     disabled: true    # DISABLED: brave changed response format, crashes SearXNG (ValueError: substring not found)
-    timeout: 3.5
+    timeout: 4.0
 
   - name: openverse
     engine: openverse
     shortcut: ovi
     disabled: false
-    timeout: 3.5
+    timeout: 4.0
 
   # ── News engines (via VPN) ──
   - name: bing news
     engine: bing_news
     disabled: false
-    timeout: 3.0
+    timeout: 4.0
 
   - name: google news
     engine: google_news
     disabled: false
-    timeout: 3.0
+    timeout: 4.0
 
   - name: hackernews
     disabled: false
-    timeout: 3.0
+    timeout: 4.0
 
   # ── Video engines (via VPN) ──
   - name: bing videos
     engine: bing_videos
     disabled: false
-    timeout: 3.5
+    timeout: 4.0
 
   - name: google videos
     engine: google_videos
     disabled: false
-    timeout: 3.5
+    timeout: 4.0
 
   - name: duckduckgo videos
     engine: duckduckgo_extra
     ddg_category: videos
     shortcut: ddv
     disabled: false
-    timeout: 3.5
+    timeout: 4.0

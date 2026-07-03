@@ -56,12 +56,12 @@ outgoing:
     default:
       proxies:
         all://: socks5h://127.0.0.1:9051
-      using_tor_proxy: true
+      using_tor_proxy: false
       retries: 1            # One retry through Tor — circuits can stall
     tor:
       proxies:
         all://: socks5h://127.0.0.1:9051
-      using_tor_proxy: true
+      using_tor_proxy: false
       retries: 1
 
 engines:
