@@ -107,6 +107,7 @@ services:
       - GRANIAN_HOST=0.0.0.0
     volumes:
       - ./meta-search-engines/searxng/searxng:/etc/searxng:rw
+      - ./shared-signals/resolv-searxng-host.conf:/etc/resolv.conf:ro
     restart: always
     cap_drop:
       - ALL
