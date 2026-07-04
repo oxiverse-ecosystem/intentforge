@@ -4,16 +4,13 @@ use_default_settings:
       # ── General web search ──
       - bing
       - brave
-      - startpage
       - wikipedia
-      - mojeek
       - marginalia
-      # (removed duckduckgo + yandex: CAPTCHA'd/blocked through ProtonVPN 80%+ of the time)
+      # (removed duckduckgo + yandex + startpage + mojeek: blocked/CAPTCHA'd/403 through VPN)
       # ── Image engines (multiple providers for redundancy) ──
       - bing images
       - google images
       - duckduckgo images
-      - brave images
       - openverse
       # ── News engines ──
       - bing news
@@ -44,8 +41,10 @@ search:
   default_lang: "en"
 
 outgoing:
-  request_timeout: 5.0
-  max_request_timeout: 8.0
+  source_ips:
+    - 0.0.0.0
+  request_timeout: 2.8
+  max_request_timeout: 3.5
   enable_http2: true       # HTTP/2 multiplexing for engines that support it
   pool_maxsize: 20         # increase per-host connection pool from default 10
   keepalive_expiry: 30     # keep idle connections alive longer (default 5s)
@@ -62,26 +61,25 @@ outgoing:
 
 engines:
   # ── Primary engines (via VPN/Gluetun) ──
-  # ── Primary engines (via VPN/Gluetun) ──
   - name: bing
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   - name: brave
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   - name: startpage
-    disabled: false
-    timeout: 5.0
+    disabled: true
+    timeout: 1.0
 
   - name: wikipedia
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   - name: mojeek
-    disabled: false
-    timeout: 5.0
+    disabled: true
+    timeout: 1.0
 
   - name: yandex
     disabled: true   # DISABLED: blocked through non-Russian VPN IPs, always times out
@@ -98,7 +96,7 @@ engines:
 
   - name: marginalia
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   # ── Onion engines (via Tor SOCKS5) ──
   - name: ahmia
@@ -110,19 +108,19 @@ engines:
   - name: bing images
     engine: bing_images
     disabled: false
-    timeout: 5.0
+    timeout: 1.5
 
   - name: google images
     engine: google_images
     disabled: false
-    timeout: 5.0
+    timeout: 1.5
 
   - name: duckduckgo images
     engine: duckduckgo_extra
     ddg_category: images
     shortcut: ddi
     disabled: false
-    timeout: 5.0
+    timeout: 1.5
 
   - name: brave images
     engine: brave
@@ -136,37 +134,37 @@ engines:
     engine: openverse
     shortcut: ovi
     disabled: false
-    timeout: 5.0
+    timeout: 1.5
 
   # ── News engines (via VPN) ──
   - name: bing news
     engine: bing_news
     disabled: false
-    timeout: 5.0
+    timeout: 1.5
 
   - name: google news
     engine: google_news
     disabled: false
-    timeout: 5.0
+    timeout: 1.5
 
   - name: hackernews
     disabled: false
-    timeout: 5.0
+    timeout: 1.0
 
   # ── Video engines (via VPN) ──
   - name: bing videos
     engine: bing_videos
     disabled: false
-    timeout: 5.0
+    timeout: 1.5
 
   - name: google videos
     engine: google_videos
     disabled: false
-    timeout: 5.0
+    timeout: 1.5
 
   - name: duckduckgo videos
     engine: duckduckgo_extra
     ddg_category: videos
     shortcut: ddv
     disabled: false
-    timeout: 5.0
+    timeout: 1.5

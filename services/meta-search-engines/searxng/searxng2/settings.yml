@@ -9,11 +9,11 @@ use_default_settings:
   engines:
     keep_only:
       # ── Tor-fast engines ──
-      - brave           # clearnet works through Tor, ~0.5s
       - bing            # 10 results, ~1.5s
-      - startpage       # 8 results, ~2s
-      - mojeek          # 6 results, ~2s
       - wikipedia       # 1-2 results, ~1s
+      - marginalia      # works well via Tor, ~1.5s
+      - brave-onion     # onion service, ~2.5s
+      - duckduckgo-onion # onion service, ~2.5s
       # ── News (fast through Tor) ──
       - bing news
       - google news
@@ -46,8 +46,10 @@ search:
   default_lang: "en"
 
 outgoing:
-  request_timeout: 6.0     # raised from 4.0 — Tor circuits need more headroom
-  max_request_timeout: 12.0 # raised from 8.0 — some Tor exits are slow
+  source_ips:
+    - 0.0.0.0
+  request_timeout: 2.8     # lowered from 6.0 — Tor circuits need more headroom
+  max_request_timeout: 3.5 # lowered from 12.0 — some Tor exits are slow
   enable_http2: true       # HTTP/2 multiplexing for engines that support it
   pool_maxsize: 20         # increase per-host connection pool from default 10
   keepalive_expiry: 30     # keep idle connections alive longer (default 5s)
@@ -68,11 +70,11 @@ engines:
   # ── Fast engines via Tor (higher timeouts for Tor latency) ──
   - name: bing
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   - name: startpage
-    disabled: false
-    timeout: 5.0
+    disabled: true
+    timeout: 1.5
 
   # Brave clearnet through Tor is unreliable (429 rate-limited). Disable the
   # default clearnet instance and use the custom brave-onion engine instead.
@@ -85,7 +87,7 @@ engines:
     base_url: "https://search.brave4u7jddbv7cyviptqjc7jusxh72uik7zt6adtckl5f4nwy2v72qd.onion/"
     disabled: false
     shortcut: brv
-    timeout: 8.0
+    timeout: 2.5
     categories: general
     network: default
 
@@ -95,65 +97,69 @@ engines:
     ddg_url: "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/html/"
     disabled: false
     shortcut: ddo
-    timeout: 8.0
+    timeout: 2.5
     categories: general
     network: default  # use the default network's SOCKS5 proxy for .onion
 
   - name: mojeek
-    disabled: false
-    timeout: 5.0
+    disabled: true
+    timeout: 1.5
 
   - name: wikipedia
     disabled: false
-    timeout: 4.0
+    timeout: 2.5
+
+  - name: marginalia
+    disabled: false
+    timeout: 2.5
 
   # ── Image engines via Tor (multiple for redundancy) ──
   - name: bing images
     engine: bing_images
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   - name: google images
     engine: google_images
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   - name: duckduckgo images
     engine: duckduckgo_extra
     ddg_category: images
     shortcut: ddi
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   # ── News via Tor ──
   - name: bing news
     engine: bing_news
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   - name: google news
     engine: google_news
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   - name: hackernews
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   # ── Video engines via Tor ──
   - name: bing videos
     engine: bing_videos
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   - name: google videos
     engine: google_videos
     disabled: false
-    timeout: 5.0
+    timeout: 2.5
 
   - name: duckduckgo videos
     engine: duckduckgo_extra
     ddg_category: videos
     shortcut: ddv
     disabled: false
-    timeout: 5.0
+    timeout: 2.5

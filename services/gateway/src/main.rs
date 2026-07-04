@@ -805,6 +805,11 @@ fn expand_negative_synonyms(term: &str) -> Vec<String> {
     let mut expanded = vec![term.to_lowercase()];
     let term_lower = term.to_lowercase();
     match term_lower.as_str() {
+        "vscode" | "vs code" | "visual studio code" => {
+            expanded.push("vscode".to_string());
+            expanded.push("vs code".to_string());
+            expanded.push("visual studio code".to_string());
+        }
         "aws" => {
             expanded.push("amazon".to_string());
             expanded.push("amazon web services".to_string());
@@ -2949,13 +2954,13 @@ async fn handle_images(
     };
 
     let searx1_fut = async {
-        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&searx_url).send()).await {
+        match tokio::time::timeout(Duration::from_millis(1500), state.http_client.get(&searx_url).send()).await {
             Ok(Ok(resp)) => match resp.text().await {
                 Ok(raw) => parse_images(raw),
                 Err(e) => { tracing::warn!("SearXNG1 image body read error: {}", e); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG1 image request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG1 image timed out after 4s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG1 image timed out after 1.5s"); vec![] }
         }
     };
 
@@ -2964,13 +2969,13 @@ async fn handle_images(
             Some(u) => u,
             None => return vec![],
         };
-        match tokio::time::timeout(Duration::from_secs(5), state.http_client.get(&url).send()).await {
+        match tokio::time::timeout(Duration::from_millis(2000), state.http_client.get(&url).send()).await {
             Ok(Ok(resp)) => match resp.text().await {
                 Ok(raw) => parse_images(raw),
                 Err(e) => { tracing::warn!("SearXNG2 image body read error: {}", e); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG2 image request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG2 image timed out after 5s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG2 image timed out after 2s"); vec![] }
         }
     };
 
@@ -3046,7 +3051,7 @@ async fn handle_videos(
 
     let (invidious_fut, searx_fut) = tokio::join!(
         async {
-            match tokio::time::timeout(Duration::from_secs(3), state.http_client.get(&invidious_url).send()).await {
+            match tokio::time::timeout(Duration::from_millis(1500), state.http_client.get(&invidious_url).send()).await {
                 Ok(Ok(resp)) => match resp.json::<Vec<InvidiousResult>>().await {
                     Ok(data) => data.into_iter()
                         .filter(|r| r.result_type.as_deref() == Some("video"))
@@ -3068,11 +3073,11 @@ async fn handle_videos(
                     Err(e) => { tracing::warn!("Invidious parse error: {}", e); vec![] }
                 },
                 Ok(Err(e)) => { tracing::warn!("Invidious request error: {}", e); vec![] }
-                Err(_) => { tracing::warn!("Invidious timed out after 3s"); vec![] }
+                Err(_) => { tracing::warn!("Invidious timed out after 1.5s"); vec![] }
             }
         },
         async {
-            match tokio::time::timeout(Duration::from_secs(3), state.http_client.get(&searx_video_url).send()).await {
+            match tokio::time::timeout(Duration::from_millis(1500), state.http_client.get(&searx_video_url).send()).await {
                 Ok(Ok(resp)) => match resp.text().await {
                     Ok(raw) => {
                         let sanitized = sanitize_json_text(&raw);
@@ -3105,7 +3110,7 @@ async fn handle_videos(
                     Err(e) => { tracing::warn!("SearXNG video body read error: {}", e); vec![] }
                 },
                 Ok(Err(e)) => { tracing::warn!("SearXNG video request error: {}", e); vec![] }
-                Err(_) => { tracing::warn!("SearXNG video timed out after 4s"); vec![] }
+                Err(_) => { tracing::warn!("SearXNG video timed out after 1.5s"); vec![] }
             }
         }
     );
@@ -3208,13 +3213,13 @@ async fn handle_news(
     };
 
     let searx1_fut = async {
-        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&searx_url).send()).await {
+        match tokio::time::timeout(Duration::from_millis(1500), state.http_client.get(&searx_url).send()).await {
             Ok(Ok(resp)) => match resp.text().await {
                 Ok(raw) => parse_news(raw),
                 Err(e) => { tracing::warn!("SearXNG1 news body read error: {}", e); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG1 news request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG1 news timed out after 4s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG1 news timed out after 1.5s"); vec![] }
         }
     };
 
@@ -3223,13 +3228,13 @@ async fn handle_news(
             Some(u) => u,
             None => return vec![],
         };
-        match tokio::time::timeout(Duration::from_secs(5), state.http_client.get(&url).send()).await {
+        match tokio::time::timeout(Duration::from_millis(2000), state.http_client.get(&url).send()).await {
             Ok(Ok(resp)) => match resp.text().await {
                 Ok(raw) => parse_news(raw),
                 Err(e) => { tracing::warn!("SearXNG2 news body read error: {}", e); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG2 news request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG2 news timed out after 5s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG2 news timed out after 2s"); vec![] }
         }
     };
 
@@ -3621,17 +3626,17 @@ async fn handle_search(
             if is_open {
                 return Ok(SearxResponse { results: vec![] });
             }
-            // Per-instance timeout: matches SearXNG's outgoing.request_timeout (8s)
+            // Per-instance timeout: matches SearXNG's outgoing.request_timeout (4s)
             // so VPN/Tor engines have enough headroom to respond.
             let first: Result<SearxResponse, reqwest::Error> = async {
                 let resp = match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(4),
                     client_ref.get(&url).send()
                 ).await {
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
-                        tracing::warn!("SearXNG instance request timed out (5s): {}", &url[..url.find('?').unwrap_or(url.len())]);
+                        tracing::warn!("SearXNG instance request timed out (4s): {}", &url[..url.find('?').unwrap_or(url.len())]);
                         return Ok(SearxResponse { results: vec![] });
                     }
                 };
@@ -3645,13 +3650,13 @@ async fn handle_search(
                     rotate_all_ips(&format!("429_rate_limit_{}", new_count));
                 }
                 let raw = match tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
+                    std::time::Duration::from_secs(4),
                     resp.text()
                 ).await {
                     Ok(Ok(t)) => t,
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
-                        tracing::warn!("SearXNG instance body read timed out (3s)");
+                        tracing::warn!("SearXNG instance body read timed out (4s)");
                         return Ok(SearxResponse { results: vec![] });
                     }
                 };
@@ -3776,12 +3781,13 @@ async fn handle_search(
                 f.map(move |r| (i, r)).boxed()
             }).collect();
         let min_early_return: usize = 15;
+        let urls_cloned = searx_urls.clone();
 
         // Use a thread-safe shared mutex to preserve results if the timeout triggers
         let results_shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let results_inner = results_shared.clone();
 
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(1800), async move {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(3300), async move {
             while !futs.is_empty() {
                 let ((orig_idx, result), _idx, remaining) = futures::future::select_all(futs).await;
                 futs = remaining;
@@ -3790,10 +3796,11 @@ async fn handle_search(
                     Ok(data) => {
                         let count = data.results.len();
                         results_inner.lock().unwrap().push((orig_idx, Ok(data)));
-                        if count >= min_early_return {
+                        let is_primary = urls_cloned[orig_idx].starts_with("http://127.0.0.1:8080");
+                        if (is_primary && count >= 5) || count >= min_early_return {
                             tracing::info!(
-                                "SearXNG early return: {} results >= {}, skipping {} remaining instance(s)",
-                                count, min_early_return, futs.len()
+                                "SearXNG early return: {} results (is_primary={}), skipping {} remaining instance(s)",
+                                count, is_primary, futs.len()
                             );
                             break;
                         }
@@ -4229,7 +4236,7 @@ async fn handle_search(
 
         if !retry_futs.is_empty() {
             let elapsed = search_start.elapsed();
-            let limit = Duration::from_millis(1900); // 1.9s overall target limit
+            let limit = Duration::from_millis(3000); // 3s overall target limit
             if elapsed >= limit {
                 tracing::warn!("Retry skipped: elapsed time ({:?}) already exceeds target deadline ({:?})", elapsed, limit);
             } else {
