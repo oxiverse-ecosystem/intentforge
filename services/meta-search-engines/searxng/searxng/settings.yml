@@ -43,8 +43,8 @@ search:
 outgoing:
   source_ips:
     - 0.0.0.0
-  request_timeout: 2.8
-  max_request_timeout: 3.5
+  request_timeout: 5.0
+  max_request_timeout: 8.0
   enable_http2: true       # HTTP/2 multiplexing for engines that support it
   pool_maxsize: 20         # increase per-host connection pool from default 10
   keepalive_expiry: 30     # keep idle connections alive longer (default 5s)
@@ -140,31 +140,32 @@ engines:
   - name: bing news
     engine: bing_news
     disabled: false
-    timeout: 1.5
+    timeout: 4.0
 
   - name: google news
     engine: google_news
     disabled: false
-    timeout: 1.5
+    timeout: 4.0
 
   - name: hackernews
     disabled: false
-    timeout: 1.0
+    timeout: 4.0
+    categories: news
 
   # ── Video engines (via VPN) ──
   - name: bing videos
     engine: bing_videos
     disabled: false
-    timeout: 1.5
+    timeout: 4.0
 
   - name: google videos
     engine: google_videos
     disabled: false
-    timeout: 1.5
+    timeout: 4.0
 
   - name: duckduckgo videos
     engine: duckduckgo_extra
     ddg_category: videos
     shortcut: ddv
     disabled: false
-    timeout: 1.5
+    timeout: 4.0

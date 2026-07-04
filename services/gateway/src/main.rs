@@ -2954,13 +2954,13 @@ async fn handle_images(
     };
 
     let searx1_fut = async {
-        match tokio::time::timeout(Duration::from_millis(1500), state.http_client.get(&searx_url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&searx_url).send()).await {
             Ok(Ok(resp)) => match resp.text().await {
                 Ok(raw) => parse_images(raw),
                 Err(e) => { tracing::warn!("SearXNG1 image body read error: {}", e); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG1 image request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG1 image timed out after 1.5s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG1 image timed out after 4s"); vec![] }
         }
     };
 
@@ -2969,13 +2969,13 @@ async fn handle_images(
             Some(u) => u,
             None => return vec![],
         };
-        match tokio::time::timeout(Duration::from_millis(2000), state.http_client.get(&url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&url).send()).await {
             Ok(Ok(resp)) => match resp.text().await {
                 Ok(raw) => parse_images(raw),
                 Err(e) => { tracing::warn!("SearXNG2 image body read error: {}", e); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG2 image request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG2 image timed out after 2s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG2 image timed out after 4s"); vec![] }
         }
     };
 
@@ -3043,85 +3043,149 @@ async fn handle_videos(
             state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
         });
 
-    // Query both Invidious and SearXNG (categories=videos) in parallel
-    let invidious_url = format!("http://127.0.0.1:3000/api/v1/search?q={}", urlencoding::encode(&q));
+    // Query Invidious and both SearXNG instances (categories=videos) in parallel
+    let invidious_url = format!("http://invidious:3000/api/v1/search?q={}", urlencoding::encode(&q));
     let searx_video_url = searxng_url_with_categories(
         "http://127.0.0.1:8080", &q, "videos", geo_location.as_ref()
     );
+    let searx2_video_url = state.searxng2_url.as_ref().map(|base| {
+        searxng_url_with_categories(base, &q, "videos", geo_location.as_ref())
+    });
 
-    let (invidious_fut, searx_fut) = tokio::join!(
-        async {
-            match tokio::time::timeout(Duration::from_millis(1500), state.http_client.get(&invidious_url).send()).await {
-                Ok(Ok(resp)) => match resp.json::<Vec<InvidiousResult>>().await {
-                    Ok(data) => data.into_iter()
-                        .filter(|r| r.result_type.as_deref() == Some("video"))
-                        .filter_map(|r| {
-                            let vid = r.video_id?;
-                            let title = r.title.unwrap_or_default();
-                            let description = r.description.unwrap_or_default();
-                            Some(VideoResult {
-                                title,
-                                url: format!("https://www.youtube.com/watch?v={}", vid),
-                                description,
-                                thumbnail: format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", vid),
-                                video_id: vid,
-                                source: "invidious".to_string(),
-                                score: 0.5,
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                    Err(e) => { tracing::warn!("Invidious parse error: {}", e); vec![] }
-                },
-                Ok(Err(e)) => { tracing::warn!("Invidious request error: {}", e); vec![] }
-                Err(_) => { tracing::warn!("Invidious timed out after 1.5s"); vec![] }
-            }
-        },
-        async {
-            match tokio::time::timeout(Duration::from_millis(1500), state.http_client.get(&searx_video_url).send()).await {
-                Ok(Ok(resp)) => match resp.text().await {
-                    Ok(raw) => {
-                        let sanitized = sanitize_json_text(&raw);
-                        match serde_json::from_str::<SearxVideoResponse>(&sanitized) {
-                            Ok(data) => data.results.into_iter().map(|r| {
-                                let thumbnail = if !r.thumbnail.is_empty() { r.thumbnail.clone() }
-                                    else if !r.img_src.is_empty() { r.img_src.clone() }
-                                    else { String::new() };
-                                let vid_title = &r.title;
-                                let vid_content = &r.content;
-                                let vid_tokens: Vec<&str> = q.split_whitespace()
-                                    .filter(|w| w.len() > 2)
-                                    .collect();
-                                let vid_tm = vid_tokens.iter().filter(|t| vid_title.to_lowercase().contains(*t)).count();
-                                let vid_cm = vid_tokens.iter().filter(|t| vid_content.to_lowercase().contains(*t)).count();
-                                let vid_score = 0.5 + (vid_tm as f32 * 0.15) + (vid_cm as f32 * 0.05);
-                                VideoResult {
-                                    title: r.title,
-                                    url: r.url,
-                                    description: r.content,
-                                    video_id: String::new(),
-                                    thumbnail,
-                                    source: r.engine,
-                                    score: vid_score.min(1.0),
-                                }
-                            }).collect::<Vec<_>>(),
-                            Err(e) => { tracing::warn!("SearXNG video parse error: {}", e); vec![] }
-                        }
+    let searx_fut = async {
+        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&searx_video_url).send()).await {
+            Ok(Ok(resp)) => match resp.text().await {
+                Ok(raw) => {
+                    let sanitized = sanitize_json_text(&raw);
+                    match serde_json::from_str::<SearxVideoResponse>(&sanitized) {
+                        Ok(data) => data.results.into_iter().map(|r| {
+                            let thumbnail = if !r.thumbnail.is_empty() { r.thumbnail.clone() }
+                                else if !r.img_src.is_empty() { r.img_src.clone() }
+                                else { String::new() };
+                            let vid_title = &r.title;
+                            let vid_content = &r.content;
+                            let vid_tokens: Vec<&str> = q.split_whitespace()
+                                .filter(|w| w.len() > 2)
+                                .collect();
+                            let vid_tm = vid_tokens.iter().filter(|t| vid_title.to_lowercase().contains(*t)).count();
+                            let vid_cm = vid_tokens.iter().filter(|t| vid_content.to_lowercase().contains(*t)).count();
+                            let vid_score = 0.5 + (vid_tm as f32 * 0.15) + (vid_cm as f32 * 0.05);
+                            VideoResult {
+                                title: r.title,
+                                url: r.url,
+                                description: r.content,
+                                video_id: String::new(),
+                                thumbnail,
+                                source: r.engine,
+                                score: vid_score.min(1.0),
+                            }
+                        }).collect::<Vec<_>>(),
+                        Err(e) => { tracing::warn!("SearXNG video parse error: {}", e); vec![] }
                     }
-                    Err(e) => { tracing::warn!("SearXNG video body read error: {}", e); vec![] }
-                },
-                Ok(Err(e)) => { tracing::warn!("SearXNG video request error: {}", e); vec![] }
-                Err(_) => { tracing::warn!("SearXNG video timed out after 1.5s"); vec![] }
+                }
+                Err(e) => { tracing::warn!("SearXNG video body read error: {}", e); vec![] }
+            },
+            Ok(Err(e)) => { tracing::warn!("SearXNG video request error: {}", e); vec![] }
+            Err(_) => { tracing::warn!("SearXNG video timed out after 4s"); vec![] }
+        }
+    };
+
+    let searx2_fut = async {
+        let url = match searx2_video_url {
+            Some(u) => u,
+            None => return vec![],
+        };
+        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&url).send()).await {
+            Ok(Ok(resp)) => match resp.text().await {
+                Ok(raw) => {
+                    let sanitized = sanitize_json_text(&raw);
+                    match serde_json::from_str::<SearxVideoResponse>(&sanitized) {
+                        Ok(data) => data.results.into_iter().map(|r| {
+                            let thumbnail = if !r.thumbnail.is_empty() { r.thumbnail.clone() }
+                                else if !r.img_src.is_empty() { r.img_src.clone() }
+                                else { String::new() };
+                            let vid_title = &r.title;
+                            let vid_content = &r.content;
+                            let vid_tokens: Vec<&str> = q.split_whitespace()
+                                .filter(|w| w.len() > 2)
+                                .collect();
+                            let vid_tm = vid_tokens.iter().filter(|t| vid_title.to_lowercase().contains(*t)).count();
+                            let vid_cm = vid_tokens.iter().filter(|t| vid_content.to_lowercase().contains(*t)).count();
+                            let vid_score = 0.5 + (vid_tm as f32 * 0.15) + (vid_cm as f32 * 0.05);
+                            VideoResult {
+                                title: r.title,
+                                url: r.url,
+                                description: r.content,
+                                video_id: String::new(),
+                                thumbnail,
+                                source: r.engine,
+                                score: vid_score.min(1.0),
+                            }
+                        }).collect::<Vec<_>>(),
+                        Err(e) => { tracing::warn!("SearXNG2 video parse error: {}", e); vec![] }
+                    }
+                }
+                Err(e) => { tracing::warn!("SearXNG2 video body read error: {}", e); vec![] }
+            },
+            Ok(Err(e)) => { tracing::warn!("SearXNG2 video request error: {}", e); vec![] }
+            Err(_) => { tracing::warn!("SearXNG2 video timed out after 4s"); vec![] }
+        }
+    };
+
+    let invidious_fut = async {
+        match tokio::time::timeout(Duration::from_secs(15), state.http_client.get(&invidious_url).send()).await {
+            Ok(Ok(resp)) => match resp.json::<Vec<InvidiousResult>>().await {
+                Ok(data) => data.into_iter()
+                    .filter(|r| r.result_type.as_deref() == Some("video"))
+                    .filter_map(|r| {
+                        let vid = r.video_id?;
+                        let title = r.title.unwrap_or_default();
+                        let description = r.description.unwrap_or_default();
+                        Some(VideoResult {
+                            title,
+                            url: format!("https://www.youtube.com/watch?v={}", vid),
+                            description,
+                            thumbnail: format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", vid),
+                            video_id: vid,
+                            source: "invidious".to_string(),
+                            score: 0.5,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                Err(e) => { tracing::warn!("Invidious parse error: {}", e); vec![] }
+            },
+            Ok(Err(e)) => { tracing::warn!("Invidious request error: {}", e); vec![] }
+            Err(_) => { tracing::warn!("Invidious timed out after 15s"); vec![] }
+        }
+    };
+
+    // Run all three in parallel — SearXNG with 4s timeout, Invidious gets same 4s deadline
+    let invidious_deadline = async {
+        tokio::select! {
+            results = invidious_fut => results,
+            _ = tokio::time::sleep(Duration::from_secs(4)) => {
+                tracing::warn!("Invidious skipped to meet 4s target");
+                vec![]
             }
         }
-    );
+    };
+    let (searx_results, searx2_results, invidious_results) = tokio::join!(searx_fut, searx2_fut, invidious_deadline);
 
-    // Merge results: SearXNG first (more reliable), then Invidious
-    let mut results = searx_fut;
-    results.extend(invidious_fut);
-
-    // Deduplicate by URL
-    let mut seen = std::collections::HashSet::new();
-    results.retain(|r| seen.insert(r.url.clone()));
+    // Merge results: SearXNG first, then SearXNG2, then Invidious
+    let mut results = searx_results;
+    {
+        let mut seen: std::collections::HashSet<String> = results.iter().map(|r| r.url.clone()).collect();
+        for r in searx2_results {
+            if seen.insert(r.url.clone()) {
+                results.push(r);
+            }
+        }
+        for r in invidious_results {
+            if seen.insert(r.url.clone()) {
+                results.push(r);
+            }
+        }
+    }
 
     let response = serde_json::json!({
         "results": results,
@@ -3190,21 +3254,21 @@ async fn handle_news(
         let sanitized = sanitize_json_text(&raw);
         match serde_json::from_str::<SearxNewsResponse>(&sanitized) {
             Ok(data) => data.results.into_iter().map(|r| {
-                let news_tokens: Vec<&str> = q.split_whitespace()
-                    .filter(|w| w.len() >= 2)
-                    .collect();
-                let news_tm = news_tokens.iter().filter(|t| r.title.to_lowercase().contains(*t)).count();
-                let news_cm = news_tokens.iter().filter(|t| r.content.to_lowercase().contains(*t)).count();
-                let news_score = 0.5 + (news_tm as f32 * 0.15) + (news_cm as f32 * 0.05);
-                NewsResult {
-                    title: r.title,
-                    url: r.url,
-                    description: r.content,
-                    published_at: r.published_date.unwrap_or_default(),
-                    source: r.engine,
-                    score: news_score.min(1.0),
-                }
-            }).collect(),
+                    let news_tokens: Vec<&str> = q.split_whitespace()
+                        .filter(|w| w.len() >= 2)
+                        .collect();
+                    let news_tm = news_tokens.iter().filter(|t| r.title.to_lowercase().contains(*t)).count();
+                    let news_cm = news_tokens.iter().filter(|t| r.content.to_lowercase().contains(*t)).count();
+                    let news_score = 0.5 + (news_tm as f32 * 0.15) + (news_cm as f32 * 0.05);
+                    NewsResult {
+                        title: r.title,
+                        url: r.url,
+                        description: r.content,
+                        published_at: r.published_date.unwrap_or_default(),
+                        source: r.engine,
+                        score: news_score.min(1.0),
+                    }
+                }).collect(),
             Err(e) => {
                 tracing::warn!("SearXNG news parse error: {}", e);
                 vec![]
@@ -3213,13 +3277,13 @@ async fn handle_news(
     };
 
     let searx1_fut = async {
-        match tokio::time::timeout(Duration::from_millis(1500), state.http_client.get(&searx_url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(6), state.http_client.get(&searx_url).send()).await {
             Ok(Ok(resp)) => match resp.text().await {
                 Ok(raw) => parse_news(raw),
                 Err(e) => { tracing::warn!("SearXNG1 news body read error: {}", e); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG1 news request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG1 news timed out after 1.5s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG1 news timed out after 6s"); vec![] }
         }
     };
 
@@ -3228,13 +3292,13 @@ async fn handle_news(
             Some(u) => u,
             None => return vec![],
         };
-        match tokio::time::timeout(Duration::from_millis(2000), state.http_client.get(&url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(6), state.http_client.get(&url).send()).await {
             Ok(Ok(resp)) => match resp.text().await {
                 Ok(raw) => parse_news(raw),
                 Err(e) => { tracing::warn!("SearXNG2 news body read error: {}", e); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG2 news request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG2 news timed out after 2s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG2 news timed out after 6s"); vec![] }
         }
     };
 
@@ -3566,7 +3630,7 @@ async fn handle_search(
         }
     }
 
-    let invidious_url = format!("http://127.0.0.1:3000/api/v1/search?q={}", q_encoded);
+    let invidious_url = format!("http://invidious:3000/api/v1/search?q={}", q_encoded);
 
     let indexer_q = if let Some(ref stripped) = stripped_override {
         stripped.clone()

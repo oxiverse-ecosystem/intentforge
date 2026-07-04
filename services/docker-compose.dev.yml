@@ -151,7 +151,6 @@ services:
   invidious-db:
     container_name: if-dev-invidious-db
     image: postgres:14-alpine
-    network_mode: "service:gluetun"
     restart: always
     environment:
       - POSTGRES_DB=invidious
@@ -159,18 +158,14 @@ services:
       - POSTGRES_PASSWORD=kemal
     volumes:
       - invidious-db-data-dev:/var/lib/postgresql/data
-      - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
 
   invidious:
     container_name: if-dev-invidious
     image: quay.io/invidious/invidious:latest
-    network_mode: "service:gluetun"
-    volumes:
-      - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
     depends_on:
       - invidious-db
     environment:
-      - INVIDIOUS_DATABASE_URL=postgres://kemal:kemal@localhost:5432/invidious
+      - INVIDIOUS_DATABASE_URL=postgres://kemal:kemal@invidious-db:5432/invidious
       - INVIDIOUS_HMAC_KEY=intentforge_v2_invidious_hmac_key_987654321
     restart: always
     logging:

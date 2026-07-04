@@ -48,8 +48,8 @@ search:
 outgoing:
   source_ips:
     - 0.0.0.0
-  request_timeout: 2.8     # lowered from 6.0 — Tor circuits need more headroom
-  max_request_timeout: 3.5 # lowered from 12.0 — some Tor exits are slow
+  request_timeout: 5.0     # Tor circuits need more headroom; increased from 2.8
+  max_request_timeout: 8.0 # increased from 3.5 — Tor circuits can stall for seconds
   enable_http2: true       # HTTP/2 multiplexing for engines that support it
   pool_maxsize: 20         # increase per-host connection pool from default 10
   keepalive_expiry: 30     # keep idle connections alive longer (default 5s)
@@ -131,35 +131,36 @@ engines:
     disabled: false
     timeout: 2.5
 
-  # ── News via Tor ──
+  # ── News via Tor (higher timeout — Tor circuits can stall) ──
   - name: bing news
     engine: bing_news
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   - name: google news
     engine: google_news
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   - name: hackernews
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
+    categories: news
 
-  # ── Video engines via Tor ──
+  # ── Video engines via Tor (higher timeout) ──
   - name: bing videos
     engine: bing_videos
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   - name: google videos
     engine: google_videos
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   - name: duckduckgo videos
     engine: duckduckgo_extra
     ddg_category: videos
     shortcut: ddv
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
