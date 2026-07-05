@@ -108,19 +108,19 @@ engines:
   - name: bing images
     engine: bing_images
     disabled: false
-    timeout: 1.5
+    timeout: 4.0
 
   - name: google images
     engine: google_images
     disabled: false
-    timeout: 1.5
+    timeout: 4.0
 
   - name: duckduckgo images
     engine: duckduckgo_extra
     ddg_category: images
     shortcut: ddi
     disabled: false
-    timeout: 1.5
+    timeout: 4.0
 
   - name: brave images
     engine: brave
@@ -134,7 +134,7 @@ engines:
     engine: openverse
     shortcut: ovi
     disabled: false
-    timeout: 1.5
+    timeout: 4.0
 
   # ── News engines (via VPN) ──
   - name: bing news

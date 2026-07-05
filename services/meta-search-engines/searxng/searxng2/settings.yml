@@ -117,19 +117,19 @@ engines:
   - name: bing images
     engine: bing_images
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   - name: google images
     engine: google_images
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   - name: duckduckgo images
     engine: duckduckgo_extra
     ddg_category: images
     shortcut: ddi
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   # ── News via Tor (higher timeout — Tor circuits can stall) ──
   - name: bing news
