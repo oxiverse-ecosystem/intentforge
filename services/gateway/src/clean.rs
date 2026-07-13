@@ -27,6 +27,119 @@ fn re(pattern: &str) -> Option<regex::Regex> {
     regex::Regex::new(pattern).ok()
 }
 
+/// Delete every top-level `{...}` JSON object that contains an `@context` or
+/// `@type` key — i.e. embedded JSON-LD / structured-data blobs some engines
+/// return as bare text (no `<script>` wrapper). A regex cannot match arbitrary
+/// brace nesting, so this scans char-by-char, tracking brace depth, and drops a
+/// balanced block once it is known to carry an LD+JSON marker. Braces inside
+/// string literals (`"..."`) are ignored so `"a}b"` never fools the depth count.
+/// Delete every {...} JSON object that contains an "@context" or "@type" key
+/// i.e. embedded JSON-LD / structured-data blobs some engines return as bare
+/// text (no <script> wrapper). A regex cannot match arbitrary brace nesting,
+/// so this scans char-by-char and drops a brace-balanced block once it carries
+/// an LD+JSON marker. The blob may appear at the top level OR inside a larger
+/// quoted string of the snippet (e.g. "prefix {"@context":...} suffix"); both
+/// are handled by descending into strings and stripping just the inner {...}
+/// when it is LD+JSON. Schema.org blobs have no nested braces in their string
+/// values, so a simple brace-depth count is sufficient.
+fn strip_json_ld_blobs(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' {
+            // Copy the string literal, but strip any embedded JSON-LD {...}.
+            out.push('"');
+            let mut j = i + 1;
+            while j < chars.len() {
+                let sc = chars[j];
+                if sc == '"' {
+                    out.push('"');
+                    i = j + 1;
+                    break;
+                }
+                if sc == '{' {
+                    // Brace-balanced scan of the embedded object.
+                    let mut depth = 0usize;
+                    let mut k = j;
+                    while k < chars.len() {
+                        if chars[k] == '{' {
+                            depth += 1;
+                        } else if chars[k] == '}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        k += 1;
+                    }
+                    if k < chars.len() {
+                        let block: String = chars[j..=k].iter().collect();
+                        if !(block.contains("@context") || block.contains("@type")) {
+                            out.push_str(&block);
+                        }
+                        j = k + 1;
+                    } else {
+                        // Unbalanced inside string (truncated snippet). Drop the
+                        // rest if it is an LD+JSON fragment, else keep verbatim.
+                        let rest: String = chars[j..].iter().collect();
+                        if !(rest.contains("@context") || rest.contains("@type")) {
+                            for ch in &chars[j..] {
+                                out.push(*ch);
+                            }
+                        }
+                        j = chars.len();
+                    }
+                    continue;
+                }
+                out.push(sc);
+                j += 1;
+            }
+            continue;
+        }
+        if c == '{' {
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < chars.len() {
+                if chars[j] == '{' {
+                    depth += 1;
+                } else if chars[j] == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            if j < chars.len() {
+                let block: String = chars[i..=j].iter().collect();
+                if block.contains("@context") || block.contains("@type") {
+                    if !out.ends_with(' ') && j + 1 < chars.len() && chars[j + 1] != ' ' {
+                        out.push(' ');
+                    }
+                } else {
+                    out.push_str(&block);
+                }
+                i = j + 1;
+            } else {
+                // Unbalanced brace (truncated upstream snippet). If it is an
+                // LD+JSON fragment, drop the rest; otherwise keep it verbatim.
+                let rest: String = chars[i..].iter().collect();
+                if !(rest.contains("@context") || rest.contains("@type")) {
+                    out.push_str(&rest);
+                }
+                break;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+
 /// Strip HTML tags, raw CSS / JS blocks, and scraped-page boilerplate from a
 /// search-engine content snippet, then bound it to complete sentences and
 /// remove a leading title echo. Returns a cleaned string (may be empty if the
@@ -44,6 +157,13 @@ pub fn clean_result_content(raw: &str, title: &str) -> String {
     if let Some(r) = re(r"(?is)<script[^>]*>.*?</script>") {
         s = r.replace_all(&s, " ").into_owned();
     }
+    // Strip embedded JSON-LD / structured-data blobs (e.g.
+    // {"@context":"https://...","@type":"BreadcrumbList","itemListElement":[...]}).
+    // Some engines return the parsed LD+JSON *text* without its <script> wrapper,
+    // so the generic <script> strip above misses it. A regex can't match arbitrary
+    // brace nesting, so strip recursively by deleting each {...} block that contains
+    // an "@context" or "@type" key (brace-depth balanced).
+    s = strip_json_ld_blobs(&s);
     // CSS: nested brace blocks, then single brace blocks.
     if let Some(r) = re(r"(?s)\{[^{}]*\{[^{}]*\}[^{}]*\}") {
         s = r.replace_all(&s, " ").into_owned();
@@ -69,6 +189,7 @@ pub fn clean_result_content(raw: &str, title: &str) -> String {
     s = s.replace("&amp;", "&")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+        .replace("&#039;", "'")
         .replace("&apos;", "'")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -278,6 +399,57 @@ mod tests {
         assert!(!out.contains("<img"), "html tag left: {out}");
         assert!(!out.contains("@font-face"), "css left: {out}");
         assert!(!out.contains("url("), "css url left: {out}");
+    }
+
+    #[test]
+    fn clean_strips_json_ld_blob() {
+        // Engines sometimes return parsed LD+JSON *text* (no <script> wrapper).
+        // Real example seen in live results: a BreadcrumbList blob leaking into the snippet.
+        // The lead text ("Find the") is deliberately not the title so the title-echo
+        // stripper doesn't remove it.
+        let dirty = "Find the Best Books 2024 {\"@context\":\"https://***@type\":\"BreadcrumbList\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\"}]} Buy now";
+        let out = clean_result_content(dirty, "Best Books 2024");
+        assert!(!out.contains("@context"), "json-ld @context left: {out}");
+        assert!(!out.contains("@type"), "json-ld @type left: {out}");
+        assert!(out.contains("Find the Best Books 2024"), "real text dropped: {out}");
+        assert!(out.contains("Buy now"), "trailing text dropped: {out}");
+    }
+
+    #[test]
+    fn clean_strips_json_ld_deeply_nested() {
+        // Deeper nesting (itemListElement -> item -> @type) that a single-level
+        // regex cannot fully consume. The brace-balanced stripper must remove it all.
+        let dirty = "Read this {\"@context\":\"https://***@graph\":[{\"@type\":\"Book\",\"name\":\"X\",\"author\":{\"@type\":\"Person\",\"name\":\"Y\"}}]} end";
+        let out = clean_result_content(dirty, "Read this");
+        assert!(!out.contains("@context"), "deep @context left: {out}");
+        assert!(!out.contains("@type"), "deep @type left: {out}");
+        assert!(out.contains("Read this"), "lead text dropped: {out}");
+        assert!(out.contains("end"), "trail text dropped: {out}");
+    }
+
+    #[test]
+    fn clean_strips_json_ld_inside_string() {
+        // Real live shape: the LD+JSON blob is embedded inside a larger quoted
+        // string of the snippet, e.g.  "prefix {"@context":...} suffix".
+        // The lead text ("Check this") is not the title so the title-echo
+        // stripper doesn't remove it.
+        let dirty = "Check this \"Related: {\"@context\":\"https://***@type\":\"BlogPosting\",\"headline\":\"X\"} more here\" thanks";
+        let out = clean_result_content(dirty, "BlogPosting X");
+        assert!(!out.contains("@context"), "json-ld @context left: {out}");
+        assert!(!out.contains("@type"), "json-ld @type left: {out}");
+        assert!(out.contains("Check this"), "lead dropped: {out}");
+        assert!(out.contains("more here"), "string-surrounding text dropped: {out}");
+        assert!(out.contains("thanks"), "trail dropped: {out}");
+    }
+
+    #[test]
+    fn clean_strips_json_ld_truncated() {
+        // Upstream sometimes truncates the LD+JSON blob mid-value, leaving an
+        // unbalanced "{" with no closing brace. It must still be dropped.
+        let dirty = "Intro text {\"@context\":\"https://schema.";
+        let out = clean_result_content(dirty, "Intro text");
+        assert!(!out.contains("@context"), "truncated json-ld left: {out}");
+        assert!(out.contains("Intro text"), "lead dropped: {out}");
     }
 
     #[test]
@@ -573,4 +745,3 @@ pub fn is_definition_site(title_lc: &str, content_lc: &str) -> bool {
         || has_pos_label && content_is_short
         || has_phonetic && short_title
 }
-
