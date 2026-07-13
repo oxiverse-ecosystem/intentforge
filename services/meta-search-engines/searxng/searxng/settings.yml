@@ -43,8 +43,8 @@ search:
 outgoing:
   source_ips:
     - 0.0.0.0
-  request_timeout: 5.0
-  max_request_timeout: 8.0
+  request_timeout: 8.0
+  max_request_timeout: 12.0
   enable_http2: true       # HTTP/2 multiplexing for engines that support it
   pool_maxsize: 20         # increase per-host connection pool from default 10
   keepalive_expiry: 30     # keep idle connections alive longer (default 5s)
@@ -63,11 +63,11 @@ engines:
   # ── Primary engines (via VPN/Gluetun) ──
   - name: bing
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   - name: brave
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   - name: startpage
     disabled: true
@@ -75,7 +75,7 @@ engines:
 
   - name: wikipedia
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   - name: mojeek
     disabled: true
@@ -96,7 +96,7 @@ engines:
 
   - name: marginalia
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   # ── Onion engines (via Tor SOCKS5) ──
   - name: ahmia

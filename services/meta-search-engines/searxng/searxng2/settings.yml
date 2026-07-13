@@ -48,8 +48,8 @@ search:
 outgoing:
   source_ips:
     - 0.0.0.0
-  request_timeout: 5.0     # Tor circuits need more headroom; increased from 2.8
-  max_request_timeout: 8.0 # increased from 3.5 — Tor circuits can stall for seconds
+  request_timeout: 8.0     # Tor circuits need more headroom; increased from 5.0
+  max_request_timeout: 12.0 # increased from 3.5 — Tor circuits can stall for seconds
   enable_http2: true       # HTTP/2 multiplexing for engines that support it
   pool_maxsize: 20         # increase per-host connection pool from default 10
   keepalive_expiry: 30     # keep idle connections alive longer (default 5s)
@@ -70,7 +70,7 @@ engines:
   # ── Fast engines via Tor (higher timeouts for Tor latency) ──
   - name: bing
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   - name: startpage
     disabled: true
@@ -87,7 +87,7 @@ engines:
     base_url: "https://search.brave4u7jddbv7cyviptqjc7jusxh72uik7zt6adtckl5f4nwy2v72qd.onion/"
     disabled: false
     shortcut: brv
-    timeout: 2.5
+    timeout: 4.0
     categories: general
     network: default
 
@@ -97,7 +97,7 @@ engines:
     ddg_url: "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/html/"
     disabled: false
     shortcut: ddo
-    timeout: 2.5
+    timeout: 4.0
     categories: general
     network: default  # use the default network's SOCKS5 proxy for .onion
 
@@ -107,11 +107,11 @@ engines:
 
   - name: wikipedia
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   - name: marginalia
     disabled: false
-    timeout: 2.5
+    timeout: 4.0
 
   # ── Image engines via Tor (multiple for redundancy) ──
   - name: bing images
