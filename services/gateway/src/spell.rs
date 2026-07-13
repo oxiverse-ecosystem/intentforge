@@ -27,6 +27,77 @@ const MIN_CORRECT_LENGTH: usize = 4;
 /// more common than 5% of the most common word)
 const MIN_FREQ_THRESHOLD: f64 = 0.001;
 
+/// ─── Protected Terms (brands / entities / tech names) ──────────────
+/// Words in this list are NEVER spell-corrected. They are coined brand
+/// names or proper nouns whose character-bigram profile can be nearly
+/// identical to a common English word, which defeats the perplexity guard.
+/// Example failure this prevents: "openai" ↔ "opened" share the bigrams
+/// o-p, p-e, e-n, so the perplexity ratio is ~1.0 and the guard cannot
+/// tell them apart — yet correcting "openai" → "opened" is catastrophic.
+///
+/// This is the same approach real search engines use (a protected-entity
+/// list). It is the single most reliable guard for brand queries because
+/// it does not depend on statistical similarity heuristics.
+///
+/// Note: most of these also live in the embedded dictionary (dictionary.rs)
+/// as exact-match entries, so a near-miss typo of a brand (e.g. "opena") is
+/// still corrected TO the brand. This list only stops the brand's exact
+/// spelling from being mangled into an English word.
+const PROTECTED_TERMS: &[&str] = &[
+    // AI / ML companies & products (high risk of English-word collision)
+    "openai", "anthropic", "mistral", "gemini", "grok", "llama", "ollama",
+    "huggingface", "copilot", "cursor", "warp", "perplexity",
+    // Dev tools / platforms
+    "notion", "vercel", "supabase", "cloudflare", "stripe", "databricks",
+    "snowflake", "figma", "linear", "slack", "discord", "hashicorp",
+    "digitalocean", "heroku", "netlify", "render", "railway", "planetscale",
+    "prisma", "astra", "supabase", "raycast", "logseq", "obsidian",
+    // Languages / frameworks / runtimes
+    "rust", "python", "golang", "kotlin", "scala", "elixir", "haskell",
+    "ocaml", "clojure", "zig", "astro", "hugo", "bun", "deno", "nextjs",
+    "nodejs", "typescript", "javascript", "svelte", "tailwind", "flutter",
+    "django", "fastapi", "laravel", "webpack", "vite", "esbuild", "pnpm",
+    "podman", "kubernetes", "terraform", "ansible", "helm", "nginx",
+    "postgres", "redis", "mongodb", "sqlite", "grafana", "caddy",
+    // Common brands likely to collide with English words
+    "github", "gitlab", "apple", "ubuntu", "debian", "alpine", "macos",
+    "android", "linux", "windows", "aws", "gcp", "azure", "vim", "neovim",
+    "emacs", "json", "yaml", "toml", "grpc", "graphql", "kafka", "duckdb",
+];
+
+/// Returns true if `word` is a protected brand/entity that must never be
+/// spell-corrected.
+#[allow(dead_code)]
+pub(crate) fn is_protected_term(word: &str) -> bool {
+    PROTECTED_TERMS.contains(&word.to_lowercase().as_str())
+}
+
+/// Returns true iff `a` and `b` are the same length and differ in exactly one
+/// character position (a pure single-character substitution, with no insertion,
+/// deletion, or transposition). This is the structural signature of an ambiguous
+/// word→word swap (e.g. "ramen"→"raven", m→v) as opposed to a genuine single-edit
+/// typo, which is almost always an insertion/deletion ("pythn"→"python"),
+/// transposition ("ngnix"→"nginx"), or a substitution where the mistyped word has
+/// unusual bigram structure ("housr"→"house", r→e at the end after "hous").
+/// Detected without any hardcoded word list.
+fn is_single_substitution(a: &str, b: &str) -> bool {
+    let ac: Vec<char> = a.chars().collect();
+    let bc: Vec<char> = b.chars().collect();
+    if ac.len() != bc.len() {
+        return false;
+    }
+    let mut diffs = 0;
+    for (x, y) in ac.iter().zip(bc.iter()) {
+        if x != y {
+            diffs += 1;
+            if diffs > 1 {
+                return false;
+            }
+        }
+    }
+    diffs == 1
+}
+
 /// SymSpell index: delete-variation → list of (original_word, frequency)
 pub(crate) struct SymSpellIndex {
     /// Maps a deletion string → list of (word_id, frequency) that could produce it
@@ -42,6 +113,12 @@ pub(crate) struct SymSpellIndex {
 }
 
 impl SymSpellIndex {
+    /// Phase 7: is `word` a known dictionary word (used for query-quality scoring)?
+    pub(crate) fn contains_word(&self, word: &str) -> bool {
+        let w = word.to_lowercase();
+        self.exact_map.contains_key(&w)
+    }
+
     /// Build the SymSpell index from the embedded word frequency dictionary
     pub(crate) fn build() -> Self {
         let mut words: Vec<String> = Vec::new();
@@ -121,8 +198,28 @@ impl SymSpellIndex {
     /// Returns `None` if the word is already correct or no good candidate found.
     pub(crate) fn correct(&self, word: &str) -> Option<String> {
         let word_lower = word.to_lowercase();
-        if word_lower.len() < MIN_CORRECT_LENGTH {
-            return None; // Don't correct very short words
+        // Short word guard: don't correct very short words (< 3 chars) OR
+        // known 3-letter tech terms that are already in the dictionary.
+        // But do attempt correction for 3-letter words NOT in the dictionary
+        // (e.g., genuine typos like hte for the where the typo isn't a
+        // known tech term). This is adaptive: known terms are protected,
+        // unknown short words can still be fixed.
+        if word_lower.len() < 3 {
+            return None; // Never correct single/double-character words (go, js, c, etc.)
+        }
+        if word_lower.len() == 3 && self.exact_map.contains_key(&word_lower) {
+            return None; // Known 3-letter word (npm, git, vue) — not a misspelling
+        }
+        // 3-letter word not in dictionary — fall through to SymSpell lookup
+
+        // Protected brands/entities are NEVER corrected. This is the strongest,
+        // most reliable guard for brand collisions (e.g. "openai" ↔ "opened")
+        // whose character-bigram profiles are nearly identical and therefore
+        // defeat the statistical perplexity guard. A protected term's exact
+        // spelling must always pass through untouched; only a *typo* of one
+        // (e.g. "opena") is still corrected — to the protected spelling.
+        if is_protected_term(&word_lower) {
+            return None;
         }
 
         // Stage 1: Exact match check — but skip very-low-frequency words
@@ -162,6 +259,22 @@ impl SymSpellIndex {
             (None, Some(l)) => l,
             (None, None) => return None,
         };
+
+        // Phase 1 (A1): block a single-character-substitution swap when BOTH
+        // the input and the candidate are real dictionary words. This is the
+        // vegan→vegas data-loss bug: "vegan" (freq 0.0025) and "vegas"
+        // (freq 0.314) are both corpus words, and a dist-1 letter swap turned
+        // the valid query word "vegan" into the common word "vegas". Genuine
+        // typos are almost always insertions/deletions/transpositions of a
+        // word ABSENT from the dictionary (e.g. "housr"→"house", where
+        // "housr" is not a dictionary word), so they still pass this guard.
+        if is_single_substitution(word_lower.as_str(), best.as_str()) {
+            let input_in_dict = self.exact_map.contains_key(&word_lower);
+            let cand_in_dict = self.exact_map.contains_key(&best.to_lowercase());
+            if input_in_dict && cand_in_dict {
+                return None;
+            }
+        }
 
         // Only accept if candidate is at least as common as the original word
         // (prevents correcting a legitimate rare word to a rarer misspelling)
@@ -256,14 +369,54 @@ impl SymSpellIndex {
         // the candidate (> 1.4x with the 15k-word dictionary), the correction
         // is likely English-ifying a tech term.
         //
-        // EXCEPTION: if the input word is a known misspelling entry (explicitly
+        // EXCEPTION 1: if the input word is a known misspelling entry (explicitly
         // added to the dictionary at freq < 0.01), we skip the guard — the word
         // was put there specifically to be corrected to its proper form.
+        //
+        // EXCEPTION 2 (BUG #2 fix): a single-character typo of a real dictionary
+        // word (e.g. "pythn" → "python", dist 1) must NEVER be blocked. The
+        // perplexity guard exists to stop a *coined* tech term (distance 0 from
+        // the input, e.g. "podman") from being English-ified to "woman" (dist 2).
+        // But the candidate itself is a high-frequency dictionary word, so the
+        // input and candidate share nearly identical bigram profiles and the
+        // ratio is ~1.0 — the guard would wrongly reject the legitimate fix.
+        // Rule: never block a dist-1 correction; only apply the guard to dist-2
+        // candidates. This preserves the "podman→woman" protection (dist 2) while
+        // allowing "pythn→python" (dist 1).
         let best_word = &self.words[best.0 as usize];
         let perp_ratio = self.char_bigram_model.perplexity_ratio(word, best_word);
-        if perp_ratio > 1.4 && !self.is_known_misspelling(word) {
+        if perp_ratio > 1.4 && !self.is_known_misspelling(word) && best.2 >= 2 {
             // Input is a tech-like word being corrected to a natural English word
+            // at distance ≥ 2 → genuinely ambiguous → block.
             return None;
+        }
+
+        // BUG #P2 fix (ramen→raven): block ambiguous dist-1 *substitutions*
+        // between two phonotactically-natural words.
+        //
+        // The dist-1 exemption above intentionally allows single-edit typo fixes,
+        // but a single mid-word consonant/vowel SUBSTITUTION that turns one real
+        // word into another real word (ramen→raven, m→v) is not a typo fix — it is
+        // an ambiguous swap, and the input is almost certainly a real word missing
+        // from the 15k dictionary. We detect this class structurally rather than by
+        // any hardcoded word list:
+        //   • same length + exactly one differing position  → substitution
+        //   • BOTH words have low absolute perplexity        → both look natural
+        // Insertions/deletions (pythn→python, programing→programming, embaras→…),
+        // transpositions (ngnix→nginx, beleive→believe), and substitutions where
+        // the input has unusual bigrams (housr→house) are NOT blocked, because they
+        // are genuine typo signatures. This preserves every existing correction test
+        // while refusing to English-ify real words.
+        if best.2 == 1
+            && !self.is_known_misspelling(word)
+            && is_single_substitution(word, best_word)
+        {
+            let input_perp = self.char_bigram_model.perplexity(word);
+            let cand_perp = self.char_bigram_model.perplexity(best_word);
+            let natural_threshold = self.char_bigram_model.reference_perplexity;
+            if input_perp <= natural_threshold && cand_perp <= natural_threshold {
+                return None;
+            }
         }
 
         // Apply a modest frequency boost for unusual-looking inputs
@@ -368,9 +521,26 @@ impl SymSpellIndex {
         best_candidate.and_then(|(candidate_word, freq, dist)| {
             // Apply perplexity ratio guard
             // Skip for known misspellings (explicitly added at freq < 0.01)
+            // BUG #2 fix: never block a distance-1 typo. Only apply the guard
+            // to distance-2 candidates so coined tech terms (podman→woman) stay
+            // protected while single-char typos (pythn→python) get fixed.
             let perp_ratio = self.char_bigram_model.perplexity_ratio(word, &candidate_word);
-            if perp_ratio > 1.4 && !self.is_known_misspelling(word) {
+            if perp_ratio > 1.4 && !self.is_known_misspelling(word) && dist >= 2 {
                 return None; // Input is tech-like, candidate is natural English → reject
+            }
+            // BUG #P2 fix (ramen→raven): block ambiguous dist-1 substitutions
+            // between two natural-looking words. See the matching guard in
+            // `lookup()` for the full rationale.
+            if dist == 1
+                && !self.is_known_misspelling(word)
+                && is_single_substitution(word, &candidate_word)
+            {
+                let input_perp = self.char_bigram_model.perplexity(word);
+                let cand_perp = self.char_bigram_model.perplexity(&candidate_word);
+                let natural_threshold = self.char_bigram_model.reference_perplexity;
+                if input_perp <= natural_threshold && cand_perp <= natural_threshold {
+                    return None;
+                }
             }
             let freq_boost = if perp_ratio > 1.5 { 5.0 } else { 1.0 };
 
@@ -736,6 +906,44 @@ mod tests {
     }
 
     #[test]
+    fn test_protected_brand_not_corrected() {
+        // BUG #1 fix: "openai" must NOT be corrected to "opened". Both share
+        // nearly-identical character bigrams, so the perplexity guard cannot
+        // distinguish them — the protected-term list is the reliable guard.
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("openai"), None,
+            "Should never correct brand 'openai' to 'opened'");
+        // Other protected brands must also pass through.
+        assert_eq!(index.correct("github"), None);
+        assert_eq!(index.correct("python"), None);
+        assert_eq!(index.correct("kubernetes"), None);
+    }
+
+    #[test]
+    fn test_distance1_typo_corrected() {
+        // BUG #2 fix: a single-character typo of a real dictionary word must
+        // still be corrected even though the input/candidate bigram profiles
+        // are similar (the perplexity guard must not block dist-1 corrections).
+        let index = SymSpellIndex::build();
+        let result = index.correct("pythn");
+        assert!(result.is_some(), "Should correct 'pythn'");
+        assert_eq!(result.unwrap(), "python");
+
+        // "programing" → "programming" (dist 1, typo of a real word) still works
+        let result = index.correct("programing");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "programming");
+    }
+
+    #[test]
+    fn test_correct_query_pythn() {
+        let index = SymSpellIndex::build();
+        let (corrected, changed) = correct_query(&index, "pythn programing");
+        assert!(changed, "Should have corrected typos");
+        assert_eq!(corrected, "python programming");
+    }
+
+    #[test]
     fn test_tech_term_not_false_positive() {
         // Tech terms with unusual bigrams (like "podman" with "dm") should NOT
         // be corrected to common English words (like "woman").
@@ -904,5 +1112,25 @@ mod tests {
         let urls = vec!["https://example.com".to_string(); 5];
         // Both "python" and "pyton" would have similar hits → keep correction
         assert!(validate_correction("pyton", "python", &titles, &urls));
+    }
+
+    #[test]
+    fn test_ramen_not_corrected_to_raven() {
+        // P2 regression: "ramen" (a real food word missing from the dict) must NOT
+        // be English-ified to "raven" by a single-character substitution (m→v).
+        // Both are natural-looking words, so this is an ambiguous swap, not a typo.
+        let index = SymSpellIndex::build();
+        let result = index.correct("ramen");
+        assert_eq!(result, None, "Should not correct real word 'ramen' to 'raven'");
+    }
+
+    #[test]
+    fn test_housr_corrected_to_house() {
+        // Sanity: a genuine single-char typo whose input has unusual bigrams at the
+        // tail (housr) must still be corrected to "house". Confirms the P2 guard only
+        // blocks natural→natural substitutions, not typo signatures.
+        let index = SymSpellIndex::build();
+        let result = index.correct("housr");
+        assert_eq!(result, Some("house".to_string()), "Should correct typo 'housr' to 'house'");
     }
 }
