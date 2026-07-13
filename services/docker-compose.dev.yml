@@ -242,7 +242,7 @@ services:
       context: ./gateway
       dockerfile: Dockerfile
     container_name: if-dev-gateway
-    mem_limit: 512m
+    mem_limit: 1024m
     mem_reservation: 256m
     environment:
       - INTENT_ENGINE_URL=http://localhost:3005
