@@ -75,6 +75,28 @@ pub struct Constraints {
     /// Used by the gateway for language-aware result scoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    #[serde(default)]
+    pub file_types: Vec<String>,
+    #[serde(default)]
+    pub sites: Vec<String>,
+    #[serde(default)]
+    pub phrases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_date: Option<String>,
+    #[serde(default)]
+    pub intitle: Vec<String>,
+    #[serde(default)]
+    pub inurl: Vec<String>,
+    #[serde(default)]
+    pub intext: Vec<String>,
+    #[serde(default)]
+    pub related: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_min: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_max: Option<f32>,
 }
 
 // ─── API Types ───────────────────────────────────────────────────────
@@ -159,8 +181,225 @@ static CONFIG: OnceLock<IntentWeights> = OnceLock::new();
 // Strategy: split query into constraint segments using punctuation and
 // constraint trigger words, classify each segment as positive or negative.
 
+fn extract_and_strip_phrases(query: &str) -> (String, Vec<String>) {
+    let mut phrases = Vec::new();
+    let mut cleaned_query = String::new();
+    let mut current_phrase = String::new();
+    let mut inside_quotes = false;
+    
+    // Normalize smart quotes
+    let normalized = query
+        .replace('“', "\"")
+        .replace('”', "\"")
+        .replace('‘', "\"")
+        .replace('’', "\"");
+
+    for c in normalized.chars() {
+        if c == '"' {
+            if inside_quotes {
+                let trimmed = current_phrase.trim().to_string();
+                if !trimmed.is_empty() {
+                    phrases.push(trimmed);
+                }
+                current_phrase.clear();
+                inside_quotes = false;
+            } else {
+                inside_quotes = true;
+            }
+        } else if inside_quotes {
+            current_phrase.push(c);
+        } else {
+            cleaned_query.push(c);
+        }
+    }
+    if inside_quotes && !current_phrase.is_empty() {
+        cleaned_query.push_str(&current_phrase);
+    }
+    
+    (cleaned_query, phrases)
+}
+
+fn parse_price_range(s: &str) -> Option<(Option<f32>, Option<f32>)> {
+    let clean: String = s.chars().filter(|c| c.is_numeric() || *c == '-' || *c == '.').collect();
+    if clean.contains('-') {
+        let parts: Vec<&str> = clean.split('-').collect();
+        if parts.len() == 2 {
+            let pmin = parts[0].parse::<f32>().ok();
+            let pmax = parts[1].parse::<f32>().ok();
+            return Some((pmin, pmax));
+        }
+    }
+    if let Ok(val) = clean.parse::<f32>() {
+        return Some((None, Some(val)));
+    }
+    None
+}
+
 fn extract_constraints(query: &str) -> Constraints {
-    let q = query.trim();
+    let (query_stripped_phrases, phrases) = extract_and_strip_phrases(query);
+    
+    let mut file_types = Vec::new();
+    let mut sites = Vec::new();
+    let mut after_date = None;
+    let mut before_date = None;
+    let mut intitle = Vec::new();
+    let mut inurl = Vec::new();
+    let mut intext = Vec::new();
+    let mut related = Vec::new();
+    let mut price_min = None;
+    let mut price_max = None;
+    let mut language = None;
+    
+    let q_lower_full = query_stripped_phrases.to_lowercase();
+    
+    // Extract filetype:
+    for cap in q_lower_full.match_indices("filetype:") {
+        let after = cap.0 + 9;
+        let rest = &query_stripped_phrases[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            file_types.push(val);
+        }
+    }
+    
+    // Extract site:
+    for cap in q_lower_full.match_indices("site:") {
+        let after = cap.0 + 5;
+        let rest = &query_stripped_phrases[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            sites.push(val);
+        }
+    }
+
+    // Extract intitle:
+    for cap in q_lower_full.match_indices("intitle:") {
+        let after = cap.0 + 8;
+        let rest = &query_stripped_phrases[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            intitle.push(val);
+        }
+    }
+
+    // Extract inurl:
+    for cap in q_lower_full.match_indices("inurl:") {
+        let after = cap.0 + 6;
+        let rest = &query_stripped_phrases[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            inurl.push(val);
+        }
+    }
+
+    // Extract intext:
+    for cap in q_lower_full.match_indices("intext:") {
+        let after = cap.0 + 7;
+        let rest = &query_stripped_phrases[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            intext.push(val);
+        }
+    }
+
+    // Extract related:
+    for cap in q_lower_full.match_indices("related:") {
+        let after = cap.0 + 8;
+        let rest = &query_stripped_phrases[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            related.push(val);
+        }
+    }
+
+    // Extract price:
+    for cap in q_lower_full.match_indices("price:") {
+        let after = cap.0 + 6;
+        let rest = &query_stripped_phrases[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if let Some((pmin, pmax)) = parse_price_range(&val) {
+            price_min = pmin.or(price_min);
+            price_max = pmax.or(price_max);
+        }
+    }
+
+    // Extract lang:
+    for cap in q_lower_full.match_indices("lang:") {
+        let after = cap.0 + 5;
+        let rest = &query_stripped_phrases[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            language = Some(val);
+        }
+    }
+    
+    // Extract after:
+    if let Some(pos) = q_lower_full.find("after:") {
+        let after = pos + 6;
+        let rest = &query_stripped_phrases[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            after_date = Some(val);
+        }
+    }
+    
+    // Extract before:
+    if let Some(pos) = q_lower_full.find("before:") {
+        let after = pos + 7;
+        let rest = &query_stripped_phrases[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            before_date = Some(val);
+        }
+    }
+
+    if language.is_none() {
+        let words: Vec<&str> = q_lower_full.split_whitespace().collect();
+        let fr_words = ["de", "la", "le", "les", "des", "et", "recette", "gateau"];
+        let de_words = ["der", "die", "das", "und", "ist", "rezept", "kuchen"];
+        let es_words = ["el", "la", "los", "las", "y", "en", "para"];
+        let nl_words = ["van", "het", "een", "en", "koptelefoon"];
+        
+        if words.iter().any(|w| fr_words.contains(w)) {
+            language = Some("fr".to_string());
+        } else if words.iter().any(|w| de_words.contains(w)) {
+            language = Some("de".to_string());
+        } else if words.iter().any(|w| es_words.contains(w)) {
+            language = Some("es".to_string());
+        } else if words.iter().any(|w| nl_words.contains(w)) {
+            language = Some("nl".to_string());
+        } else {
+            language = Some("en".to_string());
+        }
+    }
+    
+    // Clean the query of all operators for token extraction
+    let mut query_clean = String::new();
+    let words_full: Vec<&str> = query_stripped_phrases.split_whitespace().collect();
+    for w in words_full {
+        let wl = w.to_lowercase();
+        if wl.starts_with("site:") || wl.starts_with("filetype:") || wl.starts_with("after:") || wl.starts_with("before:")
+            || wl.starts_with("intitle:") || wl.starts_with("inurl:") || wl.starts_with("intext:")
+            || wl.starts_with("related:") || wl.starts_with("price:") || wl.starts_with("lang:")
+        {
+            continue;
+        }
+        query_clean.push_str(w);
+        query_clean.push(' ');
+    }
+    let query_clean = query_clean.trim().to_string();
+    
+    let q = query_clean;
     let q_lower = q.to_lowercase();
     let mut positive = Vec::new();
     let mut negative: Vec<String> = Vec::new();
@@ -181,7 +420,7 @@ fn extract_constraints(query: &str) -> Constraints {
     // Reference patterns: "alternative to X" means find things LIKE X, not exclude X
     let reference_markers = [
         " alternative to ", " alternatives to ",
-        " similar to ", " like ", " comparable to ",
+        " similar to ", " comparable to ",
         " replacement for ", " substitute for ",
         " competitor of ", " competitors of ",
     ];
@@ -215,7 +454,9 @@ fn extract_constraints(query: &str) -> Constraints {
         if q_lower.starts_with(marker) {
             let remaining = &q[marker.len()..];
             // Preserve phrases if possible for negatives.
-            let term = extract_constraint_term(remaining, 3);
+            // Phase 5: negatives use max_words=1 (head-noun only) so
+            // "without prior experience" → "prior" not "prior experience".
+            let term = extract_constraint_term(remaining, 1);
             if !term.is_empty() && term.len() > 1 {
                 negative.push(term);
             }
@@ -251,7 +492,8 @@ fn extract_constraints(query: &str) -> Constraints {
                 }
                 let remaining = &q[after_marker..];
                 // Extract multiple terms connected by "and"
-                let terms = extract_conjunctive_terms(remaining, 3);
+                // Phase 5: negatives max_words=1 (head-noun) — "without node and react" → ["node","react"].
+                let terms = extract_conjunctive_terms(remaining, 1);
                 for term in terms {
                     if !term.is_empty() && term.len() > 1 {
                         negative.push(term);
@@ -308,6 +550,50 @@ fn extract_constraints(query: &str) -> Constraints {
             }
             search_from = after_marker;
         }
+    }
+
+    // ── Phase 1b2: "alternative to X" / "instead of X" ⇒ NEGATIVE (BUG #3) ──
+    // "alternative to X" means the user wants something OTHER than X, so X is an
+    // EXCLUSION constraint, NOT a positive Reference. This corrects the prior
+    // behavior where "search engine alternative to google" returned Google as a
+    // top result (Google was being added as a positive/Reference entity).
+    // We extract X, push it to `negative`, and remove any Reference entity /
+    // positive constraint that the earlier Reference phase (Phase 1b) created.
+    let alt_neg_markers = [" alternative to ", " alternatives to ", " instead of "];
+    let alt_neg_start_markers = ["alternative to ", "alternatives to ", "instead of "];
+
+    let mut alt_terms: Vec<String> = Vec::new();
+    for marker in &alt_neg_start_markers {
+        if q_lower.starts_with(marker) {
+            // Phase 5: negatives head-noun only (max_words=1)
+            let term = extract_constraint_term(&q[marker.len()..], 1);
+            if !term.is_empty() && term.len() > 1 {
+                alt_terms.push(term);
+            }
+            break; // only one start marker can match
+        }
+    }
+    for marker in &alt_neg_markers {
+        let mut sf = 0;
+        while let Some(pos) = q_lower[sf..].find(marker) {
+            let ap = sf + pos + marker.len();
+            if ap < q_lower.len() {
+                // Phase 5: negatives head-noun only (max_words=1)
+                let term = extract_constraint_term(&q[ap..], 1);
+                if !term.is_empty() && term.len() > 1 {
+                    alt_terms.push(term);
+                }
+            }
+            sf = ap;
+        }
+    }
+    for term in &alt_terms {
+        if !negative.contains(term) {
+            negative.push(term.clone());
+        }
+        // Remove from positive constraints and Reference entities that Phase 1b added
+        positive.retain(|p| p != term);
+        entities.retain(|e| !(e.role == EntityRole::Reference && &e.text == term));
     }
 
     // ── Phase 1c: Extract Comparison entities ──
@@ -581,7 +867,7 @@ fn extract_constraints(query: &str) -> Constraints {
     positive.retain(|t| t.len() >= 2 && t.len() <= 50);
     negative.retain(|t| t.len() >= 2 && t.len() <= 50);
 
-    let language = detect_query_language(&q_lower);
+    let language = language.or_else(|| detect_query_language(&q_lower));
 
     // ── Phase 7: Promote negative terms to Exclusion entities ──
     // Any term that wasn't already captured as Reference/Comparison gets Exclusion role.
@@ -611,121 +897,43 @@ fn extract_constraints(query: &str) -> Constraints {
     let positive = normalize_terms(positive);
     let negative = normalize_terms(negative);
 
-    Constraints { positive, negative, entities, language }
+    Constraints {
+        positive,
+        negative,
+        entities,
+        language,
+        file_types,
+        sites,
+        phrases,
+        after_date,
+        before_date,
+        intitle,
+        inurl,
+        intext,
+        related,
+        price_min,
+        price_max,
+    }
 }
 
-/// Detect programming language mentioned in a query.
-/// Returns the canonical language name if found, None otherwise.
-///
-/// Uses context-aware matching:
-/// - Long language names (>= 4 chars): exact word match is sufficient
-/// - Short names (go, r, c): require context clues like "X framework", "X library",
-///   "in X", "for X", "X programming", or disambiguation like "golang"
 fn detect_query_language(q_lower: &str) -> Option<String> {
     let words: Vec<&str> = q_lower.split_whitespace().collect();
+    let fr_words = ["de", "la", "le", "les", "des", "et", "recette", "gateau", "pour", "dans"];
+    let de_words = ["der", "die", "das", "und", "ist", "rezept", "kuchen", "fur", "mit"];
+    let es_words = ["el", "la", "los", "las", "y", "en", "para", "con"];
+    let nl_words = ["van", "het", "een", "en", "koptelefoon", "voor"];
 
-    // Canonical language name → (aliases, min_confidence_without_context)
-    // Short names need context; long names are self-disambiguating.
-    let languages: &[(&str, &[&str])] = &[
-        ("go", &["go", "golang"]),
-        ("rust", &["rust"]),
-        ("python", &["python", "python3"]),
-        ("javascript", &["javascript", "js"]),
-        ("typescript", &["typescript", "ts"]),
-        ("java", &["java"]),
-        ("c++", &["c++", "cpp"]),
-        ("c#", &["c#", "csharp"]),
-        ("ruby", &["ruby"]),
-        ("php", &["php"]),
-        ("swift", &["swift"]),
-        // Disambiguation for "swift" when it appears in storage context:
-        // OpenStack Swift (object storage) is NOT the Swift programming language.
-        // Storage context clues: ring, container, object storage, cluster, proxy, account
-        // These are checked in detect_query_language via additional context logic below.
-        ("kotlin", &["kotlin"]),
-        ("scala", &["scala"]),
-        ("haskell", &["haskell"]),
-        ("elixir", &["elixir"]),
-        ("clojure", &["clojure"]),
-        ("r", &["r"]),
-        ("lua", &["lua"]),
-        ("perl", &["perl"]),
-        ("dart", &["dart"]),
-        ("zig", &["zig"]),
-        ("nim", &["nim"]),
-        ("ocaml", &["ocaml"]),
-        ("erlang", &["erlang"]),
-        ("fortran", &["fortran"]),
-        ("cobol", &["cobol"]),
-        ("assembly", &["assembly", "asm"]),
-    ];
-
-    // Context clues that confirm a word is a language reference
-    let context_clues = [
-        "framework", "library", "package", "module", "crate", "tutorial",
-        "guide", "documentation", "docs", "programming", "developer",
-        "async", "http", "api", "server", "cli", "web", "backend", "frontend",
-        "install", "setup", "configure", "build", "compile", "run",
-        "performance", "benchmark", "vs", "versus", "alternative",
-        "best", "top", "learn", "course", "book", "example",
-        "syntax", "error", "debug", "test", "deploy", "migrate",
-        "database", "orm", "template", "parser", "regex",
-    ];
-
-    for &(canonical, aliases) in languages {
-        for alias in aliases {
-            // Long names (>= 4 chars): exact word match is sufficient
-            if alias.len() >= 4 {
-                if words.iter().any(|w| *w == *alias) {
-                    // Disambiguation: "swift" in OpenStack storage context is NOT a programming language.
-                    // Check for storage-related terms that indicate OpenStack Swift object storage.
-                    if *alias == "swift" {
-                        let storage_context = ["ring", "container", "object", "storage", "cluster",
-                            "proxy", "account", "tenant", "replication", "consistency",
-                            "openstack", "keystone", "glance", "nova", "cinder", "horizon",
-                            "swiftstack", "mid-range", "midrange", "block", "backup",
-                            "availability zone", "storage policy", "object-store"];
-                        if storage_context.iter().any(|sc| q_lower.contains(sc)) {
-                            return None; // This is OpenStack Swift, not the programming language
-                        }
-                    }
-                    return Some(canonical.to_string());
-                }
-                continue;
-            }
-
-            // Short names (< 4 chars): need context clues OR other languages present
-            if !words.iter().any(|w| *w == *alias) {
-                continue;
-            }
-
-            // Check for context clues in the query
-            let has_context = words.iter().any(|w| context_clues.contains(w))
-                || q_lower.contains(&format!("{} framework", alias))
-                || q_lower.contains(&format!("{} library", alias))
-                || q_lower.contains(&format!("{} package", alias))
-                || q_lower.contains(&format!("in {}", alias))
-                || q_lower.contains(&format!("for {}", alias))
-                || q_lower.contains(&format!("with {}", alias))
-                || q_lower.contains(&format!("{} programming", alias))
-                || q_lower.contains(&format!("{} developer", alias))
-                || q_lower.contains(&format!("{} tutorial", alias))
-                || q_lower.contains(&format!("{} code", alias))
-                || q_lower.contains(&format!("{} project", alias));
-
-            // Also check if another language is mentioned (comparison context)
-            let has_other_lang = languages.iter().any(|&(other_canon, other_aliases)| {
-                if other_canon == canonical { return false; }
-                other_aliases.iter().any(|oa| words.iter().any(|w| *w == *oa))
-            });
-
-            if has_context || has_other_lang {
-                return Some(canonical.to_string());
-            }
-        }
+    if words.iter().any(|w| fr_words.contains(w)) {
+        Some("fr".to_string())
+    } else if words.iter().any(|w| de_words.contains(w)) {
+        Some("de".to_string())
+    } else if words.iter().any(|w| es_words.contains(w)) {
+        Some("es".to_string())
+    } else if words.iter().any(|w| nl_words.contains(w)) {
+        Some("nl".to_string())
+    } else {
+        Some("en".to_string())
     }
-
-    None
 }
 
 /// Extract multiple terms connected by "and" or "or" from a negated context.
@@ -865,7 +1073,7 @@ fn linear_classify(
         }
     }
 
-    let temp = weights.temperature as f64;
+    let temp = (weights.temperature as f64).max(1.2); // Phase 3: soften softmax (was ~0.5) so peaks stop saturating at 1.0
     let max_logit = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let shifted: Vec<f64> = logits.iter().map(|l| (l - max_logit) / temp).collect();
     let exp_shifted: Vec<f64> = shifted.iter().map(|s| s.exp()).collect();
@@ -890,6 +1098,15 @@ fn linear_classify(
 
     let conf = &weights.confidence;
     let confidence = (conf.base as f32 + margin as f32 * conf.margin_multiplier as f32).clamp(0.0, 1.0);
+
+    let mut intent = weights.labels[winner_idx].clone();
+
+    // Phase 3: confidence floor fallback. When the model is genuinely
+    // uncertain (low confidence), default to informational rather than
+    // emitting an over-confident misclassification (e.g. navigational).
+    if confidence < 0.35 && intent != "informational" {
+        intent = "informational".to_string();
+    }
 
     tracing::info!(
         "linear_classify: intent={} (conf={:.3}) margin={:.3} probs=[{}]",
@@ -1099,6 +1316,35 @@ fn token_entityness(token: &str) -> f32 {
     raw.clamp(0.0, 1.0)
 }
 
+/// Phase 2 (B3): detect whether a query contains a brand / proper noun.
+/// Used to gate "official <q>" injection in `expand_queries` so that only
+/// genuine navigational-brand queries ("github", "openai") get the boost,
+/// not over-predicted navigational chatter ("python", "rust", "a").
+///
+/// Adaptive (no hardcoded brand list): a token counts as brand/proper-noun
+/// when it has high character-level entityness (rare bigrams = coined name)
+/// OR is capitalized in the ORIGINAL query (proper-noun signal).
+fn contains_brand_or_proper_noun(query: &str) -> bool {
+    // Capitalization check on the original (un-normalized) query.
+    // "OpenAI pricing" → "OpenAI" is capitalized → brand present.
+    for tok in query.split_whitespace() {
+        if tok.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            return true;
+        }
+    }
+    // Character-statistics check on lowercased tokens.
+    let ql = query.to_lowercase();
+    for tok in ql.split_whitespace() {
+        // Skip pure stopwords / very short tokens — they're never brands.
+        if tok.len() < 3 { continue; }
+        if !tok.chars().all(|c| c.is_alphabetic()) { continue; }
+        if token_entityness(tok) >= 0.5 {
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(dead_code)]
 fn domain_matchability(token: &str) -> f32 {
     // Wrapper — entityness IS domain matchability now.
@@ -1157,256 +1403,59 @@ fn abbreviation_score(token: &str) -> f32 {
     (vowel_sparsity * 0.5 + length_factor * 0.3 + cluster_density * 0.2).clamp(0.0, 1.0)
 }
 
-#[allow(dead_code)]
-fn compute_navigational_score(
-    query: &str,
-    query_embedding: &[f32],
-    centroids: &[Vec<f32>],
-) -> f32 {
-    // v4: BLENDED ADAPTIVE NAVIGATIONAL SCORING
-    //
-    // Addresses ALL failure modes from user feedback:
-    //   1. Continuum entityness (not binary OOV) — uses bigram rarity
-    //   2. "photosynthesis" false positive — bigram rarity naturally low
-    //   3. Short informational queries — adaptive alpha trusts embeddings
-    //   4. Abbreviation discount — zero-vowel abbrevs (tcp, css) get discounted
-    //
-    // KEY DESIGN: score = alpha * char_signals + (1-alpha) * embedding_signals
-    // where alpha adapts based on signal strength.
-    // Multiplicative combination failed because ALL signals had to agree.
-    // Additive blending lets strong signals compensate for weak ones.
 
-    let q_lower = query.trim().to_lowercase();
-    let words: Vec<&str> = q_lower.split_whitespace().collect();
-    if words.is_empty() { return 0.0; }
+// ─── Regional / Multilingual Junk Normalization (Phase 9) ──────────
+// Strips locale tags (en-US, en_GB, fr-FR, pt-BR...), maps "in <large-region>"
+// to a geo hint (returned separately), normalizes full-width / curly punctuation
+// to ASCII. Keeps the language token itself when it is a real query word
+// (e.g. "rust" is not a locale tag).
+//
+// Returns (cleaned_query, optional_geo_region).
 
-    // ── Step 1: Generic centroid ──
-    let dim = centroids.first().map(|c| c.len()).unwrap_or(384);
-    let mut generic_centroid = vec![0.0f32; dim];
-    for centroid in centroids {
-        for (i, v) in centroid.iter().enumerate() {
-            generic_centroid[i] += v;
-        }
-    }
-    let n = centroids.len() as f32;
-    if n > 0.0 {
-        for v in generic_centroid.iter_mut() { *v /= n; }
-        let norm: f32 = generic_centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 1e-8 {
-            for v in generic_centroid.iter_mut() { *v /= norm; }
-        }
-    }
+fn normalize_regional_junk(query: &str) -> (String, Option<String>) {
+    // Normalize exotic unicode punctuation to ASCII so downstream tokenization
+    // behaves consistently (full-width colon, chinese comma, etc.)
+    let ascii_norm = query
+        .replace('：', ":")
+        .replace('，', ", ")
+        .replace('、', ", ")
+        .replace('｜', " | ")
+        .replace('－', "-")
+        .replace('—', " - ")
+        .replace('’', "'")
+        .replace('‘', "'")
+        .replace('“', "\"")
+        .replace('”', "\"")
+        .replace('　', " ");
 
-    // ── Step 2: Per-token character-level analysis ──
-    let mut entity_scores: Vec<f32> = Vec::new();
-    let mut abbr_scores: Vec<f32> = Vec::new();
+    // Locale tag regex: `(?i)\b[a-z]{2}[_-][A-Z]{2}\b` e.g. en-US, en_GB, pt-BR
+    let locale_re = regex::Regex::new(r"(?i)\b[a-z]{2}[_-][A-Za-z]{2}\b").unwrap();
+    let stripped = locale_re.replace_all(&ascii_norm, " ").to_string();
 
-    for word in &words {
-        let ent = token_entityness(word);
-        let abbr = abbreviation_score(word);
-        entity_scores.push(ent);
-        abbr_scores.push(abbr);
-    }
-
-    let entity_density: f32 = if entity_scores.is_empty() { 0.0 }
-        else { entity_scores.iter().sum::<f32>() / entity_scores.len() as f32 };
-    let max_entity: f32 = entity_scores.iter().cloned().fold(0.0f32, f32::max);
-    let max_abbr: f32 = abbr_scores.iter().cloned().fold(0.0f32, f32::max);
-
-    // ── Step 3: Abbreviation discount ──
-    // Zero-vowel abbreviations (tcp, css, html, js) have high abbreviation_score
-    // but are NOT navigational. Discount entity signals driven purely by
-    // abbreviation patterns when the token has near-zero vowel ratio.
-    let mut abbr_driven_entity = 0.0f32;
-    for (i, word) in words.iter().enumerate() {
-        let chars: Vec<char> = word.chars().collect();
-        let vowels = chars.iter().filter(|c| "aeiou".contains(**c)).count();
-        let vowel_ratio = if chars.is_empty() { 0.0 } else { vowels as f32 / chars.len() as f32 };
-        if vowel_ratio < 0.15 && abbr_scores[i] > 0.6 && entity_scores[i] > 0.4 {
-            abbr_driven_entity = abbr_driven_entity.max(entity_scores[i]);
-        }
-    }
-
-    // ── Step 3b: Tech-term discount ──
-    // Known tech terms (nosql, css, graphql) have high bigram_rarity because
-    // they're coined technical jargon, not brand names. If a high-entity token
-    // is a known tech term, discount it the same way abbreviations are discounted.
-    let tech_terms_nav = [
-        "api", "sdk", "css", "html", "sql", "nosql", "graphql", "grpc",
-        "webpack", "vite", "tailwind", "bootstrap", "sass", "terraform",
-        "ansible", "docker", "kubernetes", "k8s", "nginx", "redis",
-        "postgres", "mysql", "mongodb", "sqlite", "axum", "tokio",
+    // "in <region>" → geo. Only treat as geo when the region is a known large
+    // region/country, not a random noun.
+    let known_regions: &[&str] = &[
+        "us", "usa", "united states", "uk", "united kingdom", "england", "scotland",
+        "canada", "australia", "india", "germany", "france", "spain", "italy",
+        "japan", "china", "brazil", "mexico", "russia", "korea", "europe", "asia",
+        "africa", "latin america", "south america", "north america", "eu", "europe",
+        "singapore", "indonesia", "philippines", "vietnam", "thailand", "netherlands",
+        "ireland", "sweden", "norway", "denmark", "finland", "poland", "portugal",
     ];
-    let mut tech_driven_entity = 0.0f32;
-    for (i, word) in words.iter().enumerate() {
-        if entity_scores[i] > 0.4 && tech_terms_nav.contains(word) {
-            tech_driven_entity = tech_driven_entity.max(entity_scores[i]);
+    let mut geo: Option<String> = None;
+    let mut cleaned = stripped.clone();
+    let in_re = regex::Regex::new(r"(?i)\bin\s+([a-z][a-z\s]*?)(?:\s+in\s|\s*$|,|\.)").unwrap();
+    if let Some(cap) = in_re.captures(&stripped) {
+        let region = cap[1].trim().to_lowercase();
+        if known_regions.iter().any(|r| *r == region.as_str()) {
+            geo = Some(region);
+            cleaned = in_re.replace(&stripped, " ").to_string();
         }
     }
 
-    // ── Step 4: Embedding-level signals ──
-    let sims: Vec<f32> = centroids.iter()
-        .map(|c| cosine_similarity(query_embedding, c))
-        .collect();
-    let max_sim = sims.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let min_sim = sims.iter().cloned().fold(f32::INFINITY, f32::min);
-
-    let entropy = {
-        let shift = if min_sim < 0.01 { -min_sim + 0.01 } else { 0.0 };
-        let shifted: Vec<f32> = sims.iter().map(|s| s + shift).collect();
-        let total: f32 = shifted.iter().sum();
-        if total < 1e-8 { 0.0 } else {
-            let mut h = 0.0f32;
-            for &s in &shifted {
-                let p = s / total;
-                if p > 1e-8 { h -= p * p.log2(); }
-            }
-            h / (sims.len() as f32).log2().max(1.0)
-        }
-    };
-
-    let dist_from_generic = 1.0 - cosine_similarity(query_embedding, &generic_centroid);
-
-    // ── Step 5: Entity-aware structure bonus ──
-    // If query has a strong entity token, don't penalize for extra common words.
-    // "oxiverse terms of service" → entity present → keep structure high
-    let structure_bonus = if max_entity > 0.50 {
-        0.85  // entity present → high structure regardless of length
-    } else if max_entity > 0.40 {
-        0.75
-    } else {
-        match words.len() {
-            1 => 1.0,
-            2 => 0.95,
-            3 => 0.80,
-            4..=5 => 0.60,
-            _ => 0.40,
-        }
-    };
-
-    // ── Step 6: Compute char-level and embedding-level nav signals ──
-    let mut effective_entity = max_entity * 0.6 + entity_density * 0.4;
-    // Apply abbreviation discount
-    if abbr_driven_entity > 0.5 {
-        effective_entity *= 0.6;
-    }
-    // Apply tech-term discount: known tech jargon with high rarity isn't a brand
-    if tech_driven_entity > 0.5 {
-        effective_entity *= 0.5;
-    }
-
-    // Bigram rarity: coined brand names (oxiverse, netflix) have rare bigrams.
-    // Dictionary words (photosynthesis, machine) have common bigrams.
-    // This separates brands from English words at the character level.
-    let bigram_rarity_score = if !words.is_empty() {
-        let best = words.iter().map(|w| bigram_rarity(w)).fold(0.0f32, f32::max);
-        best
-    } else { 0.0 };
-
-    // Char nav: entity signal boosted by bigram rarity, abbreviation as tiebreaker.
-    // When both entity and bigram_rarity agree (coined brand), score is high.
-    // When entity is moderate but bigram_rarity is low (dictionary word), score stays low.
-    let entity_with_rarity = (effective_entity * 0.55 + bigram_rarity_score * 0.45).min(1.0);
-    let char_nav = (entity_with_rarity.max(max_abbr * 0.5)) * structure_bonus;
-    let emb_nav_raw = entropy * 0.5 + dist_from_generic.max(0.0) * 0.3 + (1.0 - max_sim).max(0.0) * 0.2;
-
-    // Penalize emb_nav when discriminability is low.
-    // When max_sim and min_sim are nearly identical, the embedding can't
-    // distinguish between categories. The signal is noise.
-    // "discriminability" = max_sim - min_sim. For well-separated queries
-    // this is 0.1+, for uniform queries it's <0.05.
-    let discriminability = (max_sim - min_sim).max(0.0);
-    let disc_penalty = (discriminability / 0.10).min(1.0); // 0.0 at spread=0, 1.0 at spread≥0.10
-    let emb_nav = emb_nav_raw * disc_penalty;
-
-    // ── Step 7: Adaptive alpha (the key innovation) ──
-    // USES DISCRIMINABILITY, not max_sim.
-    //
-    // max_sim > 0.6 is ALWAYS true (0.91-0.97 for all queries with MiniLM).
-    // What matters is whether embeddings can DISTINGUISH categories:
-    //   discriminability = max_sim - min_sim
-    //   < 0.08 → embeddings are noise (entropy=1.0, all sims ~equal)
-    //   > 0.15 → embeddings can distinguish (one category clearly closer)
-    //
-    // When discriminability is LOW, character signals MUST dominate.
-    // When discriminability is HIGH, embeddings help suppress false positives.
-    // Effective entity adds a secondary boost for strong brand signals.
-    let alpha = if discriminability < 0.08 && effective_entity > 0.40 {
-        0.80  // embeddings are noise, entity present → trust char
-    } else if discriminability < 0.08 {
-        0.65  // embeddings are noise, no entity → still lean char
-    } else if discriminability > 0.15 && effective_entity < 0.40 {
-        0.30  // embeddings discriminative, weak entity → trust embeddings
-    } else if effective_entity > 0.55 {
-        0.60  // strong entity signal → lean char regardless
-    } else {
-        0.45  // balanced zone
-    };
-
-    let nav_raw = alpha * char_nav + (1.0 - alpha) * emb_nav;
-
-    // ── Step 8: Entity-only factor ──
-    // Pure entity queries (brand/site names) have almost no "concept tokens"
-    // (generic English words like "database", "hooks", "tutorial").
-    // When concept tokens are present alongside an entity, the query is less
-    // navigational — the user is asking ABOUT something, not going TO it.
-    //
-    // KEY: concept detection uses bigram_rarity, NOT entityness.
-    // Entityness fails for words like "hooks" (consonant clusters → moderate entityness)
-    // even though they're common English words. Bigram rarity correctly identifies them:
-    //   "hooks"    → bigrams ho,oo,ok,ks → all common → low rarity → concept ✓
-    //   "database" → bigrams da,at,ta,ab,ba,as,se → common → low rarity → concept ✓
-    //   "oxiverse" → bigrams ox,xi,iv,ve,rs,se → rare → high rarity → entity ✓
-    //   "react"    → bigrams re,ea,ac,ct → common → low rarity → concept ✓
-    //
-    // This means "react hooks" = 2 concepts = eof=0.0 → score=0 → not navigational
-    // while "intentforge tos" = 0 concepts (tos=abbr, intentforge=rare bigrams) → navigational
-    let stopwords = ["what", "is", "are", "the", "a", "an", "how", "to", "do", "does",
-                     "can", "for", "in", "on", "of", "and", "or", "vs", "versus",
-                     "best", "top", "cheap", "buy", "price", "near", "me", "free",
-                     "online", "download", "install", "use", "using"];
-    let mut concept_tokens = 0usize;
-    let mut total_tokens = 0usize;
-    let mut _dbg_rarities: Vec<(String, f32, f32)> = Vec::new();
-    for (i, word) in words.iter().enumerate() {
-        if stopwords.contains(word) { continue; }
-        // Skip abbreviations — they're modifiers (tos, css), not concept words
-        if abbr_scores[i] > 0.5 { continue; }
-        total_tokens += 1;
-        let rarity = bigram_rarity(word);
-        _dbg_rarities.push((word.to_string(), entity_scores[i], rarity));
-        // A "concept token" is a generic English word with common bigrams.
-        // The bigram_rarity function maps: "th"→0.0, "ox"→0.97, "xi"→0.99.
-        // Common English words (hooks, database, tutorial) have rarity ~0.70-0.88.
-        // Coined brand names (oxiverse, netflix, intentforge) have rarity > 0.90.
-        // Threshold at 0.90 separates the two populations.
-        if rarity < 0.90 {
-            concept_tokens += 1;
-        }
-    }
-    let concept_fraction = if total_tokens > 0 {
-        concept_tokens as f32 / total_tokens as f32
-    } else { 0.0 };
-    let entity_only_factor = (1.0 - concept_fraction).max(0.0);
-
-    let score = nav_raw * entity_only_factor;
-
-    let dbg_str: String = _dbg_rarities.iter()
-        .map(|(w, e, r)| format!("{}(ent={:.2},rare={:.2})", w, e, r))
-        .collect::<Vec<_>>()
-        .join(", ");
-    tracing::info!(
-        "NAV SCORE v5: eff_entity={:.3} max_entity={:.3} max_abbr={:.3} abbr_discount={} \
-         entropy={:.3} dist_generic={:.3} max_sim={:.3} \
-         structure={:.3} char_nav={:.3} emb_nav={:.3} alpha={:.2} \
-         concepts={}/{} eof={:.2} tokens=[{}] → score={:.3}",
-        effective_entity, max_entity, max_abbr, abbr_driven_entity > 0.5,
-        entropy, dist_from_generic, max_sim,
-        structure_bonus, char_nav, emb_nav, alpha,
-        concept_tokens, total_tokens, entity_only_factor, dbg_str, score
-    );
-
-    score.clamp(0.0, 1.0)
+    // Collapse the extra whitespace we may have introduced.
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    (cleaned, geo)
 }
 
 // ─── Query Normalization (De-stutter, Collapse Repeats) ─────────────
@@ -1707,7 +1756,102 @@ fn compress_query_with_negatives(query: &str, negative: &[String]) -> String {
 
 // ─── Query Expansion (Dynamic, Not Hardcoded) ────────────────────────
 
-fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<String> {
+/// Function words that carry no standalone search signal. When they end up at
+/// the start or end of a generated phrase — usually because their object token
+/// was stripped upstream (e.g. a numeric price, a stop word) — they leave a
+/// dangling preposition/article/conjunction that pollutes the query
+/// ("cheap used cars under tutorial"). This set is used to trim those ends.
+/// It is intentionally small and closed-class (English function words), so it
+/// generalises to any query rather than any specific one.
+fn is_dangling_function_word(w: &str) -> bool {
+    matches!(w,
+        "a" | "an" | "the" | "to" | "for" | "in" | "on" | "of" | "and" | "or"
+        | "with" | "from" | "by" | "under" | "over" | "about" | "into" | "than"
+        | "as" | "at" | "but" | "nor" | "so" | "vs" | "versus" | "up" | "off"
+        | "out" | "per" | "via" | "onto" | "upon"
+    )
+}
+
+/// Collapse consecutive duplicate tokens (case-insensitive). Fixes artifacts
+/// like "step step" (from stripping "by" out of "step by step") and
+/// "2026 2026" (from appending a year that is already present). Only ADJACENT
+/// duplicates are collapsed so legitimate repeats ("new york new york") in
+/// distant positions are preserved.
+fn collapse_adjacent_dups(phrase: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for w in phrase.split_whitespace() {
+        if out.last().map(|p: &&str| p.eq_ignore_ascii_case(w)).unwrap_or(false) {
+            continue;
+        }
+        out.push(w);
+    }
+    out.join(" ")
+}
+
+/// Trim leading and trailing dangling function words from a token slice.
+/// Interior function words are preserved (they connect real terms).
+fn trim_dangling<'a>(words: &[&'a str]) -> Vec<&'a str> {
+    let mut start = 0usize;
+    let mut end = words.len();
+    while start < end && is_dangling_function_word(&words[start].to_lowercase()) {
+        start += 1;
+    }
+    while end > start && is_dangling_function_word(&words[end - 1].to_lowercase()) {
+        end -= 1;
+    }
+    words[start..end].to_vec()
+}
+
+/// Normalise a generated expansion: collapse adjacent duplicates, then trim
+/// dangling function words from both ends. Applied to every expansion so the
+/// fix is general rather than case-specific.
+fn sanitize_expansion(phrase: &str) -> String {
+    let collapsed = collapse_adjacent_dups(phrase);
+    let words: Vec<&str> = collapsed.split_whitespace().collect();
+    trim_dangling(&words).join(" ")
+}
+
+/// Bare ambiguous programming-language names that collide with a common English
+/// word or game title (e.g. "rust" → survival game, "go" → verb, "java" → island).
+/// When such a name appears as a standalone comparison entity without
+/// disambiguating context in the original query, we append the suffix so the
+/// generated search expansions find the language, not the game/word.
+/// Data-driven and shared in spirit with the gateway's LANGUAGE_DISAMBIGUATION.
+fn ambiguous_lang_suffix(entity: &str) -> Option<&'static str> {
+    let table: &[(&str, &str)] = &[
+        ("go", " programming"),
+        ("rust", " programming"),
+        ("ruby", " programming"),
+        ("swift", " programming"),
+        ("java", " programming"),
+        ("c", " programming"),
+    ];
+    let e = entity.trim().to_lowercase();
+    table.iter().find(|(name, _)| *name == e).map(|(_, s)| *s)
+}
+
+/// If `entity` is a bare ambiguous language name that the original query has not
+/// already disambiguated, return its disambiguated form (e.g. "rust programming").
+/// Otherwise return the entity unchanged. Used by comparison expansion so
+/// entities like "rust"/"go" resolve to the language rather than a game.
+fn disambiguate_comparison_entity(entity: &str, q_lower: &str) -> String {
+    let e_trim = entity.trim();
+    if let Some(suffix) = ambiguous_lang_suffix(e_trim) {
+        // Skip if the user already provided explicit disambiguation.
+        if q_lower.contains(&format!("{} programming", e_trim))
+            || q_lower.contains(&format!("{} language", e_trim))
+            || q_lower.contains(&format!("{} tutorial", e_trim))
+            || q_lower.contains(&format!("{} guide", e_trim))
+            || q_lower.contains(&format!("{} framework", e_trim))
+        {
+            return e_trim.to_string();
+        }
+        return format!("{}{}", e_trim, suffix);
+    }
+    e_trim.to_string()
+}
+
+fn expand_queries(query: &str, intent: &str, confidence: f32, brand_hint: bool, constraints: &Constraints) -> Vec<String> {
     let q = query.trim();
     let q_lower = q.to_lowercase();
     let words: Vec<&str> = q_lower.split_whitespace().collect();
@@ -1796,13 +1940,56 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
         "comparison" => {
             if q_lower.contains(" vs ") || q_lower.contains(" versus ") {
                 let replaced = q_lower.replace(" versus ", " vs ");
-                let parts: Vec<&str> = replaced.split(" vs ").collect();
+                let parts: Vec<&str> = replaced.split(" vs ").map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
                 if parts.len() == 2 {
-                    let (a, b) = (parts[0].trim(), parts[1].trim());
-                    expansions.push(format!("{} {} comparison", a, b));
-                    expansions.push(format!("{} compared to {}", a, b));
+                    let (a, b) = (parts[0], parts[1]);
+                    let a_d = disambiguate_comparison_entity(a, &q_lower);
+                    let b_d = disambiguate_comparison_entity(b, &q_lower);
+                    expansions.push(format!("{} {} comparison", a_d, b_d));
+                    expansions.push(format!("{} compared to {}", a_d, b_d));
                     if let Some(year) = extract_year(&q_lower) {
-                        expansions.push(format!("{} vs {} {}", a, b, year));
+                        expansions.push(format!("{} vs {} {}", a_d, b_d, year));
+                    }
+                } else if parts.len() >= 3 {
+                    // N-way comparison ("openai vs anthropic vs google ai models",
+                    // "rust vs go vs python performance comparison guide").
+                    // The last part carries trailing context words (e.g.
+                    // "google ai models") — split its first token as the final
+                    // entity and keep the remainder as shared context so every
+                    // generated variation stays on-topic.
+                    let last = *parts.last().unwrap();
+                    let mut last_words = last.split_whitespace();
+                    let last_entity = last_words.next().unwrap_or(last);
+                    let context: String = last_words.collect::<Vec<&str>>().join(" ");
+
+                    // Build the clean entity list: all middle parts are single
+                    // entities; the first token of the last part is the final one.
+                    let mut entities: Vec<String> = parts[..parts.len() - 1].iter()
+                        .map(|e| disambiguate_comparison_entity(e, &q_lower))
+                        .collect();
+                    entities.push(disambiguate_comparison_entity(last_entity, &q_lower));
+
+                    let ctx = |base: String| -> String {
+                        if context.is_empty() { base } else { format!("{} {}", base, context) }
+                    };
+
+                    // Whole-set comparison variations.
+                    let joined = entities.join(" ");
+                    expansions.push(ctx(format!("{} comparison", joined)));
+                    if let Some(year) = extract_year(&q_lower) {
+                        expansions.push(ctx(format!("{} comparison {}", joined, year)));
+                    }
+                    // Adjacent-pair variations so search engines can find the
+                    // pairwise comparison articles that dominate this query class.
+                    for pair in entities.windows(2) {
+                        expansions.push(ctx(format!("{} vs {}", pair[0], pair[1])));
+                    }
+                    // First-vs-each variations to surface head-to-head content
+                    // that skips the middle entity ("openai vs google").
+                    if entities.len() >= 3 {
+                        for other in &entities[2..] {
+                            expansions.push(ctx(format!("{} vs {}", entities[0], other)));
+                        }
                     }
                 }
             }
@@ -1849,6 +2036,11 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
             if core_trimmed.len() > 3 {
                 expansions.push(format!("{} explained", core_trimmed));
                 expansions.push(format!("{} overview", core_trimmed));
+                expansions.push(format!("what is {}", core_trimmed));
+                expansions.push(format!("{} for beginners", core_trimmed));
+                expansions.push(format!("{} examples", core_trimmed));
+                expansions.push(format!("learn {}", core_trimmed));
+                expansions.push(format!("{} best resources", core_trimmed));
                 expansions.push(core_trimmed.to_string());
             }
         }
@@ -1882,7 +2074,12 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
             }
         }
         "navigational" => {
-            if !q_lower.contains("official") {
+            // Phase 2 (B3): only inject "official <q>" when the query is a
+            // high-confidence navigational AND contains a brand/proper noun.
+            // Over-predicted navigational (chitchat, "python tutorial", "a")
+            // must NOT get "official" prepended — it pollutes results.
+            let already_official = q_lower.contains("official");
+            if !already_official && confidence >= 0.80 && brand_hint {
                 expansions.push(format!("official {}", q));
             }
         }
@@ -1994,9 +2191,15 @@ fn expand_queries(query: &str, intent: &str, constraints: &Constraints) -> Vec<S
     let mut seen = std::collections::HashSet::new();
     let mut unique = Vec::new();
     for exp in expansions {
-        let key = exp.to_lowercase();
+        // Sanitize every expansion: collapse adjacent duplicate tokens
+        // ("step step", "2026 2026") and trim dangling function words at the
+        // ends ("cheap used cars under" → "cheap used cars"). This is applied
+        // uniformly so no individual expansion branch can emit a malformed query.
+        let cleaned = sanitize_expansion(&exp);
+        let cleaned = if cleaned.trim().is_empty() { exp } else { cleaned };
+        let key = cleaned.to_lowercase();
         if seen.insert(key) {
-            unique.push(exp);
+            unique.push(cleaned);
         }
     }
     unique
@@ -2137,9 +2340,16 @@ async fn analyze_query(
         return Json(cached);
     }
 
-    // ── Step 1: Normalize query (de-stutter, collapse repeats) ──
+    // ── Step 1: Normalize query ──
+    // Phase 9: strip regional/multilingual junk (locale tags like en-US,
+    // full-width punctuation) and pull a geo region out of "in <region>".
+    let (regional_cleaned, _geo) = normalize_regional_junk(&params.q);
+    if _geo.is_some() || regional_cleaned.trim() != params.q.trim() {
+        tracing::info!("Regional junk normalized: {:?} → {:?} (geo={:?})",
+            params.q.trim(), regional_cleaned, _geo);
+    }
     // "how how to to set configure setup redis cluster" → "how to configure redis cluster"
-    let normalized = normalize_query(&params.q);
+    let normalized = normalize_query(&regional_cleaned);
     if normalized != params.q.trim() {
         tracing::info!("Query normalized: {:?} → {:?}", params.q.trim(), normalized);
     }
@@ -2182,7 +2392,96 @@ async fn analyze_query(
             ("informational".to_string(), 0.3, d)
         });
 
+    // ── Lexical intent overrides (BUG #4 + ISSUE #7) ──
+    // The ML linear probe is strong but occasionally misranks clear lexical
+    // signals (e.g. "react vs vue vs angular" was classified navigational at
+    // 0.877; "how to deploy a docker container" got only 0.272 confidence).
+    // When a high-precision lexical marker is present we override/boost the
+    // model so the API contract holds: "vs" ⇒ comparison, "how to" ⇒ how-to.
+    let mut intent = intent;
+    let mut confidence = confidence;
+    let ql = normalized.to_lowercase();
+    let has_vs = ql.contains(" vs ") || ql.contains(" versus ")
+        || ql.starts_with("vs ") || ql.starts_with("versus ");
+    // At least two distinct candidate entities separated by "or" / "vs"
+    // (e.g. "react or vue", "x vs y") ⇒ comparison, not informational/navigational.
+    let has_or_compare = ql.contains(" or ") && ql.split(" or ").count() >= 2;
+    if has_vs || has_or_compare {
+        if intent != "comparison" {
+            tracing::info!("Lexical override: 'vs'/'or' marker ⇒ comparison (was {})", intent);
+            intent = "comparison".to_string();
+            // High confidence: lexical comparison markers are unambiguous.
+            confidence = confidence.max(0.9);
+        }
+    }
+    // "how to" / "how do i" / "how can i" / "how do you" ⇒ how-to.
+    // Raise confidence so it isn't misranked behind informational/navigational.
+    let howto_markers = ["how to ", "how do i ", "how do you ", "how can i ",
+                         "how can i ", "how to", "steps to ", "tutorial for "];
+    let is_howto = howto_markers.iter().any(|m| ql.contains(m))
+        || ql.starts_with("how to") || ql.starts_with("how do");
+    if is_howto && intent == "how-to" {
+        // Boost weak how-to confidence to a more usable level.
+        confidence = confidence.max(0.6);
+        tracing::info!("Lexical boost: how-to confidence raised to {:.3}", confidence);
+    } else if is_howto && intent != "how-to" {
+        // Model missed the how-to signal — override when the lexical marker is clear.
+        if ql.contains("how to") || ql.starts_with("how do") || ql.contains("steps to ") {
+            tracing::info!("Lexical override: how-to marker ⇒ how-to (was {})", intent);
+            intent = "how-to".to_string();
+            confidence = confidence.max(0.6);
+        }
+    }
+
+    // Phase 3: chitchat lexical override. The linear probe over-predicts
+    // navigational for short social utterances ("how are you", "tell me a
+    // joke", "who are you"). Clear conversational markers must pin chitchat
+    // so they don't get "official" injection or a navigational half-life.
+    let chitchat_markers = [
+        "how are you", "how r you", "how you doing", "how's it going", "hows it going",
+        "tell me a joke", "tell me joke", "a joke", "who are you", "who r you",
+        "what are you", "are you real", "are you human", "good morning", "good evening",
+        "good afternoon", "good night", "thank you", "thanks", "hey", "hi there",
+        "hello there", "what's up", "whats up", "nice to meet you", "can you help",
+        "make me laugh", "sing a song", "what is your name", "whats your name",
+        "meaning of life", "purpose of life", "why are we here", "why do we exist",
+        "what is the meaning", "point of life",
+    ];
+    let is_chitchat = chitchat_markers.iter().any(|m| ql.contains(m))
+        || ql.trim() == "hi" || ql.trim() == "hello" || ql.trim() == "hey" || ql.trim() == "yo"
+        || ql.trim() == "sup" || ql.trim() == "thanks" || ql.trim() == "thank you";
+    if is_chitchat {
+        if intent != "chitchat" {
+            tracing::info!("Lexical override: chitchat marker ⇒ chitchat (was {})", intent);
+            intent = "chitchat".to_string();
+            confidence = confidence.max(0.7);
+        }
+    }
+
+    // Phase 4: temporal/freshness override. Queries like "latest ai news 2026"
+    // or "recent rust releases" carry an explicit recency signal. The linear
+    // probe never emits "fresh", so we force it here so the gateway applies a
+    // short (6h) freshness half-life. Requires a temporal marker AND a
+    // non-temporal topic token to avoid matching "what's new in python".
+    let temporal_markers = ["latest", "recent", "newest", "this week", "this month",
+                            "past week", "past month", "last week", "last month",
+                            "today", "2026 news", "2025 news", "new release",
+                            "new version", "current", "upcoming"];
+    let has_temporal = temporal_markers.iter().any(|t| ql.contains(t))
+        || ql.contains("news 202") || ql.contains("releases 202");
+    let topic_token_count = ql.split_whitespace()
+        .filter(|w| w.len() >= 3 && !temporal_markers.contains(w)
+                && !["latest","recent","newest","today","this","week","month","past","last","current","new"].contains(w)
+                && !["the","for","in","on","of","a","an","and","with"].contains(w))
+        .count();
+    if has_temporal && topic_token_count >= 1 && intent != "fresh" {
+        tracing::info!("Temporal override: recency marker + topic ⇒ fresh (was {})", intent);
+        intent = "fresh".to_string();
+        confidence = confidence.max(0.7);
+    }
+
     // ── Step 2: Compress long queries before expansion ──
+
     // "what monitoring stack should a small startup use for kubernetes
     //  microservices running on aws" → "kubernetes monitoring stack aws startup"
     // Uses negative-aware compression so excluded terms ("not chrome")
@@ -2192,7 +2491,7 @@ async fn analyze_query(
         tracing::info!("Query compressed: {:?} → {:?} (negation-aware)", normalized, expansion_input);
     }
 
-    let expanded = expand_queries(&expansion_input, &intent, &structured);
+    let expanded = expand_queries(&expansion_input, &intent, confidence, contains_brand_or_proper_noun(&params.q), &structured);
     tracing::info!("Expanded to {} query variations", expanded.len());
 
     let result = IntentResponse {
