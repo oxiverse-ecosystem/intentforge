@@ -55,12 +55,70 @@ struct SearchResult {
     content: String,
 }
 
+/// Robustly open or create a Tantivy index. On ANY error (corrupted meta.json,
+/// missing segment files, permissions, schema mismatch), clear the directory
+/// and create a fresh index. This ensures the indexer never gets stuck in a
+/// crash loop due to inconsistent on-disk state.
+fn open_or_create_index_robust(index_path: &str, schema: Schema) -> anyhow::Result<Index> {
+    std::fs::create_dir_all(index_path)?;
+
+    // Try to open existing index
+    // Both branches now return anyhow::Result<Index> so the match is type-consistent.
+    let dir_result = tantivy::directory::MmapDirectory::open(index_path);
+    let open_result: anyhow::Result<Index> = match dir_result {
+        Ok(dir) => Index::open_or_create(dir, schema.clone())
+            .map_err(|e| anyhow::anyhow!(e)),
+        Err(e) => {
+            tracing::warn!("MmapDirectory::open failed: {:?}, will recreate", e);
+            Err(anyhow::anyhow!("MmapDirectory open: {:?}", e))
+        }
+    };
+
+    match open_result {
+        Ok(idx) => {
+            // Verify schema matches
+            if idx.schema() != schema {
+                tracing::warn!("Schema mismatch detected, recreating index...");
+                let _ = std::fs::remove_dir_all(index_path);
+                std::fs::create_dir_all(index_path)?;
+                return Ok(Index::create_in_dir(index_path, schema.clone())?);
+            }
+            Ok(idx)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to open/create index: {:?}, clearing directory and recreating from scratch...",
+                e
+            );
+            // Best-effort clear - if files can't be deleted (permissions), try
+            // removing individual known files, then fall back to a fresh dir.
+            let _ = std::fs::remove_dir_all(index_path);
+            if let Err(e2) = std::fs::create_dir_all(index_path) {
+                tracing::warn!("Could not recreate index dir: {:?}, trying temp fallback", e2);
+            }
+            // Try creating a fresh index; if even that fails, use a temp directory
+            // as last resort so the service can still start.
+            match Index::create_in_dir(index_path, schema.clone()) {
+                Ok(idx) => Ok(idx),
+                Err(e2) => {
+                    tracing::error!(
+                        "Failed to create fresh index in {}: {:?}, trying temp fallback",
+                        index_path, e2
+                    );
+                    let temp_path = format!("{}_fresh_{}", index_path, std::process::id());
+                    let _ = std::fs::create_dir_all(&temp_path);
+                    Ok(Index::create_in_dir(&temp_path, schema.clone())?)
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let index_path = "./index_data";
-    std::fs::create_dir_all(index_path)?;
 
     let mut schema_builder = Schema::builder();
     schema_builder.add_text_field("url", STRING | STORED);
@@ -72,24 +130,8 @@ async fn main() -> anyhow::Result<()> {
     
     let schema = schema_builder.build();
 
-    let index = match Index::open_or_create(tantivy::directory::MmapDirectory::open(index_path)?, schema.clone()) {
-        Ok(idx) => {
-            if idx.schema() != schema {
-                tracing::warn!("Schema mismatch detected, recreating index...");
-                let _ = std::fs::remove_dir_all(index_path);
-                std::fs::create_dir_all(index_path)?;
-                Index::create_in_dir(index_path, schema.clone())?
-            } else {
-                idx
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to open index: {:?}, clearing directory and recreating...", e);
-            let _ = std::fs::remove_dir_all(index_path);
-            std::fs::create_dir_all(index_path)?;
-            Index::create_in_dir(index_path, schema.clone())?
-        }
-    };
+    // Use the robust open-or-create that handles corrupted data gracefully
+    let index = open_or_create_index_robust(index_path, schema.clone())?;
 
     let writer = index.writer(50_000_000)?; 
     let reader = index
@@ -257,18 +299,32 @@ async fn handle_search(
             })
             .collect();
 
-        let mut bm25_ranked = Vec::new();
-        let mut semantic_ranked = Vec::new();
+        let mut bm25_ranked: Vec<String> = Vec::new();
+        let mut semantic_ranked: Vec<(String, f32, String, u64)> = Vec::new();
         let mut metadata: HashMap<String, (String, u64, f64, String)> = HashMap::new();
-        let mut urls_without_embeddings = std::collections::HashSet::new();
+        let mut urls_without_embeddings: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let threshold = min_score.unwrap_or(0.75);
 
-        let mut semantic_pass_urls = std::collections::HashSet::new();
+        let mut semantic_pass_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
         let is_semantic = query_vector.is_some();
 
-        for (_score, doc_address) in top_docs {
+        // ── Relevance floors (robustness) ──
+        // Tantivy's BM25 returns *some* document even when nothing lexically
+        // matches, and the embedding path can return an unrelated page when only a
+        // few docs carry embeddings. Both must be gated so an off-topic page
+        // (e.g. Wikipedia "Cleopatra" for an unrelated query) can never top results.
+        const BM25_ABS_MIN: f32 = 0.5; // below this, one doc is not a real lexical match
+        const BM25_REL_FLOOR: f32 = 0.05; // keep docs at least 5% as relevant as the best
+        const SEMANTIC_MIN: f32 = 0.80; // best embedding similarity required to trust semantic
+        const MIN_EMBEDDED_FOR_SEMANTIC: usize = 5; // semantic needs a real embedding corpus
+
+        let mut candidates: Vec<(String, f32)> = Vec::new(); // (url, bm25_score)
+        let mut max_bm25: f32 = 0.0;
+        let mut max_sim: f32 = 0.0;
+
+        for (bm25_score, doc_address) in top_docs {
             let Ok(retrieved_doc) = searcher.doc::<TantivyDocument>(doc_address) else { continue; };
             let url = retrieved_doc.get_first(url_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
             let title = retrieved_doc.get_first(title_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -290,6 +346,7 @@ async fn handle_search(
                         if doc_vec.len() == q_vec.len() {
                             has_embedding = true;
                             let dot_product: f32 = q_vec.iter().zip(doc_vec.iter()).map(|(a, b)| a * b).sum();
+                            max_sim = max_sim.max(dot_product);
                             if dot_product >= threshold {
                                 semantic_ranked.push((url.clone(), dot_product, title.clone(), timestamp));
                                 semantic_pass_urls.insert(url.clone());
@@ -303,10 +360,48 @@ async fn handle_search(
                 urls_without_embeddings.insert(url.clone());
             }
 
-            if !is_semantic || semantic_pass_urls.contains(&url) || !has_embedding {
+            if bm25_score > max_bm25 {
+                max_bm25 = bm25_score;
+            }
+            candidates.push((url.clone(), bm25_score));
+        }
+
+        // BM25 relevance floor: a doc qualifies only if its BM25 score is a real
+        // lexical match. If even the best doc scores below the absolute floor, the
+        // query has no lexical match at all → exclude everything (don't surface an
+        // unrelated page). Otherwise keep docs within BM25_REL_FLOOR of the best.
+        let bm25_floor = if max_bm25 < BM25_ABS_MIN {
+            f32::MAX
+        } else {
+            (max_bm25 * BM25_REL_FLOOR).max(BM25_ABS_MIN)
+        };
+
+        for (url, s) in &candidates {
+            if *s >= bm25_floor {
                 bm25_ranked.push(url.clone());
             }
         }
+
+        // Semantic gate (robustness): only trust embedding hits when (a) the best
+        // similarity is strong AND (b) there is a real embedding corpus. When
+        // embeddings are sparse (only a few docs embedded) or weak, a single embedded
+        // doc can "win" every query at the 0.75 floor — falling back to BM25 ranking
+        // avoids injecting an off-topic page.
+        let embedded_count = candidates.len().saturating_sub(urls_without_embeddings.len());
+        if is_semantic && (max_sim < SEMANTIC_MIN || embedded_count < MIN_EMBEDDED_FOR_SEMANTIC) {
+            tracing::info!(
+                "INDEXER semantic gate: q='{}' max_sim={:.3} embedded={}/{} → ignoring semantic hits (BM25-only)",
+                q, max_sim, embedded_count, candidates.len()
+            );
+            semantic_ranked.clear();
+            semantic_pass_urls.clear();
+        }
+
+        tracing::info!(
+            "INDEXER search q='{}' is_semantic={} max_bm25={:.3} bm25_floor={:.3} max_sim={:.3} embedded={}/{} bm25_hits={} semantic_hits={}",
+            q, is_semantic, max_bm25, bm25_floor, max_sim, embedded_count, candidates.len(),
+            bm25_ranked.len(), semantic_ranked.len()
+        );
 
         semantic_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
