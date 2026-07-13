@@ -16,6 +16,7 @@ use std::net::IpAddr;
 mod spell;
 mod geoloc;
 mod dictionary;
+mod clean;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -6825,12 +6826,19 @@ let mut results = tokio::task::spawn_blocking(move || {
         !should_filter_by_constraints(&r.title, &r.content, &r.url, r.published_date.as_deref(), &intent.structured_constraints)
     });
 
-    // Sanitize content and clamp final score for safe JSON serialization and API spec conformance
+    // Sanitize content and clamp final score for safe JSON serialization and API spec conformance.
+    // clean::clean_result_content strips HTML/CSS, decodes HTML entities, and removes scraped-page
+    // boilerplate; is_junk_content then drops results that are empty / fetch-error / below an
+    // information threshold. Control chars are stripped first (sanitize_text_content) so the JSON
+    // stream stays valid.
     for r in results.iter_mut() {
         r.score = r.score.clamp(0.05, 1.0);
         r.title = sanitize_text_content(&r.title);
-        r.content = sanitize_text_content(&r.content);
+        r.content = clean::clean_result_content(&sanitize_text_content(&r.content), &r.title);
     }
+
+    // Drop results that became empty / fetch-error / boilerplate-only after cleaning.
+    results.retain(|r| !clean::is_junk_content(&r.content));
 
     // 8. Validate spelling correction against actual search result signals.
     // If the original (pre-correction) words appear more frequently in result
