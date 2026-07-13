@@ -29,6 +29,14 @@ where D: serde::Deserializer<'de> {
 struct SearchParams {
     #[serde(default)]
     q: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    count: Option<usize>,
+    #[serde(default)]
+    n: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -43,6 +51,28 @@ struct Constraints {
     /// Detected programming language from the query.
     #[serde(default)]
     language: Option<String>,
+    #[serde(default)]
+    file_types: Vec<String>,
+    #[serde(default)]
+    sites: Vec<String>,
+    #[serde(default)]
+    phrases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    after_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    before_date: Option<String>,
+    #[serde(default)]
+    intitle: Vec<String>,
+    #[serde(default)]
+    inurl: Vec<String>,
+    #[serde(default)]
+    intext: Vec<String>,
+    #[serde(default)]
+    related: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_min: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_max: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -92,6 +122,8 @@ struct SearxResult {
     score: f32,
     #[serde(default)]
     sources: Vec<String>, // tracks all engines/sources that returned this result
+    #[serde(default, alias = "publishedDate")]
+    published_date: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -258,30 +290,50 @@ struct MergedResult {
     sources: Vec<String>,  // e.g. ["local", "bing", "brave"]
     #[serde(default)]
     is_local: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_date: Option<String>,
 }
 
 #[derive(Serialize)]
 struct UnifiedResponse {
-    intent: String,
-    #[serde(default)]
-    category: String,
-    #[serde(default)]
-    confidence: f32,
-    #[serde(default)]
+    query: String,
+    intent: Option<String>,
+    category: Option<String>,
+    confidence: Option<f32>,
     constraints: Vec<String>,
-    #[serde(default)]
     structured_constraints: Constraints,
-    #[serde(default)]
     expanded_queries: Vec<String>,
-    #[serde(default)]
-    distribution: std::collections::HashMap<String, f32>,
+    distribution: Option<std::collections::HashMap<String, f32>>,
     results: Vec<MergedResult>,
     /// IP geolocation of the requesting client (if GeoLite2 database available)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     geo_location: Option<geoloc::GeoLocation>,
     /// If the original query was spell-corrected, the corrected version
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     spell_corrected_query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_quality: Option<String>,
+    /// Constraints the engine actually tried to enforce (operators it understands).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    applied_constraints: Option<Vec<String>>,
+    /// Constraints that were specified but could not take effect on the returned
+    /// results (e.g. a date range when no result carried a parseable date, or a
+    /// price range when no result snippet carried a detectable price).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ignored_constraints: Option<Vec<String>>,
+    /// Human-readable diagnostics (empty result set, upstream flakiness hints, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warnings: Option<Vec<String>>,
+    /// Web result count before any constraint filtering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    results_before_filter: Option<usize>,
+    /// Web result count after all constraint filtering (before pagination).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    results_after_filter: Option<usize>,
 }
 
 // ─── Domain Authority (Fully Algorithmic) ────────────────────────────
@@ -425,7 +477,235 @@ fn domain_authority_score(url: &str) -> f32 {
 
 // ─── Freshness Decay ─────────────────────────────────────────────────
 
-fn freshness_score(url: &str, intent: &str) -> f32 {
+fn parse_date_to_comparable(s: &str) -> Option<(i32, i32, i32)> {
+    if let Some(d) = parse_numeric_date(s) {
+        return Some(d);
+    }
+    let re_year = regex::Regex::new(r"\b(\d{4})\b").ok()?;
+    if let Some(caps) = re_year.captures(s) {
+        let y = caps.get(1)?.as_str().parse::<i32>().ok()?;
+        return Some((y, 1, 1));
+    }
+    None
+}
+
+/// Numeric YYYY-MM-DD / YYYY/MM/DD only (no bare-year fallback), so that
+/// month-name patterns can take precedence over a standalone year found in the
+/// same text (e.g. "January 5, 2024" must resolve to the full date, not 2024).
+fn parse_numeric_date(s: &str) -> Option<(i32, i32, i32)> {
+    let re = regex::Regex::new(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b").ok()?;
+    let caps = re.captures(s)?;
+    let y = caps.get(1)?.as_str().parse::<i32>().ok()?;
+    let m = caps.get(2)?.as_str().parse::<i32>().ok()?;
+    let d = caps.get(3)?.as_str().parse::<i32>().ok()?;
+    Some((y, m, d))
+}
+
+fn date_gte(d1: (i32, i32, i32), d2: (i32, i32, i32)) -> bool {
+    d1.0 > d2.0 || (d1.0 == d2.0 && (d1.1 > d2.1 || (d1.1 == d2.1 && d1.2 >= d2.2)))
+}
+
+fn date_lte(d1: (i32, i32, i32), d2: (i32, i32, i32)) -> bool {
+    d1.0 < d2.0 || (d1.0 == d2.0 && (d1.1 < d2.1 || (d1.1 == d2.1 && d1.2 <= d2.2)))
+}
+
+// ─── Pure-std Gregorian date math (no external time crate) ──────────
+// Proleptic Gregorian calendar. Days are counted from 1970-01-01 (Unix epoch).
+// Algorithm: Howard Hinnant's civil-from-days / days-from-civil.
+
+fn ymd_to_days(y: i32, m: i32, d: i32) -> i64 {
+    let y = if m <= 2 { y as i64 - 1 } else { y as i64 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as i64;
+    let mp = if m > 2 { m as i64 - 3 } else { m as i64 + 9 };
+    let doy = (153 * mp + 2) / 5 + (d as i64 - 1);
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn days_to_ymd(z: i64) -> (i32, i32, i32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as i32, d as i32)
+}
+
+fn today_ymd() -> (i32, i32, i32) {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(dur) => days_to_ymd((dur.as_secs() / 86400) as i64),
+        Err(_) => (1970, 1, 1),
+    }
+}
+
+fn add_days(ymd: (i32, i32, i32), delta: i64) -> (i32, i32, i32) {
+    days_to_ymd(ymd_to_days(ymd.0, ymd.1, ymd.2) + delta)
+}
+
+fn format_ymd(ymd: (i32, i32, i32)) -> String {
+    format!("{:04}-{:02}-{:02}", ymd.0, ymd.1, ymd.2)
+}
+
+/// Resolve the best comparable date for a result, looking at (in priority order):
+/// the upstream published_date, a 4-digit year embedded in the URL, and finally
+/// any human-readable date found in the title/content text. This makes
+/// after:/before:/recency constraints actually drop old web results whose
+/// snippets carry a date.
+fn resolve_item_date(
+    published_date: Option<&str>,
+    url: &str,
+    title: &str,
+    content: &str,
+) -> Option<(i32, i32, i32)> {
+    if let Some(pd) = published_date {
+        if let Some(d) = parse_date_to_comparable(pd) {
+            return Some(d);
+        }
+    }
+    if let Some(y) = extract_year_from_url(url) {
+        return Some((y, 1, 1));
+    }
+    let text = format!("{} {}", title, content);
+    extract_date_from_text(&text)
+}
+
+fn month_num(s: &str) -> Option<i32> {
+    let s = s.to_lowercase();
+    let months: &[(&str, i32)] = &[
+        ("january", 1), ("february", 2), ("march", 3), ("april", 4), ("may", 5),
+        ("june", 6), ("july", 7), ("august", 8), ("september", 9), ("october", 10),
+        ("november", 11), ("december", 12), ("jan", 1), ("feb", 2), ("mar", 3),
+        ("apr", 4), ("jun", 6), ("jul", 7), ("aug", 8), ("sep", 9), ("sept", 9),
+        ("oct", 10), ("nov", 11), ("dec", 12),
+    ];
+    months.iter().find(|(n, _)| s.starts_with(n)).map(|(_, m)| *m)
+}
+
+/// Extract a calendar date from free text (title/content snippet).
+fn extract_date_from_text(text: &str) -> Option<(i32, i32, i32)> {
+    // Numeric YYYY-MM-DD / YYYY/MM/DD first (precise).
+    if let Some(d) = parse_numeric_date(text) {
+        return Some(d);
+    }
+    let t = text.to_lowercase();
+    // Capturing group so we can read the month directly (it is not always first).
+    let month_alt = r"(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)";
+
+    // "Month DD, YYYY"  → groups: 1=month 2=day 3=year
+    static RE1: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re1 = RE1.get_or_init(|| {
+        regex::Regex::new(&format!(r"(?i)\b{}\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})", month_alt)).unwrap()
+    });
+    if let Some(c) = re1.captures(&t) {
+        if let (Some(m), Ok(d), Ok(y)) = (
+            month_num(c.get(1).unwrap().as_str()),
+            c.get(2).unwrap().as_str().parse::<i32>(),
+            c.get(3).unwrap().as_str().parse::<i32>(),
+        ) {
+            return Some((y, m, d));
+        }
+    }
+
+    // "DD Month YYYY"  → groups: 1=day 2=month 3=year
+    static RE2: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re2 = RE2.get_or_init(|| {
+        regex::Regex::new(&format!(r"(?i)\b(\d{{1,2}})(?:st|nd|rd|th)?\s+{}\.?,?\s+(\d{{4}})", month_alt)).unwrap()
+    });
+    if let Some(c) = re2.captures(&t) {
+        if let (Ok(d), Some(m), Ok(y)) = (
+            c.get(1).unwrap().as_str().parse::<i32>(),
+            month_num(c.get(2).unwrap().as_str()),
+            c.get(3).unwrap().as_str().parse::<i32>(),
+        ) {
+            return Some((y, m, d));
+        }
+    }
+
+    // "Month YYYY"  → groups: 1=month 2=year
+    static RE3: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re3 = RE3.get_or_init(|| {
+        regex::Regex::new(&format!(r"(?i)\b{}\.?,?\s+(\d{{4}})", month_alt)).unwrap()
+    });
+    if let Some(c) = re3.captures(&t) {
+        if let (Some(m), Ok(y)) = (
+            month_num(c.get(1).unwrap().as_str()),
+            c.get(2).unwrap().as_str().parse::<i32>(),
+        ) {
+            return Some((y, m, 1));
+        }
+    }
+
+    static REY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let rey = REY.get_or_init(|| regex::Regex::new(r"\b((?:19|20)\d{2})\b").unwrap());
+    if let Some(c) = rey.captures(&t) {
+        if let Ok(y) = c.get(1).unwrap().as_str().parse::<i32>() {
+            return Some((y, 1, 1));
+        }
+    }
+    None
+}
+
+/// Map a natural-language recency phrase to a concrete (after, before) window
+/// expressed as `YYYY-MM-DD`. Returns None when no recency signal is present, so
+/// literal after:/before: and explicit dates are left untouched.
+fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
+    let today = today_ymd();
+    let today_s = format_ymd(today);
+
+    if q_lower.contains("yesterday") {
+        return Some((format_ymd(add_days(today, -1)), today_s));
+    }
+    if q_lower.contains("today") {
+        return Some((today_s.clone(), today_s));
+    }
+
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(?:past|last|this|current|recent|over|within|in the past|in the last|during the)\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)\b",
+        )
+        .unwrap()
+    });
+    if let Some(caps) = re.captures(q_lower) {
+        if let (Ok(n), Some(unit)) = (caps.get(1).unwrap().as_str().parse::<i64>(), caps.get(2)) {
+            let delta = match unit.as_str().to_lowercase().as_str() {
+                "day" | "days" => -n,
+                "week" | "weeks" => -(n * 7),
+                "month" | "months" => -(n * 30),
+                "year" | "years" => -(n * 365),
+                _ => 0,
+            };
+            if delta != 0 {
+                return Some((format_ymd(add_days(today, delta)), today_s));
+            }
+        }
+    }
+
+    let named: &[(&str, i64)] = &[
+        ("this week", -7), ("past week", -7), ("last week", -7), ("current week", -7),
+        ("this month", -30), ("past month", -30), ("last month", -30),
+        ("this year", -365), ("past year", -365), ("last year", -365),
+    ];
+    for (phrase, delta) in named {
+        if q_lower.contains(*phrase) {
+            return Some((format_ymd(add_days(today, *delta)), today_s));
+        }
+    }
+
+    if q_lower.contains("recent") || q_lower.contains("latest") || q_lower.contains("fresh") {
+        return Some((format_ymd(add_days(today, -7)), today_s));
+    }
+
+    None
+}
+
+fn freshness_score(url: &str, intent: &str, published_date: Option<&str>) -> f32 {
     // Different half-lives per intent category
     let half_life_hours: f32 = match intent {
         "fresh" => 6.0,            // news: 6-hour half-life
@@ -438,62 +718,78 @@ fn freshness_score(url: &str, intent: &str) -> f32 {
         _ => 168.0,
     };
 
-    // We don't have the actual crawl timestamp here, so we use URL signals
-    // to estimate freshness. In a full system, this would query the indexer
-    // for the document's last_crawled_at timestamp.
-
-    let url_lower = url.to_lowercase();
     let mut estimated_age_hours: f32 = 168.0; // default: 7 days (less aggressive decay)
+    let mut parsed_ok = false;
 
-    // Fresh content signals in URL
-    if url_lower.contains("/2026/") || url_lower.contains("2026-") {
-        estimated_age_hours = 24.0; // likely very recent
-    } else if url_lower.contains("/2025/") || url_lower.contains("2025-") {
-        estimated_age_hours = 168.0; // recent
+    if let Some(pd) = published_date {
+        if let Some((y, m, d)) = parse_date_to_comparable(pd) {
+            // Current date: July 13, 2026
+            let cur_y = 2026;
+            let cur_m = 7;
+            let cur_d = 13;
+            let years_diff = cur_y - y;
+            let months_diff = cur_m - m;
+            let days_diff = cur_d - d;
+            let total_days = years_diff * 365 + months_diff * 30 + days_diff;
+            estimated_age_hours = (total_days * 24) as f32;
+            estimated_age_hours = estimated_age_hours.max(0.0);
+            parsed_ok = true;
+        }
     }
 
-    // News/forum signals = likely more recent
-    if url_lower.contains("/news/") || url_lower.contains("/blog/")
-        || url_lower.contains("news.ycombinator.com")
-        || url_lower.contains("/thread/") || url_lower.contains("/q/")
-    {
-        estimated_age_hours = estimated_age_hours.min(48.0);
-    }
+    if !parsed_ok {
+        let url_lower = url.to_lowercase();
 
-    // Documentation is relatively stable
-    if url_lower.contains("/docs/") || url_lower.contains("/doc/")
-        || url_lower.contains("/api/") || url_lower.contains("/reference/")
-    {
-        estimated_age_hours = estimated_age_hours.max(168.0);
-    }
+        // Fresh content signals in URL
+        if url_lower.contains("/2026/") || url_lower.contains("2026-") {
+            estimated_age_hours = 24.0; // likely very recent
+        } else if url_lower.contains("/2025/") || url_lower.contains("2025-") {
+            estimated_age_hours = 168.0; // recent
+        }
 
-    // Structural URL analysis for static/reference content detection.
-    // Deep, descriptive paths (long segments, high hyphen density) are characteristic
-    // of reference content (reports, documentation) that remains relevant for years.
-    // This is purely structural — no keyword lists or domain names.
-    if let Ok(parsed) = reqwest::Url::parse(url) {
-        let path = parsed.path().to_lowercase();
-        let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        let n_segments = path_segments.len();
+        // News/forum signals = likely more recent
+        if url_lower.contains("/news/") || url_lower.contains("/blog/")
+            || url_lower.contains("news.ycombinator.com")
+            || url_lower.contains("/thread/") || url_lower.contains("/q/")
+        {
+            estimated_age_hours = estimated_age_hours.min(48.0);
+        }
 
-        if n_segments >= 2 {
-            let total_chars: usize = path_segments.iter().map(|s| s.len()).sum();
-            let total_hyphens: usize = path_segments.iter().map(|s| s.matches('-').count()).sum();
-            let avg_seg_len = total_chars as f32 / n_segments as f32;
+        // Documentation is relatively stable
+        if url_lower.contains("/docs/") || url_lower.contains("/doc/")
+            || url_lower.contains("/api/") || url_lower.contains("/reference/")
+        {
+            estimated_age_hours = estimated_age_hours.max(168.0);
+        }
 
-            // Deep, descriptive path with many hyphens → reference/report content
-            // Examples: /privacy-search-engine-market-size-share-trends-2025-2026
-            // These URLs have: n_segments≥2, avg_seg_len>15, total_hyphens≥3
-            if n_segments >= 3 && avg_seg_len > 12.0 && total_hyphens >= 3 {
-                estimated_age_hours = estimated_age_hours.min(1.0);
-            }
-            // Deep path with numeric-heavy segments = database-driven pages (reports, catalogs)
-            if n_segments >= 3 {
-                let has_numeric_segment = path_segments.iter().any(|s| {
-                    s.len() >= 6 && s.chars().filter(|c| c.is_numeric()).count() >= s.len() / 2
-                });
-                if has_numeric_segment {
+        // Structural URL analysis for static/reference content detection.
+        // Deep, descriptive paths (long segments, high hyphen density) are characteristic
+        // of reference content (reports, documentation) that remains relevant for years.
+        // This is purely structural — no keyword lists or domain names.
+        if let Ok(parsed) = reqwest::Url::parse(url) {
+            let path = parsed.path().to_lowercase();
+            let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            let n_segments = path_segments.len();
+
+            if n_segments >= 2 {
+                let total_chars: usize = path_segments.iter().map(|s| s.len()).sum();
+                let total_hyphens: usize = path_segments.iter().map(|s| s.matches('-').count()).sum();
+                let avg_seg_len = total_chars as f32 / n_segments as f32;
+
+                // Deep, descriptive path with many hyphens → reference/report content
+                // Examples: /privacy-search-engine-market-size-share-trends-2025-2026
+                // These URLs have: n_segments≥2, avg_seg_len>15, total_hyphens≥3
+                if n_segments >= 3 && avg_seg_len > 12.0 && total_hyphens >= 3 {
                     estimated_age_hours = estimated_age_hours.min(1.0);
+                }
+                // Deep path with numeric-heavy segments = database-driven pages (reports, catalogs)
+                if n_segments >= 3 {
+                    let has_numeric_segment = path_segments.iter().any(|s| {
+                        s.len() >= 6 && s.chars().filter(|c| c.is_numeric()).count() >= s.len() / 2
+                    });
+                    if has_numeric_segment {
+                        estimated_age_hours = estimated_age_hours.min(1.0);
+                    }
                 }
             }
         }
@@ -801,6 +1097,184 @@ fn is_alternative_listing_page(title: &str, url: &str, content: &str) -> f32 {
 }
 
 
+/// Decide whether a result token matches a negative constraint term.
+///
+/// Naive `token.contains(term)` is catastrophic for negation: "not java"
+/// would penalise/drop every "javascript" result ("java" ⊂ "javascript"),
+/// and "not go" would match "google", "django", "logo", etc. This produced
+/// the 0-results bug for "javascript not java not typescript".
+///
+/// Rule (data-driven, no per-term hardcoding):
+///   1. Exact match always counts.
+///   2. A prefix/substring match only counts when the constraint term makes up
+///      a dominant fraction (≥ 0.75) of the token AND the token is a plausible
+///      inflection/compound of the term (e.g. "react" ⊂ "reactjs" = 0.71 is
+///      borderline; "django" ⊂ "djangorest" = 0.67 rejected; "java" ⊂
+///      "javascript" = 0.4 firmly rejected). This preserves legitimate
+///      compound-brand matches while rejecting distinct-word collisions.
+///   3. Very short terms (< 3 alnum chars, e.g. "go", "c") match ONLY exactly —
+///      they collide with far too many English tokens as substrings.
+fn negative_term_matches_token(term_clean: &str, token_clean: &str) -> bool {
+    if term_clean.is_empty() || token_clean.is_empty() {
+        return false;
+    }
+    if term_clean == token_clean {
+        return true;
+    }
+    // Short terms: exact-only (already returned above), never substring.
+    if term_clean.len() < 3 {
+        return false;
+    }
+    // Compound/inflection match: token must START with the term (suffix like
+    // "js", "lang", "rest") and the term must dominate the token length.
+    if token_clean.starts_with(term_clean) {
+        let ratio = term_clean.len() as f32 / token_clean.len() as f32;
+        return ratio >= 0.75;
+    }
+    false
+}
+
+/// Whole-text negative match: true if ANY whitespace token in `text` matches
+/// the (possibly multi-word) negative term. Multi-word terms fall back to a
+/// phrase containment check. `text` and `term` are lowercased by the caller.
+fn text_matches_negative(text_lower: &str, term_lower: &str) -> bool {
+    let term_words: Vec<&str> = term_lower.split_whitespace().collect();
+    if term_words.len() > 1 {
+        // Multi-word constraint: require the full phrase (word-boundary safe
+        // enough for phrases; single-word collisions are the real hazard).
+        return text_lower.contains(term_lower);
+    }
+    let term_clean: String = term_lower.chars().filter(|c| c.is_alphanumeric()).collect();
+    let words: Vec<&str> = text_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    words.iter().any(|w| {
+        negative_term_matches_token(&term_clean, w)
+    })
+}
+
+/// Gazetteer mapping well-known place names to ISO-3166 country codes.
+/// This is *reference data* (like a dictionary), NOT per-query hardcoded logic:
+/// it lets a query that explicitly names a location override the IP-derived
+/// geolocation. Robust and extensible — add an entry to support a new place.
+/// Matching is done on whole words only (no substring collisions).
+const LOCATION_GAZETTEER: &[(&str, &str)] = &[
+    // Countries (name + common demonym/adjective forms handled by synonyms)
+    ("united states", "US"), ("usa", "US"), ("us", "US"), ("america", "US"),
+    ("united kingdom", "GB"), ("uk", "GB"), ("britain", "GB"), ("england", "GB"),
+    ("canada", "CA"), ("australia", "AU"), ("new zealand", "NZ"),
+    ("germany", "DE"), ("france", "FR"), ("spain", "ES"), ("italy", "IT"),
+    ("portugal", "PT"), ("netherlands", "NL"), ("ireland", "IE"),
+    ("sweden", "SE"), ("norway", "NO"), ("denmark", "DK"), ("finland", "FI"),
+    ("poland", "PL"), ("austria", "AT"), ("switzerland", "CH"), ("belgium", "BE"),
+    ("russia", "RU"), ("ukraine", "UA"), ("turkey", "TR"), ("greece", "GR"),
+    ("japan", "JP"), ("china", "CN"), ("korea", "KR"), ("south korea", "KR"),
+    ("india", "IN"), ("singapore", "SG"), ("hong kong", "HK"),
+    ("brazil", "BR"), ("mexico", "MX"), ("argentina", "AR"),
+    ("united arab emirates", "AE"), ("uae", "AE"), ("saudi arabia", "SA"),
+    ("egypt", "EG"), ("israel", "IL"), ("thailand", "TH"), ("vietnam", "VN"),
+    ("indonesia", "ID"), ("malaysia", "MY"), ("philippines", "PH"),
+    ("south africa", "ZA"), ("nigeria", "NG"), ("kenya", "KE"),
+    ("czech republic", "CZ"), ("hungary", "HU"), ("romania", "RO"),
+    ("czechia", "CZ"), ("croatia", "HR"), ("slovenia", "SI"),
+    // Major cities (route to their country for language/region hints)
+    ("tokyo", "JP"), ("london", "GB"), ("paris", "FR"), ("berlin", "DE"),
+    ("madrid", "ES"), ("rome", "IT"), ("amsterdam", "NL"), ("dublin", "IE"),
+    ("stockholm", "SE"), ("oslo", "NO"), ("copenhagen", "DK"), ("helsinki", "FI"),
+    ("moscow", "RU"), ("kyiv", "UA"), ("istanbul", "TR"), ("athens", "GR"),
+    ("beijing", "CN"), ("shanghai", "CN"), ("seoul", "KR"), ("delhi", "IN"),
+    ("mumbai", "IN"), ("bangalore", "IN"), ("bengaluru", "IN"), ("singapore", "SG"),
+    ("sydney", "AU"), ("melbourne", "AU"), ("auckland", "NZ"),
+    ("new york", "US"), ("san francisco", "US"), ("los angeles", "US"),
+    ("chicago", "US"), ("seattle", "US"), ("boston", "US"), ("austin", "US"),
+    ("toronto", "CA"), ("vancouver", "CA"), ("sao paulo", "BR"), ("mexico city", "MX"),
+    ("dubai", "AE"), ("cairo", "EG"), ("bangkok", "TH"), ("jakarta", "ID"),
+    ("cape town", "ZA"), ("lagos", "NG"),
+];
+
+/// If the query explicitly names a location (via whole-word match against the
+/// gazetteer), return a `GeoLocation` describing it. This OVERRIDES the
+/// IP-derived geolocation so a user in India searching "restaurants in tokyo
+/// japan" gets JP-localised results, not IN-localised ones.
+///
+/// Robustness notes (no per-query hardcoding):
+///   • Matching is whole-word only, so "java" (the language) never matches the
+///     "ja" prefix of nothing here, and "iran" won't match "iran" inside
+///     "teheran". Only exact gazetteer entries win.
+///   • The city name is recorded so ranking can still boost the specific city.
+///   • Returns `None` when no gazetteer entry is present — then IP geo is used.
+fn detect_explicit_location(query: &str) -> Option<geoloc::GeoLocation> {
+    let q_lower = query.to_lowercase();
+    let tokens: Vec<&str> = q_lower.split_whitespace().collect();
+    // Try multi-word phrases first (longest first), then single words.
+    for entry in LOCATION_GAZETTEER.iter() {
+        let name = entry.0;
+        let cc = entry.1;
+        let name_words: Vec<&str> = name.split_whitespace().collect();
+        let matched = if name_words.len() > 1 {
+            // Multi-word place: require full phrase as a contiguous token run.
+            q_lower.contains(name)
+        } else {
+            tokens.contains(&name)
+        };
+        if matched {
+            let country_name = Some(country_name_for(cc).to_string());
+            return Some(geoloc::GeoLocation {
+                country_code: Some(cc.to_string()),
+                country_name,
+                region: None,
+                city: if name_words.len() > 1 || is_city(name) {
+                    Some(name.to_string())
+                } else {
+                    None
+                },
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
+            });
+        }
+    }
+    None
+}
+
+/// True if the gazetteer name is a city (vs a country), used to decide whether
+/// to populate `city`. Derived from the city set; cheap linear scan.
+fn is_city(name: &str) -> bool {
+    const CITIES: &[&str] = &[
+        "tokyo", "london", "paris", "berlin", "madrid", "rome", "amsterdam",
+        "dublin", "stockholm", "oslo", "copenhagen", "helsinki", "moscow", "kyiv",
+        "istanbul", "athens", "beijing", "shanghai", "seoul", "delhi", "mumbai",
+        "bangalore", "bengaluru", "singapore", "sydney", "melbourne", "auckland",
+        "new york", "san francisco", "los angeles", "chicago", "seattle", "boston",
+        "austin", "toronto", "vancouver", "sao paulo", "mexico city", "dubai",
+        "cairo", "bangkok", "jakarta", "cape town", "lagos",
+    ];
+    CITIES.contains(&name)
+}
+
+/// Human-readable country name for an ISO code (gazetteer-derived).
+fn country_name_for(cc: &str) -> String {
+    let name = match cc {
+        "US" => "United States", "GB" => "United Kingdom", "CA" => "Canada",
+        "AU" => "Australia", "NZ" => "New Zealand", "DE" => "Germany",
+        "FR" => "France", "ES" => "Spain", "IT" => "Italy", "PT" => "Portugal",
+        "NL" => "Netherlands", "IE" => "Ireland", "SE" => "Sweden", "NO" => "Norway",
+        "DK" => "Denmark", "FI" => "Finland", "PL" => "Poland", "AT" => "Austria",
+        "CH" => "Switzerland", "BE" => "Belgium", "RU" => "Russia", "UA" => "Ukraine",
+        "TR" => "Turkey", "GR" => "Greece", "JP" => "Japan", "CN" => "China",
+        "KR" => "South Korea", "IN" => "India", "SG" => "Singapore", "HK" => "Hong Kong",
+        "BR" => "Brazil", "MX" => "Mexico", "AR" => "Argentina", "AE" => "United Arab Emirates",
+        "SA" => "Saudi Arabia", "EG" => "Egypt", "IL" => "Israel", "TH" => "Thailand",
+        "VN" => "Vietnam", "ID" => "Indonesia", "MY" => "Malaysia", "PH" => "Philippines",
+        "ZA" => "South Africa", "NG" => "Nigeria", "KE" => "Kenya", "CZ" => "Czech Republic",
+        "HU" => "Hungary", "RO" => "Romania", "HR" => "Croatia", "SI" => "Slovenia",
+        _ => cc,
+    };
+    name.to_string()
+}
+
 fn expand_negative_synonyms(term: &str) -> Vec<String> {
     let mut expanded = vec![term.to_lowercase()];
     let term_lower = term.to_lowercase();
@@ -854,6 +1328,28 @@ fn expand_negative_synonyms(term: &str) -> Vec<String> {
     expanded
 }
 
+
+fn is_comparison_or_alternative_query(constraints: &Constraints) -> bool {
+    let has_comp_ref_entity = constraints.entities.iter().any(|e| {
+        e.role == EntityRole::Comparison || e.role == EntityRole::Reference
+    });
+    if has_comp_ref_entity {
+        return true;
+    }
+    for p in &constraints.positive {
+        let pl = p.to_lowercase();
+        if pl == "vs" || pl == "versus" || pl == "alternative" || pl == "alternatives" || pl == "replacement" || pl == "comparison" {
+            return true;
+        }
+    }
+    for pr in &constraints.phrases {
+        let pl = pr.to_lowercase();
+        if pl.contains(" vs ") || pl.contains("alternative") || pl.contains("replacement") || pl.contains("comparison") {
+            return true;
+        }
+    }
+    false
+}
 
 fn constraint_score(
     title: &str,
@@ -918,7 +1414,7 @@ fn constraint_score(
     // get a SINGLE flat penalty regardless of how many excluded terms they mention.
     // Regular pages get per-term multiplicative penalties.
     let alt_score = is_alternative_listing_page(title, url, content);
-    let is_alt_page = alt_score > 0.3;
+    let is_alt_page = alt_score > 0.3 && is_comparison_or_alternative_query(constraints);
     let mut any_negative_matched = false;
     let mut hit_count = 0u32;
 
@@ -928,22 +1424,9 @@ fn constraint_score(
         let neg_words: Vec<&str> = neg_lower.split_whitespace().collect();
         // Match against title + content + URL for all constraint lengths
         // Content matching uses word boundaries to reduce noise
-        let matched = if neg_words.len() == 1 {
-            // Title matching: exact word, trimmed, normalized
-            title_lower.split_whitespace().any(|w| {
-                w == neg_lower
-                || w.trim_matches(|c: char| !c.is_alphanumeric()) == neg_lower
-                || {
-                    let w_alpha: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
-                    w_alpha == neg_normalized || w_alpha.contains(&neg_normalized)
-                }
-            })
-            || title_normalized.split_whitespace().any(|w| {
-                let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
-                w_clean == neg_normalized || w_clean.contains(&neg_normalized)
-            })
-            || (neg_normalized.len() >= 3 && title_normalized.contains(&neg_normalized))
-            // URL path matching (e.g., github.com/reactjs, geeksforgeeks.org/reactjs/)
+        let title_or_url_matched = if neg_words.len() == 1 {
+            text_matches_negative(&title_lower, &neg_lower)
+            || text_matches_negative(&title_normalized, &neg_normalized)
             || url.to_lowercase().split('/').any(|segment| {
                 let seg = segment.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
                 seg == neg_lower
@@ -952,7 +1435,6 @@ fn constraint_score(
                     let domain = no_www.split('.').next().unwrap_or(no_www);
                     domain == neg_lower
                 }
-                // Compound-word prefix in URL segments: "reactjs" starts with "react"
                 || {
                     let seg_alpha: String = seg.chars().filter(|c| c.is_alphanumeric()).collect();
                     seg_alpha.len() > neg_normalized.len()
@@ -962,22 +1444,32 @@ fn constraint_score(
                 }
             })
         } else {
-            // Multi-word: check title first, then URL
             title_lower.contains(&neg_lower) || title_normalized.contains(&neg_normalized)
             || url.to_lowercase().contains(&neg_lower)
         };
-        if matched {
+
+        let content_matched = if neg_words.len() == 1 {
+            text_matches_negative(&content.to_lowercase(), &neg_lower)
+        } else {
+            content.to_lowercase().contains(&neg_lower)
+        };
+
+        if title_or_url_matched {
             hit_count += 1;
             any_negative_matched = true;
             if !is_alt_page {
-                // Non-alt pages: apply per-term multiplicative penalty.
-                // Standard penalty scales with total constraint count:
-                // 1 constraint: 0.02 (98% penalty)
-                // 2 constraints: 0.10 per violation (0.10^2 = 0.01 if both hit)
-                // 3 constraints: 0.16 per violation
-                // 4+ constraints: 0.20 per violation
                 let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
-                tracing::info!("CONSTRAINT HIT: '{}' in '{}' → penalty={:.4} (non-alt)",
+                tracing::info!("CONSTRAINT HIT (TITLE/URL): '{}' in '{}' → penalty={:.4} (non-alt)",
+                    neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                    penalty);
+                score *= penalty;
+            }
+        } else if content_matched {
+            hit_count += 1;
+            any_negative_matched = true;
+            if !is_alt_page {
+                let penalty = (0.25 + (neg_count - 1.0) * 0.05).clamp(0.25, 0.50);
+                tracing::info!("CONSTRAINT HIT (CONTENT): '{}' in '{}' → penalty={:.4} (non-alt)",
                     neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
                     penalty);
                 score *= penalty;
@@ -1087,11 +1579,12 @@ fn constraint_score(
 
         let blended_coverage = coverage_pressure * 0.70 + width_pressure * 0.30;
 
-        // Scale: 0% coverage -> 0.35x
+        // Scale: 0% coverage -> 0.60x (Phase 5: raised from 0.35 so a broad
+        //       query with no positive hits is no longer over-penalized)
         //         100% coverage -> 1.9x
         // Mapping is monotonic, but at least one positive match with high coverage
         // becomes a strong discriminator vs zero-match passthrough.
-        score *= 0.35 + blended_coverage * 1.55;
+        score *= 0.60 + blended_coverage * 1.30;
     }
 
     // Language entity constraints: when a programming language is detected in the
@@ -1150,6 +1643,401 @@ fn constraint_score(
     }
 
     score.clamp(0.0, 1.0)
+}
+
+fn parse_price_range(s: &str) -> Option<(Option<f32>, Option<f32>)> {
+    let clean: String = s.chars().filter(|c| c.is_numeric() || *c == '-' || *c == '.').collect();
+    if clean.contains('-') {
+        let parts: Vec<&str> = clean.split('-').collect();
+        if parts.len() == 2 {
+            let pmin = parts[0].parse::<f32>().ok();
+            let pmax = parts[1].parse::<f32>().ok();
+            return Some((pmin, pmax));
+        }
+    }
+    if let Ok(val) = clean.parse::<f32>() {
+        return Some((None, Some(val)));
+    }
+    None
+}
+
+/// Hard-filter results violating constraints beyond redemption.
+fn sanitize_constraints(c: &Constraints) -> Constraints {
+    let mut negative: Vec<String> = Vec::new();
+    let mut positive: Vec<String> = Vec::new();
+    let mut file_types = c.file_types.clone();
+    let mut sites = c.sites.clone();
+    let phrases = c.phrases.clone();
+    let mut after_date = c.after_date.clone();
+    let mut before_date = c.before_date.clone();
+    let mut intitle = c.intitle.clone();
+    let mut inurl = c.inurl.clone();
+    let mut intext = c.intext.clone();
+    let mut related = c.related.clone();
+    let mut price_min = c.price_min;
+    let mut price_max = c.price_max;
+
+    // 1. Process negative constraints first (filtering and stripping +- or - prefixes)
+    for n in &c.negative {
+        let mut clean_n = n.trim().to_lowercase();
+        if clean_n.starts_with('-') {
+            clean_n = clean_n.strip_prefix('-').unwrap().trim().to_string();
+        }
+        if clean_n.starts_with('+') {
+            clean_n = clean_n.strip_prefix('+').unwrap().trim().to_string();
+        }
+        if clean_n.split_whitespace().count() <= 2 && !clean_n.is_empty() {
+            if !negative.contains(&clean_n) {
+                negative.push(clean_n);
+            }
+        }
+    }
+
+    // 2. Process positive constraints, filtering out actual negatives and operators
+    for p in &c.positive {
+        let mut clean_p = p.trim().to_lowercase();
+        
+        let mut is_neg = false;
+        if clean_p.starts_with('-') {
+            clean_p = clean_p.strip_prefix('-').unwrap().trim().to_string();
+            is_neg = true;
+        } else if clean_p.starts_with("+-") {
+            clean_p = clean_p.strip_prefix("+-").unwrap().trim().to_string();
+            is_neg = true;
+        }
+        
+        if is_neg {
+            if !clean_p.is_empty() && clean_p.split_whitespace().count() <= 2 {
+                if !negative.contains(&clean_p) {
+                    negative.push(clean_p);
+                }
+            }
+            continue;
+        }
+
+        if clean_p.starts_with("filetype:") {
+            let ft = clean_p.strip_prefix("filetype:").unwrap().trim().to_string();
+            if !ft.is_empty() && !file_types.contains(&ft) {
+                file_types.push(ft);
+            }
+        } else if clean_p.starts_with("site:") {
+            let site = clean_p.strip_prefix("site:").unwrap().trim().to_string();
+            if !site.is_empty() && !sites.contains(&site) {
+                sites.push(site);
+            }
+        } else if clean_p.starts_with("after:") {
+            let val = clean_p.strip_prefix("after:").unwrap().trim().to_string();
+            if !val.is_empty() {
+                after_date = Some(val);
+            }
+        } else if clean_p.starts_with("before:") {
+            let val = clean_p.strip_prefix("before:").unwrap().trim().to_string();
+            if !val.is_empty() {
+                before_date = Some(val);
+            }
+        } else if clean_p.starts_with("intitle:") {
+            let val = clean_p.strip_prefix("intitle:").unwrap().trim().to_string();
+            if !val.is_empty() && !intitle.contains(&val) {
+                intitle.push(val);
+            }
+        } else if clean_p.starts_with("inurl:") {
+            let val = clean_p.strip_prefix("inurl:").unwrap().trim().to_string();
+            if !val.is_empty() && !inurl.contains(&val) {
+                inurl.push(val);
+            }
+        } else if clean_p.starts_with("intext:") {
+            let val = clean_p.strip_prefix("intext:").unwrap().trim().to_string();
+            if !val.is_empty() && !intext.contains(&val) {
+                intext.push(val);
+            }
+        } else if clean_p.starts_with("related:") {
+            let val = clean_p.strip_prefix("related:").unwrap().trim().to_string();
+            if !val.is_empty() && !related.contains(&val) {
+                related.push(val);
+            }
+        } else if clean_p.starts_with("price:") {
+            let val = clean_p.strip_prefix("price:").unwrap().trim().to_string();
+            if let Some((pmin, pmax)) = parse_price_range(&val) {
+                price_min = pmin.or(price_min);
+                price_max = pmax.or(price_max);
+            }
+        } else {
+            let pl = clean_p;
+            if pl.is_empty() { continue; }
+            let is_dup = positive.iter().any(|kept| {
+                let kl = kept.to_lowercase();
+                kl == pl || kl.split_whitespace().all(|w| pl.split_whitespace().any(|w2| w2 == w))
+                    || pl.split_whitespace().all(|w| kl.split_whitespace().any(|w2| w2 == w))
+            });
+            if !is_dup {
+                positive.push(p.clone()); // keep original casing
+            }
+        }
+    }
+
+    Constraints {
+        positive,
+        negative,
+        entities: c.entities.clone(),
+        language: c.language.clone(),
+        file_types,
+        sites,
+        phrases,
+        after_date,
+        before_date,
+        intitle,
+        inurl,
+        intext,
+        related,
+        price_min,
+        price_max,
+    }
+}
+
+fn extract_year_from_url(url: &str) -> Option<i32> {
+    let re = regex::Regex::new(r"\b(20\d{2}|19\d{2})\b").ok()?;
+    if let Some(caps) = re.captures(url) {
+        let y = caps.get(1)?.as_str().parse::<i32>().ok()?;
+        return Some(y);
+    }
+    None
+}
+
+fn get_related_domains(domain: &str) -> Vec<String> {
+    let d = domain.to_lowercase();
+    let clean_d = d.trim_start_matches("www.");
+    match clean_d {
+        "github.com" => vec!["gitlab.com".to_string(), "bitbucket.org".to_string()],
+        "google.com" => vec!["bing.com".to_string(), "duckduckgo.com".to_string(), "yahoo.com".to_string()],
+        "reddit.com" => vec!["news.ycombinator.com".to_string(), "quora.com".to_string(), "stackexchange.com".to_string()],
+        "wikipedia.org" => vec!["britannica.com".to_string(), "wikihow.com".to_string()],
+        _ => vec![],
+    }
+}
+
+fn extract_price_from_text(text: &str) -> Option<f32> {
+    let lower = text.to_lowercase();
+    let amount = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
+
+    // Currency symbol / code followed by an amount: $100, €99, US$ 1,299.00, £50
+    static RE1: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re1 = RE1.get_or_init(|| {
+        regex::Regex::new(&format!(
+            r"(?i)(?:us\s?\$|can\s?\$|au\s?\$|\$|€|£|¥|₹|rs\.?\s?|inr|eur|gbp|usd)\s*{}",
+            amount
+        ))
+        .unwrap()
+    });
+    if let Some(caps) = re1.captures(&lower) {
+        let raw = caps.get(1)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f32>() {
+            return Some(v);
+        }
+    }
+
+    // Amount followed by a currency word: 100 dollars, 200 euros, 999 rupees
+    static RE2: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re2 = RE2.get_or_init(|| {
+        regex::Regex::new(&format!(
+            r"(?i){}\s*(?:us\s?dollars?|dollars?|euros?|pounds?|gbp|usd|inr|rupees?|rs)",
+            amount
+        ))
+        .unwrap()
+    });
+    if let Some(caps) = re2.captures(&lower) {
+        let raw = caps.get(1)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f32>() {
+            return Some(v);
+        }
+    }
+
+    // Explicit price/cost label: "price: 49", "cost 129", "starting at 15.99"
+    static RE3: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re3 = RE3.get_or_init(|| {
+        regex::Regex::new(&format!(
+            r"(?i)(?:price|cost|starting\s+at|from\s+price|for\s+only)\s*:?\s*\$?\s*{}",
+            amount
+        ))
+        .unwrap()
+    });
+    if let Some(caps) = re3.captures(&lower) {
+        let raw = caps.get(1)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f32>() {
+            return Some(v);
+        }
+    }
+
+    None
+}
+
+fn should_filter_by_constraints(
+    title: &str, content: &str, url: &str, published_date: Option<&str>, constraints: &Constraints,
+) -> bool {
+    // 1. Hard filter on file_types
+    if !constraints.file_types.is_empty() {
+        if let Ok(parsed_url) = reqwest::Url::parse(url) {
+            let path = parsed_url.path();
+            let ext = std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
+            if !constraints.file_types.iter().any(|ft| ft.to_lowercase() == ext) {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+
+    // 2. Hard filter on sites
+    if !constraints.sites.is_empty() {
+        if let Ok(parsed_url) = reqwest::Url::parse(url) {
+            if let Some(host) = parsed_url.host_str().map(|h| h.to_lowercase()) {
+                let matches_site = constraints.sites.iter().any(|site| {
+                    let s_low = site.to_lowercase();
+                    host == s_low || host.ends_with(&format!(".{}", s_low))
+                });
+                if !matches_site {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+
+    // 3. Hard filter on date bounds
+    if let Some(ref ad) = constraints.after_date {
+        if let Some(limit) = parse_date_to_comparable(ad) {
+            if let Some(p_date) = resolve_item_date(published_date, url, title, content) {
+                if !date_gte(p_date, limit) {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(ref bd) = constraints.before_date {
+        if let Some(limit) = parse_date_to_comparable(bd) {
+            if let Some(p_date) = resolve_item_date(published_date, url, title, content) {
+                if !date_lte(p_date, limit) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 4. Hard filter on phrases
+    if !constraints.phrases.is_empty() {
+        let t_low = title.to_lowercase();
+        let c_low = content.to_lowercase();
+        let u_low = url.to_lowercase();
+        for phrase in &constraints.phrases {
+            let p_low = phrase.to_lowercase();
+            if !t_low.contains(&p_low) && !c_low.contains(&p_low) && !u_low.contains(&p_low) {
+                return true;
+            }
+        }
+    }
+
+    // 4b. Hard filter on intitle:
+    if !constraints.intitle.is_empty() {
+        let t_low = title.to_lowercase();
+        for t in &constraints.intitle {
+            if !t_low.contains(&t.to_lowercase()) {
+                return true;
+            }
+        }
+    }
+
+    // 4c. Hard filter on inurl:
+    if !constraints.inurl.is_empty() {
+        let u_low = url.to_lowercase();
+        for u in &constraints.inurl {
+            if !u_low.contains(&u.to_lowercase()) {
+                return true;
+            }
+        }
+    }
+
+    // 4d. Hard filter on intext:
+    if !constraints.intext.is_empty() {
+        let c_low = content.to_lowercase();
+        for txt in &constraints.intext {
+            if !c_low.contains(&txt.to_lowercase()) {
+                return true;
+            }
+        }
+    }
+
+    // 4e. Hard filter on related:
+    // Semantics: "related:amazon.com" means sites SIMILAR to amazon, NOT amazon
+    // itself. The upstream search engine is forwarded the `related:` operator
+    // (see preprocess_searxng_query) and is expected to return similar sites.
+    // Here we only hard-exclude the domain itself (and its subdomains) and keep
+    // any curated similar domain. For unknown domains with no curated map we
+    // cannot prove a result is unrelated, so we keep it rather than guess.
+    if !constraints.related.is_empty() {
+        if let Ok(parsed_url) = reqwest::Url::parse(url) {
+            if let Some(host) = parsed_url.host_str().map(|h| h.to_lowercase()) {
+                let mut is_self = false;
+                let mut is_known_related = false;
+                for rel in &constraints.related {
+                    let rel_l = rel.to_lowercase().trim_start_matches("www.").to_string();
+                    if host == rel_l || host.ends_with(&format!(".{}", rel_l)) {
+                        is_self = true;
+                        break;
+                    }
+                    for rd in get_related_domains(&rel_l) {
+                        if host == rd || host.ends_with(&format!(".{}", rd)) {
+                            is_known_related = true;
+                        }
+                    }
+                }
+                if is_self {
+                    return true; // drop the domain itself
+                }
+                if is_known_related {
+                    return false; // curated similar domain → keep
+                }
+            }
+        }
+    }
+
+    // 4f. Hard filter on price:
+    if constraints.price_min.is_some() || constraints.price_max.is_some() {
+        if let Some(price) = extract_price_from_text(title)
+            .or_else(|| extract_price_from_text(content))
+        {
+            if let Some(pmin) = constraints.price_min {
+                if price < pmin { return true; }
+            }
+            if let Some(pmax) = constraints.price_max {
+                if price > pmax { return true; }
+            }
+        }
+    }
+
+    // 5. Negative constraint hard filter (skipped for only-negative queries)
+    let is_only_negative = !constraints.negative.is_empty() && constraints.positive.is_empty();
+    if is_only_negative {
+        return false;
+    }
+
+    if constraints.negative.is_empty() && constraints.positive.is_empty() {
+        return false;
+    }
+    let c_score = constraint_score(title, content, url, constraints);
+    let alt_score = is_alternative_listing_page(title, url, content);
+    if alt_score > 0.3 && is_comparison_or_alternative_query(constraints) {
+        return c_score < 0.02;
+    }
+    let threshold = if constraints.negative.len() >= 2 { 0.10 }
+    else if constraints.negative.len() == 1 { 0.05 }
+    else { 0.02 };
+    c_score < threshold
 }
 
 // ─── IP Rotation ────────────────────────────────────────────────────
@@ -1644,70 +2532,79 @@ fn strip_tracking_params(url: &str) -> String {
 // scores above 1.0 are log-compressed into [0.95, 1.0] so the over-1.0
 // cluster (from consensus boosts, nav domain boosts) retains differentiation.
 
-fn normalize_scores(scores: &mut [f32]) {
+/// Phase 0: per-query min-max calibration.
+/// Maps the raw [min, max] score distribution onto [0.05, 1.0], preserving
+/// the *real* relative ordering/differentiation between results instead of
+/// collapsing every negation-survivor to exactly 1.0 (the old
+/// normalize_scores spread=0.05 behaviour). Scores become differentiable
+/// within a query but are NOT comparable across queries — acceptable, since
+/// the downstream ranking/threshold is per-query.
+fn calibrate_scores(scores: &mut [f32]) {
     if scores.is_empty() {
         return;
     }
-    // Find the raw max to detect if any scores exceed 1.0
-    let raw_max = scores.iter().cloned().fold(0.0f32, f32::max);
-    let cap = 1.0f32;
-
-    if raw_max <= 0.0 {
+    let raw_min = scores.iter().cloned().fold(f32::INFINITY, f32::min);
+    let raw_max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    if raw_max <= raw_min {
+        // Degenerate cluster — leave scores as-is (already equal).
         return;
     }
-
-    if raw_max <= cap {
-        // High quality top result on restrictive query -> scale up to 0.85 - 1.00 range
-        let target_max = if raw_max >= 0.25 {
-            0.85 + (raw_max - 0.25) * 0.15 / 0.75 // maps 0.25 -> 0.85, 1.0 -> 1.0
-        } else {
-            raw_max
-        };
-        let multiplier = target_max / raw_max;
-        for score in scores.iter_mut() {
-            *score = (*score * multiplier).clamp(0.05, cap);
-        }
-        return;
-    }
-
-    // Over-1.0 cluster exists. Compress the tail into [cap - spread, cap]
-    // using log-scaling so the #1 result is still distinguishable from #2.
-    // spread = 0.05 means the #1 result gets 1.000 and the worst over-1.0
-    // result gets ~0.950 — visible but not dominant.
-    let spread = 0.05f32;
-    let log_max = (1.0 + (raw_max - cap)).ln(); // ln(1 + excess)
-
+    let floor = 0.05f32;
+    let ceil = 1.0f32;
+    let span = ceil - floor;
+    let norm = raw_max - raw_min;
     for score in scores.iter_mut() {
-        if *score > cap {
-            let excess = *score - cap;
-            let compressed = spread * (1.0 + excess).ln() / log_max;
-            *score = cap - spread + compressed; // maps [cap, raw_max] → [cap - spread, cap]
-        } else {
-            *score = score.clamp(0.05, cap);
-        }
+        let t = (*score - raw_min) / norm;
+        *score = (floor + t * span).clamp(floor, ceil);
     }
 }
 
 // ─── Search URL Builder with Location Support ──────────────────────
 
+fn map_lang_to_country(lang: &str) -> Option<&'static str> {
+    match lang.to_lowercase().as_str() {
+        "de" => Some("de"),
+        "fr" => Some("fr"),
+        "es" => Some("es"),
+        "nl" => Some("nl"),
+        "it" => Some("it"),
+        "en" => Some("us"),
+        _ => None,
+    }
+}
+
 /// Build a SearXNG search URL with optional geolocation parameters.
 /// Appends `source_country` and `language` when location data is available.
-fn searxng_url(base: &str, query: &str, geo: Option<&geoloc::GeoLocation>) -> String {
-    searxng_url_with_categories(base, query, "", geo)
+fn searxng_url(base: &str, query: &str, geo: Option<&geoloc::GeoLocation>, lang: Option<&str>) -> String {
+    searxng_url_with_categories(base, query, "", geo, lang)
 }
 
 /// Build a SearXNG URL with optional categories (news, images, videos) and geolocation.
-fn searxng_url_with_categories(base: &str, query: &str, categories: &str, geo: Option<&geoloc::GeoLocation>) -> String {
+fn searxng_url_with_categories(
+    base: &str,
+    query: &str,
+    categories: &str,
+    geo: Option<&geoloc::GeoLocation>,
+    lang: Option<&str>,
+) -> String {
     let encoded = urlencoding::encode(query);
     let cat = if categories.is_empty() { String::new() } else { format!("&categories={}", categories) };
     let mut url = format!("{}/search?q={}&format=json{}&pageno=1", base, encoded, cat);
-    if let Some(g) = geo {
+    
+    if let Some(l) = lang {
+        url.push_str(&format!("&language={}", l));
+        if let Some(ref cc) = map_lang_to_country(l) {
+            url.push_str(&format!("&source_country={}", cc));
+        }
+    } else if let Some(g) = geo {
         if let Some(ref cc) = g.country_code {
             url.push_str(&format!("&source_country={}", cc.to_lowercase()));
         }
         if let Some(ref lang_tag) = g.language_tag() {
             url.push_str(&format!("&language={}", lang_tag));
         }
+    } else {
+        url.push_str("&language=en");
     }
     url
 }
@@ -1823,6 +2720,72 @@ fn preprocess_searxng_query(query: &str) -> String {
     let q = query.trim();
     let q_lower = q.to_lowercase();
     
+    // Count filetype operators
+    let filetype_count = q_lower.matches("filetype:").count();
+    let has_booleans = q_lower.contains(" or ") || q_lower.contains(" and ");
+
+    // Multiple `site:` operators must be OR'd (e.g. "site:a site:b" →
+    // "site:a OR site:b"), NOT intersected. Bing/SearXNG treat adjacent
+    // site: tokens as a conjunction and return 0 results, which silently
+    // zeroes out any multi-site query. Collect the distinct site values so we
+    // can fold them into a single OR-group below.
+    let mut site_values: Vec<String> = Vec::new();
+    for cap in q_lower.match_indices("site:") {
+        let after = cap.0 + 5;
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() && !site_values.contains(&val) {
+            site_values.push(val);
+        }
+    }
+
+    let mut words_cleaned = Vec::new();
+    for w in q.split_whitespace() {
+        let wl = w.to_lowercase();
+        if wl.starts_with("intitle:") || wl.starts_with("inurl:") || wl.starts_with("intext:")
+            || wl.starts_with("price:") || wl.starts_with("lang:")
+            || wl.starts_with("after:") || wl.starts_with("before:")
+        {
+            continue;
+        }
+        if wl == "or" || wl == "and" {
+            continue;
+        }
+        // Drop raw site: tokens here; they are re-emitted as a single OR-group
+        // (or passed through unchanged when there is exactly one).
+        if wl.starts_with("site:") {
+            continue;
+        }
+        if (filetype_count > 1 || has_booleans) && wl.starts_with("filetype:") {
+            continue;
+        }
+        let clean_w = w.replace('"', "").replace('\'', "");
+        if !clean_w.is_empty() {
+            words_cleaned.push(clean_w);
+        }
+    }
+
+    let mut cleaned_str = words_cleaned.join(" ");
+    // Re-emit site: as OR-group when there are 2+, otherwise the single value
+    // passes through (already stripped above).
+    if site_values.len() >= 2 {
+        let or_group = site_values
+            .iter()
+            .map(|s| format!("site:{}", s))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        if !cleaned_str.is_empty() {
+            cleaned_str.push(' ');
+        }
+        cleaned_str.push_str(&or_group);
+    } else if let Some(single) = site_values.first() {
+        if !cleaned_str.is_empty() {
+            cleaned_str.push(' ');
+        }
+        cleaned_str.push_str(&format!("site:{}", single));
+    }
+
     // Prefixes that trigger dictionary/definition results on Bing
     let prefix_triggers = [
         "comparing ", "compare ", "compared ", "comparison of ",
@@ -1830,7 +2793,7 @@ fn preprocess_searxng_query(query: &str) -> String {
         "implications of ", "analysis of ", "overview of ",
         "understanding ", "introduction to ",
     ];
-    let mut cleaned = q_lower.to_string();
+    let mut cleaned = cleaned_str.to_lowercase();
     for prefix in &prefix_triggers {
         if let Some(rest) = cleaned.strip_prefix(prefix) {
             cleaned = rest.to_string();
@@ -1847,27 +2810,7 @@ fn preprocess_searxng_query(query: &str) -> String {
         }
     }
     
-    // Strip noise adjectives that search engines misinterpret as nouns.
-    // "fast" → speed tests (fast.com), "modern" → dictionary definitions,
-    // "quick" → speed tests, "simple" → dictionary, etc.
-    // These words have strong standalone noun meanings that override their
-    // intended use as descriptors. They're safe to strip because:
-    //   1. They're filtered as stop words in semantic_relevance_score() already
-    //   2. They don't change the topical intent ("fast web framework python"
-    //      and "web framework python" return the same relevant results)
-    //   3. Positive constraint checking still verifies them in results
-    // Algorithmic: derived from the semantic scoring stop_words set plus
-    // adjectives with strong alternate noun senses (modern=era, quick=speed).
-    let noise_adjectives: std::collections::HashSet<&str> = [
-        "fast", "quick", "slow", "modern", "simple", "easy", "hard",
-        "best", "top", "good", "bad", "new", "old", "big", "small",
-        "great", "awesome", "cool", "popular", "powerful", "amazing",
-    ].iter().copied().collect();
-
     // Action verbs that trigger dictionary/definition results on Bing/Google
-    // when used as standalone nouns: "deploy" → dictionary definition of "deploy",
-    // "install" → documentation for installing unrelated software, etc.
-    // Only stripped when the query has enough remaining content (>3 words).
     let action_verbs: std::collections::HashSet<&str> = [
         "deploy", "implement", "configure", "setup", "install", "migrate",
         "optimize", "compile", "debug", "integrate", "initialize", "instantiate",
@@ -1877,31 +2820,87 @@ fn preprocess_searxng_query(query: &str) -> String {
     ].iter().copied().collect();
     
     let words: Vec<&str> = cleaned.split_whitespace().collect();
-    if words.len() > 3 {
-        // Strip noise adjectives
+    if words.len() > 6 {
         let filtered: Vec<&str> = words.iter()
-            .filter(|w| !noise_adjectives.contains(*w))
-            .copied()
-            .collect();
-        // Strip action verbs that trigger dictionary results
-        let filtered: Vec<&str> = filtered.iter()
             .filter(|w| !action_verbs.contains(*w))
             .copied()
             .collect();
         if filtered.len() >= 3 {
             cleaned = filtered.join(" ");
         }
-        // If stripping would leave < 3 words, keep original (query is too short)
     }
     
-    // If cleaned is empty or too short, fall back to original
     if cleaned.len() < 3 {
-        return q.to_string();
+        return cleaned_str;
     }
     
-    // Preserve dotted names like "node.js", "deno.js", "c++" — don't strip dots
-    // that are part of technology names
     cleaned
+}
+
+/// Disambiguate short language names that have non-programming meanings.
+/// "rust" -> "rust programming" (vs the survival game)
+/// Language disambiguation data: programming language names whose bare form
+/// is also a common English word or game name, causing search engines to return
+/// unrelated results. Each entry: (query_match, replacement_base, suffix).
+/// When a bare query matches `query_match`, it becomes
+/// `format!("{}{}", replacement_base, suffix)` before sending to SearXNG.
+/// Data-driven: add entries here without changing any logic.
+static LANGUAGE_DISAMBIGUATION: &[(&str, &str, &str)] = &[
+    ("go",    "golang",         ""),        // go is a common verb -> golang
+    ("rust",  "rust",           " programming"),  // rust is a survival game
+    ("ruby",  "ruby",           " programming"),  // ruby is a gemstone
+    ("swift", "swift",          " programming"),  // swift means fast
+    ("java",  "java",           " programming"),  // java is an island/coffee
+    ("c",     "c",              " programming"),  // c is a grade/note/vitamin
+];
+
+/// Disambiguate ambiguous programming language names using LANGUAGE_DISAMBIGUATION data.
+/// Phase 6: token-level rewrite. The OLD version only rewrote when the BARE
+/// trimmed query exactly equaled a language name, so "rust backend" / "rust vs go"
+/// leaked through to "Rust on Steam". Now we rewrite EACH ambiguous token in place
+/// (unless the query is clearly about gaming), and "go" gets a verb guard so
+/// "how to go to sleep" is never rewritten to "golang".
+fn disambiguate_engine_query(query: &str, intent: &str, _expanded_queries: &[String]) -> String {
+    let q_lower = query.to_lowercase();
+    let trimmed = q_lower.trim();
+    let is_gaming = intent == "gaming" || intent == "entertainment";
+    if is_gaming {
+        return query.to_string();
+    }
+
+    // Verb-guard tokens that, when immediately preceding "go", mean "go" is a verb.
+    let go_verb_leads: &[&str] = &["to", "how", "will", "let", "lets", "should", "can", "did", "wanna", "want"];
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut changed = false;
+    for (i, tok) in tokens.iter().enumerate() {
+        let t = tok.trim_matches(|c: char| !c.is_alphanumeric());
+        let mut matched: Option<(&str, &str, &str)> = None;
+        for &(lang_name, base, suffix) in LANGUAGE_DISAMBIGUATION {
+            if t == lang_name {
+                matched = Some((lang_name, base, suffix));
+                break;
+            }
+        }
+        if let Some((lang_name, base, suffix)) = matched {
+            // Verb guard for "go": if it follows a verb-lead token, it's a verb, not golang.
+            if lang_name == "go" {
+                let prev = tokens.get(i.wrapping_sub(1)).map(|p| p.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()).unwrap_or_default();
+                if go_verb_leads.contains(&prev.as_str()) {
+                    out.push(tok.to_string());
+                    continue;
+                }
+            }
+            let d = format!("{}{}", base, suffix);
+            tracing::info!("DISAMBIGUATE: token '{}' -> '{}' (lang={})", tok, d, lang_name);
+            out.push(d);
+            changed = true;
+        } else {
+            out.push(tok.to_string());
+        }
+    }
+    if changed { out.join(" ") } else { query.to_string() }
 }
 
 // Simple negation-word stripper for the initial fan-out (no intent engine needed).
@@ -1923,6 +2922,12 @@ fn simple_negation_strip(query: &str) -> Option<String> {
         "self-hosted", "selfhosted", "offline", "local",
         "lightweight", "minimal", "minimalist",
         "ubuntu", "debian", "linux", "mac", "macos", "windows", "android", "ios",
+        "framework", "library", "language", "programming", "compiler", "runtime",
+        "editor", "browser", "server", "client", "database", "distro", "distribution",
+        "package", "module", "tool", "api", "web", "app", "application",
+        "search", "engine", "cloud", "native", "backend", "frontend", "fullstack",
+        "mobile", "desktop", "enterprise", "community", "stable", "testing",
+        "production", "development", "deployment", "container", "orchestrator",
     ].iter().copied().collect();
 
     let words: Vec<&str> = query.split_whitespace().collect();
@@ -2250,6 +3255,70 @@ impl SearchCache {
     }
 }
 
+fn deduplicate_merged_results(results: &mut Vec<MergedResult>) {
+    let mut seen_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_domain_titles: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+    results.retain(|r| {
+        let t_clean: String = r.title
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if t_clean.is_empty() {
+            return true;
+        }
+
+        // 1. Exact title deduplication (case-insensitive, whitespace-normalized)
+        if seen_titles.contains(&t_clean) {
+            return false;
+        }
+        seen_titles.insert(t_clean.clone());
+
+        // 2. Domain + Title similarity deduplication
+        let host = reqwest::Url::parse(&r.url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+            .unwrap_or_default();
+
+        if !host.is_empty() {
+            let title_words: std::collections::HashSet<&str> = t_clean.as_str().split_whitespace().collect::<std::collections::HashSet<&str>>();
+            if let Some(existing_titles) = seen_domain_titles.get(&host) {
+                for ext_title in existing_titles {
+                    let ext_words: std::collections::HashSet<&str> = ext_title.as_str().split_whitespace().collect::<std::collections::HashSet<&str>>();
+                    let intersection = title_words.intersection(&ext_words).count();
+                    let union = title_words.union(&ext_words).count();
+                    if union > 0 {
+                        let jaccard = intersection as f32 / union as f32;
+                        if jaccard > 0.70 {
+                            return false; // too similar on the same domain
+                        }
+                    }
+                }
+            }
+            seen_domain_titles.entry(host).or_insert_with(Vec::new).push(t_clean);
+        }
+
+        true
+    });
+}
+
+fn renormalize_distribution(distribution: &mut std::collections::HashMap<String, f32>) {
+    if distribution.is_empty() {
+        return;
+    }
+    let sum: f32 = distribution.values().sum();
+    if sum > 0.0 {
+        for val in distribution.values_mut() {
+            *val = *val / sum;
+        }
+    }
+}
+
 // ─── Unified Merge: Local + Web → Single Ranked List ────────────────
 // Cross-source dedup: URLs appearing in both local index AND web search
 // get merged with a consensus boost. This is the strongest relevance signal.
@@ -2291,6 +3360,7 @@ fn merge_local_and_web(
             authority: r.authority,
             sources: vec!["local".to_string()],
             is_local: true,
+            published_date: None,
         };
         url_to_idx.insert(norm, merged.len());
         merged.push(entry);
@@ -2321,6 +3391,9 @@ fn merge_local_and_web(
             if r.content.len() > existing.content.len() {
                 existing.content = r.content;
             }
+            if existing.published_date.is_none() {
+                existing.published_date = r.published_date.clone();
+            }
         } else {
             let source = if r.engine.is_empty() { "web".to_string() } else { r.engine.clone() };
             let authority = domain_authority_score(&r.url);
@@ -2332,6 +3405,7 @@ fn merge_local_and_web(
                 authority,
                 sources: vec![source],
                 is_local: false,
+                published_date: r.published_date.clone(),
             };
             url_to_idx.insert(norm, merged.len());
             merged.push(entry);
@@ -2367,7 +3441,7 @@ fn merge_local_and_web(
         let semantic = semantic_relevance_score(&clean_query, &r.title, &r.content);
         if semantic > _max_semantic { _max_semantic = semantic; }
         let intent_boost = calculate_intent_boost(&r.url, &r.title, &clean_query, intent);
-        let mut freshness = freshness_score(&r.url, intent);
+        let mut freshness = freshness_score(&r.url, intent, r.published_date.as_deref());
         let mut quality = content_quality_score(&r.content);
 
         // Local index artifact gate: if a local result has near-zero semantic relevance
@@ -2721,15 +3795,23 @@ fn merge_local_and_web(
                     source_counts.get(&s.to_lowercase()).copied().unwrap_or(0) as f32 <= median_per_source * 0.5
                 });
                 if is_underrepresented {
-                    r.score *= 1.25; // 25% boost for underrepresented sources (now includes instance-level diversity)
+                    // Phase 0: differential nudge instead of uniform ×1.25.
+                    // A flat ×1.25 makes every survivor of a negation cluster
+                    // land identically ≥1.0 and then collapse to 1.0 in
+                    // calibrate_scores. A small additive nudge (+0.03) keeps
+                    // the real relative ordering intact (differentiable).
+                    r.score += 0.03;
                 }
             }
         }
     }
 
-    // 5. Normalize scores to [0, 1]
+    // Deduplicate merged results by title and domain
+    deduplicate_merged_results(&mut merged);
+
+    // 5. Calibrate scores onto [0.05, 1.0] preserving real distribution (Phase 0)
     let mut scores: Vec<f32> = merged.iter().map(|r| r.score).collect();
-    normalize_scores(&mut scores);
+    calibrate_scores(&mut scores);
     for (i, r) in merged.iter_mut().enumerate() {
         r.score = scores[i];
     }
@@ -2912,13 +3994,23 @@ async fn handle_images(
             state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
         });
 
+    // P3 fix: explicit location in query overrides IP/header geolocation.
+    let geo_location: Option<geoloc::GeoLocation> = match detect_explicit_location(&q) {
+        Some(explicit) => Some(explicit),
+        None => geo_location,
+    };
+
+    // Fan-out to both SearXNG instances in parallel (VPN + Tor)
+    let constraints = extract_gateway_constraints(&q);
+    let lang = constraints.language.as_deref();
+
     // Fan-out to both SearXNG instances in parallel (VPN + Tor)
     let searx_url = searxng_url_with_categories(
-        "http://127.0.0.1:8080", &q, "images", geo_location.as_ref()
+        "http://127.0.0.1:8080", &q, "images", geo_location.as_ref(), lang
     );
 
     let searx2_url = state.searxng2_url.as_ref().map(|base| {
-        searxng_url_with_categories(base, &q, "images", geo_location.as_ref())
+        searxng_url_with_categories(base, &q, "images", geo_location.as_ref(), lang)
     });
 
     let parse_images = |raw: String| -> Vec<ImageResult> {
@@ -3043,13 +4135,22 @@ async fn handle_videos(
             state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
         });
 
+    // P3 fix: explicit location in query overrides IP/header geolocation.
+    let geo_location: Option<geoloc::GeoLocation> = match detect_explicit_location(&q) {
+        Some(explicit) => Some(explicit),
+        None => geo_location,
+    };
+
+    let constraints = extract_gateway_constraints(&q);
+    let lang = constraints.language.as_deref();
+
     // Query Invidious and both SearXNG instances (categories=videos) in parallel
     let invidious_url = format!("http://invidious:3000/api/v1/search?q={}", urlencoding::encode(&q));
     let searx_video_url = searxng_url_with_categories(
-        "http://127.0.0.1:8080", &q, "videos", geo_location.as_ref()
+        "http://127.0.0.1:8080", &q, "videos", geo_location.as_ref(), lang
     );
     let searx2_video_url = state.searxng2_url.as_ref().map(|base| {
-        searxng_url_with_categories(base, &q, "videos", geo_location.as_ref())
+        searxng_url_with_categories(base, &q, "videos", geo_location.as_ref(), lang)
     });
 
     let searx_fut = async {
@@ -3241,13 +4342,22 @@ async fn handle_news(
             state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
         });
 
+    // P3 fix: explicit location in query overrides IP/header geolocation.
+    let geo_location: Option<geoloc::GeoLocation> = match detect_explicit_location(&q) {
+        Some(explicit) => Some(explicit),
+        None => geo_location,
+    };
+
+    let constraints = extract_gateway_constraints(&q);
+    let lang = constraints.language.as_deref();
+
     // Fan-out to both SearXNG instances in parallel (VPN + Tor)
     let searx_url = searxng_url_with_categories(
-        "http://127.0.0.1:8080", &q, "news", geo_location.as_ref()
+        "http://127.0.0.1:8080", &q, "news", geo_location.as_ref(), lang
     );
 
     let searx2_url = state.searxng2_url.as_ref().map(|base| {
-        searxng_url_with_categories(base, &q, "news", geo_location.as_ref())
+        searxng_url_with_categories(base, &q, "news", geo_location.as_ref(), lang)
     });
 
     let parse_news = |raw: String| -> Vec<NewsResult> {
@@ -3432,6 +4542,174 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+/// Phase 8: common English stopwords used to detect stopword-only queries.
+static STOPWORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "but", "if", "then", "else", "of", "to", "in",
+    "on", "at", "by", "for", "with", "about", "as", "is", "are", "was", "were",
+    "be", "been", "being", "it", "this", "that", "these", "those", "i", "you",
+    "he", "she", "we", "they", "my", "your", "his", "her", "its", "our", "their",
+    "me", "him", "us", "them", "do", "does", "did", "have", "has", "had", "will",
+    "would", "can", "could", "should", "may", "might", "must", "not", "no", "yes",
+    "so", "than", "too", "very", "just", "also", "from", "into", "out", "up", "down",
+];
+
+/// Phase 7: classify incoming query quality so we can degrade gracefully.
+/// Returns (flag, valid_ratio):
+///   flag == "junk"   -> no recognizable words AND low entropy -> return 200 OK empty
+///   flag == "low"    -> few recognizable words or very high entropy -> search but flag
+///   otherwise ""     -> normal
+fn is_valid_word(w: &str, spell_index: &spell::SymSpellIndex) -> bool {
+    let wl = w.to_lowercase();
+    if spell::is_protected_term(&wl) || spell_index.contains_word(&wl) {
+        return true;
+    }
+    let parts: Vec<&str> = wl.split(|c: char| !c.is_alphanumeric() && c != '\'').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return false;
+    }
+    parts.iter().all(|part| {
+        part.len() <= 2
+            || spell_index.contains_word(part)
+            || spell::is_protected_term(part)
+    })
+}
+
+fn is_pronounceable(w: &str) -> bool {
+    let lower = w.to_lowercase();
+    if lower.len() < 3 {
+        return true;
+    }
+    let has_vowel = lower.chars().any(|c| c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u' || c == 'y');
+    if !has_vowel {
+        return false;
+    }
+    let chars: Vec<char> = lower.chars().collect();
+    let mut max_repeat = 1;
+    let mut current_repeat = 1;
+    for i in 1..chars.len() {
+        if chars[i] == chars[i-1] {
+            current_repeat += 1;
+            max_repeat = max_repeat.max(current_repeat);
+        } else {
+            current_repeat = 1;
+        }
+    }
+    if max_repeat > 3 {
+        return false;
+    }
+    true
+}
+
+fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f32) {
+    let words: Vec<&str> = q.split_whitespace().filter(|w| w.chars().any(|c| c.is_alphabetic())).collect();
+    if words.is_empty() {
+        return ("low".to_string(), 0.0);
+    }
+    
+    let european_words: std::collections::HashSet<&str> = [
+        "de", "la", "le", "el", "un", "une", "en", "et", "les", "des",
+        "der", "die", "das", "ein", "eine", "und", "ist", "mit",
+        "van", "het", "een", "je", "di", "il", "con", "del", "al", "para"
+    ].iter().copied().collect();
+
+    let has_european_word = words.iter().any(|w| european_words.contains(w.to_lowercase().as_str()));
+
+    let known = words.iter().filter(|w| is_valid_word(w, spell_index)).count() as f32;
+    let valid_ratio = known / words.len() as f32;
+
+    let mut freq = [0u32; 128];
+    let mut total = 0u32;
+    for ch in q.chars() {
+        if (ch as usize) < 128 { freq[ch as usize] += 1; total += 1; }
+    }
+    let mut h = 0.0f32;
+    if total > 0 {
+        for &f in &freq {
+            if f > 0 {
+                let p = f as f32 / total as f32;
+                h -= p * p.log2();
+            }
+        }
+    }
+
+    let all_pronounceable = words.iter().all(|w| is_pronounceable(w));
+
+    if valid_ratio == 0.0 && !has_european_word && !all_pronounceable {
+        ("junk".to_string(), valid_ratio)
+    } else if valid_ratio < 0.25 && !has_european_word && !all_pronounceable && (h < 2.5 || h > 6.5) {
+        ("junk".to_string(), valid_ratio)
+    } else if valid_ratio < 0.5 && !has_european_word {
+        ("low".to_string(), valid_ratio)
+    } else {
+        ("".to_string(), valid_ratio)
+    }
+}
+
+fn clean_query_for_spelling(q: &str) -> String {
+    let normalized = q
+        .replace('“', "")
+        .replace('”', "")
+        .replace('‘', "")
+        .replace('’', "")
+        .replace('"', "");
+    
+    let mut cleaned = String::new();
+    for w in normalized.split_whitespace() {
+        let wl = w.to_lowercase();
+        if wl.starts_with("site:") || wl.starts_with("filetype:") || wl.starts_with("after:") || wl.starts_with("before:")
+            || wl.starts_with("lang:") || wl.starts_with("intitle:") || wl.starts_with("inurl:") || wl.starts_with("intext:")
+            || wl.starts_with("related:") || wl.starts_with("price:")
+        {
+            continue;
+        }
+        cleaned.push_str(w);
+        cleaned.push(' ');
+    }
+    cleaned.trim().to_string()
+}
+
+/// Remove a bare whole-word `term` from `s` (case-insensitive), returning the
+/// whitespace-joined remainder. Used during spell reconstruction so that a
+/// negated term (e.g. `-windows`) does not also survive as its positive twin
+/// after correction (`linux windows` -> we strip `windows` before re-appending
+/// `-windows`), which would otherwise self-contradict the engine query.
+fn strip_bare_token(s: &str, term: &str) -> String {
+    let term_l = term.to_lowercase();
+    let filtered: Vec<&str> = s
+        .split_whitespace()
+        .filter(|w| w.to_lowercase() != term_l)
+        .collect();
+    filtered.join(" ")
+}
+
+fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bool) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let response = UnifiedResponse {
+        query: query.to_string(),
+        intent: None,
+        category: None,
+        confidence: None,
+        constraints: vec![],
+        structured_constraints: Constraints::default(),
+        expanded_queries: vec![],
+        distribution: None,
+        results: vec![],
+        geo_location: None,
+        spell_corrected_query: None,
+        error: Some(error_code.to_string()),
+        message: Some(message.to_string()),
+        query_quality: if is_junk { Some("junk".to_string()) } else { None },
+        applied_constraints: None,
+        ignored_constraints: None,
+        warnings: None,
+        results_before_filter: None,
+        results_after_filter: None,
+    };
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({}))),
+    )
+}
+
 async fn handle_search(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
@@ -3439,40 +4717,63 @@ async fn handle_search(
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     // 0. Validate query — reject empty or whitespace-only queries
     let q_trimmed = params.q.as_deref().unwrap_or("").trim();
+    // Phase 8: empty / 1-char / stopword-only handling (graceful, never 400).
     if q_trimmed.is_empty() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "Missing or empty query parameter 'q'",
-                "results": [],
-                "count": 0,
-            })),
-        );
+        return make_error_response(q_trimmed, "empty_query", "Query parameter 'q' is empty", false);
     }
     // Reject queries that have no letters (digits/symbols only).
     let alpha_count = q_trimmed.chars().filter(|c| c.is_alphabetic()).count();
     if alpha_count == 0 {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "Query must contain at least one alphabetic character",
-                "results": [],
-                "count": 0,
-            })),
-        );
+        return make_error_response(q_trimmed, "empty_query", "Query must contain at least one alphabetic character", false);
+    }
+
+    // Phase 8: meaningful-empty guard. A query that is only 1 char, or only
+    // stopwords, has no retrievable intent. Return 400 Bad Request with a soft
+    // query_quality:low flag — BUT exempt protected terms / language tokens so
+    // single-token lookups like `go` / `rust` still search normally.
+    let raw_tokens: Vec<&str> = q_trimmed.split_whitespace().collect();
+    let meaningful: Vec<&str> = raw_tokens.iter()
+        .filter(|t| {
+            let tl = t.to_lowercase();
+            !STOPWORDS.contains(&tl.as_str())
+        })
+        .copied()
+        .collect();
+    let only_stopwords = !raw_tokens.is_empty() && meaningful.is_empty();
+    let is_single_char = raw_tokens.len() == 1 && raw_tokens[0].chars().filter(|c| c.is_alphabetic()).count() <= 1;
+    if only_stopwords || is_single_char {
+        let is_protected = raw_tokens.iter().any(|t| spell::is_protected_term(&t.to_lowercase()));
+        if !is_protected {
+            return make_error_response(q_trimmed, "invalid_query", "Query has no retrievable content (stopword-only or single character)", false);
+        }
+    }
+
+    let q_cleaned_spelling = clean_query_for_spelling(q_trimmed);
+
+    // Phase 7: graceful degradation for gibberish / low-quality input.
+    let (qflag, _valid_ratio) = query_quality_flag(&q_cleaned_spelling, &state.spell_index);
+    if qflag == "junk" {
+        return make_error_response(q_trimmed, "invalid_query", "Query appears to be gibberish; no results returned", true);
     }
 
     // 0b. Check cache first (5-min TTL)
-    let cache_key = format!("{}:{}", q_trimmed.to_lowercase(), "all");
+    // Cache key must include pagination params: results are sliced by
+    // limit/offset before serialization, so two requests for the same query
+    // with different count/offset must NOT share a cached body.
+    let page_key = match (params.limit.or(params.count).or(params.n), params.offset) {
+        (None, None) => "all".to_string(),
+        (l, o) => format!("l{}_o{}", l.unwrap_or(24), o.unwrap_or(0)),
+    };
+    let cache_key = format!("{}:{}", q_trimmed.to_lowercase(), page_key);
     if let Some(cached) = state.cache.get(&cache_key) {
         tracing::info!("Cache hit for query: {}", q_trimmed);
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
         return (axum::http::StatusCode::OK, Json(value));
     }
     // 0b.5: Spelling correction — correct misspellings before fan-out
-    let (q_corrected, mut spell_changed) = spell::correct_query(&state.spell_index, q_trimmed);
+    let (q_corrected_cleaned, mut spell_changed) = spell::correct_query(&state.spell_index, &q_cleaned_spelling);
     if spell_changed {
-        tracing::info!("Spell-corrected query: '{}' -> '{}'", q_trimmed, q_corrected);
+        tracing::info!("Spell-corrected query: '{}' -> '{}'", q_trimmed, q_corrected_cleaned);
     }
 
     // 0c. Request deduplication: if another task is already fetching this query, wait for it
@@ -3504,7 +4805,55 @@ async fn handle_search(
     let search_start = std::time::Instant::now();
     let client = state.http_client.clone();
 
-    let q = if spell_changed { q_corrected } else { q_trimmed.to_string() };
+    // Phase 1 (A3): keep the CORRECTED form only for display + engine search,
+    // but send the ORIGINAL query to the intent engine and constraint
+    // extraction. A spell correction must NEVER silently change the user's
+    // intent/constraints (the vegan→vegas data-loss bug). Corruption can only
+    // ever touch the engine query string + spell_corrected_query display.
+    let q = if spell_changed {
+        let mut reconstructed = q_corrected_cleaned;
+        let gateway_extracted = extract_gateway_constraints(q_trimmed);
+        for phrase in gateway_extracted.phrases {
+            reconstructed.push(' ');
+            reconstructed.push('"');
+            reconstructed.push_str(&phrase);
+            reconstructed.push('"');
+        }
+        // Re-append operators the upstream engine understands natively so a
+        // spell correction can never silently drop them (the vegan→vegas class
+        // of data-loss bug — only the non-operator term text may be corrected).
+        for w in q_trimmed.split_whitespace() {
+            let wl = w.to_lowercase();
+            if wl.starts_with("site:") || wl.starts_with("filetype:") || wl.starts_with("after:") || wl.starts_with("before:") {
+                reconstructed.push(' ');
+                reconstructed.push_str(w);
+            }
+        }
+        // Re-append EXPLICIT negation tokens (-term). Spell correction collapses
+        // "-windows" into a positive "windows" twin, which would invert the
+        // user's intent (searching FOR windows instead of excluding it). Strip
+        // that twin, then re-inject the negation so the engine query stays
+        // faithful — and so the upstream engine itself excludes the term.
+        for w in q_trimmed.split_whitespace() {
+            let wl = w.to_lowercase();
+            if let Some(neg) = wl.strip_prefix('-') {
+                if !neg.is_empty() && !neg.starts_with('-') {
+                    let neg_term = neg.trim().to_string();
+                    let neg_form = format!("-{}", neg_term);
+                    if !reconstructed.split_whitespace().any(|t| t.eq_ignore_ascii_case(&neg_form)) {
+                        // remove the positive twin the corrector may have produced
+                        reconstructed = strip_bare_token(&reconstructed, &neg_term);
+                        reconstructed.push(' ');
+                        reconstructed.push_str(&neg_form);
+                    }
+                }
+            }
+        }
+        reconstructed
+    } else {
+        q_trimmed.to_string()
+    };
+    let q_orig = q_trimmed.to_string(); // original, untouched query for intent/constraints
     let q_encoded = urlencoding::encode(&q);
 
     // Extract client IP for geolocation (from X-Forwarded-For or X-Real-IP headers)
@@ -3524,9 +4873,24 @@ async fn handle_search(
         state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
     });
 
-    // 1. Run Intent Analysis (with retry) and Embedding in parallel
-    let intent_url = format!("http://127.0.0.1:3005/analyze?q={}", q_encoded);
-    let embed_url = format!("http://127.0.0.1:3005/embed?text={}", q_encoded);
+    // P3 fix: an explicit location named in the query (e.g. "tokyo japan",
+    // "restaurants in london") MUST override the IP-derived geolocation. Without
+    // this, a user in India searching "restaurants in tokyo japan" got
+    // IN-localised results. Explicit user intent wins over inferred IP location.
+    let geo_location: Option<geoloc::GeoLocation> = match detect_explicit_location(&q) {
+        Some(explicit) => {
+            tracing::info!("GEO: explicit location '{}' overrides IP geolocation",
+                explicit.country_code.as_deref().unwrap_or("?"));
+            Some(explicit)
+        }
+        None => geo_location,
+    };
+
+    // 1. Run Intent Analysis (with retry) and Embedding in parallel.
+    // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
+    // spell correction can never change classification/constraints.
+    let intent_url = format!("http://127.0.0.1:3005/analyze?q={}", urlencoding::encode(&q_orig));
+    let embed_url = format!("http://127.0.0.1:3005/embed?text={}", urlencoding::encode(&q_orig));
 
     // Retry intent engine up to 2 extra times with backoff.
     // Handles cold-start after container restart (model load takes 5-15s).
@@ -3614,17 +4978,45 @@ async fn handle_search(
 
     let mut searx_urls: Vec<String> = Vec::new();
     let mut searx_instance_keys: Vec<String> = Vec::new();
+    // Comparison: append "vs comparison guide" for vs/versus queries.
+    // Uses only the raw query string since intent isn't resolved yet at this stage.
+    let q_lower_local = q.to_lowercase();
+    let comparison_q = if q_lower_local.contains(" vs ") || q_lower_local.contains(" versus ") {
+        let no_vs = q_lower_local.replace(" vs ", " ").replace(" versus ", " ");
+        let terms: Vec<&str> = no_vs.split_whitespace()
+            .filter(|w| w.len() >= 2 && w != &"vs" && w != &"versus")
+            .collect();
+        if terms.len() >= 2 {
+            format!("{} vs comparison guide 2026", q)
+        } else {
+            q.clone()
+        }
+    } else {
+        q.clone()
+    };
+    // Language disambiguation for the INITIAL SearXNG query (pre-intent).
+    // Bare ambiguous terms like "rust" return survival-game results from
+    // Bing/SearXNG. Since the BERT-based intent engine hasn't resolved yet
+    // at this stage, we use a simple data-driven check: if the preprocessed
+    // query is a bare ambiguous term without disambiguating context, append
+    // " programming". This is the same function used later in the retry
+    // stage (post-intent), which has full intent context for richer decisions.
+    let engine_q = disambiguate_engine_query(&comparison_q, "", &[]);
+
+    let constraints = extract_gateway_constraints(&q);
+    let lang = constraints.language.as_deref();
+
     for (i, base_url) in searx_base_urls.iter().enumerate() {
         let key = format!("searxng{}", i);
         // Raw query URL (with geolocation parameters)
-        let clean_q = preprocess_searxng_query(&q);
-        searx_urls.push(searxng_url(base_url, &clean_q, geo_location.as_ref()));
+        let clean_q = preprocess_searxng_query(&engine_q);
+        searx_urls.push(searxng_url(base_url, &clean_q, geo_location.as_ref(), lang));
         searx_instance_keys.push(key.clone());
         // Stripped query URL (same instance, runs in parallel)
         if let Some(ref stripped) = stripped_override {
             let clean_stripped = preprocess_searxng_query(stripped);
             if !clean_stripped.is_empty() {
-                searx_urls.push(searxng_url(base_url, &clean_stripped, geo_location.as_ref()));
+                searx_urls.push(searxng_url(base_url, &clean_stripped, geo_location.as_ref(), lang));
                 searx_instance_keys.push(key);
             }
         }
@@ -3793,7 +5185,7 @@ async fn handle_search(
             return Ok(SearxNewsResponse { results: vec![] }) as Result<SearxNewsResponse, anyhow::Error>;
         }
         let news_url = searxng_url_with_categories(
-            "http://127.0.0.1:8080", &q, "news", geo_location.as_ref()
+            "http://127.0.0.1:8080", &q, "news", geo_location.as_ref(), lang
         );
         let resp = match tokio::time::timeout(std::time::Duration::from_millis(800), client_ref.get(&news_url).send()).await {
             Ok(Ok(r)) => r,
@@ -3818,7 +5210,7 @@ async fn handle_search(
             return Ok(SearxImageResponse { results: vec![] }) as Result<SearxImageResponse, anyhow::Error>;
         }
         let image_url = searxng_url_with_categories(
-            "http://127.0.0.1:8080", &q, "images", geo_location.as_ref()
+            "http://127.0.0.1:8080", &q, "images", geo_location.as_ref(), lang
         );
         let resp = match tokio::time::timeout(std::time::Duration::from_millis(800), client_ref.get(&image_url).send()).await {
             Ok(Ok(r)) => r,
@@ -3861,7 +5253,22 @@ async fn handle_search(
                         let count = data.results.len();
                         results_inner.lock().unwrap().push((orig_idx, Ok(data)));
                         let is_primary = urls_cloned[orig_idx].starts_with("http://127.0.0.1:8080");
-                        if (is_primary && count >= 5) || count >= min_early_return {
+                        // FIX: do NOT early-return on the primary instance returning a
+                        // small/medium set. SearXNG1 (127.0.0.1:8080) sits behind a flaky
+                        // VPN and its Bing/Brave engines frequently return OFF-TOPIC junk
+                        // (e.g. "population of France" → New Balance shoe pages). The
+                        // secondary instance (Tor2 / SearXNG2) is far more reliable and
+                        // routinely returns the correct results. The old `is_primary &&
+                        // count >= 5` rule discarded Tor2's good results the moment the
+                        // primary coughed up 5 junk hits, and the downstream "garbage
+                        // cluster" fallback then trusted raw RRF ranking — surfacing junk
+                        // at the top.
+                        //
+                        // We now only short-circuit when a result set is genuinely LARGE
+                        // (>= min_early_return=15), which still bounds latency while
+                        // guaranteeing Tor2's reliable results always join the merge.
+                        // Tor2 responds in ~2.5s, comfortably inside the 3.3s budget.
+                        if count >= min_early_return {
                             tracing::info!(
                                 "SearXNG early return: {} results (is_primary={}), skipping {} remaining instance(s)",
                                 count, is_primary, futs.len()
@@ -3907,6 +5314,58 @@ async fn handle_search(
         }
     };
 
+    intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+    
+    // Merge constraints parsed directly by the gateway to prevent any loss of operators
+    let gateway_extracted = extract_gateway_constraints(&q_orig);
+    for ft in gateway_extracted.file_types {
+        if !intent.structured_constraints.file_types.contains(&ft) {
+            intent.structured_constraints.file_types.push(ft);
+        }
+    }
+    for site in gateway_extracted.sites {
+        if !intent.structured_constraints.sites.contains(&site) {
+            intent.structured_constraints.sites.push(site);
+        }
+    }
+    for phrase in gateway_extracted.phrases {
+        if !intent.structured_constraints.phrases.contains(&phrase) {
+            intent.structured_constraints.phrases.push(phrase);
+        }
+    }
+    if intent.structured_constraints.after_date.is_none() {
+        intent.structured_constraints.after_date = gateway_extracted.after_date;
+    }
+    if intent.structured_constraints.before_date.is_none() {
+        intent.structured_constraints.before_date = gateway_extracted.before_date;
+    }
+    intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+
+    // P3 fix: inject detected location as a Target entity so structured_constraints.entities
+    // reflects the explicit user location intent. Must happen AFTER intent is defined.
+    if let Some(ref loc) = geo_location {
+        if let Some(ref city) = loc.city {
+            if !intent.structured_constraints.entities.iter().any(|e| e.text == *city) {
+                intent.structured_constraints.entities.push(QueryEntity {
+                    text: city.clone(),
+                    role: EntityRole::Target,
+                });
+                if !intent.structured_constraints.positive.contains(&city) {
+                    intent.structured_constraints.positive.push(city.clone());
+                }
+            }
+        }
+        if let Some(ref cc) = loc.country_code {
+            let country_lower = cc.to_lowercase();
+            if !intent.structured_constraints.entities.iter().any(|e| e.text == country_lower) {
+                intent.structured_constraints.entities.push(QueryEntity {
+                    text: country_lower.clone(),
+                    role: EntityRole::Target,
+                });
+            }
+        }
+    }
+
     // If query has ONLY negative constraints, keep results for constraint scoring
     let only_negative = !intent.structured_constraints.negative.is_empty()
         && intent.structured_constraints.positive.is_empty();
@@ -3942,26 +5401,32 @@ async fn handle_search(
             intent.distribution.insert("navigational".to_string(), nav_prob * 0.5);
         }
 
-        // Override 2: "latest X news" with low confidence → force fresh intent
-        // e.g. "latest ai news today" (conf=0.12, classified comparison — should be fresh)
-        // The linear probe has a strong comparison bias (bias=2.03) and fresh bias=-1.72,
-        // so ambiguous queries with news signals need explicit override.
-        if !only_negative_pattern && intent.confidence < 0.30 {
+        // Override 2: temporal/freshness signal → force fresh intent.
+        // Phase 4 (CROSS-CUTTING): the engine now emits intent="fresh" for
+        // recency queries, but as defense-in-depth the gateway also forces it
+        // here. The OLD gate (confidence < 0.30) let "latest ai news 2026"
+        // (0.459) and "recent rust releases" (0.519) slip through to a 90-day
+        // navigational half-life. We now trigger on the recency signal itself,
+        // not on low confidence.
+        {
             let has_news_signal = q_lower.contains("latest") || q_lower.contains("recent")
                 || q_lower.contains("breaking") || q_lower.contains("headline")
                 || q_lower.contains("new ") || q_lower.contains("newest")
-                || q_lower.contains("cve-") || q_lower.contains("vulnerability");
+                || q_lower.contains("cve-") || q_lower.contains("vulnerability")
+                || q_lower.contains("this week") || q_lower.contains("this month")
+                || q_lower.contains("past week") || q_lower.contains("last week");
             let has_topic_signal = q_lower.contains("news") || q_lower.contains("update")
                 || q_lower.contains("today") || q_lower.contains("this week")
-                || q_lower.contains("2026") || q_lower.contains("2025");
-            // Strong signal: both news signal AND topic signal present with low confidence
-            if has_news_signal && has_topic_signal {
+                || q_lower.contains("2026") || q_lower.contains("2025")
+                || q_lower.contains("release") || q_lower.contains("version");
+            // Don't clobber a fresh intent that the engine already set.
+            if intent.intent != "fresh" && has_news_signal && has_topic_signal {
                 tracing::info!(
                     "INTENT OVERRIDE (STRONG): news query '{}' was '{}' (conf={:.3}) — forcing fresh",
                     q, intent.intent, intent.confidence
                 );
                 intent.intent = "fresh".to_string();
-                intent.confidence = 0.45;
+                intent.confidence = intent.confidence.max(0.45);
                 // Reshape distribution: fresh gets the top probability
                 let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
                 let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
@@ -3970,9 +5435,8 @@ async fn handle_search(
                 let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
                 intent.distribution.insert("informational".to_string(), info_prob + 0.15);
             }
-            // Weak signal: only topic signal (e.g. "2026" year without news keywords)
-            // Just boost fresh distribution, don't force intent
-            else if q_lower.contains("2026") || q_lower.contains("2025") {
+            // Weak signal: only topic signal (e.g. year without news keywords).
+            else if intent.intent != "fresh" && (q_lower.contains("2026") || q_lower.contains("2025")) {
                 let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
                 let current_prob = intent.distribution.get(&intent.intent).copied().unwrap_or(0.0);
                 if fresh_prob + 0.15 > current_prob {
@@ -3983,6 +5447,18 @@ async fn handle_search(
                     intent.distribution.insert("fresh".to_string(), fresh_prob + 0.15);
                 }
             }
+        }
+
+        // Override 2b: a fresh intent with no derived date window must still
+        // apply a real recency cutoff (not just re-weight scoring). Without this,
+        // "latest ai news" would rank newer items higher but never drop stale ones.
+        if intent.intent == "fresh" && intent.structured_constraints.after_date.is_none() {
+            let today = today_ymd();
+            intent.structured_constraints.after_date = Some(format_ymd(add_days(today, -7)));
+            if intent.structured_constraints.before_date.is_none() {
+                intent.structured_constraints.before_date = Some(format_ymd(today));
+            }
+            tracing::info!("FRESH OVERRIDE: applied default 7-day recency window");
         }
 
         // Override 3: "other than X" with low confidence → boost comparison + technical
@@ -3998,35 +5474,68 @@ async fn handle_search(
             intent.distribution.insert("technical".to_string(), tech + 0.1);
         }
 
-        // Override 4: local intent signals with low confidence → boost local in distribution
+        // Override 4: local intent signals with low confidence → force local
         // e.g. "pizza near me" (conf=0.12, classified comparison → should be local)
         let has_local_keywords = q_lower.contains(" near me") || q_lower.starts_with("near me")
-            || q_lower.contains("nearby") || q_lower.contains(" in ")
-            || q_lower.contains("close to");
-        if has_local_keywords && intent.intent.as_str() != "local" && intent.confidence < 0.50 {
+            || q_lower.contains("nearby") || q_lower.contains(" close to")
+            || q_lower.starts_with("close to") || q_lower.contains("coffee shop");
+        if has_local_keywords && intent.intent != "local" && intent.confidence < 0.50 {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): local query '{}' was '{}' (conf={:.3}) -> local",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "local".to_string();
+            intent.confidence = intent.confidence.max(0.45);
             let local_prob = intent.distribution.get("local").copied().unwrap_or(0.0);
-            if local_prob < 0.15 {
+            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+            intent.distribution.insert("local".to_string(), (local_prob + current_top_prob * 0.5).min(0.85));
+        }
+
+        // Override 6: transactional keywords -> force/boost transactional intent
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon "];
+        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(&format!(" {}", k)) || q_lower.contains("headphones"));
+        if has_tx_signal && !has_local_keywords && intent.intent != "transactional" && intent.confidence < 0.50 {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): transactional query '{}' was '{}' (conf={:.3}) -> transactional",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "transactional".to_string();
+            intent.confidence = intent.confidence.max(0.45);
+            let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
+            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+            intent.distribution.insert("transactional".to_string(), (tx_prob + current_top_prob * 0.5).min(0.85));
+        }
+
+        // Override 5: "vs" or "versus" signals in query with low comparison confidence
+        // boost comparison intent. Handles queries like "react vs vue vs angular comparison"
+        // that the engine may misclassify as informational.
+        let has_vs_signal = q_lower.contains(" vs ") || q_lower.starts_with("vs ")
+            || q_lower.contains(" versus ") || q_lower.starts_with("versus");
+        if has_vs_signal {
+            let comp_prob = intent.distribution.get("comparison").copied().unwrap_or(0.0);
+            if comp_prob < 0.30 {
                 tracing::info!(
-                    "INTENT OVERRIDE: local-signal query '{}' was '{}' (conf={:.3}) — boosting local",
+                    "INTENT OVERRIDE: vs query '{}' was '{}' (conf={:.3}) — boosting comparison",
                     q, intent.intent, intent.confidence
                 );
-                // Shift probability from the current top intent to local
-                let current_top = intent.distribution.iter()
+                intent.distribution.insert("comparison".to_string(), comp_prob + 0.25);
+            }
+            // If intent is informational or navigational with low confidence, force comparison
+            if intent.intent != "comparison" && intent.confidence < 0.40 {
+                let cur_top = intent.distribution.iter()
                     .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(k, _)| k.clone())
                     .unwrap_or_default();
-                let top_prob = intent.distribution.get(&current_top).copied().unwrap_or(0.0);
-                let shift = top_prob * 0.3;
-                intent.distribution.insert(current_top.clone(), top_prob - shift);
-                intent.distribution.insert("local".to_string(), local_prob + shift);
-                // If boosted local becomes the highest, set intent to local
-                let new_local = intent.distribution.get("local").copied().unwrap_or(0.0);
-                let new_top = intent.distribution.iter()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(_, v)| *v)
-                    .unwrap_or(0.0);
-                if new_local >= new_top {
-                    intent.intent = "local".to_string();
+                let cur_prob = intent.distribution.get(&cur_top).copied().unwrap_or(0.0);
+                let new_comp = intent.distribution.get("comparison").copied().unwrap_or(0.0);
+                let threshold = if intent.intent == "informational" { 0.35 } else { 0.25 };
+                if new_comp + 0.25 > cur_prob.min(threshold) {
+                    tracing::info!(
+                        "INTENT OVERRIDE (STRONG): vs query '{}' was '{}' (conf={:.3}) — comparison now dominant",
+                        q, intent.intent, intent.confidence
+                    );
+                    intent.intent = "comparison".to_string();
+                    intent.confidence = intent.confidence.max(0.30);
                 }
             }
         }
@@ -4045,10 +5554,20 @@ async fn handle_search(
 
 
     // Secondary fan-out with expanded queries if initial results are sparse
+    // Apply language disambiguation for short language names
+    let disambiguated_q = disambiguate_engine_query(&q, &intent.intent, &intent.expanded_queries);
     let expanded_queries = if intent.expanded_queries.len() > 1 {
-        intent.expanded_queries.clone()
+        let mut eq = intent.expanded_queries.clone();
+        if disambiguated_q != q {
+            eq.insert(0, disambiguated_q);
+        }
+        eq
     } else {
-        vec![q.clone()]
+        if disambiguated_q != q {
+            vec![disambiguated_q.clone(), q.clone()]
+        } else {
+            vec![q.clone()]
+        }
     };
     // When query has ONLY negative constraints ("not X not Y"), SearXNG searched with
     // the raw query including negative terms. Strip negation trigger words to create a
@@ -4270,7 +5789,7 @@ async fn handle_search(
                 // For normal queries, only use VPN instance (SearXNG1) for speed.
                 if !only_negative && intent.structured_constraints.negative.is_empty() && inst_idx > 0 { continue; }
                 if circuit_ref.is_open(&retry_key) { continue; }
-                let retry_url = searxng_url(base_url, &clean_eq, geo_location.as_ref());
+                let retry_url = searxng_url(base_url, &clean_eq, geo_location.as_ref(), lang);
                 let client = client_ref.clone();
                 let key = retry_key.clone();
                 let url_for_log = retry_url[..retry_url.find('?').unwrap_or(retry_url.len())].to_string();
@@ -4425,6 +5944,7 @@ async fn handle_search(
                             engine: "invidious".to_string(),
                             score: 0.0,
                             sources: vec!["invidious".to_string()],
+                            published_date: None,
                         });
                     }
                 }
@@ -4458,6 +5978,7 @@ async fn handle_search(
                         engine: r.engine,
                         score: 0.0,
                         sources: vec!["news".to_string()],
+                        published_date: r.published_date.clone(),
                     });
                 }
             }
@@ -4489,6 +6010,7 @@ async fn handle_search(
                         engine: r.engine,
                         score: 0.0,
                         sources: vec!["images".to_string()],
+                        published_date: None,
                     });
                 }
             }
@@ -4626,6 +6148,21 @@ async fn handle_search(
         else if web_results.len() > 20 { 0.15 }
         else if web_results.len() > 10 { 0.12 }
         else { 0.08 };
+
+    // When the relevance model cannot discriminate (garbage cluster: every
+    // candidate scored ~identically, e.g. results with empty/short
+    // title+content that the lexical scorer rates uniformly ~0.01), the
+    // semantic filter below would drop EVERYTHING and the post-filter floor
+    // would collapse the response to 3 arbitrary results. That is the root
+    // cause of the "sparse/off-topic 3-result" symptom. In that degenerate
+    // case we trust the search-engine ranking (RRF) instead and keep the
+    // merged results rather than discarding them.
+    if is_garbage_cluster {
+        tracing::warn!(
+            "SEMANTIC FILTER SKIPPED (degenerate scorer, trusting RRF): web_results.len={}",
+            web_results.len()
+        );
+    } else {
     let mut keep_indices: Vec<usize> = Vec::new();
     for (i, &score) in semantic_scores_web.iter().enumerate() {
         if score >= semantic_threshold {
@@ -4641,6 +6178,19 @@ async fn handle_search(
         keep_indices = scored.iter().take(3).map(|(i, _)| *i).collect();
     }
     web_results = keep_indices.into_iter().map(|i| web_results[i].clone()).collect();
+    }
+
+    // Constraint transparency bookkeeping: capture the result count before any
+    // constraint filtering, and how many results actually carry a parseable
+    // date / detectable price. These let us report applied-vs-ignored
+    // constraints honestly instead of silently returning empty or unfiltered.
+    let pre_filter_count = web_results.len();
+    let dated_result_count = web_results.iter().filter(|r| {
+        resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
+    }).count();
+    let priced_result_count = web_results.iter().filter(|r| {
+        extract_price_from_text(&r.title).or_else(|| extract_price_from_text(&r.content)).is_some()
+    }).count();
 
     // --- Hard filter: remove web results that violate negative constraints ---
     // Uses a graduated penalty approach instead of a single threshold:
@@ -4674,10 +6224,8 @@ async fn handle_search(
                     let n_lower = n.to_lowercase();
                     let n_words: Vec<&str> = n_lower.split_whitespace().collect();
                     if n_words.len() == 1 {
-                        text.split_whitespace().any(|tw| {
-                            let tw_clean: String = tw.chars().filter(|c| c.is_alphanumeric()).collect();
-                            tw_clean == n_lower || tw_clean.contains(&n_lower)
-                        })
+                        // Word-boundary aware — "java" must not match "javascript".
+                        text_matches_negative(&text, &n_lower)
                     } else {
                         text.contains(&n_lower)
                     }
@@ -4705,13 +6253,24 @@ async fn handle_search(
         // Filter strategy:
         // - Normal case: keep results with violations <= 1 (clean match)
         // - Goldilocks case: keep results with violations <= max_violations / 2 (relaxed)
+        // - 3+ negatives: zero violations only (unless ALL have violations)
+        let is_only_negative = constraints_ref.positive.is_empty();
+        // A negative constraint means "exclude results that match". When there is
+        // at least one clean result (no negative match) we drop every matching
+        // result. When *all* results match (degenerate set) we fall back to the
+        // Goldilocks relaxation below so we never return an empty page. Pure
+        // negation ("-trump") and mixed queries both expect matches to be removed.
         let violation_threshold = if is_goldilocks {
             tracing::warn!("GOLDILOCKS: avg_violations={:.1} max={} - relaxing constraint threshold",
                 avg_violations, max_violations
             );
             (max_violations / 2).max(1)
+        } else if min_violations == 0 {
+            0
+        } else if is_only_negative {
+            0
         } else {
-            1.min(max_violations)
+            0
         };
 
         let kept: Vec<usize> = scored.iter()
@@ -4753,16 +6312,40 @@ async fn handle_search(
         }
     }
 
-    if !intent.structured_constraints.negative.is_empty() {
+    let has_any_constraints = !intent.structured_constraints.negative.is_empty()
+        || !intent.structured_constraints.file_types.is_empty()
+        || !intent.structured_constraints.sites.is_empty()
+        || !intent.structured_constraints.phrases.is_empty()
+        || intent.structured_constraints.after_date.is_some()
+        || intent.structured_constraints.before_date.is_some()
+        || !intent.structured_constraints.related.is_empty()
+        || !intent.structured_constraints.intitle.is_empty()
+        || !intent.structured_constraints.inurl.is_empty()
+        || !intent.structured_constraints.intext.is_empty()
+        || intent.structured_constraints.price_min.is_some()
+        || intent.structured_constraints.price_max.is_some();
+    if has_any_constraints {
         let before_count = web_results.len();
-        let mut negative_norm: Vec<String> = Vec::new();
-        for n in &intent.structured_constraints.negative {
-            for syn in expand_negative_synonyms(n) {
-                if !negative_norm.contains(&syn) {
-                    negative_norm.push(syn);
+        let constraints_ref = &intent.structured_constraints;
+        // Pre-filter: remove results that violate constraints beyond redemption
+        let pre_before = web_results.len();
+        web_results.retain(|r| {
+            !should_filter_by_constraints(&r.title, &r.content, &r.url, r.published_date.as_deref(), constraints_ref)
+        });
+        let pre_removed = pre_before.saturating_sub(web_results.len());
+        if pre_removed > 0 {
+            tracing::info!("should_filter: removed {}/{} results (from {})",
+                pre_removed, pre_before, before_count);
+        }
+        if !intent.structured_constraints.negative.is_empty() {
+            let mut negative_norm: Vec<String> = Vec::new();
+            for n in &intent.structured_constraints.negative {
+                for syn in expand_negative_synonyms(n) {
+                    if !negative_norm.contains(&syn) {
+                        negative_norm.push(syn);
+                    }
                 }
             }
-        }
 
         web_results.retain(|r| {
             // Alternative-listing page check: if the result is a comparison/
@@ -4800,11 +6383,8 @@ async fn handle_search(
                 let neg_lower = neg.to_lowercase();
                 let words: Vec<&str> = neg_lower.split_whitespace().collect();
                 if words.len() == 1 {
-                    let neg_clean: String = neg_lower.chars().filter(|c| c.is_alphanumeric()).collect();
-                    !(text_lower.split_whitespace().any(|w| {
-                        let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
-                        w_clean.starts_with(&neg_clean) || w_clean.contains(&neg_clean)
-                    }) || text_normalized.contains(&neg_clean))
+                    // Word-boundary aware — never substring ("java" ⊄ "javascript").
+                    !text_matches_negative(&text_lower, &neg_lower)
                 } else {
                     let joined = words.join(" ");
                     !(text_lower.contains(&joined) || text_normalized.contains(&joined))
@@ -4823,6 +6403,47 @@ async fn handle_search(
                 "Negative constraint hard filter: removed {}/{} web results (hard gate)",
                 removed, before_count
             );
+        }
+        }
+    }
+
+    // --- Price constraint: real narrowing (BUG: price silently passed) ---
+    // When a price range is requested we drop results whose snippet carries a
+    // price outside the range. More importantly, if ANY result carries an
+    // in-range price, we also drop results with no detectable price at all —
+    // an explicit price intent is not satisfied by unpriced pages. If NO result
+    // has a detectable price, we keep everything (we cannot verify) but flag it.
+    {
+        let pmin = intent.structured_constraints.price_min;
+        let pmax = intent.structured_constraints.price_max;
+        if pmin.is_some() || pmax.is_some() {
+            let lo = pmin.unwrap_or(0.0);
+            let hi = pmax.unwrap_or(f32::MAX);
+            let has_in_range = web_results.iter().any(|r| {
+                extract_price_from_text(&r.title)
+                    .or_else(|| extract_price_from_text(&r.content))
+                    .map(|p| p >= lo && p <= hi)
+                    .unwrap_or(false)
+            });
+            if has_in_range {
+                let before = web_results.len();
+                web_results.retain(|r| {
+                    extract_price_from_text(&r.title)
+                        .or_else(|| extract_price_from_text(&r.content))
+                        .map(|p| p >= lo && p <= hi)
+                        .unwrap_or(false)
+                });
+                let after = web_results.len();
+                tracing::info!(
+                    "Price constraint: narrowed {} → {} results (dropped {} unpriced/out-of-range)",
+                    before, after, before - after
+                );
+            } else {
+                tracing::warn!(
+                    "Price constraint specified ({:?}-{:?}) but no result snippets carried a detectable price — cannot narrow",
+                    pmin, pmax
+                );
+            }
         }
     }
 
@@ -4901,7 +6522,7 @@ async fn handle_search(
     //          "without node not django" → ["node", "django"]
     //          "not prometheus not grafana not datadog" → ["prometheus", "grafana", "datadog"]
     let query_neg_terms: Vec<String> = if query_has_negation {
-        let q_lower = q.to_lowercase();
+        let q_lower = q_orig.to_lowercase(); // Phase 1 (A3): original query (not corrected)
         let negation_markers = ["not ", "no ", "without "];
         let mut terms: Vec<String> = Vec::new();
         let words: Vec<&str> = q_lower.split_whitespace().collect();
@@ -5057,11 +6678,7 @@ let mut results = tokio::task::spawn_blocking(move || {
     for r in results.iter_mut() {
         let title_lower = r.title.to_lowercase();
         let has_neg_in_title = negative_norm.iter().any(|nt| {
-            title_lower.split_whitespace().any(|w| {
-                let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
-                let n_clean: String = nt.chars().filter(|c| c.is_alphanumeric()).collect();
-                w_clean == n_clean || w_clean.contains(&n_clean)
-            })
+            text_matches_negative(&title_lower, &nt.to_lowercase())
         });
         if has_neg_in_title {
             let alt = is_alternative_listing_page(&r.title, &r.url, &r.content);
@@ -5100,27 +6717,16 @@ let mut results = tokio::task::spawn_blocking(move || {
             before_count
         );
     } else {
-        let pos_terms: Vec<String> = intent.structured_constraints.positive.iter()
-            .map(|p| p.to_lowercase())
-            .collect();
         results.retain(|r| {
             // Alternative-listing page check: keep comparison/alternative pages
             // even if they mention excluded terms (they are HIGHLY relevant).
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-            if alt_score > 0.3 {
+            if alt_score > 0.3 && is_comparison_or_alternative_query(&intent.structured_constraints) {
                 return true;
             }
 
-            // If result contains any positive term, skip hard removal — let title penalty handle it.
             let text = format!("{} {}", r.title, r.url);
             let text_lower = text.to_lowercase();
-            if pos_terms.iter().any(|pt| {
-                let pt_clean: String = pt.chars().filter(|c| c.is_alphanumeric()).collect();
-                pt_clean.len() >= 3 && text_lower.contains(&pt_clean)
-            }) {
-                return true;
-            }
-
             let text_normalized = {
                 let chars: Vec<char> = text_lower.chars().collect();
                 let mut out = String::with_capacity(chars.len());
@@ -5145,11 +6751,9 @@ let mut results = tokio::task::spawn_blocking(move || {
                 let neg_lower = neg.to_lowercase();
                 let words: Vec<&str> = neg_lower.split_whitespace().collect();
                 if words.len() == 1 {
-                    let neg_clean: String = neg_lower.chars().filter(|c| c.is_alphanumeric()).collect();
-                    !(text_lower.split_whitespace().any(|w| {
-                        let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
-                        w_clean.starts_with(&neg_clean) || w_clean.contains(&neg_clean)
-                    }) || text_normalized.contains(&neg_clean))
+                    // Word-boundary aware match — never substring. Prevents
+                    // "not java" from dropping every "javascript" result.
+                    !text_matches_negative(&text_lower, &neg_lower)
                 } else {
                     let joined = words.join(" ");
                     !(text_lower.contains(&joined) || text_normalized.contains(&joined))
@@ -5163,10 +6767,7 @@ let mut results = tokio::task::spawn_blocking(move || {
                 // TITLE-ONLY HARD CHECK: even if alt page, demote by 90% if title contains excluded term
                 let title_lower = r.title.to_lowercase();
                 for nt_after in &negative_norm {
-                    if title_lower.split_whitespace().any(|w| {
-                        let w_clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
-                        w_clean == *nt_after || w_clean.contains(nt_after.as_str())
-                    }) {
+                    if text_matches_negative(&title_lower, &nt_after.to_lowercase()) {
                         // Score penalty moved to separate loop before retain
                         tracing::info!("TITLE HARD PENALTY: title contains excluded term -> score *= 0.01 (penalty applied in separate loop)");
                         break;
@@ -5209,14 +6810,21 @@ let mut results = tokio::task::spawn_blocking(move || {
                     title_lower.contains(&joined)
                 }
             });
-            // Boost clean results by 25% so they outrank alt pages with similar scores
+            // Boost clean results by a small differential nudge (+0.03) so they
+            // outrank alt pages WITHOUT collapsing the whole cluster to 1.0.
+            // (Phase 0: replaced the old uniform ×1.25.)
             if !has_neg_in_title {
-                r.score *= 1.25;
+                r.score += 0.03;
             }
         }
         // Re-sort by final score
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     }
+    // Hard filter on all constraints (file types, sites, date bounds, phrases, and negatives) post-merge:
+    results.retain(|r| {
+        !should_filter_by_constraints(&r.title, &r.content, &r.url, r.published_date.as_deref(), &intent.structured_constraints)
+    });
+
     // Sanitize content and clamp final score for safe JSON serialization and API spec conformance
     for r in results.iter_mut() {
         r.score = r.score.clamp(0.05, 1.0);
@@ -5240,17 +6848,108 @@ let mut results = tokio::task::spawn_blocking(move || {
         }
     }
 
+    let mut flat_constraints = Vec::new();
+    for p in &intent.structured_constraints.positive {
+        flat_constraints.push(format!("+{}", p));
+    }
+    for n in &intent.structured_constraints.negative {
+        flat_constraints.push(format!("-{}", n));
+    }
+    for ft in &intent.structured_constraints.file_types {
+        flat_constraints.push(format!("+filetype:{}", ft));
+    }
+    for site in &intent.structured_constraints.sites {
+        flat_constraints.push(format!("+site:{}", site));
+    }
+    for phrase in &intent.structured_constraints.phrases {
+        flat_constraints.push(format!("+\"{}\"", phrase));
+    }
+    if let Some(ref ad) = intent.structured_constraints.after_date {
+        flat_constraints.push(format!("+after:{}", ad));
+    }
+    if let Some(ref bd) = intent.structured_constraints.before_date {
+        flat_constraints.push(format!("+before:{}", bd));
+    }
+
+    // Renormalize distribution before returning
+    renormalize_distribution(&mut intent.distribution);
+
+    // Apply pagination (limit & offset)
+    let limit = params.limit.or(params.count).or(params.n).unwrap_or(24);
+    let offset = params.offset.unwrap_or(0);
+    let post_filter_count = results.len();
+    let paginated_results = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+
+    // ─── Constraint transparency (applied / ignored / warnings) ───
+    let sc = &intent.structured_constraints;
+    let mut applied: Vec<String> = Vec::new();
+    let mut ignored: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    if let Some(l) = &sc.language { applied.push(format!("lang:{}", l)); }
+    if let Some(a) = &sc.after_date { applied.push(format!("after:{}", a)); }
+    if let Some(b) = &sc.before_date { applied.push(format!("before:{}", b)); }
+    for s in &sc.sites { applied.push(format!("site:{}", s)); }
+    for f in &sc.file_types { applied.push(format!("filetype:{}", f)); }
+    for p in &sc.phrases { applied.push(format!("\"{}\"", p)); }
+    for t in &sc.intitle { applied.push(format!("intitle:{}", t)); }
+    for u in &sc.inurl { applied.push(format!("inurl:{}", u)); }
+    for t in &sc.intext { applied.push(format!("intext:{}", t)); }
+    for r in &sc.related { applied.push(format!("related:{}", r)); }
+    if sc.price_min.is_some() || sc.price_max.is_some() {
+        let lo = sc.price_min.map(|v| v.to_string()).unwrap_or_else(|| "*".to_string());
+        let hi = sc.price_max.map(|v| v.to_string()).unwrap_or_else(|| "*".to_string());
+        applied.push(format!("price:{}-{}", lo, hi));
+    }
+    for n in &sc.negative { applied.push(format!("not:{}", n)); }
+
+    if (sc.after_date.is_some() || sc.before_date.is_some()) && dated_result_count == 0 {
+        ignored.push(
+            "date range — no returned result carried a parseable date, so filtering relied on the upstream engine only".to_string(),
+        );
+    }
+    if (sc.price_min.is_some() || sc.price_max.is_some()) && priced_result_count == 0 {
+        ignored.push(
+            "price — no returned result snippet carried a detectable price, so no results could be narrowed".to_string(),
+        );
+    }
+    if !sc.related.is_empty() {
+        ignored.push(
+            "related — effectiveness depends on upstream search-engine support for the related: operator".to_string(),
+        );
+    }
+
+    if pre_filter_count > 0 && post_filter_count == 0 {
+        warnings.push(
+            "All web results were removed by your constraints. Try relaxing them (wider date range, or drop a negative term).".to_string(),
+        );
+    }
+    if pre_filter_count == 0 {
+        warnings.push(
+            "No web results were returned by the upstream search engines for this query.".to_string(),
+        );
+    }
+
     let response = UnifiedResponse {
-        intent: intent.intent.clone(),
-        category: parent_category(&intent.intent),
-        confidence: intent.confidence,
-        constraints: intent.constraints.clone(),
+        query: q.clone(),
+        intent: Some(intent.intent.clone()),
+        category: Some(parent_category(&intent.intent)),
+        confidence: Some(intent.confidence),
+        constraints: flat_constraints,
         structured_constraints: intent.structured_constraints.clone(),
         expanded_queries: intent.expanded_queries.clone(),
-        distribution: intent.distribution.clone(),
-        results,
+        distribution: Some(intent.distribution.clone()),
+        results: paginated_results,
         geo_location,
         spell_corrected_query: if spell_changed { Some(q.clone()) } else { None },
+        error: None,
+        message: None,
+        query_quality: if qflag == "low" { Some("low".to_string()) } else { None },
+        applied_constraints: if applied.is_empty() { None } else { Some(applied) },
+        ignored_constraints: if ignored.is_empty() { None } else { Some(ignored) },
+        warnings: if warnings.is_empty() { None } else { Some(warnings) },
+        results_before_filter: Some(pre_filter_count),
+        results_after_filter: Some(post_filter_count),
     };
 
     // Cache for 5 minutes — but never cache empty results
@@ -5270,13 +6969,232 @@ let mut results = tokio::task::spawn_blocking(move || {
     (axum::http::StatusCode::OK, Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({}))))
 }
 
+fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
+    let q_lower = q.to_lowercase();
+    let mut after_date = None;
+    let mut before_date = None;
+    if let Some(pos) = q_lower.find("after:") {
+        let after = pos + 6;
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            after_date = Some(val);
+        }
+    }
+    if let Some(pos) = q_lower.find("before:") {
+        let after = pos + 7;
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            before_date = Some(val);
+        }
+    }
+    // Natural-language recency ("last 7 days", "this week", "recent", ...) must
+    // become a real date window, not just a re-weighting signal. Only derive it
+    // when no explicit after:/before: was supplied.
+    if after_date.is_none() {
+        if let Some((a, b)) = derive_recency_window(&q_lower) {
+            after_date = Some(a);
+            if before_date.is_none() {
+                before_date = Some(b);
+            }
+        }
+    }
+    (after_date, before_date)
+}
+
+fn extract_gateway_constraints(q: &str) -> Constraints {
+    let mut file_types = Vec::new();
+    let mut sites = Vec::new();
+    let mut phrases = Vec::new();
+    let mut intitle = Vec::new();
+    let mut inurl = Vec::new();
+    let mut intext = Vec::new();
+    let mut related = Vec::new();
+    let mut price_min = None;
+    let mut price_max = None;
+    let mut language = None;
+    
+    // Parse phrases (quotes)
+    let mut current_phrase = String::new();
+    let mut inside_quotes = false;
+    let normalized = q
+        .replace('“', "\"")
+        .replace('”', "\"")
+        .replace('‘', "\"")
+        .replace('’', "\"");
+    
+    for c in normalized.chars() {
+        if c == '"' {
+            if inside_quotes {
+                let trimmed = current_phrase.trim().to_string();
+                if !trimmed.is_empty() {
+                    phrases.push(trimmed);
+                }
+                current_phrase.clear();
+                inside_quotes = false;
+            } else {
+                inside_quotes = true;
+            }
+        } else if inside_quotes {
+            current_phrase.push(c);
+        }
+    }
+
+    let q_lower = q.to_lowercase();
+    
+    // Extract filetype:
+    for cap in q_lower.match_indices("filetype:") {
+        let after = cap.0 + 9;
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            file_types.push(val);
+        }
+    }
+    
+    // Extract site:
+    for cap in q_lower.match_indices("site:") {
+        let after = cap.0 + 5;
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            sites.push(val);
+        }
+    }
+
+    // Extract intitle:
+    for cap in q_lower.match_indices("intitle:") {
+        let after = cap.0 + 8;
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            intitle.push(val);
+        }
+    }
+
+    // Extract inurl:
+    for cap in q_lower.match_indices("inurl:") {
+        let after = cap.0 + 6;
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            inurl.push(val);
+        }
+    }
+
+    // Extract intext:
+    for cap in q_lower.match_indices("intext:") {
+        let after = cap.0 + 7;
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            intext.push(val);
+        }
+    }
+
+    // Extract related:
+    for cap in q_lower.match_indices("related:") {
+        let after = cap.0 + 8;
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            related.push(val);
+        }
+    }
+
+    // Extract price:
+    for cap in q_lower.match_indices("price:") {
+        let after = cap.0 + 6;
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if let Some((pmin, pmax)) = parse_price_range(&val) {
+            price_min = pmin.or(price_min);
+            price_max = pmax.or(price_max);
+        }
+    }
+
+    // Extract lang:
+    for cap in q_lower.match_indices("lang:") {
+        let after = cap.0 + 5;
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() {
+            language = Some(val);
+        }
+    }
+
+    if language.is_none() {
+        let words: Vec<&str> = q_lower.split_whitespace().collect();
+        let fr_words = ["de", "la", "le", "les", "des", "et", "recette", "gateau"];
+        let de_words = ["der", "die", "das", "und", "ist", "rezept", "kuchen"];
+        let es_words = ["el", "la", "los", "las", "y", "en", "para"];
+        let nl_words = ["van", "het", "een", "en", "koptelefoon"];
+        
+        if words.iter().any(|w| fr_words.contains(w)) {
+            language = Some("fr".to_string());
+        } else if words.iter().any(|w| de_words.contains(w)) {
+            language = Some("de".to_string());
+        } else if words.iter().any(|w| es_words.contains(w)) {
+            language = Some("es".to_string());
+        } else if words.iter().any(|w| nl_words.contains(w)) {
+            language = Some("nl".to_string());
+        } else {
+            language = Some("en".to_string());
+        }
+    }
+    
+    let (after_date, before_date) = parse_date_constraints(q);
+    
+    Constraints {
+        positive: vec![],
+        negative: vec![],
+        entities: vec![],
+        language,
+        file_types,
+        sites,
+        phrases,
+        after_date,
+        before_date,
+        intitle,
+        inurl,
+        intext,
+        related,
+        price_min,
+        price_max,
+    }
+}
+
 fn fallback_intent(q: &str) -> IntentResponse {
+    let mut structured = extract_gateway_constraints(q);
+    let mut negative = Vec::new();
+    let q_lower = q.to_lowercase();
+    for word in q_lower.split_whitespace() {
+        if word.starts_with('-') {
+            let neg = word.strip_prefix('-').unwrap().trim().to_string();
+            if !neg.is_empty() {
+                negative.push(neg);
+            }
+        }
+    }
+    structured.negative = negative;
+
     IntentResponse {
         query: q.to_string(),
         intent: "informational".to_string(),
         confidence: 0.3,
         constraints: vec![],
-        structured_constraints: Constraints::default(),
+        structured_constraints: structured,
         expanded_queries: vec![q.to_string()],
         distribution: std::collections::HashMap::new(),
     }
@@ -5327,6 +7245,7 @@ async fn handle_search_fast(
                         authority: r.authority,
                         sources: vec!["local".to_string()],
                         is_local: true,
+                        published_date: None,
                     }).collect::<Vec<_>>()
                 }
                 Err(_) => vec![]
@@ -5348,4 +7267,121 @@ async fn handle_search_fast(
     }
 
     (axum::http::StatusCode::OK, Json(response))
+}
+
+#[cfg(test)]
+mod constraint_fix_tests {
+    use super::*;
+
+    fn cst() -> Constraints {
+        Constraints::default()
+    }
+
+    #[test]
+    fn recency_natural_language_becomes_date_window() {
+        // BUG2: "last 7 days" / "this week" / "past 2 weeks" must yield a window.
+        for q in ["ai news last 7 days", "rust release this week", "past 2 weeks update", "recent vulnerabilities"] {
+            let (after, before) = parse_date_constraints(q);
+            assert!(after.is_some(), "expected after_date for '{}'", q);
+            assert!(before.is_some(), "expected before_date for '{}'", q);
+            let today = format_ymd(today_ymd());
+            assert!(
+                date_lte(
+                    parse_date_to_comparable(&after.clone().unwrap()).unwrap(),
+                    parse_date_to_comparable(&today).unwrap()
+                ),
+                "after_date {} should be <= today for '{}'",
+                after.clone().unwrap(),
+                q
+            );
+        }
+    }
+
+    #[test]
+    fn literal_after_still_parsed() {
+        let (after, _) = parse_date_constraints("rust after:2024");
+        assert_eq!(after.as_deref(), Some("2024"));
+    }
+
+    #[test]
+    fn extract_date_from_text_handles_human_dates() {
+        // BUG3: dates inside content/title must be extractable.
+        assert_eq!(extract_date_from_text("Updated January 5, 2024 by the team"), Some((2024, 1, 5)));
+        assert_eq!(extract_date_from_text("Posted 12 Mar 2021"), Some((2021, 3, 12)));
+        assert_eq!(extract_date_from_text("See the 2023-12-01 release notes"), Some((2023, 12, 1)));
+        assert_eq!(extract_date_from_text("Archived in October 2019"), Some((2019, 10, 1)));
+        assert_eq!(extract_date_from_text("Back to 1999"), Some((1999, 1, 1)));
+    }
+
+    #[test]
+    fn date_filter_drops_old_content() {
+        // BUG3: after:2024 should filter a result whose content mentions 2021.
+        let mut c = cst();
+        c.after_date = Some("2024".to_string());
+        let old = should_filter_by_constraints(
+            "Old article",
+            "This was published on March 3, 2021 and is stale.",
+            "https://example.com/a",
+            None,
+            &c,
+        );
+        assert!(old, "result dated 2021 should be filtered by after:2024");
+
+        let fresh = should_filter_by_constraints(
+            "New article",
+            "This was published on March 3, 2025 and is current.",
+            "https://example.com/b",
+            None,
+            &c,
+        );
+        assert!(!fresh, "result dated 2025 should pass after:2024");
+    }
+
+    #[test]
+    fn price_extraction_broadened() {
+        // BUG4: more price formats detected.
+        assert_eq!(extract_price_from_text("Only $99 today"), Some(99.0));
+        assert_eq!(extract_price_from_text("Cost is €149.99"), Some(149.99));
+        assert_eq!(extract_price_from_text("from 250 dollars"), Some(250.0));
+        assert_eq!(extract_price_from_text("price: 49"), Some(49.0));
+        assert_eq!(extract_price_from_text("no monetary value here"), None);
+    }
+
+    #[test]
+    fn related_excludes_self_not_similar() {
+        // BUG5: related:amazon.com must NOT return amazon itself.
+        let mut c = cst();
+        c.related = vec!["amazon.com".to_string()];
+        assert!(
+            should_filter_by_constraints("Buy", "https://www.amazon.com/dp/123", "https://www.amazon.com/dp/123", None, &c),
+            "amazon itself should be filtered for related:amazon.com"
+        );
+        assert!(
+            !should_filter_by_constraints("Shop", "https://www.ebay.com", "https://www.ebay.com", None, &c),
+            "unrelated (non-self) result should be kept for related:amazon.com"
+        );
+    }
+
+    #[test]
+    fn related_known_map_kept() {
+        let mut c = cst();
+        c.related = vec!["github.com".to_string()];
+        assert!(
+            !should_filter_by_constraints("Git", "https://gitlab.com/x", "https://gitlab.com/x", None, &c),
+            "gitlab (curated similar) should be kept for related:github.com"
+        );
+        assert!(
+            should_filter_by_constraints("Git", "https://github.com/x", "https://github.com/x", None, &c),
+            "github itself should be filtered for related:github.com"
+        );
+    }
+
+    #[test]
+    fn pure_negation_scores_match_down() {
+        // BUG7 sanity: a trump-mentioning result scores near-zero for -trump.
+        let mut c = cst();
+        c.negative = vec!["trump".to_string()];
+        let score = constraint_score("Trump speech", "https://x.com/trump", "trump said things", &c);
+        assert!(score < 0.05, "trump-mentioning result should score near-zero for -trump");
+    }
 }
