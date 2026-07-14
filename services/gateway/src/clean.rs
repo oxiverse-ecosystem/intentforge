@@ -140,6 +140,143 @@ fn strip_json_ld_blobs(input: &str) -> String {
 }
 
 
+/// Strip CSS rule blocks (which upstream scrapers sometimes embed verbatim
+/// inside a snippet, e.g. "@media (max-width: 767px) { #_R_... iframe } Advertisement").
+/// A single-level regex cannot reach nested-brace CSS, so this scans char-by-char with
+/// a brace-depth counter (respecting "..." strings, /* */ comments, and (...) groups so
+/// CSS like `content: "a}b"` or `url(http://a}b)` is not mis-counted). A {...} block is
+/// removed only when it LOOKS like CSS, not prose: it must carry a CSS signature (an
+/// @-rule, `url(`, a `prop:` declaration, an `iframe` token, etc.) AND must not contain a
+/// genuine sentence clause. This guards against eating real sentences that sit in braces.
+fn strip_css_blocks(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '{' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // Find the matching close brace (depth-balanced; strings/comments/(...) respected).
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut in_comment = false;
+        let mut end = None;
+        let mut j = i;
+        while j < chars.len() {
+            let c = chars[j];
+            if in_comment {
+                if c == '*' && j + 1 < chars.len() && chars[j + 1] == '/' {
+                    in_comment = false;
+                    j += 2;
+                    continue;
+                }
+            } else if in_str {
+                if c == '\\' {
+                    j += 2;
+                    continue;
+                } else if c == '"' {
+                    in_str = false;
+                }
+            } else if c == '/' && j + 1 < chars.len() && chars[j + 1] == '*' {
+                in_comment = true;
+                j += 2;
+                continue;
+            } else if c == '"' {
+                in_str = true;
+            } else if c == '(' {
+                // Skip a (...) group (e.g. url(http://a}b)) so a brace inside
+                // parentheses does not perturb the brace-depth count.
+                let mut pd = 1usize;
+                let mut pk = j + 1;
+                while pk < chars.len() {
+                    if chars[pk] == '(' {
+                        pd += 1;
+                    } else if chars[pk] == ')' {
+                        pd -= 1;
+                        if pd == 0 {
+                            break;
+                        }
+                    } else if chars[pk] == '"' {
+                        pk += 1;
+                        while pk < chars.len() && chars[pk] != '"' {
+                            pk += 1;
+                        }
+                    }
+                    pk += 1;
+                }
+                j = pk + 1;
+                continue;
+            } else if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(j);
+                    break;
+                }
+            }
+            j += 1;
+        }
+        match end {
+            None => {
+                for ch in &chars[i..] {
+                    out.push(*ch);
+                }
+                break;
+            }
+            Some(end) => {
+                let block: String = chars[i..=end].iter().collect();
+                if looks_like_css(&block) {
+                    if !out.ends_with(' ') && end + 1 < chars.len() && chars[end + 1] != ' ' {
+                        out.push(' ');
+                    }
+                } else {
+                    out.push_str(&block);
+                }
+                i = end + 1;
+            }
+        }
+    }
+    out
+}
+
+/// Heuristic: does this {...} block look like CSS rather than prose?
+/// True (strip it) when it carries a CSS *signature* AND has no genuine
+/// sentence clause (we never eat a real sentence that happens to contain code).
+fn looks_like_css(block: &str) -> bool {
+    // Genuine prose guard: a real sentence clause means keep the block.
+    if block.contains(". ") || block.contains("? ") || block.contains("! ") {
+        return false;
+    }
+    let lower = block.to_lowercase();
+    let has_at_rule = lower.contains("@media")
+        || lower.contains("@font-face")
+        || lower.contains("@import")
+        || lower.contains("@keyframes")
+        || lower.contains("@charset");
+    let has_other_marker = lower.contains("!important")
+        || lower.contains("url(")
+        || lower.contains("iframe")
+        || lower.contains("@font");
+    // Property declaration shape: a letter before ":" not part of a URL scheme
+    // (http:/https: or //). e.g. "color:", "background:", "width:".
+    let mut has_prop = false;
+    let chars: Vec<char> = block.chars().collect();
+    for k in 0..chars.len() {
+        if chars[k] == ':' {
+            let prev_is_alpha = k > 0 && chars[k - 1].is_alphabetic();
+            let next_bad = k + 1 < chars.len() && chars[k + 1] == '/';
+            if prev_is_alpha && !next_bad {
+                has_prop = true;
+                break;
+            }
+        }
+    }
+    has_at_rule || has_other_marker || has_prop
+}
+
 /// Strip HTML tags, raw CSS / JS blocks, and scraped-page boilerplate from a
 /// search-engine content snippet, then bound it to complete sentences and
 /// remove a leading title echo. Returns a cleaned string (may be empty if the
@@ -164,6 +301,11 @@ pub fn clean_result_content(raw: &str, title: &str) -> String {
     // brace nesting, so strip recursively by deleting each {...} block that contains
     // an "@context" or "@type" key (brace-depth balanced).
     s = strip_json_ld_blobs(&s);
+    // Strip nested-brace CSS rule blocks (e.g. "@media (max-width: 767px) { #_R_...
+    // iframe } Advertisement"). This brace-balanced scanner supersedes the old
+    // single-level regexes below (which mis-count braces inside url(...) and nested
+    // rules), so it runs first; the legacy strips remain as a cheap safety net.
+    s = strip_css_blocks(&s);
     // CSS: nested brace blocks, then single brace blocks.
     if let Some(r) = re(r"(?s)\{[^{}]*\{[^{}]*\}[^{}]*\}") {
         s = r.replace_all(&s, " ").into_owned();
@@ -245,6 +387,11 @@ pub fn clean_result_content(raw: &str, title: &str) -> String {
     }
     // Generic "Read more", "See also", cookie/consent leftovers.
     if let Some(r) = re(r"(?i)\b(read more|see also|cookie policy|accept cookies|we use cookies)[^\n]*") {
+        s = r.replace_all(&s, " ").into_owned();
+    }
+    // Ad-label boilerplate that scrapers sometimes leave dangling after a stripped
+    // CSS rule block (e.g. "...iframe } Advertisement #_R_...").
+    if let Some(r) = re(r"(?i)\badvertisement\b") {
         s = r.replace_all(&s, " ").into_owned();
     }
     // Publisher "about this article" footer taglines that carry no content
@@ -450,6 +597,42 @@ mod tests {
         let out = clean_result_content(dirty, "Intro text");
         assert!(!out.contains("@context"), "truncated json-ld left: {out}");
         assert!(out.contains("Intro text"), "lead dropped: {out}");
+    }
+
+    #[test]
+    fn clean_strips_nested_css_media_iframe() {
+        // Real live shape: a CSS media-query rule leaked into the snippet, with the
+        // iframe token inside a NESTED brace. A single-level regex cannot reach it.
+        let dirty = "Video Science & Exploration 8 th width: 767.95px) { #_R_29avcqbsnqq5b_ iframe } Advertisement #_R_49avcqbsnqq5b tail";
+        // The scanner itself must remove the brace block (regression-proof unit).
+        let stripped = strip_css_blocks(dirty);
+        assert!(!stripped.contains("iframe"), "css iframe block left: {stripped}");
+        assert!(stripped.contains("tail"), "trail dropped: {stripped}");
+        // End-to-end through the full cleaner (also strips the dangling ad-label).
+        let out = clean_result_content(dirty, "Video Science");
+        assert!(!out.contains("iframe"), "css iframe block left: {out}");
+        assert!(!out.contains("Advertisement"), "css advert block left: {out}");
+    }
+
+    #[test]
+    fn clean_css_brace_counter_ignores_urls() {
+        // A url(...) containing a "}" must not break the brace-depth counter.
+        let dirty = "Head { background: url(http://a}b) center; color: red } Tail text";
+        let out = clean_result_content(dirty, "Head");
+        assert!(!out.contains("url("), "css block left: {out}");
+        assert!(!out.contains("color:"), "css prop left: {out}");
+        assert!(out.contains("Head"), "lead dropped: {out}");
+        assert!(out.contains("Tail text"), "trail dropped: {out}");
+    }
+
+    #[test]
+    fn clean_keeps_brace_prose() {
+        // Regression guard: a {...} block holding a real English sentence must be
+        // PRESERVED by the CSS scanner (not stripped as if it were CSS).
+        let dirty = "Before { This is a real sentence about cats. } After";
+        let out = strip_css_blocks(dirty);
+        assert!(out.contains("This is a real sentence about cats."), "prose inside braces dropped: {out}");
+        assert!(out.contains("After"), "trail dropped: {out}");
     }
 
     #[test]
