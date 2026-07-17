@@ -4703,6 +4703,10 @@ fn is_valid_word(w: &str, spell_index: &spell::SymSpellIndex) -> bool {
         part.len() <= 2
             || spell_index.contains_word(part)
             || spell::is_protected_term(part)
+            // A part containing a digit is a technical token (version, hex, acronym
+            // with a number, e.g. http3, tls1.3, x86_64, k8s, arm64) — never
+            // gibberish. Treat it as valid rather than down-ranking the query.
+            || part.chars().any(|c| c.is_numeric())
     })
 }
 
@@ -4766,11 +4770,21 @@ fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f
 
     let all_pronounceable = words.iter().all(|w| is_pronounceable(w));
 
-    if valid_ratio == 0.0 && !has_european_word && !all_pronounceable {
+    // A token with a digit, internal symbol, or mixed case is a technical
+    // identifier/version (http3, tls1.3, x86_64, k8s, arm64, c++) — these
+    // are never gibberish even if absent from the spell dictionary. Treat their
+    // presence as legitimizing the query (structural rule, not a hardcoded list).
+    let has_technical_token = words.iter().any(|w| {
+        w.chars().any(|c| c.is_numeric())
+            || w.chars().any(|c| c.is_uppercase()) && w.chars().any(|c| c.is_lowercase())
+            || w.contains('_') || w.contains('-') || w.contains('.')
+    });
+
+    if valid_ratio == 0.0 && !has_european_word && !all_pronounceable && !has_technical_token {
         ("junk".to_string(), valid_ratio)
-    } else if valid_ratio < 0.25 && !has_european_word && !all_pronounceable && (h < 2.5 || h > 6.5) {
+    } else if valid_ratio < 0.25 && !has_european_word && !all_pronounceable && (h < 2.5 || h > 6.5) && !has_technical_token {
         ("junk".to_string(), valid_ratio)
-    } else if valid_ratio < 0.5 && !has_european_word {
+    } else if valid_ratio < 0.5 && !has_european_word && !has_technical_token {
         ("low".to_string(), valid_ratio)
     } else {
         ("".to_string(), valid_ratio)
@@ -4911,7 +4925,12 @@ async fn handle_search(
         .copied()
         .collect();
     let only_stopwords = !raw_tokens.is_empty() && meaningful.is_empty();
-    let is_single_char = raw_tokens.len() == 1 && raw_tokens[0].chars().filter(|c| c.is_alphabetic()).count() <= 1;
+    let is_single_char = raw_tokens.len() == 1
+        && raw_tokens[0].chars().filter(|c| c.is_alphabetic()).count() <= 1
+        // A token with a digit or symbol (c++, x86_64, 3d, c#, f#) is a
+        // technical identifier, not a bare single letter — it has retrievable
+        // content, so exempt it from the single-character rejection.
+        && !raw_tokens[0].chars().any(|c| c.is_numeric() || c.is_ascii_punctuation());
     if only_stopwords || is_single_char {
         let is_protected = raw_tokens.iter().any(|t| spell::is_protected_term(&t.to_lowercase()));
         if !is_protected {
