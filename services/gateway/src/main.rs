@@ -4072,7 +4072,7 @@ impl ResultVolumeTracker {
 struct AppState {
     circuit: CircuitBreaker,
     cache: SearchCache,
-    rate_limits: RateLimitTracker,
+    rate_limits: Arc<RateLimitTracker>,
     volume_tracker: ResultVolumeTracker,
     http_client: reqwest::Client,
     searxng2_url: Option<String>,
@@ -4178,13 +4178,9 @@ async fn handle_images(
     };
 
     let searx1_fut = async {
-        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&searx_url).send()).await {
-            Ok(Ok(resp)) => match resp.text().await {
-                Ok(raw) => parse_images(raw),
-                Err(e) => { tracing::warn!("SearXNG1 image body read error: {}", e); vec![] }
-            },
-            Ok(Err(e)) => { tracing::warn!("SearXNG1 image request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG1 image timed out after 4s"); vec![] }
+        match fetch_text_budgeted(state.http_client.clone(), searx_url.clone(), 4000).await {
+            Some(raw) => parse_images(raw),
+            None => { tracing::warn!("SearXNG1 image timed out/failed — empty"); vec![] }
         }
     };
 
@@ -4193,13 +4189,9 @@ async fn handle_images(
             Some(u) => u,
             None => return vec![],
         };
-        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&url).send()).await {
-            Ok(Ok(resp)) => match resp.text().await {
-                Ok(raw) => parse_images(raw),
-                Err(e) => { tracing::warn!("SearXNG2 image body read error: {}", e); vec![] }
-            },
-            Ok(Err(e)) => { tracing::warn!("SearXNG2 image request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG2 image timed out after 4s"); vec![] }
+        match fetch_text_budgeted(state.http_client.clone(), url.clone(), 4000).await {
+            Some(raw) => parse_images(raw),
+            None => { tracing::warn!("SearXNG2 image timed out/failed — empty"); vec![] }
         }
     };
 
@@ -4580,7 +4572,7 @@ async fn main() {
     let state = Arc::new(AppState {
         circuit: CircuitBreaker::new(),
         cache: SearchCache::new(),
-        rate_limits: RateLimitTracker::new(),
+        rate_limits: Arc::new(RateLimitTracker::new()),
         volume_tracker: ResultVolumeTracker::new(),
         http_client: reqwest::Client::builder()
             .timeout(Duration::from_secs(10))  // Allow up to 10s for external engines (VPN/Tor overhead)
@@ -4788,6 +4780,78 @@ fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f
         ("low".to_string(), valid_ratio)
     } else {
         ("".to_string(), valid_ratio)
+    }
+}
+
+/// Resilient outbound GET with a HARD budget.
+///
+/// Runs `client.get(url).send()` (and the JSON parse) inside a DETACHED
+/// `tokio::spawn` task and joins it with `budget` ms. This is the
+/// root-cause fix for the flaky-connection blips: every engine call
+/// (SearXNG / Invidious / News / Image / Embed / Intent / Indexer)
+/// is routed through gluetun/VPN, whose connections can stall in a way an
+/// inline `tokio::time::timeout` around `client.get().send()` does NOT
+/// reliably interrupt (observed: the task blocked 26-31s with the timeout
+/// never firing, dropping the whole response). A detached task + join budget
+/// cannot be defeated that way — if the connection stalls, the parent still
+/// returns on time with `None` (fail-closed to empty/partial results).
+///
+/// `T` must be `DeserializeOwned + Send + 'static` so it can cross the
+/// spawn boundary. On any failure/timeout/panic the task returns `None`.
+async fn fetch_json_budgeted<T: serde::de::DeserializeOwned + Send + 'static>(
+    client: reqwest::Client,
+    url: String,
+    budget_ms: u64,
+) -> Option<T> {
+    let task = tokio::spawn(async move {
+        let send = match tokio::time::timeout(
+            std::time::Duration::from_millis(budget_ms),
+            client.get(&url).send(),
+        ).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) | Err(_) => return None,
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(budget_ms),
+            send.json::<T>(),
+        ).await {
+            Ok(Ok(parsed)) => Some(parsed),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    });
+    match tokio::time::timeout(std::time::Duration::from_millis(budget_ms + 200), task).await {
+        Ok(Ok(v)) => v,
+        _ => None,
+    }
+}
+
+/// Resilient outbound GET returning the raw body text with a HARD budget.
+/// Same rationale as `fetch_json_budgeted`; used where the caller needs the
+/// raw JSON string (e.g. SearXNG image/HTML parsing, the parallel retry).
+async fn fetch_text_budgeted(
+    client: reqwest::Client,
+    url: String,
+    budget_ms: u64,
+) -> Option<String> {
+    let task = tokio::spawn(async move {
+        let send = match tokio::time::timeout(
+            std::time::Duration::from_millis(budget_ms),
+            client.get(&url).send(),
+        ).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) | Err(_) => return None,
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(budget_ms),
+            send.text(),
+        ).await {
+            Ok(Ok(t)) => Some(t),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    });
+    match tokio::time::timeout(std::time::Duration::from_millis(budget_ms + 200), task).await {
+        Ok(Ok(v)) => v,
+        _ => None,
     }
 }
 
@@ -5113,45 +5177,56 @@ async fn handle_search(
     // Retry intent engine up to 2 extra times with backoff.
     // Handles cold-start after container restart (model load takes 5-15s).
     // Wrapped in an overall 800ms timeout to prevent local engine delays.
-    let intent_fut = async {
-        let delays = [0u64, 200, 400]; // 0ms, 200ms, 400ms
-        let res = tokio::time::timeout(std::time::Duration::from_millis(800), async {
+    let intent_fut = {
+        let intent_client = client.clone();
+        let intent_url_str = intent_url.clone();
+        let task = tokio::spawn(async move {
+            let delays = [0u64, 200, 400]; // 0ms, 200ms, 400ms
             for (attempt, delay_ms) in delays.iter().enumerate() {
                 if *delay_ms > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
                 }
-                match client.get(&intent_url).send().await {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        match resp.json::<IntentResponse>().await {
-                            Ok(parsed) => return Ok(parsed),
-                            Err(e) => {
-                                tracing::warn!("Intent parse failed (attempt {}, status: {}): {:?}",
-                                    attempt + 1, status, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Intent Engine request failed (attempt {}): {:?}", attempt + 1, e);
-                    }
+                // NOTE (flaky-connection fix): intent-engine is reached through
+                // gluetun; the inner .send() is wrapped in its own timeout AND
+                // the whole attempt runs in a detached task + budget so a stall
+                // cannot hang the handler the way an inline timeout did.
+                let resp = match tokio::time::timeout(
+                    std::time::Duration::from_millis(700),
+                    intent_client.get(&intent_url_str).send(),
+                ).await {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => { tracing::warn!("Intent Engine request failed (attempt {}): {:?}", attempt + 1, e); continue; }
+                    Err(_) => { tracing::warn!("Intent Engine request timed out (attempt {})", attempt + 1); continue; }
+                };
+                let status = resp.status();
+                match resp.json::<IntentResponse>().await {
+                    Ok(parsed) => return Ok(parsed),
+                    Err(e) => { tracing::warn!("Intent parse failed (attempt {}, status: {}): {:?}", attempt + 1, status, e); }
                 }
             }
             Err::<IntentResponse, ()>(())
-        }).await;
-        match res {
-            Ok(inner) => inner,
-            Err(_) => {
-                tracing::warn!("Intent Engine request timed out overall (800ms)");
-                Err::<IntentResponse, ()>(())
+        });
+        async move {
+            match tokio::time::timeout(std::time::Duration::from_millis(900), task).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(_)) => { tracing::warn!("Intent Engine task panicked/timed out (budget)"); Err::<IntentResponse, ()>(()) }
+                Err(_) => { tracing::warn!("Intent Engine request timed out overall (budget)"); Err::<IntentResponse, ()>(()) }
             }
         }
     };
-    let embed_fut = async {
-        match tokio::time::timeout(std::time::Duration::from_millis(800), client.get(&embed_url).send()).await {
-            Ok(Ok(resp)) => Some(resp),
-            _ => {
-                tracing::warn!("Embedding request timed out or failed (800ms)");
-                None
+    let embed_fut = {
+        let embed_client = client.clone();
+        let embed_url_str = embed_url.clone();
+        let task = tokio::spawn(async move {
+            match tokio::time::timeout(std::time::Duration::from_millis(700), embed_client.get(&embed_url_str).send()).await {
+                Ok(Ok(resp)) => Some(resp),
+                _ => { tracing::warn!("Embedding request timed out or failed (700ms)"); None }
+            }
+        });
+        async move {
+            match tokio::time::timeout(std::time::Duration::from_millis(900), task).await {
+                Ok(v) => v.unwrap_or(None),
+                Err(_) => { tracing::warn!("Embedding task timed out (budget)"); None }
             }
         }
     };
@@ -5272,7 +5347,7 @@ async fn handle_search(
     // fetch in a DETACHED spawned task and join it with a hard budget. If it
     // stalls, the parent handler proceeds with empty local results instead of
     // hanging the entire response.
-    let indexer_client = client_ref.clone();
+    let indexer_client = client.clone();
     let indexer_q_raw = indexer_query_raw.clone();
     let indexer_task = tokio::spawn(async move {
         match tokio::time::timeout(Duration::from_millis(1500), indexer_client.get(&indexer_q_raw).send()).await {
@@ -5305,75 +5380,75 @@ async fn handle_search(
     let searx_futs: Vec<_> = searx_urls.iter().enumerate().map(|(i, url)| {
         let url = url.clone();
         let is_open = searx_instance_open[i];
+        let client_for_searx = client.clone();
+        let ratelimit_for_searx = state.rate_limits.clone();
         async move {
             if is_open {
                 return Ok(SearxResponse { results: vec![] });
             }
-            // Per-instance timeout: matches SearXNG's outgoing.request_timeout (4s)
-            // so VPN/Tor engines have enough headroom to respond.
-            let first: Result<SearxResponse, reqwest::Error> = async {
+            // NOTE (flaky-connection fix): the SearXNG instance is reached
+            // through gluetun/VPN, whose connections can stall in a way an
+            // inline `tokio::time::timeout` around `client.get().send()` does
+            // NOT reliably interrupt (same root cause as the indexer hangs).
+            // So we run the fetch in a DETACHED spawned task and join it
+            // with a hard 4s budget. If it stalls, we return empty results
+            // instead of hanging the whole fan-out.
+            let task = tokio::spawn(async move {
                 let resp = match tokio::time::timeout(
                     std::time::Duration::from_secs(4),
-                    client_ref.get(&url).send()
+                    client_for_searx.get(&url).send(),
                 ).await {
                     Ok(Ok(r)) => r,
-                    Ok(Err(e)) => return Err(e),
+                    Ok(Err(e)) => {
+                        tracing::warn!("SearXNG instance request failed: {:?}", e);
+                        return SearxResponse { results: vec![] };
+                    }
                     Err(_) => {
-                        tracing::warn!("SearXNG instance request timed out (4s): {}", &url[..url.find('?').unwrap_or(url.len())]);
-                        return Ok(SearxResponse { results: vec![] });
+                        tracing::warn!("SearXNG instance timed out (4s): {}", &url[..url.find('?').unwrap_or(url.len())]);
+                        return SearxResponse { results: vec![] };
                     }
                 };
                 let status = resp.status();
                 // Detect 429 from first attempt — rotate IP instead of retrying the same query.
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    let rl_count = ratelimit_ref.count_in_window(300);
-                    ratelimit_ref.record();
-                    let new_count = ratelimit_ref.count_in_window(300);
+                    let rl_count = ratelimit_for_searx.count_in_window(300);
+                    ratelimit_for_searx.record();
+                    let new_count = ratelimit_for_searx.count_in_window(300);
                     tracing::warn!("SearXNG got 429 — rate-limits in 5min: {} → {}", rl_count, new_count);
                     rotate_all_ips(&format!("429_rate_limit_{}", new_count));
                 }
                 let raw = match tokio::time::timeout(
                     std::time::Duration::from_secs(4),
-                    resp.text()
+                    resp.text(),
                 ).await {
                     Ok(Ok(t)) => t,
-                    Ok(Err(e)) => return Err(e),
+                    Ok(Err(e)) => {
+                        tracing::warn!("SearXNG instance body read error: {}", e);
+                        return SearxResponse { results: vec![] };
+                    }
                     Err(_) => {
                         tracing::warn!("SearXNG instance body read timed out (4s)");
-                        return Ok(SearxResponse { results: vec![] });
+                        return SearxResponse { results: vec![] };
                     }
                 };
                 let sanitized = sanitize_json_text(&raw);
                 match serde_json::from_str::<SearxResponse>(&sanitized) {
-                    Ok(data) => Ok(data),
+                    Ok(data) => data,
                     Err(e) => {
                         tracing::error!("Failed to parse SearXNG JSON (status: {}): {:?}", status, e);
-                        Ok(SearxResponse { results: vec![] })
+                        SearxResponse { results: vec![] }
                     }
                 }
-            }.await;
-
-            match first {
-                Ok(data) if !data.results.is_empty() => Ok(data),
-                Ok(_) => {
-                    // Reject malformed/garbage queries early — they never return results.
-                    let url_lower = url.to_lowercase();
-                    let q_part = url_lower.split("q=").nth(1).unwrap_or("");
-                    let q_decoded = q_part.split("&").next().unwrap_or("");
-                    let alpha_ratio: f32 = if q_decoded.len() > 0 {
-                        q_decoded.chars().filter(|c| c.is_alphabetic() || c.is_whitespace()).count() as f32 / q_decoded.len() as f32
-                    } else { 0.0 };
-                    let is_malformed = q_decoded.len() > 200 || alpha_ratio < 0.3;
-                    if is_malformed {
-                        return Ok(SearxResponse { results: vec![] });
-                    }
-                    // No retry on 0 results: a second identical query is almost certain
-                    // to return the same empty payload. Saves up to 3s of wasted latency.
+            });
+            match tokio::time::timeout(std::time::Duration::from_millis(4200), task).await {
+                Ok(Ok(inner)) => Ok(inner),
+                Ok(Err(_)) => {
+                    tracing::warn!("SearXNG instance task panicked — empty results");
                     Ok(SearxResponse { results: vec![] })
                 }
-                Err(e) => {
-                    tracing::warn!("SearXNG request failed (local error, no VPN rotation): {:?}", e);
-                    Err(e)
+                Err(_) => {
+                    tracing::warn!("SearXNG instance task timed out (budget) — empty results");
+                    Ok(SearxResponse { results: vec![] })
                 }
             }
         }
@@ -5383,21 +5458,29 @@ async fn handle_search(
         if invidious_open {
             return Ok::<Vec<InvidiousResult>, anyhow::Error>(vec![]);
         }
-        let resp = match tokio::time::timeout(Duration::from_millis(800), client_ref.get(&invidious_url).send()).await {
-            Ok(Ok(r)) => r,
-            _ => return Ok::<Vec<InvidiousResult>, anyhow::Error>(vec![]),
-        };
-        let status = resp.status();
-        match tokio::time::timeout(Duration::from_millis(800), resp.json::<Vec<InvidiousResult>>()).await {
-            Ok(Ok(data)) => Ok(data),
-            Ok(Err(e)) => {
-                tracing::error!("Failed to parse Invidious JSON (status: {}): {:?}", status, e);
-                Ok(vec![])
+        // NOTE (flaky-connection fix): invidious is reached through gluetun;
+        // run the fetch in a detached task + budget so a stall can't hang
+        // the fan-out the way an inline tokio::time::timeout did.
+        let inv_client = client.clone();
+        let inv_url = invidious_url.clone();
+        let task = tokio::spawn(async move {
+            let resp = match tokio::time::timeout(Duration::from_millis(800), inv_client.get(&inv_url).send()).await {
+                Ok(Ok(r)) => r,
+                _ => return Ok::<Vec<InvidiousResult>, anyhow::Error>(vec![]),
+            };
+            let status = resp.status();
+            match tokio::time::timeout(Duration::from_millis(800), resp.json::<Vec<InvidiousResult>>()).await {
+                Ok(Ok(data)) => Ok(data),
+                Ok(Err(e)) => {
+                    tracing::error!("Failed to parse Invidious JSON (status: {}): {:?}", status, e);
+                    Ok(vec![])
+                }
+                Err(_) => { tracing::warn!("Invidious JSON read timed out after 800ms"); Ok(vec![]) }
             }
-            Err(_) => {
-                tracing::warn!("Invidious JSON read timed out after 800ms");
-                Ok(vec![])
-            }
+        });
+        match tokio::time::timeout(Duration::from_millis(1000), task).await {
+            Ok(inner) => inner.unwrap_or_else(|e| { tracing::warn!("Invidious task error: {:?}", e); Ok(vec![]) }),
+            Err(_) => { tracing::warn!("Invidious task timed out (budget)"); Ok(vec![]) }
         }
     };
 
@@ -5409,51 +5492,65 @@ async fn handle_search(
 
     let news_fut = async {
         if !is_news_intent || all_searx_open {
-            return Ok(SearxNewsResponse { results: vec![] }) as Result<SearxNewsResponse, anyhow::Error>;
+            return Ok(SearxNewsResponse { results: vec![] });
         }
         let news_url = searxng_url_with_categories(
             "http://127.0.0.1:8080", &q, "news", geo_location.as_ref(), lang
         );
-        let resp = match tokio::time::timeout(std::time::Duration::from_millis(800), client_ref.get(&news_url).send()).await {
-            Ok(Ok(r)) => r,
-            _ => return Ok(SearxNewsResponse { results: vec![] }),
-        };
-        let raw = match tokio::time::timeout(std::time::Duration::from_millis(800), resp.text()).await {
-            Ok(Ok(t)) => t,
-            _ => return Ok(SearxNewsResponse { results: vec![] }),
-        };
-        let sanitized = sanitize_json_text(&raw);
-        match serde_json::from_str::<SearxNewsResponse>(&sanitized) {
-            Ok(data) => Ok(data),
-            Err(e) => {
-                tracing::warn!("SearXNG news fan-out parse error: {}", e);
-                Ok(SearxNewsResponse { results: vec![] })
+        // NOTE (flaky-connection fix): detached spawn + budget so a gluetun
+        // stall can't hang the fan-out.
+        let n_client = client.clone();
+        let task = tokio::spawn(async move {
+            let resp = match tokio::time::timeout(Duration::from_millis(800), n_client.get(&news_url).send()).await {
+                Ok(Ok(r)) => r,
+                _ => return Ok::<SearxNewsResponse, anyhow::Error>(SearxNewsResponse { results: vec![] }),
+            };
+            let raw = match tokio::time::timeout(Duration::from_millis(800), resp.text()).await {
+                Ok(Ok(t)) => t,
+                _ => return Ok::<SearxNewsResponse, anyhow::Error>(SearxNewsResponse { results: vec![] }),
+            };
+            let sanitized = sanitize_json_text(&raw);
+            match serde_json::from_str::<SearxNewsResponse>(&sanitized) {
+                Ok(data) => Ok(data),
+                Err(e) => { tracing::warn!("SearXNG news fan-out parse error: {}", e); Ok(SearxNewsResponse { results: vec![] }) }
             }
+        });
+        match tokio::time::timeout(Duration::from_millis(1000), task).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => { tracing::warn!("SearXNG news task error"); Ok(SearxNewsResponse { results: vec![] }) }
+            Err(_) => { tracing::warn!("SearXNG news task timed out (budget)"); Ok(SearxNewsResponse { results: vec![] }) }
         }
     };
 
     let image_fut = async {
         if !is_image_intent || all_searx_open {
-            return Ok(SearxImageResponse { results: vec![] }) as Result<SearxImageResponse, anyhow::Error>;
+            return Ok(SearxImageResponse { results: vec![] });
         }
         let image_url = searxng_url_with_categories(
             "http://127.0.0.1:8080", &q, "images", geo_location.as_ref(), lang
         );
-        let resp = match tokio::time::timeout(std::time::Duration::from_millis(800), client_ref.get(&image_url).send()).await {
-            Ok(Ok(r)) => r,
-            _ => return Ok(SearxImageResponse { results: vec![] }),
-        };
-        let raw = match tokio::time::timeout(std::time::Duration::from_millis(800), resp.text()).await {
-            Ok(Ok(t)) => t,
-            _ => return Ok(SearxImageResponse { results: vec![] }),
-        };
-        let sanitized = sanitize_json_text(&raw);
-        match serde_json::from_str::<SearxImageResponse>(&sanitized) {
-            Ok(data) => Ok(data),
-            Err(e) => {
-                tracing::warn!("SearXNG image fan-out parse error: {}", e);
-                Ok(SearxImageResponse { results: vec![] })
+        // NOTE (flaky-connection fix): detached spawn + budget so a gluetun
+        // stall can't hang the fan-out.
+        let i_client = client.clone();
+        let task = tokio::spawn(async move {
+            let resp = match tokio::time::timeout(Duration::from_millis(800), i_client.get(&image_url).send()).await {
+                Ok(Ok(r)) => r,
+                _ => return Ok::<SearxImageResponse, anyhow::Error>(SearxImageResponse { results: vec![] }),
+            };
+            let raw = match tokio::time::timeout(Duration::from_millis(800), resp.text()).await {
+                Ok(Ok(t)) => t,
+                _ => return Ok::<SearxImageResponse, anyhow::Error>(SearxImageResponse { results: vec![] }),
+            };
+            let sanitized = sanitize_json_text(&raw);
+            match serde_json::from_str::<SearxImageResponse>(&sanitized) {
+                Ok(data) => Ok(data),
+                Err(e) => { tracing::warn!("SearXNG image fan-out parse error: {}", e); Ok(SearxImageResponse { results: vec![] }) }
             }
+        });
+        match tokio::time::timeout(Duration::from_millis(1000), task).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => { tracing::warn!("SearXNG image task error"); Ok(SearxImageResponse { results: vec![] }) }
+            Err(_) => { tracing::warn!("SearXNG image task timed out (budget)"); Ok(SearxImageResponse { results: vec![] }) }
         }
     };
 
@@ -6134,7 +6231,7 @@ async fn handle_search(
                 if !only_negative && intent.structured_constraints.negative.is_empty() && inst_idx > 0 { continue; }
                 if circuit_ref.is_open(&retry_key) { continue; }
                 let retry_url = searxng_url(base_url, &clean_eq, geo_location.as_ref(), lang);
-                let client = client_ref.clone();
+                let client = client.clone();
                 let key = retry_key.clone();
                 let url_for_log = retry_url[..retry_url.find('?').unwrap_or(retry_url.len())].to_string();
                 retry_futs.push(Box::pin(async move {
