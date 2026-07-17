@@ -74,6 +74,14 @@ struct Constraints {
     price_min: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     price_max: Option<f32>,
+    /// Upper bound from an explicit `<` operator, e.g. `price:<100`. Semantically
+    /// identical to `price_max` for filtering, but preserved so the operator is
+    /// not silently dropped when reporting applied constraints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_lt: Option<f32>,
+    /// Lower bound from an explicit `>` operator, e.g. `price:>50`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_gt: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -1646,18 +1654,54 @@ fn constraint_score(
     score.clamp(0.0, 1.0)
 }
 
-fn parse_price_range(s: &str) -> Option<(Option<f32>, Option<f32>)> {
-    let clean: String = s.chars().filter(|c| c.is_numeric() || *c == '-' || *c == '.').collect();
+/// Parsed price constraint. `min`/`max` describe an explicit range (`price:10-100`);
+/// `lt`/`gt` describe a comparison operator (`price:<100`, `price:>50`). A bare
+/// `price:100` is treated as an upper bound (`max`/`lt` both set to 100) so the
+/// documented `<` operator is never silently discarded.
+struct ParsedPrice {
+    min: Option<f32>,
+    max: Option<f32>,
+    lt: Option<f32>,
+    gt: Option<f32>,
+}
+
+fn parse_price_range(s: &str) -> Option<ParsedPrice> {
+    let s = s.trim();
+    // Detect comparison operators before stripping them.
+    let (op, rest) = if let Some(v) = s.strip_prefix("<=") {
+        ("le", v)
+    } else if let Some(v) = s.strip_prefix(">=") {
+        ("ge", v)
+    } else if let Some(v) = s.strip_prefix('<') {
+        ("lt", v)
+    } else if let Some(v) = s.strip_prefix('>') {
+        ("gt", v)
+    } else {
+        ("", s)
+    };
+
+    // Keep digits, '-' (range separator) and '.' only.
+    let clean: String = rest.chars().filter(|c| c.is_numeric() || *c == '-' || *c == '.').collect();
+
+    // Explicit range: "10-100"
     if clean.contains('-') {
         let parts: Vec<&str> = clean.split('-').collect();
         if parts.len() == 2 {
             let pmin = parts[0].parse::<f32>().ok();
             let pmax = parts[1].parse::<f32>().ok();
-            return Some((pmin, pmax));
+            if pmin.is_some() || pmax.is_some() {
+                return Some(ParsedPrice { min: pmin, max: pmax, lt: None, gt: None });
+            }
         }
     }
+
+    // Single value: bare `price:100` or `price:<100` / `price:>50`.
     if let Ok(val) = clean.parse::<f32>() {
-        return Some((None, Some(val)));
+        return match op {
+            "lt" | "le" => Some(ParsedPrice { min: None, max: Some(val), lt: Some(val), gt: None }),
+            "gt" | "ge" => Some(ParsedPrice { min: Some(val), max: None, lt: None, gt: Some(val) }),
+            _ => Some(ParsedPrice { min: None, max: Some(val), lt: Some(val), gt: None }),
+        };
     }
     None
 }
@@ -1677,6 +1721,8 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
     let mut related = c.related.clone();
     let mut price_min = c.price_min;
     let mut price_max = c.price_max;
+    let mut price_lt = c.price_lt;
+    let mut price_gt = c.price_gt;
 
     // 1. Process negative constraints first (filtering and stripping +- or - prefixes)
     for n in &c.negative {
@@ -1758,9 +1804,11 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             }
         } else if clean_p.starts_with("price:") {
             let val = clean_p.strip_prefix("price:").unwrap().trim().to_string();
-            if let Some((pmin, pmax)) = parse_price_range(&val) {
-                price_min = pmin.or(price_min);
-                price_max = pmax.or(price_max);
+            if let Some(p) = parse_price_range(&val) {
+                price_min = p.min.or(price_min);
+                price_max = p.max.or(price_max);
+                price_lt = p.lt.or(price_lt);
+                price_gt = p.gt.or(price_gt);
             }
         } else {
             let pl = clean_p;
@@ -1792,6 +1840,8 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         related,
         price_min,
         price_max,
+        price_lt,
+        price_gt,
     }
 }
 
@@ -1943,35 +1993,17 @@ fn should_filter_by_constraints(
         }
     }
 
-    // 4b. Hard filter on intitle:
-    if !constraints.intitle.is_empty() {
-        let t_low = title.to_lowercase();
-        for t in &constraints.intitle {
-            if !t_low.contains(&t.to_lowercase()) {
-                return true;
-            }
-        }
-    }
+    // 4b. Soft preference on intitle: (kept as BOOST, not hard-drop).
+    // The operator is now forwarded to the upstream engine (preprocess_searxng_query),
+    // which applies it natively. A local hard-drop here re-creates the n=0 trap
+    // whenever an engine instance ignores intitle: — so we only nudge ranking.
+    // should_filter_by_constraints is a pure predicate, so the boost itself is
+    // applied by the callers (constraint_boost). This block intentionally does
+    // nothing for intitle (left in place as an explicit no-op marker).
 
-    // 4c. Hard filter on inurl:
-    if !constraints.inurl.is_empty() {
-        let u_low = url.to_lowercase();
-        for u in &constraints.inurl {
-            if !u_low.contains(&u.to_lowercase()) {
-                return true;
-            }
-        }
-    }
-
-    // 4d. Hard filter on intext:
-    if !constraints.intext.is_empty() {
-        let c_low = content.to_lowercase();
-        for txt in &constraints.intext {
-            if !c_low.contains(&txt.to_lowercase()) {
-                return true;
-            }
-        }
-    }
+    // 4c. Soft preference on inurl: (BOOST, not hard-drop — see 4b).
+    // 4d. Soft preference on intext: (BOOST, not hard-drop — see 4b).
+    // (All three are now enforced upstream + boosted downstream; never hard-dropped.)
 
     // 4e. Hard filter on related:
     // Semantics: "related:amazon.com" means sites SIMILAR to amazon, NOT amazon
@@ -2008,7 +2040,9 @@ fn should_filter_by_constraints(
     }
 
     // 4f. Hard filter on price:
-    if constraints.price_min.is_some() || constraints.price_max.is_some() {
+    if constraints.price_min.is_some() || constraints.price_max.is_some()
+        || constraints.price_lt.is_some() || constraints.price_gt.is_some()
+    {
         if let Some(price) = extract_price_from_text(title)
             .or_else(|| extract_price_from_text(content))
         {
@@ -2017,6 +2051,12 @@ fn should_filter_by_constraints(
             }
             if let Some(pmax) = constraints.price_max {
                 if price > pmax { return true; }
+            }
+            if let Some(plt) = constraints.price_lt {
+                if price > plt { return true; }
+            }
+            if let Some(pgt) = constraints.price_gt {
+                if price < pgt { return true; }
             }
         }
     }
@@ -2041,7 +2081,41 @@ fn should_filter_by_constraints(
     c_score < threshold
 }
 
-// ─── IP Rotation ────────────────────────────────────────────────────
+/// Soft boost for `intitle:`/`inurl:`/`intext:` constraints.
+///
+/// These operators are now forwarded to the upstream engine (SearXNG applies them
+/// natively). Historically the gateway ALSO hard-dropped any result that did not
+/// literally contain the operator token — which zeroed out queries like
+/// `rust inurl:blog` when an engine instance ignored the operator (the engine
+/// returned results without the token, then the local hard filter wiped them → n=0).
+///
+/// We therefore never hard-drop on these: the engine is the authoritative enforcer,
+/// and the gateway instead gives a modest ranking nudge to results that DO satisfy
+/// the operator. This keeps the operator meaningful without risking an empty page.
+fn constraint_boost(title: &str, content: &str, url: &str, constraints: &Constraints) -> f32 {
+    let mut bonus = 0.0f32;
+    let t_low = title.to_lowercase();
+    let u_low = url.to_lowercase();
+    let c_low = content.to_lowercase();
+    for t in &constraints.intitle {
+        if !t.is_empty() && t_low.contains(&t.to_lowercase()) {
+            bonus += 0.05;
+        }
+    }
+    for u in &constraints.inurl {
+        if !u.is_empty() && u_low.contains(&u.to_lowercase()) {
+            bonus += 0.05;
+        }
+    }
+    for txt in &constraints.intext {
+        if !txt.is_empty() && c_low.contains(&txt.to_lowercase()) {
+            bonus += 0.05;
+        }
+    }
+    bonus.min(0.15) // cap so a multi-operator match can't dominate the score
+}
+
+
 // Rotates both gluetun VPN and tor2 circuit to get fresh exit IPs.
 // Called on CAPTCHA detection, rate limiting, and periodically every 10 minutes.
 
@@ -2742,12 +2816,26 @@ fn preprocess_searxng_query(query: &str) -> String {
     }
 
     let mut words_cleaned = Vec::new();
+    // Operators SearXNG understands natively. Stripping them and never re-emitting
+    // (the old behaviour) silently forwarded e.g. `rust inurl:blog` as just `rust`,
+    // so the engine could never honour the constraint and a downstream hard filter
+    // then dropped every result → n=0. We preserve them verbatim so the engine
+    // itself applies them (it supports intitle:/inurl:/intext: natively), and the
+    // local `should_filter_by_constraints` hard-drop is downgraded to a soft boost.
+    let mut passthrough_emitted: Vec<String> = Vec::new();
     for w in q.split_whitespace() {
         let wl = w.to_lowercase();
         if wl.starts_with("intitle:") || wl.starts_with("inurl:") || wl.starts_with("intext:")
             || wl.starts_with("price:") || wl.starts_with("lang:")
             || wl.starts_with("after:") || wl.starts_with("before:")
         {
+            // Emit native operators (everything except price:, after:, before: which
+            // are handled via dedicated query params / date-window overrides).
+            if wl.starts_with("intitle:") || wl.starts_with("inurl:") || wl.starts_with("intext:")
+                || wl.starts_with("lang:")
+            {
+                passthrough_emitted.push(w.to_string());
+            }
             continue;
         }
         if wl == "or" || wl == "and" {
@@ -2785,6 +2873,17 @@ fn preprocess_searxng_query(query: &str) -> String {
             cleaned_str.push(' ');
         }
         cleaned_str.push_str(&format!("site:{}", single));
+    }
+
+    // Re-emit native operators (intitle:/inurl:/intext:/lang:) verbatim so the
+    // upstream engine applies them. Skipping this is what zeroed out e.g.
+    // `rust inurl:blog` (forwarded as `rust`); the engine then returned results
+    // that failed the local hard filter → 0 hits.
+    for op in &passthrough_emitted {
+        if !cleaned_str.is_empty() {
+            cleaned_str.push(' ');
+        }
+        cleaned_str.push_str(op);
     }
 
     // Prefixes that trigger dictionary/definition results on Bing
@@ -3200,6 +3299,18 @@ impl CircuitBreaker {
 /// not access time — the access pattern is read-heavy with rare repeats, so age is a
 /// good proxy for staleness without per-get bookkeeping.
 const SEARCH_CACHE_MAX_ENTRIES: usize = 10_000;
+
+/// Maximum total bytes held by cached response bodies. This is the *real* memory
+/// bound: each entry stores a fully serialized `UnifiedResponse` which can be very
+/// large (MBs). A pure entry-count cap of 10k would permit gigabytes of retained
+/// JSON under sustained load and OOM the container. Entries older than the newest
+/// (`inserted_at` ascending) are evicted first until the byte budget is satisfied.
+const SEARCH_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Responses larger than this are not cached at all — caching a single multi-MB
+/// body permanently occupies the budget and helps no repeat query in practice.
+const SEARCH_CACHE_MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
 struct SearchCache {
     entries: Mutex<HashMap<String, CacheEntry>>,
 }
@@ -3208,6 +3319,7 @@ struct CacheEntry {
     response_json: String, // serialized UnifiedResponse
     inserted_at: Instant,
     ttl: Duration,
+    bytes: usize,
 }
 
 impl SearchCache {
@@ -3228,29 +3340,48 @@ impl SearchCache {
     }
 
     fn put(&self, key: String, response_json: String, ttl: Duration) {
+        let bytes = response_json.len();
+
+        // Never cache pathological responses — they would monopolize the budget.
+        if bytes > SEARCH_CACHE_MAX_ENTRY_BYTES {
+            tracing::debug!(
+                "Cache skip: response {}B exceeds entry cap ({}B)",
+                bytes, SEARCH_CACHE_MAX_ENTRY_BYTES
+            );
+            return;
+        }
+
         let mut entries = self.entries.lock();
         entries.insert(key, CacheEntry {
             response_json,
             inserted_at: Instant::now(),
             ttl,
+            bytes,
         });
 
-        // Evict expired entries to prevent unbounded growth
+        // Evict expired entries to prevent unbounded growth.
         entries.retain(|_, e| e.inserted_at.elapsed() < e.ttl);
 
-        // Cap total entries. Evict the oldest by `inserted_at` until under the cap.
-        // Iterating the full map is O(n) but n is bounded by SEARCH_CACHE_MAX_ENTRIES,
-        // so worst case is ~10k string comparisons on each put — acceptable for a
-        // background-quality cache.
-        if entries.len() > SEARCH_CACHE_MAX_ENTRIES {
-            let to_evict = entries.len() - SEARCH_CACHE_MAX_ENTRIES;
+        // Enforce the byte budget: evict oldest-by-age entries until total bytes
+        // is within budget (and the count cap is respected). O(n log n) per put
+        // but n is small in practice and correctness > micro-optimization here.
+        let total_bytes: usize = entries.values().map(|e| e.bytes).sum();
+        if total_bytes > SEARCH_CACHE_MAX_BYTES || entries.len() > SEARCH_CACHE_MAX_ENTRIES {
             let mut by_age: Vec<(Instant, String)> = entries
                 .iter()
                 .map(|(k, e)| (e.inserted_at, k.clone()))
                 .collect();
             by_age.sort_by_key(|(t, _)| *t);
-            for (_, k) in by_age.into_iter().take(to_evict) {
-                entries.remove(&k);
+            let mut used: usize = entries.values().map(|e| e.bytes).sum();
+            let mut count = entries.len();
+            for (_, k) in by_age.into_iter() {
+                if used <= SEARCH_CACHE_MAX_BYTES && count <= SEARCH_CACHE_MAX_ENTRIES {
+                    break;
+                }
+                if let Some(e) = entries.remove(&k) {
+                    used = used.saturating_sub(e.bytes);
+                    count -= 1;
+                }
             }
         }
     }
@@ -4711,6 +4842,45 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
     )
 }
 
+/// RAII guard that removes a query's entry from `AppState::in_flight` when it goes
+/// out of scope — including on panic. The dedup map is keyed by `cache_key`; the
+/// "leader" request inserts an empty `Vec` and is responsible for removing it once
+/// the result is ready. Without this guard, any panic between insertion and the
+/// explicit `remove` (e.g. inside `spawn_blocking(...).await.unwrap()`) leaks the
+/// key forever, growing the map unbounded over a long-running process.
+struct DedupGuard {
+    state: std::sync::Arc<AppState>,
+    key: String,
+    done: bool,
+}
+
+impl DedupGuard {
+    /// Create the guard. The entry is assumed inserted by the caller.
+    fn new(state: std::sync::Arc<AppState>, key: String) -> Self {
+        Self { state, key, done: false }
+    }
+
+    /// Normal completion: the leader has already removed the entry and notified
+    /// waiters, so the guard should do nothing on drop.
+    fn complete(mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for DedupGuard {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        // Panic path (or early return): best-effort removal. `in_flight` is a
+        // parking_lot Mutex whose `lock()` never fails, so removal is
+        // unconditional. If another panic is unwinding concurrently the worst
+        // case is the entry lingers and is overwritten on a future identical query.
+        let mut map = self.state.in_flight.lock();
+        map.remove(&self.key);
+    }
+}
+
 async fn handle_search(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
@@ -4777,7 +4947,10 @@ async fn handle_search(
         tracing::info!("Spell-corrected query: '{}' -> '{}'", q_trimmed, q_corrected_cleaned);
     }
 
-    // 0c. Request deduplication: if another task is already fetching this query, wait for it
+    // 0c. Request deduplication: if another task is already fetching this query, wait for it.
+    // `dedup_guard` lives for the whole handler so it removes the in_flight entry even
+    // on panic; it is marked complete() on the normal success path below.
+    let mut dedup_guard: Option<DedupGuard> = None;
     let dedup_rx = {
         let mut in_flight = state.in_flight.lock();
         if let Some(senders) = in_flight.get_mut(&cache_key) {
@@ -4787,6 +4960,7 @@ async fn handle_search(
             Some(rx)
         } else {
             in_flight.insert(cache_key.clone(), vec![]);
+            dedup_guard = Some(DedupGuard::new(state.clone(), cache_key.clone()));
             None
         }
     };
@@ -4794,8 +4968,29 @@ async fn handle_search(
         tracing::info!("DEDUP: waiting for in-flight query '{}' to complete", q_trimmed);
         match rx.await {
             Ok(response_json) => {
-                let value: serde_json::Value = serde_json::from_str(&response_json).unwrap_or(serde_json::json!({}));
-                return (axum::http::StatusCode::OK, Json(value));
+                // Decouple subscribers from a failed leader. The leader may have been
+                // cancelled by the global TimeoutLayer (20s) or hit an upstream failure
+                // and returned an error/empty payload. If so, do NOT blindly return the
+                // leader's bad outcome to every concurrent caller (that fans out one
+                // failure into N identical 408/empty responses). Instead, fall through
+                // and execute the query independently so at least one copy can succeed.
+                let leader_failed = {
+                    let v: serde_json::Value = serde_json::from_str(&response_json).unwrap_or(serde_json::Value::Null);
+                    let has_error = v.get("error").and_then(|e| e.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+                    let results_empty = v.get("results").and_then(|r| r.as_array()).map(|a| a.is_empty()).unwrap_or(false);
+                    // A leader that produced an error body, OR a 200 with an empty
+                    // result set AND an error/message marker, is treated as a failure.
+                    let has_message_err = v.get("message").and_then(|m| m.as_str())
+                        .map(|s| s.to_lowercase().contains("upstream") || s.to_lowercase().contains("unavailable"))
+                        .unwrap_or(false);
+                    has_error || (results_empty && has_message_err)
+                };
+                if leader_failed {
+                    tracing::warn!("DEDUP: leader failed/empty (timeout or upstream error); re-executing independently instead of inheriting its failure");
+                } else {
+                    let value: serde_json::Value = serde_json::from_str(&response_json).unwrap_or(serde_json::json!({}));
+                    return (axum::http::StatusCode::OK, Json(value));
+                }
             }
             Err(_) => {
                 tracing::warn!("DEDUP: sender dropped, processing query ourselves");
@@ -4825,7 +5020,10 @@ async fn handle_search(
         // of data-loss bug — only the non-operator term text may be corrected).
         for w in q_trimmed.split_whitespace() {
             let wl = w.to_lowercase();
-            if wl.starts_with("site:") || wl.starts_with("filetype:") || wl.starts_with("after:") || wl.starts_with("before:") {
+            if wl.starts_with("site:") || wl.starts_with("filetype:") || wl.starts_with("after:")
+                || wl.starts_with("before:") || wl.starts_with("intitle:") || wl.starts_with("inurl:")
+                || wl.starts_with("intext:") || wl.starts_with("lang:")
+            {
                 reconstructed.push(' ');
                 reconstructed.push_str(w);
             }
@@ -5340,6 +5538,24 @@ async fn handle_search(
     if intent.structured_constraints.before_date.is_none() {
         intent.structured_constraints.before_date = gateway_extracted.before_date;
     }
+    // Price: the gateway parser preserves the explicit `<`/`>` operators from the
+    // query (e.g. `price:<100`), whereas the intent engine only populates the
+    // range bounds. Prefer the gateway-extracted price fields so the operator is
+    // not silently dropped from applied_constraints.
+    if gateway_extracted.price_lt.is_some() {
+        intent.structured_constraints.price_lt = gateway_extracted.price_lt;
+        intent.structured_constraints.price_max = intent.structured_constraints.price_max.or(gateway_extracted.price_lt);
+    }
+    if gateway_extracted.price_gt.is_some() {
+        intent.structured_constraints.price_gt = gateway_extracted.price_gt;
+        intent.structured_constraints.price_min = intent.structured_constraints.price_min.or(gateway_extracted.price_gt);
+    }
+    if gateway_extracted.price_min.is_some() {
+        intent.structured_constraints.price_min = gateway_extracted.price_min;
+    }
+    if gateway_extracted.price_max.is_some() {
+        intent.structured_constraints.price_max = gateway_extracted.price_max;
+    }
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
 
     // P3 fix: inject detected location as a Target entity so structured_constraints.entities
@@ -5539,6 +5755,79 @@ async fn handle_search(
                     intent.confidence = intent.confidence.max(0.30);
                 }
             }
+
+            // Override 7: weather / forecast queries → fresh (time-sensitive, never navigational).
+            // "weather forecast tomorrow" is routinely mislabeled navigational by the engine.
+            let weather_signals = [
+                "weather", "forecast", "temperature", "rain", "snow", "humidity",
+                "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
+            ];
+            let has_weather_signal = weather_signals.iter().any(|s| q_lower.contains(s));
+            if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" {
+                tracing::info!(
+                    "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
+                    q, intent.intent, intent.confidence
+                );
+                intent.intent = "fresh".to_string();
+                intent.confidence = intent.confidence.max(0.45);
+                let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
+                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+                intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
+            }
+
+            // Override 8: procedural / how-to queries → how-to (with technical secondary).
+            // e.g. "linux find files modified last 7 days", "how to fix npm ERR_MODULE_NOT_FOUND".
+            // The engine often mislabels step-by-step operational queries as navigational.
+            let howto_signals = [
+                "how to", "how do i", "how do you", "how can i", "how can you", "how to's",
+                "tutorial", "step by step", "step-by-step", "ways to", "guide to", "guide:",
+                "find files", "find the", "modified", "fix ", "install", "configure",
+                "set up", "setup", "uninstall", "upgrade", "build from", "compile",
+                "debug", "troubleshoot", "resolve", "workaround",
+            ];
+            let has_howto_signal = howto_signals.iter().any(|s| q_lower.contains(s));
+            if has_howto_signal
+                && (intent.intent == "navigational" || intent.confidence < 0.40)
+                && intent.intent != "how-to"
+            {
+                tracing::info!(
+                    "INTENT OVERRIDE (STRONG): how-to query '{}' was '{}' (conf={:.3}) → how-to",
+                    q, intent.intent, intent.confidence
+                );
+                intent.intent = "how-to".to_string();
+                intent.confidence = intent.confidence.max(0.45);
+                let howto_prob = intent.distribution.get("how-to").copied().unwrap_or(0.0);
+                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+                intent.distribution.insert("how-to".to_string(), (howto_prob + current_top_prob * 0.5).min(0.85));
+                // Technical is a natural secondary intent for operational/dev queries.
+                let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
+                intent.distribution.insert("technical".to_string(), tech_prob + 0.15);
+            }
+
+            // Override 9: research / study queries → informational (with technical secondary).
+            // e.g. "covid vaccine efficacy studies", "attention is all you need paper".
+            let research_signals = [
+                "study", "studies", "efficacy", "research", "analysis", "literature",
+                "paper", "survey", "whitepaper", "benchmark", "experiment", "findings",
+                "meta-analysis", "peer review", "journal", "abstract",
+            ];
+            let has_research_signal = research_signals.iter().any(|s| q_lower.contains(s));
+            if has_research_signal
+                && (intent.intent == "navigational" || intent.confidence < 0.40)
+                && intent.intent != "informational"
+            {
+                tracing::info!(
+                    "INTENT OVERRIDE (STRONG): research query '{}' was '{}' (conf={:.3}) → informational",
+                    q, intent.intent, intent.confidence
+                );
+                intent.intent = "informational".to_string();
+                intent.confidence = intent.confidence.max(0.45);
+                let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+                intent.distribution.insert("informational".to_string(), (info_prob + current_top_prob * 0.5).min(0.85));
+                let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
+                intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
+            }
         }
     }
 
@@ -5698,6 +5987,10 @@ async fn handle_search(
     // Aggregate SearXNG results from all query variations
     // Track per-engine result counts for degradation detection
     let mut engine_counts: HashMap<String, u64> = HashMap::new();
+    // Track upstream SearXNG instance health for the "all upstream failed" signal.
+    // seax_results is consumed by the into_iter() below, so count here before it moves.
+    let mut searx_instances_total: usize = searx_results.len();
+    let mut searx_instances_ok: usize = 0;
     for (orig_idx, searx_res) in searx_results.into_iter() {
         let instance_key = &searx_instance_keys[orig_idx];
         match searx_res {
@@ -5705,6 +5998,7 @@ async fn handle_search(
                 let n = searx_data.results.len();
                 tracing::info!("SearXNG variation {} returned {} results", orig_idx, n);
                 if n > 0 {
+                    searx_instances_ok += 1;
                     circuit_ref.record_success(instance_key);
                     // Track last-used time for connection-cooldown aware routing
                     if let Some(url) = searx_key_to_url.get(instance_key) {
@@ -6313,6 +6607,17 @@ async fn handle_search(
         }
     }
 
+    // Soft boost for intitle:/inurl:/intext: — these are enforced upstream and
+    // must NOT hard-drop (would re-create the n=0 trap). Nudge ranking instead.
+    if !intent.structured_constraints.intitle.is_empty()
+        || !intent.structured_constraints.inurl.is_empty()
+        || !intent.structured_constraints.intext.is_empty()
+    {
+        for r in web_results.iter_mut() {
+            r.score += constraint_boost(&r.title, &r.content, &r.url, &intent.structured_constraints);
+        }
+    }
+
     let has_any_constraints = !intent.structured_constraints.negative.is_empty()
         || !intent.structured_constraints.file_types.is_empty()
         || !intent.structured_constraints.sites.is_empty()
@@ -6630,7 +6935,7 @@ async fn handle_search(
         }
     }
     
-let mut results = tokio::task::spawn_blocking(move || {
+let mut results = match tokio::task::spawn_blocking(move || {
         merge_local_and_web(
             local_results,
             web_results,
@@ -6640,7 +6945,18 @@ let mut results = tokio::task::spawn_blocking(move || {
             Some(&distribution_clone),
             geo_clone.as_ref(),
         )
-    }).await.unwrap();
+    }).await {
+        Ok(r) => r,
+        Err(e) => {
+            // The blocking ranking task panicked (or was cancelled). Surface a
+            // structured JSON error instead of unwinding the handler and leaving
+            // the client with an empty/aborted body.
+            tracing::error!("Ranking task failed for query '{}': {:?}", q_trimmed, e);
+            let mut err_resp = make_error_response(q_trimmed, "ranking_failed", "Search ranking failed internally; please retry", false);
+            err_resp.0 = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+            return err_resp;
+        }
+    };
 
     // 8b. Post-merge hard negative filter: apply negative constraints to ALL results
     // (local + web). The pre-merge filter only catches web results; local index
@@ -6826,6 +7142,17 @@ let mut results = tokio::task::spawn_blocking(move || {
         !should_filter_by_constraints(&r.title, &r.content, &r.url, r.published_date.as_deref(), &intent.structured_constraints)
     });
 
+    // Soft boost for intitle:/inurl:/intext: (enforced upstream, never hard-drop).
+    if !intent.structured_constraints.intitle.is_empty()
+        || !intent.structured_constraints.inurl.is_empty()
+        || !intent.structured_constraints.intext.is_empty()
+    {
+        for r in results.iter_mut() {
+            r.score += constraint_boost(&r.title, &r.content, &r.url, &intent.structured_constraints);
+        }
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
     // Sanitize content and clamp final score for safe JSON serialization and API spec conformance.
     // clean::clean_result_content strips HTML/CSS, decodes HTML entities, and removes scraped-page
     // boilerplate; is_junk_content then drops results that are empty / fetch-error / below an
@@ -6882,6 +7209,10 @@ let mut results = tokio::task::spawn_blocking(move || {
     // Renormalize distribution before returning
     renormalize_distribution(&mut intent.distribution);
 
+    // Mutable error/message so we can signal upstream-unavailable below.
+    let mut error: Option<String> = None;
+    let mut message: Option<String> = None;
+
     // Apply pagination (limit & offset)
     let limit = params.limit.or(params.count).or(params.n).unwrap_or(24);
     let offset = params.offset.unwrap_or(0);
@@ -6904,10 +7235,25 @@ let mut results = tokio::task::spawn_blocking(move || {
     for u in &sc.inurl { applied.push(format!("inurl:{}", u)); }
     for t in &sc.intext { applied.push(format!("intext:{}", t)); }
     for r in &sc.related { applied.push(format!("related:{}", r)); }
-    if sc.price_min.is_some() || sc.price_max.is_some() {
-        let lo = sc.price_min.map(|v| v.to_string()).unwrap_or_else(|| "*".to_string());
-        let hi = sc.price_max.map(|v| v.to_string()).unwrap_or_else(|| "*".to_string());
-        applied.push(format!("price:{}-{}", lo, hi));
+    let has_range = sc.price_min.is_some() || sc.price_max.is_some();
+    let has_lt = sc.price_lt.is_some();
+    let has_gt = sc.price_gt.is_some();
+    if has_range || has_lt || has_gt {
+        // Preserve the operator the user actually typed. An explicit `<`/`>` in
+        // the query is reported verbatim (e.g. `price:<100`) so it is not silently
+        // rewritten to a range. A plain `price:100` (no operator) is normalized to
+        // an upper bound and reported as `price:<100` by convention.
+        if let Some(v) = sc.price_lt {
+            applied.push(format!("price:<{}", v));
+        }
+        if let Some(v) = sc.price_gt {
+            applied.push(format!("price:>{}", v));
+        }
+        if !has_lt && !has_gt {
+            let lo = sc.price_min.map(|v| v.to_string()).unwrap_or_else(|| "*".to_string());
+            let hi = sc.price_max.map(|v| v.to_string()).unwrap_or_else(|| "*".to_string());
+            applied.push(format!("price:{}-{}", lo, hi));
+        }
     }
     for n in &sc.negative { applied.push(format!("not:{}", n)); }
 
@@ -6916,7 +7262,8 @@ let mut results = tokio::task::spawn_blocking(move || {
             "date range — no returned result carried a parseable date, so filtering relied on the upstream engine only".to_string(),
         );
     }
-    if (sc.price_min.is_some() || sc.price_max.is_some()) && priced_result_count == 0 {
+    if (sc.price_min.is_some() || sc.price_max.is_some()
+        || sc.price_lt.is_some() || sc.price_gt.is_some()) && priced_result_count == 0 {
         ignored.push(
             "price — no returned result snippet carried a detectable price, so no results could be narrowed".to_string(),
         );
@@ -6927,6 +7274,26 @@ let mut results = tokio::task::spawn_blocking(move || {
         );
     }
 
+    // Upstream-unavailable signalling: when the response is an empty result set,
+    // distinguish a genuine zero-hit from a total upstream failure. Previously the
+    // gateway returned 200 + results:[] with no error body — a blank page that is
+    // indistinguishable from a real zero-hit. Here we surface an explicit signal so
+    // clients/monitoring can tell "nothing matched" apart from "everything broke".
+    // We detect failure from the main SearXNG fan-out: if EVERY instance errored
+    // (or returned nothing) AND the final merged result set is empty, the upstream
+    // tier is unavailable rather than merely empty.
+    let all_upstream_failed =
+        searx_instances_total > 0 && searx_instances_ok == 0 && post_filter_count == 0;
+    if all_upstream_failed {
+        error = Some("upstream_unavailable".to_string());
+        message = Some(
+            "All upstream search engines timed out or failed to respond. This is a temporary upstream/connectivity issue, not a genuine zero-hit. Please retry.".to_string(),
+        );
+        tracing::warn!(
+            "UPSTREAM UNAVAILABLE: all {} SearXNG instance(s) failed and no results were produced for '{}'",
+            searx_instances_total, q_trimmed
+        );
+    }
     if pre_filter_count > 0 && post_filter_count == 0 {
         warnings.push(
             "All web results were removed by your constraints. Try relaxing them (wider date range, or drop a negative term).".to_string(),
@@ -6950,8 +7317,8 @@ let mut results = tokio::task::spawn_blocking(move || {
         results: paginated_results,
         geo_location,
         spell_corrected_query: if spell_changed { Some(q.clone()) } else { None },
-        error: None,
-        message: None,
+        error,
+        message,
         query_quality: if qflag == "low" { Some("low".to_string()) } else { None },
         applied_constraints: if applied.is_empty() { None } else { Some(applied) },
         ignored_constraints: if ignored.is_empty() { None } else { Some(ignored) },
@@ -6972,6 +7339,11 @@ let mut results = tokio::task::spawn_blocking(move || {
         for sender in waiters {
             let _ = sender.send(response_json.clone());
         }
+    }
+    // Normal completion: the entry is removed above, so the RAII guard must not
+    // remove it again (and must not run its panic-path cleanup).
+    if let Some(guard) = dedup_guard.take() {
+        guard.complete();
     }
 
     (axum::http::StatusCode::OK, Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({}))))
@@ -7023,6 +7395,8 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     let mut related = Vec::new();
     let mut price_min = None;
     let mut price_max = None;
+    let mut price_lt = None;
+    let mut price_gt = None;
     let mut language = None;
     
     // Parse phrases (quotes)
@@ -7125,9 +7499,11 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         let rest = &q[after..];
         let end = rest.find(' ').unwrap_or(rest.len());
         let val = rest[..end].trim().to_lowercase();
-        if let Some((pmin, pmax)) = parse_price_range(&val) {
-            price_min = pmin.or(price_min);
-            price_max = pmax.or(price_max);
+        if let Some(p) = parse_price_range(&val) {
+            price_min = p.min.or(price_min);
+            price_max = p.max.or(price_max);
+            price_lt = p.lt.or(price_lt);
+            price_gt = p.gt.or(price_gt);
         }
     }
 
@@ -7180,6 +7556,8 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         related,
         price_min,
         price_max,
+        price_lt,
+        price_gt,
     }
 }
 
@@ -7391,5 +7769,43 @@ mod constraint_fix_tests {
         c.negative = vec!["trump".to_string()];
         let score = constraint_score("Trump speech", "https://x.com/trump", "trump said things", &c);
         assert!(score < 0.05, "trump-mentioning result should score near-zero for -trump");
+    }
+
+    #[test]
+    fn preprocess_preserves_native_operators() {
+        // BUG1a: intitle:/inurl:/intext: must be FORWARDED to SearXNG,
+        // not stripped (the old behaviour zeroed out `rust inurl:blog` → `rust`).
+        let q = preprocess_searxng_query("rust inurl:blog");
+        assert!(q.contains("inurl:blog"), "inurl: must survive preprocessing, got: '{}'", q);
+        let q2 = preprocess_searxng_query("cli intitle:deploy");
+        assert!(q2.contains("intitle:deploy"), "intitle: must survive preprocessing, got: '{}'", q2);
+        let q3 = preprocess_searxng_query("docs intext:quickstart");
+        assert!(q3.contains("intext:quickstart"), "intext: must survive preprocessing, got: '{}'", q3);
+        // Non-operator term is retained alongside the operator.
+        assert!(q.contains("rust"), "operator query must keep its plain term, got: '{}'", q);
+    }
+
+    #[test]
+    fn intitle_inurl_no_longer_hard_drop() {
+        // BUG1b: should_filter_by_constraints must NOT hard-drop results that
+        // lack the intitle:/inurl:/intext: token. The engine enforces upstream;
+        // the gateway only boosts. A bare result for `rust inurl:blog` must pass.
+        let mut c = cst();
+        c.inurl = vec!["blog".to_string()];
+        let kept = should_filter_by_constraints(
+            "Rust blog",
+            "A rust programming blog post",
+            "https://example.com/about", // does NOT contain "blog" in url
+            None,
+            &c,
+        );
+        assert!(!kept, "inurl: must NOT hard-drop when engine is the enforcer (was the n=0 trap)");
+        // And the boost rewards results that DO satisfy the operator.
+        let mut c2 = cst();
+        c2.inurl = vec!["blog".to_string()];
+        let boost = constraint_boost("Rust blog", "post", "https://example.com/blog/rust", &c2);
+        assert!(boost > 0.0, "inurl:-matching result should receive a positive boost");
+        let boost_none = constraint_boost("Rust", "post", "https://example.com/x", &c2);
+        assert_eq!(boost_none, 0.0, "non-matching result should get no intitle/inurl/intext boost");
     }
 }
