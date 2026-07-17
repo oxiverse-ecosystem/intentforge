@@ -135,7 +135,7 @@ pub struct EmbedResponse {
 // ─── App State (no more Qwen!) ──────────────────────────────────────
 
 pub struct AppState {
-    pub bert_model: Mutex<BertModel>,
+    pub bert_model: Arc<BertModel>,
     pub bert_tokenizer: Tokenizer,
     pub device: Device,
     pub intent_cache: Cache<String, IntentResponse>,
@@ -2305,12 +2305,25 @@ async fn main() -> anyhow::Result<()> {
         .build();
 
     let state = Arc::new(AppState {
-        bert_model: Mutex::new(bert_model),
+        bert_model: Arc::new(bert_model),
         bert_tokenizer,
         device,
         intent_cache,
         embed_cache,
-        bert_semaphore: Semaphore::new(2),
+        // Concurrency for the CPU-bound BERT forward pass. The model is
+        // immutable (`forward` takes &self), so there is no shared-mutable
+        // state to serialize — this semaphore alone bounds true parallelism.
+        // Tunable via INTENT_MAX_CONCURRENCY (default 4, matching the
+        // RAYON_NUM_THREADS budget). The previous Semaphore::new(2) throttled
+        // inference so hard that burst traffic queued past the gateway's
+        // intent budget, surfacing as "Intent Engine unreachable" blips.
+        bert_semaphore: Semaphore::new(
+            std::env::var("INTENT_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n >= 1 && n <= 16)
+                .unwrap_or(4),
+        ),
     });
 
     let app = Router::new()
@@ -2376,8 +2389,7 @@ async fn analyze_query(
         let state_clone = state.clone();
         let query_text = params.q.clone();
         tokio::task::spawn_blocking(move || {
-            let bert_model = state_clone.bert_model.lock().unwrap();
-            compute_embedding(&state_clone.device, &*bert_model, &state_clone.bert_tokenizer, &query_text)
+            compute_embedding(&state_clone.device, &state_clone.bert_model, &state_clone.bert_tokenizer, &query_text)
         }).await.unwrap_or(None)
     };
 
@@ -2525,8 +2537,7 @@ async fn embed_text(
         let state_clone = state.clone();
         let text = params.text.clone();
         tokio::task::spawn_blocking(move || {
-            let bert_model = state_clone.bert_model.lock().unwrap();
-            compute_embedding(&state_clone.device, &*bert_model, &state_clone.bert_tokenizer, &text)
+            compute_embedding(&state_clone.device, &state_clone.bert_model, &state_clone.bert_tokenizer, &text)
                 .unwrap_or_else(|| vec![0.0; 384])
         }).await.unwrap_or_else(|_| vec![0.0; 384])
     };

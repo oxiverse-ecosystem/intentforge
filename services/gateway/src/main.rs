@@ -6234,25 +6234,36 @@ async fn handle_search(
                 let client = client.clone();
                 let key = retry_key.clone();
                 let url_for_log = retry_url[..retry_url.find('?').unwrap_or(retry_url.len())].to_string();
+                let fallback_key = key.clone();
+                let fallback_url = url_for_log.clone();
                 retry_futs.push(Box::pin(async move {
-                    let result: Result<SearxResponse, String> = match tokio::time::timeout(
-                        retry_timeout,
-                        client.get(&retry_url).send(),
-                    ).await {
-                        Ok(Ok(resp)) => {
-                            let raw = match tokio::time::timeout(Duration::from_secs(3), resp.text()).await {
-                                Ok(Ok(t)) => t,
-                                _ => return (inst_idx, key, url_for_log, Err("retry body read timeout".into())),
-                            };
-                            let sanitized = sanitize_json_text(&raw);
-                            match serde_json::from_str::<SearxResponse>(&sanitized) {
-                                Ok(data) => Ok(data),
-                                Err(e) => Err(format!("retry parse error: {:?}", e)),
+                    let retry_client = client.clone();
+                    let retry_url_owned = retry_url.clone();
+                    let task = tokio::spawn(async move {
+                        match tokio::time::timeout(
+                            retry_timeout,
+                            retry_client.get(&retry_url_owned).send(),
+                        ).await {
+                            Ok(Ok(resp)) => {
+                                let raw = match tokio::time::timeout(Duration::from_secs(3), resp.text()).await {
+                                    Ok(Ok(t)) => t,
+                                    _ => return (inst_idx, key, url_for_log, Err("retry body read timeout".into())),
+                                };
+                                let sanitized = sanitize_json_text(&raw);
+                                match serde_json::from_str::<SearxResponse>(&sanitized) {
+                                    Ok(data) => (inst_idx, key, url_for_log, Ok(data)),
+                                    Err(e) => (inst_idx, key, url_for_log, Err(format!("retry parse error: {:?}", e))),
+                                }
                             }
+                            Ok(Err(e)) => (inst_idx, key, url_for_log, Err(format!("retry request error: {:?}", e))),
+                            Err(_) => (inst_idx, key, url_for_log, Err("retry timeout".into())),
                         }
-                        Ok(Err(e)) => Err(format!("retry request error: {:?}", e)),
-                        Err(_) => Err("retry timeout".into()),
-                    };
+                    });
+                    let (inst_idx, key, url_for_log, result): (usize, String, String, Result<SearxResponse, String>) =
+                        match tokio::time::timeout(retry_timeout + Duration::from_millis(200), task).await {
+                            Ok(inner) => inner.unwrap_or_else(|e| (inst_idx, fallback_key.clone(), fallback_url.clone(), Err(format!("retry join error: {:?}", e)))),
+                            Err(_) => (inst_idx, fallback_key.clone(), fallback_url.clone(), Err("retry task budget exceeded".into())),
+                        };
                     (inst_idx, key, url_for_log, result)
                 }));
             }

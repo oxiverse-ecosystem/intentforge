@@ -212,8 +212,8 @@ services:
       context: ./intent-engine
       dockerfile: Dockerfile
     container_name: if-dev-intent-engine
-    mem_limit: 256m
-    mem_reservation: 128m
+    mem_limit: 512m
+    mem_reservation: 256m
     volumes:
       - ./intent-engine/models:/app/models
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
@@ -242,8 +242,8 @@ services:
       context: ./gateway
       dockerfile: Dockerfile
     container_name: if-dev-gateway
-    mem_limit: 1024m
-    mem_reservation: 256m
+    mem_limit: 4096m
+    mem_reservation: 1024m
     environment:
       - INTENT_ENGINE_URL=http://localhost:3005
       - SEARXNG_URL=http://localhost:8080
