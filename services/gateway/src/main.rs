@@ -5246,18 +5246,27 @@ async fn handle_search(
     let all_searx_open = searx_instance_open.iter().all(|&o| o);
     let invidious_open = circuit_ref.is_open("invidious");
 
-    let indexer_fut = async {
-        match tokio::time::timeout(Duration::from_secs(1), client_ref.get(&indexer_query_raw).send()).await {
+    // NOTE (flaky-connection fix): the indexer lives behind gluetun and its
+    // connection can stall in a way an inline `tokio::time::timeout` around
+    // `client.get().send()` does NOT reliably interrupt (observed: the whole
+    // handler hung 26s with the timeout never firing). So we run the indexer
+    // fetch in a DETACHED spawned task and join it with a hard budget. If it
+    // stalls, the parent handler proceeds with empty local results instead of
+    // hanging the entire response.
+    let indexer_client = client_ref.clone();
+    let indexer_q_raw = indexer_query_raw.clone();
+    let indexer_task = tokio::spawn(async move {
+        match tokio::time::timeout(Duration::from_millis(1500), indexer_client.get(&indexer_q_raw).send()).await {
             Ok(Ok(resp)) => {
                 let status = resp.status();
-                match tokio::time::timeout(Duration::from_secs(1), resp.json::<Vec<IndexerResult>>()).await {
+                match tokio::time::timeout(Duration::from_millis(1500), resp.json::<Vec<IndexerResult>>()).await {
                     Ok(Ok(data)) => Ok(data),
                     Ok(Err(e)) => {
                         tracing::error!("Failed to parse Indexer JSON (status: {}): {:?}", status, e);
                         Err(e)
                     }
                     Err(_) => {
-                        tracing::warn!("Indexer JSON read timed out after 2s");
+                        tracing::warn!("Indexer JSON read timed out — using empty results");
                         Ok(vec![])
                     }
                 }
@@ -5267,11 +5276,11 @@ async fn handle_search(
                 Err(e)
             }
             Err(_) => {
-                tracing::warn!("Indexer request timed out after 2s — using empty results");
+                tracing::warn!("Indexer request timed out — using empty results");
                 Ok(vec![])
             }
         }
-    };
+    });
 
     // Fire all SearXNG instances in parallel. No retry on 0 results — IP rotation only.
     let searx_futs: Vec<_> = searx_urls.iter().enumerate().map(|(i, url)| {
@@ -5498,7 +5507,7 @@ async fn handle_search(
     let (intent_result, embed_res, indexer_res, searx_results, invidious_res, news_res, image_res) = tokio::join!(
         intent_fut,
         embed_fut,
-        indexer_fut,
+        indexer_task,
         searx_fut_with_timeout,
         invidious_fut,
         news_fut,
@@ -5928,10 +5937,17 @@ async fn handle_search(
     // For now, scoring uses intent-based weighting on the raw query results
 
     // 4. Process Local Results
+    // indexer_res is Result<Result<Vec<IndexerResult>, reqwest::Error>, JoinError>:
+    // outer = join-timeout/budget, inner = the spawned task's own outcome (which
+    // itself returns Ok(vec) on success OR on timeout, Err only on hard failure).
     let mut local_results: Vec<IndexerResult> = match indexer_res {
-        Ok(res) => res,
-        Err(e) => {
-            tracing::error!("Indexer search failed/timed out: {:?}", e);
+        Ok(Ok(res)) => res,
+        Ok(Err(_)) => {
+            tracing::warn!("Indexer search hard-failed — using empty local results");
+            vec![]
+        }
+        Err(_) => {
+            tracing::warn!("Indexer search task panicked/timed out — using empty local results");
             vec![]
         }
     };
@@ -5940,6 +5956,14 @@ async fn handle_search(
     // The initial indexer call (parallel fan-out) ran without the embedding
     // because it wasn't available yet. Re-query with the vector for RRF fusion
     // of BM25 + semantic similarity, giving better results for natural language queries.
+    // NOTE (flaky-connection fix): the vector re-query talks to the indexer over a
+    // connection that, behind gluetun/VPN, can stall in a way that is NOT reliably
+    // interrupted by an inline `tokio::time::timeout` wrapping `client.get().send()`
+    // (observed: the handler hung 28-31s with the timeout never firing, dropping the
+    // whole response). This re-query is a non-essential RRF *enhancement* — it must
+    // never block the critical response path. So we run it in a DETACHED spawned task
+    // and join it with a hard budget. If the task (or its connection) hangs, the parent
+    // handler still returns on time with the BM25 results already in `local_results`.
     if let Some(ref vec) = vector {
         let vec_str = serde_json::to_string(vec).unwrap_or_default();
         let indexer_q = if let Some(ref stripped) = stripped_override {
@@ -5953,28 +5977,34 @@ async fn handle_search(
             indexer_q_encoded,
             urlencoding::encode(&vec_str)
         );
-        match tokio::time::timeout(
-            Duration::from_secs(1),
-            client.get(&indexer_url_vec).send()
-        ).await {
-            Ok(Ok(resp)) => {
-                match tokio::time::timeout(Duration::from_secs(1), resp.json::<Vec<IndexerResult>>()).await {
-                    Ok(Ok(vec_results)) => {
-                        if !vec_results.is_empty() {
-                            tracing::info!(
-                                "Vector-enhanced indexer returned {} results (vs {} BM25-only)",
-                                vec_results.len(),
-                                local_results.len()
-                            );
-                            local_results = vec_results;
-                        }
+        let client_for_vec = client.clone();
+        let vec_task = tokio::spawn(async move {
+            match tokio::time::timeout(
+                Duration::from_millis(1500),
+                client_for_vec.get(&indexer_url_vec).send(),
+            ).await {
+                Ok(Ok(resp)) => {
+                    match tokio::time::timeout(Duration::from_millis(1500), resp.json::<Vec<IndexerResult>>()).await {
+                        Ok(Ok(vec_results)) if !vec_results.is_empty() => Some(vec_results),
+                        _ => None,
                     }
-                    Ok(Err(e)) => tracing::warn!("Vector indexer JSON parse error: {:?}", e),
-                    Err(_) => tracing::warn!("Vector indexer JSON read timed out"),
                 }
+                _ => None,
             }
-            Ok(Err(e)) => tracing::warn!("Vector indexer request failed: {:?}", e),
-            Err(_) => tracing::warn!("Vector indexer re-query timed out"),
+        });
+        // Join the detached task with a hard budget. If it hangs, we keep BM25 results.
+        match tokio::time::timeout(Duration::from_millis(1600), vec_task).await {
+            Ok(Ok(Some(vec_results))) => {
+                tracing::info!(
+                    "Vector-enhanced indexer returned {} results (vs {} BM25-only)",
+                    vec_results.len(),
+                    local_results.len()
+                );
+                local_results = vec_results;
+            }
+            Ok(Ok(None)) => { /* no vector hits; keep BM25 */ }
+            Ok(Err(e)) => tracing::warn!("Vector indexer task panicked: {:?}", e),
+            Err(_) => tracing::warn!("Vector indexer re-query timed out — keeping BM25 results"),
         }
     }
 
