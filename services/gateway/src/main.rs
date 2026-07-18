@@ -119,6 +119,12 @@ struct IntentResponse {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct SearxResponse {
     results: Vec<SearxResult>,
+    // Captures engine-level failures (e.g. ["brave", "too many requests"]).
+    // SearXNG-internal rate limits arrive as HTTP 200 (not 429), so the
+    // gateway's 429-only rotation trigger misses them. We inspect this to
+    // rotate IPs when an engine reports suspension/rate-limiting.
+    #[serde(default)]
+    unresponsive_engines: Vec<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -5384,7 +5390,7 @@ async fn handle_search(
         let ratelimit_for_searx = state.rate_limits.clone();
         async move {
             if is_open {
-                return Ok(SearxResponse { results: vec![] });
+                return Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] });
             }
             // NOTE (flaky-connection fix): the SearXNG instance is reached
             // through gluetun/VPN, whose connections can stall in a way an
@@ -5401,11 +5407,11 @@ async fn handle_search(
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => {
                         tracing::warn!("SearXNG instance request failed: {:?}", e);
-                        return SearxResponse { results: vec![] };
+                        return SearxResponse { results: vec![], unresponsive_engines: vec![] };
                     }
                     Err(_) => {
                         tracing::warn!("SearXNG instance timed out (4s): {}", &url[..url.find('?').unwrap_or(url.len())]);
-                        return SearxResponse { results: vec![] };
+                        return SearxResponse { results: vec![], unresponsive_engines: vec![] };
                     }
                 };
                 let status = resp.status();
@@ -5424,19 +5430,51 @@ async fn handle_search(
                     Ok(Ok(t)) => t,
                     Ok(Err(e)) => {
                         tracing::warn!("SearXNG instance body read error: {}", e);
-                        return SearxResponse { results: vec![] };
+                        return SearxResponse { results: vec![], unresponsive_engines: vec![] };
                     }
                     Err(_) => {
                         tracing::warn!("SearXNG instance body read timed out (4s)");
-                        return SearxResponse { results: vec![] };
+                        return SearxResponse { results: vec![], unresponsive_engines: vec![] };
                     }
                 };
                 let sanitized = sanitize_json_text(&raw);
                 match serde_json::from_str::<SearxResponse>(&sanitized) {
-                    Ok(data) => data,
+                    Ok(data) => {
+                        // SearXNG-internal rate limits (TooManyRequests /
+                        // AccessDenied / suspended) arrive as HTTP 200 with an
+                        // `unresponsive_engines` entry — the 429-only rotation
+                        // trigger at the top of this task misses them. Detect the
+                        // signal here and rotate BOTH VPN and Tor IPs so the
+                        // suspended engine's IP cools instead of being hammered
+                        // through the whole server-side ban window.
+                        let rate_limited = data.unresponsive_engines.iter().any(|e| {
+                            e.get(1)
+                                .map(|msg| {
+                                    let m = msg.to_lowercase();
+                                    m.contains("too many request")
+                                        || m.contains("rate")
+                                        || m.contains("suspend")
+                                        || m.contains("403")
+                                        || m.contains("access denied")
+                                        || m.contains("captcha")
+                                })
+                                .unwrap_or(false)
+                        });
+                        if rate_limited {
+                            let rl_count = ratelimit_for_searx.count_in_window(300);
+                            ratelimit_for_searx.record();
+                            let new_count = ratelimit_for_searx.count_in_window(300);
+                            tracing::warn!(
+                                "SearXNG engine rate-limited (HTTP 200, unresponsive_engines) — rotating IPs: {} → {}",
+                                rl_count, new_count
+                            );
+                            rotate_all_ips(&format!("engine_ratelimit_{}", new_count));
+                        }
+                        data
+                    }
                     Err(e) => {
                         tracing::error!("Failed to parse SearXNG JSON (status: {}): {:?}", status, e);
-                        SearxResponse { results: vec![] }
+                        SearxResponse { results: vec![], unresponsive_engines: vec![] }
                     }
                 }
             });
@@ -5444,11 +5482,11 @@ async fn handle_search(
                 Ok(Ok(inner)) => Ok(inner),
                 Ok(Err(_)) => {
                     tracing::warn!("SearXNG instance task panicked — empty results");
-                    Ok(SearxResponse { results: vec![] })
+                    Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] })
                 }
                 Err(_) => {
                     tracing::warn!("SearXNG instance task timed out (budget) — empty results");
-                    Ok(SearxResponse { results: vec![] })
+                    Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] })
                 }
             }
         }

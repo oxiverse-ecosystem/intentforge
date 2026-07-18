@@ -48,10 +48,10 @@ search:
     - html
     - json
   suspended_times:
-    SearxEngineAccessDenied: 0
-    SearxEngineCaptcha: 0
-    SearxEngineTooManyRequests: 0
-    SearxEngineTimeout: 0
+    SearxEngineAccessDenied: 60
+    SearxEngineCaptcha: 60
+    SearxEngineTooManyRequests: 30
+    SearxEngineTimeout: 10
   default_lang: "en"
 
 outgoing:

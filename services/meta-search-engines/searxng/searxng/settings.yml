@@ -32,12 +32,20 @@ search:
   formats:
     - html
     - json
-  # Auto-suspend engines disabled (set to 0) because gateway and vpn-rotator handle IP rotation dynamically.
+  # Auto-suspend engines with REAL backoff. Previously set to 0 ("gateway and
+  # vpn-rotator handle IP rotation") — but the gateway only rotates on HTTP 429,
+  # while engines actually fail with SearxEngineTooManyRequestsException served
+  # as HTTP 200. With suspended_time=0 SearXNG hammered the same VPN IP every
+  # query through the whole server-side suspension window (confirmed in logs:
+  # brave/wikipedia "Too many request (suspended_time=0)" repeating every 1s).
+  # Non-zero values let each instance self-heal: a rate-limited engine is skipped
+  # for N seconds, so the gateway's fan-out leans on the other instance, and the
+  # IP naturally cools. Complements (does not replace) gateway IP rotation.
   suspended_times:
-    SearxEngineAccessDenied: 0
-    SearxEngineCaptcha: 0
-    SearxEngineTooManyRequests: 0
-    SearxEngineTimeout: 0
+    SearxEngineAccessDenied: 60
+    SearxEngineCaptcha: 60
+    SearxEngineTooManyRequests: 30
+    SearxEngineTimeout: 10
   default_lang: "en"
 
 outgoing:
