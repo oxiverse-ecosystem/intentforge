@@ -1,19 +1,28 @@
-# SearXNG2 settings — Tor-optimized (speed over coverage)
-# Only engines that actually work through Tor exit nodes.
-# Brave: clearnet 429 through Tor exits, so we use brave-onion engine.
-# DuckDuckGo WEB: uses custom onion engine pointing to the onion
-# service at duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion
-# DuckDuckGo images/videos: still use clearnet through Tor exit nodes
+# SearXNG2 settings — Tor-exit path (clearnet engines routed through Tor2
+# SOCKS proxy). INVESTIGATED 2026-07-18: Tor2 itself is healthy (SOCKS proxy
+# works, bing/wikipedia return via Tor exit). The previous .onion engines
+# failed for two RECOVERABLE reasons, not because they were "dead":
+#   - brave-onion: ALIVE but cold onion circuits took 7.9s / warmed ~3.3s —
+#     killed by the 4.0s per-engine timeout AND the gateway's hard 4s fan-out
+#     cap (services/gateway/src/main.rs:5398,5421).
+#   - duckduckgo-onion: reachable but DDG's anti-Tor-abuse returns HTTP 406
+#     ("issue with the Tor Exit Node") intermittently — classified as
+#     unresponsive by SearXNG.
+# The gateway caps the tor2 fan-out at 4s, so the .onion path is fundamentally
+# marginal against that cap. Clearnet engines through the Tor2 EXIT return in
+# ~1-2s (under the cap) and avoid DDG's onion-specific 406 filter — keeping the
+# Tor IP-diversity benefit without the latency cliff.
 
 use_default_settings:
   engines:
     keep_only:
-      # ── Tor-fast engines ──
-      - bing            # 10 results, ~1.5s
-      - wikipedia       # 1-2 results, ~1s
+      # ── Tor-exit clearnet engines (verified working via Tor2) ──
+      - bing            # 10 results, ~1.5s via Tor exit
+      - wikipedia       # 1-2 results, ~1s via Tor exit
       - marginalia      # works well via Tor, ~1.5s
-      - brave-onion     # onion service, ~2.5s
-      - duckduckgo-onion # onion service, ~2.5s
+      - brave           # clearnet through Tor exit
+      - duckduckgo      # clearnet through Tor exit (primary DDG)
+      - duckduckgo-onion # onion front-end: layered bypass if DDG suspends Tor exit IP
       # ── News (fast through Tor) ──
       - bing news
       - google news
@@ -76,28 +85,46 @@ engines:
     disabled: true
     timeout: 1.5
 
-  # Brave clearnet through Tor is unreliable (429 rate-limited). Disable the
-  # default clearnet instance and use the custom brave-onion engine instead.
+  # Brave clearnet through Tor2 exit node (reliable). The old brave-onion
+  # variant pointed at a dead onion service and timed out every query (4s),
+  # dragging the gateway's parallel fan-out into a full 4s wait. Use clearnet.
   - name: brave
-    disabled: true
+    disabled: false
 
-  # Brave via onion service — consistently works through Tor (3-4s, ~20 results).
+  # Brave .onion engine — reachable but cold onion circuits exceed the 4s
+  # engine timeout (and the gateway's hard 4s fan-out cap), so it was
+  # effectively failing. Superseded by clearnet `brave` via Tor2 exit.
+  # Disabled 2026-07-18.
   - name: brave-onion
     engine: brave
     base_url: "https://search.brave4u7jddbv7cyviptqjc7jusxh72uik7zt6adtckl5f4nwy2v72qd.onion/"
-    disabled: false
+    disabled: true
     shortcut: brv
     timeout: 4.0
     categories: general
     network: default
 
-  # DDG via onion service — avoids CAPTCHA on Tor exit nodes
+  # DDG clearnet through Tor2 exit node (reliable, fast ~1-2s, under the
+  # gateway's 4s fan-out cap). Primary DDG path for SearXNG2.
+  - name: duckduckgo
+    disabled: false
+
+  # DDG .onion front-end — RE-ENABLED 2026-07-18 as a LAYERED BYPASS, not a
+  # replacement. Design intent: Tor's job is to bypass search-engine suspensions;
+  # two SearXNG instances = redundancy (VPN IP vs Tor IP). If DDG suspends the
+  # Tor EXIT IP, this onion front-end (a different service) may still answer.
+  # SearXNG fails over across engines in one instance, so clearnet `duckduckgo`
+  # above covers this engine if it 406s. Timeout raised to 10s (instance
+  # max_request_timeout is 12.0) so a slow cold onion circuit isn't killed at 4s.
+  # NOTE: this engine is intentionally NOT counted on the critical latency path —
+  # the gateway's 4s tor2 cap is satisfied by the clearnet engines; the onion
+  # engine contributes when it can and is skipped (harmlessly) when it can't.
   - name: duckduckgo-onion
     engine: duckduckgo
     ddg_url: "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/html/"
     disabled: false
     shortcut: ddo
-    timeout: 4.0
+    timeout: 10.0
     categories: general
     network: default  # use the default network's SOCKS5 proxy for .onion
 
