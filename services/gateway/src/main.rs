@@ -5605,7 +5605,16 @@ async fn handle_search(
         let results_shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let results_inner = results_shared.clone();
 
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(3300), async move {
+        // Overall budget: raised from 3.3s to 5.5s so the SECONDARY instance
+        // (Tor2/SearXNG2) can cover when the PRIMARY (VPN/gluetun) is briefly
+        // unreachable — e.g. during an IP rotation the VPN tunnel drops for
+        // ~5s. Verified: tor2-direct returns 20-40 results within ~1-3s even
+        // while the VPN is down, but the old 3.3s budget expired before tor2's
+        // answer was merged, so the gateway emitted results=0. Normal latency is
+        // unchanged: the primary still early-returns at >=15 results (~3s), so the
+        // budget only extends when the primary is slow/dead and we WANT tor2 to
+        // fill in. Per-branch 4s timeout still caps a hung primary.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(5500), async move {
             while !futs.is_empty() {
                 let ((orig_idx, result), _idx, remaining) = futures::future::select_all(futs).await;
                 futs = remaining;
