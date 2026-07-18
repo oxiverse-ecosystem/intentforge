@@ -5440,35 +5440,50 @@ async fn handle_search(
                 let sanitized = sanitize_json_text(&raw);
                 match serde_json::from_str::<SearxResponse>(&sanitized) {
                     Ok(data) => {
-                        // SearXNG-internal rate limits (TooManyRequests /
-                        // AccessDenied / suspended) arrive as HTTP 200 with an
-                        // `unresponsive_engines` entry — the 429-only rotation
-                        // trigger at the top of this task misses them. Detect the
-                        // signal here and rotate BOTH VPN and Tor IPs so the
-                        // suspended engine's IP cools instead of being hammered
-                        // through the whole server-side ban window.
-                        let rate_limited = data.unresponsive_engines.iter().any(|e| {
+                        // SearXNG-internal failures arrive as HTTP 200 with an
+                        // `unresponsive_engines` entry, so the 429-only trigger at
+                        // the top of this task misses them. BUT rotating IPs on
+                        // EVERY such response causes a self-amplifying storm:
+                        // rotating tor2 (NEWNYM) disrupts its circuits -> next query
+                        // slower -> rate-limit again -> rotate again; and rotating
+                        // the VPN (`status: stopped`) briefly flaps gluetun's
+                        // namespace, dropping the gateway's :4000 socket. Observed:
+                        // 4 rotations in 5 min, gateway unreachable mid-rotation.
+                        //
+                        // Correct policy:
+                        //  - Transient engine rate-limits ("too many requests" /
+                        //    "suspend" / "rate") are SELF-HEALED by SearXNG's
+                        //    suspended_times (TooManyRequests=30) and covered by the
+                        //    OTHER instance (5.5s fan-out budget). Do NOT rotate.
+                        //  - Only a genuine IP BAN (403 / access denied / captcha)
+                        //    warrants an IP rotation. Even then, throttle to once per
+                        //    120s via the existing rate-limit window so a bad IP can't
+                        //    trigger a rotation storm.
+                        let ip_banned = data.unresponsive_engines.iter().any(|e| {
                             e.get(1)
                                 .map(|msg| {
                                     let m = msg.to_lowercase();
-                                    m.contains("too many request")
-                                        || m.contains("rate")
-                                        || m.contains("suspend")
-                                        || m.contains("403")
+                                    m.contains("403")
                                         || m.contains("access denied")
                                         || m.contains("captcha")
                                 })
                                 .unwrap_or(false)
                         });
-                        if rate_limited {
-                            let rl_count = ratelimit_for_searx.count_in_window(300);
-                            ratelimit_for_searx.record();
-                            let new_count = ratelimit_for_searx.count_in_window(300);
-                            tracing::warn!(
-                                "SearXNG engine rate-limited (HTTP 200, unresponsive_engines) — rotating IPs: {} → {}",
-                                rl_count, new_count
-                            );
-                            rotate_all_ips(&format!("engine_ratelimit_{}", new_count));
+                        if ip_banned {
+                            // Throttle: skip if we already rotated within 120s.
+                            if ratelimit_for_searx.count_in_window(120) == 0 {
+                                ratelimit_for_searx.record();
+                                let new_count = ratelimit_for_searx.count_in_window(300);
+                                tracing::warn!(
+                                    "SearXNG engine IP-banned (HTTP 200, unresponsive_engines) — rotating IPs (throttled 120s): {}",
+                                    new_count
+                                );
+                                rotate_all_ips(&format!("engine_ipban_{}", new_count));
+                            } else {
+                                tracing::info!(
+                                    "SearXNG engine IP-banned but rotation throttled (<=120s since last)"
+                                );
+                            }
                         }
                         data
                     }
