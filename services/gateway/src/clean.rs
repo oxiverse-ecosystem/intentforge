@@ -49,6 +49,7 @@ fn strip_json_ld_blobs(input: &str) -> String {
     while i < chars.len() {
         let c = chars[i];
         if c == '"' {
+            let start = i;
             // Copy the string literal, but strip any embedded JSON-LD {...}.
             out.push('"');
             let mut j = i + 1;
@@ -95,6 +96,17 @@ fn strip_json_ld_blobs(input: &str) -> String {
                 }
                 out.push(sc);
                 j += 1;
+            }
+            // If the inner string scan consumed to EOF without finding a closing
+            // quote (unterminated `"` in a scraped snippet) OR bailed out via the
+            // unbalanced-brace path (which sets j = chars.len()), the outer index
+            // `i` was never advanced. Without this guard the outer `continue`
+            // below restarts at the SAME `i`, re-copying forever and growing
+            // `out` without bound → multi-GB allocation → cgroup OOM-kill. Snap
+            // `i` past everything the inner loop consumed so the outer loop can
+            // make progress and terminate.
+            if i <= start {
+                i = chars.len();
             }
             continue;
         }
@@ -491,6 +503,29 @@ pub fn strip_title_echo(content: &str, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_json_ld_unterminated_quote_terminates() {
+        // Regression: a scraped snippet with an UNTERMINATED double-quote used to
+        // trap strip_json_ld_blobs in an infinite loop (the outer index `i` was
+        // never advanced when the inner string scan hit EOF without a closing
+        // quote), growing the output String without bound → multi-GB alloc →
+        // cgroup OOM-kill on the geo-None "near me" path. This must return
+        // promptly and never hang.
+        let malicious = format!("coffee shops near me \"{}", "x".repeat(5000));
+        let out = clean_result_content(&malicious, "coffee shops");
+        // If the bug were present this would hang / OOM before asserting.
+        assert!(out.len() < 20_000, "output grew unexpectedly: {}", out.len());
+    }
+
+    #[test]
+    fn strip_json_ld_unterminated_with_embedded_brace() {
+        // Unterminated quote AND an embedded unbalanced brace inside it — hits the
+        // other non-advancing fall-through (j = chars.len()). Must terminate.
+        let malicious = "prefix \"open {\"@context\":\"https://schema.org\" tail with no close";
+        let out = clean_result_content(malicious, "t");
+        assert!(out.len() < 10_000);
+    }
 
     #[test]
     fn strip_title_echo_pure_title() {

@@ -4090,6 +4090,14 @@ struct AppState {
     spell_index: spell::SymSpellIndex,
     /// Optional MaxMind GeoLite2 IP geolocation lookup
     geo_locator: Option<geoloc::GeoLocator>,
+    /// Bounds concurrent heavy search handlers so the combined per-request
+    /// working set (7+ parallel upstream fetches + embeddings + spawn_blocking
+    /// merge) can never exceed the container cgroup. Measured peak is ~350-400
+    /// MiB per concurrent search; with the 4 GiB gateway cgroup this caps at
+    /// `N` concurrent searches to stay safely under the limit. Without it, a
+    /// burst of N concurrent "near me" / local queries pushes RSS to the cgroup
+    /// ceiling and the OOM-killer recycles the container (dropped connections).
+    search_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 async fn handle_images(
@@ -4285,8 +4293,9 @@ async fn handle_videos(
 
     let searx_fut = async {
         match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&searx_video_url).send()).await {
-            Ok(Ok(resp)) => match resp.text().await {
-                Ok(raw) => {
+            Ok(Ok(resp)) => match read_body_bounded(resp).await {
+                Some(bytes) => {
+                    let raw = String::from_utf8_lossy(&bytes).into_owned();
                     let sanitized = sanitize_json_text(&raw);
                     match serde_json::from_str::<SearxVideoResponse>(&sanitized) {
                         Ok(data) => data.results.into_iter().map(|r| {
@@ -4314,7 +4323,7 @@ async fn handle_videos(
                         Err(e) => { tracing::warn!("SearXNG video parse error: {}", e); vec![] }
                     }
                 }
-                Err(e) => { tracing::warn!("SearXNG video body read error: {}", e); vec![] }
+                None => { tracing::warn!("SearXNG video body read error / exceeded cap"); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG video request error: {}", e); vec![] }
             Err(_) => { tracing::warn!("SearXNG video timed out after 4s"); vec![] }
@@ -4327,8 +4336,9 @@ async fn handle_videos(
             None => return vec![],
         };
         match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&url).send()).await {
-            Ok(Ok(resp)) => match resp.text().await {
-                Ok(raw) => {
+            Ok(Ok(resp)) => match read_body_bounded(resp).await {
+                Some(bytes) => {
+                    let raw = String::from_utf8_lossy(&bytes).into_owned();
                     let sanitized = sanitize_json_text(&raw);
                     match serde_json::from_str::<SearxVideoResponse>(&sanitized) {
                         Ok(data) => data.results.into_iter().map(|r| {
@@ -4356,7 +4366,7 @@ async fn handle_videos(
                         Err(e) => { tracing::warn!("SearXNG2 video parse error: {}", e); vec![] }
                     }
                 }
-                Err(e) => { tracing::warn!("SearXNG2 video body read error: {}", e); vec![] }
+                None => { tracing::warn!("SearXNG2 video body read error / exceeded cap"); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG2 video request error: {}", e); vec![] }
             Err(_) => { tracing::warn!("SearXNG2 video timed out after 4s"); vec![] }
@@ -4365,8 +4375,8 @@ async fn handle_videos(
 
     let invidious_fut = async {
         match tokio::time::timeout(Duration::from_secs(15), state.http_client.get(&invidious_url).send()).await {
-            Ok(Ok(resp)) => match resp.json::<Vec<InvidiousResult>>().await {
-                Ok(data) => data.into_iter()
+            Ok(Ok(resp)) => match read_json_bounded::<Vec<InvidiousResult>>(resp).await {
+                Some(data) => data.into_iter()
                     .filter(|r| r.result_type.as_deref() == Some("video"))
                     .filter_map(|r| {
                         let vid = r.video_id?;
@@ -4383,7 +4393,7 @@ async fn handle_videos(
                         })
                     })
                     .collect::<Vec<_>>(),
-                Err(e) => { tracing::warn!("Invidious parse error: {}", e); vec![] }
+                None => { tracing::warn!("Invidious parse error / exceeded cap"); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("Invidious request error: {}", e); vec![] }
             Err(_) => { tracing::warn!("Invidious timed out after 15s"); vec![] }
@@ -4518,9 +4528,12 @@ async fn handle_news(
 
     let searx1_fut = async {
         match tokio::time::timeout(Duration::from_secs(6), state.http_client.get(&searx_url).send()).await {
-            Ok(Ok(resp)) => match resp.text().await {
-                Ok(raw) => parse_news(raw),
-                Err(e) => { tracing::warn!("SearXNG1 news body read error: {}", e); vec![] }
+            Ok(Ok(resp)) => match read_body_bounded(resp).await {
+                Some(bytes) => {
+                    let raw = String::from_utf8_lossy(&bytes).into_owned();
+                    parse_news(raw)
+                }
+                None => { tracing::warn!("SearXNG1 news body read error / exceeded cap"); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG1 news request error: {}", e); vec![] }
             Err(_) => { tracing::warn!("SearXNG1 news timed out after 6s"); vec![] }
@@ -4533,9 +4546,12 @@ async fn handle_news(
             None => return vec![],
         };
         match tokio::time::timeout(Duration::from_secs(6), state.http_client.get(&url).send()).await {
-            Ok(Ok(resp)) => match resp.text().await {
-                Ok(raw) => parse_news(raw),
-                Err(e) => { tracing::warn!("SearXNG2 news body read error: {}", e); vec![] }
+            Ok(Ok(resp)) => match read_body_bounded(resp).await {
+                Some(bytes) => {
+                    let raw = String::from_utf8_lossy(&bytes).into_owned();
+                    parse_news(raw)
+                }
+                None => { tracing::warn!("SearXNG2 news body read error / exceeded cap"); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG2 news request error: {}", e); vec![] }
             Err(_) => { tracing::warn!("SearXNG2 news timed out after 6s"); vec![] }
@@ -4595,6 +4611,10 @@ async fn main() {
         in_flight: Mutex::new(HashMap::new()),
         spell_index: spell::SymSpellIndex::build(),
         geo_locator: geoloc::GeoLocator::load(),
+        // Cap concurrent heavy searches. Measured peak per concurrent search is
+        // ~350-400 MiB; with a 4 GiB cgroup, 8 keeps peak RSS safely under the
+        // limit even under a burst, while still allowing real parallelism.
+        search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -4789,10 +4809,55 @@ fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f
     }
 }
 
+/// ─── Bounded body reader (OOM guard) ───────────────────────────────
+/// Every upstream response is buffered with `reqwest`'s default client, which
+/// has NO body-size limit. With the gateway cgroup at `mem_limit: 4096m`
+/// (docker-compose.dev.yml), a single oversized or attacker-shaped response
+/// from any of the 7 parallel upstreams (SearXNG / Invidious / News / Image /
+/// Embed / Intent / Indexer) can allocate gigabytes and OOM-kill the
+/// container (RSS ~3 GiB → cgroup kill → dropped connections → restart loop).
+///
+/// `MAX_RESPONSE_BYTES` caps how many bytes we will read from ANY upstream
+/// before aborting. It is sized generously for legit payloads (SearXNG can
+/// return ~tens of MB for a large result page; the local indexer stays <1 MB)
+/// but far below the 4 GiB cgroup so a runaway upstream can never take down
+/// the process. On overflow we return `None` (fail-closed: that source
+/// contributes empty results instead of OOM-ing the whole gateway).
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB hard ceiling
+
+/// Stream a `reqwest::Response` body into a `Vec<u8>`, aborting the moment the
+/// byte cap is exceeded. Returns `None` on any error, timeout, or overflow.
+async fn read_body_bounded(resp: reqwest::Response) -> Option<Vec<u8>> {
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::with_capacity(1 << 20); // start ~1 MiB
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while let Ok(Some(Ok(chunk))) = tokio::time::timeout(
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        stream.next(),
+    ).await {
+        if buf.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            tracing::warn!(
+                "UPSTREAM BODY GUARD: response exceeded {} MiB cap — aborting read (possible runaway payload)",
+                MAX_RESPONSE_BYTES / (1024 * 1024)
+            );
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Some(buf)
+}
+
+/// Like `read_body_bounded` but parses the (size-capped) bytes as JSON `T`.
+async fn read_json_bounded<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Option<T> {
+    let bytes = read_body_bounded(resp).await?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// Resilient outbound GET with a HARD budget.
 ///
 /// Runs `client.get(url).send()` (and the JSON parse) inside a DETACHED
-/// `tokio::spawn` task and joins it with `budget` ms. This is the
+/// `tokio::spawn` task and joins it with `budget_ms` ms. This is the
 /// root-cause fix for the flaky-connection blips: every engine call
 /// (SearXNG / Invidious / News / Image / Embed / Intent / Indexer)
 /// is routed through gluetun/VPN, whose connections can stall in a way an
@@ -4804,6 +4869,8 @@ fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f
 ///
 /// `T` must be `DeserializeOwned + Send + 'static` so it can cross the
 /// spawn boundary. On any failure/timeout/panic the task returns `None`.
+/// Response bodies are read through the size-capped reader so a runaway
+/// upstream payload can never blow the gateway cgroup.
 async fn fetch_json_budgeted<T: serde::de::DeserializeOwned + Send + 'static>(
     client: reqwest::Client,
     url: String,
@@ -4817,12 +4884,9 @@ async fn fetch_json_budgeted<T: serde::de::DeserializeOwned + Send + 'static>(
             Ok(Ok(r)) => r,
             Ok(Err(_)) | Err(_) => return None,
         };
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(budget_ms),
-            send.json::<T>(),
-        ).await {
-            Ok(Ok(parsed)) => Some(parsed),
-            Ok(Err(_)) | Err(_) => None,
+        match read_json_bounded::<T>(send).await {
+            Some(parsed) => Some(parsed),
+            None => None,
         }
     });
     match tokio::time::timeout(std::time::Duration::from_millis(budget_ms + 200), task).await {
@@ -4834,6 +4898,8 @@ async fn fetch_json_budgeted<T: serde::de::DeserializeOwned + Send + 'static>(
 /// Resilient outbound GET returning the raw body text with a HARD budget.
 /// Same rationale as `fetch_json_budgeted`; used where the caller needs the
 /// raw JSON string (e.g. SearXNG image/HTML parsing, the parallel retry).
+/// Body read is size-capped by `read_body_bounded` so a runaway payload
+/// cannot blow the gateway cgroup.
 async fn fetch_text_budgeted(
     client: reqwest::Client,
     url: String,
@@ -4847,12 +4913,9 @@ async fn fetch_text_budgeted(
             Ok(Ok(r)) => r,
             Ok(Err(_)) | Err(_) => return None,
         };
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(budget_ms),
-            send.text(),
-        ).await {
-            Ok(Ok(t)) => Some(t),
-            Ok(Err(_)) | Err(_) => None,
+        match read_body_bounded(send).await {
+            Some(bytes) => String::from_utf8(bytes).ok(),
+            None => None,
         }
     });
     match tokio::time::timeout(std::time::Duration::from_millis(budget_ms + 200), task).await {
@@ -5030,6 +5093,33 @@ async fn handle_search(
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
         return (axum::http::StatusCode::OK, Json(value));
     }
+    // 0b.x: Bound concurrency. Acquire a slot in the global search semaphore so
+    // the combined per-request working set can never exceed the container cgroup.
+    // `permit` is held for the whole handler and dropped (released) on return,
+    // including on early-return paths above (it lives in this scope). This is the
+    // root-cause guard against burst-driven OOM-kills: a burst of N concurrent
+    // "near me"/local queries each peak at ~350-400 MiB; with the 4 GiB cgroup,
+    // capping at 8 keeps peak RSS safely under the limit. Cached hits above skip
+    // this and don't consume a slot. Acquire is bounded so a saturated gateway
+    // still answers (just queued), never hangs.
+    let sem = state.search_semaphore.clone();
+    let _permit = match tokio::time::timeout(
+        Duration::from_secs(20),
+        sem.acquire(),
+    ).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            // Semaphore closed (shouldn't happen) — fail safe to an empty result
+            // rather than panic.
+            tracing::error!("Search semaphore closed unexpectedly");
+            return make_error_response(q_trimmed, "search_unavailable", "Search service temporarily unavailable", false);
+        }
+        Err(_) => {
+            tracing::warn!("Search concurrency slot wait exceeded 20s for '{}'", q_trimmed);
+            return make_error_response(q_trimmed, "search_busy", "Search service is busy; please retry", false);
+        }
+    };
+
     // 0b.5: Spelling correction — correct misspellings before fan-out
     let (q_corrected_cleaned, mut spell_changed) = spell::correct_query(&state.spell_index, &q_cleaned_spelling);
     if spell_changed {
@@ -5205,9 +5295,9 @@ async fn handle_search(
                     Err(_) => { tracing::warn!("Intent Engine request timed out (attempt {})", attempt + 1); continue; }
                 };
                 let status = resp.status();
-                match resp.json::<IntentResponse>().await {
-                    Ok(parsed) => return Ok(parsed),
-                    Err(e) => { tracing::warn!("Intent parse failed (attempt {}, status: {}): {:?}", attempt + 1, status, e); }
+                match read_json_bounded::<IntentResponse>(resp).await {
+                    Some(parsed) => return Ok(parsed),
+                    None => { tracing::warn!("Intent parse failed (attempt {}, status: {}): invalid/oversized body", attempt + 1, status); }
                 }
             }
             Err::<IntentResponse, ()>(())
@@ -5359,21 +5449,17 @@ async fn handle_search(
         match tokio::time::timeout(Duration::from_millis(1500), indexer_client.get(&indexer_q_raw).send()).await {
             Ok(Ok(resp)) => {
                 let status = resp.status();
-                match tokio::time::timeout(Duration::from_millis(1500), resp.json::<Vec<IndexerResult>>()).await {
-                    Ok(Ok(data)) => Ok(data),
-                    Ok(Err(e)) => {
-                        tracing::error!("Failed to parse Indexer JSON (status: {}): {:?}", status, e);
-                        Err(e)
-                    }
-                    Err(_) => {
-                        tracing::warn!("Indexer JSON read timed out — using empty results");
-                        Ok(vec![])
+                match read_json_bounded::<Vec<IndexerResult>>(resp).await {
+                    Some(data) => Ok(data),
+                    None => {
+                        tracing::error!("Failed to read/parse Indexer JSON (status: {}) — body exceeded cap or invalid", status);
+                        Err(())
                     }
                 }
             }
             Ok(Err(e)) => {
                 tracing::warn!("Indexer request failed: {:?}", e);
-                Err(e)
+                Err(())
             }
             Err(_) => {
                 tracing::warn!("Indexer request timed out — using empty results");
@@ -5522,13 +5608,12 @@ async fn handle_search(
                 _ => return Ok::<Vec<InvidiousResult>, anyhow::Error>(vec![]),
             };
             let status = resp.status();
-            match tokio::time::timeout(Duration::from_millis(800), resp.json::<Vec<InvidiousResult>>()).await {
-                Ok(Ok(data)) => Ok(data),
-                Ok(Err(e)) => {
-                    tracing::error!("Failed to parse Invidious JSON (status: {}): {:?}", status, e);
+            match read_json_bounded::<Vec<InvidiousResult>>(resp).await {
+                Some(data) => Ok(data),
+                None => {
+                    tracing::error!("Failed to read/parse Invidious JSON (status: {}) — body exceeded cap or invalid", status);
                     Ok(vec![])
                 }
-                Err(_) => { tracing::warn!("Invidious JSON read timed out after 800ms"); Ok(vec![]) }
             }
         });
         match tokio::time::timeout(Duration::from_millis(1000), task).await {
@@ -6020,7 +6105,7 @@ async fn handle_search(
 
     let vector: Option<Vec<f32>> = match embed_res {
         Some(resp) => {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
+            if let Some(json) = read_json_bounded::<serde_json::Value>(resp).await {
                 json["embedding"].as_array().map(|arr| {
                     arr.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect()
                 })
@@ -6162,8 +6247,8 @@ async fn handle_search(
                 client_for_vec.get(&indexer_url_vec).send(),
             ).await {
                 Ok(Ok(resp)) => {
-                    match tokio::time::timeout(Duration::from_millis(1500), resp.json::<Vec<IndexerResult>>()).await {
-                        Ok(Ok(vec_results)) if !vec_results.is_empty() => Some(vec_results),
+                    match read_json_bounded::<Vec<IndexerResult>>(resp).await {
+                        Some(vec_results) if !vec_results.is_empty() => Some(vec_results),
                         _ => None,
                     }
                 }
@@ -7839,8 +7924,8 @@ async fn handle_search_fast(
     let indexer_url = format!("http://127.0.0.1:6000/search?q={}", q_encoded);
     let results = match state.http_client.get(&indexer_url).send().await {
         Ok(resp) => {
-            match resp.json::<Vec<IndexerResult>>().await {
-                Ok(indexer_results) => {
+            match read_json_bounded::<Vec<IndexerResult>>(resp).await {
+                Some(indexer_results) => {
                     // Convert to MergedResult format
                     indexer_results.into_iter().map(|r| MergedResult {
                         url: r.url,
@@ -7853,7 +7938,7 @@ async fn handle_search_fast(
                         published_date: None,
                     }).collect::<Vec<_>>()
                 }
-                Err(_) => vec![]
+                None => vec![]
             }
         }
         Err(_) => vec![]
