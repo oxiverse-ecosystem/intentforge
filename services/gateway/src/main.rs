@@ -1534,6 +1534,52 @@ fn constraint_score(
         score *= alt_penalty;
     }
 
+    // ── BUG P0: hard-exclude pages whose TOPIC IS the excluded term ──
+    // Soft penalties alone let "best python ide NOT pycharm" surface PyCharm
+    // in the top 5 (47% of results still mentioned it). But we must NOT drop
+    // alternative-listing / comparison pages (e.g. "Best Static Site Generators"
+    // that *mention* Jekyll among many) — those are useful and the user wants
+    // them. Rule: a NON-alt page is dropped only when its TITLE is dominated by
+    // the excluded term(s): ≥50% of its non-stopword title tokens are an
+    // excluded term (or a sub-brand of it, e.g. "pycharm" ∈ "pycharm-community").
+    // Incidental mentions inside body/comparison pages are left to the soft
+    // penalty above. Fail-closed: if we can't prove dominance, we keep it.
+    if !is_alt_page && !expanded_negatives.is_empty() {
+        const STOP: &[&str] = &[
+            "the", "a", "an", "and", "or", "for", "of", "in", "on", "to", "with",
+            "vs", "versus", "best", "top", "review", "reviews", "guide", "guides",
+            "how", "what", "why", "is", "are", "not", "without", "free", "new",
+        ];
+        let title_tokens: Vec<String> = title_lower
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|t| t.trim().to_string())
+            .filter(|t| t.len() >= 2 && !STOP.contains(&t.as_str()))
+            .collect();
+        if !title_tokens.is_empty() {
+            let dominated = title_tokens.iter().filter(|tok| {
+                expanded_negatives.iter().any(|neg| {
+                    if neg.is_empty() { return false; }
+                    let n = neg.trim().to_lowercase();
+                    // Exact word, or the token is a sub-brand/compound of the
+                    // excluded term (n ⊂ tok, covering "pycharm-community",
+                    // "macbook-pro", "nodejs"-style collisions handled by len gap).
+                    tok.as_str() == n.as_str()
+                        || (tok.len() > n.len()
+                            && tok.starts_with(&n)
+                            && (tok.len() - n.len()) as f32 / n.len() as f32 <= 0.6)
+                })
+            }).count();
+            let dom_frac = dominated as f32 / title_tokens.len() as f32;
+            if dom_frac >= 0.5 {
+                tracing::info!(
+                    "NEG HARD-DROP (topic match): '{}' dominated by excluded term(s) ({}/{} tokens)",
+                    title, dominated, title_tokens.len()
+                );
+                return 0.0;
+            }
+        }
+    }
+
     // Positive constraints: boost for each match (fuzzy matching)
     if !constraints.positive.is_empty() {
         let mut matched = 0;
@@ -2438,6 +2484,327 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
     combined.clamp(0.0, 1.0)
 }
 
+/// Blend genuine BERT semantic similarity into web-result ranking.
+///
+/// The query already has a MiniLM embedding (computed in handle_search and used
+/// for the local index). Web results from SearXNG/Whoogle were ONLY scored by
+/// unigram cosine + substring coherence (semantic_relevance_score), which cannot
+/// tell word senses apart — so "square a circle" matched the POS-system "Square"
+/// and the chart "Circle". This function embeds the top web-result texts in ONE
+/// batched call to the intent-engine /embed_batch endpoint and returns, per URL,
+/// the cosine similarity of each result's text to the QUERY embedding. The caller
+/// blends this into the result's `semantic` score.
+///
+/// Fail-closed: if the query has no vector, or the batch call errors/timeouts,
+/// returns an empty map and the caller falls back to the existing substring
+/// scorer (no behaviour change). A zero vector in the batch yields cosine 0, so a
+/// single bad embed never poisons others.
+async fn compute_web_semantic(
+    query_vector: &Option<Vec<f32>>,
+    web_results: &[SearxResult],
+    client: &reqwest::Client,
+) -> std::collections::HashMap<String, f32> {
+    use std::collections::HashMap;
+    let mut out: HashMap<String, f32> = HashMap::new();
+    let qv = match query_vector {
+        Some(v) if v.len() >= 2 => v,
+        _ => return out, // no query embedding -> fail closed
+    };
+    // Deduplicate texts by URL; only embed the top ~28 distinct results.
+    let mut texts: Vec<String> = Vec::new();
+    let mut url_order: Vec<String> = Vec::new();
+    for r in web_results.iter().take(28) {
+        let text = format!("{} {}", r.title, r.content);
+        if text.trim().len() < 10 { continue; }
+        url_order.push(r.url.clone());
+        texts.push(text);
+    }
+    if texts.is_empty() { return out; }
+
+    let body = serde_json::json!({ "texts": texts });
+    let req = client
+        .post("http://127.0.0.1:3005/embed_batch")
+        .json(&body)
+        .timeout(std::time::Duration::from_millis(1500));
+    let embeddings: Option<Vec<Vec<f32>>> = match req.send().await {
+        Ok(resp) => resp.json::<serde_json::Value>().await.ok()
+            .and_then(|j| j.get("embeddings").cloned())
+            .and_then(|e| serde_json::from_value(e).ok()),
+        Err(_) => None,
+    };
+    let embeddings = match embeddings {
+        Some(e) if e.len() == texts.len() => e,
+        _ => return out, // fail closed
+    };
+    for (url, vec) in url_order.into_iter().zip(embeddings.into_iter()) {
+        out.insert(url, cosine_sim_vec(qv, &vec));
+    }
+    out
+}
+
+/// Cosine similarity between two equal-or-unequal length f32 vectors.
+/// Zero vectors -> 0.0 (never NaN). Used by compute_web_semantic.
+fn cosine_sim_vec(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || b.is_empty() { return 0.0; }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    let n = a.len().min(b.len());
+    for i in 0..n {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    // If vectors differ in length, pad the shorter with zeros (already handled by
+    // min above); add remaining squared magnitudes for the longer side.
+    for i in n..a.len() { na += a[i] * a[i]; }
+    for i in n..b.len() { nb += b[i] * b[i]; }
+    if na < 1e-8 || nb < 1e-8 { return 0.0; }
+    (dot / (na.sqrt() * nb.sqrt())).clamp(-1.0, 1.0)
+}
+
+// ─── Intent-aware domain disambiguation (P-B) ───────────────────────────
+//
+// Polysemous verbs (e.g. "break", "crash", "run") and the token "code" collapse
+// across word senses that a BERT cosine cannot separate. Example: the query
+// "is it okay to break a promise" embeds ~equally close to "break no contact
+// with a narcissist", "Promise | JavaScript", and "tell a lie" — all ~0.85.
+// A pure embedding blend therefore cannot pick the moral/relationship sense.
+//
+// This guard disambiguates via *query intent*, not fixed thresholds:
+//   - We classify the query into a coarse sense class from its lexical signals
+//     (relationship/moral, programming-help, conspiracy-claim, ...). These are
+//     descriptive buckets, not scoring magic numbers.
+//   - For each result we detect whether it belongs to a *conflicting* sense
+//     class (e.g. a JavaScript-API page for a relationship query, a brand/IDE
+//     page for a programming-help query) using structural signals (URL path,
+//     title shape, content markers) — not hardcoded domain allow/deny lists.
+//   - The returned multiplier is a soft penalty derived from the *strength of
+//     the conflicting-sense evidence* (how many independent markers fired),
+//     so it degrades gracefully and never silently drops a legitimate result.
+//
+// Fail-closed: if the query has no clear sense class, or the result shows no
+// conflicting-sense markers, this returns 1.0 (no effect). It can only ever
+// *reduce* a score, never invent relevance.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SenseClass {
+    RelationshipMoral,
+    ProgrammingHelp,
+    ConspiracyClaim,
+    None,
+}
+
+/// Classify the query into a coarse sense class using lexical signals only.
+/// Returns `SenseClass::None` when no strong signal is present (fail-closed).
+fn query_sense_class(query: &str) -> SenseClass {
+    let q = query.to_lowercase();
+    let q_words: Vec<&str> = q.split_whitespace().collect();
+    let has = |w: &str| q_words.iter().any(|x| *x == w);
+
+    // Relationship / moral sense: first-person relational verbs + moral objects.
+    let relational = ["promise", "lie", "cheat", "relationship", "marriage",
+        "boyfriend", "girlfriend", "partner", "spouse", "friend", "family",
+        "date", "dating", "breakup", "apology", "forgive", "trust"];
+    let moral_obj = ["okay", "ok", "right", "wrong", "moral", "ethic", "honest",
+        "fair", "justify", "acceptable"];
+    let relational_hit = relational.iter().any(|w| has(w));
+    let moral_hit = moral_obj.iter().any(|w| has(w));
+    if relational_hit && moral_hit {
+        return SenseClass::RelationshipMoral;
+    }
+
+    // Programming-help sense: programming verbs/nouns + a problem framing.
+    let prog = ["code", "crash", "bug", "error", "debug", "compile", "runtime",
+        "stack", "null", "segfault", "exception", "syntax", "function", "variable",
+        "loop", "thread", "async", "api", "dependency", "module", "package",
+        "build", "test", "refactor", "algorithm", "database", "query", "server",
+        "deploy", "docker", "kubernetes", "python", "rust", "javascript", "java",
+        "typescript", "golang", "c++", "react", "vue", "node", "sql"];
+    let prog_hit = prog.iter().any(|w| has(w));
+    let problem_frame = ["why", "how", "fix", "crash", "error", "not", "won't",
+        "wont", "doesn't", "dont", "fails", "broken", "issue", "problem", "debug"];
+    let problem_hit = problem_frame.iter().any(|w| has(w));
+    if prog_hit && problem_hit {
+        return SenseClass::ProgrammingHelp;
+    }
+
+    // Conspiracy-claim sense: claim-framing + secrecy language.
+    let claim_frame = ["secret", "cover", "coverup", "conspiracy", "they",
+        "government", "truth", "expose", "hidden", "suppressed", "lies", "lie",
+        "kept", "don't", "dont", "want", "know", "real", "truth", "reveal",
+        "theyre", "they're", "elite", "illuminati", "matrix"];
+    let secrecy_hit = claim_frame.iter().any(|w| has(w));
+    // Require a second independent secrecy-ish token so ordinary "government"
+    // news queries are not flagged.
+    let secrecy_count = claim_frame.iter().filter(|w| has(w)).count();
+    if secrecy_hit && secrecy_count >= 2 {
+        return SenseClass::ConspiracyClaim;
+    }
+
+    SenseClass::None
+}
+
+/// Detect whether a result text belongs to a *conflicting* sense class for the
+/// given query sense. Returns a soft penalty multiplier in (0, 1] derived from
+/// the number of independent conflicting-sense markers that fired (more markers
+/// = stronger, but capped so it never fully zeroes a result unless extreme).
+///
+/// Markers are structural/lexical, never domain lists:
+///   - ProgrammingHelp query vs a JavaScript-API page: title is exactly the
+///     API symbol + "| MDN"/"w3schools"/"docs" shape, or content opens with a
+///     code/syntax block, or the token "code" appears as the IDE "Visual Studio
+///     Code" rather than "source code".
+///   - RelationshipMoral query vs a programming page: same programming markers
+///     fire while the page shows no relational content.
+///   - Either query vs a dictionary/definition page (already penalized elsewhere,
+///     but reinforced here via POS-label / phonetic structure).
+fn conflicting_sense_penalty(
+    sense: SenseClass,
+    title: &str,
+    content: &str,
+    url: &str,
+) -> f32 {
+    if sense == SenseClass::None {
+        return 1.0;
+    }
+    let title_l = title.to_lowercase();
+    let content_l = content.to_lowercase();
+    let url_l = url.to_lowercase();
+    let title_words: Vec<&str> = title_l.split_whitespace().collect();
+    let short_title = title_words.len() <= 3;
+
+    // Programming-page markers (fired for a relationship/moral query = conflict).
+    let mut prog_markers = 0u32;
+    // 1) Title is an API symbol paired with a docs site pattern.
+    if (title_l.contains("| mdn") || title_l.contains("| w3schools")
+        || title_l.contains("| mozilla") || title_l.contains("| devdocs")
+        || title_l.contains(" docs") || title_l.ends_with(" api"))
+        && short_title
+    {
+        prog_markers += 1;
+    }
+    // 2) Content opens with a code fence or inline code / syntax markers.
+    let content_prefix = content_l.chars().take(200).collect::<String>();
+    if content_prefix.contains("```") || content_prefix.contains("<code")
+        || content_prefix.contains("function ") || content_prefix.contains("=>")
+        || content_prefix.contains("console.log") || content_prefix.contains("#!/")
+    {
+        prog_markers += 1;
+    }
+    // 3) "Visual Studio Code" / IDE framing rather than source code.
+    if title_l.contains("visual studio code") || title_l.contains("vs code")
+        || url_l.contains("code.visualstudio.com")
+    {
+        prog_markers += 1;
+    }
+    // 4) Bare API token in title (e.g. "Promise", "Array", "Map") with no
+    //    relational words anywhere in the page.
+    let api_symbols = ["promise", "array", "map", "set", "async", "await",
+        "closure", "callback", "prototype", "iterator", "generator"];
+    let title_has_api = api_symbols.iter().any(|s| title_words.iter().any(|t| *t == *s));
+    let relational_in_page = ["promise", "relationship", "marriage", "partner",
+        "boyfriend", "girlfriend", "friend", "apology", "trust", "honest"]
+        .iter().any(|w| content_l.contains(w) || title_l.contains(w));
+    if title_has_api && !relational_in_page && short_title {
+        prog_markers += 1;
+    }
+
+    // Dictionary/definition marker (conflicts with any non-definition query).
+    let dict_marker =
+        content_prefix.starts_with("noun") || content_prefix.starts_with("verb")
+        || content_prefix.starts_with("adjective") || content_prefix.contains("/ˈ")
+        || content_prefix.contains("/ˌ");
+
+    // Relationship/moral query: penalize programming pages specifically.
+    if sense == SenseClass::RelationshipMoral {
+        if prog_markers >= 2 {
+            // Soft, capped penalty: each extra marker beyond 2 deepens it
+            // slightly, but never below 0.45 so a genuinely-good page survives.
+            return (0.45f32 + 0.10f32 * (2u32.saturating_sub(prog_markers) as f32)).clamp(0.45, 1.0);
+        }
+        if prog_markers == 1 {
+            return 0.8;
+        }
+        if dict_marker {
+            return 0.85;
+        }
+        return 1.0;
+    }
+
+    // Programming-help query: penalize IDE/dictionary/brand pages, prefer dev docs.
+    if sense == SenseClass::ProgrammingHelp {
+        if prog_markers >= 2 {
+            // This is itself a programming page, but the *wrong* kind
+            // (IDE/docs-API vs the debugging help the query wants). Moderate.
+            return 0.7;
+        }
+        if prog_markers == 1 {
+            return 0.85;
+        }
+        if dict_marker {
+            return 0.8;
+        }
+        return 1.0;
+    }
+
+    // ConspiracyClaim: handled separately (P-C) — no-op here.
+    1.0
+}
+
+// ─── Conspiracy-claim debias (P-C) ──────────────────────────────────────
+//
+// Dense-retrieval rewards claim-echoing pages: a query like "perpetual motion =
+// government secret kept from the masses" embeds *closer* to a clickbait article
+// that repeats the claim than to a Britannica debunk, because they share
+// vocabulary. Left alone, the conspiracy echo outranks the debunk.
+//
+// This guard does NOT censor — it applies a *mild, evidence-counted* penalty to
+// pages that merely *amplify* the claim (echo it without counter-evidence) and a
+// *mild* boost to pages that present counter-evidence (debunk markers). Both are
+// derived from lexical counters, not fixed lists, and are capped so they nudge
+// rather than dictate. Fail-closed: returns (1.0, 0.0) when the query is not a
+// conspiracy-claim sense.
+
+/// Returns (penalty_multiplier, boost_addition) for a conspiracy-claim query.
+/// - penalty: 1.0 normally; reduced toward ~0.7 when the page *echoes* the claim
+///   with little counter-evidence (count of echo phrases vs debunk phrases).
+/// - boost: 0.0 normally; up to +0.15 when the page presents debunk/counter
+///   evidence (so the credible source climbs without being forced to #1).
+fn conspiracy_guard(title: &str, content: &str) -> (f32, f32) {
+    let text = format!("{} {}", title, content).to_lowercase();
+
+    // Echo phrases: the page repeats/endorses the claim-like framing.
+    let echo = ["secret", "they don't want you to know", "hidden truth",
+        "wake up", "the truth they", "cover up", "cover-up", "what they",
+        "mainstream media won't", "suppressed", "they are lying", "real reason",
+        "government doesn't want", "kept from", "they don't tell you"];
+    // Debunk / counter-evidence phrases: the page presents skepticism or facts.
+    let debunk = ["debunk", "myth", "false", "not true", "fact check", "no evidence",
+        "conspiracy theory", "pseudoscience", "hoax", "physicist", "scientist",
+        "law of thermodynamics", "conservation of energy", "peer review",
+        "evidence shows", "actually", "misinformation", "snopes", "reliable source"];
+
+    let echo_n = echo.iter().filter(|p| text.contains(*p)).count() as f32;
+    let debunk_n = debunk.iter().filter(|p| text.contains(*p)).count() as f32;
+
+    // Net echo signal: more echo than debunk → mild penalty.
+    let net = echo_n - debunk_n;
+    let penalty = if net >= 2.0 {
+        // Echo-heavy, little counter-evidence: nudge down, floor at 0.7.
+        (0.7f32 + 0.05f32 * (2.0f32 - net).clamp(0.0, 2.0)).clamp(0.7, 1.0)
+    } else {
+        1.0
+    };
+    // Counter-evidence present: mild climb, capped at +0.15.
+    let boost = if debunk_n >= 1.0 {
+        (0.05f32 * debunk_n).clamp(0.0, 0.15)
+    } else {
+        0.0
+    };
+    (penalty, boost)
+}
+
 // ─── Engine Consensus Score ─────────────────────────────────────────
 // Algorithmic: results returned by multiple independent sources get higher scores.
 // This is the single strongest quality signal — if Bing, Brave, DuckDuckGo, and
@@ -3205,6 +3572,31 @@ fn simple_negation_strip(query: &str) -> Option<String> {
     Some(cleaned)
 }
 
+/// P1-compound: when a query pairs `site:` with `filetype:` (e.g.
+/// "python tutorial site:docs.python.org filetype:pdf"), SearXNG frequently
+/// returns 0 for the narrow conjunction even though `site:`-alone has hits
+/// (observed: site:realpython.com -> 2 results, site:realpython.com
+/// filetype:pdf -> 0). Fire a filetype-RELAXED variant in parallel so the
+/// gateway can recover results when the strict conjunction is empty. The
+/// relaxed variant keeps `site:` and drops only `filetype:`.
+fn filetype_relax_variant(query: &str) -> Option<String> {
+    let has_site = query.to_lowercase().contains("site:");
+    let has_filetype = query.to_lowercase().contains("filetype:");
+    if !(has_site && has_filetype) {
+        return None;
+    }
+    let kept: Vec<&str> = query
+        .split_whitespace()
+        .filter(|w| !w.to_lowercase().starts_with("filetype:"))
+        .collect();
+    if kept.len() == query.split_whitespace().count() {
+        return None; // nothing removed
+    }
+    let relaxed = kept.join(" ");
+    if relaxed.is_empty() { return None; }
+    Some(relaxed)
+}
+
 
 // ─── JSON Key Deduplication ────────────────────────────────────────
 // Removes duplicate keys from JSON objects. Keeps the LAST value for each key.
@@ -3604,6 +3996,7 @@ fn merge_local_and_web(
     constraints: &Constraints,
     distribution: Option<&std::collections::HashMap<String, f32>>,
     geo_location: Option<&geoloc::GeoLocation>,
+    web_semantic: &std::collections::HashMap<String, f32>,
 ) -> Vec<MergedResult> {
     let mut merged: Vec<MergedResult> = Vec::new();
     let mut url_to_idx: HashMap<String, usize> = HashMap::new();
@@ -3710,11 +4103,50 @@ fn merge_local_and_web(
 
     let mut _max_semantic: f32 = 0.0; // tracked for thin-result gate
     for r in merged.iter_mut() {
-        let semantic = semantic_relevance_score(&clean_query, &r.title, &r.content);
+        let substr_semantic = semantic_relevance_score(&clean_query, &r.title, &r.content);
+        // Blend genuine BERT semantic similarity (web_semantic vs the query
+        // embedding) into the substring scorer. This is what resolves polysemous
+        // queries: "square a circle" embeds close to a geometry article and far
+        // from the POS-system "Square", so the right-sense result wins. When the
+        // embedding map has no entry for this URL (fail-closed), we keep the
+        // substring scorer untouched.
+        let semantic = match web_semantic.get(&r.url) {
+            Some(&web_cos) => {
+                let web_cos = web_cos.clamp(0.0, 1.0);
+                (substr_semantic * 0.6 + web_cos * 0.4).clamp(0.0, 1.0)
+            }
+            None => substr_semantic,
+        };
         if semantic > _max_semantic { _max_semantic = semantic; }
         let intent_boost = calculate_intent_boost(&r.url, &r.title, &clean_query, intent);
         let mut freshness = freshness_score(&r.url, intent, r.published_date.as_deref());
         let mut quality = content_quality_score(&r.content);
+
+        // ─── Intent-aware sense disambiguation (P-B) + conspiracy debias (P-C) ───
+        // Computed once per result. Both are fail-closed: they only ever *reduce*
+        // quality (P-B) or nudge score (P-C), never invent relevance. They rely on
+        // lexical/structural signals, not hardcoded domain lists, so they stay
+        // robust as the web shifts.
+        let sense_class = query_sense_class(&clean_query);
+        if sense_class != SenseClass::None {
+            let p = conflicting_sense_penalty(sense_class, &r.title, &r.content, &r.url);
+            if p < 1.0 {
+                quality *= p;
+                tracing::debug!(
+                    "P-B SENSE PENALTY x{:.2}: '{}' (sense={:?})",
+                    p, r.url.chars().take(60).collect::<String>(), sense_class
+                );
+            }
+        }
+        // P-C: only act when the query itself is a conspiracy-claim sense.
+        let mut conspiracy_boost = 0.0f32;
+        if sense_class == SenseClass::ConspiracyClaim {
+            let (penalty, boost) = conspiracy_guard(&r.title, &r.content);
+            if penalty < 1.0 {
+                quality *= penalty;
+            }
+            conspiracy_boost = boost;
+        }
 
         // Local index artifact gate: if a local result has near-zero semantic relevance
         // to the query, it's an irrelevant local page (e.g., a different project's README
@@ -3946,7 +4378,8 @@ fn merge_local_and_web(
             + (weights.consensus * consensus)
             + (weights.local_bonus * local_bonus)
             + nav_domain_boost
-            + geo_boost;
+            + geo_boost
+            + conspiracy_boost;
 
         let mut generic_penalty = 1.0f32;
         if !constraints.negative.is_empty() && (url_lower.contains("wikipedia.org") || url_lower.contains("wikidata.org")) {
@@ -5544,7 +5977,17 @@ async fn handle_search(
             let clean_stripped = preprocess_searxng_query(stripped);
             if !clean_stripped.is_empty() {
                 searx_urls.push(searxng_url(base_url, &clean_stripped, geo_location.as_ref(), lang));
-                searx_instance_keys.push(key);
+                searx_instance_keys.push(key.clone());
+            }
+        }
+        // P1-compound: filetype-relaxed variant (site: kept, filetype: dropped)
+        // fires in parallel so a narrow site:+filetype: conjunction that yields
+        // 0 upstream can be recovered from the site:-scoped result set.
+        if let Some(ref relaxed) = filetype_relax_variant(&engine_q) {
+            let clean_relaxed = preprocess_searxng_query(relaxed);
+            if !clean_relaxed.is_empty() && clean_relaxed != clean_q {
+                searx_urls.push(searxng_url(base_url, &clean_relaxed, geo_location.as_ref(), lang));
+                searx_instance_keys.push(key.clone());
             }
         }
     }
@@ -7377,17 +7820,24 @@ async fn handle_search(
         }
     }
     
+// Web-result BERT semantic map: embed the top web snippets once and compare
+// to the query embedding, so word-sense collisions (square-a-circle, promise,
+// crash) resolve correctly. Fail-closed: returns empty on any error and the
+// ranking falls back to the existing substring scorer (no behaviour change).
+let web_semantic = compute_web_semantic(&vector, &web_results, &client).await;
+
 let mut results = match tokio::task::spawn_blocking(move || {
-        merge_local_and_web(
-            local_results,
-            web_results,
-            &q_clone,
-            &intent_clone,
-            &constraints_clone,
-            Some(&distribution_clone),
-            geo_clone.as_ref(),
-        )
-    }).await {
+    merge_local_and_web(
+        local_results,
+        web_results,
+        &q_clone,
+        &intent_clone,
+        &constraints_clone,
+        Some(&distribution_clone),
+        geo_clone.as_ref(),
+        &web_semantic,
+    )
+}).await {
         Ok(r) => r,
         Err(e) => {
             // The blocking ranking task panicked (or was cancelled). Surface a

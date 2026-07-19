@@ -1,6 +1,6 @@
 use axum::{
     extract::{Query, State},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use candle_core::{Device, Tensor, DType};
@@ -1267,7 +1267,10 @@ fn linear_classify(
     // Phase 3: confidence floor fallback. When the model is genuinely
     // uncertain (low confidence), default to informational rather than
     // emitting an over-confident misclassification (e.g. navigational).
-    if confidence < 0.35 && intent != "informational" {
+    // Raised from 0.35 to 0.55: a navigational that wins at only 0.37 is a
+    // weak over-prediction (see audit — "kubernetes ingress tls configuration"
+    // was classified navigational @0.374 with how-to 0.24 right behind it).
+    if confidence < 0.55 && intent != "informational" {
         intent = "informational".to_string();
     }
 
@@ -2493,6 +2496,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { "OK" }))
         .route("/analyze", get(analyze_query))
         .route("/embed", get(embed_text))
+        .route("/embed_batch", post(embed_batch))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3005));
@@ -2655,6 +2659,55 @@ async fn analyze_query(
         confidence = confidence.max(0.7);
     }
 
+    // Phase 3b: technical / documentation override. Developer doc queries like
+    // "kubernetes ingress tls configuration" or "python asyncio event loop
+    // explained" were being classified navigational at low confidence (0.37)
+    // because a title-case token (e.g. "Kubernetes", "Python") trips the
+    // brand/proper-noun navigational signal. A doc/reference intent should win
+    // when a technical topic token appears in a multi-token doc phrase (a bare
+    // single brand like "docker" alone stays navigational — that's correct).
+    // High-precision lexical override, mirrors the how-to/comparison overrides.
+    let tech_markers = [
+        "docs", "doc", "api", "reference", "configure", "configuration",
+        "config", "tls", "ssl", "setup", "install", "tutorial", "guide",
+        "explained", "example", "examples", "implementation", "architecture",
+        "spec", "specification", "cli", "sdk", "library", "framework", "syntax",
+        "async", "event loop", "ingress", "handler", "middleware", "deployment",
+        "pooling", "module", "pattern", "patterns", "cluster", "index", "query",
+        "schema", "migration", "cache", "benchmark", "benchmarking", "networking",
+        "connection", "authentication", "authorization", "routing", "logging",
+        "metrics", "pipeline", "state", "thread", "process", "memory", "build",
+        "compile", "debug", "test", "testing", "deploy", "scale", "scaling",
+    ];
+    let has_tech_marker = tech_markers.iter().any(|m| ql.contains(m));
+    // Known code/infra tokens: a bare single one may be brand-navigational
+    // (e.g. "docker"), but combined with other tokens it's a doc query.
+    const CODE_TOKENS: &[&str] = &[
+        "kubernetes", "docker", "nginx", "postgresql", "postgres", "redis",
+        "terraform", "kafka", "rabbitmq", "graphql", "grpc", "rust", "python",
+        "golang", "typescript", "javascript", "react", "vue", "node", "nodejs",
+        "elasticsearch", "mongodb", "mysql", "sqlite", "cassandra", "prometheus",
+        "grafana", "etcd", "consul", "vault", "aws", "gcp", "azure", "linux",
+        "windows", "macos", "kotlin", "swift", "java", "scala", "ruby", "php",
+        "django", "flask", "fastapi", "spring", "express", "rails",
+    ];
+    let code_token_count = ql.split_whitespace().filter(|w| {
+        let wl = w.trim_end_matches('s');
+        CODE_TOKENS.contains(&wl) || CODE_TOKENS.contains(&w)
+    }).count();
+    let token_count = ql.split_whitespace().count();
+    // Fire when a code token is present AND either (a) a doc marker word is
+    // present, or (b) it's a multi-token phrase (>=2 tokens) — i.e. not a bare
+    // brand search. This flips "kubernetes ingress tls configuration",
+    // "postgresql connection pooling", "terraform aws vpc module",
+    // "redis pub sub patterns" to technical while leaving "docker" navigational.
+    let tech_trigger = code_token_count >= 1 && (has_tech_marker || token_count >= 2);
+    if tech_trigger && intent != "technical" {
+        tracing::info!("Lexical override: technical marker ⇒ technical (was {})", intent);
+        intent = "technical".to_string();
+        confidence = confidence.max(0.6);
+    }
+
     // ── Step 2: Compress long queries before expansion ──
 
     // "what monitoring stack should a small startup use for kubernetes
@@ -2709,4 +2762,46 @@ async fn embed_text(
     Json(EmbedResponse {
         embedding: embedding_vec,
     })
+}
+
+/// Batch embedding endpoint. Accepts a JSON list of texts and returns the
+/// matching list of embeddings in a SINGLE model pass per text (cached). This
+/// lets the gateway embed many web-result snippets with ONE round-trip instead
+/// of N calls to /embed, so web-result semantic scoring can reuse the same
+/// deployed MiniLM model that already powers intent classification and the
+/// local index. Fail-closed: any text that fails to embed returns a zero
+/// vector (cosine 0) so a partial failure never poisons the whole batch.
+#[derive(Deserialize)]
+pub struct EmbedBatchRequest {
+    pub texts: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct EmbedBatchResponse {
+    pub embeddings: Vec<Vec<f32>>,
+}
+
+async fn embed_batch(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EmbedBatchRequest>,
+) -> Json<EmbedBatchResponse> {
+    let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(req.texts.len());
+    for text in req.texts {
+        let text_norm = text.trim().to_lowercase();
+        let vec = if let Some(cached) = state.embed_cache.get(&text_norm).await {
+            cached
+        } else {
+            let _permit = state.bert_semaphore.acquire().await.unwrap();
+            let state_clone = state.clone();
+            let t = text.clone();
+            let computed = tokio::task::spawn_blocking(move || {
+                compute_embedding(&state_clone.device, &state_clone.bert_model, &state_clone.bert_tokenizer, &t)
+                    .unwrap_or_else(|| vec![0.0; 384])
+            }).await.unwrap_or_else(|_| vec![0.0; 384]);
+            state.embed_cache.insert(text_norm, computed.clone()).await;
+            computed
+        };
+        embeddings.push(vec);
+    }
+    Json(EmbedBatchResponse { embeddings })
 }
