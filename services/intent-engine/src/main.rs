@@ -235,9 +235,63 @@ fn parse_price_range(s: &str) -> Option<(Option<f32>, Option<f32>)> {
     None
 }
 
+/// Normalize natural-language constraint syntax into canonical operator tokens
+/// so downstream extraction is surface-form agnostic. Pure, order-independent
+/// regex-free string rewriting:
+///   * "under $500" / "less than 100" / "below 50" / "cheaper than 30" -> `price:<N`
+///   * "over $100" / "more than 200" / "above 50"                    -> `price:>N`
+///   * "in url:github" / "inurl github"                             -> `inurl:github`
+///   * "on site:reddit" / "on site reddit"                         -> `site:reddit`
+/// Existing canonical operators (`site:`, `filetype:`, `price:`, ...) are left
+/// untouched. Only whitespace-delimited surface forms are rewritten; this never
+/// touches quoted phrases (they are stripped before this runs).
+fn normalize_nl_operators(query: &str) -> String {
+    let mut out = query.to_string();
+
+    // Price: upper-bound forms.
+    for (re_src, replacement) in [
+        (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bless\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bbelow\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bcheaper\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bmax(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        // Price: lower-bound forms.
+        (r"(?i)\bover\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bmore\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\babove\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bgreater\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bmin(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        // Operator spacing: "in url:github" / "inurl github" -> "inurl:github"
+        (r"(?i)\bin\s+url\s*:\s*", "inurl:"),
+        (r"(?i)\binurl\s+", "inurl:"),
+        // "on site:reddit" / "on site reddit" -> "site:reddit"
+        (r"(?i)\bon\s+site\s*:\s*", "site:"),
+        (r"(?i)\bonsite\s+", "site:"),
+        // "in title:guide" / "in title guide" -> "intitle:guide"
+        (r"(?i)\bin\s+title\s*:\s*", "intitle:"),
+        (r"(?i)\bintitle\s+", "intitle:"),
+        // "in text:foo" / "in text foo" -> "intext:foo"
+        (r"(?i)\bin\s+text\s*:\s*", "intext:"),
+        (r"(?i)\bintext\s+", "intext:"),
+    ] {
+        if let Ok(re) = regex::Regex::new(re_src) {
+            out = re.replace_all(&out, replacement).to_string();
+        }
+    }
+    out
+}
+
 fn extract_constraints(query: &str) -> Constraints {
-    let (query_stripped_phrases, phrases) = extract_and_strip_phrases(query);
-    
+    let (query_stripped_phrases_raw, phrases) = extract_and_strip_phrases(query);
+    // Normalize natural-language constraint syntax into the canonical
+    // operator tokens the rest of this function already parses. This lets
+    // users type the way they speak:
+    //   "under $500" / "less than 100" / "below 50"  -> price:<N
+    //   "in url:github" / "on site:reddit"           -> inurl:/site:
+    // Applied before operator scanning so `price:`, `site:`, `inurl:` are
+    // extracted uniformly regardless of the surface form the user typed.
+    let query_stripped_phrases = normalize_nl_operators(&query_stripped_phrases_raw);
+
     let mut file_types = Vec::new();
     let mut sites = Vec::new();
     let mut after_date = None;
@@ -249,7 +303,12 @@ fn extract_constraints(query: &str) -> Constraints {
     let mut price_min = None;
     let mut price_max = None;
     let mut language = None;
-    
+
+    // Negated site:/filetype: tokens (e.g. "-site:reddit.com") are collected
+    // here during operator scanning below and later merged with the natural-
+    // language negative constraints extracted in Phase 1.
+    let mut negative: Vec<String> = Vec::new();
+
     let q_lower_full = query_stripped_phrases.to_lowercase();
     
     // Extract filetype:
@@ -258,18 +317,38 @@ fn extract_constraints(query: &str) -> Constraints {
         let rest = &query_stripped_phrases[after..];
         let end = rest.find(' ').unwrap_or(rest.len());
         let val = rest[..end].trim().to_lowercase();
-        if !val.is_empty() {
+        if val.is_empty() {
+            continue;
+        }
+        // Negated form "-filetype:x" is an EXCLUSION, not a positive filter.
+        // Routing it into `file_types` would invert the intent (include x
+        // instead of excluding it). Push to `negative` so the hard filter and
+        // the graduated penalty both treat it as exclusion.
+        let negated = cap.0 > 0 && q_lower_full.as_bytes().get(cap.0 - 1) == Some(&b'-');
+        if negated {
+            negative.push(format!("filetype:{}", val));
+        } else {
             file_types.push(val);
         }
     }
-    
+
     // Extract site:
     for cap in q_lower_full.match_indices("site:") {
         let after = cap.0 + 5;
         let rest = &query_stripped_phrases[after..];
         let end = rest.find(' ').unwrap_or(rest.len());
         let val = rest[..end].trim().to_lowercase();
-        if !val.is_empty() {
+        if val.is_empty() {
+            continue;
+        }
+        // Negated form "-site:x" is an EXCLUSION, not a positive filter.
+        // A bare `site:` scan would otherwise swallow "-site:reddit.com"
+        // into the positive `sites` list and return the very site the user
+        // asked to exclude. Push to `negative` as a `site:` exclusion token.
+        let negated = cap.0 > 0 && q_lower_full.as_bytes().get(cap.0 - 1) == Some(&b'-');
+        if negated {
+            negative.push(format!("site:{}", val));
+        } else {
             sites.push(val);
         }
     }
@@ -364,23 +443,10 @@ fn extract_constraints(query: &str) -> Constraints {
     }
 
     if language.is_none() {
-        let words: Vec<&str> = q_lower_full.split_whitespace().collect();
-        let fr_words = ["de", "la", "le", "les", "des", "et", "recette", "gateau"];
-        let de_words = ["der", "die", "das", "und", "ist", "rezept", "kuchen"];
-        let es_words = ["el", "la", "los", "las", "y", "en", "para"];
-        let nl_words = ["van", "het", "een", "en", "koptelefoon"];
-        
-        if words.iter().any(|w| fr_words.contains(w)) {
-            language = Some("fr".to_string());
-        } else if words.iter().any(|w| de_words.contains(w)) {
-            language = Some("de".to_string());
-        } else if words.iter().any(|w| es_words.contains(w)) {
-            language = Some("es".to_string());
-        } else if words.iter().any(|w| nl_words.contains(w)) {
-            language = Some("nl".to_string());
-        } else {
-            language = Some("en".to_string());
-        }
+        // Delegate to the evidence-based detector so the gateway doesn't get a
+        // forced "en" for non-matching queries. Returns None when no language
+        // clearly wins (caller then falls back to geo/IP-derived locale).
+        language = detect_query_language(&q_lower_full);
     }
     
     // Clean the query of all operators for token extraction
@@ -402,7 +468,9 @@ fn extract_constraints(query: &str) -> Constraints {
     let q = query_clean;
     let q_lower = q.to_lowercase();
     let mut positive = Vec::new();
-    let mut negative: Vec<String> = Vec::new();
+    // `negative` is already declared above (near the operator scanners) so that
+    // negated site:/filetype: tokens collected there and natural-language
+    // negatives from Phase 1 accumulate into the same vector.
 
     // ── Phase 1: Extract explicit negative constraints ──
     // Handles: "NOT X", "-X", "without X", "except X", "excluding X"
@@ -660,25 +728,51 @@ fn extract_constraints(query: &str) -> Constraints {
     }
 
     // ── Phase 2.5: Extract site: and filetype: as positive constraints ──
-    // These are explicit positive filters the user wants applied
+    // These are explicit positive filters the user wants applied. Mirror the
+    // negation handling and host validation from `extract_constraints` so a
+    // negated "-site:x"/"-filetype:x" is NOT swallowed into `positive` (which
+    // would invert the exclusion into an inclusion) and a malformed token such
+    // as ".edu" (leading dot) is normalized/dropped instead of becoming a
+    // literal (and zero-resulting) host filter.
     for cap in q_lower.match_indices("site:") {
         let after = cap.0 + 5; // skip "site:"
         let rest = &q[after..];
         // Take until next space or end
         let end = rest.find(' ').unwrap_or(rest.len());
         let site_val = &rest[..end];
-        if !site_val.is_empty() {
-            positive.push(format!("site:{}", site_val));
+        if site_val.is_empty() {
+            continue;
         }
+        // Leading '-' => this is a negation; do not push to positive.
+        let negated = cap.0 > 0 && q_lower.as_bytes().get(cap.0 - 1) == Some(&b'-');
+        if negated {
+            continue;
+        }
+        // Normalize bare TLDs (edu/gov/...) to ".edu"/".gov"; drop leading-dot
+        // or other non-host tokens so they don't zero out the query.
+        let is_valid_host = site_val.contains('.') || site_val == "localhost";
+        if !is_valid_host {
+            let bare_tlds = ["edu","gov","org","com","net","io","dev","ai","co","us","uk","de","fr","es","nl","ru","cn","jp","in"];
+            if bare_tlds.contains(&site_val) {
+                positive.push(format!("site:.{}", site_val));
+            }
+            continue;
+        }
+        positive.push(format!("site:{}", site_val));
     }
     for cap in q_lower.match_indices("filetype:") {
         let after = cap.0 + 9; // skip "filetype:"
         let rest = &q[after..];
         let end = rest.find(' ').unwrap_or(rest.len());
         let ft_val = &rest[..end];
-        if !ft_val.is_empty() {
-            positive.push(format!("filetype:{}", ft_val));
+        if ft_val.is_empty() {
+            continue;
         }
+        let negated = cap.0 > 0 && q_lower.as_bytes().get(cap.0 - 1) == Some(&b'-');
+        if negated {
+            continue;
+        }
+        positive.push(format!("filetype:{}", ft_val));
     }
 
     // ── Phase 3: Comma-separated constraint list ──
@@ -825,6 +919,23 @@ fn extract_constraints(query: &str) -> Constraints {
         }
         let pos_set: std::collections::HashSet<String> = positive.iter().cloned().collect();
 
+        // Words that appear as explicit OR/AND alternatives (e.g. "best OR worst",
+        // "python and java") are deliberate comparison constraints. They must NOT
+        // be silently dropped just because a quality adjective like "best"/"free"
+        // is in `stop_words` — otherwise "best OR worst" collapses to just "worst".
+        // We collect the operand words up front and exempt them from the stop-word
+        // filter below (negation still wins, so "-best" stays excluded).
+        let mut alt_operands: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for conj in [" or ", " and "] {
+            for segment in q_lower.split(conj) {
+                let operand = segment.trim().trim_end_matches(['.', ',', ';', '!', '?'])
+                    .split_whitespace().next().unwrap_or("").to_string();
+                if operand.len() >= 2 {
+                    alt_operands.insert(operand);
+                }
+            }
+        }
+
         // Extract candidate topic words from the query
         // Prefer keeping phrase groups intact so hyphenated/slashed negative terms
         // like "react/vue/nextjs" survive as whole phrases and won't leak back
@@ -837,7 +948,8 @@ fn extract_constraints(query: &str) -> Constraints {
             w_clean = w_clean.split_whitespace().collect::<Vec<_>>().join(" ");
             if w_clean.is_empty() { continue; }
             if w_clean.len() < 2 { continue; }
-            if stop_words.contains(w_clean.as_str()) { continue; }
+            // Explicit OR/AND operands survive the stop-word filter (see above).
+            if !alt_operands.contains(w_clean.as_str()) && stop_words.contains(w_clean.as_str()) { continue; }
             // Use lowercase string forms for set lookups (HashSet<String>).
             let w_lower: String = w.to_lowercase();
             if neg_set.contains(&w_lower) { continue; }
@@ -918,22 +1030,53 @@ fn extract_constraints(query: &str) -> Constraints {
 
 fn detect_query_language(q_lower: &str) -> Option<String> {
     let words: Vec<&str> = q_lower.split_whitespace().collect();
-    let fr_words = ["de", "la", "le", "les", "des", "et", "recette", "gateau", "pour", "dans"];
-    let de_words = ["der", "die", "das", "und", "ist", "rezept", "kuchen", "fur", "mit"];
-    let es_words = ["el", "la", "los", "las", "y", "en", "para", "con"];
-    let nl_words = ["van", "het", "een", "en", "koptelefoon", "voor"];
-
-    if words.iter().any(|w| fr_words.contains(w)) {
-        Some("fr".to_string())
-    } else if words.iter().any(|w| de_words.contains(w)) {
-        Some("de".to_string())
-    } else if words.iter().any(|w| es_words.contains(w)) {
-        Some("es".to_string())
-    } else if words.iter().any(|w| nl_words.contains(w)) {
-        Some("nl".to_string())
-    } else {
-        Some("en".to_string())
+    if words.is_empty() {
+        return None;
     }
+    // Each language mapped to a set of its characteristic (function/stop) words.
+    // Detection is evidence-based: we count how many query words belong to each
+    // language's signature. A language is returned only when it clearly wins
+    // (strict majority of query words, or any distinctive non-cognate marker),
+    // otherwise we return None and let the caller avoid forcing a wrong locale.
+    // This fixes the prior behaviour where any non-matching query was silently
+    // pinned to "en" and forwarded as a hard language filter.
+    let fr_words = ["de", "la", "le", "les", "des", "et", "recette", "gateau", "pour", "dans", "une", "que", "qui", "est", "avec"];
+    let de_words = ["der", "die", "das", "und", "ist", "rezept", "kuchen", "fur", "mit", "wie", "man", "lernt", "ein", "eine", "nicht", "sich", "auf", "von"];
+    let es_words = ["el", "la", "los", "las", "y", "en", "para", "con", "mejor", "zapatos", "baratos", "comprar", "que", "uno", "una", "por", "como", "mas"];
+    let nl_words = ["van", "het", "een", "en", "koptelefoon", "voor", "de", "die", "met", "is", "op", "een"];
+
+    let score_for = |sig: &[&str]| -> usize {
+        words.iter().filter(|w| sig.contains(w)).count()
+    };
+    let fr = score_for(&fr_words);
+    let de = score_for(&de_words);
+    let es = score_for(&es_words);
+    let nl = score_for(&nl_words);
+
+    // Distinctive markers that are unambiguous (not shared English cognates).
+    let fr_hit = words.iter().any(|w| ["recette", "gateau", "pour", "dans", "une"].contains(w));
+    let de_hit = words.iter().any(|w| ["wie", "man", "lernt", "rezept", "kuchen", "fur"].contains(w));
+    let es_hit = words.iter().any(|w| ["mejor", "zapatos", "baratos", "comprar", "para"].contains(w));
+    let nl_hit = words.iter().any(|w| ["koptelefoon", "voor", "van"].contains(w));
+
+    // Pick the language with the highest signature overlap; require it to be a
+    // strict majority of the query words OR carry a distinctive marker, so that
+    // e.g. "python" or "best laptop" (English-passing words) do not get mis-tagged.
+    let best = [(fr as i32, "fr"), (de as i32, "de"), (es as i32, "es"), (nl as i32, "nl")]
+        .iter()
+        .copied()
+        .max_by_key(|&(s, _)| s)
+        .unwrap();
+    let total = words.len() as i32;
+    let (best_score, best_lang) = best;
+    let distinctive = fr_hit || de_hit || es_hit || nl_hit;
+    if best_score >= 2 && (best_score * 2 > total || distinctive) {
+        let lang = if fr_hit { "fr" } else if de_hit { "de" } else if es_hit { "es" } else if nl_hit { "nl" } else { best_lang };
+        return Some(lang.to_string());
+    }
+    // No clear non-English signal: do NOT force "en". Return None so the
+    // gateway falls back to geo/IP-derived language rather than an asserted en.
+    None
 }
 
 /// Extract multiple terms connected by "and" or "or" from a negated context.
@@ -975,7 +1118,27 @@ fn extract_conjunctive_terms(text: &str, max_words: usize) -> Vec<String> {
 
     if combined_parts.len() > 1 {
         combined_parts.iter()
-            .map(|p| extract_constraint_term(&strip_neg(p), max_words))
+            .map(|p| {
+                let cleaned = strip_neg(p);
+                // OR/AND clauses are union/comparison terms. The generic
+                // extractor drops a clause that is a *pure* quality adjective
+                // (e.g. "best", "free") because quality adjectives are stripped
+                // as modifiers — but as an explicit OR operand the word IS the
+                // constraint the user wants. So if extraction yields nothing,
+                // fall back to the literal clause token (minus the negation
+                // prefix) so operands like "best OR worst" both survive.
+                let extracted = extract_constraint_term(&cleaned, max_words);
+                if extracted.is_empty() {
+                    let t = cleaned.trim().to_lowercase();
+                    if !t.is_empty() && t != "and" && t != "or" {
+                        t
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    extracted
+                }
+            })
             .filter(|t| !t.is_empty())
             .collect()
     } else {

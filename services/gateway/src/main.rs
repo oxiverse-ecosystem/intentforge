@@ -349,6 +349,20 @@ struct UnifiedResponse {
     /// Web result count after all constraint filtering (before pagination).
     #[serde(skip_serializing_if = "Option::is_none")]
     results_after_filter: Option<usize>,
+    /// Total number of results available after filtering (identical to
+    /// `results_after_filter`). The `results` array is a paginated slice of
+    /// this total, so `len(results)` is NOT the total count.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "total")]
+    total: Option<usize>,
+    /// The effective `limit` applied to the `results` slice.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "limit")]
+    page_limit: Option<usize>,
+    /// The effective `offset` applied to the `results` slice.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "offset")]
+    page_offset: Option<usize>,
+    /// Whether more results exist beyond the returned slice (`offset + limit < total`).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "has_more")]
+    has_more: Option<bool>,
 }
 
 // ─── Domain Authority (Fully Algorithmic) ────────────────────────────
@@ -1939,7 +1953,16 @@ fn should_filter_by_constraints(
                 .and_then(|e| e.to_str())
                 .map(|e| e.to_lowercase())
                 .unwrap_or_default();
-            if !constraints.file_types.iter().any(|ft| ft.to_lowercase() == ext) {
+            if ext.is_empty() {
+                // The URL has no file extension at all (clean slug, CDN download
+                // link, Google Docs viewer, etc.). SearXNG already applied the
+                // `filetype:` constraint upstream, so we trust that and KEEP the
+                // result rather than hard-dropping it. Only when the URL *does*
+                // carry an extension do we require it to match — that's a
+                // reliable signal we can enforce without false negatives.
+                // (Previously every extensionless filetype result was dropped,
+                // which zeroed out `python filetype:pdf filetype:doc`.)
+            } else if !constraints.file_types.iter().any(|ft| ft.to_lowercase() == ext) {
                 return true;
             }
         } else {
@@ -1947,8 +1970,44 @@ fn should_filter_by_constraints(
         }
     }
 
-    // 2. Hard filter on sites
-    if !constraints.sites.is_empty() {
+    // 2b. Hard EXCLUSION for negated site:/filetype: tokens (e.g. "-site:reddit.com").
+        // These arrive in `negative` as "site:reddit.com" / "filetype:pdf" and must
+        // hard-drop matching results — the exact opposite of the positive `+site:` filter.
+        // Without this, "-site:reddit.com python" would return reddit links because the
+        // negation was only applied as a soft text penalty, never as a structural exclude.
+        if !constraints.negative.is_empty() {
+        let neg_sites: Vec<String> = constraints.negative.iter()
+            .filter_map(|n| n.strip_prefix("site:").map(|s| s.trim().to_lowercase()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let neg_fts: Vec<String> = constraints.negative.iter()
+            .filter_map(|n| n.strip_prefix("filetype:").map(|s| s.trim().to_lowercase()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !neg_sites.is_empty() {
+        if let Ok(parsed_url) = reqwest::Url::parse(url) {
+            if let Some(host) = parsed_url.host_str().map(|h| h.to_lowercase()) {
+                if neg_sites.iter().any(|site| host == *site || host.ends_with(&format!(".{}", site))) {
+                    return true;
+                }
+            }
+        }
+        }
+        if !neg_fts.is_empty() {
+        if let Ok(parsed_url) = reqwest::Url::parse(url) {
+            if let Some(ext) = std::path::Path::new(parsed_url.path())
+                .extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase())
+            {
+                if neg_fts.iter().any(|ft| *ft == ext) {
+                    return true;
+                }
+            }
+        }
+        }
+        }
+
+        // 2. Hard filter on sites
+        if !constraints.sites.is_empty() {
         if let Ok(parsed_url) = reqwest::Url::parse(url) {
             if let Some(host) = parsed_url.host_str().map(|h| h.to_lowercase()) {
                 let matches_site = constraints.sites.iter().any(|site| {
@@ -1967,6 +2026,15 @@ fn should_filter_by_constraints(
     }
 
     // 3. Hard filter on date bounds
+    // Policy: a date bound filters ONLY results that carry a parseable
+    // published date. Results without a resolvable date are KEPT, never
+    // dropped — dropping them silently removes the majority of general web
+    // results (most pages expose no machine-readable date), which previously
+    // zeroed out queries like "python after:2024" even though plenty of
+    // relevant content existed. We report the coverage gap via
+    // `ignored_constraints` (dated_result_count==0) instead of silently
+    // filtering everything. This is the fail-open choice: a dateless result is
+    // assumed in-range rather than out-of-range.
     if let Some(ref ad) = constraints.after_date {
         if let Some(limit) = parse_date_to_comparable(ad) {
             if let Some(p_date) = resolve_item_date(published_date, url, title, content) {
@@ -2798,7 +2866,12 @@ fn sanitize_json_text(raw: &str) -> String {
 
 // Preprocess query for SearXNG — strip trigger words that cause dictionary/shopping results
 fn preprocess_searxng_query(query: &str) -> String {
-    let q = query.trim();
+    // Normalize natural-language constraint syntax (under $500, in url:, …)
+    // into canonical operator tokens so the engine query honours them. The
+    // intent engine applies the same normalization for constraint extraction,
+    // keeping both paths consistent.
+    let normalized = normalize_nl_operators(query);
+    let q = normalized.trim();
     let q_lower = q.to_lowercase();
     
     // Count filetype operators
@@ -2816,8 +2889,49 @@ fn preprocess_searxng_query(query: &str) -> String {
         let rest = &q[after..];
         let end = rest.find(' ').unwrap_or(rest.len());
         let val = rest[..end].trim().to_lowercase();
-        if !val.is_empty() && !site_values.contains(&val) {
-            site_values.push(val);
+        // Skip malformed site tokens. A valid site constraint must look like a
+        // host: it either contains a dot (example.com) or is a bare TLD that we
+        // normalise (see below). Tokens such as ".edu" (leading dot) or a bare
+        // two/three-letter string with no dot are not real hosts and would make
+        // the upstream engine return zero hits — drop them so they don't
+        // silently zero out the whole query.
+        if val.is_empty() {
+            continue;
+        }
+        // A leading-dot token like ".edu" is a malformed host. Strip the dot so
+        // it becomes the bare TLD "edu" and falls through to the normalisation
+        // below (SearXNG matches `site:edu` correctly; `site:.edu` returned 0).
+        let val = val.strip_prefix('.').unwrap_or(&val);
+        let is_valid_host = val.contains('.') || val == "localhost";
+        if !is_valid_host {
+            // Bare TLD like "edu"/"gov" → emit the bare form (e.g. "edu") so the
+            // upstream engine can match subdomains. SearXNG honours `site:edu`;
+            // the dotted form `site:.edu` returned zero hits in testing.
+            if ["edu", "gov", "org", "com", "net", "io", "dev", "ai", "co", "us", "uk", "de", "fr", "es", "nl", "ru", "cn", "jp", "in"].contains(&val) {
+                if !site_values.contains(&val.to_string()) {
+                    site_values.push(val.to_string());
+                }
+            }
+            continue;
+        }
+        if !site_values.contains(&val.to_string()) {
+            site_values.push(val.to_string());
+        }
+    }
+
+    // Collect filetype operators so multiple values can be OR'd (e.g.
+    // "filetype:pdf filetype:doc" → "filetype:pdf OR filetype:doc"). The old
+    // code dropped every filetype token when more than one was present, which
+    // left the upstream engine with no type constraint and the local hard
+    // filter then dropped all general web results → 0 hits.
+    let mut filetype_values: Vec<String> = Vec::new();
+    for cap in q_lower.match_indices("filetype:") {
+        let after = cap.0 + 9;
+        let rest = &q[after..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        let val = rest[..end].trim().to_lowercase();
+        if !val.is_empty() && !filetype_values.contains(&val) {
+            filetype_values.push(val);
         }
     }
 
@@ -2852,7 +2966,7 @@ fn preprocess_searxng_query(query: &str) -> String {
         if wl.starts_with("site:") {
             continue;
         }
-        if (filetype_count > 1 || has_booleans) && wl.starts_with("filetype:") {
+        if wl.starts_with("filetype:") {
             continue;
         }
         let clean_w = w.replace('"', "").replace('\'', "");
@@ -2879,6 +2993,26 @@ fn preprocess_searxng_query(query: &str) -> String {
             cleaned_str.push(' ');
         }
         cleaned_str.push_str(&format!("site:{}", single));
+    }
+
+    // Re-emit filetype: as an OR-group when there are 2+, otherwise the single
+    // value passes through (already stripped above). Mirrors the site: handling
+    // so "filetype:pdf filetype:doc" is honoured as a union, not silently dropped.
+    if filetype_values.len() >= 2 {
+        let or_group = filetype_values
+            .iter()
+            .map(|s| format!("filetype:{}", s))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        if !cleaned_str.is_empty() {
+            cleaned_str.push(' ');
+        }
+        cleaned_str.push_str(&or_group);
+    } else if let Some(single) = filetype_values.first() {
+        if !cleaned_str.is_empty() {
+            cleaned_str.push(' ');
+        }
+        cleaned_str.push_str(&format!("filetype:{}", single));
     }
 
     // Re-emit native operators (intitle:/inurl:/intext:/lang:) verbatim so the
@@ -4982,6 +5116,10 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         warnings: None,
         results_before_filter: None,
         results_after_filter: None,
+        total: None,
+        page_limit: None,
+        page_offset: None,
+        has_more: None,
     };
     (
         axum::http::StatusCode::BAD_REQUEST,
@@ -7599,9 +7737,21 @@ let mut results = match tokio::task::spawn_blocking(move || {
         );
     }
     if pre_filter_count > 0 && post_filter_count == 0 {
-        warnings.push(
-            "All web results were removed by your constraints. Try relaxing them (wider date range, or drop a negative term).".to_string(),
-        );
+        // Attribute the empty result set to the most likely cause so the
+        // warning is actionable rather than generic. A date-bound query that
+        // leaves nothing is almost always a too-narrow range; otherwise it's a
+        // negative-term / constraint conflict. (Previously this always blamed a
+        // negative term even when the real cause was the date window.)
+        let has_date_bound = sc.after_date.is_some() || sc.before_date.is_some();
+        if has_date_bound {
+            warnings.push(
+                "All web results were removed by your date constraint. Try widening the range (e.g. a broader after:/before: window).".to_string(),
+            );
+        } else {
+            warnings.push(
+                "All web results were removed by your constraints. Try relaxing them (drop a negative term, or widen a filter).".to_string(),
+            );
+        }
     }
     if pre_filter_count == 0 {
         warnings.push(
@@ -7629,6 +7779,10 @@ let mut results = match tokio::task::spawn_blocking(move || {
         warnings: if warnings.is_empty() { None } else { Some(warnings) },
         results_before_filter: Some(pre_filter_count),
         results_after_filter: Some(post_filter_count),
+        total: Some(post_filter_count),
+        page_limit: Some(limit),
+        page_offset: Some(offset),
+        has_more: if post_filter_count > 0 { Some(offset + limit < post_filter_count) } else { Some(false) },
     };
 
     // Cache for 5 minutes — but never cache empty results
@@ -7689,7 +7843,44 @@ fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
     (after_date, before_date)
 }
 
+/// Normalize natural-language constraint syntax into canonical operator tokens
+/// (mirror of the intent engine's helper) so the engine query and the gateway's
+/// own constraint parsing honour spoken forms: "under $500" -> price:<500,
+/// "in url:github" -> inurl:github, "on site:reddit" -> site:reddit.
+fn normalize_nl_operators(query: &str) -> String {
+    let mut out = query.to_string();
+    for (re_src, replacement) in [
+        (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bless\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bbelow\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bcheaper\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bmax(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bover\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bmore\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\babove\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bgreater\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bmin(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bin\s+url\s*:\s*", "inurl:"),
+        (r"(?i)\binurl\s+", "inurl:"),
+        (r"(?i)\bon\s+site\s*:\s*", "site:"),
+        (r"(?i)\bonsite\s+", "site:"),
+        (r"(?i)\bin\s+title\s*:\s*", "intitle:"),
+        (r"(?i)\bintitle\s+", "intitle:"),
+        (r"(?i)\bin\s+text\s*:\s*", "intext:"),
+        (r"(?i)\bintext\s+", "intext:"),
+    ] {
+        if let Ok(re) = regex::Regex::new(re_src) {
+            out = re.replace_all(&out, replacement).to_string();
+        }
+    }
+    out
+}
+
 fn extract_gateway_constraints(q: &str) -> Constraints {
+    // Normalize spoken constraint forms (under $500, in url:, …) before
+    // scanning for operators so the gateway's own parsing matches the engine
+    // query and the intent engine's extraction.
+    let q = normalize_nl_operators(q);
     let mut file_types = Vec::new();
     let mut sites = Vec::new();
     let mut phrases = Vec::new();
@@ -7702,6 +7893,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     let mut price_lt = None;
     let mut price_gt = None;
     let mut language = None;
+    let mut negative: Vec<String> = Vec::new();
     
     // Parse phrases (quotes)
     let mut current_phrase = String::new();
@@ -7732,25 +7924,51 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     let q_lower = q.to_lowercase();
     
     // Extract filetype:
+    // Negated form "-filetype:x" is an EXCLUSION, not a positive filter — route
+    // it to `negative` so the hard filter excludes it instead of including it.
     for cap in q_lower.match_indices("filetype:") {
         let after = cap.0 + 9;
         let rest = &q[after..];
         let end = rest.find(' ').unwrap_or(rest.len());
         let val = rest[..end].trim().to_lowercase();
-        if !val.is_empty() {
+        if val.is_empty() {
+            continue;
+        }
+        let negated = cap.0 > 0 && q_lower.as_bytes().get(cap.0 - 1) == Some(&b'-');
+        if negated {
+            negative.push(format!("filetype:{}", val));
+        } else {
             file_types.push(val);
         }
     }
     
     // Extract site:
+    // Negated "-site:x" => exclusion (route to `negative`). Bare/leading-dot
+    // TLDs like ".edu"/"edu" are not real hosts; normalize bare TLDs to
+    // ".edu" and drop leading-dot tokens so they don't zero out the query.
     for cap in q_lower.match_indices("site:") {
         let after = cap.0 + 5;
         let rest = &q[after..];
         let end = rest.find(' ').unwrap_or(rest.len());
         let val = rest[..end].trim().to_lowercase();
-        if !val.is_empty() {
-            sites.push(val);
+        if val.is_empty() {
+            continue;
         }
+        let negated = cap.0 > 0 && q_lower.as_bytes().get(cap.0 - 1) == Some(&b'-');
+        if negated {
+            negative.push(format!("site:{}", val));
+            continue;
+        }
+        let val = val.strip_prefix('.').unwrap_or(&val);
+        let is_valid_host = val.contains('.') || val == "localhost";
+        if !is_valid_host {
+            let bare_tlds = ["edu","gov","org","com","net","io","dev","ai","co","us","uk","de","fr","es","nl","ru","cn","jp","in"];
+            if bare_tlds.contains(&val) {
+                sites.push(val.to_string());
+            }
+            continue;
+        }
+        sites.push(val.to_string());
     }
 
     // Extract intitle:
@@ -7842,11 +8060,11 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         }
     }
     
-    let (after_date, before_date) = parse_date_constraints(q);
+    let (after_date, before_date) = parse_date_constraints(&q);
     
     Constraints {
         positive: vec![],
-        negative: vec![],
+        negative,
         entities: vec![],
         language,
         file_types,
