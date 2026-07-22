@@ -4404,7 +4404,11 @@ fn merge_local_and_web(
             } else { 0.0 }
         } else { 0.0 };
 
-        let local_bonus = if r.is_local { 1.0 } else { 0.0 };
+        // Local pages earn the bonus ONLY when actually relevant to the query.
+        // The old blanket +1.0 floated token-overlap noise (e.g. "boilerplate code"
+        // -> "QR Code Generator") to the top regardless of relevance. The merge-time
+        // consensus *1.5 boost still prefers genuinely-good local pages.
+        let local_bonus = if r.is_local && relevance >= 0.3 { 0.6 } else { 0.0 };
         // Geo-relevance boost: boost results that mention the user's country, region, or city.
         // Higher boost for city-level matches (0.25) than country-level (0.10).
         let geo_boost = geo_location.map(|g| geo_relevance_score(&r.title, &r.content, &r.url, g)).unwrap_or(0.0);
@@ -4437,10 +4441,36 @@ fn merge_local_and_web(
             generic_penalty *= 0.10;
         }
 
-        r.score = base * c_score * generic_penalty;
+        r.score = base * c_score * generic_penalty * relevance_factor;
         // Capture this result's relevance for the post-loop adaptive-floor pass.
         relevance_vec.push(relevance);
     }
+
+    // ── Adaptive relevance floor (distribution-driven, no fixed threshold) ──
+    // Demote results whose relevance sits far below THIS query's own relevance
+    // distribution. The floor tracks the shape of the results returned, so it
+    // stays correct as the web shifts (no magic constant like 0.12/0.18). Off-topic
+    // pages (football spam for "predictive coding", dictionary/listicle clickbait)
+    // have low distinctive-term overlap -> low relevance -> crushed here on the
+    // FINAL score, where it actually bites (the old quality*0.08 never did).
+    if !relevance_vec.is_empty() {
+        let mut sorted = relevance_vec.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p60_idx = ((sorted.len() as f32 * 0.6).floor() as usize).min(sorted.len() - 1);
+        let p60 = sorted[p60_idx];
+        // Floor = a fraction of the 60th-percentile relevance, clamped to a sane band.
+        let floor = (p60 * 0.35).max(0.05).min(0.5);
+        for (i, r) in merged.iter_mut().enumerate() {
+            let rel = relevance_vec.get(i).copied().unwrap_or(0.0);
+            let factor = if rel < floor {
+                (rel / floor).clamp(0.05, 1.0)
+            } else {
+                1.0
+            };
+            r.score *= factor;
+        }
+    }
+
     // --- Thin-Result Detection: boost scores when few results or low max score ---
     // For niche topics (few results returned, low max score), apply a proportional
     // boost to ensure the top results surface with reasonable confidence.
