@@ -2298,6 +2298,12 @@ fn rotate_tor_circuit() {
                 let _ = reader.read_line(&mut newnym_resp);
                 if newnym_resp.starts_with("250") {
                     tracing::info!("tor2 circuit rotated successfully");
+                    // A fresh Tor circuit is COLD: the next SearXNG2 query can
+                    // take 10-15s to build a circuit, which would blow the
+                    // gateway's retry budget and surface `upstream_unavailable`
+                    // for the very first user query after a rotation. Warm the
+                    // circuit in the background so real queries hit a HOT path.
+                    warm_tor2_cache();
                 } else {
                     tracing::warn!("tor2 NEWNYM response: {}", newnym_resp.trim());
                 }
@@ -2306,6 +2312,29 @@ fn rotate_tor_circuit() {
             }
         } else {
             tracing::warn!("Could not connect to tor2:9052 for circuit rotation");
+        }
+    });
+}
+
+/// Fire a cheap background query at SearXNG2 (tor2) to rebuild its Tor
+/// circuit after a NEWNYM, so subsequent user queries don't pay the cold
+/// 10-15s circuit-build cost. Runs detached; results are discarded.
+fn warm_tor2_cache() {
+    std::thread::spawn(|| {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(25))
+            .build();
+        if let Ok(client) = client {
+            // Two sequential warmups: the first builds the circuit, the second
+            // confirms it's hot. Ignore errors — this is best-effort.
+            for _ in 0..2 {
+                let _ = client
+                    .get("http://tor2:8081/search")
+                    .query(&[("q", "warmup"), ("format", "json")])
+                    .send();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            tracing::info!("tor2 cache warmed after NEWNYM");
         }
     });
 }
@@ -6187,11 +6216,18 @@ async fn handle_search(
             // inline `tokio::time::timeout` around `client.get().send()` does
             // NOT reliably interrupt (same root cause as the indexer hangs).
             // So we run the fetch in a DETACHED spawned task and join it
-            // with a hard 4s budget. If it stalls, we return empty results
+            // with a hard budget. If it stalls, we return empty results
             // instead of hanging the whole fan-out.
+            // The Tor-backed instance (index 1, searxng2/tor2) is inherently
+            // slower: a WARM Tor circuit answers in ~1.5s, but the FIRST
+            // request after a circuit rebuild (NEWNYM, done every 10 min for
+            // IP rotation) can take ~10-12s. Give it a 13s branch budget so it
+            // isn't cut before it responds; the gluetun instance (index 0)
+            // keeps the original 4.2s budget.
+            let branch_timeout_ms: u64 = if i == 1 { 15000 } else { 4200 };
             let task = tokio::spawn(async move {
                 let resp = match tokio::time::timeout(
-                    std::time::Duration::from_secs(4),
+                    std::time::Duration::from_millis(branch_timeout_ms),
                     client_for_searx.get(&url).send(),
                 ).await {
                     Ok(Ok(r)) => r,
@@ -6283,7 +6319,7 @@ async fn handle_search(
                     }
                 }
             });
-            match tokio::time::timeout(std::time::Duration::from_millis(4200), task).await {
+            match tokio::time::timeout(std::time::Duration::from_millis(branch_timeout_ms + 500), task).await {
                 Ok(Ok(inner)) => Ok(inner),
                 Ok(Err(_)) => {
                     tracing::warn!("SearXNG instance task panicked — empty results");
@@ -6412,15 +6448,18 @@ async fn handle_search(
         let max_attempts: usize = if has_site { 2 } else { 1 };
         let attempt_budget_ms = |attempt: usize| -> u64 {
             if has_site {
-                // attempt1 must NOT starve the primary (gluetun) instance, which
-                // answers in 1-2.6s when healthy — a 1.8s budget was cutting it
-                // before it could return. attempt2 is a quick forced re-probe of
-                // any breaker-excluded instance. Total worst: 3.0 + 0.15 + 1.5 =
-                // ~4.65s < 5s. (A genuinely COLD tor2 needing ~5.5s is irreducible
-                // under the 5s ceiling — the retry covers transient, not cold-start.)
-                if attempt == 1 { 3000 } else { 1500 }
+                // attempt1 gives the gluetun instance a fair shot (instance1
+                // attempt2 is the tor2 recovery path: tor2
+                // is warm ~1.5s but a cold Tor circuit (after NEWNYM) can take
+                // ~10-12s, so the retry budget must allow that. Worst case:
+                // 4.5 + 0.15 + 13 = ~17.6s — only on the rare cold-tor2 degraded
+                // run; a warm tor2 recovers in ~1.5s (total ~6s, just over 5s).
+                // The common case (instance1 healthy, early-returns) stays fast.
+                if attempt == 1 { 4500 } else { 15000 }
             } else {
-                5500
+                // Non-site queries also fan out to tor2; allow its cold-circuit
+                // time so it can serve as a true redundant path.
+                10000
             }
         };
         let min_early_return: usize = 15;
@@ -6496,7 +6535,18 @@ async fn handle_search(
                 std::mem::take(&mut *guard)
             };
 
-            if !results.is_empty() {
+            // A resolved future is NOT the same as a usable result. An instance
+            // can return Ok([]) (HTTP 200 but Brave suspended / no hits) — that
+            // must NOT count as "we got results" or the retry below is skipped
+            // and we surface upstream_unavailable even though the other path
+            // (tor2) simply got cut by the budget and would have answered on
+            // the retry. Only break early when at least one instance returned
+            // a non-empty result set.
+            let has_usable = results.iter().any(|(_, r)| {
+                matches!(r, Ok(d) if !d.results.is_empty())
+            });
+
+            if has_usable {
                 out_results = results;
                 if attempt > 1 {
                     tracing::info!(

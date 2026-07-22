@@ -27,6 +27,14 @@ services:
       - HTTP_CONTROL_SERVER_ADDRESS=:8000
       - HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE=public
       - OPENVPN_OPTIONS=--route-nopull
+      # Allow the gateway (which shares this netns) to reach the OTHER egress
+      # path (tor2 / SearXNG2 on the docker bridge) WITHOUT tunnelling it
+      # through the VPN. Without this, gluetun's kill-switch firewall blocks
+      # all non-VPN outbound, so the gateway can reach only loopback services
+      # (searxng/intent/indexer) and never tor2 — collapsing the "two
+      # independent paths" fallback to a single dead-end whenever tor2 is the
+      # one that's up. 172.19.0.0/16 is the services_default bridge subnet.
+      - FIREWALL_OUTBOUND_SUBNETS=172.19.0.0/16
     ports:
       - "8888:8888/tcp"
       - "8388:8388/tcp"
@@ -57,13 +65,17 @@ services:
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
     command: ["sh", "/vpn-rotator.sh"]
     depends_on:
-      - gluetun
+      gluetun:
+        condition: service_healthy
     network_mode: "service:gluetun"
     restart: always
 
   tor:
     build: ./privacy-layer/tor
     container_name: if-dev-tor
+    depends_on:
+      gluetun:
+        condition: service_healthy
     network_mode: "service:gluetun"
     volumes:
       - ./privacy-layer/tor/data:/var/lib/tor
@@ -101,7 +113,10 @@ services:
     image: searxng/searxng:latest
     network_mode: "service:gluetun"
     depends_on:
-      - tor
+      gluetun:
+        condition: service_healthy
+      tor:
+        condition: service_started
     environment:
       - GRANIAN_WORKERS=4
       - GRANIAN_HOST=0.0.0.0
@@ -189,6 +204,9 @@ services:
       - ./indexer/index_data:/app/index_data
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
     network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
     restart: always
 
   crawler:
@@ -199,6 +217,9 @@ services:
     mem_limit: 256m
     mem_reservation: 128m
     network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
     volumes:
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
     restart: always
@@ -221,6 +242,9 @@ services:
       - RUST_LOG=info
       - RAYON_NUM_THREADS=4
     network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
     restart: always
 
   geolite2-updater:
@@ -256,12 +280,26 @@ services:
       - ../data/geolite2:/var/lib/geolite2:ro
     network_mode: "service:gluetun"
     depends_on:
-      - intent-engine
-      - crawler
-      - indexer
-      - searxng
-      - searxng2
-      - invidious
+      gluetun:
+        condition: service_healthy
+      intent-engine:
+        condition: service_started
+      crawler:
+        condition: service_started
+      indexer:
+        condition: service_started
+      searxng:
+        condition: service_started
+      searxng2:
+        condition: service_started
+      invidious:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
     restart: always
 
 volumes:
