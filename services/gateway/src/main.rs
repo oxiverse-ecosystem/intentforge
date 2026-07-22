@@ -6160,13 +6160,25 @@ async fn handle_search(
         }
     });
 
-    // Fire all SearXNG instances in parallel. No retry on 0 results — IP rotation only.
-    let searx_futs: Vec<_> = searx_urls.iter().enumerate().map(|(i, url)| {
+    // Fire all SearXNG instances in parallel. For site:-constrained queries a
+    // single transient double-failure (both the gluetun-VPN and Tor2 egress paths
+    // hiccup at once) yields upstream_unavailable. Because the two paths are
+    // independent, a short backoff + one re-fire almost always recovers. The
+    // fan-out futures are built by `build_searx_futs` so they can be re-issued on
+    // the retry without duplicating the ~120-line fetch block.
+    let build_searx_futs = |searx_urls: &[String], force: bool| -> Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<SearxResponse, reqwest::Error>> + Send>>> {
+        searx_urls.iter().enumerate().map(|(i, url)| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SearxResponse, reqwest::Error>> + Send>> {
         let url = url.clone();
-        let is_open = searx_instance_open[i];
+        // When `force` (the retry attempt), ignore the circuit breaker's open
+        // state and re-probe EVERY instance. The breaker can exclude Tor2 for up
+        // to its cooldown window; if that exclusion coincides with a gluetun
+        // stall, the "two independent paths" fallback collapses to a single dead
+        // path and a naive retry just re-hits it. Re-probing the excluded instance
+        // is exactly the transient-recovery the site:-retry exists for.
+        let is_open = if force { false } else { searx_instance_open[i] };
         let client_for_searx = client.clone();
         let ratelimit_for_searx = state.rate_limits.clone();
-        async move {
+        let fut = async move {
             if is_open {
                 return Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] });
             }
@@ -6282,8 +6294,10 @@ async fn handle_search(
                     Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] })
                 }
             }
-        }
-    }).collect();
+        };
+        Box::pin(fut)
+        }).collect()
+    };
 
     let invidious_fut = async {
         if invidious_open {
@@ -6384,78 +6398,122 @@ async fn handle_search(
         }
     };
 
+    let has_site = !constraints.sites.is_empty();
     let searx_fut_with_timeout = async {
         use futures::future::FutureExt;
-        let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<SearxResponse, reqwest::Error>)> + Send>>> =
-            searx_futs.into_iter().enumerate().map(|(i, f)| {
-                f.map(move |r| (i, r)).boxed()
-            }).collect();
+
+        // Retry policy. For site:-constrained queries an upstream_unavailable is
+        // almost always a transient double-failure of the two INDEPENDENT egress
+        // paths (gluetun-VPN + Tor2) — a short backoff + one re-fire recovers it.
+        // Budgets are sized so the WHOLE request stays under 5s:
+        //   attempt1 = 2600ms, backoff 250ms, attempt2 = 1800ms  => worst ~4650ms.
+        // Non-site queries keep the original single-shot 5.5s budget (no extra
+        // upstream load, no behaviour change).
+        let max_attempts: usize = if has_site { 2 } else { 1 };
+        let attempt_budget_ms = |attempt: usize| -> u64 {
+            if has_site {
+                // attempt1 gives the primary a fair shot; attempt2 is sized to
+                // Tor2's warm response time (~2.5s) so the forced re-probe isn't
+                // cut short. Total worst case: 1.8 + 0.15 + 2.5 = ~4.45s < 5s.
+                if attempt == 1 { 1800 } else { 2500 }
+            } else {
+                5500
+            }
+        };
         let min_early_return: usize = 15;
-        let urls_cloned = searx_urls.clone();
 
-        // Use a thread-safe shared mutex to preserve results if the timeout triggers
-        let results_shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let results_inner = results_shared.clone();
+        let mut out_results: Vec<(usize, Result<SearxResponse, reqwest::Error>)> = Vec::new();
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            // Use a thread-safe shared mutex to preserve results if the timeout triggers
+            let results_shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let results_inner = results_shared.clone();
+            // Cloned per attempt: the select_all loop below moves it into an `async move`
+            // that runs once per attempt, so it must be fresh each iteration.
+            let urls_cloned = searx_urls.clone();
 
-        // Overall budget: raised from 3.3s to 5.5s so the SECONDARY instance
-        // (Tor2/SearXNG2) can cover when the PRIMARY (VPN/gluetun) is briefly
-        // unreachable — e.g. during an IP rotation the VPN tunnel drops for
-        // ~5s. Verified: tor2-direct returns 20-40 results within ~1-3s even
-        // while the VPN is down, but the old 3.3s budget expired before tor2's
-        // answer was merged, so the gateway emitted results=0. Normal latency is
-        // unchanged: the primary still early-returns at >=15 results (~3s), so the
-        // budget only extends when the primary is slow/dead and we WANT tor2 to
-        // fill in. Per-branch 4s timeout still caps a hung primary.
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(5500), async move {
-            while !futs.is_empty() {
-                let ((orig_idx, result), _idx, remaining) = futures::future::select_all(futs).await;
-                futs = remaining;
+            let futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<SearxResponse, reqwest::Error>)> + Send>>> =
+                build_searx_futs(&searx_urls, attempt == 2).into_iter().enumerate().map(|(i, f)| {
+                    f.map(move |r| (i, r)).boxed()
+                }).collect();
+            let mut futs = futs;
 
-                match result {
-                    Ok(data) => {
-                        let count = data.results.len();
-                        results_inner.lock().unwrap().push((orig_idx, Ok(data)));
-                        let is_primary = urls_cloned[orig_idx].starts_with("http://127.0.0.1:8080");
-                        // FIX: do NOT early-return on the primary instance returning a
-                        // small/medium set. SearXNG1 (127.0.0.1:8080) sits behind a flaky
-                        // VPN and its Bing/Brave engines frequently return OFF-TOPIC junk
-                        // (e.g. "population of France" → New Balance shoe pages). The
-                        // secondary instance (Tor2 / SearXNG2) is far more reliable and
-                        // routinely returns the correct results. The old `is_primary &&
-                        // count >= 5` rule discarded Tor2's good results the moment the
-                        // primary coughed up 5 junk hits, and the downstream "garbage
-                        // cluster" fallback then trusted raw RRF ranking — surfacing junk
-                        // at the top.
-                        //
-                        // We now only short-circuit when a result set is genuinely LARGE
-                        // (>= min_early_return=15), which still bounds latency while
-                        // guaranteeing Tor2's reliable results always join the merge.
-                        // Tor2 responds in ~2.5s, comfortably inside the 3.3s budget.
-                        if count >= min_early_return {
-                            tracing::info!(
-                                "SearXNG early return: {} results (is_primary={}), skipping {} remaining instance(s)",
-                                count, is_primary, futs.len()
-                            );
-                            break;
+            let budget = attempt_budget_ms(attempt);
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(budget), async move {
+                while !futs.is_empty() {
+                    let ((orig_idx, result), _idx, remaining) = futures::future::select_all(futs).await;
+                    futs = remaining;
+
+                    match result {
+                        Ok(data) => {
+                            let count = data.results.len();
+                            results_inner.lock().unwrap().push((orig_idx, Ok(data)));
+                            let is_primary = urls_cloned[orig_idx].starts_with("http://127.0.0.1:8080");
+                            // FIX: do NOT early-return on the primary instance returning a
+                            // small/medium set. SearXNG1 (127.0.0.1:8080) sits behind a flaky
+                            // VPN and its Bing/Brave engines frequently return OFF-TOPIC junk
+                            // (e.g. "population of France" -> New Balance shoe pages). The
+                            // secondary instance (Tor2 / SearXNG2) is far more reliable and
+                            // routinely returns the correct results. The old `is_primary &&
+                            // count >= 5` rule discarded Tor2's good results the moment the
+                            // primary coughed up 5 junk hits, and the downstream "garbage
+                            // cluster" fallback then trusted raw RRF ranking -- surfacing junk
+                            // at the top.
+                            //
+                            // We now only short-circuit when a result set is genuinely LARGE
+                            // (>= min_early_return=15), which still bounds latency while
+                            // guaranteeing Tor2's reliable results always join the merge.
+                            // Tor2 responds in ~2.5s, comfortably inside the 3.3s budget.
+                            if count >= min_early_return {
+                                tracing::info!(
+                                    "SearXNG early return: {} results (is_primary={}), skipping {} remaining instance(s)",
+                                    count, is_primary, futs.len()
+                                );
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("SearXNG instance error (idx={}): {:?}", orig_idx, e);
+                            results_inner.lock().unwrap().push((orig_idx, Err(e)));
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("SearXNG instance error (idx={}): {:?}", orig_idx, e);
-                        results_inner.lock().unwrap().push((orig_idx, Err(e)));
-                    }
                 }
+            }).await;
+
+            let results = {
+                let mut guard = results_shared.lock().unwrap();
+                std::mem::take(&mut *guard)
+            };
+
+            if !results.is_empty() {
+                out_results = results;
+                if attempt > 1 {
+                    tracing::info!(
+                        "SearXNG retry recovered results on attempt {} (site:-constrained query)",
+                        attempt
+                    );
+                }
+                break;
             }
-        }).await;
+            if attempt >= max_attempts {
+                out_results = results;
+                if has_site {
+                    tracing::warn!(
+                        "SearXNG site:-constrained query empty after {} attempt(s) -- will signal upstream_unavailable",
+                        attempt
+                    );
+                }
+                break;
+            }
+            // Short backoff before the single retry (transient double-failure cleared).
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
 
-        let results = {
-            let mut guard = results_shared.lock().unwrap();
-            std::mem::take(&mut *guard)
-        };
-
-        results
+        out_results
     };
 
-    // ─── SINGLE PARALLEL JOIN: intent + engines fire simultaneously ───
+
     // This eliminates the sequential intent→engines pipeline.
     // Engines start fetching immediately; intent runs in parallel.
     // Latency = max(intent, engines) instead of intent + engines.
