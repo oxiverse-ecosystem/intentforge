@@ -2250,6 +2250,14 @@ fn constraint_boost(title: &str, content: &str, url: &str, constraints: &Constra
 // Rotates both gluetun VPN and tor2 circuit to get fresh exit IPs.
 // Called on CAPTCHA detection, rate limiting, and periodically every 10 minutes.
 
+/// Tracks whether SearXNG2 (tor2 / Tor) currently has a HOT circuit. A fresh
+/// Tor circuit (after NEWNYM) is COLD and the first query can take 10-15s;
+/// queries sent into a cold circuit blow the retry budget and surface
+/// `upstream_unavailable`. `warm_tor2_cache()` flips this to true once it has
+/// rebuilt+confirmed the circuit; the search recovery path waits (bounded) for
+/// it before querying tor2 so users don't pay the cold-build cost.
+static TOR2_WARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn trigger_vpn_rotation(reason: &str) {
     tracing::info!("VPN rotation triggered: {}", reason);
     let signal_dir = "/tmp/vpn-signals";
@@ -2298,6 +2306,12 @@ fn rotate_tor_circuit() {
                 let _ = reader.read_line(&mut newnym_resp);
                 if newnym_resp.starts_with("250") {
                     tracing::info!("tor2 circuit rotated successfully");
+                    // Mark tor2 COLD immediately so the search recovery path's
+                    // bounded pre-query wait engages until warm_tor2_cache()
+                    // rebuilds+confirms the circuit. Without this, a query
+                    // arriving in the cold window would hit the 10-15s build
+                    // cost and surface upstream_unavailable.
+                    TOR2_WARM.store(false, std::sync::atomic::Ordering::SeqCst);
                     // A fresh Tor circuit is COLD: the next SearXNG2 query can
                     // take 10-15s to build a circuit, which would blow the
                     // gateway's retry budget and surface `upstream_unavailable`
@@ -2318,23 +2332,26 @@ fn rotate_tor_circuit() {
 
 /// Fire a cheap background query at SearXNG2 (tor2) to rebuild its Tor
 /// circuit after a NEWNYM, so subsequent user queries don't pay the cold
-/// 10-15s circuit-build cost. Runs detached; results are discarded.
+/// 10-15s circuit-build cost. Runs detached; results are discarded. Once the
+/// circuit is confirmed hot, flips `TOR2_WARM` so the search recovery path
+/// knows it can query tor2 without the cold penalty.
 fn warm_tor2_cache() {
     std::thread::spawn(|| {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(25))
             .build();
         if let Ok(client) = client {
-            // Two sequential warmups: the first builds the circuit, the second
-            // confirms it's hot. Ignore errors — this is best-effort.
-            for _ in 0..2 {
-                let _ = client
-                    .get("http://tor2:8081/search")
-                    .query(&[("q", "warmup"), ("format", "json")])
-                    .send();
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-            tracing::info!("tor2 cache warmed after NEWNYM");
+            // Fire ONE warmup query. A cold Tor circuit builds on the first
+            // request (the result is discarded); once it returns, the circuit
+            // is HOT, so flip TOR2_WARM immediately rather than waiting for a
+            // second confirmation. This keeps the warmup well under the
+            // search recovery path's 12s pre-query wait window.
+            let _ = client
+                .get("http://tor2:8081/search")
+                .query(&[("q", "warmup"), ("format", "json")])
+                .send();
+            TOR2_WARM.store(true, std::sync::atomic::Ordering::SeqCst);
+            tracing::info!("tor2 cache warmed after NEWNYM (TOR2_WARM=true)");
         }
     });
 }
@@ -5369,7 +5386,10 @@ async fn main() {
             prewarm_futs.push(prewarm_client.get(url).send());
         }
         let _ = futures::future::join_all(prewarm_futs).await;
-        tracing::info!("Prewarm complete");
+        // The tor2 GET above rebuilt the circuit; mark it hot so the search
+        // recovery path can query tor2 without paying the cold-build penalty.
+        TOR2_WARM.store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!("Prewarm complete (tor2 circuit marked hot)");
     });
 
     // Periodic IP rotation every 10 minutes — rotates both gluetun VPN and tor2 circuit
@@ -6437,6 +6457,26 @@ async fn handle_search(
     let has_site = !constraints.sites.is_empty();
     let searx_fut_with_timeout = async {
         use futures::future::FutureExt;
+
+        // If tor2 (SearXNG2 / Tor) is currently COLD (flag false), wait a
+        // bounded amount for warm_tor2_cache() to rebuild+confirm the circuit
+        // before we query it. Querying a cold circuit blows the per-branch
+        // budget and surfaces upstream_unavailable even though tor2 would
+        // have answered once warm. We only wait when tor2 is actually in the
+        // fan-out (it is, for every request) and it's currently marked cold.
+        // Cap at 12s so a genuinely stuck tor2 can't hang the request.
+        if searx_urls.iter().any(|u| u.contains("tor2")) && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut waited = 0u64;
+            while waited < 12000 && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                waited += 500;
+            }
+            if TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
+                tracing::debug!("tor2 warmed during pre-query wait ({}ms)", waited);
+            } else {
+                tracing::warn!("tor2 still cold after 12s pre-query wait; querying anyway");
+            }
+        }
 
         // Retry policy. For site:-constrained queries an upstream_unavailable is
         // almost always a transient double-failure of the two INDEPENDENT egress
