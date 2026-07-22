@@ -4119,6 +4119,47 @@ fn merge_local_and_web(
     } else { None };
 
     let mut _max_semantic: f32 = 0.0; // tracked for thin-result gate
+    // Relevance multiplier applied to each result's final score in the post-loop
+    // adaptive-floor pass. Initialised to 1.0; the floor pass (Task 4) overrides it.
+    let mut relevance_factor: f32 = 1.0;
+
+    // Compute the query's distinctive terms ONCE (per-query, not per-result).
+    // These drive both the lexical overlap relevance and the coherence gate. A
+    // distinctive term is a word >=3 chars that is NOT a stop word and NOT a
+    // generic web term (e.g. "web", "framework"), so "boilerplate code" ->
+    // ["boilerplate","code"], not ["web"]. This is the lexical backbone of the
+    // single relevance signal (BERT cannot separate polysemous tokens like "code").
+    let stop_words: std::collections::HashSet<&str> = [
+        "the","a","an","is","are","was","were","be","been","have","has","had",
+        "do","does","did","will","would","can","may","might","shall","must","could",
+        "should","in","on","at","to","for","of","with","from","by","and","but","or",
+        "nor","not","so","yet","this","that","these","those","it","its","what","which",
+        "who","whom","when","where","why","how","all","each","every","both","few",
+        "more","most","other","some","such","no","only","own","same","than","too",
+        "very","just","about","also","any","because","before","after","during",
+        "between","through","under","over","again","then","there","here","into",
+        "upon","within","without","out","off","up","down",
+    ].iter().copied().collect();
+    let generic_web_terms: std::collections::HashSet<&str> = [
+        "web","framework","library","lib","tool","tools","app","apps","application",
+        "applications","guide","guides","tutorial","tutorials","docs","doc",
+        "documentation","example","examples","reference","server","client","best",
+        "top","review","reviews","using","getting","started","introduction","overview",
+    ].iter().copied().collect();
+    let q_words: Vec<&str> = clean_query.split_whitespace().collect();
+    let distinctive_terms: Vec<&str> = q_words.iter()
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            lower.len() >= 3
+                && !stop_words.contains(lower.as_str())
+                && !generic_web_terms.contains(lower.as_str())
+                && !lower.chars().all(|c| c.is_ascii_digit())
+        })
+        .copied()
+        .collect();
+    // Relevance collector (parallel to `merged`) for the post-loop adaptive floor.
+    let mut relevance_vec: Vec<f32> = Vec::with_capacity(merged.len());
+
     for r in merged.iter_mut() {
         let substr_semantic = semantic_relevance_score(&clean_query, &r.title, &r.content);
         // Blend genuine BERT semantic similarity (web_semantic vs the query
@@ -4135,6 +4176,24 @@ fn merge_local_and_web(
             None => substr_semantic,
         };
         if semantic > _max_semantic { _max_semantic = semantic; }
+        // ── Single relevance signal (lexical overlap blended with BERT cosine) ──
+        // This is the SOURCE OF TRUTH for topical fit. Distinctive-term overlap is
+        // pure lexical (no network) so local and web results are directly comparable;
+        // the BERT cosine (where the embed service returned one) only enhances it.
+        // The post-loop adaptive-floor pass (Task 4) demotes results below the
+        // query's own relevance distribution on the FINAL score.
+        let title_lower = r.title.to_lowercase();
+        let content_lower = r.content.to_lowercase();
+        let overlap = if distinctive_terms.is_empty() {
+            1.0 // generic query (all stopwords/generics) -> treat as relevant
+        } else {
+            let present = distinctive_terms.iter().filter(|t| {
+                title_lower.contains(*t) || content_lower.contains(*t)
+            }).count() as f32;
+            present / distinctive_terms.len() as f32
+        };
+        let bert_cos = web_semantic.get(&r.url).copied().unwrap_or(overlap).clamp(0.0, 1.0);
+        let mut relevance = 0.4f32 * overlap + 0.6f32 * bert_cos;
         let intent_boost = calculate_intent_boost(&r.url, &r.title, &clean_query, intent);
         let mut freshness = freshness_score(&r.url, intent, r.published_date.as_deref());
         let mut quality = content_quality_score(&r.content);
@@ -4202,43 +4261,6 @@ fn merge_local_and_web(
                     }
                 }
             }
-            let generic_web_terms: std::collections::HashSet<&str> = [
-                "web", "framework", "library", "lib", "tool", "tools",
-                "app", "apps", "application", "applications",
-                "guide", "guides", "tutorial", "tutorials",
-                "docs", "doc", "documentation", "example", "examples",
-                "reference", "server", "client",
-                "best", "top", "review", "reviews",
-                "using", "getting", "started", "introduction", "overview",
-            ].iter().copied().collect();
-            let stop_words: std::collections::HashSet<&str> = [
-                "the", "a", "an", "is", "are", "was", "were", "be", "been",
-                "have", "has", "had", "do", "does", "did", "will", "would",
-                "can", "may", "might", "shall", "must", "could", "should",
-                "in", "on", "at", "to", "for", "of", "with", "from", "by",
-                "and", "but", "or", "nor", "not", "so", "yet",
-                "this", "that", "these", "those", "it", "its",
-                "what", "which", "who", "whom", "when", "where", "why", "how",
-                "all", "each", "every", "both", "few", "more", "most", "other",
-                "some", "such", "no", "only", "own", "same", "than", "too",
-                "very", "just", "about", "also", "any", "because", "before",
-                "after", "during", "between", "through", "under", "over",
-                "again", "then", "there", "here", "into", "upon", "within",
-                "without", "out", "off", "up", "down",
-            ].iter().copied().collect();
-
-            let q_words: Vec<&str> = clean_query.split_whitespace().collect();
-            let distinctive_terms: Vec<&str> = q_words.iter()
-                .filter(|w| {
-                    let lower = w.to_lowercase();
-                    lower.len() >= 3
-                        && !stop_words.contains(lower.as_str())
-                        && !generic_web_terms.contains(lower.as_str())
-                        && !lower.chars().all(|c| c.is_ascii_digit())
-                })
-                .copied()
-                .collect();
-
             let title_lower = r.title.to_lowercase();
             let content_lower = r.content.to_lowercase();
 
@@ -4416,6 +4438,8 @@ fn merge_local_and_web(
         }
 
         r.score = base * c_score * generic_penalty;
+        // Capture this result's relevance for the post-loop adaptive-floor pass.
+        relevance_vec.push(relevance);
     }
     // --- Thin-Result Detection: boost scores when few results or low max score ---
     // For niche topics (few results returned, low max score), apply a proportional
