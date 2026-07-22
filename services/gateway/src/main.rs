@@ -8286,7 +8286,10 @@ let mut results = match tokio::task::spawn_blocking(move || {
     }
 
     // Drop results that became empty / fetch-error / boilerplate-only after cleaning.
-    results.retain(|r| !clean::is_junk_content(&r.content));
+    // Results from trusted academic/technical domains (arxiv, PubMed, etc.) are
+    // exempted from the minimum-length floor: a short snippet there is still a
+    // legitimate paper, not noise (see is_junk_content_for_url).
+    results.retain(|r| !clean::is_junk_content_for_url(&r.content, &r.url));
 
     // 8. Validate spelling correction against actual search result signals.
     // If the original (pre-correction) words appear more frequently in result

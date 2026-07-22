@@ -720,6 +720,80 @@ pub fn bound_to_sentences(s: &str) -> String {
 
 /// True when the (already-cleaned) content carries no usable information and
 /// should be dropped before ranking/return.
+/// Same as [`is_junk_content`], but takes the result URL so that results from
+/// authoritative academic / technical sources are NEVER dropped for having a
+/// short snippet. SearXNG arxiv/PMC/etc. hits sometimes carry only a title
+/// with no abstract in the `content` field; a 15-alnum threshold would wrongly
+/// discard a perfectly good paper. For trusted domains we still drop genuine
+/// fetch-errors / boilerplate, but we do NOT apply the minimum-length floor.
+pub fn is_junk_content_for_url(content: &str, url: &str) -> bool {
+    let c = content.trim();
+    // Genuinely empty still dropped everywhere (nothing to show).
+    if c.is_empty() {
+        return true;
+    }
+    let cl = c.to_lowercase();
+    let fetch_errors = [
+        "we cannot provide a description for this page right now",
+        "we can't provide a description for this page right now",
+        "cannot provide a description for this page right now",
+        "we couldn't find a description for this page",
+    ];
+    if fetch_errors.iter().any(|e| cl.contains(e)) {
+        return true;
+    }
+    if cl.contains("toggle the table of contents") {
+        return true;
+    }
+    if cl.contains("in-browser video") && cl.contains("requires javascript") {
+        return true;
+    }
+    if cl.contains("video item preview") {
+        return true;
+    }
+    // Trusted academic / technical sources: a short snippet is still a legit
+    // result, not noise. Skip the minimum-length floor for these.
+    if is_trusted_academic_domain(url) {
+        return false;
+    }
+    let alnum = c.chars().filter(|ch| ch.is_alphanumeric()).count();
+    if alnum < 15 {
+        return true;
+    }
+    false
+}
+
+/// Domains whose short snippets are still authoritative results (papers,
+/// preprints, clinical/reference entries) and must not be dropped by the
+/// minimum-information threshold.
+fn is_trusted_academic_domain(url: &str) -> bool {
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        if let Some(host) = parsed.host_str().map(|h| h.to_lowercase()) {
+            return host == "arxiv.org"
+                || host.ends_with(".arxiv.org")
+                || host == "pubmed.ncbi.nlm.nih.gov"
+                || host == "ncbi.nlm.nih.gov"
+                || host.ends_with(".ncbi.nlm.nih.gov")
+                || host == "semanticscholar.org"
+                || host.ends_with(".semanticscholar.org")
+                || host == "doi.org"
+                || host == "bibsonomy.org"
+                || host == "researchgate.net"
+                || host == "aclanthology.org"
+                || host.ends_with(".aclanthology.org")
+                || host == "openreview.net"
+                || host == "ieeexplore.ieee.org"
+                || host == "dl.acm.org"
+                || host == "link.springer.com"
+                || host == "sci-hub.se"
+                || host == "sci-hub.st"
+                || host.ends_with(".sci-hub.se")
+                || host.ends_with(".sci-hub.st");
+        }
+    }
+    false
+}
+
 pub fn is_junk_content(content: &str) -> bool {
     let c = content.trim();
     if c.is_empty() {
