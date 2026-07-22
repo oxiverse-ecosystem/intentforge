@@ -6412,10 +6412,13 @@ async fn handle_search(
         let max_attempts: usize = if has_site { 2 } else { 1 };
         let attempt_budget_ms = |attempt: usize| -> u64 {
             if has_site {
-                // attempt1 gives the primary a fair shot; attempt2 is sized to
-                // Tor2's warm response time (~2.5s) so the forced re-probe isn't
-                // cut short. Total worst case: 1.8 + 0.15 + 2.5 = ~4.45s < 5s.
-                if attempt == 1 { 1800 } else { 2500 }
+                // attempt1 must NOT starve the primary (gluetun) instance, which
+                // answers in 1-2.6s when healthy — a 1.8s budget was cutting it
+                // before it could return. attempt2 is a quick forced re-probe of
+                // any breaker-excluded instance. Total worst: 3.0 + 0.15 + 1.5 =
+                // ~4.65s < 5s. (A genuinely COLD tor2 needing ~5.5s is irreducible
+                // under the 5s ceiling — the retry covers transient, not cold-start.)
+                if attempt == 1 { 3000 } else { 1500 }
             } else {
                 5500
             }
@@ -6433,8 +6436,15 @@ async fn handle_search(
             // that runs once per attempt, so it must be fresh each iteration.
             let urls_cloned = searx_urls.clone();
 
+            // For site:-constrained queries we ALWAYS bypass the circuit breaker
+            // (force=true) on every attempt: a narrow site: query must never be
+            // starved because the breaker excluded a path that has since
+            // recovered. Both egress paths are always tried. Non-site queries
+            // keep normal breaker-respecting behaviour on the first attempt and
+            // only force-reprobe on the retry.
+            let force = has_site || attempt == 2;
             let futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<SearxResponse, reqwest::Error>)> + Send>>> =
-                build_searx_futs(&searx_urls, attempt == 2).into_iter().enumerate().map(|(i, f)| {
+                build_searx_futs(&searx_urls, force).into_iter().enumerate().map(|(i, f)| {
                     f.map(move |r| (i, r)).boxed()
                 }).collect();
             let mut futs = futs;

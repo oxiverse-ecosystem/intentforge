@@ -1,0 +1,36 @@
+  ZERO 'boilerplate site:arxiv.org' #1: upstream_unavailable (3.09s)
+  ZERO 'function words site:arxiv.org' #1: upstream_unavailable (3.04s)
+  ZERO 'function words site:arxiv.org' #2: upstream_unavailable (3.05s)
+  ZERO 'transformer explainability site:arxiv.org' #1: upstream_unavailable (3.06s)
+  ZERO 'transformer explainability site:arxiv.org' #2: upstream_unavailable (3.03s)
+  ZERO 'transformer explainability site:arxiv.org' #3: upstream_unavailable (3.04s)
+  ZERO 'transformer explainability site:arxiv.org' #4: upstream_unavailable (3.04s)
+  ZERO 'bayesian inference site:arxiv.org' #1: upstream_unavailable (3.07s)
+  ZERO 'word embedding site:arxiv.org' #1: upstream_unavailable (3.05s)
+  ZERO 'word embedding site:arxiv.org' #2: upstream_unavailable (3.06s)
+  ZERO 'reinforcement learning site:arxiv.org' #1: upstream_unavailable (3.06s)
+  ZERO 'reinforcement learning site:arxiv.org' #2: upstream_unavailable (3.03s)
+  ZERO 'knowledge graph site:arxiv.org' #1: upstream_unavailable (3.10s)
+  ZERO 'knowledge graph site:arxiv.org' #2: upstream_unavailable (3.03s)
+
+================ STRESS TEST SUMMARY ================
+queries            : 10 distinct site: queries
+runs total         : 60
+zero-result runs   : 14   (23.3%)
+  of which upstream: 14
+  of which errors  : 0
+latency p50/p95/max: 0.02s / 3.10s / 3.33s
+under 5s          : True
+
+per-query zero-rate (expect 0/0):
+  [FAIL] boilerplate site:arxiv.org                 zero=1/6  avg_results=3.3
+  [FAIL] function words site:arxiv.org              zero=2/6  avg_results=3.3
+  [OK] predictive coding site:arxiv.org           zero=0/6  avg_results=3
+  [OK] attention mechanism site:arxiv.org         zero=0/6  avg_results=2
+  [OK] semantic memory site:arxiv.org             zero=0/6  avg_results=2
+  [FAIL] transformer explainability site:arxiv.org  zero=4/6  avg_results=0.3
+  [FAIL] bayesian inference site:arxiv.org          zero=1/6  avg_results=0.8
+  [FAIL] word embedding site:arxiv.org              zero=2/6  avg_results=2
+  [FAIL] reinforcement learning site:arxiv.org      zero=2/6  avg_results=2
+  [FAIL] knowledge graph site:arxiv.org             zero=2/6  avg_results=2
+====================================================

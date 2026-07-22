@@ -1,0 +1,57 @@
+  ZERO 'boilerplate site:arxiv.org' #1: upstream_unavailable (1.15s)
+  ZERO 'boilerplate site:arxiv.org' #2: upstream_unavailable (1.67s)
+  ZERO 'boilerplate site:arxiv.org' #3: upstream_unavailable (3.13s)
+  ZERO 'boilerplate site:arxiv.org' #4: upstream_unavailable (1.32s)
+  ZERO 'boilerplate site:arxiv.org' #5: upstream_unavailable (3.04s)
+  ZERO 'boilerplate site:arxiv.org' #6: upstream_unavailable (3.03s)
+  ZERO 'boilerplate site:arxiv.org' #7: upstream_unavailable (3.03s)
+  ZERO 'boilerplate site:arxiv.org' #8: upstream_unavailable (2.81s)
+  ZERO 'boilerplate site:arxiv.org' #9: upstream_unavailable (1.14s)
+  ZERO 'boilerplate site:arxiv.org' #10: upstream_unavailable (1.13s)
+  ZERO 'function words site:arxiv.org' #1: upstream_unavailable (1.77s)
+  ZERO 'function words site:arxiv.org' #2: upstream_unavailable (3.02s)
+  ZERO 'function words site:arxiv.org' #3: upstream_unavailable (3.21s)
+  ZERO 'function words site:arxiv.org' #4: upstream_unavailable (3.03s)
+  ZERO 'function words site:arxiv.org' #5: upstream_unavailable (3.03s)
+  ZERO 'function words site:arxiv.org' #6: upstream_unavailable (0.72s)
+  ZERO 'function words site:arxiv.org' #7: upstream_unavailable (1.17s)
+  ZERO 'function words site:arxiv.org' #8: upstream_unavailable (0.82s)
+  ZERO 'function words site:arxiv.org' #9: upstream_unavailable (0.75s)
+  ZERO 'function words site:arxiv.org' #10: upstream_unavailable (0.70s)
+  ZERO 'predictive coding site:arxiv.org' #1: upstream_unavailable (2.83s)
+  ZERO 'predictive coding site:arxiv.org' #2: upstream_unavailable (3.05s)
+  ZERO 'predictive coding site:arxiv.org' #3: upstream_unavailable (3.04s)
+  ZERO 'predictive coding site:arxiv.org' #4: upstream_unavailable (3.06s)
+  ZERO 'semantic memory site:arxiv.org' #1: upstream_unavailable (3.05s)
+  ZERO 'semantic memory site:arxiv.org' #2: upstream_unavailable (3.10s)
+  ZERO 'semantic memory site:arxiv.org' #3: upstream_unavailable (3.04s)
+  ZERO 'bayesian inference site:arxiv.org' #1: upstream_unavailable (3.05s)
+  ZERO 'bayesian inference site:arxiv.org' #2: upstream_unavailable (3.05s)
+  ZERO 'bayesian inference site:arxiv.org' #3: upstream_unavailable (3.07s)
+  ZERO 'bayesian inference site:arxiv.org' #4: upstream_unavailable (3.04s)
+  ZERO 'reinforcement learning site:arxiv.org' #1: upstream_unavailable (3.04s)
+  ZERO 'reinforcement learning site:arxiv.org' #2: upstream_unavailable (3.03s)
+  ZERO 'reinforcement learning site:arxiv.org' #3: upstream_unavailable (3.06s)
+  ZERO 'reinforcement learning site:arxiv.org' #4: upstream_unavailable (3.07s)
+
+================ STRESS TEST SUMMARY ================
+queries            : 10 distinct site: queries
+runs total         : 100
+zero-result runs   : 35   (35.0%)
+  of which upstream: 35
+  of which errors  : 0
+latency p50/p95/max: 0.02s / 3.21s / 3.38s
+under 5s          : True
+
+per-query zero-rate (expect 0/0):
+  [FAIL] boilerplate site:arxiv.org                 zero=10/10  avg_results=0
+  [FAIL] function words site:arxiv.org              zero=10/10  avg_results=0
+  [FAIL] predictive coding site:arxiv.org           zero=4/10  avg_results=1.8
+  [OK] attention mechanism site:arxiv.org         zero=0/10  avg_results=2
+  [FAIL] semantic memory site:arxiv.org             zero=3/10  avg_results=1.4
+  [OK] transformer explainability site:arxiv.org  zero=0/10  avg_results=2
+  [FAIL] bayesian inference site:arxiv.org          zero=4/10  avg_results=0.6
+  [OK] word embedding site:arxiv.org              zero=0/10  avg_results=3
+  [FAIL] reinforcement learning site:arxiv.org      zero=4/10  avg_results=1.8
+  [OK] knowledge graph site:arxiv.org             zero=0/10  avg_results=3
+====================================================
