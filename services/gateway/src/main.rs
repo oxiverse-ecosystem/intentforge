@@ -3336,7 +3336,13 @@ fn preprocess_searxng_query(query: &str) -> String {
         if wl.starts_with("filetype:") {
             continue;
         }
-        let clean_w = w.replace('"', "").replace('\'', "");
+        // Preserve double quotes so the upstream engine honors "exact phrase"
+        // queries (e.g. "Lancaster norms"). Single quotes (apostrophes) are still
+        // stripped. Previously BOTH were stripped, which silently turned a quoted
+        // phrase into a loose bag-of-words and broke the phrase hard-filter below
+        // (the engine was asked for the unquoted text, so snippets rarely contained
+        // the verbatim substring and every result got dropped -> n=0).
+        let clean_w = w.replace('\'', "");
         if !clean_w.is_empty() {
             words_cleaned.push(clean_w);
         }
