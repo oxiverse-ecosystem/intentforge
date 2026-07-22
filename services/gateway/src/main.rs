@@ -4219,7 +4219,11 @@ fn merge_local_and_web(
             || (title_lower.starts_with("what does ") && title_lower.contains(" mean"))
             || (title_lower.starts_with("what is ") && title_lower.contains(" mean"));
         if listicle_title && !is_def_query {
-            relevance *= 0.4;
+            // A listicle title is a STRUCTURAL off-topic signal (clickbait about the
+            // word's etymology, not the topic). Because the page still contains the
+            // query term, lexical overlap is high and a gentle multiplier wouldn't sink
+            // it — so CAP relevance to a low value so the adaptive floor crushes it.
+            relevance = relevance.min(0.12);
         }
         let intent_boost = calculate_intent_boost(&r.url, &r.title, &clean_query, intent);
         let mut freshness = freshness_score(&r.url, intent, r.published_date.as_deref());
@@ -4375,13 +4379,14 @@ fn merge_local_and_web(
             || q_lower_check.contains("what does")
             || q_lower_check.contains("what is");
         if is_definition_site && !is_definition_query {
-            // Definition/listicle pages are off-topic for non-definition queries:
-            // fold into the single relevance gate instead of a separate quality
-            // multiplier (the adaptive floor then demotes them on the final score).
-            relevance *= 0.4;
+            // Definition pages are off-topic for non-definition queries. Because the
+            // page often contains the query term (lexical overlap high), a gentle
+            // multiplier wouldn't sink it — CAP relevance so the adaptive floor
+            // (hard below-floor multiplier) crushes it on the final score.
+            relevance = relevance.min(0.18);
             freshness *= 0.20;
             tracing::info!(
-                "DICTIONARY SITE PENALTY: '{}' -> relevance*0.4",
+                "DICTIONARY SITE PENALTY: '{}' -> relevance capped 0.18",
                 r.url.chars().take(60).collect::<String>()
             );
         }
@@ -4492,11 +4497,13 @@ fn merge_local_and_web(
         let floor = (p60 * 0.35).max(0.05).min(0.5);
         for (i, r) in merged.iter_mut().enumerate() {
             let rel = relevance_vec.get(i).copied().unwrap_or(0.0);
-            let factor = if rel < floor {
-                (rel / floor).clamp(0.05, 1.0)
-            } else {
-                1.0
-            };
+            // Below the distribution floor = genuinely off-topic (bottom ~40% of the
+            // result set). Apply a HARD demotion (not a ratio): a ratio `rel/floor`
+            // leaves a moderately-low relevance at ~0.5, which is too gentle when the
+            // page still contains the query term (listicle/dictionary case). The hard
+            // 0.15 multiplier reliably sinks off-topic results while the top of the
+            // distribution (above floor) is untouched (factor 1.0).
+            let factor = if rel < floor { 0.15 } else { 1.0 };
             r.score *= factor;
         }
     }
