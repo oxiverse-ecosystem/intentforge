@@ -4274,19 +4274,22 @@ fn merge_local_and_web(
                     // If the query has negatives ("not X"), results that don't mention
                     // X AND don't mention the distinctive positive terms are probably
                     // off-topic garbage (e.g., football scores for a productivity query).
+                    // Fold the off-topic signal into the single relevance gate (the
+                    // adaptive floor then demotes on the final score) instead of a
+                    // near-no-op quality multiplier.
                     if !constraints.negative.is_empty() && !neg_word_set.is_empty() {
                         let title_content = format!("{} {}", title_lower, content_lower);
                         let mentions_negative = neg_word_set.iter().any(|n| title_content.contains(n.as_str()));
                         if !mentions_negative {
                             // No distinctive positive AND no negative = completely off-topic
-                            quality *= if r.is_local { 0.01 } else { 0.05 };
+                            relevance *= if r.is_local { 0.10 } else { 0.20 };
                         } else {
                             // Mentions negative terms but not positive = borderline
-                            quality *= if r.is_local { 0.05 } else { 0.10 };
+                            relevance *= if r.is_local { 0.20 } else { 0.35 };
                         }
                     } else {
                         // No negative constraints — just no positive match
-                        quality *= if r.is_local { 0.01 } else { 0.08 };
+                        relevance *= if r.is_local { 0.10 } else { 0.25 };
                     }
                 }
             } else if !constraints.negative.is_empty() && !neg_word_set.is_empty() {
@@ -4295,7 +4298,7 @@ fn merge_local_and_web(
                 let title_content = format!("{} {}", title_lower, content_lower);
                 let mentions_negative = neg_word_set.iter().any(|n| title_content.contains(n.as_str()));
                 if !mentions_negative {
-                    quality *= if r.is_local { 0.10 } else { 0.20 };
+                    relevance *= if r.is_local { 0.20 } else { 0.35 };
                 }
             }
         }
@@ -4345,13 +4348,13 @@ fn merge_local_and_web(
             || q_lower_check.contains("what does")
             || q_lower_check.contains("what is");
         if is_definition_site && !is_definition_query {
-            // Heavy penalty — dictionary definitions are useless for technical queries
-            // Override quality to near-zero so these results sink to the bottom
-            quality *= 0.10;
-            // Also reduce freshness since definition content is static
+            // Definition/listicle pages are off-topic for non-definition queries:
+            // fold into the single relevance gate instead of a separate quality
+            // multiplier (the adaptive floor then demotes them on the final score).
+            relevance *= 0.4;
             freshness *= 0.20;
             tracing::info!(
-                "DICTIONARY SITE PENALTY: '{}' → quality*0.10, freshness*0.20",
+                "DICTIONARY SITE PENALTY: '{}' -> relevance*0.4",
                 r.url.chars().take(60).collect::<String>()
             );
         }
