@@ -2100,15 +2100,26 @@ fn should_filter_by_constraints(
         }
     }
 
-    // 4. Hard filter on phrases
+    // 4. Hard filter on phrases — token-overlap, fail-open.
+    // Require ALL words of the phrase to appear (case-insensitive) in
+    // title/content/url instead of the exact contiguous substring. Upstream now
+    // receives the phrase WITH quotes (preprocess_searxng_query preserves them),
+    // so snippets rarely contain the verbatim substring and the old exact-match
+    // filter zeroed out valid queries ("Lancaster norms" -> n=0). Fail-open: an
+    // empty phrase never drops a result.
     if !constraints.phrases.is_empty() {
-        let t_low = title.to_lowercase();
-        let c_low = content.to_lowercase();
-        let u_low = url.to_lowercase();
         for phrase in &constraints.phrases {
-            let p_low = phrase.to_lowercase();
-            if !t_low.contains(&p_low) && !c_low.contains(&p_low) && !u_low.contains(&p_low) {
-                return true;
+            let p_words: Vec<&str> = phrase.split_whitespace().collect();
+            if p_words.is_empty() { continue; }
+            let t_low = title.to_lowercase();
+            let c_low = content.to_lowercase();
+            let u_low = url.to_lowercase();
+            let all_present = p_words.iter().all(|w| {
+                let wl = w.to_lowercase();
+                t_low.contains(&wl) || c_low.contains(&wl) || u_low.contains(&wl)
+            });
+            if !all_present {
+                return true; // drop only when the page lacks the whole phrase's words
             }
         }
     }
