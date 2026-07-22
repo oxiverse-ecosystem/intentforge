@@ -4192,8 +4192,35 @@ fn merge_local_and_web(
             }).count() as f32;
             present / distinctive_terms.len() as f32
         };
-        let bert_cos = web_semantic.get(&r.url).copied().unwrap_or(overlap).clamp(0.0, 1.0);
+        // BERT cosine enhances relevance ONLY when the page already has lexical
+        // overlap with the query. When overlap is ZERO the page shares no query
+        // term, and BERT is known to conflate polysemous tokens (main.rs:2568:
+        // "prediction" ≈ "predictive", "code" ≈ boilerplate-code) — so trusting
+        // the cosine there would resurrect the football-drift. Fall back to pure
+        // overlap (which is 0) instead of letting the embedding float spam.
+        let bert_cos = if overlap > 0.0 {
+            web_semantic.get(&r.url).copied().unwrap_or(overlap).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let mut relevance = 0.4f32 * overlap + 0.6f32 * bert_cos;
+        // Listicle/clickbait title detector: "Why does X mean…", "What is the
+        // meaning of X", "X explained (listicle)" — these are off-topic for a
+        // substantive query and the POS/phonetic dictionary guard misses them.
+        // Fold into relevance so the adaptive floor demotes them on the final score.
+        // (is_definition_query is computed later in the loop, so use a local check here.)
+        let q_lc = clean_query.to_lowercase();
+        let is_def_query = q_lc.contains("define") || q_lc.contains("definition")
+            || q_lc.contains("meaning of") || q_lc.contains("what does")
+            || q_lc.contains("what is");
+        let listicle_title = (title_lower.starts_with("why ")
+                && (title_lower.contains(" mean") || title_lower.contains(" meaning")))
+            || title_lower.starts_with("what is the meaning of")
+            || (title_lower.starts_with("what does ") && title_lower.contains(" mean"))
+            || (title_lower.starts_with("what is ") && title_lower.contains(" mean"));
+        if listicle_title && !is_def_query {
+            relevance *= 0.4;
+        }
         let intent_boost = calculate_intent_boost(&r.url, &r.title, &clean_query, intent);
         let mut freshness = freshness_score(&r.url, intent, r.published_date.as_deref());
         let mut quality = content_quality_score(&r.content);
