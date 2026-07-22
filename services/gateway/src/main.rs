@@ -4494,14 +4494,17 @@ fn merge_local_and_web(
             let query_terms_raw: Vec<&str> = query.split_whitespace()
                 .filter(|w| w.len() >= 2)
                 .collect();
-            let has_good_result = merged.iter().any(|r| {
+            let has_good_result = merged.iter().enumerate().any(|(i, r)| {
                 let t_lower = r.title.to_lowercase();
                 let c_lower = r.content.to_lowercase();
                 let match_count = query_terms_raw.iter()
                     .filter(|qt| t_lower.contains(*qt) || c_lower.contains(*qt))
                     .count();
                 let min_terms = (query_terms_raw.len().min(5) / 2).max(2); // at least 2 terms or half of query
-                match_count >= min_terms
+                // ALSO require the result to be genuinely relevant (single relevance
+                // gate), so a niche query can never amplify an off-topic page.
+                let rel = relevance_vec.get(i).copied().unwrap_or(0.0);
+                match_count >= min_terms && rel >= 0.2
             });
             if has_good_result {
                 let boost_factor = (0.30 / max_score.max(0.01)).min(2.5);
