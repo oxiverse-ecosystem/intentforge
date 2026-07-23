@@ -6,6 +6,11 @@ use_default_settings:
       - brave
       - wikipedia
       - marginalia
+      # ── Academic / technical (serve site:arxiv.org directly, independent of
+      # Brave). When Brave is rate-limited, instance1 still answers arxiv
+      # queries via these engines instead of falling back to tor2. ──
+      - arxiv
+      - crossref
       # (removed duckduckgo + yandex + startpage + mojeek: blocked/CAPTCHA'd/403 through VPN)
       # ── Image engines (multiple providers for redundancy) ──
       - bing images
