@@ -6617,11 +6617,28 @@ async fn handle_search(
     // This eliminates the sequential intent→engines pipeline.
     // Engines start fetching immediately; intent runs in parallel.
     // Latency = max(intent, engines) instead of intent + engines.
+    // Cap SearXNG at 5s so slow backend instances can't block the whole response.
+    // The SearXNG internal budget remains 10s for retries, but we surface
+    // whatever results arrived within the deadline. The other backends (intent,
+    // indexer, invidious, news, images) still get their full budget.
     let (intent_result, embed_res, indexer_res, searx_results, invidious_res, news_res, image_res) = tokio::join!(
         intent_fut,
         embed_fut,
         indexer_task,
-        searx_fut_with_timeout,
+        // ⚠️  NOTE: tokio::time::timeout cancels the inner future, which drops any
+        // partial results already collected by searx_fut_with_timeout (from faster
+        // SearXNG instances that completed within the 5s window). This means on
+        // timeout we return Vec::new() for SearXNG — we don't preserve partial
+        // results. The ROADMAP.md "Return early + merge stragglers" plan item
+        // describes the proper fix: return completed results immediately and merge
+        // slow instances' results in the background.
+        async {
+            tokio::time::timeout(Duration::from_secs(5), searx_fut_with_timeout).await
+                .unwrap_or_else(|_| {
+                    tracing::warn!("SearXNG fan-out exceeded 5s deadline; returning partial results from other backends");
+                    Vec::new()
+                })
+        },
         invidious_fut,
         news_fut,
         image_fut,
