@@ -160,9 +160,70 @@ impl DomainRateLimiter {
 
 // ─── Crawl Queue Manager ─────────────────────────────────────────────
 
+/// Bounded two-generation dedup set (amortized O(1) insert/contains).
+///
+/// `cur` fills to MAX_SEEN_URLS/2, then rotates: `old` is dropped, `cur`
+/// becomes `old`, and a fresh `cur` starts. Total size is bounded by
+/// MAX_SEEN_URLS; eviction granularity is the oldest half-generation.
+/// Rationale vs alternatives: an insertion-ordered set with per-entry FIFO
+/// eviction (IndexSet::shift_remove_index(0)) is O(n) PER INSERT once at
+/// capacity — a 2M-element shift on every enqueue. Generational rotation
+/// gives the same bound with O(1) ops and zero new dependencies.
+///
+/// Eviction makes a URL re-crawlable again — which is what revives the
+/// refresh checker for aged content (an unbounded set silently blocked ALL
+/// re-enqueues, leaving the refresh checker permanently dead) and bounds
+/// memory, snapshot size, and startup time on a long-running instance.
+struct SeenSet {
+    old: HashSet<String>,
+    cur: HashSet<String>,
+    /// Total budget across both generations; rotation triggers at cap/2.
+    cap: usize,
+}
+
+impl SeenSet {
+    fn new() -> Self {
+        Self::with_capacity(MAX_SEEN_URLS)
+    }
+
+    fn with_capacity(cap: usize) -> Self {
+        Self { old: HashSet::new(), cur: HashSet::new(), cap: cap.max(2) }
+    }
+
+    fn contains(&self, url: &str) -> bool {
+        self.cur.contains(url) || self.old.contains(url)
+    }
+
+    /// Insert a URL; returns false if already present. Rotates generations
+    /// when the current one reaches half the total budget.
+    fn insert(&mut self, url: String) -> bool {
+        if self.contains(&url) {
+            return false;
+        }
+        if self.cur.len() >= self.cap / 2 {
+            self.old = std::mem::take(&mut self.cur);
+            tracing::info!("Seen-URL set rotated: dropped oldest generation, {} URLs retained", self.old.len());
+        }
+        self.cur.insert(url)
+    }
+
+    /// Generations are disjoint by construction (insert checks both).
+    fn len(&self) -> usize {
+        self.old.len() + self.cur.len()
+    }
+
+    /// Snapshot as a single Vec, oldest generation first, so the persisted
+    /// format stays a plain array (identical to the pre-bounded format) and
+    /// reload rebuilds the same age ordering.
+    fn to_vec(&self) -> Vec<String> {
+        self.old.iter().chain(self.cur.iter()).cloned().collect()
+    }
+}
+
 struct CrawlQueueManager {
     queue: BinaryHeap<CrawlEntry>,
-    seen_urls: HashSet<String>,
+    /// Bounded dedup set — see SeenSet.
+    seen_urls: SeenSet,
     domain_limiter: DomainRateLimiter,
     max_queue_size: usize,
     max_discovered_per_page: usize,
@@ -172,7 +233,7 @@ impl CrawlQueueManager {
     fn new() -> Self {
         Self {
             queue: BinaryHeap::new(),
-            seen_urls: HashSet::new(),
+            seen_urls: SeenSet::new(),
             domain_limiter: DomainRateLimiter::new(750),
             max_queue_size: 50000,
             max_discovered_per_page: 5,
@@ -187,6 +248,8 @@ impl CrawlQueueManager {
         if self.queue.len() >= self.max_queue_size {
             return false;
         }
+        // SeenSet::insert is bounded: it rotates generations at capacity,
+        // evicting the oldest half so memory/snapshot size can't grow forever.
         self.seen_urls.insert(normalized);
         self.queue.push(entry);
         true
@@ -238,7 +301,7 @@ impl CrawlQueueManager {
         QueueSnapshot {
             version: 1,
             queue: self.queue.iter().cloned().collect(),
-            seen_urls: self.seen_urls.iter().cloned().collect(),
+            seen_urls: self.seen_urls.to_vec(),
             max_queue_size: self.max_queue_size,
             max_discovered_per_page: self.max_discovered_per_page,
             content_cap,
@@ -368,6 +431,12 @@ const CONTENT_CAP_MAX: usize = 12000;
 const CAP_RECOMPUTE_EVERY: usize = 50;
 const QUEUE_SAVE_PATH: &str = "/app/queue_data/queue_snapshot.json";
 const QUEUE_SAVE_INTERVAL: u64 = 20; // seconds
+/// Upper bound on the seen-URL dedup set (both generations combined).
+/// At ~120 bytes/entry of Rust String overhead this is ~240 MB in memory and
+/// ~300 MB serialized — within the 1 GB container limit with headroom.
+/// Oldest half-generation is dropped on rotation, making those URLs
+/// re-crawlable (deliberate: it revives the refresh path for aged content).
+const MAX_SEEN_URLS: usize = 2_000_000;
 
 fn normalize_url(url: &str) -> String {
     if let Ok(mut parsed) = Url::parse(url) {
@@ -1465,4 +1534,133 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seen_set_dedup_and_bound() {
+        let mut s = SeenSet::with_capacity(10); // rotation at 5
+        assert!(s.insert("a".to_string()));
+        assert!(!s.insert("a".to_string()), "duplicate must be rejected");
+        assert!(s.contains("a"));
+        // Fill well past capacity; the set must stay bounded.
+        for i in 0..100 {
+            s.insert(format!("url{}", i));
+        }
+        assert!(s.len() <= 10, "seen set exceeded its bound: {}", s.len());
+        // Recently inserted URLs must still be present (dedup still works).
+        assert!(s.contains("url99"));
+        // The oldest URL was evicted by rotation and is re-crawlable.
+        assert!(!s.contains("a"), "oldest generation should have been evicted");
+    }
+
+    #[test]
+    fn seen_set_to_vec_disjoint_and_complete() {
+        let mut s = SeenSet::with_capacity(4); // rotation at 2
+        for i in 0..3 {
+            s.insert(format!("u{}", i));
+        }
+        let v = s.to_vec();
+        assert_eq!(v.len(), s.len());
+        let uniq: HashSet<&String> = v.iter().collect();
+        assert_eq!(uniq.len(), v.len(), "generations must be disjoint");
+    }
+
+    #[test]
+    fn snapshot_v1_round_trip() {
+        let mut mgr = CrawlQueueManager::new();
+        mgr.enqueue(CrawlEntry {
+            url: "https://example.com/page".to_string(),
+            priority: 1.0,
+            source: "test".to_string(),
+            content_type: ContentType::Article,
+            discovered_at: 123,
+            attempts: 0,
+        });
+        let snap = mgr.snapshot(9500);
+        let data = serde_json::to_vec(&snap).unwrap();
+        let back: QueueSnapshot = serde_json::from_slice(&data).unwrap();
+        assert_eq!(back.version, 1);
+        assert_eq!(back.content_cap, 9500);
+        assert_eq!(back.queue.len(), 1);
+        assert_eq!(back.seen_urls.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_v0_backward_compat() {
+        // Pre-versioning snapshot: no `version`, no `content_cap` fields.
+        // Must load with defaults (version=0, cap=8000) — zero data loss.
+        let v0 = r#"{
+            "queue": [{"url":"https://old.example/a","priority":0.5,"source":"seed","content_type":"Article","discovered_at":1,"attempts":0}],
+            "seen_urls": ["https://old.example/a"],
+            "max_queue_size": 50000,
+            "max_discovered_per_page": 5
+        }"#;
+        let snap: QueueSnapshot = serde_json::from_str(v0).expect("v0 snapshot must deserialize");
+        assert_eq!(snap.version, 0);
+        assert_eq!(snap.content_cap, 8000);
+        assert_eq!(snap.queue.len(), 1);
+        assert_eq!(snap.seen_urls.len(), 1);
+    }
+
+    #[test]
+    fn atomic_save_and_load_round_trip() {
+        let dir = std::env::temp_dir().join(format!("crawler_snap_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.json");
+        let path_str = path.to_str().unwrap();
+
+        let mut mgr = CrawlQueueManager::new();
+        mgr.enqueue(CrawlEntry {
+            url: "https://example.com/x".to_string(),
+            priority: 2.0,
+            source: "test".to_string(),
+            content_type: ContentType::Article,
+            discovered_at: 42,
+            attempts: 0,
+        });
+        let snap = mgr.snapshot(10000);
+        save_snapshot_atomic(path_str, &snap).unwrap();
+        // Second save creates the .bak of the first.
+        save_snapshot_atomic(path_str, &snap).unwrap();
+        assert!(path.exists());
+        assert!(dir.join("snap.json.bak").exists());
+        assert!(!dir.join("snap.json.tmp").exists(), "tmp file must not linger");
+
+        let (loaded, cap) = CrawlQueueManager::load(path_str).expect("load must succeed");
+        assert_eq!(cap, 10000);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.seen_count(), 1);
+
+        // Corrupt the primary — load must fall back to .bak.
+        std::fs::write(&path, b"{corrupt").unwrap();
+        let (loaded2, cap2) = CrawlQueueManager::load(path_str).expect(".bak fallback must succeed");
+        assert_eq!(cap2, 10000);
+        assert_eq!(loaded2.len(), 1);
+
+        // Corrupt both — load must return None (fresh start), not panic.
+        std::fs::write(dir.join("snap.json.bak"), b"{also corrupt").unwrap();
+        assert!(CrawlQueueManager::load(path_str).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adaptive_cap_uses_raw_distribution() {
+        // Window of raw lengths ABOVE the current cap must widen the cap —
+        // the old post-truncation feed made this impossible.
+        let w: VecDeque<usize> = (0..32).map(|_| 11000).collect();
+        let cap = adaptive_content_cap(&w, 8000);
+        assert_eq!(cap, 11000, "cap must widen toward raw p90");
+        // And the clamp still applies.
+        let w_long: VecDeque<usize> = (0..32).map(|_| 50000).collect();
+        assert_eq!(adaptive_content_cap(&w_long, 8000), CONTENT_CAP_MAX);
+        let w_short: VecDeque<usize> = (0..32).map(|_| 100).collect();
+        assert_eq!(adaptive_content_cap(&w_short, 8000), CONTENT_CAP_MIN);
+    }
 }
