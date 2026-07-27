@@ -229,26 +229,31 @@ impl CrawlQueueManager {
         self.seen_urls.contains(normalized)
     }
 
-    /// Persist the queue (pending entries) + seen-URL dedup set to a JSON
-    /// snapshot so a container restart can resume without re-seeding from
-    /// scratch. The BinaryHeap is serialized as a Vec (priority order is
-    /// restored on load by re-pushing). Domain rate-limit state is intentionally
-    /// not persisted (it resets on restart, which is fine).
-    fn save(&self, path: &str) -> std::io::Result<()> {
+    /// Persist the queue (pending entries) + seen-URL dedup set + the current
+    /// adaptive content cap to a JSON snapshot so a container restart can
+    /// resume without re-seeding from scratch. The BinaryHeap is serialized as
+    /// a Vec (priority order is restored on load by re-pushing). Domain
+    /// rate-limit state is intentionally not persisted (it resets on restart,
+    /// which is fine).
+    fn save(&self, path: &str, content_cap: usize) -> std::io::Result<()> {
         let snap = QueueSnapshot {
+            version: 1,
             queue: self.queue.iter().cloned().collect(),
             seen_urls: self.seen_urls.iter().cloned().collect(),
             max_queue_size: self.max_queue_size,
             max_discovered_per_page: self.max_discovered_per_page,
+            content_cap,
         };
         let data = serde_json::to_vec(&snap)?;
         std::fs::write(path, data)?;
         Ok(())
     }
 
-    /// Load a previously saved snapshot, restoring pending entries + seen set.
-    /// Entries are re-pushed so the BinaryHeap priority ordering is rebuilt.
-    fn load(path: &str) -> Option<Self> {
+    /// Load a previously saved snapshot, restoring pending entries + seen set
+    /// + the persisted adaptive content cap (defaults to the 8000 seed for
+    /// pre-v1 snapshots). Entries are re-pushed so the BinaryHeap priority
+    /// ordering is rebuilt.
+    fn load(path: &str) -> Option<(Self, usize)> {
         let data = std::fs::read(path).ok()?;
         let snap: QueueSnapshot = serde_json::from_slice(&data).ok()?;
         let mut mgr = CrawlQueueManager::new();
@@ -260,22 +265,36 @@ impl CrawlQueueManager {
         for entry in snap.queue {
             mgr.queue.push(entry);
         }
-        Some(mgr)
+        Some((mgr, snap.content_cap))
     }
 }
 
 /// Serializable snapshot of the crawl queue manager.
 #[derive(Serialize, Deserialize)]
 struct QueueSnapshot {
+    /// Schema version. 0 = implicit pre-versioning format (no content_cap).
+    #[serde(default)]
+    version: u32,
     queue: Vec<CrawlEntry>,
     seen_urls: Vec<String>,
     max_queue_size: usize,
     max_discovered_per_page: usize,
+    /// Persisted adaptive content cap so a restart doesn't reset the cap to
+    /// its seed and re-converge from scratch (a gate saved but never reloaded
+    /// is dead). Pre-v1 snapshots default to the historical 8000 seed.
+    #[serde(default = "default_content_cap")]
+    content_cap: usize,
 }
 
-/// Distribution-driven content cap: p90 of recent cleaned-content lengths,
-/// clamped to a sane range. Keeps enough text for quality scoring + embedding
-/// while trimming the long tail, instead of a fixed 8000-char truncation.
+fn default_content_cap() -> usize {
+    8000
+}
+
+/// Distribution-driven content cap: p90 of recent RAW (pre-truncation)
+/// content lengths, clamped to a sane range. Keeps enough text for quality
+/// scoring + embedding while trimming the long tail, instead of a fixed
+/// 8000-char truncation. The window MUST be fed raw lengths — feeding
+/// truncated lengths pins the cap (see crawl_and_index).
 fn adaptive_content_cap(window: &VecDeque<usize>, cached: usize) -> usize {
     if window.len() < 16 {
         return cached;
@@ -500,12 +519,18 @@ async fn main() {
         .unwrap();
 
     // Restore the crawl queue from a prior snapshot if present, so a restart
-    // resumes in-flight crawling instead of re-seeding from scratch.
-    let queue = CrawlQueueManager::load(QUEUE_SAVE_PATH)
-        .unwrap_or_else(|| CrawlQueueManager::new());
+    // resumes in-flight crawling instead of re-seeding from scratch. Also
+    // restores the adaptive content cap so it doesn't re-converge from seed.
+    if let Some(dir) = std::path::Path::new(QUEUE_SAVE_PATH).parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!("Could not create queue snapshot dir {:?}: {:?}", dir, e);
+        }
+    }
+    let (queue, restored_cap) = CrawlQueueManager::load(QUEUE_SAVE_PATH)
+        .unwrap_or_else(|| (CrawlQueueManager::new(), default_content_cap()));
     let restored = queue.seen_count();
     if restored > 0 {
-        tracing::info!("Restored crawl queue snapshot: {} seen URLs", restored);
+        tracing::info!("Restored crawl queue snapshot: {} seen URLs, content_cap={}", restored, restored_cap);
     }
 
     let state = Arc::new(AppState {
@@ -516,7 +541,7 @@ async fn main() {
         ingest_buffer: Mutex::new(Vec::with_capacity(64)),
         concurrency: Mutex::new(20),
         content_window: Mutex::new(VecDeque::with_capacity(300)),
-        content_cap: Mutex::new(8000),
+        content_cap: Mutex::new(restored_cap),
         cap_counter: Mutex::new(0),
         perf: Mutex::new(PerfState { ewma_dps: 0.0, last_batch_docs: 0 }),
     });
@@ -529,9 +554,10 @@ async fn main() {
             let mut interval = tokio::time::interval(Duration::from_secs(QUEUE_SAVE_INTERVAL));
             loop {
                 interval.tick().await;
+                let cap = *state.content_cap.lock().await;
                 let snap = {
                     let q = state.queue.lock().await;
-                    q.save(QUEUE_SAVE_PATH)
+                    q.save(QUEUE_SAVE_PATH, cap)
                 };
                 if let Err(e) = snap {
                     tracing::warn!("Queue snapshot save failed: {:?}", e);
@@ -1091,7 +1117,7 @@ async fn crawl_and_index(
 
     // Parse + extract everything from Html in a block so it's dropped before any .await
     // (scraper::Html contains Cell<usize> which is not Send)
-    let (title, cleaned_content, links, pub_date, quality_score) = {
+    let (title, cleaned_content, raw_len, links, pub_date, quality_score) = {
         let document = Html::parse_document(&html_content);
 
         let title_selector = Selector::parse("title").unwrap();
@@ -1111,10 +1137,14 @@ async fn crawl_and_index(
             }
         }
         // Clean: collapse whitespace, then truncate to the distribution-driven
-        // content cap (p90 of recent lengths, clamped) instead of a fixed 8000.
-        let cleaned_content: String = {
+        // content cap (p90 of recent RAW lengths, clamped) instead of a fixed 8000.
+        // raw_len is measured BEFORE truncation: feeding post-truncation lengths
+        // into the cap window makes the cap self-fulfilling (every sample <= cap
+        // => p90 <= cap => monotonically non-increasing from seed, never widens).
+        let (cleaned_content, raw_len): (String, usize) = {
             let collapsed: String = main_content.split_whitespace().collect::<Vec<_>>().join(" ");
-            collapsed.chars().take(cap).collect()
+            let raw_len = collapsed.chars().count();
+            (collapsed.chars().take(cap).collect(), raw_len)
         };
 
         let links = extract_links(&document, &entry.url);
@@ -1125,14 +1155,16 @@ async fn crawl_and_index(
         // Compute content quality score
         let quality_score = compute_content_quality(&cleaned_content);
 
-        (title, cleaned_content, links, pub_date, quality_score)
+        (title, cleaned_content, raw_len, links, pub_date, quality_score)
     };
 
     // Feed the content-length distribution for the adaptive cap: record this
-    // page's length, and every CAP_RECOMPUTE_EVERY pages recompute the p90 cap.
+    // page's RAW (pre-truncation) length, and every CAP_RECOMPUTE_EVERY pages
+    // recompute the p90 cap from the raw distribution.
     {
         let mut w = state.content_window.lock().await;
-        w.push_back(cleaned_content.chars().count());
+        w.push_back(raw_len);
+        tracing::debug!("Content length: raw={} truncated={} cap={}", raw_len, cleaned_content.chars().count(), cap);
         if w.len() > 300 {
             w.pop_front();
         }
