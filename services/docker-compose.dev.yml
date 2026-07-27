@@ -222,6 +222,7 @@ services:
         condition: service_healthy
     volumes:
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
+      - ./crawler/queue_data:/app/queue_data
     restart: always
 
   # ══════════════════════════════════════════════════════════════════

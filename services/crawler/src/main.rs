@@ -4,10 +4,11 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, BinaryHeap};
+use std::collections::{HashMap, HashSet, BinaryHeap, VecDeque};
 use std::cmp::Ordering;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use scraper::{Html, Selector};
 use reqwest::Url;
@@ -223,7 +224,81 @@ impl CrawlQueueManager {
     fn seen_count(&self) -> usize {
         self.seen_urls.len()
     }
+
+    fn is_seen(&self, normalized: &str) -> bool {
+        self.seen_urls.contains(normalized)
+    }
+
+    /// Persist the queue (pending entries) + seen-URL dedup set to a JSON
+    /// snapshot so a container restart can resume without re-seeding from
+    /// scratch. The BinaryHeap is serialized as a Vec (priority order is
+    /// restored on load by re-pushing). Domain rate-limit state is intentionally
+    /// not persisted (it resets on restart, which is fine).
+    fn save(&self, path: &str) -> std::io::Result<()> {
+        let snap = QueueSnapshot {
+            queue: self.queue.iter().cloned().collect(),
+            seen_urls: self.seen_urls.iter().cloned().collect(),
+            max_queue_size: self.max_queue_size,
+            max_discovered_per_page: self.max_discovered_per_page,
+        };
+        let data = serde_json::to_vec(&snap)?;
+        std::fs::write(path, data)?;
+        Ok(())
+    }
+
+    /// Load a previously saved snapshot, restoring pending entries + seen set.
+    /// Entries are re-pushed so the BinaryHeap priority ordering is rebuilt.
+    fn load(path: &str) -> Option<Self> {
+        let data = std::fs::read(path).ok()?;
+        let snap: QueueSnapshot = serde_json::from_slice(&data).ok()?;
+        let mut mgr = CrawlQueueManager::new();
+        mgr.max_queue_size = snap.max_queue_size;
+        mgr.max_discovered_per_page = snap.max_discovered_per_page;
+        for url in snap.seen_urls {
+            mgr.seen_urls.insert(url);
+        }
+        for entry in snap.queue {
+            mgr.queue.push(entry);
+        }
+        Some(mgr)
+    }
 }
+
+/// Serializable snapshot of the crawl queue manager.
+#[derive(Serialize, Deserialize)]
+struct QueueSnapshot {
+    queue: Vec<CrawlEntry>,
+    seen_urls: Vec<String>,
+    max_queue_size: usize,
+    max_discovered_per_page: usize,
+}
+
+/// Distribution-driven content cap: p90 of recent cleaned-content lengths,
+/// clamped to a sane range. Keeps enough text for quality scoring + embedding
+/// while trimming the long tail, instead of a fixed 8000-char truncation.
+fn adaptive_content_cap(window: &VecDeque<usize>, cached: usize) -> usize {
+    if window.len() < 16 {
+        return cached;
+    }
+    let mut v: Vec<usize> = window.iter().copied().collect();
+    v.sort_unstable();
+    let idx = ((v.len() as f64) * 0.90) as usize;
+    let p90 = v[idx.min(v.len() - 1)];
+    p90.clamp(CONTENT_CAP_MIN, CONTENT_CAP_MAX)
+}
+
+// ─── Adaptive controller bounds (not magic numbers in the hot loop) ──
+const MIN_CONCURRENCY: usize = 4;
+const MAX_CONCURRENCY: usize = 30;
+/// Throughput deadband: below SLOW we shed concurrency (saturated), above FAST
+/// we add it (headroom). Between, hold.
+const CONCURRENCY_SLOW_DPS: f64 = 6.0;
+const CONCURRENCY_FAST_DPS: f64 = 15.0;
+const CONTENT_CAP_MIN: usize = 2000;
+const CONTENT_CAP_MAX: usize = 12000;
+const CAP_RECOMPUTE_EVERY: usize = 50;
+const QUEUE_SAVE_PATH: &str = "/app/queue_data/queue_snapshot.json";
+const QUEUE_SAVE_INTERVAL: u64 = 20; // seconds
 
 fn normalize_url(url: &str) -> String {
     if let Ok(mut parsed) = Url::parse(url) {
@@ -296,12 +371,33 @@ fn default_seed_urls() -> Vec<(&'static str, &'static str)> {
 
 // ─── App State ───────────────────────────────────────────────────────
 
+/// Rolling performance state for the adaptive-concurrency controller.
+/// `ewma_dps` = exponentially-weighted throughput (docs/sec) of the crawl+
+/// embed+ingest pipeline. When saturated (low dps) we shed concurrency; when
+/// there is headroom (high dps) we add it. No fixed thresholds in the hot loop
+/// beyond the clamp bounds — the setpoint is distribution-driven.
+struct PerfState {
+    ewma_dps: f64,
+    last_batch_docs: usize,
+}
+
 struct AppState {
     queue: Mutex<CrawlQueueManager>,
     crawl_client: reqwest::Client,
     indexer_url: String,
     embed_url: String,
     ingest_buffer: Mutex<Vec<serde_json::Value>>,
+    /// Adaptive crawl concurrency (batch size dequeued per tick). Bounded
+    /// [MIN_CONCURRENCY, MAX_CONCURRENCY]; adjusted from observed throughput.
+    concurrency: Mutex<usize>,
+    /// Window of recent cleaned-content lengths, used to derive a
+    /// distribution-driven content cap (p90, clamped) instead of a fixed 8000.
+    content_window: Mutex<VecDeque<usize>>,
+    /// Cached content cap, recomputed every CAP_RECOMPUTE_EVERY pages.
+    content_cap: Mutex<usize>,
+    cap_counter: Mutex<usize>,
+    /// Rolling pipeline throughput for the concurrency controller.
+    perf: Mutex<PerfState>,
 }
 
 #[derive(Clone, Serialize)]
@@ -403,13 +499,46 @@ async fn main() {
         .build()
         .unwrap();
 
+    // Restore the crawl queue from a prior snapshot if present, so a restart
+    // resumes in-flight crawling instead of re-seeding from scratch.
+    let queue = CrawlQueueManager::load(QUEUE_SAVE_PATH)
+        .unwrap_or_else(|| CrawlQueueManager::new());
+    let restored = queue.seen_count();
+    if restored > 0 {
+        tracing::info!("Restored crawl queue snapshot: {} seen URLs", restored);
+    }
+
     let state = Arc::new(AppState {
-        queue: Mutex::new(CrawlQueueManager::new()),
+        queue: Mutex::new(queue),
         crawl_client,
         indexer_url: "http://127.0.0.1:6000".to_string(),
         embed_url: "http://127.0.0.1:3005/embed".to_string(),
         ingest_buffer: Mutex::new(Vec::with_capacity(64)),
+        concurrency: Mutex::new(20),
+        content_window: Mutex::new(VecDeque::with_capacity(300)),
+        content_cap: Mutex::new(8000),
+        cap_counter: Mutex::new(0),
+        perf: Mutex::new(PerfState { ewma_dps: 0.0, last_batch_docs: 0 }),
     });
+
+    // Queue snapshot saver: persist pending URLs + seen set periodically so a
+    // crash/restart loses at most QUEUE_SAVE_INTERVAL of progress.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(QUEUE_SAVE_INTERVAL));
+            loop {
+                interval.tick().await;
+                let snap = {
+                    let q = state.queue.lock().await;
+                    q.save(QUEUE_SAVE_PATH)
+                };
+                if let Err(e) = snap {
+                    tracing::warn!("Queue snapshot save failed: {:?}", e);
+                }
+            }
+        });
+    }
 
     // Batch-ingest flush ticker: flushes the shared ingest buffer every 500ms so
     // docs committed to the indexer at most 500ms after crawl, regardless of volume.
@@ -432,7 +561,15 @@ async fn main() {
             let mut queue = state.queue.lock().await;
             let now = now_secs();
             let mut seeded = 0;
+            let mut skipped_seen = 0;
             for (url, source) in default_seed_urls() {
+                // If a snapshot was restored, its seen-set already covers seeds;
+                // only enqueue seeds we haven't seen to avoid redundant re-crawls.
+                let normalized = normalize_url(url);
+                if queue.seen_count() > 0 && queue.is_seen(&normalized) {
+                    skipped_seen += 1;
+                    continue;
+                }
                 let content_type = detect_content_type(url);
                 let entry = CrawlEntry {
                     url: url.to_string(),
@@ -446,7 +583,7 @@ async fn main() {
                     seeded += 1;
                 }
             }
-            tracing::info!("Seeded {} URLs into crawl queue", seeded);
+            tracing::info!("Seeded {} new URLs (skipped {} already-seen from snapshot) into crawl queue", seeded, skipped_seen);
         });
     }
 
@@ -457,12 +594,15 @@ async fn main() {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-                // Dequeue up to 5 entries (respecting domain rate limits)
+                // Dequeue up to `concurrency` entries (adaptive; respects domain
+                // rate limits). Concurrency is tuned from observed pipeline
+                // throughput so we shed load when embed/upstream is saturated.
                 let now_ms = now_millis();
+                let concurrency = *state.concurrency.lock().await;
                 let mut batch: Vec<CrawlEntry> = Vec::new();
                 {
                     let mut queue = state.queue.lock().await;
-                    for _ in 0..20 {
+                    for _ in 0..concurrency {
                         if let Some(entry) = queue.dequeue(now_ms) {
                             batch.push(entry);
                         } else {
@@ -475,7 +615,9 @@ async fn main() {
                     continue;
                 }
 
-                tracing::info!("Crawling batch of {} URLs", batch.len());
+                tracing::info!("Crawling batch of {} URLs (concurrency={})", batch.len(), concurrency);
+
+                let batch_start = Instant::now();
 
                 // Process batch concurrently
                 let futs: Vec<_> = batch.iter().map(|entry| {
@@ -534,6 +676,33 @@ async fn main() {
                         }
                     } else {
                         tracing::info!("Queue at capacity ({}), pausing discovery to drain", queue.len());
+                    }
+                }
+
+                // ── Adaptive concurrency: tune from observed pipeline throughput.
+                // Sustained low docs/sec ⇒ saturated (embed/upstream slow) ⇒ shed
+                // concurrency; high docs/sec ⇒ headroom ⇒ add it. Deadband between
+                // SLOW and FAST holds the current setting. Bounded [MIN, MAX].
+                let elapsed = batch_start.elapsed().as_secs_f64().max(0.001);
+                let dps = batch.len() as f64 / elapsed;
+                let ewma = {
+                    let mut perf = state.perf.lock().await;
+                    perf.ewma_dps = if perf.ewma_dps == 0.0 {
+                        dps
+                    } else {
+                        0.7 * perf.ewma_dps + 0.3 * dps
+                    };
+                    perf.last_batch_docs = batch.len();
+                    perf.ewma_dps
+                };
+                let mut conc = state.concurrency.lock().await;
+                if *conc > 0 {
+                    if ewma <= CONCURRENCY_SLOW_DPS && *conc > MIN_CONCURRENCY {
+                        *conc = (*conc).saturating_sub(2).max(MIN_CONCURRENCY);
+                        tracing::info!("Pipeline saturated (dps={:.1} <= {}): concurrency -> {}", ewma, CONCURRENCY_SLOW_DPS, *conc);
+                    } else if ewma >= CONCURRENCY_FAST_DPS && *conc < MAX_CONCURRENCY {
+                        *conc = (*conc + 2).min(MAX_CONCURRENCY);
+                        tracing::info!("Pipeline headroom (dps={:.1} >= {}): concurrency -> {}", ewma, CONCURRENCY_FAST_DPS, *conc);
                     }
                 }
             }
@@ -916,6 +1085,10 @@ async fn crawl_and_index(
     let resp = state.crawl_client.get(&entry.url).send().await?;
     let html_content = resp.text().await.unwrap_or_default();
 
+    // Distribution-driven content cap (p90 of recent lengths, clamped). Read
+    // once here; the crawl block below is sync so the value stays valid.
+    let cap = *state.content_cap.lock().await;
+
     // Parse + extract everything from Html in a block so it's dropped before any .await
     // (scraper::Html contains Cell<usize> which is not Send)
     let (title, cleaned_content, links, pub_date, quality_score) = {
@@ -937,10 +1110,11 @@ async fn crawl_and_index(
                 if main_content.len() > 500 { break; }
             }
         }
-        // Clean: collapse whitespace, take first 8000 chars (increased from 5000)
+        // Clean: collapse whitespace, then truncate to the distribution-driven
+        // content cap (p90 of recent lengths, clamped) instead of a fixed 8000.
         let cleaned_content: String = {
             let collapsed: String = main_content.split_whitespace().collect::<Vec<_>>().join(" ");
-            collapsed.chars().take(8000).collect()
+            collapsed.chars().take(cap).collect()
         };
 
         let links = extract_links(&document, &entry.url);
@@ -953,6 +1127,24 @@ async fn crawl_and_index(
 
         (title, cleaned_content, links, pub_date, quality_score)
     };
+
+    // Feed the content-length distribution for the adaptive cap: record this
+    // page's length, and every CAP_RECOMPUTE_EVERY pages recompute the p90 cap.
+    {
+        let mut w = state.content_window.lock().await;
+        w.push_back(cleaned_content.chars().count());
+        if w.len() > 300 {
+            w.pop_front();
+        }
+        let mut ctr = state.cap_counter.lock().await;
+        *ctr += 1;
+        if *ctr >= CAP_RECOMPUTE_EVERY {
+            *ctr = 0;
+            let new_cap = adaptive_content_cap(&w, cap);
+            *state.content_cap.lock().await = new_cap;
+            tracing::info!("Content cap adapted (p90 of {} samples) -> {}", w.len(), new_cap);
+        }
+    }
 
     // Content quality gate — don't pollute the index with gibberish
     if !is_indexworthy(&title, &cleaned_content) {
