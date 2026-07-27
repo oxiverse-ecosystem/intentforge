@@ -193,6 +193,8 @@ services:
       dockerfile: Dockerfile
     container_name: if-crawler
     network_mode: "service:gluetun"
+    volumes:
+      - ./crawler/queue_data:/app/queue_data
     restart: always
 
   # ══════════════════════════════════════════════════════════════════

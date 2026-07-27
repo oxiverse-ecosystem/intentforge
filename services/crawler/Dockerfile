@@ -14,6 +14,9 @@ RUN apt-get update && apt-get install -y libssl3 ca-certificates curl && rm -rf 
 
 WORKDIR /app
 COPY --from=builder /usr/src/crawler/target/release/crawler .
+# Queue snapshot dir — must exist even when no volume is mounted (the binary
+# also mkdir -p's it defensively at boot).
+RUN mkdir -p /app/queue_data
 
 EXPOSE 5001
 CMD ["./crawler"]
