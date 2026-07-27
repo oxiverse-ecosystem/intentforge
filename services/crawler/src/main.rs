@@ -349,10 +349,20 @@ fn adaptive_content_cap(window: &VecDeque<usize>, cached: usize) -> usize {
 // ─── Adaptive controller bounds (not magic numbers in the hot loop) ──
 const MIN_CONCURRENCY: usize = 4;
 const MAX_CONCURRENCY: usize = 30;
-/// Throughput deadband: below SLOW we shed concurrency (saturated), above FAST
-/// we add it (headroom). Between, hold.
-const CONCURRENCY_SLOW_DPS: f64 = 6.0;
-const CONCURRENCY_FAST_DPS: f64 = 15.0;
+/// Per-doc latency deadband (seconds/doc): above SLOW we shed concurrency
+/// (pipeline saturated), below FAST we add it (headroom). Between, hold.
+/// Latency is volume-independent — unlike batch throughput, it does not read
+/// "low" just because the queue drained and the batch was small. Values are
+/// the unit conversion of the previous 6/15 docs-sec deadband; initial
+/// setpoints, to be replaced by an adaptive baseline if steady-state
+/// measurement shows oscillation.
+const CONCURRENCY_SLOW_SPD: f64 = 1.0 / 6.0; // ~167ms/doc
+const CONCURRENCY_FAST_SPD: f64 = 1.0 / 15.0; // ~67ms/doc
+/// Only adjust concurrency when the batch was filled to at least this
+/// fraction of the target — a partial batch means the queue drained or
+/// domain rate limits starved it, and the latency sample says nothing about
+/// pipeline saturation.
+const CONCURRENCY_ADJUST_FRACTION: f64 = 0.8;
 const CONTENT_CAP_MIN: usize = 2000;
 const CONTENT_CAP_MAX: usize = 12000;
 const CAP_RECOMPUTE_EVERY: usize = 50;
@@ -431,12 +441,13 @@ fn default_seed_urls() -> Vec<(&'static str, &'static str)> {
 // ─── App State ───────────────────────────────────────────────────────
 
 /// Rolling performance state for the adaptive-concurrency controller.
-/// `ewma_dps` = exponentially-weighted throughput (docs/sec) of the crawl+
-/// embed+ingest pipeline. When saturated (low dps) we shed concurrency; when
-/// there is headroom (high dps) we add it. No fixed thresholds in the hot loop
-/// beyond the clamp bounds — the setpoint is distribution-driven.
+/// `ewma_spd` = exponentially-weighted per-doc latency (seconds/doc) of the
+/// crawl+embed+ingest pipeline. When saturated (high latency) we shed
+/// concurrency; when there is headroom (low latency) we add it. Latency is
+/// volume-independent, and updates are gated on the batch being at capacity,
+/// so a drained queue cannot masquerade as saturation.
 struct PerfState {
-    ewma_dps: f64,
+    ewma_spd: f64,
     last_batch_docs: usize,
 }
 
@@ -583,7 +594,7 @@ async fn main() {
         content_window: Mutex::new(VecDeque::with_capacity(300)),
         content_cap: Mutex::new(restored_cap),
         cap_counter: Mutex::new(0),
-        perf: Mutex::new(PerfState { ewma_dps: 0.0, last_batch_docs: 0 }),
+        perf: Mutex::new(PerfState { ewma_spd: 0.0, last_batch_docs: 0 }),
     });
 
     // Queue snapshot saver: persist pending URLs + seen set periodically so a
@@ -747,31 +758,43 @@ async fn main() {
                     }
                 }
 
-                // ── Adaptive concurrency: tune from observed pipeline throughput.
-                // Sustained low docs/sec ⇒ saturated (embed/upstream slow) ⇒ shed
-                // concurrency; high docs/sec ⇒ headroom ⇒ add it. Deadband between
-                // SLOW and FAST holds the current setting. Bounded [MIN, MAX].
+                // ── Adaptive concurrency: tune from observed PER-DOC latency,
+                // gated on the batch being at capacity. A partial batch means
+                // the queue drained or domain limits starved it — that sample
+                // says nothing about pipeline saturation, so skip adjustment
+                // (previously a drained queue read as "saturated" and collapsed
+                // concurrency toward MIN while idle). Sustained high latency ⇒
+                // saturated (embed/upstream slow) ⇒ shed; low latency ⇒
+                // headroom ⇒ add. Deadband between. Bounded [MIN, MAX].
                 let elapsed = batch_start.elapsed().as_secs_f64().max(0.001);
-                let dps = batch.len() as f64 / elapsed;
-                let ewma = {
-                    let mut perf = state.perf.lock().await;
-                    perf.ewma_dps = if perf.ewma_dps == 0.0 {
-                        dps
-                    } else {
-                        0.7 * perf.ewma_dps + 0.3 * dps
+                let batch_at_capacity =
+                    batch.len() as f64 >= (concurrency as f64 * CONCURRENCY_ADJUST_FRACTION);
+                if batch_at_capacity {
+                    let spd = elapsed / batch.len() as f64; // seconds per doc
+                    let ewma = {
+                        let mut perf = state.perf.lock().await;
+                        perf.ewma_spd = if perf.ewma_spd == 0.0 {
+                            spd
+                        } else {
+                            0.7 * perf.ewma_spd + 0.3 * spd
+                        };
+                        perf.last_batch_docs = batch.len();
+                        perf.ewma_spd
                     };
-                    perf.last_batch_docs = batch.len();
-                    perf.ewma_dps
-                };
-                let mut conc = state.concurrency.lock().await;
-                if *conc > 0 {
-                    if ewma <= CONCURRENCY_SLOW_DPS && *conc > MIN_CONCURRENCY {
-                        *conc = (*conc).saturating_sub(2).max(MIN_CONCURRENCY);
-                        tracing::info!("Pipeline saturated (dps={:.1} <= {}): concurrency -> {}", ewma, CONCURRENCY_SLOW_DPS, *conc);
-                    } else if ewma >= CONCURRENCY_FAST_DPS && *conc < MAX_CONCURRENCY {
-                        *conc = (*conc + 2).min(MAX_CONCURRENCY);
-                        tracing::info!("Pipeline headroom (dps={:.1} >= {}): concurrency -> {}", ewma, CONCURRENCY_FAST_DPS, *conc);
+                    let mut conc = state.concurrency.lock().await;
+                    if *conc > 0 {
+                        if ewma >= CONCURRENCY_SLOW_SPD && *conc > MIN_CONCURRENCY {
+                            *conc = (*conc).saturating_sub(2).max(MIN_CONCURRENCY);
+                            tracing::info!("Pipeline saturated ({:.0}ms/doc >= {:.0}ms): concurrency -> {}", ewma * 1000.0, CONCURRENCY_SLOW_SPD * 1000.0, *conc);
+                        } else if ewma <= CONCURRENCY_FAST_SPD && *conc < MAX_CONCURRENCY {
+                            *conc = (*conc + 2).min(MAX_CONCURRENCY);
+                            tracing::info!("Pipeline headroom ({:.0}ms/doc <= {:.0}ms): concurrency -> {}", ewma * 1000.0, CONCURRENCY_FAST_SPD * 1000.0, *conc);
+                        }
                     }
+                } else {
+                    let mut perf = state.perf.lock().await;
+                    perf.last_batch_docs = batch.len();
+                    tracing::debug!("Partial batch ({}/{}) — holding concurrency (starved, not saturated)", batch.len(), concurrency);
                 }
             }
         });
