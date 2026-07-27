@@ -13,3 +13,4 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1.0"
 tower-http = { version = "0.5", features = ["cors"] }
+sled = "0.34"

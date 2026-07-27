@@ -198,8 +198,8 @@ services:
       context: ./indexer
       dockerfile: Dockerfile
     container_name: if-dev-indexer
-    mem_limit: 256m
-    mem_reservation: 128m
+    mem_limit: 1024m
+    mem_reservation: 256m
     volumes:
       - ./indexer/index_data:/app/index_data
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
@@ -214,8 +214,8 @@ services:
       context: ./crawler
       dockerfile: Dockerfile
     container_name: if-dev-crawler
-    mem_limit: 256m
-    mem_reservation: 128m
+    mem_limit: 1024m
+    mem_reservation: 512m
     network_mode: "service:gluetun"
     depends_on:
       gluetun:

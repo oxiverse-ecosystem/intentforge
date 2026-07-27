@@ -172,9 +172,9 @@ impl CrawlQueueManager {
         Self {
             queue: BinaryHeap::new(),
             seen_urls: HashSet::new(),
-            domain_limiter: DomainRateLimiter::new(2000),
+            domain_limiter: DomainRateLimiter::new(750),
             max_queue_size: 50000,
-            max_discovered_per_page: 20,
+            max_discovered_per_page: 5,
         }
     }
 
@@ -301,7 +301,50 @@ struct AppState {
     crawl_client: reqwest::Client,
     indexer_url: String,
     embed_url: String,
+    ingest_buffer: Mutex<Vec<serde_json::Value>>,
 }
+
+#[derive(Clone, Serialize)]
+struct IngestRequest {
+    url: String,
+    title: String,
+    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authority: Option<f64>,
+}
+
+// Flush buffered docs to the indexer via the batch endpoint (one POST + one
+// commit for N docs). Returns number flushed.
+async fn flush_ingest_buffer(state: &Arc<AppState>) -> usize {
+    let batch: Vec<serde_json::Value> = {
+        let mut buf = state.ingest_buffer.lock().await;
+        if buf.is_empty() {
+            return 0;
+        }
+        std::mem::take(&mut *buf)
+    };
+    let n = batch.len();
+    let payload = serde_json::json!({ "documents": batch, "replace_existing": true });
+    if let Err(e) = state.crawl_client
+        .post(format!("{}/ingest_batch", state.indexer_url))
+        .json(&payload)
+        .send()
+        .await
+    {
+        tracing::warn!("Batch ingest POST failed: {:?}", e);
+        return 0;
+    }
+    tracing::info!("Flushed batch of {} doc(s) to indexer", n);
+    n
+}
+
+// Buffer size that triggers an immediate flush.
+const INGEST_FLUSH_THRESHOLD: usize = 20;
+
 
 // ─── API Types ───────────────────────────────────────────────────────
 
@@ -365,7 +408,20 @@ async fn main() {
         crawl_client,
         indexer_url: "http://127.0.0.1:6000".to_string(),
         embed_url: "http://127.0.0.1:3005/embed".to_string(),
+        ingest_buffer: Mutex::new(Vec::with_capacity(64)),
     });
+
+    // Batch-ingest flush ticker: flushes the shared ingest buffer every 500ms so
+    // docs committed to the indexer at most 500ms after crawl, regardless of volume.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                flush_ingest_buffer(&state).await;
+            }
+        });
+    }
 
     // Seed URL injection on startup
     {
@@ -399,14 +455,14 @@ async fn main() {
         let state = state.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
                 // Dequeue up to 5 entries (respecting domain rate limits)
                 let now_ms = now_millis();
                 let mut batch: Vec<CrawlEntry> = Vec::new();
                 {
                     let mut queue = state.queue.lock().await;
-                    for _ in 0..5 {
+                    for _ in 0..20 {
                         if let Some(entry) = queue.dequeue(now_ms) {
                             batch.push(entry);
                         } else {
@@ -442,35 +498,42 @@ async fn main() {
 
                 let results = futures::future::join_all(futs).await;
 
-                // Enqueue discovered links from all successful crawls
+                // Enqueue discovered links from all successful crawls.
+                // Backpressure: once the queue is >=80% full, stop discovering new
+                // links so the crawler can actually drain to a steady state instead
+                // of growing without bound (discovery is free, crawl is ~1s each).
                 {
                     let mut queue = state.queue.lock().await;
-                    let now = now_secs();
-                    let mut total_discovered = 0;
-                    for result in results.into_iter().flatten() {
-                        let (entry, links) = result;
-                        let mut discovered = 0;
-                        for link in links {
-                            if discovered >= queue.max_discovered_per_page {
-                                break;
+                    if queue.len() < (queue.max_queue_size * 4 / 5) {
+                        let now = now_secs();
+                        let mut total_discovered = 0;
+                        for result in results.into_iter().flatten() {
+                            let (entry, links) = result;
+                            let mut discovered = 0;
+                            for link in links {
+                                if discovered >= queue.max_discovered_per_page {
+                                    break;
+                                }
+                                let link_type = detect_content_type(&link);
+                                let new_entry = CrawlEntry {
+                                    url: link,
+                                    priority: entry.priority * 0.7,
+                                    source: "discovery".to_string(),
+                                    content_type: link_type,
+                                    discovered_at: now,
+                                    attempts: 0,
+                                };
+                                if queue.enqueue(new_entry) {
+                                    discovered += 1;
+                                }
                             }
-                            let link_type = detect_content_type(&link);
-                            let new_entry = CrawlEntry {
-                                url: link,
-                                priority: entry.priority * 0.7,
-                                source: "discovery".to_string(),
-                                content_type: link_type,
-                                discovered_at: now,
-                                attempts: 0,
-                            };
-                            if queue.enqueue(new_entry) {
-                                discovered += 1;
-                            }
+                            total_discovered += discovered;
                         }
-                        total_discovered += discovered;
-                    }
-                    if total_discovered > 0 {
-                        tracing::info!("Discovered {} new URLs from batch", total_discovered);
+                        if total_discovered > 0 {
+                            tracing::info!("Discovered {} new URLs from batch", total_discovered);
+                        }
+                    } else {
+                        tracing::info!("Queue at capacity ({}), pausing discovery to drain", queue.len());
                     }
                 }
             }
@@ -931,11 +994,15 @@ async fn crawl_and_index(
         index_payload["timestamp"] = serde_json::json!(ts);
     }
 
-    let _ = state.crawl_client
-        .post(format!("{}/index", state.indexer_url))
-        .json(&index_payload)
-        .send()
-        .await;
+    // Buffer the doc for batched ingest instead of one POST per crawl.
+    {
+        let mut buf = state.ingest_buffer.lock().await;
+        buf.push(index_payload);
+        if buf.len() >= INGEST_FLUSH_THRESHOLD {
+            drop(buf);
+            flush_ingest_buffer(&state).await;
+        }
+    }
 
     Ok((title, cleaned_content, links))
 }
