@@ -6,7 +6,10 @@
 # The database is downloaded to /data/ (mounted volume), which
 # is the same volume the gateway mounts at /var/lib/geolite2.
 
-set -e
+# NOTE: intentionally NOT using `set -e` — a failed MaxMind download must not
+# exit the script (which, combined with restart:always, would crash-loop the
+# container ~every 18s and, on any successful download, SIGTERM the gateway
+# mid-request causing intermittent aborted API responses).
 
 BASE_URL="https://download.maxmind.com/app/geoip_download"
 EDITION_ID="GeoLite2-City"
@@ -68,22 +71,30 @@ update_and_restart() {
     mv "${TEMP_MMDB}" "${DEST_FILE}"
     echo "  SUCCESS: Database updated ($(ls -lh "${DEST_FILE}" | awk '{print $5}'))"
 
-    # Restart the gateway container to pick up the new database
-    echo "  Restarting container: ${GATEWAY_CONTAINER_NAME}..."
-    if [ -S /var/run/docker.sock ]; then
-        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X POST --unix-socket /var/run/docker.sock \
-            "http://localhost/containers/${GATEWAY_CONTAINER_NAME}/restart" \
-            -d '{"signal": "SIGTERM"}' 2>&1 || echo "000")
-        if [ "${HTTP_STATUS}" = "204" ]; then
-            echo "  Gateway restarted successfully."
+    # Restart the gateway container to pick up the new database.
+    # Disabled by default: the gateway mounts GeoLite2 read-only and only loads
+    # it at boot, so restarting it mid-traffic causes aborted API responses.
+    # Set RESTART_GATEWAY_ON_UPDATE=1 to re-enable (e.g. if hot-reload is added).
+    if [ "${RESTART_GATEWAY_ON_UPDATE}" = "1" ]; then
+        echo "  Restarting container: ${GATEWAY_CONTAINER_NAME}..."
+        if [ -S /var/run/docker.sock ]; then
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X POST --unix-socket /var/run/docker.sock \
+                "http://localhost/containers/${GATEWAY_CONTAINER_NAME}/restart" \
+                -d '{"signal": "SIGTERM"}' 2>&1 || echo "000")
+            if [ "${HTTP_STATUS}" = "204" ]; then
+                echo "  Gateway restarted successfully."
+            else
+                echo "  WARNING: Gateway restart returned HTTP ${HTTP_STATUS}."
+                echo "  (Expected 204. Container may need manual restart.)"
+            fi
         else
-            echo "  WARNING: Gateway restart returned HTTP ${HTTP_STATUS}."
-            echo "  (Expected 204. Container may need manual restart.)"
+            echo "  WARNING: Docker socket not mounted. Cannot restart gateway."
+            echo "  Restart manually: docker restart ${GATEWAY_CONTAINER_NAME}"
         fi
     else
-        echo "  WARNING: Docker socket not mounted. Cannot restart gateway."
-        echo "  Restart manually: docker restart ${GATEWAY_CONTAINER_NAME}"
+        echo "  NOTE: Gateway NOT restarted (RESTART_GATEWAY_ON_UPDATE not set)."
+        echo "  The new database will be picked up on the gateway's next natural restart."
     fi
 }
 
