@@ -229,33 +229,47 @@ impl CrawlQueueManager {
         self.seen_urls.contains(normalized)
     }
 
-    /// Persist the queue (pending entries) + seen-URL dedup set + the current
-    /// adaptive content cap to a JSON snapshot so a container restart can
-    /// resume without re-seeding from scratch. The BinaryHeap is serialized as
-    /// a Vec (priority order is restored on load by re-pushing). Domain
-    /// rate-limit state is intentionally not persisted (it resets on restart,
-    /// which is fine).
-    fn save(&self, path: &str, content_cap: usize) -> std::io::Result<()> {
-        let snap = QueueSnapshot {
+    /// Clone the persistable state into a QueueSnapshot. Called under the
+    /// queue lock — kept to a cheap O(n) clone; serialization and disk I/O
+    /// happen OUTSIDE the lock (see the snapshot saver task) so dequeue and
+    /// the /enqueue handler are not stalled for the duration of a full JSON
+    /// encode + write of up to 50k entries.
+    fn snapshot(&self, content_cap: usize) -> QueueSnapshot {
+        QueueSnapshot {
             version: 1,
             queue: self.queue.iter().cloned().collect(),
             seen_urls: self.seen_urls.iter().cloned().collect(),
             max_queue_size: self.max_queue_size,
             max_discovered_per_page: self.max_discovered_per_page,
             content_cap,
-        };
-        let data = serde_json::to_vec(&snap)?;
-        std::fs::write(path, data)?;
-        Ok(())
+        }
     }
 
     /// Load a previously saved snapshot, restoring pending entries + seen set
     /// + the persisted adaptive content cap (defaults to the 8000 seed for
     /// pre-v1 snapshots). Entries are re-pushed so the BinaryHeap priority
-    /// ordering is rebuilt.
+    /// ordering is rebuilt. Falls back to the .bak copy if the primary file
+    /// is corrupt (e.g. torn write on hard kill); only returns None when both
+    /// are unreadable, and logs loudly in that case.
     fn load(path: &str) -> Option<(Self, usize)> {
-        let data = std::fs::read(path).ok()?;
-        let snap: QueueSnapshot = serde_json::from_slice(&data).ok()?;
+        let snap = match Self::read_snapshot(path) {
+            Some(s) => s,
+            None => {
+                let bak = format!("{}.bak", path);
+                match Self::read_snapshot(&bak) {
+                    Some(s) => {
+                        tracing::warn!("Primary queue snapshot {} unreadable/corrupt; restored from backup {}", path, bak);
+                        s
+                    }
+                    None => {
+                        if std::path::Path::new(path).exists() {
+                            tracing::error!("Queue snapshot {} AND backup are corrupt — starting with an EMPTY queue", path);
+                        }
+                        return None;
+                    }
+                }
+            }
+        };
         let mut mgr = CrawlQueueManager::new();
         mgr.max_queue_size = snap.max_queue_size;
         mgr.max_discovered_per_page = snap.max_discovered_per_page;
@@ -267,6 +281,32 @@ impl CrawlQueueManager {
         }
         Some((mgr, snap.content_cap))
     }
+
+    fn read_snapshot(path: &str) -> Option<QueueSnapshot> {
+        let data = std::fs::read(path).ok()?;
+        serde_json::from_slice(&data).ok()
+    }
+}
+
+/// Atomically persist a snapshot: keep a best-effort backup of the previous
+/// good file, write to a temp file, fsync, then rename over the target.
+/// rename() is atomic on the same filesystem, so a hard kill mid-save leaves
+/// either the old complete file or the new complete file — never a torn one.
+fn save_snapshot_atomic(path: &str, snap: &QueueSnapshot) -> std::io::Result<()> {
+    use std::io::Write;
+    let data = serde_json::to_vec(snap)?;
+    // Best-effort backup of the current good snapshot (load() falls back to it).
+    if std::path::Path::new(path).exists() {
+        let _ = std::fs::copy(path, format!("{}.bak", path));
+    }
+    let tmp = format!("{}.tmp", path);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&data)?;
+        f.sync_data()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Serializable snapshot of the crawl queue manager.
@@ -554,12 +594,14 @@ async fn main() {
             let mut interval = tokio::time::interval(Duration::from_secs(QUEUE_SAVE_INTERVAL));
             loop {
                 interval.tick().await;
+                // Clone under a short lock; serialize + write OUTSIDE the lock
+                // so dequeue/enqueue are not blocked by JSON encoding + disk I/O.
                 let cap = *state.content_cap.lock().await;
                 let snap = {
                     let q = state.queue.lock().await;
-                    q.save(QUEUE_SAVE_PATH, cap)
+                    q.snapshot(cap)
                 };
-                if let Err(e) = snap {
+                if let Err(e) = save_snapshot_atomic(QUEUE_SAVE_PATH, &snap) {
                     tracing::warn!("Queue snapshot save failed: {:?}", e);
                 }
             }
