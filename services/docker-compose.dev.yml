@@ -216,6 +216,10 @@ services:
     container_name: if-dev-crawler
     mem_limit: 1024m
     mem_reservation: 512m
+    environment:
+      # crawler=debug surfaces the per-page "Content length: raw= truncated= cap="
+      # line used for raw-length distribution measurement (cap tuning).
+      - RUST_LOG=info,crawler=debug
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
