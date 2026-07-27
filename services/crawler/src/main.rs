@@ -427,7 +427,19 @@ const CONCURRENCY_FAST_SPD: f64 = 1.0 / 15.0; // ~67ms/doc
 /// pipeline saturation.
 const CONCURRENCY_ADJUST_FRACTION: f64 = 0.8;
 const CONTENT_CAP_MIN: usize = 2000;
-const CONTENT_CAP_MAX: usize = 12000;
+/// Storage clamp on the adaptive cap, anchored to the MEASURED raw-length
+/// distribution (538-page sample, 2026-07-27, scripts/analyze_content_lengths.py):
+/// p50=6353, p75=24k, p90=101k, p99=938k chars. The corpus is so heavy-tailed
+/// that raw p90 sits ~8x above any sane storage bound — the p90 statistic is
+/// permanently clamp-bound here, so the clamp itself is the deliberate,
+/// data-justified cap. 6500 ≈ measured p50: half of pages are stored in full;
+/// beyond that, chars belong overwhelmingly to 100k+ mega-pages (87.6% of all
+/// raw chars lie past 12000). Embedding quality is unaffected (MiniLM truncates
+/// at 512 tokens ≈ 2.5k chars). Measured footprint: 6500 stores ~67% of the
+/// 12000-clamp baseline (-33%) and ~87% of the old fixed 8000 (-13%).
+/// The adaptive p90 still governs BELOW the clamp: if the corpus shifts
+/// shorter, the cap follows it down toward CONTENT_CAP_MIN.
+const CONTENT_CAP_MAX: usize = 6500;
 const CAP_RECOMPUTE_EVERY: usize = 50;
 const QUEUE_SAVE_PATH: &str = "/app/queue_data/queue_snapshot.json";
 const QUEUE_SAVE_INTERVAL: u64 = 20; // seconds
@@ -653,6 +665,9 @@ async fn main() {
     }
     let (queue, restored_cap) = CrawlQueueManager::load(QUEUE_SAVE_PATH)
         .unwrap_or_else(|| (CrawlQueueManager::new(), default_content_cap()));
+    // Clamp the restored cap: a snapshot written under an older, wider
+    // CONTENT_CAP_MAX must not resurrect a cap outside the current bounds.
+    let restored_cap = restored_cap.clamp(CONTENT_CAP_MIN, CONTENT_CAP_MAX);
     let restored = queue.seen_count();
     if restored > 0 {
         tracing::info!("Restored crawl queue snapshot: {} seen URLs, content_cap={}", restored, restored_cap);
@@ -1657,15 +1672,16 @@ mod tests {
 
     #[test]
     fn adaptive_cap_uses_raw_distribution() {
-        // Window of raw lengths ABOVE the current cap must widen the cap —
-        // the old post-truncation feed made this impossible.
-        let w: VecDeque<usize> = (0..32).map(|_| 11000).collect();
-        let cap = adaptive_content_cap(&w, 8000);
-        assert_eq!(cap, 11000, "cap must widen toward raw p90");
-        // And the clamp still applies.
+        // Window of raw lengths ABOVE the current cap must widen the cap
+        // (up to the clamp) — the old post-truncation feed made this
+        // impossible. Use a cached cap below the samples to prove widening.
+        let w: VecDeque<usize> = (0..32).map(|_| 5000).collect();
+        let cap = adaptive_content_cap(&w, 3000);
+        assert_eq!(cap, 5000, "cap must widen toward raw p90");
+        // And the clamp still applies on both ends.
         let w_long: VecDeque<usize> = (0..32).map(|_| 50000).collect();
-        assert_eq!(adaptive_content_cap(&w_long, 8000), CONTENT_CAP_MAX);
+        assert_eq!(adaptive_content_cap(&w_long, 3000), CONTENT_CAP_MAX);
         let w_short: VecDeque<usize> = (0..32).map(|_| 100).collect();
-        assert_eq!(adaptive_content_cap(&w_short, 8000), CONTENT_CAP_MIN);
+        assert_eq!(adaptive_content_cap(&w_short, 3000), CONTENT_CAP_MIN);
     }
 }
