@@ -57,7 +57,7 @@ const PROTECTED_TERMS: &[&str] = &[
     "ocaml", "clojure", "zig", "astro", "hugo", "bun", "deno", "nextjs",
     "nodejs", "typescript", "javascript", "svelte", "tailwind", "flutter",
     "django", "fastapi", "laravel", "webpack", "vite", "esbuild", "pnpm",
-    "podman", "kubernetes", "terraform", "ansible", "helm", "nginx",
+    "podman", "kubernetes", "terraform", "ansible", "helm", "nginx", "tokio",
     "postgres", "redis", "mongodb", "sqlite", "grafana", "caddy",
     // Common brands likely to collide with English words
     "github", "gitlab", "apple", "ubuntu", "debian", "alpine", "macos",
