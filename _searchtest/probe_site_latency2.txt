@@ -1,7 +1,0 @@
-query                                      n  res  p50   p95   max   <5s  upstream
-boilerplate site:arxiv.org                  6    2 3.01 3.40 4.53  True  3
-function words site:arxiv.org               6    3 0.01 0.02 1.52  True  0
-predictive coding site:arxiv.org            6    3 0.01 0.01 2.96  True  0
-attention mechanism site:arxiv.org          6    2 0.02 0.02 2.78  True  0
-semantic memory site:arxiv.org              6    2 0.00 0.02 3.29  True  0
-Lancaster norms                             6   15 0.02 0.03 2.85  True  0
