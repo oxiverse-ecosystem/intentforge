@@ -18,6 +18,11 @@
   - [GET /images](#get-images)
   - [GET /videos](#get-videos)
   - [GET /news](#get-news)
+  - [POST /goals](#post-goals)
+  - [POST /goals/quick](#post-goalsquick)
+  - [GET /goals/:goal_id](#get-goalsgoal_id)
+  - [POST /goals/:goal_id/answers](#post-goalsgoal_idanswers)
+  - [GET /goals/leaderboard](#get-goalsleaderboard)
 - [Query Parameters](#query-parameters)
 - [Response Structures](#response-structures)
 - [Advanced Query Operators](#advanced-query-operators)
@@ -30,6 +35,7 @@
 - [Caching](#caching)
 - [Error Handling](#error-handling)
 - [Performance & Stress Test Results](#performance--stress-test-results)
+- [Goals API](#goals-api)
 - [Examples](#examples)
 - [Architecture](#architecture)
 
@@ -844,3 +850,598 @@ Client → Traefik (SSL) → Gateway (port 4000)
 All search backends are queried in parallel with configurable timeouts. Results are deduplicated by URL, scored using multi-signal ranking, filtered by constraints, paginated, and returned as a unified list.
 
 **Privacy:** All outbound search requests go through VPN (Gluetun) or Tor. No user data, tracking, or analytics is included in responses or used for ranking.
+
+---
+
+## Goals API
+
+The Goals feature transforms a user's long-term goal (e.g. "build an AI assistant", "write a fantasy novel", "start a SaaS business") into a personalized, phased roadmap with curated resources, deadlines, and deliverables.
+
+The system works in two flows:
+1. **Discovery Flow** (`POST /goals` → questions → `POST /goals/:id/answers` → roadmap)
+2. **Quick Flow** (`POST /goals/quick` → immediate full roadmap)
+
+**Flow Overview**
+```
+Discovery Flow:
+  Client                                    Gateway
+    │                                         │
+    ├─ POST /goals  { goal: "..." } ──────────┤
+    │                                         ├── classify_goal() → intent engine
+    │                                         ├── search_resources() → 20 results from /search
+    │                                         ├── generate_questions() → domain-specific questions
+    │                                         ├── GoalStore.insert() → goal_0001
+    │◄──────── { goal_id, questions } ────────┤
+    │                                         │
+    ├─ POST /goals/{id}/answers { answers } ──┤
+    │                                         ├── generate_roadmap() → phased plan
+    │                                         ├── GoalStore.update_roadmap()
+    │◄─────────── { roadmap } ────────────────┤
+
+Quick Flow (one-shot):
+  Client                                    Gateway
+    │                                         │
+    ├─ POST /goals/quick  { goal: "..." } ────┤
+    │                                         ├── classify_goal()
+    │                                         ├── search_resources()
+    │                                         ├── default_answers (Q1=timeline, Q2=hours)
+    │                                         ├── generate_roadmap() → full plan
+    │◄─────── { goal_id, roadmap } ───────────┤
+```
+
+---
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/goals` | Create a goal → get 6–9 domain-specific questions |
+| `POST` | `/goals/:goal_id/answers` | Submit answers → get full phased roadmap |
+| `GET`  | `/goals/:goal_id` | Get goal status and roadmap by ID |
+| `GET`  | `/goals/leaderboard` | Get leaderboard of all goals (sorted by score) |
+| `POST` | `/goals/quick` | One-shot: goal → full roadmap immediately (no questions) |
+
+---
+
+### `POST /goals`
+
+Creates a new goal and returns domain-specific questions tailored to the goal type.
+
+**Request Body**
+
+```json
+{
+  "goal": "build a full-stack web app for project management with team collaboration"
+}
+```
+
+**Response** `200 OK`
+
+```json
+{
+  "goal_id": "goal_0001",
+  "goal": "build a full-stack web app for project management with team collaboration",
+  "intent": "technical",
+  "questions": [
+    {
+      "id": 1,
+      "question": "What is your target timeline for this goal?",
+      "description": "How much calendar time do you want to allocate? This sets the pacing of each phase.",
+      "options": [
+        "1 month — Quick sprint",
+        "3 months — Quarter project",
+        "6 months — Half-year journey",
+        "12 months — Year-long mastery",
+        "Flexible — No strict deadline"
+      ],
+      "type": "single_choice"
+    },
+    {
+      "id": 2,
+      "question": "How many hours per week can you dedicate?",
+      "description": "Consistency matters more than intensity...",
+      "options": ["1-5 hours — Casual", "5-10 hours — Evenings", "10-20 hours — Half-time", "20+ hours — Full-time"],
+      "type": "single_choice"
+    },
+    {
+      "id": 3,
+      "question": "What architecture pattern do you want to follow?",
+      "description": "The architecture shapes how your components communicate and scale.",
+      "options": [
+        "Monolithic — simple, single deployable",
+        "Microservices — independent, deployable services",
+        "Serverless — functions as a service",
+        "Event-driven — message queues and async processing",
+        "Jamstack — static frontend + APIs"
+      ],
+      "type": "single_choice"
+    }
+  ],
+  "total_questions": 7,
+  "created_at": "2026-07-29T12:00:00Z",
+  "next_step": {
+    "method": "POST",
+    "path": "/goals/goal_0001/answers",
+    "body": {
+      "answers": [
+        {"question_id": 1, "answer": "..."}
+      ]
+    }
+  }
+}
+```
+
+**Status Codes**
+
+| Code | Meaning |
+|------|---------|
+| 200  | Goal created successfully |
+
+**Input validation:** Goal must be at least 3 characters.
+
+---
+
+### `POST /goals/:goal_id/answers`
+
+Submits answers to the questions from `POST /goals` and generates a personalized phased roadmap.
+
+**Request Body**
+
+```json
+{
+  "answers": [
+    {"question_id": 1, "answer": "3 months — Quarter project"},
+    {"question_id": 2, "answer": "5-10 hours — Evenings & weekends"},
+    {"question_id": 3, "answer": "Microservices — independent, deployable services"},
+    {"question_id": 4, "answer": "Hybrid — SQL + cache layer (Redis)"},
+    {"question_id": 5, "answer": "Container / Kubernetes (Docker, EKS, GKE)"},
+    {"question_id": 6, "answer": "WebSockets for live bidirectional communication"},
+    {"question_id": 7, "answer": "A completed product ready for users"}
+  ]
+}
+```
+
+**Response** `200 OK`
+
+```json
+{
+  "goal_id": "goal_0001",
+  "goal": "build a full-stack web app for project management with team collaboration",
+  "intent": "technical",
+  "roadmap": {
+    "title": "Your Personalized Roadmap: build a full-stack web app...",
+    "overview": "A 12-week journey (5-10 hours/week) across 4 phases.",
+    "phases": [
+      {
+        "id": 1,
+        "title": "Architecture & Planning",
+        "description": "Design the system architecture, choose your tech stack...",
+        "duration_weeks": 3,
+        "deadline": "2026-08-19 (buffer: 2026-08-26)",
+        "buffer_days": 7,
+        "objectives": [
+          "Design system architecture and component diagram",
+          "Choose tech stack and dependencies",
+          "Set up development environment and CI/CD",
+          "Define API contracts and data models"
+        ],
+        "resources": [
+          {
+            "title": "How to Build a Project Management App: Step-by-Step",
+            "url": "https://example.com/tutorial",
+            "resource_type": "article",
+            "description": "A comprehensive guide to building..."
+          }
+        ],
+        "deliverables": [
+          "Architecture document with diagrams",
+          "Tech stack decision record",
+          "Development environment with CI/CD"
+        ],
+        "completion_type": "foundation",
+        "is_completed": false
+      }
+    ],
+    "total_duration_weeks": 12,
+    "total_buffer_days": 28
+  },
+  "created_at": "2026-07-29T12:00:00Z",
+  "status": "active",
+  "completed_phases": 0,
+  "total_phases": 4,
+  "score": 0
+}
+```
+
+**Status Codes**
+
+| Code | Meaning |
+|------|---------|
+| 200  | Roadmap generated successfully |
+
+**Error Codes**
+
+| Code | Meaning |
+|------|---------|
+| `not_found` | Goal ID does not exist. Create one first with `POST /goals`. |
+
+---
+
+### `GET /goals/:goal_id`
+
+Retrieves the goal status and full roadmap (if answers have been submitted).
+
+**Response** `200 OK`
+
+```json
+{
+  "goal_id": "goal_0001",
+  "goal": "build a full-stack web app for project management with team collaboration",
+  "intent": "technical",
+  "roadmap": { ... },
+  "created_at": "2026-07-29T12:00:00Z",
+  "status": "active",
+  "completed_phases": 0,
+  "total_phases": 4,
+  "score": 0
+}
+```
+
+**Status field values:** `"active"` (in progress), `"completed"` (all phases completed).
+
+**Status Codes**
+
+| Code | Meaning |
+|------|---------|
+| 200  | Goal found (roadmap may be `null` if not yet generated) |
+
+**Error Codes**
+
+| Code | Meaning |
+|------|---------|
+| `not_found` | Goal ID does not exist |
+
+---
+
+### `GET /goals/leaderboard`
+
+Returns all goals sorted by score (descending). Max 50 entries.
+
+**Response** `200 OK`
+
+```json
+{
+  "entries": [
+    {
+      "goal_id": "goal_0001",
+      "goal": "build a full-stack web app...",
+      "user_name": "Anonymous",
+      "score": 0,
+      "completed_phases": 0,
+      "total_phases": 4,
+      "created_at": "2026-07-29T12:00:00Z"
+    }
+  ],
+  "total_entries": 1
+}
+```
+
+---
+
+### `POST /goals/quick`
+
+One-shot endpoint that creates a goal and generates a full roadmap immediately without asking questions. Uses sensible defaults (3-month timeline, 5-10 hours/week).
+
+**Request Body**
+
+```json
+{
+  "goal": "build a full-stack web app for managing personal finances"
+}
+```
+
+**Response** `200 OK`
+
+```json
+{
+  "goal_id": "goal_0002",
+  "goal": "build a full-stack web app for managing personal finances",
+  "intent": "technical",
+  "resource_count": 12,
+  "roadmap": {
+    "title": "Your Personalized Roadmap: build a full-stack web app...",
+    "overview": "A 12-week journey (5-10 hours/week) across 4 phases.",
+    "phases": [ ... ],
+    "total_duration_weeks": 12,
+    "total_buffer_days": 28
+  },
+  "created_at": "2026-07-29T12:00:05Z",
+  "status": "active",
+  "completed_phases": 0,
+  "total_phases": 4,
+  "score": 0
+}
+```
+
+`resource_count` represents the total distributed resources curated across all roadmap phases.
+
+**Input validation:** Goal must be at least 3 characters.
+
+---
+
+### `POST /goals/:goal_id/phases/:phase_id/complete`
+
+Marks a specific 1-indexed phase as completed, recalculating progress score (+100 pts per phase, +500 bonus pts upon 100% completion).
+
+**Request Body**
+None (empty body).
+
+**Response** `200 OK`
+
+```json
+{
+  "goal_id": "goal_0001",
+  "goal": "build a web app",
+  "completed_phase_id": 1,
+  "completed_phases": 1,
+  "total_phases": 4,
+  "score": 100,
+  "status": "active",
+  "roadmap": { ... }
+}
+```
+
+---
+
+### `POST /goals/:goal_id/progress`
+
+Sets specific phase completion status via JSON payload.
+
+**Request Body**
+
+```json
+{
+  "phase_id": 1,
+  "is_completed": true
+}
+```
+
+**Response** `200 OK`
+
+```json
+{
+  "goal_id": "goal_0001",
+  "goal": "build a web app",
+  "phase_id": 1,
+  "is_completed": true,
+  "completed_phases": 1,
+  "total_phases": 4,
+  "score": 100,
+  "status": "active",
+  "roadmap": { ... }
+}
+```
+
+---
+
+### Domain-Specific Question Banks
+
+The `/goals` endpoint detects the goal's domain using keyword analysis and returns tailored questions.
+
+| Domain | Goal Keywords | Questions Returned |
+|--------|---------------|-------------------|
+| `ai-ml` | ai, machine learning, llm, chatbot, recommendation, deep learning, nlp | 7 questions: timeline, hours, AI system type, data strategy, compute infrastructure, evaluation, success vision |
+| `web-app` | website, web app, frontend, full-stack | 7 questions: timeline, hours, architecture pattern, data persistence, deployment, real-time features, success vision |
+| `api-backend` | api, backend, microservice, serverless, graphql | 7 questions: timeline, hours, architecture, persistence, deployment, real-time, success vision |
+| `mobile` | mobile, ios, android, react native, flutter | 6 questions: timeline, hours, platform target, backend/API, offline sync, success vision |
+| `systems` | system, embedded, kernel, low-level, driver, firmware | 5 questions: timeline, hours, target hardware, performance profile, success vision |
+| `devops` | devops, ci/cd, deployment, kubernetes, infrastructure, terraform | 5 questions: timeline, hours, infrastructure scale, cloud provider, success vision |
+| `research` | research, paper, study, thesis, experiment, publication | 7 questions: timeline, hours, methodology, publication outlet, tools/resources, collaboration, success vision |
+| `creative-writing` | write, novel, book, story, poem, script | 6 questions: timeline, hours, genre/format, process style, editing approach, success vision |
+| `creative-design` | design, art, illustration, animation, graphic, ui/ux | 5 questions: timeline, hours, design medium, toolchain, success vision |
+| `business` | startup, business, company, venture, saas, e-commerce | 6 questions: timeline, hours, business model, target customer, business stage, success vision |
+| `lifestyle` | cook, recipe, fitness, workout, guitar, piano, yoga, gardening | 5 questions: timeline, hours, activity focus, practice style, success vision |
+| `learning` | learn, course, tutorial, certification | 5 questions: timeline, hours, learning style, assessment goal, success vision |
+| `general-tech` | build, develop, create, platform, tool, framework | 7 questions: same as web-app bank |
+| `general` | (no specific keywords matched) | 3 questions: timeline, hours, success vision |
+
+All questions are `"type": "single_choice"` with curated options.
+
+---
+
+### Roadmap Structure
+
+The generated roadmap contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `title` | string | "Your Personalized Roadmap: {goal}" |
+| `overview` | string | Summary of total duration, weekly hours, and phase count |
+| `phases` | Phase[] | Ordered list of phases (3–6 phases) |
+| `total_duration_weeks` | int | Total project duration in weeks |
+| `total_buffer_days` | int | Total buffer days (= phases × 7) |
+
+**Phase Fields**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | int | 1-indexed phase number |
+| `title` | string | Phase title (e.g. "Architecture & Planning") |
+| `description` | string | Detailed description with goal name |
+| `duration_weeks` | int | Number of weeks allocated to this phase |
+| `deadline` | string | Hard deadline + buffer date, e.g. `"2026-08-19 (buffer: 2026-08-26)"` |
+| `buffer_days` | int | Always 7 (1 week buffer per phase) |
+| `objectives` | string[] | 4 actionable objectives for the phase |
+| `deliverables` | string[] | 3–4 concrete deliverables to complete |
+| `resources` | Resource[] | 2–5 curated resources (articles, docs, videos, papers) |
+| `completion_type` | string | Type: `"foundation"`, `"prototype"`, `"feature_complete"`, `"project"`, `"final_delivery"` |
+| `is_completed` | bool | Whether the phase is marked complete (default: `false`) |
+
+**Resource Fields**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `title` | string | Resource title from search result |
+| `url` | string | Full URL to the resource |
+| `resource_type` | string | `"article"`, `"documentation"`, `"video"`, or `"paper"` (inferred from URL pattern) |
+| `description` | string | Snippet or description of the resource (first 200 chars) |
+
+**Phase Sequencing by Domain**
+
+| Domain | Phase 1 | Phase 2 | Phase 3 | Phase 4 / Final |
+|--------|---------|---------|---------|----------------|
+| Technical (web-app, mobile, api, systems) | Architecture & Planning | Core Implementation | Integration & Testing | Launch & Polish |
+| AI/ML | Architecture & Planning | Model Development & Training | Integration & Optimization | Launch & Polish |
+| Research | Literature Review & Research Design | Data Collection & Analysis | Analysis & Drafting | Publication & Dissemination |
+| Creative (writing, design) | Concept Development & Planning | Drafting & Creation | Revision & Refinement | Production & Publication |
+| Business | Market Research & Strategy | MVP Development | Testing & Iteration | Launch & Growth |
+| Learning | Foundation & Curriculum Planning | Core Learning | Practice & Projects | Mastery & Assessment |
+
+---
+
+### Deadline Calculation
+
+Deadlines are computed from the **current system time** at request time, not hardcoded. The timeline answer (Q1) determines total duration:
+
+| Timeline Answer | Total Weeks | Phases |
+|----------------|-------------|--------|
+| `"1 month — Quick sprint"` | 4 | 3 |
+| `"3 months — Quarter project"` | 12 | 4 |
+| `"6 months — Half-year journey"` | 24 | 5 |
+| `"12 months — Year-long mastery"` | 48 | 6 |
+| `"Flexible — No strict deadline"` | 12 | 4 (default) |
+
+Each phase gets equal weeks (`total_weeks / phases`). Each phase has a hard deadline + 7-day buffer.
+
+---
+
+### Resource Curation
+
+Resources are sourced from the search API (`GET /search?q={goal}&limit=20`) — the same engine used for web search. Results are categorized by URL pattern:
+
+- `youtube.com`, `youtu.be`, `vimeo.com` → `"video"`
+- `/docs/`, `/api/`, `/reference/`, `/wiki/` → `"documentation"`
+- `arxiv.org`, `researchgate.net`, `acm.org`, `ieee.org` → `"paper"`
+- Everything else → `"article"`
+
+Resources are distributed round-robin across phases. If the search returns 20 results for a 4-phase roadmap, each phase gets 5 resources.
+
+If search fails (timeout or zero results), fallback resources with Google search links are generated per phase.
+
+---
+
+### Intent Classification
+
+Goals are classified using the intent engine (same endpoint used by `/search`). The engine extracts one of:
+
+| Intent | Typical Goal Keywords |
+|--------|----------------------|
+| `technical` | build, develop, create app, software |
+| `informational` | research, paper, study |
+| `how-to` | learn, understand, master |
+| `comparison` | compare, vs, alternative |
+| `informational` (default) | falls through with no strong signal |
+
+The classification uses keyword detection first (fast path), then falls back to the intent engine HTTP call.
+
+---
+
+### Examples
+
+#### Create a goal and get questions (AI/ML domain)
+
+```bash
+curl -s -X POST "http://localhost:4000/goals" \
+  -H "Content-Type: application/json" \
+  -d '{"goal":"build a recommendation engine using deep learning"}' | jq
+```
+
+#### Create a goal and get questions (Research domain)
+
+```bash
+curl -s -X POST "http://localhost:4000/goals" \
+  -H "Content-Type: application/json" \
+  -d '{"goal":"research and publish a paper on transformer optimization"}' | jq '.questions'
+```
+
+#### Submit answers and get a roadmap
+
+```bash
+GOAL_ID=$(curl -s -X POST "http://localhost:4000/goals" \
+  -H "Content-Type: application/json" \
+  -d '{"goal":"build a mobile fitness tracking app"}' | jq -r '.goal_id')
+
+curl -s -X POST "http://localhost:4000/goals/$GOAL_ID/answers" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "answers": [
+      {"question_id": 1, "answer": "3 months — Quarter project"},
+      {"question_id": 2, "answer": "10-20 hours — Half-time commitment"},
+      {"question_id": 3, "answer": "Cross-platform (React Native, Flutter)"},
+      {"question_id": 4, "answer": "Custom REST/GraphQL API"},
+      {"question_id": 5, "answer": "Full offline-first with background sync"},
+      {"question_id": 6, "answer": "A working prototype I can demo"}
+    ]
+  }' | jq '.roadmap.phases[] | {id, title, deadline, completion_type}'
+```
+
+#### Get goal status
+
+```bash
+curl -s "http://localhost:4000/goals/goal_0001" | jq '{status, completed_phases, total_phases}'
+```
+
+#### Quick one-shot roadmap
+
+```bash
+curl -s -X POST "http://localhost:4000/goals/quick" \
+  -H "Content-Type: application/json" \
+  -d '{"goal":"build a rust web framework"}' | jq '.roadmap.phases[].title'
+```
+
+#### Leaderboard
+
+```bash
+curl -s "http://localhost:4000/goals/leaderboard" | jq '.entries[] | {goal, total_phases}'
+```
+
+#### Extract phase resources (with jq)
+
+```bash
+# Get all resources across all phases
+curl -s -X POST "http://localhost:4000/goals/quick" \
+  -H "Content-Type: application/json" \
+  -d '{"goal":"learn kubernetes"}' | jq '.roadmap.phases[].resources[] | {title, resource_type, url}'
+```
+
+---
+
+### Goals Architecture
+
+```
+Client → Gateway (port 4000)
+              │
+              ├→ POST /goals
+              │     ├── classify_goal() → Intent Engine (port 3005)
+              │     ├── search_resources() → Search API (localhost:4000/search)
+              │     ├── generate_questions() → domain detection → question bank
+              │     └── GoalStore (in-memory HashMap)
+              │
+              ├→ POST /goals/:id/answers
+              │     ├── generate_roadmap() → phase_content (domain-aware)
+              │     ├── curate_resources() → round-robin distribution
+              │     └── GoalStore.update_roadmap()
+              │
+              ├→ POST /goals/quick
+              │     ├── classify_goal() + search_resources()
+              │     ├── default_answers (timeline=3mo, hours=5-10)
+              │     └── generate_roadmap() → immediate result
+              │
+              ├→ GET /goals/:id
+              │     └── GoalStore.get()
+              │
+              └→ GET /goals/leaderboard
+                    └── GoalStore.leaderboard() → sorted by score
+```
+
+**Data Flow:** Goals are stored in-memory (non-persistent across restarts). Resources are fetched in real-time from the search API. The intent engine classifies each goal for phase content customization. Deadlines are computed from the current system time + user's timeline answer.

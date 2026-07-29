@@ -1,6 +1,6 @@
 use axum::{
     extract::Query,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ mod spell;
 mod geoloc;
 mod dictionary;
 mod clean;
+mod goals;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -4822,6 +4823,8 @@ struct AppState {
     /// burst of N concurrent "near me" / local queries pushes RSS to the cgroup
     /// ceiling and the OOM-killer recycles the container (dropped connections).
     search_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Goal Feature: stores user goals, roadmaps, and leaderboard data
+    goals_state: parking_lot::Mutex<goals::GoalStore>,
 }
 
 async fn handle_images(
@@ -5335,6 +5338,7 @@ async fn main() {
         in_flight: Mutex::new(HashMap::new()),
         spell_index: spell::SymSpellIndex::build(),
         geo_locator: geoloc::GeoLocator::load(),
+        goals_state: parking_lot::Mutex::new(goals::GoalStore::new()),
         // Cap concurrent heavy searches. Measured peak per concurrent search is
         // ~350-400 MiB; with a 4 GiB cgroup, 8 keeps peak RSS safely under the
         // limit even under a burst, while still allowing real parallelism.
@@ -5410,7 +5414,15 @@ async fn main() {
         .route("/images", get(handle_images))
         .route("/videos", get(handle_videos))
         .route("/news", get(handle_news))
-        .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(20)));
+        // Goal Feature endpoints
+        .route("/goals", post(goals::handle_create_goal))
+        .route("/goals/quick", post(goals::handle_quick_roadmap))
+        .route("/goals/leaderboard", get(goals::handle_leaderboard))
+        .route("/goals/:goal_id", get(goals::handle_get_goal))
+        .route("/goals/:goal_id/answers", post(goals::handle_submit_answers))
+        .route("/goals/:goal_id/phases/:phase_id/complete", post(goals::handle_complete_phase))
+        .route("/goals/:goal_id/progress", post(goals::handle_update_progress))
+        .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
     tracing::info!("Gateway listening on {} (circuit-breaker + cache)", addr);
