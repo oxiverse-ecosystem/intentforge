@@ -1,0 +1,22 @@
+* text=auto
+
+# Shell scripts must stay LF — Alpine's ash chokes on CRLF
+*.sh text eol=lf
+
+# Docker files are sensitive to line endings too
+Dockerfile* text eol=lf
+*.dockerfile text eol=lf
+
+# Config files parsed in Linux containers
+*.cfg text eol=lf
+*.conf text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Binary files
+*.mmdb binary
+*.tar.gz binary
+*.png binary
+*.jpg binary
+*.ico binary
