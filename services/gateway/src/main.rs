@@ -3668,7 +3668,7 @@ fn filetype_relax_variant(query: &str) -> Option<String> {
 fn keyphrase_relax_variant(query: &str) -> Option<String> {
     let q_lower = query.to_lowercase();
     let words: Vec<&str> = q_lower.split_whitespace().collect();
-    if words.len() <= 3 {
+    if words.len() < 3 {
         return None;
     }
     // Don't strip structured operators or site constraints
@@ -3682,7 +3682,8 @@ fn keyphrase_relax_variant(query: &str) -> Option<String> {
         "under", "using", "construct", "build", "create", "make", "how", "what",
         "why", "where", "when", "which", "who", "is", "are", "was", "were", "be",
         "been", "being", "have", "has", "had", "do", "does", "did", "can", "could",
-        "should", "would", "shall", "will", "may", "might", "must"
+        "should", "would", "shall", "will", "may", "might", "must", "deploy",
+        "master", "learn", "start", "write", "develop", "setup", "install", "run"
     ];
 
     let filtered: Vec<&str> = words.into_iter()
@@ -4229,6 +4230,21 @@ fn merge_local_and_web(
         "documentation","example","examples","reference","server","client","best",
         "top","review","reviews","using","getting","started","introduction","overview",
     ].iter().copied().collect();
+    let meta_action_terms: std::collections::HashSet<&str> = [
+        "deploy", "deployment", "deploying", "master", "mastering", "learn", "learning",
+        "start", "starting", "write", "writing", "build", "building", "create", "creating",
+        "make", "making", "use", "using", "run", "running", "setup", "setting",
+        "install", "installing", "develop", "developing", "beginner", "beginners",
+        "intermediate", "advanced", "production", "business", "complete", "ultimate",
+        "essential", "practical", "basic", "basics", "how", "what", "why", "where",
+        "when", "which", "definition", "meaning", "dictionary", "define", "versus",
+        "cheap", "best", "top", "review", "reviews", "free", "course", "courses",
+        "tutorial", "tutorials", "guide", "guides", "documentation", "docs", "doc",
+        "reference", "overview", "introduction", "getting", "started", "example",
+        "examples", "sample", "samples", "site", "sites", "page", "pages", "online",
+        "architecture", "architectures", "design", "pattern", "patterns"
+    ].iter().copied().collect();
+
     let q_words: Vec<&str> = clean_query.split_whitespace().collect();
     let distinctive_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
@@ -4240,6 +4256,19 @@ fn merge_local_and_web(
         })
         .copied()
         .collect();
+
+    let core_topic_terms: Vec<&str> = q_words.iter()
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            lower.len() >= 3
+                && !stop_words.contains(lower.as_str())
+                && !generic_web_terms.contains(lower.as_str())
+                && !meta_action_terms.contains(lower.as_str())
+                && !lower.chars().all(|c| c.is_ascii_digit())
+        })
+        .copied()
+        .collect();
+
     // Relevance collector (parallel to `merged`) for the post-loop adaptive floor.
     let mut relevance_vec: Vec<f32> = Vec::with_capacity(merged.len());
 
@@ -4267,11 +4296,29 @@ fn merge_local_and_web(
         // query's own relevance distribution on the FINAL score.
         let title_lower = r.title.to_lowercase();
         let content_lower = r.content.to_lowercase();
-        let overlap = if distinctive_terms.is_empty() {
-            1.0 // generic query (all stopwords/generics) -> treat as relevant
+        let url_lower = r.url.to_lowercase();
+
+        let core_matches = if core_topic_terms.is_empty() {
+            true
+        } else {
+            // Require matching all core topic terms (or their stemmed versions).
+            // For multi-term topic queries (e.g. "fantasy novel", "microservices architecture"),
+            // matching only "fantasy" (like ESPN Fantasy Football) or only "architecture" (Quantum Architecture)
+            // is off-topic. All core topic terms must be present.
+            core_topic_terms.iter().all(|t| {
+                let tl = t.to_lowercase();
+                let stemmed = tl.trim_end_matches('s');
+                title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
+                    || title_lower.contains(stemmed) || content_lower.contains(stemmed) || url_lower.contains(stemmed)
+            })
+        };
+
+        let overlap = if distinctive_terms.is_empty() || !core_matches {
+            if !core_matches { 0.0 } else { 1.0 }
         } else {
             let present = distinctive_terms.iter().filter(|t| {
-                title_lower.contains(*t) || content_lower.contains(*t)
+                let tl = t.to_lowercase();
+                title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
             }).count() as f32;
             present / distinctive_terms.len() as f32
         };
@@ -4417,59 +4464,71 @@ fn merge_local_and_web(
             }
         }
 
-        // Dictionary/definition site penalty: detect definition pages algorithmically
-        // via content structure (phonetic notation, part-of-speech labels, brevity)
-        // rather than hardcoded domain lists. This catches any dictionary/glossary site
-        // regardless of domain.
+        // Dictionary/definition site penalty: detect dictionary/glossary sites
+        // via content structure, domain markers, and title patterns.
         let is_definition_site = {
             let title_lower = r.title.to_lowercase();
-            let content_prefix = r.content.chars().take(300).collect::<String>().to_lowercase();
+            let content_lower = r.content.to_lowercase();
+            let url_lower = r.url.to_lowercase();
+            let content_prefix = content_lower.chars().take(300).collect::<String>();
             let title_words: Vec<&str> = title_lower.split_whitespace().collect();
-            // Definition pages have characteristic content structure:
-            // - Phonetic notation: /ˈwɜːd/ or /wɜrd/ patterns (slashes with phonetic chars)
+
+            let is_dict_domain_or_path = url_lower.contains("merriam-webster.com")
+                || url_lower.contains("dictionary.cambridge.org")
+                || url_lower.contains("wiktionary.org")
+                || url_lower.contains("dictionary.com")
+                || url_lower.contains("vocabulary.com")
+                || url_lower.contains("thefreedictionary.com")
+                || url_lower.contains("wordnik.com")
+                || url_lower.contains("/dictionary/")
+                || url_lower.contains("/define/")
+                || url_lower.contains("/meaning/");
+
+            let has_dict_title = title_lower.contains("meaning & definition")
+                || title_lower.contains("definition & meaning")
+                || title_lower.contains("definition of ")
+                || title_lower.contains("meaning of ")
+                || title_lower.ends_with("- wiktionary")
+                || title_lower.contains("cambridge dictionary")
+                || title_lower.contains("merriam-webster")
+                || (title_words.len() <= 3 && (title_lower.contains("definition") || title_lower.contains("dictionary")));
+
             let has_phonetic = content_prefix.contains("/ˈ") || content_prefix.contains("/ˌ")
                 || content_prefix.contains("/'") || content_prefix.contains("/-");
-            // - Part-of-speech labels at content start
             let has_pos_label = content_prefix.starts_with("noun")
                 || content_prefix.starts_with("verb")
                 || content_prefix.starts_with("adjective")
                 || content_prefix.starts_with("adverb")
-                || content_prefix.starts_with("preposition")
-                || content_prefix.starts_with("conjunction")
-                || content_prefix.starts_with("interjection")
-                || content_prefix.starts_with("pronoun")
-                || content_prefix.starts_with("determiner")
-                || content_prefix.starts_with("abbreviation");
-            // - Very short content snippet (< 200 chars) with single-word title matching URL path
+                || content_prefix.contains("1. : to ")
+                || content_prefix.contains("2. : to ")
+                || content_prefix.contains("definition of ")
+                || content_prefix.contains("meaning of ");
+
             let content_is_short = r.content.len() < 200;
             let short_title = title_words.len() <= 3;
-            let has_single_segment_path = reqwest::Url::parse(&r.url)
-                .ok()
-                .map(|u| {
-                    let segs: Vec<&str> = u.path().split('/').filter(|s| !s.is_empty()).collect();
-                    segs.len() <= 2 && u.path().chars().filter(|&c| c == '-').count() <= 1
-                })
-                .unwrap_or(false);
-            (has_phonetic || has_pos_label) && short_title
+
+            is_dict_domain_or_path
+                || has_dict_title
+                || (has_phonetic || has_pos_label) && short_title
                 || has_pos_label && content_is_short
-                || has_phonetic && has_single_segment_path
         };
-        // Only penalize when the query is NOT about definitions (no "define", "meaning", "definition" in query)
+        // Only treat as definition query if user explicitly asked for linguistic word definition
         let q_lower_check = query.to_lowercase();
-        let is_definition_query = q_lower_check.contains("define")
-            || q_lower_check.contains("definition")
-            || q_lower_check.contains("meaning of")
-            || q_lower_check.contains("what does")
-            || q_lower_check.contains("what is");
+        let is_definition_query = q_lower_check.starts_with("define ")
+            || q_lower_check.starts_with("definition of ")
+            || q_lower_check.contains("definition of ")
+            || q_lower_check.contains(" meaning of ")
+            || q_lower_check.contains("word meaning")
+            || (q_lower_check.starts_with("what does ") && q_lower_check.contains(" mean"))
+            || (q_lower_check.starts_with("what is the definition"));
+
         if is_definition_site && !is_definition_query {
-            // Definition pages are off-topic for non-definition queries. Because the
-            // page often contains the query term (lexical overlap high), a gentle
-            // multiplier wouldn't sink it — CAP relevance so the adaptive floor
-            // (hard below-floor multiplier) crushes it on the final score.
-            relevance = relevance.min(0.18);
-            freshness *= 0.20;
+            // Dictionary definition pages are off-topic for non-definition queries.
+            // Crush relevance to 0.001 and quality to 0.01 so they sink completely.
+            relevance = 0.001;
+            quality *= 0.01;
             tracing::info!(
-                "DICTIONARY SITE PENALTY: '{}' -> relevance capped 0.18",
+                "DICTIONARY SITE PENALTY: '{}' -> relevance crushed 0.001",
                 r.url.chars().take(60).collect::<String>()
             );
         }
@@ -7461,14 +7520,13 @@ async fn handle_search(
             for (pos, r) in invidious_data.into_iter().enumerate() {
                 if r.result_type.as_deref() == Some("video") {
                     if let Some(vid) = r.video_id {
-                        let desc = r.description.unwrap_or_default();
-                        // Skip Invidious results with empty description — they provide
-                        // no content for semantic scoring and degrade result quality.
-                        // Video metadata alone (title + thumbnail) isn't useful in search.
-                        if desc.trim().is_empty() {
-                            tracing::debug!("Skipping Invidious result with empty content: {:?}", r.title);
-                            continue;
-                        }
+                        let title_str = r.title.clone().unwrap_or_else(|| "Video Tutorial".to_string());
+                        let desc_raw = r.description.unwrap_or_default();
+                        let desc = if desc_raw.trim().is_empty() {
+                            format!("YouTube video tutorial on {}. Watch video online.", title_str)
+                        } else {
+                            desc_raw
+                        };
                         let video_url = format!("https://www.youtube.com/watch?v={}", vid);
                         let normalized = {
                             let lower = video_url.to_lowercase();
@@ -7480,12 +7538,12 @@ async fn handle_search(
                         let rrf_contrib = invidious_weight / (60.0 + (pos + 1) as f32);
                         *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
                         web_results.push(SearxResult {
-                            title: r.title.unwrap_or_else(|| "No Title".to_string()),
+                            title: title_str,
                             url: video_url,
                             content: desc,
                             engine: "invidious".to_string(),
                             score: 0.0,
-                            sources: vec!["invidious".to_string()],
+                            sources: vec!["invidious".to_string(), "video".to_string()],
                             published_date: None,
                         });
                     }
