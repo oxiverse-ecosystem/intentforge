@@ -3661,6 +3661,42 @@ fn filetype_relax_variant(query: &str) -> Option<String> {
     Some(relaxed)
 }
 
+/// Extract core keyphrases by removing natural-language filler/stop words
+/// from verbose queries (e.g. "construct a warp drive using exotic matter" → "warp drive exotic matter").
+/// Fires in parallel during the initial fan-out to ensure upstream engines return
+/// relevant hits even when verbose natural-language framing yields 0 exact matches.
+fn keyphrase_relax_variant(query: &str) -> Option<String> {
+    let q_lower = query.to_lowercase();
+    let words: Vec<&str> = q_lower.split_whitespace().collect();
+    if words.len() <= 3 {
+        return None;
+    }
+    // Don't strip structured operators or site constraints
+    if q_lower.contains("site:") || q_lower.contains("filetype:") || q_lower.contains("intitle:") || q_lower.contains("inurl:") {
+        return None;
+    }
+
+    const STOP_WORDS: &[&str] = &[
+        "a", "an", "the", "of", "to", "in", "on", "for", "with", "by", "from", "at",
+        "about", "into", "through", "during", "before", "after", "above", "below",
+        "under", "using", "construct", "build", "create", "make", "how", "what",
+        "why", "where", "when", "which", "who", "is", "are", "was", "were", "be",
+        "been", "being", "have", "has", "had", "do", "does", "did", "can", "could",
+        "should", "would", "shall", "will", "may", "might", "must"
+    ];
+
+    let filtered: Vec<&str> = words.into_iter()
+        .filter(|w| !STOP_WORDS.contains(w) && w.len() > 1)
+        .collect();
+
+    let orig_count = query.split_whitespace().count();
+    if filtered.len() < 2 || filtered.len() == orig_count {
+        return None;
+    }
+
+    Some(filtered.join(" "))
+}
+
 
 // ─── JSON Key Deduplication ────────────────────────────────────────
 // Removes duplicate keys from JSON objects. Keeps the LAST value for each key.
@@ -6162,6 +6198,15 @@ async fn handle_search(
                 searx_instance_keys.push(key.clone());
             }
         }
+        // Verbose query keyphrase relaxation (strips filler words like "construct a ... using ...")
+        // Fires in parallel during initial fan-out to ensure upstream engines return hits for verbose natural language queries.
+        if let Some(ref keyphrase) = keyphrase_relax_variant(&engine_q) {
+            let clean_kp = preprocess_searxng_query(keyphrase);
+            if !clean_kp.is_empty() && clean_kp != clean_q {
+                searx_urls.push(searxng_url(base_url, &clean_kp, geo_location.as_ref(), lang));
+                searx_instance_keys.push(key.clone());
+            }
+        }
     }
 
     let invidious_url = format!("http://invidious:3000/api/v1/search?q={}", q_encoded);
@@ -6256,7 +6301,8 @@ async fn handle_search(
             // IP rotation) can take ~10-12s. Give it a 13s branch budget so it
             // isn't cut before it responds; the gluetun instance (index 0)
             // keeps the original 4.2s budget.
-            let branch_timeout_ms: u64 = if i == 1 { 15000 } else { 4200 };
+            let is_tor_url = url.contains("tor2") || url.contains("8081");
+            let branch_timeout_ms: u64 = if is_tor_url { 15000 } else { 4200 };
             let task = tokio::spawn(async move {
                 let resp = match tokio::time::timeout(
                     std::time::Duration::from_millis(branch_timeout_ms),
@@ -6467,7 +6513,9 @@ async fn handle_search(
     };
 
     let has_site = !constraints.sites.is_empty();
-    let searx_fut_with_timeout = async {
+    let searx_partial_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let partial_collector_inner = searx_partial_collector.clone();
+    let searx_fut_with_timeout = async move {
         use futures::future::FutureExt;
 
         // If tor2 (SearXNG2 / Tor) is currently COLD (flag false), wait a
@@ -6523,6 +6571,7 @@ async fn handle_search(
             // Use a thread-safe shared mutex to preserve results if the timeout triggers
             let results_shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let results_inner = results_shared.clone();
+            let partial_collector_sub = partial_collector_inner.clone();
             // Cloned per attempt: the select_all loop below moves it into an `async move`
             // that runs once per attempt, so it must be fresh each iteration.
             let urls_cloned = searx_urls.clone();
@@ -6549,7 +6598,10 @@ async fn handle_search(
                     match result {
                         Ok(data) => {
                             let count = data.results.len();
-                            results_inner.lock().unwrap().push((orig_idx, Ok(data)));
+                            results_inner.lock().unwrap().push((orig_idx, Ok(data.clone())));
+                            if count > 0 {
+                                partial_collector_sub.lock().unwrap().push((orig_idx, Ok(data)));
+                            }
                             let is_primary = urls_cloned[orig_idx].starts_with("http://127.0.0.1:8080");
                             // FIX: do NOT early-return on the primary instance returning a
                             // small/medium set. SearXNG1 (127.0.0.1:8080) sits behind a flaky
@@ -6645,11 +6697,23 @@ async fn handle_search(
         // describes the proper fix: return completed results immediately and merge
         // slow instances' results in the background.
         async {
-            tokio::time::timeout(Duration::from_secs(5), searx_fut_with_timeout).await
-                .unwrap_or_else(|_| {
-                    tracing::warn!("SearXNG fan-out exceeded 5s deadline; returning partial results from other backends");
-                    Vec::new()
-                })
+            let partial_collector_ref = searx_partial_collector.clone();
+            match tokio::time::timeout(Duration::from_secs(5), searx_fut_with_timeout).await {
+                Ok(res) => {
+                    if res.is_empty() {
+                        let mut guard = partial_collector_ref.lock().unwrap();
+                        if !guard.is_empty() {
+                            return std::mem::take(&mut *guard);
+                        }
+                    }
+                    res
+                }
+                Err(_) => {
+                    tracing::warn!("SearXNG fan-out exceeded 5s deadline; preserving partial results from completed instances");
+                    let mut guard = partial_collector_ref.lock().unwrap();
+                    std::mem::take(&mut *guard)
+                }
+            }
         },
         invidious_fut,
         news_fut,
@@ -7297,7 +7361,7 @@ async fn handle_search(
 
         if !retry_futs.is_empty() {
             let elapsed = search_start.elapsed();
-            let limit = Duration::from_millis(3000); // 3s overall target limit
+            let limit = Duration::from_millis(4500); // 4.5s overall target limit (handler budget is 5.5s)
             if elapsed >= limit {
                 tracing::warn!("Retry skipped: elapsed time ({:?}) already exceeds target deadline ({:?})", elapsed, limit);
             } else {
