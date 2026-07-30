@@ -23,6 +23,8 @@ use_default_settings:
       - brave           # clearnet through Tor exit
       - duckduckgo      # clearnet through Tor exit (primary DDG)
       - duckduckgo-onion # onion front-end: layered bypass if DDG suspends Tor exit IP
+      - arxiv           # academic engine for arXiv site/paper queries
+      - crossref        # academic cross-ref engine
       # ── News (fast through Tor) ──
       - bing news
       - google news
@@ -138,6 +140,17 @@ engines:
 
   - name: marginalia
     disabled: false
+    timeout: 4.0
+
+  # ── Academic engines via Tor ──
+  - name: arxiv
+    disabled: false
+    categories: [general, science]
+    timeout: 4.0
+
+  - name: crossref
+    disabled: false
+    categories: [general, science]
     timeout: 4.0
 
   # ── Image engines via Tor (multiple for redundancy) ──

@@ -111,6 +111,17 @@ engines:
     disabled: false
     timeout: 4.0
 
+  # ── Academic engines (via VPN) ──
+  - name: arxiv
+    disabled: false
+    categories: [general, science]
+    timeout: 4.0
+
+  - name: crossref
+    disabled: false
+    categories: [general, science]
+    timeout: 4.0
+
   # ── Onion engines (via Tor SOCKS5) ──
   - name: ahmia
     disabled: true    # DISABLED: searx.network.tor integration broken (Python httpx SOCKS5 issue)
