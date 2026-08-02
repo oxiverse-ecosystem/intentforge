@@ -310,6 +310,19 @@ struct MergedResult {
     published_date: Option<String>,
 }
 
+#[derive(Serialize, Clone, Debug)]
+struct DeepResult {
+    result_type: String,
+    vendor_name: String,
+    page_title: String,
+    page_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direct_download_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_name: Option<String>,
+    confidence: f32,
+}
+
 #[derive(Serialize)]
 struct UnifiedResponse {
     query: String,
@@ -320,6 +333,8 @@ struct UnifiedResponse {
     structured_constraints: Constraints,
     expanded_queries: Vec<String>,
     distribution: Option<std::collections::HashMap<String, f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deep_result: Option<DeepResult>,
     results: Vec<MergedResult>,
     /// IP geolocation of the requesting client (if GeoLite2 database available)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -365,6 +380,11 @@ struct UnifiedResponse {
     #[serde(skip_serializing_if = "Option::is_none", rename = "has_more")]
     has_more: Option<bool>,
 }
+
+const DOWNLOAD_KEYWORDS: &[&str] = &[
+    "driver", "drivers", "download", "downloads", "installer", "installers",
+    "firmware", "patch", "software download", "official download", "setup.exe"
+];
 
 // ─── Domain Authority (Fully Algorithmic) ────────────────────────────
 // Scores based purely on URL structure signals — no hardcoded domain lists.
@@ -4533,6 +4553,33 @@ fn merge_local_and_web(
             );
         }
 
+        // Academic Paper Deprioritization for Navigational, Download, and Commercial Queries:
+        // Academic repositories (arxiv, crossref, pubmed) often contain math/theory papers that match
+        // query words like "driver" (e.g. wireless LAN driver math, cancer survivorship drivers).
+        // For navigational, software download, or commercial queries, academic papers are 100% noise.
+        let is_academic = url_lower.contains("arxiv.org") || url_lower.contains("crossref.org")
+            || url_lower.contains("ncbi.nlm.nih.gov")
+            || r.sources.iter().any(|s| s == "arxiv" || s == "crossref" || s == "pubmed");
+
+        let has_download = DOWNLOAD_KEYWORDS.iter().any(|k| q_lower_check.contains(k));
+        let is_nav_or_download = intent == "navigational"
+            || intent == "transactional"
+            || has_download
+            || distribution.and_then(|d| d.get("download")).copied().unwrap_or(0.0) > 0.40;
+
+        let q_wants_academic = q_lower_check.contains("paper") || q_lower_check.contains("arxiv")
+            || q_lower_check.contains("study") || q_lower_check.contains("journal")
+            || q_lower_check.contains("research");
+
+        if is_academic && is_nav_or_download && !q_wants_academic {
+            relevance = 0.001;
+            quality *= 0.01;
+            tracing::info!(
+                "ACADEMIC PAPER PENALTY: '{}' -> crushed 0.001 for navigational/download query",
+                r.url.chars().take(60).collect::<String>()
+            );
+        }
+
         // Wikidata penalty: Wikidata is a machine database, not a human-readable search result.
         let url_lower = r.url.to_lowercase();
         let is_wikidata = url_lower.contains("wikidata.org");
@@ -5805,6 +5852,7 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         structured_constraints: Constraints::default(),
         expanded_queries: vec![],
         distribution: None,
+        deep_result: None,
         results: vec![],
         geo_location: None,
         spell_corrected_query: None,
@@ -6995,6 +7043,25 @@ async fn handle_search(
             let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
             let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
             intent.distribution.insert("transactional".to_string(), (tx_prob + current_top_prob * 0.5).min(0.85));
+        }
+
+        // Override 8: Driver / Software Download Intent -> force decisive Navigational + Download intent
+        // Handles queries like "find the driver download", "nvidia rtx 4090 driver download", "download vlc"
+        let download_keywords = [
+            "driver", "drivers", "download", "downloads", "installer", "installers",
+            "firmware", "patch", "software download", "official download", "setup.exe"
+        ];
+        let has_download_signal = download_keywords.iter().any(|k| q_lower.contains(k));
+        if has_download_signal {
+            tracing::info!(
+                "INTENT OVERRIDE (DECISIVE): driver/download query '{}' was '{}' (conf={:.3}) -> navigational",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "navigational".to_string();
+            intent.confidence = intent.confidence.max(0.88);
+            let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
+            intent.distribution.insert("navigational".to_string(), (nav_prob + 0.60).min(0.95));
+            intent.distribution.insert("download".to_string(), 0.90);
         }
 
         // Override 5: "vs" or "versus" signals in query with low comparison confidence
@@ -8532,7 +8599,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
     let limit = params.limit.or(params.count).or(params.n).unwrap_or(24);
     let offset = params.offset.unwrap_or(0);
     let post_filter_count = results.len();
-    let paginated_results = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+    let mut paginated_results = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
 
     // ─── Constraint transparency (applied / ignored / warnings) ───
     let sc = &intent.structured_constraints;
@@ -8626,10 +8693,127 @@ let mut results = match tokio::task::spawn_blocking(move || {
             );
         }
     }
-    if pre_filter_count == 0 {
-        warnings.push(
-            "No web results were returned by the upstream search engines for this query.".to_string(),
-        );
+    // ─── Deep Result Mode / Direct Answer Extractor ─────────────────────
+    // For navigational, software download, or driver queries, identify the top candidate
+    // official page, crawl the page HTML for direct installer/executable download links (.exe, .msi, .zip, .dmg),
+    // and surface a structured `deep_result` object.
+    let mut deep_result: Option<DeepResult> = None;
+    let is_download_or_nav = intent.intent == "navigational"
+        || intent.intent == "transactional"
+        || DOWNLOAD_KEYWORDS.iter().any(|k| q.to_lowercase().contains(k))
+        || intent.distribution.get("download").copied().unwrap_or(0.0) > 0.40;
+
+    if is_download_or_nav && !paginated_results.is_empty() {
+        let vendor_domains = [
+            "nvidia.com", "amd.com", "intel.com", "realtek.com", "microsoft.com",
+            "dell.com", "hp.com", "lenovo.com", "asus.com", "msi.com", "gigabyte.com",
+            "logitech.com", "corsair.com", "razer.com", "apple.com", "oracle.com",
+            "python.org", "videolan.org", "github.com", "canonical.com", "ubuntu.com"
+        ];
+
+        let q_lower_deep = q.to_lowercase();
+        let matched_brand_domain = vendor_domains.iter().find(|d| {
+            let brand = d.split('.').next().unwrap_or(d);
+            q_lower_deep.contains(brand) || (brand == "videolan" && q_lower_deep.contains("vlc"))
+        });
+
+        let best_vendor_idx = if let Some(target_d) = matched_brand_domain {
+            paginated_results.iter().position(|r| r.url.contains(target_d))
+        } else {
+            paginated_results.iter().position(|r| {
+                vendor_domains.iter().any(|d| r.url.contains(d))
+            })
+        };
+
+        let cand_idx = best_vendor_idx.unwrap_or(0);
+        let cand_url = paginated_results[cand_idx].url.clone();
+        let cand_title = paginated_results[cand_idx].title.clone();
+        let cand_domain = reqwest::Url::parse(&cand_url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_else(|| "Official Vendor".to_string());
+
+        if !paginated_results[cand_idx].sources.contains(&"official_vendor".to_string()) {
+            paginated_results[cand_idx].sources.push("official_vendor".to_string());
+        }
+
+        let http_client_deep = state.http_client.clone();
+        let deep_target_url = cand_url.clone();
+        let deep_target_title = cand_title.clone();
+        let deep_target_domain = cand_domain.clone();
+        let url_for_fetch = deep_target_url.clone();
+
+        let fetch_deep = tokio::spawn(async move {
+            let resp = match tokio::time::timeout(
+                Duration::from_millis(1500),
+                http_client_deep.get(&url_for_fetch)
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                    .send(),
+            ).await {
+                Ok(Ok(r)) => r,
+                _ => return None,
+            };
+
+            let html = match tokio::time::timeout(Duration::from_millis(1000), resp.text()).await {
+                Ok(Ok(h)) => h,
+                _ => return None,
+            };
+
+            let download_exts = [".exe", ".msi", ".zip", ".dmg", ".pkg", ".iso", ".tar.gz", ".deb", ".rpm"];
+            let mut direct_link: Option<String> = None;
+
+            for chunk in html.split("href=") {
+                let chunk_clean = chunk.trim_start_matches(|c| c == '"' || c == '\'');
+                let end_idx = chunk_clean.find(['"', '\'', ' ', '>']).unwrap_or(chunk_clean.len().min(300));
+                let raw_url = &chunk_clean[..end_idx];
+
+                let lower_raw = raw_url.to_lowercase();
+                if download_exts.iter().any(|ext| lower_raw.contains(ext))
+                    || lower_raw.contains("download.nvidia.com")
+                    || lower_raw.contains("download.intel.com")
+                    || lower_raw.contains("download.amd.com")
+                    || lower_raw.contains("driver_download") {
+
+                    let full_url = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+                        raw_url.to_string()
+                    } else if raw_url.starts_with('/') {
+                        if let Ok(b) = reqwest::Url::parse(&url_for_fetch) {
+                            format!("{}://{}{}", b.scheme(), b.host_str().unwrap_or(""), raw_url)
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    };
+                    direct_link = Some(full_url);
+                    break;
+                }
+            }
+
+            direct_link
+        });
+
+        let direct_download_url = match tokio::time::timeout(Duration::from_millis(1800), fetch_deep).await {
+            Ok(Ok(Some(link))) => Some(link),
+            _ => None,
+        };
+
+        let file_name = direct_download_url.as_ref().and_then(|u| {
+            reqwest::Url::parse(u).ok().and_then(|parsed| {
+                parsed.path_segments().and_then(|segs| segs.last().map(|s| s.to_string()))
+            })
+        });
+
+        let has_direct = direct_download_url.is_some();
+        deep_result = Some(DeepResult {
+            result_type: if has_direct { "direct_download".to_string() } else { "official_page".to_string() },
+            vendor_name: deep_target_domain,
+            page_title: deep_target_title,
+            page_url: deep_target_url,
+            direct_download_url,
+            file_name,
+            confidence: if has_direct { 0.98 } else { 0.88 },
+        });
     }
 
     let response = UnifiedResponse {
@@ -8641,6 +8825,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         structured_constraints: intent.structured_constraints.clone(),
         expanded_queries: intent.expanded_queries.clone(),
         distribution: Some(intent.distribution.clone()),
+        deep_result,
         results: paginated_results,
         geo_location,
         spell_corrected_query: if spell_changed { Some(q.clone()) } else { None },
