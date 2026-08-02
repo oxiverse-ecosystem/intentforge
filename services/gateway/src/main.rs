@@ -163,7 +163,14 @@ struct IndexerResult {
     authority: f32,
     #[serde(default)]
     content: String,
+    /// Signal-quality metric [0,1] from the indexer: how strongly this local page
+    /// genuinely matches the query. The gateway's local-index quality gate (P2)
+    /// uses it to demote low-signal crawled pages without a hardcoded blocklist.
+    #[serde(default = "default_indexer_quality")]
+    quality: f32,
 }
+
+fn default_indexer_quality() -> f32 { 1.0 }
 
 // ─── Image Result (from SearXNG categories=images) ────────────────
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -308,7 +315,14 @@ struct MergedResult {
     is_local: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     published_date: Option<String>,
+    /// Signal-quality metric [0,1] inherited from the indexer for local results
+    /// (BM25/semantic match strength). Used by the local-index quality gate (P2)
+    /// to demote low-signal crawled pages. Defaults to 1.0 for web results.
+    #[serde(default = "default_f32_one")]
+    quality: f32,
 }
+
+fn default_f32_one() -> f32 { 1.0 }
 
 #[derive(Serialize, Clone, Debug)]
 struct DeepResult {
@@ -3110,6 +3124,22 @@ fn strip_tracking_params(url: &str) -> String {
     }
 }
 
+/// URL canonicalization used when fusing local-index result sets (BM25 vs
+/// semantic re-query) by URL. Mirrors the dedup logic inside
+/// `merge_local_and_web` so the two passes agree on what counts as "the same
+/// URL" (lowercase, strip fragment, trailing slash, www./m. prefixes, tracking
+/// params). Centralized here so the two code paths can't drift apart.
+fn normalize_indexer_url(url: &str) -> String {
+    let lower = url.to_lowercase();
+    let no_fragment = lower.split('#').next().unwrap_or(&lower);
+    let no_trailing = no_fragment.trim_end_matches('/');
+    let no_www = no_trailing.replacen("://www.", "://", 1);
+    let no_mobile = no_www
+        .replacen("://m.", "://", 1)
+        .replacen("://mobile.", "://", 1);
+    strip_tracking_params(&no_mobile)
+}
+
 // Scores are already on an absolute calibrated scale from the weighted
 // multi-signal fusion — raw scores directly reflect quality:
 //   Mediocre results:  ~0.15-0.25
@@ -4147,6 +4177,7 @@ fn merge_local_and_web(
             sources: vec!["local".to_string()],
             is_local: true,
             published_date: None,
+            quality: r.quality,
         };
         url_to_idx.insert(norm, merged.len());
         merged.push(entry);
@@ -4192,6 +4223,7 @@ fn merge_local_and_web(
                 sources: vec![source],
                 is_local: false,
                 published_date: r.published_date.clone(),
+                quality: 1.0,
             };
             url_to_idx.insert(norm, merged.len());
             merged.push(entry);
@@ -4289,7 +4321,42 @@ fn merge_local_and_web(
         .copied()
         .collect();
 
-    // Relevance collector (parallel to `merged`) for the post-loop adaptive floor.
+    // Multi-word phrase entities (P1): adjacent non-stopword runs of length >= 2 in the
+    // raw query. These are the terms most prone to FALSE-POSITIVE token overlap — e.g.
+    // "sky blue", "best laptop", "world wide web". A result that contains the individual
+    // words scattered across different sentences ("bright sky", "blue ocean") is NOT a
+    // real match. We require the contiguous phrase to appear (title preferred) so
+    // "Sky Blue Credit" (a brand whose two tokens happen to be "sky"+"blue") no longer
+    // rides a token-overlap bonus it didn't earn. Computed once per query, not per result.
+    let phrase_entities: Vec<String> = {
+        let mut phrases = Vec::new();
+        let mut run: Vec<String> = Vec::new();
+        for w in q_words.iter() {
+            let lower = w.to_lowercase();
+            let is_content = lower.len() >= 2
+                && !stop_words.contains(lower.as_str())
+                && !lower.chars().all(|c| c.is_ascii_digit());
+            if is_content {
+                run.push(lower);
+            } else if run.len() >= 2 {
+                phrases.push(run.join(" "));
+                run.clear();
+            } else {
+                run.clear();
+            }
+        }
+        if run.len() >= 2 {
+            phrases.push(run.join(" "));
+        }
+        phrases
+    };
+
+    // Superlative terms whose presence alone is a weak/off-topic signal when the page
+    // is about the superlative ("best", "top") rather than the actual topic. Used to
+    // penalize pages that rank purely because they contain the generic word "best".
+    let superlative_terms: &[&str] = &["best", "top", "greatest", "cheapest", "finest"];
+    let query_has_superlative = q_words.iter().any(|w| superlative_terms.contains(&w.to_lowercase().as_str()));
+
     let mut relevance_vec: Vec<f32> = Vec::with_capacity(merged.len());
 
     for r in merged.iter_mut() {
@@ -4354,7 +4421,114 @@ fn merge_local_and_web(
             0.0
         };
         let mut relevance = 0.4f32 * overlap + 0.6f32 * bert_cos;
-        // Listicle/clickbait title detector: "Why does X mean…", "What is the
+
+        // ── Phrase-entity fidelity (P1) ──
+        // For multi-word phrase entities in the query (e.g. "sky blue", "world wide web",
+        // "best laptop"), require the CONTIGUOUS phrase to actually appear. Token-overlap
+        // scoring alone lets "Sky Blue Credit" (a brand) or "Best Western Hotels" win on
+        // scattered single-word hits. When a phrase entity exists, a result that lacks the
+        // contiguous phrase is not a genuine match for that entity — cap its relevance so
+        // it sinks below results that do contain the phrase. Title phrase = strong; content
+        // phrase = partial; neither = damped. This is generic (no brand hardcodes).
+        if !phrase_entities.is_empty() {
+            let phrase_hits: usize = phrase_entities.iter().filter(|p| {
+                title_lower.contains(p.as_str()) || content_lower.contains(p.as_str()) || url_lower.contains(p.as_str())
+            }).count();
+            let phrase_ratio = phrase_hits as f32 / phrase_entities.len() as f32;
+            // Blend the phrase ratio into relevance: a result missing every phrase entity
+            // drops to at most ~0.45 of its token-overlap relevance; full phrase coverage
+            // keeps it intact. This lets "Why Is the Sky Blue?" (title has the phrase) rank
+            // above "Sky Blue Credit" (no contiguous phrase), purely from structure.
+            relevance *= 0.45 + 0.55 * phrase_ratio;
+        }
+
+        // ── Superlative penalty (P1) ──
+        // Queries with a superlative ("best laptop ...", "top framework") attract pages
+        // that match ONLY on the generic word "best"/"top" while missing the actual topic.
+        // If the query has a superlative and this result's TITLE contains the superlative
+        // but NONE of the core topic terms, the "best" token is doing all the work — dampen
+        // so topic-relevant pages (which may not say "best") rank above generic listicles.
+        if query_has_superlative && !core_topic_terms.is_empty() {
+            let title_has_superlative = superlative_terms.iter().any(|s| title_lower.contains(*s));
+            let title_has_topic = core_topic_terms.iter().any(|t| {
+                let tl = t.to_lowercase();
+                title_lower.contains(&tl) || title_lower.contains(tl.trim_end_matches('s'))
+            });
+            if title_has_superlative && !title_has_topic {
+                relevance *= 0.55;
+            }
+        }
+
+        // ── Local-index low-signal gate (P2) ──
+        // The local crawl index can contain pages that matched the query only on a
+        // generic/boilerplate term (or a single scattered token) and are otherwise
+        // off-topic for the query — e.g. a JetBrains "Django vs Flask" blog surfacing
+        // for "history of the world wide web". The indexer already emits a per-result
+        // `quality` metric (BM25/semantic match strength). We use it — plus a check
+        // that the result actually mentions the query's distinctive topic terms — to
+        // demote low-signal local pages BEFORE they can crowd out authoritative web hits.
+        // Generic (no hardcoded domains): a local page that is both low-quality AND
+        // missing every distinctive term is almost certainly crawl noise.
+        if r.is_local {
+            let topic_mentioned = distinctive_terms.is_empty()
+                || distinctive_terms.iter().any(|t| {
+                    let tl = t.to_lowercase();
+                    title_lower.contains(&tl) || content_lower.contains(&tl)
+                        || title_lower.contains(tl.trim_end_matches('s')) || content_lower.contains(tl.trim_end_matches('s'))
+                });
+            if r.quality < 0.5 && !topic_mentioned {
+                relevance *= 0.05;
+                tracing::info!(
+                    "LOCAL NOISE GATE: '{}' quality={:.2} topic_mentioned={} -> relevance crushed",
+                    r.url.chars().take(60).collect::<String>(), r.quality, topic_mentioned
+                );
+            } else if r.quality < 0.7 && !topic_mentioned {
+                relevance *= 0.5;
+            }
+        }
+
+        // ── Price-aware ranking (P3) ──
+        // The price constraint (price:<1000, price_max:1000.0) is extracted correctly
+        // but was a NO-OP: web/local results carry no structured price metadata, so the
+        // hard filter (which only fires when a price is parsed from page text) never
+        // triggered and ranking stayed pure relevance. We make the bound MEANINGFUL at
+        // ranking time without inventing structured price data:
+        //   • if the result states a price, hold it to the bound (out-of-budget -> crush;
+        //     in-budget -> small boost "this is the product");
+        //   • if NO price is stated AND the query is a transactional-product query (price
+        //     bound present) AND the result shows no price/product lexical signal, demote
+        //     it — almost certainly not the priced product asked for. Generic; no hardcoded
+        //     merchants or domains.
+        let price_bound = constraints.price_max.or(constraints.price_lt)
+            .or_else(|| constraints.price_min.or(constraints.price_gt));
+        if let Some(_bound) = price_bound {
+            let res_price = extract_price_from_text(&r.title)
+                .or_else(|| extract_price_from_text(&r.content));
+            let price_signal = title_lower.contains('$') || content_lower.contains('$')
+                || title_lower.contains("price") || content_lower.contains("price")
+                || title_lower.contains("cost") || content_lower.contains("cost")
+                || title_lower.contains("rs") || title_lower.contains("rupee")
+                || title_lower.contains("pound") || title_lower.contains("euro")
+                || title_lower.contains("buy") || title_lower.contains("shop")
+                || title_lower.contains("cheap") || title_lower.contains("affordable")
+                || title_lower.contains("sale") || title_lower.contains("deal")
+                || title_lower.contains("specs") || title_lower.contains("spec");
+            if let Some(p) = res_price {
+                let over = (constraints.price_max.is_some() && p > constraints.price_max.unwrap())
+                    || (constraints.price_lt.is_some() && p > constraints.price_lt.unwrap())
+                    || (constraints.price_min.is_some() && p < constraints.price_min.unwrap())
+                    || (constraints.price_gt.is_some() && p < constraints.price_gt.unwrap());
+                if over {
+                    relevance *= 0.12;
+                } else {
+                    relevance *= 1.10;
+                }
+            } else if !price_signal {
+                relevance *= 0.45;
+            }
+        }
+
+
         // meaning of X", "X explained (listicle)" — these are off-topic for a
         // substantive query and the POS/phonetic dictionary guard misses them.
         // Fold into relevance so the adaptive floor demotes them on the final score.
@@ -4668,7 +4842,17 @@ fn merge_local_and_web(
             generic_penalty *= 0.10;
         }
 
-        r.score = base * c_score * generic_penalty * relevance_factor;
+        // Fold the single relevance signal directly into the FINAL score (P1/P2 fix).
+        // Previously `relevance` (which carries the phrase-entity fidelity, superlative,
+        // and local-noise penalties) only fed the distribution-relative adaptive floor.
+        // When every top result is similarly spammy, a relative floor cannot crush any of
+        // them, so "Sky Blue Credit" kept outranking the real "Why Is the Sky Blue?".
+        // Multiplying the final score by relevance makes those penalties bite: a result
+        // whose relevance was halved by the phrase gate (×0.45) also has its score halved,
+        // creating real separation. Clamped to [0.05,1.0] so relevance can demote hard
+        // but never zero out a result (preserving the calibrate_scores floor logic).
+        let relevance_mult = relevance.clamp(0.05, 1.0);
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult;
         // Capture this result's relevance for the post-loop adaptive-floor pass.
         relevance_vec.push(relevance);
     }
@@ -7330,12 +7514,38 @@ async fn handle_search(
         // Join the detached task with a hard budget. If it hangs, we keep BM25 results.
         match tokio::time::timeout(Duration::from_millis(1600), vec_task).await {
             Ok(Ok(Some(vec_results))) => {
+                // FUSE (P0 fix): the semantic re-query must ADD to, never REPLACE, the
+                // BM25 local results. Previously we overwrote `local_results` with the
+                // indexer's semantic-RRF set, which — when only a few docs carry the
+                // embedding — collapses the 10 good local hits down to those 3 embedded
+                // docs (e.g. arxiv papers for "what is quantum computing"). Union the two
+                // sets by URL, keeping the higher-scoring copy, so semantic *enhances*
+                // recall instead of destroying it.
+                let mut by_url: HashMap<String, IndexerResult> = HashMap::new();
+                for r in local_results.drain(..) {
+                    by_url.insert(normalize_indexer_url(&r.url), r);
+                }
+                let mut added = 0usize;
+                for r in vec_results {
+                    let key = normalize_indexer_url(&r.url);
+                    match by_url.get_mut(&key) {
+                        Some(existing) => {
+                            // Same URL in both sets: keep the stronger score.
+                            if r.score > existing.score {
+                                existing.score = r.score;
+                            }
+                        }
+                        None => {
+                            by_url.insert(key, r);
+                            added += 1;
+                        }
+                    }
+                }
+                local_results = by_url.into_values().collect();
                 tracing::info!(
-                    "Vector-enhanced indexer returned {} results (vs {} BM25-only)",
-                    vec_results.len(),
-                    local_results.len()
+                    "Vector re-query fused: {} BM25 + {} new semantic = {} local results",
+                    local_results.len() - added, added, local_results.len()
                 );
-                local_results = vec_results;
             }
             Ok(Ok(None)) => { /* no vector hits; keep BM25 */ }
             Ok(Err(e)) => tracing::warn!("Vector indexer task panicked: {:?}", e),
@@ -8831,7 +9041,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         deep_result,
         results: paginated_results,
         geo_location,
-        spell_corrected_query: if spell_changed { Some(q.clone()) } else { None },
+        spell_corrected_query: if spell_changed { Some(q_cleaned_spelling.clone()) } else { None },
         error,
         message,
         query_quality: if qflag == "low" { Some("low".to_string()) } else { None },
@@ -9215,6 +9425,7 @@ async fn handle_search_fast(
                         sources: vec!["local".to_string()],
                         is_local: true,
                         published_date: None,
+                        quality: r.quality,
                     }).collect::<Vec<_>>()
                 }
                 None => vec![]

@@ -75,7 +75,17 @@ struct SearchResult {
     authority: f32,
     #[serde(default)]
     content: String,
+    /// Signal-quality metric in [0,1]. 1.0 = high-signal page that is genuinely
+    /// about the query (strong BM25 + (optionally) semantic match). Lower values
+    /// indicate a low-signal crawled page (matched only on a generic/boilerplate
+    /// term, or a weak/partial lexical hit) that the gateway should demote before
+    /// it can pollute general-topic result sets. Computed fail-safe: defaults to
+    /// 1.0 when no query is present so non-search callers are unaffected.
+    #[serde(default = "default_quality")]
+    quality: f32,
 }
+
+fn default_quality() -> f32 { 1.0 }
 
 /// Robustly open or create a Tantivy index.
 ///
@@ -678,15 +688,43 @@ async fn handle_search(
 
         let k = 60.0;
         let mut rrf_scores: HashMap<String, f32> = HashMap::new();
+        // Track which URLs are *genuinely* matched (strong BM25 or verified semantic),
+        // so we can emit a per-result signal-quality metric for the gateway to gate on.
+        // ADDITIVE SEMANTIC FUSION (P0 fix): a semantic query must NEVER shrink the
+        // BM25 result set. Previously the loop `continue`d past every BM25 hit that
+        // wasn't in the (often tiny, embedding-sparse) semantic set, so a query whose
+        // only embedded docs were 3 arxiv papers would replace 10 good local results
+        // with those 3 papers. Now BM25 hits always contribute; semantic contributes
+        // only its *additional* (new) URLs. The semantic gate at ~663 still clears
+        // `semantic_ranked` entirely when embeddings are too sparse/weak, so in that
+        // case the RRF below is purely BM25 — exactly the robust fallback we want.
+        let mut genuine_match: HashMap<String, bool> = HashMap::new();
+        for url in &bm25_ranked {
+            // A BM25 hit above the relative floor is a real lexical match.
+            let _ = genuine_match.entry(url.clone()).or_insert(true);
+        }
+        for (url, _sim, _title, _ts) in &semantic_ranked {
+            // Semantic hits are genuine only if the gate above did NOT clear them
+            // (i.e. embeddings were sufficiently dense + strong). When the gate fired,
+            // semantic_ranked is empty so this branch never tags anything.
+            genuine_match.entry(url.clone()).or_insert(true);
+        }
 
         for (rank, url) in bm25_ranked.iter().enumerate() {
-            if is_semantic && !semantic_pass_urls.contains(url) && !urls_without_embeddings.contains(url) { continue; }
             *rrf_scores.entry(url.clone()).or_insert(0.0) += 1.0 / (k + (rank + 1) as f32);
         }
 
         for (rank, (url, _sim, _title, _ts)) in semantic_ranked.iter().enumerate() {
             *rrf_scores.entry(url.clone()).or_insert(0.0) += 1.0 / (k + (rank + 1) as f32);
         }
+
+        // Per-URL BM25 strength in [0,1] (candidate score / best candidate score).
+        // Surfaces how strongly each local page lexically matches the query so the
+        // gateway can demote low-signal crawled pages (P2) without a hardcoded list.
+        let bm25_strength: HashMap<String, f32> = candidates
+            .iter()
+            .map(|(u, s)| (u.clone(), if max_bm25 > 0.0 { (*s / max_bm25).clamp(0.0, 1.0) } else { 0.0 }))
+            .collect();
 
         let mut results: Vec<SearchResult> = rrf_scores
             .into_iter()
@@ -705,11 +743,25 @@ async fn handle_search(
                     final_score *= 2.0;
                 }
 
+                // Signal-quality metric for the gateway's local-index quality gate (P2).
+                // Genuine matches (in the RRF set) start at 1.0; we dampen by weak
+                // lexical strength so pages that barely matched (low BM25 vs the best
+                // hit) read as lower-quality. Fail-safe: 1.0 when strength is unknown.
+                let strength = bm25_strength.get(&url).copied().unwrap_or(1.0);
+                let quality = if *genuine_match.get(&url).unwrap_or(&false) {
+                    // Strong match (>=0.5 of best) = full quality; weaker = linearly damped.
+                    0.5 + 0.5 * strength.clamp(0.0, 1.0)
+                } else {
+                    // Should not happen (RRF set ⊆ genuine), but fail-safe low.
+                    0.3
+                };
+
                 SearchResult {
                     url, title,
                     score: final_score,
                     authority: auth as f32,
                     content: if content.len() > 500 { content.chars().take(500).collect() } else { content },
+                    quality,
                 }
             })
             .collect();
