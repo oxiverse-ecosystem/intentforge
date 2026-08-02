@@ -4562,9 +4562,12 @@ fn merge_local_and_web(
             || r.sources.iter().any(|s| s == "arxiv" || s == "crossref" || s == "pubmed");
 
         let has_download = DOWNLOAD_KEYWORDS.iter().any(|k| q_lower_check.contains(k));
+        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon"];
+        let has_tx = tx_keywords.iter().any(|k| q_lower_check.contains(k));
         let is_nav_or_download = intent == "navigational"
             || intent == "transactional"
             || has_download
+            || has_tx
             || distribution.and_then(|d| d.get("download")).copied().unwrap_or(0.0) > 0.40;
 
         let q_wants_academic = q_lower_check.contains("paper") || q_lower_check.contains("arxiv")
