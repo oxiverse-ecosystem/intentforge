@@ -789,9 +789,19 @@ pub(crate) fn correct_query(index: &SymSpellIndex, query: &str) -> (String, bool
         }
 
         match index.correct(word) {
+            // P7 fix: a correction that returns the IDENTICAL word (e.g. a low-frequency
+            // dictionary entry whose SymSpell candidate is itself) must NOT be treated as a
+            // change. Otherwise `any_corrected` is set spuriously and the API reports a
+            // `spell_corrected_query` equal to the original ("why does my laptop overheat..."
+            // → same string), implying a correction that never happened. Only flag a real
+            // change when the corrected form differs from the input word.
             Some(corrected) => {
-                corrected_words.push(corrected);
-                any_corrected = true;
+                if corrected != *word {
+                    corrected_words.push(corrected);
+                    any_corrected = true;
+                } else {
+                    corrected_words.push(word.to_string());
+                }
             }
             None => {
                 corrected_words.push(word.to_string());

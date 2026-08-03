@@ -1,37 +1,32 @@
-
-# Round 2026-08-03 09:24 UTC
-what is the best way to learn rust programming language as a complete beginner
-history of the world wide web and how it changed society
-restaurants serving authentic south indian food in hyderabad
-compare postgresql and mysql for a small web application
-text editor without vim keybindings for people who hate modal editing
-search engine alternative to google that respects privacy
-latest developments in quantum computing research this year
-how much does it cost to buy a decent gaming laptop under 80000 rupees
-what is the difference between ramen and raven in japanese culture
-steps to deploy a docker container to a production kubernetes cluster
-coffee shops with free wifi in tokyo shinjuku area
-why is the night sky blue but sunsets red explained simply
-best open source password manager that is not lastpass
-how to train a small neural network for image classification using pytorch
-what movies were released in theaters during summer of 2026
-programming language other than java for building android apps
-how does photosynthesis actually work at the molecular level
-compare rust and go for building high performance network servers
-where can i find free online courses about machine learning from stanford
-static site generator instead of jekyll for a technical blog
-what are the health benefits of drinking green tea every morning
-css framework besides bootstrap for rapid ui prototyping
-how to set up a wireguard vpn server on a cheap vps
-what is the meaning of the word biryani and its origin
-linux distribution that is good for older laptops with low ram
-explain how bitcoin mining works and why it uses so much electricity
-javascript framework except react for building single page applications
-what are some good books about astrophysics for beginners not textbooks
-how to make a simple rest api with go and postgresql
-what happened in the field of artificial intelligence during the month of july 2026
-[GET /videos] how to cook chicken biryani at home
-[GET /videos] rust programming language full tutorial
-[GET /news] latest news about artificial intelligence breakthroughs
-[GET /images] photos of the andromeda galaxy
-[POST_GOALS_QUICK /goals/quick] learn to play the classical piano as an adult beginner
+# IntentForge NL quality round — query log (append-only, unique per round)
+# Round 2026-08-03T14:42Z (round 2) — 30 brand-new unique queries
+how do i set up continuous integration with github actions for a rust project
+what are the main differences between ubuntu and arch linux for daily desktop use
+good mechanical keyboards without rgb lighting for quiet office work
+a note taking app alternative to evernote that works fully offline
+what new features did the latest version of python 3.13 introduce for developers
+best budget wireless earbuds under 5000 rupees with a good microphone
+traditional breakfast places in chennai that serve strong filter coffee
+what caused the extinction of the dinosaurs according to the most recent fossil evidence
+how to reverse a singly linked list in python with a step by step explanation
+messaging app that does not collect user metadata and is not whatsapp
+explain the difference between http and https in plain simple terms
+which programming language should i learn first python or javascript for web development
+documentaries about climate change released in 2026 that are worth watching
+how to configure a reverse proxy with nginx for multiple docker services
+healthy dinner recipes without onion and garlic for people with food sensitivities
+a federated search engine built on activitypub that is not controlled by google
+what is the cheapest electric car currently available in india right now
+how does the attention mechanism in a transformer neural network actually work
+books about the history of mathematics besides dry textbooks for general readers
+what are the common symptoms of vitamin d deficiency and how do i fix it naturally
+a task management tool alternative to trello for personal productivity
+how to install arch linux alongside windows on a modern uefi system
+why does my laptop overheat when running heavy programs and how can i prevent it
+best open source alternative to adobe photoshop for digital painting
+what is the current state of nuclear fusion energy research in 2026
+how can i learn french as a complete beginner using only free resources online
+a microcontroller board other than arduino that is good for robotics projects
+what are good strategies to improve sleep quality without taking any medication
+how does quantum entanglement enable secure quantum cryptography networks
+where can i get free legal advice about rental deposit disputes in bangalore

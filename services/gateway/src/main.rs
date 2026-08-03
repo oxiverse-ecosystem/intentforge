@@ -3542,6 +3542,37 @@ fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
                 }
             }
 
+            // Skip trailer verbs that immediately follow the negation marker
+            // (e.g. "without TAKING any medication", "not USING chemical fertilizer",
+            // "other than HAVING a smartphone"). These are the action, not the thing
+            // being excluded; the real negative target is the noun that follows.
+            // Picking "taking" (for #28) collapsed the exclusion to a verb and let
+            // dictionary/spam pages rank. We skip these only when MORE content words
+            // remain after them, so "without help" still yields "help" correctly.
+            let trailer_verbs = [
+                "taking", "taken", "take", "using", "use", "used", "having", "have",
+                "has", "buying", "buy", "bought", "getting", "get", "got", "making",
+                "make", "made", "eating", "eat", "ate", "drinking", "drink", "drank",
+                "doing", "do", "did", "going", "go", "applying", "apply", "wearing",
+                "wear", "wore", "installing", "install", "running", "run",
+            ];
+            if j < words.len() && trailer_verbs.contains(&words[j]) {
+                let mut k = j + 1;
+                let mut extra = 0;
+                while k < words.len() && extra < 4 {
+                    let c2 = words[k];
+                    if stopwords.contains(&c2) {
+                        k += 1;
+                        extra += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if k < words.len() {
+                    j = k; // there is a real target after the trailer verb
+                }
+            }
+
             if j < words.len() {
                 let target = words[j];
                 let target_is_neg = neg_markers.contains(&target) || target.starts_with('-');
@@ -4618,6 +4649,27 @@ fn merge_local_and_web(
         "gbp", "rupee", "rupees", "inr", "yen", "price", "prices", "pricing",
         "cost", "costs", "budget", "amount",
     ].iter().copied().collect();
+    // Role / descriptor words: these describe the KIND of answer sought (where/when/how
+    // the result should be delivered, or the linguistic framing of the question) rather
+    // than the TOPIC itself. Treating them as distinctive topic terms lets a page that
+    // matches only the role word pass the off-topic guard:
+    //   "vegetarian restaurants in bengaluru that DELIVER late" -> water.ca.gov
+    //     "...Late December Storms DELIVER..." (matched "deliver"/"late", missed bengaluru)
+    //   "meaning and ORIGIN of the name mumbai" -> "Be Afraid Be Very Afraid - MEANING &
+    //     ORIGIN of the phrase" (matched meaning/origin, missed mumbai/bombay)
+    //   "where can i WATCH ... telugu MOVIES" -> wrist-WATCH shops (matched watch, missed
+    //     telugu/movies)
+    // Excluding them from DISTINCTIVE-TERM overlap keeps the off-topic penalty anchored
+    // on the actual subject words. They remain ordinary content words elsewhere (still in
+    // core_topic_terms, so a genuine page about "meaning" still matches on it).
+    let role_descriptor_terms: std::collections::HashSet<&str> = [
+        "deliver", "delivery", "delivers", "late", "night", "tonight", "near",
+        "nearby", "meaning", "origin", "origins", "watch", "watching", "watched",
+        "streaming", "stream", "legally", "legal", "online", "classic", "classics",
+        "released", "release", "announced", "announce", "according", "recent",
+        "studies", "study", "research", "risks", "risk", "top", "rated", "versus",
+        "vs", "official", "history", "cultural", "significance", "free", "old", "older",
+    ].iter().copied().collect();
     // Weak discriminative fillers: words that are grammatically "content" but carry
     // almost no topical signal, so requiring a result to contain them is wrong.
     // e.g. "how does photosynthesis ACTUALLY work at the MOLECULAR LEVEL" — "actually"
@@ -4649,6 +4701,7 @@ fn merge_local_and_web(
                 && !stop_words.contains(lower.as_str())
                 && !generic_web_terms.contains(lower.as_str())
                 && !unit_terms.contains(lower.as_str())
+                && !role_descriptor_terms.contains(lower.as_str())
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
@@ -4768,6 +4821,26 @@ fn merge_local_and_web(
             0.0
         };
         let mut relevance = 0.4f32 * overlap + 0.6f32 * bert_cos;
+
+        // ── Generic-word false-match guard (this round, #20/#28) ──
+        // A page can score high on token overlap purely because one of its tokens
+        // matches a GENERIC, non-topical query word (e.g. the dictionary pages for
+        // "common" / "good" ranking #1 for "symptoms of vitamin D deficiency" /
+        // "strategies to improve sleep quality", where the only overlap is the weak
+        // word "common"/"good"). When the query has DISTINCTIVE topic terms but the
+        // result matches NONE of them, its overlap is entirely composed of generic
+        // words — treat it as off-topic and crush relevance so topic-bearing pages
+        // (which DO contain a distinctive term) can outrank it. Fully generic queries
+        // with no distinctive terms are untouched (nothing to miss).
+        if !distinctive_terms.is_empty() {
+            let matched_distinctive = distinctive_terms.iter().any(|t| {
+                let tl = t.to_lowercase();
+                title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
+            });
+            if !matched_distinctive {
+                relevance *= 0.12;
+            }
+        }
 
         // ── Phrase-entity fidelity (P1) ──
         // For multi-word phrase entities in the query (e.g. "sky blue", "world wide web",
@@ -4973,6 +5046,55 @@ fn merge_local_and_web(
         let intent_boost = calculate_intent_boost(&r.url, &r.title, &clean_query, intent);
         let mut freshness = freshness_score(&r.url, intent, r.published_date.as_deref());
         let mut quality = content_quality_score(&r.content);
+
+        // ── Fresh-intent news-portal demotion (this round, #16/#22) ──
+        // For FRESH intent, upstream often returns ONLY the bare homepage or top-level
+        // section of a major news portal (cnn.com/, bbc.com/news/world, foxnews.com/)
+        // because those domains dominate recency signals. A bare portal URL with a GENERIC
+        // title ("Breaking News", "Latest News & Updates") carries no specific article and
+        // crowds out the few topical articles that did come back. We crush such portals
+        // WHEN their title lacks any distinctive query term — this lifts the topical
+        // article above the homepage. The penalty is anchored on distinctive_terms (not
+        // role words), so a portal article whose title names the topic (e.g. "solid-state
+        // battery breakthrough") is NOT demoted. Pure generic-title portal pages are the
+        // failure mode; they are demoted but never fully removed (floor preserved).
+        if intent == "fresh" {
+            let is_portal_home = {
+                let host = reqwest::Url::parse(&r.url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                    .unwrap_or_default();
+                let path = reqwest::Url::parse(&r.url)
+                    .ok()
+                    .map(|u| u.path().to_string())
+                    .unwrap_or_else(|| "/".to_string());
+                let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                // homepage ("/") OR a single shallow news section ("/news", "/news/world")
+                let shallow = path_segments.len() <= 1
+                    || (path_segments.len() == 2 && path_segments[0] == "news");
+                let known_portal = [
+                    "cnn.com", "bbc.com", "bbc.co.uk", "foxnews.com", "nytimes.com",
+                    "abcnews.com", "nbcnews.com", "cbsnews.com", "ndtv.com", "indiatimes.com",
+                    "news.google.com", "google.com", "yahoo.com", "msn.com", "reuters.com",
+                ].iter().any(|p| host == *p || host.ends_with(&format!(".{}", p)));
+                known_portal && shallow
+            };
+            let title_has_topic = if distinctive_terms.is_empty() {
+                false
+            } else {
+                distinctive_terms.iter().any(|t| {
+                    let tl = t.to_lowercase();
+                    title_lower.contains(&tl) || content_lower.contains(&tl)
+                })
+            };
+            if is_portal_home && !title_has_topic {
+                relevance *= 0.12;
+                tracing::info!(
+                    "FRESH PORTAL DEMOTE x0.12: '{}' (generic-title portal for fresh intent)",
+                    r.url.chars().take(60).collect::<String>()
+                );
+            }
+        }
 
         // ─── Intent-aware sense disambiguation (P-B) + conspiracy debias (P-C) ───
         // Computed once per result. Both are fail-closed: they only ever *reduce*
@@ -5299,10 +5421,18 @@ fn merge_local_and_web(
         let is_video_source = r.sources.iter().any(|s| s == "invidious" || s == "video");
         let q_lc = query.to_lowercase();
         let video_mult = if is_video_source {
-            if q_lc.contains("video") || q_lc.contains("youtube") || q_lc.contains("watch") || q_lc.contains("tutorial") {
+            if q_lc.contains("video") || q_lc.contains("youtube") || q_lc.contains("watch") || q_lc.contains("tutorial") || q_lc.contains("animation") {
                 1.0 // explicit video intent → keep
             } else {
-                0.25 // generic text query → demote below relevant web/text results
+                // P8 fix (this round): for a generic TEXT query, videos must NOT outrank
+                // relevant articles. The old 0.25x multiplier was still amplified back to
+                // ~1.0 by calibrate_scores (which rescales every score onto [0.05,1.0])
+                // whenever the competing web/text results were themselves near-zero
+                // (thin result sets). Now crush hard so a youtube tutorial can never sit
+                // above a topical article for "...how to..." / "...reverse a linked list..."
+                // text queries. The /videos endpoint remains the home for video intent; in
+                // /search they are secondary. Floor keeps them present, not dominant.
+                0.08
             }
         } else {
             1.0
@@ -8823,55 +8953,38 @@ async fn handle_search(
                 }
             }
 
-        web_results.retain(|r| {
-            // Alternative-listing page check: if the result is a comparison/
-            // alternative page, keep it even if it mentions excluded terms.
-            // This prevents "Top 10 Prometheus Alternatives" from being
-            // dropped for queries like "monitoring not prometheus".
-            let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-            if alt_score > 0.3 {
-                return true; // keep alternative-listing pages regardless of negative terms
-            }
-
-            let text = format!("{} {} {}", r.title, r.url, r.content.chars().take(300).collect::<String>());
-            let text_lower = text.to_lowercase();
-            let text_normalized = {
-                let chars: Vec<char> = text_lower.chars().collect();
-                let mut out = String::with_capacity(chars.len());
-                for (i, &c) in chars.iter().enumerate() {
-                    if c == '.' || c == '-' || c == '_' {
-                        if i > 0
-                            && i + 1 < chars.len()
-                            && chars[i-1].is_alphanumeric()
-                            && chars[i+1].is_alphanumeric()
-                        {
+            // P5-class "negative over-filter" fix (this round, #15):
+            // A bare NEGATIVE TERM ("onion", "garlic") is a TOPICAL exclusion that
+            // grades smoothly — it is NOT a structural operator (site:/filetype:/
+            // date/phrase are handled in should_filter_by_constraints and hard-drop
+            // correctly). Hard-dropping every web result that mentions a topical
+            // excluded term collapses queries like "healthy dinner recipes without
+            // onion and garlic" to ZERO results, because nearly every recipe page
+            // mentions onion/garlic. The soft penalty is already enforced through
+            // constraint_score -> c_score -> r.score downstream, which demotes
+            // matching results while keeping the set non-empty. So we NO LONGER
+            // hard-drop here. We only log a diagnostic; the actual demotion happens
+            // in the scoring loop. This matches the documented design at main.rs:2385
+            // ("a bare word like vim/django is NOT structural ... never hard-drop").
+            for r in web_results.iter() {
+                let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
+                if alt_score <= 0.3 {
+                    let text = format!("{} {} {}", r.title, r.url, r.content.chars().take(300).collect::<String>());
+                    let text_lower = text.to_lowercase();
+                    let _matched = negative_norm.iter().any(|neg| {
+                        let neg_lower = neg.to_lowercase();
+                        let words: Vec<&str> = neg_lower.split_whitespace().collect();
+                        if words.len() == 1 {
+                            text_matches_negative(&text_lower, &neg_lower)
                         } else {
-                            out.push(c);
+                            let joined = words.join(" ");
+                            text_lower.contains(&joined)
                         }
-                    } else {
-                        out.push(c);
-                    }
+                    });
+                    // No hard drop — soft penalty applied later in scoring.
                 }
-                out
-            };
-
-            let should_keep = negative_norm.iter().all(|neg| {
-                let neg_lower = neg.to_lowercase();
-                let words: Vec<&str> = neg_lower.split_whitespace().collect();
-                if words.len() == 1 {
-                    // Word-boundary aware — never substring ("java" ⊄ "javascript").
-                    !text_matches_negative(&text_lower, &neg_lower)
-                } else {
-                    let joined = words.join(" ");
-                    !(text_lower.contains(&joined) || text_normalized.contains(&joined))
-                }
-            });
-
-            if !should_keep {
-                tracing::info!("HARD NEGATIVE DROP (pre-merge WEB ONLY): result removed because negative constraint matched (not alt page)");
             }
-            should_keep
-        });
+        }
 
         let removed = before_count.saturating_sub(web_results.len());
         if removed > 0 {
@@ -8879,7 +8992,6 @@ async fn handle_search(
                 "Negative constraint hard filter: removed {}/{} web results (hard gate)",
                 removed, before_count
             );
-        }
         }
     }
 
