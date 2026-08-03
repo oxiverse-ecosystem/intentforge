@@ -30,3 +30,35 @@ a microcontroller board other than arduino that is good for robotics projects
 what are good strategies to improve sleep quality without taking any medication
 how does quantum entanglement enable secure quantum cryptography networks
 where can i get free legal advice about rental deposit disputes in bangalore
+
+# Round 2026-08-03 09:32 UTC (round 2)
+what are the top rated vegetarian restaurants in bengaluru that deliver late at night
+how do i set up a reverse proxy with nginx for multiple docker containers
+differences between functional and object oriented programming paradigms
+best lightweight markdown note taking app for linux that is not electron based
+what did scientists discover about the james webb telescope in early 2026
+explain the working principle of a lithium ion battery in simple terms
+where to buy affordable mechanical keyboards under 3000 rupees with hot swappable switches
+film photography camera alternative to canon for beginners on a budget
+how does the indian stock market index nifty 50 actually get calculated
+compare the safety features of tesla and byd electric cars
+what are some good free resources to learn linear algebra for machine learning without a paid course
+why does my python script leak memory when i create generators in a loop
+best coffee beans for making espresso at home shipped within india
+what is the history and cultural significance of the festival of onam in kerala
+how to configure a self hosted passwordless ssh login using ed25519 keys
+which programming language should i learn after python for backend web development
+latest breakthroughs in solid state battery technology announced this quarter
+remote job boards that are not linkedin for software engineers
+explain what vector databases are and when to use them instead of postgres
+best budget smartphones under 15000 rupees with good cameras released in 2026
+how to make authentic hyderabadi chicken dum biryani step by step
+what causes the northern lights and why are they visible further south recently
+open source alternatives to slack for self hosted team chat
+how do i debug a segfault in a rust program using gdb
+what are the health risks of drinking too much coffee according to recent studies
+compare the rust web frameworks actix and axum for building apis
+good books about the history of mathematics not academic textbooks
+how to reduce docker image size for a node js application
+what is the meaning and origin of the name mumbai formerly bombay
+where can i watch old classic telugu movies legally streaming online

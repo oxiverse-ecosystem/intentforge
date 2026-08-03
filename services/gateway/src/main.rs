@@ -5373,11 +5373,27 @@ fn merge_local_and_web(
         // Geo-relevance boost: boost results that mention the user's country, region, or city.
         // Higher boost for city-level matches (0.25) than country-level (0.10).
         let geo_boost = geo_location.map(|g| geo_relevance_score(&r.title, &r.content, &r.url, g)).unwrap_or(0.0);
+        // Off-topic authority suppression: when a result matches NONE of the query's
+        // distinctive topic terms it is genuinely off-topic (the generic-word guard at
+        // ~4835 already crushed its relevance). High-authority portals (water.ca.gov,
+        // cnn.com) would otherwise keep floating above on the authority signal alone,
+        // which — combined with calibrate_scores rescaling the max raw score to 1.0 —
+        // lets an off-topic homepage (e.g. "Late December Storms Deliver...") rank #1
+        // for "vegetarian restaurants in bengaluru that deliver late". Suppressing
+        // authority here makes the off-topic crush actually bite. This never hurts a
+        // result that contains a real topic term, and authority is only halved (not
+        // zeroed) so a borderline page still earns a little trust.
+        let off_topic = !distinctive_terms.is_empty() && !distinctive_terms.iter().any(|t| {
+            let tl = t.to_lowercase();
+            title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
+        });
+        let authority_eff = if off_topic { r.authority * 0.3 } else { r.authority };
+
         let base = (weights.rrf * r.score)
             + (weights.semantic * semantic)
             + (weights.intent * intent_boost)
             + (weights.freshness * freshness)
-            + (weights.authority * r.authority)
+            + (weights.authority * authority_eff)
             + (weights.quality * quality)
             + (weights.consensus * consensus)
             + (weights.local_bonus * local_bonus)
