@@ -1,0 +1,3056 @@
+[
+  {
+    "id": "s01",
+    "endpoint": "search",
+    "q": "how can i naturally lower my blood sugar levels in the morning without medication",
+    "status": 200,
+    "intent": "how-to",
+    "confidence": 0.44999998807907104,
+    "category": "informational",
+    "results_before_filter": 10,
+    "total": 10,
+    "neg": [
+      "medication"
+    ],
+    "pos": [
+      "blood",
+      "how",
+      "levels",
+      "lower",
+      "morning",
+      "naturally",
+      "sugar"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "How to Lower Morning Blood Sugar Naturally: 7 Ways",
+        "url": "https://scienceinsights.org/how-to-lower-morning-blood-sugar-naturally-7-ways/",
+        "score": 1.0,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Diabetes Management Diet: 5 Tips To Lower Morning High Blood Sugar ...",
+        "url": "https://www.thehealthsite.com/diseases-conditions/diabetes-management-diet-tips-how-to-lower-morning-high-blood-sugar-spike-naturally-1149286/",
+        "score": 0.949,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Reduce Blood Sugar Levels Immediately: List of Foods",
+        "url": "https://www.medicinenet.com/what_foods_will_lower_blood_sugar_quickly/article.htm",
+        "score": 0.09,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "15 Everyday Habits That Can Help Lower Your Blood Sugar Naturally - Health",
+        "url": "https://www.health.com/everyday-habits-to-lower-blood-sugar-11959232",
+        "score": 0.09,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "7 Habits That Can Spike Your Morning Blood Sugar - Verywell Health",
+        "url": "https://www.verywellhealth.com/why-blood-sugar-is-high-in-the-morning-11905419",
+        "score": 0.089,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "5 Things to Do When You Wake Up for Better Blood Sugar",
+        "url": "https://www.eatingwell.com/things-to-do-when-you-wake-up-for-better-blood-sugar-11875567",
+        "score": 0.089,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "High Morning Blood Sugar? Do These 5 Things to Lower It!",
+        "url": "https://healthcoachkait.com/blog/high-morning-blood-sugar-do-these-5-things-to-lower-it",
+        "score": 0.088,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Lower High Morning Blood Sugar: 5 Proven Steps",
+        "url": "https://int.livhospital.com/how-to-lower-high-morning-blood-sugar-5-proven-steps/",
+        "score": 0.086,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Morning Habits to Lower Blood Sugar and Inflammation - EatingWell",
+        "url": "https://www.eatingwell.com/anti-inflammatory-habits-before-noon-for-diabetes-11903207",
+        "score": 0.08,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "10 Foods That Lower Blood Sugar Immediately - Verywell Health",
+        "url": "https://www.verywellhealth.com/foods-that-lower-blood-sugar-immediately-11776074",
+        "score": 0.08,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 6106
+  },
+  {
+    "id": "s02",
+    "endpoint": "search",
+    "q": "what are the best strategies to negotiate a higher salary during a job offer as a fresher",
+    "status": 200,
+    "intent": "informational",
+    "confidence": 0.4827454090118408,
+    "category": "informational",
+    "results_before_filter": 9,
+    "total": 0,
+    "neg": [],
+    "pos": [
+      "fresher",
+      "higher",
+      "job",
+      "negotiate",
+      "offer",
+      "salary",
+      "strategies",
+      "what"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": [
+      "All web results were removed by your date constraint. Try widening the range (e.g. a broader after:/before: window)."
+    ],
+    "top5": [],
+    "ms": 5051
+  },
+  {
+    "id": "s03",
+    "endpoint": "search",
+    "q": "a self hosted alternative to google analytics that does not track individual visitors",
+    "status": 200,
+    "intent": "comparison",
+    "confidence": 0.85,
+    "category": "informational",
+    "results_before_filter": 10,
+    "total": 10,
+    "neg": [
+      "track"
+    ],
+    "pos": [
+      "analytics",
+      "hosted",
+      "individual",
+      "self",
+      "visitors"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Plausible vs Google Analytics: the private, self-hosted alternative",
+        "url": "https://localfirstlab.org/plausible-vs-google-analytics.html",
+        "score": 1.0,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Best Self-Hosted Alternatives to Google Analytics (2026)",
+        "url": "https://selfhostedpicker.com/alternatives/google-analytics",
+        "score": 0.989,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Plausible: Self-Hosted Google Analytics alternative",
+        "url": "https://plausible.io/self-hosted-web-analytics",
+        "score": 0.988,
+        "authority": 0.65,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Self-Hosted Alternatives to Google Analytics in 2026 (Tested)",
+        "url": "https://mustafa.net/self-hosted-alternatives/google-analytics/",
+        "score": 0.977,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Google Analytics Alternatives: Top 12 Self-Hosted Web Analytics ...",
+        "url": "https://alternativeto.net/software/google-analytics/?platform=self-hosted",
+        "score": 0.969,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "7 Best Open-Source Google Analytics Alternatives in 2026",
+        "url": "https://www.databuddy.cc/blog/best-open-source-google-analytics-alternatives-2026",
+        "score": 0.908,
+        "authority": 0.85,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "3 Best Open Source Alternatives to Google Analytics (2026)",
+        "url": "https://ossalt.com/alternatives/google-analytics",
+        "score": 0.857,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Best Self-Hosted Analytics Tools, Ranked by Ops Cost",
+        "url": "https://analytics-alternatives.com/best-self-hosted-analytics/",
+        "score": 0.711,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "AddToAny & Google Analytics - Sharing Stats",
+        "url": "https://www.addtoany.com/ext/google_analytics/",
+        "score": 0.169,
+        "authority": 0.6,
+        "sources": [
+          "local"
+        ]
+      },
+      {
+        "title": "4 Best Google Analytics Alternatives (Free & Paid, 2026) \u2014 Macrostack",
+        "url": "https://www.macrostack.net/alternative-to-google-analytics",
+        "score": 0.08,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 12
+  },
+  {
+    "id": "s04",
+    "endpoint": "search",
+    "q": "compare the fuel efficiency and maintenance cost of owning a maruti suzuki brezza versus a hyundai venue",
+    "status": 200,
+    "intent": "comparison",
+    "confidence": 0.8999999761581421,
+    "category": "informational",
+    "results_before_filter": 22,
+    "total": 22,
+    "neg": [],
+    "pos": [
+      "brezza",
+      "compare",
+      "efficiency",
+      "fuel",
+      "hyundai",
+      "maintenance",
+      "maruti",
+      "owning",
+      "suzuki",
+      "venue"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "2026 Maruti Suzuki Brezza Facelift vs Hyundai Venue: Comparative \u2026",
+        "url": "https://ackodrive.com/news/2026-maruti-suzuki-brezza-facelift-vs-hyundai-venue-comparative-breakdown/",
+        "score": 0.133,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Maruti Suzuki Brezza Facelift vs Hyundai Venue: Price, Mileage and ...",
+        "url": "https://www.timesnownews.com/auto/car-news/maruti-suzuki-brezza-facelift-vs-hyundai-venue-price-mileage-and-features-compared-article-155187550",
+        "score": 0.131,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Hyundai Venue vs Maruti Suzuki Brezza Comparison \u2013 Price, \u2026",
+        "url": "https://www.autocarindia.com/compare-cars/hyundai-venue-vs-maruti-suzuki-brezza",
+        "score": 0.126,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Hyundai Venue vs Maruti Suzuki Brezza 2022-2026 Comparison",
+        "url": "https://www.91wheels.com/compare-car/hyundai-venue-vs-maruti-vitara-brezza",
+        "score": 0.124,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "New Hyundai Venue vs Maruti Brezza Detailed Comparison",
+        "url": "https://carzonwheel.com/news/hyundai-venue-vs-maruti-brezza-detailed-comparison",
+        "score": 0.124,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Hyundai Venue vs Maruti Suzuki Brezza Comparison - HT Auto",
+        "url": "https://auto.hindustantimes.com/compare-cars/hyundai-venue-vs-marutisuzuki-brezza",
+        "score": 0.123,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Maruti Brezza vs Hyundai Venue 2026: A Detailed Comparison",
+        "url": "https://vedanshauto.in/maruti-brezza-vs-hyundai-venue/",
+        "score": 0.12,
+        "authority": 0.65,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Maruti vs Hyundai vs Tata Service Cost Comparison 2026: Which Is ...",
+        "url": "https://autoindiadaily.in/car-news/maruti-vs-hyundai-vs-tata-service-cost-comparison-2026/",
+        "score": 0.117,
+        "authority": 0.95,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Hyundai Venue N Line vs Maruti Suzuki Brezza - CarDekho",
+        "url": "https://www.cardekho.com/compare/hyundai-venue-n-line-and-maruti-brezza.htm",
+        "score": 0.115,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Hyundai Venue vs Maruti Suzuki Brezza - ZigWheels.com",
+        "url": "https://www.zigwheels.com/compare-cars/hyundai-venue-vs-maruti-suzuki-brezza",
+        "score": 1.0,
+        "authority": 0.8,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "Maruti Suzuki Brezza vs Hyundai Venue: AI-Powered Comparison 2026 | Cartoq",
+        "url": "https://www.cartoq.com/compare-cars/brezza-vs-venue/",
+        "score": 0.998,
+        "authority": 0.6,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "Hyundai Venue vs Maruti Brezza petrol MT real-world mileage \u2026",
+        "url": "https://www.autocarindia.com/auto-features/hyundai-venue-vs-maruti-brezza-petrol-mt-real-world-mileage-compared-440582",
+        "score": 0.094,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Fuel - Wikipedia",
+        "url": "https://en.wikipedia.org/wiki/Fuel",
+        "score": 0.09,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Gasoline and Diesel Fuel Update - U.S. Energy Information ...",
+        "url": "https://www.eia.gov/petroleum/gasdiesel/index.php",
+        "score": 0.089,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Fuel Economy",
+        "url": "https://www.fueleconomy.gov/",
+        "score": 0.088,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 3972
+  },
+  {
+    "id": "s05",
+    "endpoint": "search",
+    "q": "how do i set up a wireguard vpn server on a debian 12 vps with ufw firewall",
+    "status": 200,
+    "intent": "how-to",
+    "confidence": 0.6,
+    "category": "informational",
+    "results_before_filter": 10,
+    "total": 10,
+    "neg": [],
+    "pos": [
+      "12",
+      "debian",
+      "firewall",
+      "how",
+      "ufw",
+      "vpn",
+      "vps",
+      "wireguard"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "How to Set Up a Self-Hosted VPN with WireGuard on a VPS",
+        "url": "https://mohamedch.com/en/blog/how-to-set-up-a-self-hosted-vpn-with-wireguard-on-a-vps",
+        "score": 1.0,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Set Up a WireGuard VPN Server \u00b7 Linux Junkies",
+        "url": "https://linuxjunkies.org/guides/set-up-a-wireguard-vpn-server",
+        "score": 0.669,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Set Up WireGuard VPN on Linux (Server and Client, 2026)",
+        "url": "https://linuxlap.com/linux-tips/how-to-set-up-wireguard-vpn-on-linux/",
+        "score": 0.438,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "WireGuard VPN on Linux: Complete Setup Guide - LinuxBlog.io",
+        "url": "https://linuxblog.io/wireguard-vpn-linux-setup-guide/",
+        "score": 0.303,
+        "authority": 0.65,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Set Up WireGuard Server on Debian (2026) - FOSS Linux",
+        "url": "https://www.fosslinux.com/65253/set-up-wireguard-server-on-debian.htm",
+        "score": 0.279,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Self-Host a WireGuard VPN Server on Ubuntu or Debian",
+        "url": "https://codingprotocols.com/tutorials/self-host-wireguard-vpn-server",
+        "score": 0.224,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Configure a WireGuard VPN Server on Debian 12 Bookworm",
+        "url": "https://www.siberoloji.com/how-to-configure-a-wireguard-vpn-server-on-debian-12/",
+        "score": 0.199,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Deploy WireGuard VPN Server on Debian 12 | Programster's Blog",
+        "url": "https://blog.programster.org/deploy-wireguard-vpn-server-on-debian-12",
+        "score": 0.126,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Install WireGuard VPN on Debian 12 - HowtoForge",
+        "url": "https://www.howtoforge.com/guide-to-install-wireguard-vpn-on-debian-12/",
+        "score": 0.112,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Set Up WireGuard VPN on Debian 12 - Progressive Robot",
+        "url": "https://www.progressiverobot.com/2025/12/16/how-to-set-up-wireguard-vpn-on-debian-12/",
+        "score": 0.05,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 4
+  },
+  {
+    "id": "s06",
+    "endpoint": "search",
+    "q": "what are the early signs of burnout at work and how can i recover without quitting my job",
+    "status": 200,
+    "intent": "how-to",
+    "confidence": 0.45,
+    "category": "informational",
+    "results_before_filter": 7,
+    "total": 7,
+    "neg": [
+      "quitting"
+    ],
+    "pos": [
+      "burnout",
+      "early",
+      "how",
+      "job",
+      "recover",
+      "signs",
+      "what",
+      "work"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Multiple Sclerosis (MS): Early Warning Signs and Symptoms",
+        "url": "https://www.webmd.com/multiple-sclerosis/multiple-sclerosis-symptoms",
+        "score": 1.0,
+        "authority": 0.6,
+        "sources": [
+          "local"
+        ]
+      },
+      {
+        "title": "Key signs of burnout you shouldn\u2019t ignore (and 5 strategies to prevent \u2026",
+        "url": "https://www.bswhealth.com/blog/key-signs-of-burnout-you-shouldnt-ignore-and-strategies-to-prevent-it",
+        "score": 0.088,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Early Signs of Burnout and How to Address Them Effectively",
+        "url": "https://tidesmentalhealth.com/early-signs-of-burnout-and-how-to-address-them-effectively/",
+        "score": 0.085,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Job burnout: How to spot it and take action - Mayo Clinic",
+        "url": "https://www.mayoclinic.org/healthy-lifestyle/adult-health/in-depth/burnout/art-20046642",
+        "score": 0.082,
+        "authority": 0.95,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "7 Early Warning Burnout Signs Most Workers Miss Before It\u2019s ... - Forbes",
+        "url": "https://www.forbes.com/sites/bryanrobinson/2026/04/10/7-early-warning-burnout-signs-most-workers-miss-before-its-too-late/",
+        "score": 0.082,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "10 Early Signs of Burnout at Work Before Exhaustion Sets In",
+        "url": "https://www.stressinsight.com/early-signs-burnout-work/",
+        "score": 0.081,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "The Stages of Burnout and How to Recognize the Warning Signs Early",
+        "url": "https://www.simplypsychology.com/articles/burnout-stages-warning-signs",
+        "score": 0.08,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 26
+  },
+  {
+    "id": "s07",
+    "endpoint": "search",
+    "q": "which indian coastal states have the cleanest beaches and are safe for a solo woman traveler in september",
+    "status": 200,
+    "intent": "informational",
+    "confidence": 0.2733596861362457,
+    "category": "informational",
+    "results_before_filter": 13,
+    "total": 13,
+    "neg": [],
+    "pos": [
+      "a solo",
+      "are",
+      "beaches",
+      "cleanest",
+      "coastal",
+      "indian",
+      "safe",
+      "september",
+      "states",
+      "traveler",
+      "which",
+      "woman"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Top 10 Safe Beaches in India for Solo Women Travelers - Ghum India \u2026",
+        "url": "https://www.ghumindiaghum.com/blog/web-stories/top-10-safe-beaches-in-india-for-solo-women-travelers/",
+        "score": 1.0,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "9 Safe And Beautiful Beaches In India Perfect For Solo Women \u2026",
+        "url": "https://zeenews.india.com/photos/lifestyle/9-safe-and-beautiful-beaches-in-india-perfect-for-solo-women-travellers-2866777",
+        "score": 0.947,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "10 beaches in India perfect for solo women travellers",
+        "url": "https://timesofindia.indiatimes.com/travel/web-stories/10-beaches-in-india-perfect-for-solo-women-travellers/photostory/118537015.cms",
+        "score": 0.833,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Which Beaches in India Are Safe for Travelers in 2025?",
+        "url": "https://startwagon.in/which-beaches-in-india-are-safe-for-travelers-in",
+        "score": 0.802,
+        "authority": 0.65,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Solo Travel in India \u2014 Best Beaches & Safety Tips",
+        "url": "https://indianbeach.in/solo-travel",
+        "score": 0.623,
+        "authority": 0.65,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Top 10 Beaches in India to Visit in September 2025",
+        "url": "https://www.easeindiatrip.com/blog/beaches-in-india-to-visit-in-september/",
+        "score": 0.614,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "10 Best Beaches in India for Solo Travelers (Safe, Peaceful & Budget ...",
+        "url": "https://peoplesblog.co.in/articles/10-best-beaches-india-solo-travelers-safe-peaceful-budget-friendly-guide/",
+        "score": 0.612,
+        "authority": 0.85,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Safe Beaches India: Best Coastal Spots for Travelers",
+        "url": "https://rachnatravels.in/tag/safe-beaches-india/",
+        "score": 0.604,
+        "authority": 0.75,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Which Beach is Safe in India? Top Picks for a Worry-Free Trip",
+        "url": "https://indusbus.in/which-beach-is-safe-in-india-top-picks-for-a-worry-free-trip",
+        "score": 0.6,
+        "authority": 0.65,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Beach Destinations That Are Perfect For Best Escape in India",
+        "url": "https://blog.zenithholidays.com/beach-destinations-that-feel-safe-clean-perfect-for-a-chill-vacation-in-india",
+        "score": 0.529,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "18 Blue Flag Beaches in India: Cleanest Coastal Destinations",
+        "url": "https://www.travelfika.com/blogs/blue-flag-beaches-in-india",
+        "score": 0.525,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "5 Stunning Cleanest Beaches in India You Must Visit",
+        "url": "https://travellerscoop.com/cleanest-beaches-in-india/",
+        "score": 0.358,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "13 Safest Places in India for Solo Female Travellers - Holidify",
+        "url": "https://www.holidify.com/collections/solo-female-travel-destinations-in-india",
+        "score": 0.05,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 6299
+  },
+  {
+    "id": "s08",
+    "endpoint": "search",
+    "q": "explain how a recursive function works using the example of calculating a factorial step by step",
+    "status": 200,
+    "intent": "how-to",
+    "confidence": 0.44999998807907104,
+    "category": "informational",
+    "results_before_filter": 16,
+    "total": 16,
+    "neg": [],
+    "pos": [
+      "calculating",
+      "example",
+      "explain",
+      "factorial",
+      "function",
+      "recursive",
+      "step",
+      "works"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Demystifying Recursion in Java: Calculating Factorials",
+        "url": "https://www.javaspring.net/blog/recursion-java-factorial/",
+        "score": 0.098,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to implement recursive logic in Python factorial function",
+        "url": "https://labex.io/tutorials/python-how-to-implement-recursive-logic-in-python-factorial-function-417455",
+        "score": 0.097,
+        "authority": 0.95,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Implement a Basic Recursive Method for Calculating Factorial \u2026",
+        "url": "https://codingtechroom.com/question/-programming-recursive-factorial",
+        "score": 0.095,
+        "authority": 0.95,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Calculate Factorials with Recursion: A Step-by-Step Guide",
+        "url": "https://www.somethingsblog.com/2024/10/21/calculate-factorials-with-recursion-a-step-by-step-guide/",
+        "score": 0.094,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Recursion Explained with Real-World Examples - Medium",
+        "url": "https://medium.com/@techintervu/recursion-explained-with-real-world-examples-c1e9f02f71ce",
+        "score": 0.092,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to write recursive Python Function to find factorial?",
+        "url": "https://www.tutorialspoint.com/article/How-to-write-recursive-Python-Function-to-find-factorial",
+        "score": 0.092,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "From Recursion to Iteration \u2013 Factorial Function Example",
+        "url": "https://www.baeldung.com/cs/factorial-recursion-to-iteration",
+        "score": 0.088,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Python Recursion (Recursive Function) - Programiz",
+        "url": "https://www.programiz.com/python-programming/recursion",
+        "score": 0.087,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Recursion Explained (with Examples) - DEV Community",
+        "url": "https://dev.to/christinamcmahon/recursion-explained-with-examples-4k1m",
+        "score": 0.086,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Mastering Recursive Factorials in Python: A Step-by-Step Guide",
+        "url": "https://pyquesthub.com/mastering-recursive-factorials-in-python-a-step-by-step-guide",
+        "score": 0.085,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Introduction to Recursion - GeeksforGeeks",
+        "url": "https://www.geeksforgeeks.org/dsa/introduction-to-recursion-2/",
+        "score": 0.085,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Recursion Using Stack with Example - Teachix",
+        "url": "https://teachix.org/data-structure-c-tutorial/recursion-using-stack-factorial/",
+        "score": 0.084,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How Recursion Works \u2014 step-by-step walkthrough - Dev Genius",
+        "url": "https://blog.devgenius.io/how-recursion-works-step-by-step-walkthrough-8447e7abc9ee",
+        "score": 0.083,
+        "authority": 0.55,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Transformer Neural Network Step by Step with Example - ML Journey",
+        "url": "https://mljourney.com/transformer-neural-network-step-by-step-with-example/",
+        "score": 1.0,
+        "authority": 0.6,
+        "sources": [
+          "local"
+        ]
+      },
+      {
+        "title": "Free Math Solver by YesChat \u2013 Accurate Solutions & Step-by-Step Explanations",
+        "url": "https://www.yeschat.ai/features/math-solver",
+        "score": 0.998,
+        "authority": 0.65,
+        "sources": [
+          "local"
+        ]
+      }
+    ],
+    "ms": 6476
+  },
+  {
+    "id": "s09",
+    "endpoint": "search",
+    "q": "what is the difference between investing in a mutual fund and buying individual stocks for long term wealth",
+    "status": 200,
+    "intent": "comparison",
+    "confidence": 0.8500000238418579,
+    "category": "informational",
+    "results_before_filter": 3,
+    "total": 3,
+    "neg": [],
+    "pos": [
+      "buying",
+      "difference",
+      "fund",
+      "individual",
+      "investing",
+      "long",
+      "mutual",
+      "stocks",
+      "term",
+      "wealth",
+      "what"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Mutual Funds vs Individual Stocks: Which Investment Option Is Better ...",
+        "url": "https://www.pocketful.in/blog/mutual-funds-vs-individual-stocks/",
+        "score": 1.0,
+        "authority": 0.85,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "Individual Stocks vs. Mutual Funds Explained | Financial Terms",
+        "url": "https://investedbetter.com/financial-term/individual-stocks-vs-mutual-funds/",
+        "score": 0.053,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Mutual Funds vs ETFs vs Individual Stocks - Trajan Wealth",
+        "url": "https://trajanwealth.com/blog/mutual-funds-vs-etfs/",
+        "score": 0.05,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 2212
+  },
+  {
+    "id": "s10",
+    "endpoint": "search",
+    "q": "a lightweight linux distribution that runs well on old laptops with only 2gb of ram and is not ubuntu",
+    "status": 200,
+    "intent": "technical",
+    "confidence": 0.6,
+    "category": "informational",
+    "results_before_filter": 6,
+    "total": 5,
+    "neg": [
+      "ubuntu"
+    ],
+    "pos": [
+      "2gb",
+      "distribution",
+      "is",
+      "laptops",
+      "lightweight",
+      "linux",
+      "only",
+      "ram",
+      "runs",
+      "well"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "16 Lightweight Linux Distributions for Older Machines in 2026",
+        "url": "https://www.linuxtoday.com/blog/16-lightweight-linux-distributions-for-older-machines-in-2026/",
+        "score": 1.0,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "I tried 4 lightweight Linux distros on a 4GB laptop, and one ... - MUO",
+        "url": "https://www.makeuseof.com/i-tried-4-lightweight-linux-distros-on-a-4gb-laptop-and-one-surprised-me/",
+        "score": 0.733,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "10 Best Lightweight Linux Distributions For Older Computers",
+        "url": "https://www.dotlinux.net/blog/10-best-lightweight-linux-distributions-for-older-computers/",
+        "score": 0.512,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "10 Best Lightweight Linux Distributions to Revive Your Old PC in 2026",
+        "url": "https://www.tech2geek.net/10-best-lightweight-linux-distributions-to-revive-your-old-pc-in-2025/",
+        "score": 0.098,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "16 Best Lightweight Linux Distributions for Older Computers",
+        "url": "https://itsfoss.com/lightweight-linux-beginners/",
+        "score": 0.08,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 15
+  },
+  {
+    "id": "s11",
+    "endpoint": "search",
+    "q": "how to make cold brew coffee at home without any special equipment",
+    "status": 200,
+    "intent": "how-to",
+    "confidence": 0.6,
+    "category": "informational",
+    "results_before_filter": 3,
+    "total": 3,
+    "neg": [
+      "special"
+    ],
+    "pos": [
+      "brew",
+      "coffee",
+      "cold",
+      "equipment",
+      "home",
+      "how",
+      "make",
+      "special"
+    ],
+    "spell": "how to make cold brew coffee at home without any special equipment",
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "How to Make Cold Brew Coffee at Home: A Practical 2026 Guide",
+        "url": "https://acadofchoc.com/blog/how-to-make-cold-brew-coffee/",
+        "score": 1.0,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Make Cold Brew at Home - Sarah's Vegan Kitchen",
+        "url": "https://sarahsvegankitchen.com/recipes/how-to-make-cold-brew-coffee/",
+        "score": 0.559,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Simple Cold Brew (No Fancy Equipment Required)",
+        "url": "https://butfirstwebrunch.com/cold-brew/",
+        "score": 0.08,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 16
+  },
+  {
+    "id": "s12",
+    "endpoint": "search",
+    "q": "what are the newest discoveries about habitable zones around red dwarf stars announced this year",
+    "status": 200,
+    "intent": "fresh",
+    "confidence": 0.699999988079071,
+    "category": "informational",
+    "results_before_filter": 3,
+    "total": 1,
+    "neg": [],
+    "pos": [
+      "announced",
+      "around",
+      "discoveries",
+      "dwarf",
+      "habitable",
+      "newest",
+      "red",
+      "stars",
+      "what",
+      "year",
+      "zones"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Exoplanet in Habitable Zone Orbiting a Red Dwarf Star Discovered \u2026",
+        "url": "https://www.sciencetimes.com/articles/62023/20260703/exoplanet-habitable-zone-orbiting-red-dwarf-star-discovered-just-25-light-years-earth.htm",
+        "score": 0.05,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 2012
+  },
+  {
+    "id": "s13",
+    "endpoint": "search",
+    "q": "books on personal finance for young adults that are not written by indian authors",
+    "status": 200,
+    "intent": "informational",
+    "confidence": 0.39722258,
+    "category": "informational",
+    "results_before_filter": 15,
+    "total": 15,
+    "neg": [
+      "written"
+    ],
+    "pos": [
+      "adults",
+      "authors",
+      "books",
+      "finance",
+      "indian",
+      "personal",
+      "young"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Best Personal Finance Books for Young Adults (2026)",
+        "url": "https://www.achievecu.org/blog/best-personal-finance-books",
+        "score": 1.0,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Best Personal Finance Books For Young Adults: 10 Authoritative Reads",
+        "url": "https://www.mypersonalfinance.com/finance-education/best-personal-finance-books-for-young-adults/",
+        "score": 0.954,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Best Personal Finance Books for Young Adults (Teens and Tweens)",
+        "url": "https://www.moneycrashers.com/best-personal-finance-books-for-young-adults/",
+        "score": 0.856,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Best Personal Finance Books for Young Adults - Whimsy Read",
+        "url": "https://whimsyread.com/best-personal-finance-books-for-young-adults/",
+        "score": 0.852,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "15 Best Money Books For Young Adults - Making Sense Of Cents",
+        "url": "https://www.makingsenseofcents.com/2020/03/best-money-books-for-young-adults.html",
+        "score": 0.822,
+        "authority": 0.95,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "17 Best Personal Finance Books for Young Adults- Next Phase \u2026",
+        "url": "https://nextphaseparenting.com/13-best-finance-books-for-young-adults/",
+        "score": 0.77,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Advisor\u2019s Choice: Top 5 Finance Books for Teens & Young Adults in \u2026",
+        "url": "https://michaelryanmoney.com/best-books-about-personal-finance-for-teens/",
+        "score": 0.729,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Personal Finance - Business Insider",
+        "url": "https://www.businessinsider.com/personal-finance",
+        "score": 0.131,
+        "authority": 0.5,
+        "sources": [
+          "local"
+        ]
+      },
+      {
+        "title": "7 best Money Management books by Indian authors | Mymoneybooks | Books by Indian Authors to read",
+        "url": "https://www.youtube.com/watch?v=uZXJJP40xsQ",
+        "score": 0.125,
+        "authority": 0.5,
+        "sources": [
+          "invidious"
+        ]
+      },
+      {
+        "title": "Best Personal Finance Books India: 10 Empowering Reads",
+        "url": "https://investiohub.com/blog/best-personal-finance-books-india",
+        "score": 0.083,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "10 Best Personal Finance Books You Must Read in India - Airtel",
+        "url": "https://www.airtel.in/blog/personal-loan/the-10-best-personal-finance-books-you-must-read/",
+        "score": 0.083,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Amazon.in: Personal Finance Books India",
+        "url": "https://www.amazon.in/personal-finance-books-india/s?k=personal+finance+books+india",
+        "score": 0.082,
+        "authority": 0.55,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Personal Finance Books Books - Buy Personal Finance Books",
+        "url": "https://www.flipkart.com/books/selfhelp-books/personal-finance-books/pr?sid=bks%2C5uw%2Cwp9",
+        "score": 0.082,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "10 Best Personal Finance Books to Read in 2025",
+        "url": "https://www.cashe.co.in/our-blog/best-personal-finance-books/",
+        "score": 0.082,
+        "authority": 0.85,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Personal Finance Books (\u092a\u0930\u094d\u0938\u0928\u0932 \u092b\u093e\u0907\u0928\u0947\u0902\u0938 \u092c\u0941\u0915\u094d\u0938): Buy Personal Finance ...",
+        "url": "https://www.flipkart.com/books/personal-finance-books/pr?sid=bks%2Cwp9",
+        "score": 0.08,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 0
+  },
+  {
+    "id": "s14",
+    "endpoint": "search",
+    "q": "how can a final year college student build a credible resume with no prior internships",
+    "status": 200,
+    "intent": "how-to",
+    "confidence": 0.5520116,
+    "category": "informational",
+    "results_before_filter": 24,
+    "total": 23,
+    "neg": [
+      "internships"
+    ],
+    "pos": [
+      "build",
+      "college",
+      "credible",
+      "final",
+      "how",
+      "internships",
+      "resume",
+      "student",
+      "year"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "How to Build a Strong Resume as a College Student - EMERGE",
+        "url": "https://emergescholars.org/blog/how-to-build-a-strong-resume-as-a-college-student/",
+        "score": 1.0,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Resume Writing Advice for Final Year Students: A Comprehensive \u2026",
+        "url": "https://www.cvowl.com/blog/resume-writing-advice-for-final-year-students",
+        "score": 0.969,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "7 Ways to Boost Your Resume as a College Student - Dexian",
+        "url": "https://dexian.com/blog/7-ways-to-boost-your-resume-as-a-college-student/",
+        "score": 0.959,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Write a Killer College Resume (That Gets You Noticed)",
+        "url": "https://www.pearson.com/channels/blog/how-to-write-a-killer-college-resume-that-gets-you-noticed",
+        "score": 0.851,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Free Final Year Student Resume Template to Edit Online",
+        "url": "https://www.template.net/edit-online/384748/final-year-student-resume",
+        "score": 0.849,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Resume Builder For College Students: Be Ready To Submit, Fast!",
+        "url": "https://www.careerflow.ai/blog/resume-builder-for-college-students",
+        "score": 0.843,
+        "authority": 0.85,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "College Student Resume: Examples, Template, & Tips - Zety",
+        "url": "https://zety.com/blog/college-student-resume-example",
+        "score": 0.833,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "2026 How to Build a Resume in College - Research.com",
+        "url": "https://research.com/student-guides/career-planning/how-to-build-a-resume-in-college",
+        "score": 0.812,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "9 Resume Tips for College Students (With Examples) - Indeed",
+        "url": "https://www.indeed.com/career-advice/resumes-cover-letters/college-resume-tips-with-examples",
+        "score": 0.811,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Free College Student Resume Example | Kickresume",
+        "url": "https://www.kickresume.com/en/help-center/free-college-student-resume-sample/",
+        "score": 0.791,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "College Student Resume Guide 2026 | Stand Out to Recruiters",
+        "url": "https://techncv.com/blog/college-student-resume",
+        "score": 0.787,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Write a College Resume (+ Example Templates)",
+        "url": "https://www.collegeessayguy.com/blog/college-resume-templates",
+        "score": 0.746,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "25 College Student Resume Examples and Templates for 2026",
+        "url": "https://www.resumebuilder.com/resume-examples/college/",
+        "score": 0.743,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Final-year Student Resume Example in 2026 - ResumeKraft",
+        "url": "https://resumekraft.com/final-year-student-resume-example/",
+        "score": 0.72,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Write Resume for Final Year Student? Stand Out",
+        "url": "https://wordscr.com/how-to-write-resume-for-final-year-student/",
+        "score": 0.718,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 6
+  },
+  {
+    "id": "s15",
+    "endpoint": "search",
+    "q": "why do indian cities face frequent power cuts during summer and how can households prepare",
+    "status": 200,
+    "intent": "informational",
+    "confidence": 0.31810203194618225,
+    "category": "informational",
+    "results_before_filter": 20,
+    "total": 20,
+    "neg": [],
+    "pos": [
+      "cities",
+      "cuts",
+      "face",
+      "frequent",
+      "households",
+      "how",
+      "indian",
+      "power",
+      "prepare",
+      "summer",
+      "why"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Explained: Why Mumbaikars are enduring more power cuts this summer ...",
+        "url": "https://indianexpress.com/article/cities/mumbai/why-mumbaikars-enduring-electricity-power-cuts-summer-10736018/",
+        "score": 1.0,
+        "authority": 1.0,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "Energy Crisis: Why Power Cut in India Is Getting Worse",
+        "url": "https://nextdaynation.com/blog/power-cut-in-india-energy-crisis-2025/",
+        "score": 0.899,
+        "authority": 0.9,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "India battles power cuts as heatwave boosts electricity demand to ...",
+        "url": "https://www.reuters.com/business/energy/india-battles-power-cuts-heatwave-boosts-electricity-demand-record-2026-05-22/",
+        "score": 0.804,
+        "authority": 1.0,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "Urban power supply: How cities can meet peak demand in summers",
+        "url": "https://citizenmatters.in/power-cuts-discoms-air-conditioners-summer/",
+        "score": 0.767,
+        "authority": 0.65,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "Bridging the Gap: Analyzing Power Outages and Solutions in India",
+        "url": "https://www.linkedin.com/pulse/bridging-gap-analyzing-power-outages-solutions-india-amit-kumar",
+        "score": 0.731,
+        "authority": 0.8,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "India faces power cuts as heatwave drives record electricity demand",
+        "url": "https://www.business-standard.com/india-news/india-faces-power-cuts-as-heatwave-drives-record-electricity-demand-126052201049_1.html",
+        "score": 0.719,
+        "authority": 0.7,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "Why Power Cuts Still Happen in India & Energy Solutions",
+        "url": "https://www.energycompany.in/why-power-cuts-still-happen-in-india",
+        "score": 0.716,
+        "authority": 0.55,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "Why Do Power Cuts Happen in India? - Chai Nomad",
+        "url": "https://chainomad.com/why-do-power-cuts-happen-in-india/",
+        "score": 0.69,
+        "authority": 0.6,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "Power crisis: This summer may bring the worst blackouts yet",
+        "url": "https://www.policycircle.org/industry/indias-power-crisis-this-summer/",
+        "score": 0.666,
+        "authority": 0.9,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "85% of Indian households surveyed face power outages every day",
+        "url": "https://www.localcircles.com/a/press/page/power-outage-survey",
+        "score": 0.648,
+        "authority": 0.5,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "Why - Wikipedia",
+        "url": "https://en.wikipedia.org/wiki/Why",
+        "score": 0.197,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Why \u2013 meaning, definition, etymology, examples and more \u2014 Self ...",
+        "url": "https://selfexploration.academy/the-academic-glossary/why",
+        "score": 0.188,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Michael Jackson Why - YouTube",
+        "url": "https://www.youtube.com/watch?v=Ac4JvziFzNc",
+        "score": 0.186,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "WHY Definition & Meaning - Merriam-Webster",
+        "url": "https://www.merriam-webster.com/dictionary/why",
+        "score": 0.138,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "WHY | English meaning - Cambridge Dictionary",
+        "url": "https://dictionary.cambridge.org/dictionary/english/why",
+        "score": 0.083,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 2117
+  },
+  {
+    "id": "s16",
+    "endpoint": "search",
+    "q": "compare the noise level and print quality of resin versus filament 3d printers for tabletop miniatures",
+    "status": 200,
+    "intent": "comparison",
+    "confidence": 0.8999999761581421,
+    "category": "informational",
+    "results_before_filter": 3,
+    "total": 3,
+    "neg": [],
+    "pos": [
+      "3d",
+      "compare",
+      "filament",
+      "level",
+      "miniatures",
+      "noise",
+      "print",
+      "printers",
+      "quality",
+      "resin",
+      "tabletop"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "FDM vs Resin 3D Printing: Which Is Best for Miniatures in 2026?",
+        "url": "https://blog.lootstudios.com/print/the-ultimate-fdm-versus-resin-guide/",
+        "score": 1.0,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Resin Vs. Filament 3D Printers: Which One Should You Choose?",
+        "url": "https://www.3dtechvalley.com/resin-vs-filament-3d-printer/",
+        "score": 0.057,
+        "authority": 0.5,
+        "sources": [
+          "brave"
+        ]
+      },
+      {
+        "title": "Best 3D Printers for Miniatures 2026: Resin & FDM Tested",
+        "url": "https://gadgetschamp.com/printers/best-3d-printer-for-miniatures/",
+        "score": 0.05,
+        "authority": 0.9,
+        "sources": [
+          "brave"
+        ]
+      }
+    ],
+    "ms": 1473
+  },
+  {
+    "id": "s17",
+    "endpoint": "search",
+    "q": "where can i learn rust programming through interactive browser based exercises completely free",
+    "status": 200,
+    "intent": "technical",
+    "confidence": 0.6000000238418579,
+    "category": "informational",
+    "results_before_filter": 4,
+    "total": 4,
+    "neg": [],
+    "pos": [
+      "based",
+      "browser",
+      "completely",
+      "exercises",
+      "interactive",
+      "rust",
+      "where"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Learn Rust Free: 26 Interactive Lessons + Playground",
+        "url": "https://learningrust.org/",
+        "score": 0.057,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Learn Rust | Free Interactive Rust Tutorial | Learn2Code",
+        "url": "https://www.learn2code.io/languages/rust",
+        "score": 0.054,
+        "authority": 0.65,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Learn Rust Programming Course \u2013 Interactive Rust Language Tutorial on Replit",
+        "url": "https://www.freecodecamp.org/news/rust-in-replit/",
+        "score": 1.0,
+        "authority": 0.7,
+        "sources": [
+          "local"
+        ]
+      },
+      {
+        "title": "Learn Rust Free - Ownership, Borrowing, Real Code | Coddy",
+        "url": "https://coddy.tech/landing/rust",
+        "score": 0.05,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 2230
+  },
+  {
+    "id": "s18",
+    "endpoint": "search",
+    "q": "what are the health risks of cooking with a nonstick pan that has scratched teflon coating",
+    "status": 200,
+    "intent": "informational",
+    "confidence": 0.2935701608657837,
+    "category": "informational",
+    "results_before_filter": 15,
+    "total": 15,
+    "neg": [],
+    "pos": [
+      "a nonstick",
+      "coating",
+      "cooking",
+      "health",
+      "pan",
+      "risks",
+      "scratched",
+      "teflon",
+      "what"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Is Scratched Nonstick Dangerous? Health Risks, Safety Tips & When \u2026",
+        "url": "https://www.solamexhome.com/blog/is-scratched-nonstick-dangerous-a-complete-guide",
+        "score": 1.0,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Is it Safe to Use Teflon Pans that are Scratched? A Comprehensive Guide",
+        "url": "https://shortfoodblog.com/is-it-safe-to-use-teflon-pans-that-are-scratched/",
+        "score": 0.794,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Are Nonstick Pans Toxic? 5 Dangers of PFAS in Your Kitchen",
+        "url": "https://theroundup.org/are-nonstick-pans-toxic-dangers-pfas/",
+        "score": 0.758,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Is It Safe To Use Scratched Nonstick Pans? Here\u2019s What Experts Say",
+        "url": "https://www.simplyrecipes.com/is-it-safe-to-use-scratched-nonstick-pans-7480071",
+        "score": 0.73,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "PFAS in Your Pan? The Hidden Dangers of Scratched Teflon",
+        "url": "https://www.perkinelmer.com/library/atl-pfas-in-your-pan.html",
+        "score": 0.686,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Is It Safe To Use Scratched Non Stick Cookware? Expert Insights",
+        "url": "https://cookwareguider.com/is-it-safe-to-use-scratched-non-stick-cookware/",
+        "score": 0.646,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Is Scratched Non Stick Cookware Dangerous? A Safety Guide",
+        "url": "https://cookwithrome.com/cookware/is-scratched-non-stick-cookware-dangerous/",
+        "score": 0.608,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Is Non-Stick Cookware Safe - safekitchn.com",
+        "url": "https://safekitchn.com/is-non-stick-cookware-safe-guide/",
+        "score": 0.581,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Are nonstick pans toxic? Research, safety, and alternatives",
+        "url": "https://www.medicalnewstoday.com/articles/are-nonstick-pans-toxic",
+        "score": 0.54,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Is It Dangerous to Cook with Scratched Teflon Pans?",
+        "url": "https://cookingupdate.com/is-it-dangerous-to-cook-with-scratched-teflon-pans/",
+        "score": 0.539,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Are Scratched Nonstick Pans Safe to Use? - mykitchenhints.com",
+        "url": "https://mykitchenhints.com/are-scratched-nonstick-pans-safe-to-use/",
+        "score": 0.537,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Is It Safe To Use A Pan With Non-Stick Coating Coming Off ...",
+        "url": "https://cookedbytaste.com/is-it-safe-to-use-pan-with-non-stick-coating-coming-off/",
+        "score": 0.515,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Scratched Teflon Dangers: Is Your Pan Safe? [Safety Guide]",
+        "url": "https://cookcube.blog/dangers-scratched-teflon-cookware-home-guides",
+        "score": 0.499,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Is Non-Stick Cookware Safe? What the Science Actually Says (2026)",
+        "url": "https://nontoxiclab.com/is-non-stick-cookware-safe/",
+        "score": 0.395,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Truth About Non-Stick Cookware and Food Safety",
+        "url": "https://www.globalfoodconsumers.org/food-safety/truth-about-non-stick-cookware-and-food-safety/",
+        "score": 0.05,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 6648
+  },
+  {
+    "id": "s19",
+    "endpoint": "search",
+    "q": "how to start a small rooftop vegetable garden in a hot tropical climate with very limited space",
+    "status": 200,
+    "intent": "how-to",
+    "confidence": 0.6000000238418579,
+    "category": "informational",
+    "results_before_filter": 6,
+    "total": 6,
+    "neg": [],
+    "pos": [
+      "climate",
+      "garden",
+      "hot",
+      "how",
+      "limited",
+      "rooftop",
+      "space",
+      "start",
+      "tropical",
+      "vegetable"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Rooftop Vegetable Garden Setup Guide - gardeningtrace.com",
+        "url": "https://gardeningtrace.com/by-space/rooftop-vegetable-garden-setup-guide",
+        "score": 1.0,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Start a Rooftop Vegetable Garden: The Expert Guide",
+        "url": "https://gardeningpleasure.com/how-to-start-a-rooftop-vegetable-garden/",
+        "score": 0.812,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Small Space Rooftop Garden Hacks - Stay Green Garden",
+        "url": "https://staygreengarden.com/small-space-rooftop-garden-hacks/",
+        "score": 0.76,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Secrets to stunning small tropical garden design + photos",
+        "url": "https://tropicalstyleplants.com/secrets-to-stunning-small-tropical-garden-design/",
+        "score": 0.252,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Tropical Vegetable Planting: Growing in Hot and Humid Climates",
+        "url": "https://gardeningtips.in/tropical-vegetable-planting-hot-and-humid-climates",
+        "score": 0.15,
+        "authority": 0.65,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Grow Your Own Edible Oasis: A Comprehensive Guide to Rooftop Vegetable ...",
+        "url": "https://greatgardenplans.com/how-to-grow-rooftop-vegetable-garden/",
+        "score": 0.05,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 5648
+  },
+  {
+    "id": "s20",
+    "endpoint": "search",
+    "q": "a privacy focused web browser that blocks ads and trackers by default and is not based on chromium",
+    "status": 200,
+    "intent": "informational",
+    "confidence": 0.37148988,
+    "category": "informational",
+    "results_before_filter": 4,
+    "total": 2,
+    "neg": [
+      "based"
+    ],
+    "pos": [
+      "ads",
+      "blocks",
+      "browser",
+      "chromium",
+      "default",
+      "focused",
+      "is",
+      "privacy",
+      "trackers",
+      "web"
+    ],
+    "spell": "a privacy focused web browser that blocks ads and trackers by default and is not based on chromium",
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Top 5 Privacy-Focused Web Browsers In 2026 - techgolly.com",
+        "url": "https://techgolly.com/top-5-privacy-focused-web-browsers-in-2026",
+        "score": 1.0,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Free Ad Blocker for Chrome | Block Ads & Trackers | Ghostery",
+        "url": "https://www.ghostery.com/ghostery-ad-blocker-chrome",
+        "score": 0.085,
+        "authority": 0.5,
+        "sources": [
+          "brave"
+        ]
+      }
+    ],
+    "ms": 4
+  },
+  {
+    "id": "s21",
+    "endpoint": "search",
+    "q": "what is the cultural history behind the celebration of pongal in tamil nadu",
+    "status": 200,
+    "intent": "informational",
+    "confidence": 0.4063620865345001,
+    "category": "informational",
+    "results_before_filter": 9,
+    "total": 9,
+    "neg": [],
+    "pos": [
+      "behind",
+      "celebration",
+      "cultural",
+      "history",
+      "nadu",
+      "pongal",
+      "tamil",
+      "what"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Pongal Festival of Tamil Nadu: A Celebration of Harvest, Gratitude, \u2026",
+        "url": "https://cultureandheritage.org/pongal-festival-of-tamil-nadu-a-celebration-of-harvest-gratitude-and-prosperity",
+        "score": 0.117,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Pongal | Harvest Festival, Rituals, Tamil Nadu, India, & Rice | Britannica",
+        "url": "https://www.britannica.com/topic/Pongal",
+        "score": 0.114,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Pongal: The Divine Harvest Festival Sacred to Tamil Hearts",
+        "url": "https://hindutone.com/festivals/pongal-the-divine-harvest-festival-sacred-to-tamil-hearts/",
+        "score": 0.114,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Pongal (\u0baa\u0bca\u0b99\u0bcd\u0b95\u0bb2\u0bcd) \u2014 Tamil Festival Guide",
+        "url": "https://discovertamil.com/resources/festivals/pongal",
+        "score": 0.112,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Pongal: The Heartbeat of Tamil Nadu's Festive Spirit",
+        "url": "https://tamilculture.in/pongal-the-heartbeat-of-tamil-nadu-s-festive-spirit",
+        "score": 0.108,
+        "authority": 0.65,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Love hotels in Tamil Nadu",
+        "url": "https://www.hotelsintamilnadu.com/en/type/love-hotels-28/",
+        "score": 0.096,
+        "authority": 0.6,
+        "sources": [
+          "local"
+        ]
+      },
+      {
+        "title": "Campsites in Tamil Nadu",
+        "url": "https://www.hotelsintamilnadu.com/en/type/campsites-35/",
+        "score": 0.069,
+        "authority": 0.6,
+        "sources": [
+          "local"
+        ]
+      },
+      {
+        "title": "Economy hotels in Tamil Nadu",
+        "url": "https://www.hotelsintamilnadu.com/en/type/economy-hotels-26/",
+        "score": 0.05,
+        "authority": 0.6,
+        "sources": [
+          "local"
+        ]
+      },
+      {
+        "title": "What is Pongal? | Pongal Festival Explained for Kids | Pongal Celebration #indianculture ",
+        "url": "https://www.youtube.com/watch?v=ogcx-yH1zJY",
+        "score": 1.0,
+        "authority": 0.5,
+        "sources": [
+          "invidious"
+        ]
+      }
+    ],
+    "ms": 2530
+  },
+  {
+    "id": "s22",
+    "endpoint": "search",
+    "q": "how does a differential gear work in a car and why is it needed when turning corners",
+    "status": 200,
+    "intent": "how-to",
+    "confidence": 0.6000000238418579,
+    "category": "informational",
+    "results_before_filter": 4,
+    "total": 4,
+    "neg": [],
+    "pos": [
+      "car",
+      "corners",
+      "differential",
+      "gear",
+      "how",
+      "needed",
+      "turning",
+      "why",
+      "work"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "How does a differential gear work? - tec-science",
+        "url": "https://www.tec-science.com/mechanical-power-transmission/planetary-gear/how-does-a-differential-gear-work/",
+        "score": 1.0,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Differential Gear: How It Works, Diagram & Examples | FIRGELLI",
+        "url": "https://www.firgelliauto.com/blogs/mechanisms/differential-mechanical-device",
+        "score": 0.43,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How does a differential gear work? - mechbasic.com",
+        "url": "https://mechbasic.com/how-does-a-differential-gear-work/",
+        "score": 0.408,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How Does an Axle Differential Work? | Gear Basics Explained",
+        "url": "https://wellwhisk.com/how-does-an-axle-differential-work/",
+        "score": 0.05,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 2185
+  },
+  {
+    "id": "s23",
+    "endpoint": "search",
+    "q": "what are some good open source tools to create animated explainer videos without paying a subscription",
+    "status": 200,
+    "intent": "informational",
+    "confidence": 0.48278993,
+    "category": "informational",
+    "results_before_filter": 4,
+    "total": 4,
+    "neg": [
+      "paying"
+    ],
+    "pos": [
+      "animated",
+      "create",
+      "explainer",
+      "open",
+      "source",
+      "subscription",
+      "tools",
+      "videos",
+      "what"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "10 Essential Tools to Create Stunning Explainer Video - Gisteo | Animated Explainer Video Company",
+        "url": "https://gisteo.com/blogs/video-production/essential-tools-create-explainer-videos/",
+        "score": 1.0,
+        "authority": 1.0,
+        "sources": [
+          "brave"
+        ]
+      },
+      {
+        "title": "5 Open Source Alternatives to Notion",
+        "url": "https://opensourcealternative.to/alternativesto/notion",
+        "score": 0.083,
+        "authority": 0.75,
+        "sources": [
+          "local"
+        ]
+      },
+      {
+        "title": "7 Open Source Alternatives to Notion That Just Work",
+        "url": "https://opensourcealternatives.substack.com/p/open-source-alternatives-to-notion",
+        "score": 0.082,
+        "authority": 0.5,
+        "sources": [
+          "local"
+        ]
+      },
+      {
+        "title": "Microsoft Open Source",
+        "url": "https://opensource.microsoft.com/",
+        "score": 0.082,
+        "authority": 0.5,
+        "sources": [
+          "local"
+        ]
+      }
+    ],
+    "ms": 14
+  },
+  {
+    "id": "s24",
+    "endpoint": "search",
+    "q": "how can i improve my hindi writing skills when my native language is english",
+    "status": 200,
+    "intent": "how-to",
+    "confidence": 0.6642863750457764,
+    "category": "informational",
+    "results_before_filter": 9,
+    "total": 9,
+    "neg": [],
+    "pos": [
+      "english",
+      "hindi",
+      "how",
+      "improve",
+      "native",
+      "skills",
+      "writing"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Online hindi lessons - Learn hindi - How do I improve my writing skills ...",
+        "url": "https://www.lingo-play.com/en/hindi-articles/how-can-i-improve-my-written-hindi-language-skills/",
+        "score": 0.107,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Improve Hindi Writing Skills in 30 Days | Hindi Check",
+        "url": "https://www.hindicheck.in/blogs/how-to-improve-hindi-writing-30-days",
+        "score": 0.097,
+        "authority": 0.85,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "improve hindi writing skills - Free Language",
+        "url": "https://freelanguage.org/learn-hindi/skill-enhancement/improve-hindi-writing-skills",
+        "score": 0.081,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Write Hindi? Master Hindi Writing - WordSCR",
+        "url": "https://wordscr.com/how-to-write-hindi/",
+        "score": 1.0,
+        "authority": 0.6,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "Master Hindi Writing Practice: Improve Your Skills Fast",
+        "url": "https://talkpal.ai/master-hindi-writing-practice-improve-your-skills-fast/",
+        "score": 0.071,
+        "authority": 0.65,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Improve Your Hindi Writing Ability - hindiapp.in",
+        "url": "https://hindiapp.in/how-to-improve-your-hindi-writing-ability/",
+        "score": 0.07,
+        "authority": 0.65,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "IMPROVE | definition in the Cambridge English Dictionary",
+        "url": "https://dictionary.cambridge.org/us/dictionary/english/improve",
+        "score": 0.056,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "IMPROVE definition and meaning | Collins English Dictionary",
+        "url": "https://www.collinsdictionary.com/dictionary/english/improve",
+        "score": 0.053,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Improve - definition of improve by The Free Dictionary",
+        "url": "https://www.thefreedictionary.com/improve",
+        "score": 0.05,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 2609
+  },
+  {
+    "id": "s25",
+    "endpoint": "search",
+    "q": "what should i check carefully before signing a rental agreement for a flat in chennai",
+    "status": 200,
+    "intent": "informational",
+    "confidence": 0.35091567,
+    "category": "informational",
+    "results_before_filter": 9,
+    "total": 8,
+    "neg": [],
+    "pos": [
+      "agreement",
+      "carefully",
+      "check",
+      "chennai",
+      "flat",
+      "rental",
+      "signing",
+      "what"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Chennai House Rental Agreement Template",
+        "url": "https://www.scribd.com/document/432547755/Rental-Agreement-format-in-Chennai",
+        "score": 1.0,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "What You need to Know About Rentals in Chennai?",
+        "url": "https://www.stanzaliving.com/blog/what-you-need-to-know-about-rentals-in-chennai",
+        "score": 0.752,
+        "authority": 0.8,
+        "sources": [
+          "brave"
+        ]
+      },
+      {
+        "title": "Rental Chennai Agreement Template: Fill out & sign online | DocHub",
+        "url": "https://www.dochub.com/fillable-form/445414-rental-chennai-agreement-template",
+        "score": 0.609,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Online Rent Agreement in Chennai - NoBroker",
+        "url": "https://www.nobroker.in/rental-agreement-in-chennai/contract",
+        "score": 0.561,
+        "authority": 0.85,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "What Tenants Should Know About Rental Agreement | PropertyAngel",
+        "url": "https://www.propertyangel.in/propertyangel-blog/what-tenants-should-know-about-rental-agreement",
+        "score": 0.544,
+        "authority": 0.85,
+        "sources": [
+          "brave"
+        ]
+      },
+      {
+        "title": "Make a Rental Agreement in Chennai and Tamil Nadu",
+        "url": "https://legaldesk.com/documents/rental-agreement/tn-chennai",
+        "score": 0.305,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Rental Agreement Format in Chennai: Top 5 Tips for a Successful Lease | Maadiveedu Real Estate Blog | MaadiVeedu",
+        "url": "https://blog.maadiveedu.com/hysense/rental-agreement-format-in-chennai-top-5-tips-for-a-successful-lease",
+        "score": 0.204,
+        "authority": 0.8,
+        "sources": [
+          "brave"
+        ]
+      },
+      {
+        "title": "Rental Agreement - House Rent Agreement Terms, Format, and Types",
+        "url": "https://cleartax.in/s/rental-agreement-format-download",
+        "score": 0.05,
+        "authority": 0.85,
+        "sources": [
+          "brave"
+        ]
+      }
+    ],
+    "ms": 0
+  },
+  {
+    "id": "s26",
+    "endpoint": "search",
+    "q": "compare the benefits of brisk walking versus running for losing weight and protecting knee joints",
+    "status": 200,
+    "intent": "comparison",
+    "confidence": 0.9,
+    "category": "informational",
+    "results_before_filter": 3,
+    "total": 2,
+    "neg": [],
+    "pos": [
+      "benefits",
+      "brisk",
+      "compare",
+      "joints",
+      "knee",
+      "losing",
+      "protecting",
+      "running",
+      "walking",
+      "weight"
+    ],
+    "spell": "compare the benefits of brisk walking versus running for losing weight and protecting knee joints",
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Walking Versus Running for Health: Which is Better for You? | BJC",
+        "url": "https://www.bjc.org/news/walking-vs-running-health-which-better-you",
+        "score": 0.099,
+        "authority": 0.9,
+        "sources": [
+          "brave"
+        ]
+      },
+      {
+        "title": "Walking vs Running \u2014 Health Benefits Side by Side",
+        "url": "https://symptomvault.com/walking-vs-running",
+        "score": 1.0,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 0
+  },
+  {
+    "id": "s27",
+    "endpoint": "search",
+    "q": "how do i back up my entire linux system to an external drive as a bootable image",
+    "status": 200,
+    "intent": "technical",
+    "confidence": 0.6000000238418579,
+    "category": "informational",
+    "results_before_filter": 23,
+    "total": 23,
+    "neg": [],
+    "pos": [
+      "back",
+      "bootable",
+      "drive",
+      "entire",
+      "external",
+      "how",
+      "image",
+      "linux"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "backup - How to back up my entire system? - Ask Ubuntu",
+        "url": "https://askubuntu.com/questions/7809/how-to-back-up-my-entire-system",
+        "score": 0.111,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Create a Bootable System Backup in Linux Using `rsync`",
+        "url": "https://blog.robintehofstee.com/blog/How-to-clone-your-system-or-create-a-backup-image-in-linux-rsync",
+        "score": 0.107,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Creating and Restoring a Linux System Image - Baeldung",
+        "url": "https://www.baeldung.com/linux/system-image-create-restore",
+        "score": 0.105,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Backing up and Restoring your Linux System with Clonezilla",
+        "url": "https://wiki.nobaraproject.org/backup-clonezilla",
+        "score": 0.098,
+        "authority": 0.85,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Effective Methods for Backing Up Entire Ubuntu Systems",
+        "url": "https://www.vinchin.com/linux-backup/ubuntu-backup-whole-system.html",
+        "score": 0.098,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Best way to \"clone\" or backup my entire Linux OS ... - Reddit",
+        "url": "https://www.reddit.com/r/linuxquestions/comments/13pd3cv/best_way_to_clone_or_backup_my_entire_linux_os/",
+        "score": 1.0,
+        "authority": 0.95,
+        "sources": [
+          "duckduckgo-onion"
+        ]
+      },
+      {
+        "title": "Clone a Linux System: dd, Partimage, Clonezilla",
+        "url": "https://linuxconfig.org/how-to-clone-a-linux-system",
+        "score": 0.096,
+        "authority": 0.7,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Creating bootable images and scripts - Linux Bash",
+        "url": "https://linuxbash.sh/post/creating-bootable-images-and-scripts",
+        "score": 0.096,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Use Clonezilla Live to Back Up Your Hard Drive - LinuxBabe",
+        "url": "https://www.linuxbabe.com/backup/how-to-use-clonezilla-live",
+        "score": 0.095,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to Clone a Linux System: A Comprehensive Guide",
+        "url": "https://www.dotlinux.net/blog/how-to-clone-a-linux-system/",
+        "score": 0.095,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Full system backup with tar - ArchWiki",
+        "url": "https://wiki.archlinux.org/title/Full_system_backup_with_tar",
+        "score": 0.093,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "8 Best Free Disk Cloning & Backup Tools for Linux (2024) - Tecmint",
+        "url": "https://www.tecmint.com/linux-disk-cloning-tools/",
+        "score": 0.086,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "How to make a disk image and restore from it later? - Ask Ubuntu",
+        "url": "https://askubuntu.com/questions/19901/how-to-make-a-disk-image-and-restore-from-it-later",
+        "score": 0.077,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Back: Anatomy, parts, diagrams and function | Kenhub",
+        "url": "https://www.kenhub.com/en/library/anatomy/back",
+        "score": 0.076,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Back pain - Symptoms and causes - Mayo Clinic",
+        "url": "https://www.mayoclinic.org/diseases-conditions/back-pain/symptoms-causes/syc-20369906",
+        "score": 0.072,
+        "authority": 1.0,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 3642
+  },
+  {
+    "id": "s28",
+    "endpoint": "search",
+    "q": "what are the main reasons new youtube channels fail to grow in their first year and how to avoid them",
+    "status": 200,
+    "intent": "how-to",
+    "confidence": 0.44999998807907104,
+    "category": "informational",
+    "results_before_filter": 9,
+    "total": 9,
+    "neg": [],
+    "pos": [
+      "avoid",
+      "channels",
+      "fail",
+      "grow",
+      "how",
+      "main",
+      "reasons",
+      "their",
+      "them",
+      "what",
+      "year",
+      "youtube"
+    ],
+    "spell": null,
+    "error": null,
+    "message": null,
+    "warnings": null,
+    "top5": [
+      {
+        "title": "Why Most YouTube Channels Fail and How to Fix Your Strategy",
+        "url": "https://prapermedia.com/blog/why-youtube-channels-fail-strategy-fix/",
+        "score": 1.0,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Common YouTube mistakes: 11 mistakes and how to avoid them",
+        "url": "https://www.tubebuddy.com/blog/11-common-youtube-mistakes-and-how-to-avoid-them/",
+        "score": 0.793,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Why Your YouTube Channel Isn't Growing \u2014 7 Fixes",
+        "url": "https://www.tubeanalytics.net/blog/youtube-channel-not-growing",
+        "score": 0.696,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Five Habits That Cause 98% of New YouTube Channels to Fail",
+        "url": "https://magica.com/youtube-summarizer/five-habits-that-cause-98-of-new-youtube-channels-to-fail-FT4U4Td-ldM",
+        "score": 0.648,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Why Most YouTube Channels Fail to Grow & How to Avoid Their",
+        "url": "https://medium.com/@kargbom434/why-most-youtube-channels-fail-to-grow-how-to-avoid-their-mistakes-c9cda847f201",
+        "score": 0.398,
+        "authority": 0.9,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "12 Critical Mistakes That Destroy YouTube Channel Growth in 2025 \u2026",
+        "url": "https://thegoguy.com/critical-mistakes-that-kill-youtube-channel-growth/",
+        "score": 0.382,
+        "authority": 0.6,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "9 Common Reasons Why New YouTube Channels Fail",
+        "url": "https://www.makeuseof.com/reasons-new-youtube-channels-fail/",
+        "score": 0.252,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "The Real Reason Most YouTube Channels Fail Early - LinkedIn",
+        "url": "https://www.linkedin.com/pulse/why-most-youtube-channels-fail-before-publish-first-video-khatun-lthlc",
+        "score": 0.101,
+        "authority": 0.8,
+        "sources": [
+          "bing"
+        ]
+      },
+      {
+        "title": "Why Most New YouTube Channels Fail (4 Big Mistakes)",
+        "url": "https://www.youtube.com/watch?v=aroirxAubao",
+        "score": 0.05,
+        "authority": 0.5,
+        "sources": [
+          "bing"
+        ]
+      }
+    ],
+    "ms": 5943
+  },
+  {
+    "id": "v01",
+    "endpoint": "videos",
+    "q": "how to fold a fitted sheet neatly without it becoming a ball",
+    "status": 200,
+    "count": 58,
+    "top5": [
+      {
+        "title": "How to Fold a Fitted Sheet Without Getting Mad #howtomakeabed #foldafittedsheet",
+        "url": "https://www.youtube.com/watch?v=-7XQBj_fcTI",
+        "score": 1.0
+      },
+      {
+        "title": "How to Fold a Fitted Sheet the Easy Way!",
+        "url": "https://www.youtube.com/watch?v=n4yRoXwdpAE",
+        "score": 1.0
+      },
+      {
+        "title": "SATISFYING: How To Fold A Fitted Sheet Like A Pro! Easy Aesthetic Bedroom Hack DIY",
+        "url": "https://www.youtube.com/watch?v=bnoK0a9dqUM",
+        "score": 1.0
+      },
+      {
+        "title": "How to Fold a Fitted Sheet PERFECTLY (Laundry Secret Most People Don't Know)",
+        "url": "https://www.youtube.com/watch?v=MsB2HvRqUtA",
+        "score": 1.0
+      },
+      {
+        "title": "Fitted Sheet Folding Hack \ud83d\udecf | Easiest Way to Fold Like a Pro! #FittedSheetHack",
+        "url": "https://www.youtube.com/watch?v=eCrJGGCgJf8",
+        "score": 1.0
+      }
+    ],
+    "ms": 11
+  },
+  {
+    "id": "n01",
+    "endpoint": "news",
+    "q": "major breakthroughs in room temperature superconductor research reported this month",
+    "status": 200,
+    "count": 5,
+    "top5": [
+      {
+        "title": "AI helped scientists discover two new superconductors, bringing them closer to a room-temperature breakthrough that could change electronics",
+        "url": "https://www.msn.com/en-in/news/techandscience/ai-helped-scientists-discover-two-new-superconductors-bringing-them-closer-to-a-room-temperature-breakthrough-that-could-change-electronics/ar-AA27u2Jk"
+      },
+      {
+        "title": "Scientists break 30-year superconductivity record at normal pressure",
+        "url": "https://www.sciencedaily.com/releases/2026/05/260527023220.htm"
+      },
+      {
+        "title": "AI just supercharged the race to find room temperature superconductors",
+        "url": "https://sciencedaily.com/releases/2026/07/260701205006.htm"
+      },
+      {
+        "title": "Scientists shatter 30-year superconductivity record with zero-resistance material that works at normal pressure",
+        "url": "https://www.yahoo.com/news/science/articles/scientists-shatter-30-superconductivity-record-050000859.html"
+      },
+      {
+        "title": "Researchers identify new superconductors, unlocking process that could yield thousands more",
+        "url": "https://www.eurekalert.org/news-releases/1133828"
+      }
+    ],
+    "ms": 0
+  },
+  {
+    "id": "i01",
+    "endpoint": "images",
+    "q": "labeled diagram of the layers of earth atmosphere",
+    "status": 200,
+    "count": 85,
+    "top5": [
+      {
+        "title": "Levels of Ecological Organization",
+        "url": "https://www.sciencefacts.net/wp-content/uploads/2020/05/Layers-of-the-Atmosphere.jpg"
+      },
+      {
+        "title": "Atmosphere of earth with labeled layers and distance model outline ...",
+        "url": "https://i.pinimg.com/originals/63/af/c4/63afc40bef2752b6edc7f0178fbdc53c.jpg"
+      },
+      {
+        "title": "Atmosphere Layers",
+        "url": "https://cdn2.vectorstock.com/i/1000x1000/94/71/layers-of-earth-atmosphere-poster-vector-30349471.jpg"
+      },
+      {
+        "title": "Earth Atmosphere Diagram Earth Atmosphere Diagram | Earth Atmosphere",
+        "url": "https://www.shutterstock.com/shutterstock/photos/1216516150/display_1500/stock-vector-diagram-of-the-layers-within-earth-s-atmosphere-illustration-vector-eps-1216516150.jpg"
+      },
+      {
+        "title": "Main Layers Earths Atmosphere Stock Vector 115547989 - Shutterstock",
+        "url": "http://image.shutterstock.com/z/stock-vector-the-main-layers-of-earth-s-atmosphere-115547989.jpg"
+      }
+    ],
+    "ms": 8
+  },
+  {
+    "id": "g_quick",
+    "endpoint": "goals_quick",
+    "body": {
+      "goal": "start a side hustle selling homemade snacks online in india"
+    },
+    "status": 200,
+    "goal_id": "goal_0001",
+    "intent": "general",
+    "resource_count": 6,
+    "roadmap_title": "Your Personalized Roadmap: start a side hustle selling homemade snacks online in india",
+    "total_duration_weeks": 12,
+    "phases": [
+      "Preparation & Foundational Setup",
+      "Core Practice & Mechanics",
+      "Technique Refinement & Execution",
+      "Mastery & Showcase"
+    ],
+    "snippet": "A 12-week journey (5-10 hours/week) across 4 phases.",
+    "ms": 4
+  },
+  {
+    "id": "g_disc",
+    "endpoint": "goals_discovery",
+    "body": {
+      "goal": "write and publish a childrens picture book about a friendly robot"
+    },
+    "status": 200,
+    "goal_id": "goal_0002",
+    "intent": "creative-writing",
+    "questions": [
+      {
+        "id": 1,
+        "q": "What is your target timeline for this goal?"
+      },
+      {
+        "id": 2,
+        "q": "How many hours per week can you dedicate?"
+      },
+      {
+        "id": 3,
+        "q": "What's your writing genre and format?"
+      },
+      {
+        "id": 4,
+        "q": "What's your creative process style?"
+      },
+      {
+        "id": 5,
+        "q": "What's your editing and revision approach?"
+      },
+      {
+        "id": 6,
+        "q": "What would make this goal feel truly accomplished to you?"
+      }
+    ],
+    "ms": 3
+  }
+]

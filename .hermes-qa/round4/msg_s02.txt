@@ -1,0 +1,13 @@
+[IntentForge round 4] commit <SHORT>
+
+fix(search): recency window no longer spuriously injected for "fresher"/"freshman"/"refresh"
+
+What changed: derive_recency_window matched "fresh"/"latest"/"recent" by bare substring, so "fresher" (and "freshman"/"refresh") wrongly triggered a 7-day date window that was forwarded to upstream SearXNG and collapsed normal informational queries to 0 results. Replaced with a whole-word matcher (q_has_word).
+
+Why: a query like "negotiate a higher salary during a job offer as a fresher" has no recency intent yet got after:2026-07-27 before:2026-08-03 applied; every web result lacked a parseable date so upstream hard-filtered them → results_before_filter=7, total=0.
+
+Verified: rebuilt gateway + up -d; cold /search on the failing query now returns 8 relevant results (top: "How to Negotiate a Job Offer & Salary: 7 Tips"), applied_constraints=null, ignored_constraints=null. No hardcoded query/dates — fix is a general word-boundary check.
+
+Self-audit: PASS. Q1 no authored prose. Q2 not applicable (signal change, not a reply). Q3 not applicable. Q4 no retraining. Q5 no threshold tuned to one query — reused existing 7-day window only for genuine "fresh"/"latest"/"recent" whole words. Q6 ran it and saw 8 results vs prior 0.
+
+Progress: 1 of ~3 planned units done. Next: local-index topical-noise gate (s06 MS page, s23 weak matches).
