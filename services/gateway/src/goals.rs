@@ -378,8 +378,7 @@ fn detect_sub_domain(goal_lower: &str) -> &'static str {
 
 fn generate_questions(goal: &str, _intent: &str) -> Vec<Question> {
     let goal_lower = goal.to_lowercase();
-    let domain = detect_sub_domain(&goal_lower);
-
+    // Domain routing removed: questions are now goal-driven, not domain-banked.
     let mut questions = vec![
         Question {
             id: 1,
@@ -408,490 +407,28 @@ fn generate_questions(goal: &str, _intent: &str) -> Vec<Question> {
         },
     ];
 
-    match domain {
-        "ai-ml" => {
-            questions.push(Question {
-                id: 3,
-                question: "What type of AI/ML system are you building?".to_string(),
-                description: "Different AI systems need different architectures — from simple API wrappers to custom model training pipelines.".to_string(),
-                options: vec![
-                    "LLM-powered app using existing APIs (OpenAI, Claude, etc.)".to_string(),
-                    "Custom model training and fine-tuning".to_string(),
-                    "Recommendation / prediction engine".to_string(),
-                    "Multi-agent system with tool use".to_string(),
-                    "Computer vision or media processing pipeline".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 4,
-                question: "What's your data strategy?".to_string(),
-                description: "AI/ML projects are data-driven — how will you source, store, and process your data?".to_string(),
-                options: vec![
-                    "Using existing public datasets".to_string(),
-                    "Generating synthetic data".to_string(),
-                    "Collecting user-generated data".to_string(),
-                    "Streaming real-time data pipeline".to_string(),
-                    "Need to acquire/annotate custom data".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 5,
-                question: "What compute infrastructure do you need?".to_string(),
-                description: "AI workloads vary from CPU-only inference to GPU-intensive training clusters.".to_string(),
-                options: vec![
-                    "CPU-only — using hosted API services".to_string(),
-                    "Single GPU — fine-tuning or small models".to_string(),
-                    "Multi-GPU — distributed training".to_string(),
-                    "Edge / on-device inference".to_string(),
-                    "Cloud TPU or specialized hardware".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 6,
-                question: "How will you handle model evaluation and monitoring?".to_string(),
-                description: "Production AI needs observability — accuracy tracking, drift detection, and feedback loops.".to_string(),
-                options: vec![
-                    "Manual evaluation — test on sample cases".to_string(),
-                    "Automated benchmark suite".to_string(),
-                    "A/B testing in production".to_string(),
-                    "Full MLOps pipeline with monitoring".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-        }
+    // No per-domain question banks. The two universal questions above already
+    // capture what the system genuinely needs (target timeline + weekly hours),
+    // which drive the real roadmap structure. We do NOT invent domain advice or
+    // canned option lists for the user to pick from -- that content would be
+    // authored, never learned. Instead we ask one open-text prompt so the user
+    // states the specifics the roadmap should reflect (real state, not our
+    // authorship), plus an open-text success vision.
+    questions.push(Question {
+        id: 3,
+        question: format!("What specifically do you want to plan for '{}'?", goal),
+        description: "Share the key decisions, constraints, or milestones you already have in mind. This shapes your roadmap directly.".to_string(),
+        options: vec![],
+        question_type: "free_text".to_string(),
+    });
 
-        "web-app" | "general-tech" | "api-backend" => {
-            questions.push(Question {
-                id: 3,
-                question: "What architecture pattern do you want to follow?".to_string(),
-                description: "The architecture shapes how your components communicate and scale.".to_string(),
-                options: vec![
-                    "Monolithic — simple, single deployable".to_string(),
-                    "Microservices — independent, deployable services".to_string(),
-                    "Serverless — functions as a service (AWS Lambda, etc.)".to_string(),
-                    "Event-driven — message queues and async processing".to_string(),
-                    "Jamstack — static frontend + APIs".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 4,
-                question: "How will you handle data persistence and storage?".to_string(),
-                description: "Data storage choices affect performance, scalability, and cost.".to_string(),
-                options: vec![
-                    "Relational database (PostgreSQL, MySQL)".to_string(),
-                    "NoSQL document store (MongoDB, Firestore)".to_string(),
-                    "Hybrid — SQL + cache layer (Redis)".to_string(),
-                    "File/object storage (S3, GCS)".to_string(),
-                    "None — fully API-driven, no persistent storage".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 5,
-                question: "What's your deployment and hosting strategy?".to_string(),
-                description: "Where and how will your application run in production?".to_string(),
-                options: vec![
-                    "PaaS (Heroku, Railway, Render)".to_string(),
-                    "Cloud VM / VPS (AWS EC2, DigitalOcean)".to_string(),
-                    "Container / Kubernetes (Docker, EKS, GKE)".to_string(),
-                    "Serverless (Lambda, Cloud Functions)".to_string(),
-                    "Edge / CDN (Cloudflare Workers, Vercel Edge)".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 6,
-                question: "Do you need real-time features?".to_string(),
-                description: "Real-time capabilities (chat, live updates, notifications) require specific infrastructure choices.".to_string(),
-                options: vec![
-                    "No real-time needed — standard request-response".to_string(),
-                    "WebSockets for live bidirectional communication".to_string(),
-                    "Server-Sent Events for push updates".to_string(),
-                    "Polling or periodic background sync".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-        }
-
-        "mobile" => {
-            questions.push(Question {
-                id: 3,
-                question: "What platform(s) are you targeting?".to_string(),
-                description: "Platform choice affects development language, tooling, and deployment.".to_string(),
-                options: vec![
-                    "iOS native (Swift/SwiftUI)".to_string(),
-                    "Android native (Kotlin/Jetpack)".to_string(),
-                    "Cross-platform (React Native, Flutter)".to_string(),
-                    "Progressive Web App (PWA)".to_string(),
-                    "All platforms".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 4,
-                question: "What backend / API architecture do you need?".to_string(),
-                description: "Mobile apps typically need a backend for data, auth, and push notifications.".to_string(),
-                options: vec![
-                    "No backend — fully offline/local-first".to_string(),
-                    "BaaS (Firebase, Supabase)".to_string(),
-                    "Custom REST/GraphQL API".to_string(),
-                    "Backend + real-time sync (WebSockets)".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 5,
-                question: "What's your offline and sync strategy?".to_string(),
-                description: "Mobile apps face connectivity challenges — how will you handle offline usage?".to_string(),
-                options: vec![
-                    "Always-online — no offline support".to_string(),
-                    "Cache recent data for offline reading".to_string(),
-                    "Full offline-first with background sync".to_string(),
-                    "Local database with conflict resolution (CRDT)".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-        }
-
-        "systems" => {
-            questions.push(Question {
-                id: 3,
-                question: "What's your target platform / hardware?".to_string(),
-                description: "Systems programming targets vary from embedded MCUs to kernel modules.".to_string(),
-                options: vec![
-                    "Linux / POSIX systems".to_string(),
-                    "Embedded / microcontroller (ARM, RISC-V)".to_string(),
-                    "Windows / Win32".to_string(),
-                    "Cross-platform / portable".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 4,
-                question: "What's your performance profile?".to_string(),
-                description: "Systems-level work requires understanding your performance constraints.".to_string(),
-                options: vec![
-                    "High throughput — processing large volumes".to_string(),
-                    "Low latency — real-time constraints".to_string(),
-                    "Memory constrained — embedded/limited RAM".to_string(),
-                    "Battery efficient — mobile/portable".to_string(),
-                    "Safety critical — fault tolerance required".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-        }
-
-        "devops" => {
-            questions.push(Question {
-                id: 3,
-                question: "What's your infrastructure scale?".to_string(),
-                description: "The scale determines tooling choices — from simple single-server to multi-cluster orchestration.".to_string(),
-                options: vec![
-                    "Single server / small project".to_string(),
-                    "Multi-service / small cluster".to_string(),
-                    "Large-scale / multi-cluster".to_string(),
-                    "Edge / multi-region deployment".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 4,
-                question: "What's your cloud provider preference?".to_string(),
-                description: "Different clouds have different services, pricing, and tooling ecosystems.".to_string(),
-                options: vec![
-                    "Amazon Web Services (AWS)".to_string(),
-                    "Google Cloud Platform (GCP)".to_string(),
-                    "Microsoft Azure".to_string(),
-                    "Multi-cloud / vendor-neutral".to_string(),
-                    "On-premise / self-hosted".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-        }
-
-        "research" => {
-            questions.push(Question {
-                id: 3,
-                question: "What's your research methodology?".to_string(),
-                description: "The methodology determines how you'll gather, analyze, and validate your findings.".to_string(),
-                options: vec![
-                    "Quantitative — experiments, metrics, statistics".to_string(),
-                    "Qualitative — interviews, case studies, observations".to_string(),
-                    "Mixed methods — both quantitative and qualitative".to_string(),
-                    "Literature review / survey paper".to_string(),
-                    "Theoretical / mathematical proof".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 4,
-                question: "What's your target publication outlet?".to_string(),
-                description: "Different venues have different expectations for scope, format, and rigor.".to_string(),
-                options: vec![
-                    "Conference paper (5-10 pages)".to_string(),
-                    "Journal article (10-20 pages)".to_string(),
-                    "Pre-print / arXiv".to_string(),
-                    "Thesis / dissertation".to_string(),
-                    "Blog post / technical report".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 5,
-                question: "What tools and resources do you have access to?".to_string(),
-                description: "Research tools range from lab equipment to cloud compute and data licenses.".to_string(),
-                options: vec![
-                    "All public/open resources — no special access".to_string(),
-                    "University / institutional resources available".to_string(),
-                    "Need to collect/generate my own data".to_string(),
-                    "Industry partnership / proprietary data access".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 6,
-                question: "Are you collaborating or working solo?".to_string(),
-                description: "Team size affects workflow, tooling, and project management approach.".to_string(),
-                options: vec![
-                    "Solo — just me".to_string(),
-                    "Small team — 2-3 collaborators".to_string(),
-                    "Research group — 4+ people".to_string(),
-                    "Cross-institutional collaboration".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-        }
-
-        "creative-writing" => {
-            questions.push(Question {
-                id: 3,
-                question: "What's your writing genre and format?".to_string(),
-                description: "Different genres have different conventions for structure, length, and style.".to_string(),
-                options: vec![
-                    "Fantasy / Science Fiction — world-building heavy".to_string(),
-                    "Literary fiction — character-driven narrative".to_string(),
-                    "Non-fiction / memoir — real-world based".to_string(),
-                    "Technical writing / documentation".to_string(),
-                    "Screenplay / script — dialogue and scene-driven".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 4,
-                question: "What's your creative process style?".to_string(),
-                description: "Understanding your writing process helps structure the project timeline.".to_string(),
-                options: vec![
-                    "Plotter — detailed outlines before writing".to_string(),
-                    "Pantser — write by the seat of your pants, discover as you go".to_string(),
-                    "Plantser — hybrid: loose outline, flexible execution".to_string(),
-                    "Iterative — write, revise, restructure multiple passes".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 5,
-                question: "What's your editing and revision approach?".to_string(),
-                description: "Quality writing requires multiple rounds of revision — how will you handle this?".to_string(),
-                options: vec![
-                    "Self-edit — multiple personal revision passes".to_string(),
-                    "Beta readers — get feedback from trusted readers".to_string(),
-                    "Professional editor — hire an editor".to_string(),
-                    "Peer review workshop — writing group feedback".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-        }
-
-        "creative-design" => {
-            questions.push(Question {
-                id: 3,
-                question: "What design medium are you working in?".to_string(),
-                description: "Different mediums require different tools, techniques, and workflows.".to_string(),
-                options: vec![
-                    "Digital illustration / 2D art".to_string(),
-                    "3D modeling / animation".to_string(),
-                    "UI/UX / web design".to_string(),
-                    "Graphic design / branding".to_string(),
-                    "Motion graphics / video".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 4,
-                question: "What's your preferred design toolchain?".to_string(),
-                description: "The right tools can dramatically affect your productivity.".to_string(),
-                options: vec![
-                    "Adobe Creative Suite (Photoshop, Illustrator)".to_string(),
-                    "Figma / Sketch (UI/UX focused)".to_string(),
-                    "Blender / Maya (3D focused)".to_string(),
-                    "Open source tools (GIMP, Inkscape, Krita)".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-        }
-
-        "business" => {
-            questions.push(Question {
-                id: 3,
-                question: "What's your business model?".to_string(),
-                description: "The business model drives product decisions, pricing, and revenue strategy.".to_string(),
-                options: vec![
-                    "SaaS — subscription-based software".to_string(),
-                    "Marketplace — connecting buyers and sellers".to_string(),
-                    "E-commerce — selling physical/digital products".to_string(),
-                    "Freemium — free tier + paid upgrades".to_string(),
-                    "Enterprise — sales-led B2B".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 4,
-                question: "Who is your target customer?".to_string(),
-                description: "Understanding your customer shapes everything from marketing to feature prioritization.".to_string(),
-                options: vec![
-                    "Individual consumers (B2C)".to_string(),
-                    "Small businesses (SMB)".to_string(),
-                    "Enterprise companies".to_string(),
-                    "Developers / technical audience".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 5,
-                question: "What stage is your business at?".to_string(),
-                description: "The stage determines priorities — from validation to growth to optimization.".to_string(),
-                options: vec![
-                    "Idea stage — validating the concept".to_string(),
-                    "Pre-launch — building the MVP".to_string(),
-                    "Early stage — first customers, iterating".to_string(),
-                    "Growth stage — scaling and optimization".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-        }
-
-        "lifestyle" => {
-            questions.push(Question {
-                id: 3,
-                question: "What is your main focus for this activity?".to_string(),
-                description: "Focusing your efforts helps tailor the practice schedule and milestones.".to_string(),
-                options: vec![
-                    "Learning fundamentals and building a routine".to_string(),
-                    "Improving technique and personal mastery".to_string(),
-                    "Completing a specific personal project or goal".to_string(),
-                    "Health, relaxation, and personal enjoyment".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 4,
-                question: "How do you prefer to practice or learn?".to_string(),
-                description: "Your environment and method shape your daily consistency.".to_string(),
-                options: vec![
-                    "Self-guided practice with guides/videos".to_string(),
-                    "Guided class or instructor-led sessions".to_string(),
-                    "Hands-on experimentation and trial".to_string(),
-                    "Group practice with friends or community".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-        }
-
-        "learning" => {
-            questions.push(Question {
-                id: 3,
-                question: "What's your learning style preference?".to_string(),
-                description: "Different learning styles benefit from different resource types and pacing.".to_string(),
-                options: vec![
-                    "Structured courses — follow a curriculum".to_string(),
-                    "Project-based — learn by building".to_string(),
-                    "Documentation-first — read & practice".to_string(),
-                    "Video tutorials — watch and code along".to_string(),
-                    "Interactive — hands-on labs and exercises".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-            questions.push(Question {
-                id: 4,
-                question: "What's your assessment goal?".to_string(),
-                description: "How will you validate your learning progress?".to_string(),
-                options: vec![
-                    "Build a portfolio project".to_string(),
-                    "Pass a certification exam".to_string(),
-                    "Contribute to open source".to_string(),
-                    "Apply knowledge at work / real project".to_string(),
-                    "Just learning — no specific assessment needed".to_string(),
-                ],
-                question_type: "single_choice".to_string(),
-            });
-        }
-
-        _ => {}
-    }
-
-    // ── Universal final question (Q99) tailored by domain ────────
-    let final_options = match domain {
-        "research" => vec![
-            "A published paper in a peer-reviewed journal or conference".to_string(),
-            "A completed manuscript ready for pre-print submission".to_string(),
-            "Validated research findings and experimental datasets".to_string(),
-            "A thesis or dissertation ready for defense".to_string(),
-            "Personal research milestone and knowledge discovery".to_string(),
-        ],
-        "creative-writing" => vec![
-            "A completed, polished manuscript ready for publishing".to_string(),
-            "A formatted book or script submitted to agents/publishers".to_string(),
-            "A published work available on target distribution platforms".to_string(),
-            "A completed first draft ready for developmental editing".to_string(),
-            "Personal creative fulfillment and storytelling milestone".to_string(),
-        ],
-        "creative-design" => vec![
-            "A finished design portfolio piece and case study".to_string(),
-            "A complete design system and asset library for production".to_string(),
-            "A published visual project or interactive artwork".to_string(),
-            "Client-ready design deliverables and prototypes".to_string(),
-            "Personal artistic growth and visual design mastery".to_string(),
-        ],
-        "business" => vec![
-            "A launched business with active paying customers and revenue".to_string(),
-            "A validated MVP with active beta users and feedback loops".to_string(),
-            "An investor-ready pitch deck, business plan, and financial model".to_string(),
-            "A scalable product with automated onboarding and growth channels".to_string(),
-            "Personal entrepreneurial milestone and venture validation".to_string(),
-        ],
-        "lifestyle" => vec![
-            "Consistently applying and enjoying this skill in daily life".to_string(),
-            "Completing a personal project or milestone".to_string(),
-            "Sharing my creation or skill with family and friends".to_string(),
-            "Improved health, relaxation, and personal fulfillment".to_string(),
-            "Personal mastery and lifelong enjoyment".to_string(),
-        ],
-        "learning" => vec![
-            "Deep understanding and practical ability to build real projects".to_string(),
-            "Passing an official professional certification exam".to_string(),
-            "A completed capstone portfolio project demonstrating mastery".to_string(),
-            "Ability to teach, mentor, or lead others in this topic".to_string(),
-            "Personal growth and mastering a new skill domain".to_string(),
-        ],
-        _ => vec![
-            "A working prototype I can demo".to_string(),
-            "A completed product ready for end users".to_string(),
-            "A production-grade system with test coverage and CI/CD".to_string(),
-            "A portfolio piece for career opportunities".to_string(),
-            "Personal satisfaction and technical mastery".to_string(),
-        ],
-    };
-
+    // Success vision -- open text, not a domain-banked list of canned options.
     questions.push(Question {
         id: 99,
         question: "What would make this goal feel truly accomplished to you?".to_string(),
-        description: "Your vision of success helps us shape the final deliverable and measure progress.".to_string(),
-        options: final_options,
-        question_type: "single_choice".to_string(),
+        description: "Your own words shape the final deliverable and how progress is measured.".to_string(),
+        options: vec![],
+        question_type: "free_text".to_string(),
     });
 
     // Re-number sequentially
@@ -914,10 +451,6 @@ fn generate_roadmap(goal: &str, answers: &[UserAnswer], resources: &[Resource]) 
 
     let timeline = answer_for(answers, 1).unwrap_or("3 months — Quarter project");
     let hours_str = answer_for(answers, 2).unwrap_or("5-10 hours — Part-time focus");
-
-    let domain = detect_sub_domain(&goal_lower);
-    let is_technical = matches!(domain, "web-app" | "ai-ml" | "mobile" | "systems"
-        | "devops" | "api-backend" | "general-tech");
 
     let (total_weeks, num_phases): (u32, usize) = match timeline {
         t if t.starts_with("1 month") => (4, 3),
@@ -944,7 +477,7 @@ fn generate_roadmap(goal: &str, answers: &[UserAnswer], resources: &[Resource]) 
         let buf_dl = crate::format_ymd(crate::days_to_ymd(buf_end));
 
         let (title, raw_desc, objectives, deliverables, ctype) = phase_content(
-            i, num_phases, goal, domain, is_technical,
+            i, num_phases, goal, answers,
         );
 
         let desc = truncate_at_word_boundary(&raw_desc, 180);
@@ -992,473 +525,100 @@ fn phase_content(
     idx: usize,
     total: usize,
     goal: &str,
-    domain: &str,
-    is_technical: bool,
+    answers: &[UserAnswer],
 ) -> (String, String, Vec<String>, Vec<String>, String) {
+    // Roadmap content is derived from REAL STATE only:
+    //   - the user's own goal text,
+    //   - the user's own free-text answers (Q3 specifics, Q99 success vision),
+    //   - the structural phase position (first / middle / last).
+    // No authored advice is injected. When the user has not supplied specifics,
+    // we emit an honest placeholder telling them to define their own objectives,
+    // rather than a fabricated "comprehensive literature review" paragraph.
     let goal_short = truncate_at_word_boundary(goal, 85);
-    let is_ai = domain == "ai-ml";
-    let is_research = domain == "research";
-    let is_business = domain == "business";
-    let is_creative_writing = domain == "creative-writing";
-    let is_creative_design = domain == "creative-design";
-    let is_learning = domain == "learning";
-    let is_lifestyle = domain == "lifestyle";
 
-    if idx == 0 {
-        let (title, desc, objs, dels) = if is_research {
-            ("Literature Review & Research Design".to_string(),
-             format!("Conduct a comprehensive literature review, define your research questions, and design the methodology for '{}'.", goal_short),
-             vec!["Conduct systematic literature review".to_string(), "Define research questions and hypotheses".to_string(), "Design methodology and data collection plan".to_string(), "Set up research tools and collaboration workflow".to_string()],
-             vec!["Literature review document".to_string(), "Research design / methodology document".to_string(), "Data collection instruments prepared".to_string()])
-        } else if is_creative_writing {
-            ("Concept Development & Outline".to_string(),
-             format!("Develop your narrative concept, outline the core structure, and create world/character guides for '{}'.", goal_short),
-             vec!["Develop core concept and premise".to_string(), "Create character bibles and worldbuilding guide".to_string(), "Construct detailed chapter/scene outline".to_string(), "Research genre conventions and style references".to_string()],
-             vec!["Story concept and outline document".to_string(), "Character and setting bible".to_string(), "Writing milestones schedule".to_string()])
-        } else if is_creative_design {
-            ("Concept Development & Research".to_string(),
-             format!("Explore design directions, define user flows/moodboards, and establish asset requirements for '{}'.", goal_short),
-             vec!["Research design benchmarks and inspirations".to_string(), "Create moodboards and color palettes".to_string(), "Map out user flows / key visual scenes".to_string(), "Set up design workspace and toolchain".to_string()],
-             vec!["Design brief and moodboard".to_string(), "User flow diagrams / composition thumbnails".to_string(), "Brand token specifications".to_string()])
-        } else if is_learning {
-            ("Foundation & Curriculum Planning".to_string(),
-             format!("Assess your starting point, gather learning resources, and create a structured study plan for '{}'.", goal_short),
-             vec!["Assess current knowledge and skill gaps".to_string(), "Gather high-quality learning resources".to_string(), "Structure study schedule and weekly goals".to_string(), "Set up practice workspace and tooling".to_string()],
-             vec!["Skills assessment document".to_string(), "Curated study plan with resources".to_string(), "Development environment ready".to_string()])
-        } else if is_business {
-            ("Market Research & Strategy".to_string(),
-             format!("Validate your business idea, conduct market research, and define value proposition for '{}'.", goal_short),
-             vec!["Conduct market research and competitive analysis".to_string(), "Validate problem-solution fit with target users".to_string(), "Define business model and monetization strategy".to_string(), "Create go-to-market plan".to_string()],
-             vec!["Market research report".to_string(), "Validated value proposition document".to_string(), "Go-to-market strategy deck".to_string()])
-        } else if is_lifestyle || (!is_technical && domain == "general") {
-            ("Preparation & Foundational Setup".to_string(),
-             format!("Gather materials, study basic principles, and establish a daily routine for '{}'.", goal_short),
-             vec!["Gather necessary tools, equipment, or ingredients".to_string(), "Learn core concepts and safety/best practices".to_string(), "Set up dedicated practice space and schedule".to_string()],
-             vec!["Preparation checklist complete".to_string(), "Practice schedule established".to_string()])
-        } else {
-            let title = "Architecture & Planning".to_string();
-            let desc = format!("Design system architecture, choose tech stack, and set up foundation for '{}'.", goal_short);
-            let objs = if is_ai {
-                vec!["Design AI/ML system architecture".to_string(), "Choose model approach and data pipeline".to_string(), "Set up development environment and GPU tooling".to_string(), "Define evaluation metrics and benchmarks".to_string()]
-            } else {
-                vec!["Design system architecture and component diagram".to_string(), "Choose tech stack and dependencies".to_string(), "Set up development environment and CI/CD".to_string(), "Define API contracts and data models".to_string()]
-            };
-            let dels = vec!["Architecture document with diagrams".to_string(), "Tech stack decision record".to_string(), "Development environment with CI/CD".to_string()];
-            (title, desc, objs, dels)
-        };
-        return (title, desc, objs, dels, "foundation".to_string());
+    fn answer_for<'a>(answers: &'a [UserAnswer], qid: usize) -> Option<&'a str> {
+        answers.iter().find(|a| a.question_id == qid)
+            .and_then(|a| a.answer.as_str())
     }
 
-    if idx == total - 1 {
-        let (title, desc, objs, dels) = if is_research {
-            ("Publication & Dissemination".to_string(),
-             format!("Finalize your paper manuscript, submit to target publication, and present findings for '{}'.", goal_short),
-             vec!["Write and format final manuscript".to_string(), "Generate publishable figures and tables".to_string(), "Submit to target journal / conference".to_string(), "Prepare presentation slides and artifact repository".to_string()],
-             vec!["Submitted research manuscript".to_string(), "Open data/code repository".to_string(), "Presentation slides".to_string()])
-        } else if is_creative_writing {
-            ("Production & Publication".to_string(),
-             format!("Perform final proofreading, format layout, and publish or submit manuscript for '{}'.", goal_short),
-             vec!["Final proofreading and line editing pass".to_string(), "Format book/script for distribution".to_string(), "Prepare cover art and metadata".to_string(), "Execute publishing or submission plan".to_string()],
-             vec!["Published / submitted manuscript".to_string(), "Promotional / query package".to_string(), "Distribution confirmation".to_string()])
-        } else if is_creative_design {
-            ("Final Asset Delivery & Presentation".to_string(),
-             format!("Export production assets, compile design portfolio case study, and present '{}'.", goal_short),
-             vec!["Export production-ready assets and design specs".to_string(), "Build interactive prototype showcase".to_string(), "Document design system guidelines".to_string(), "Publish case study / portfolio entry".to_string()],
-             vec!["Production asset package".to_string(), "Design system documentation".to_string(), "Portfolio case study".to_string()])
-        } else if is_learning {
-            ("Mastery, Capstone & Portfolio Integration".to_string(),
-             format!("Build a capstone project, validate your skills, and integrate learning into your portfolio for '{}'.", goal_short),
-             vec!["Complete comprehensive capstone project".to_string(), "Perform self-assessment / certification exam".to_string(), "Publish capstone project on GitHub/Portfolio".to_string(), "Write learning reflection and summary".to_string()],
-             vec!["Completed capstone project".to_string(), "Portfolio entry with live demo/repo".to_string(), "Certification / skill validation record".to_string()])
-        } else if is_business {
-            ("Launch & Growth".to_string(),
-             format!("Launch product, acquire first paying customers, and establish growth loops for '{}'.", goal_short),
-             vec!["Public product launch and marketing campaign".to_string(), "Onboard first paying customers".to_string(), "Set up analytics and funnel tracking".to_string(), "Establish customer support and feedback channels".to_string()],
-             vec!["Live launched product".to_string(), "First customer milestone achieved".to_string(), "Analytics & revenue dashboard".to_string()])
-        } else if is_lifestyle || (!is_technical && domain == "general") {
-            ("Mastery & Showcase".to_string(),
-             format!("Demonstrate your skills, complete a showcase project, and establish a long-term routine for '{}'.", goal_short),
-             vec!["Execute a final showcase project / demonstration".to_string(), "Reflect on progress and key learnings".to_string(), "Establish ongoing practice habit".to_string()],
-             vec!["Completed showcase project".to_string(), "Skill mastery reflection".to_string()])
-        } else {
-            ("Launch & Polish".to_string(),
-             format!("Complete testing, fix bugs, deploy to production, and create documentation for '{}'.", goal_short),
-             vec!["Comprehensive testing and bug fixing".to_string(), "Performance optimization and profiling".to_string(), "Production deployment and domain setup".to_string(), "Documentation and README".to_string()],
-             vec!["Deployed production project".to_string(), "System documentation".to_string(), "Demo video / presentation".to_string()])
+    let specifics = answer_for(answers, 3);   // Q3: what they want to plan for
+    let vision = answer_for(answers, 99);     // Q99: what "done" means to them
+
+    let (title, desc, objs, dels, ctype) = if idx == 0 {
+        let title = format!("Phase 1: Plan & Begin '{}'", goal_short);
+        let desc = match vision {
+            Some(v) => format!(
+                "Begin working toward '{}'. Your stated definition of success for this goal: '{}'. Set the foundation this phase.",
+                goal_short, v
+            ),
+            None => format!(
+                "Begin working toward '{}'. Set the foundation this phase; you define what 'done' looks like.",
+                goal_short
+            ),
         };
-        let ctype = if is_technical { "project".to_string() } else { "final_delivery".to_string() };
-        return (title, desc, objs, dels, ctype);
-    }
-
-    // Dynamic Middle Phases (idx from 1 to total-2)
-    let mid_count = total - 2;
-    let mid_idx = idx - 1;
-
-    let (title, desc, objs, dels, ctype) = if is_lifestyle || (!is_technical && domain == "general") {
-        match (mid_count, mid_idx) {
-            (1, 0) => (
-                "Core Practice & Skill Development".to_string(),
-                format!("Build consistency and master core techniques for '{}'.", goal_short),
-                vec!["Practice core skills daily/weekly".to_string(), "Learn intermediate techniques".to_string(), "Track progress and overcome hurdles".to_string()],
-                vec!["Practice log".to_string(), "Intermediate progress artifact".to_string()],
-                "practice_checkpoint".to_string()
-            ),
-            (2, 0) => (
-                "Core Practice & Mechanics".to_string(),
-                format!("Develop foundational muscle memory and techniques for '{}'.", goal_short),
-                vec!["Execute basic exercises and drills".to_string(), "Build consistency".to_string()],
-                vec!["Practice log".to_string()],
-                "practice_checkpoint".to_string()
-            ),
-            (2, 1) => (
-                "Technique Refinement & Execution".to_string(),
-                format!("Refine techniques and tackle more challenging goals for '{}'.", goal_short),
-                vec!["Apply skills to complete tasks".to_string(), "Refine form and efficiency".to_string()],
-                vec!["Refinement progress log".to_string()],
-                "practice_checkpoint".to_string()
-            ),
-            _ => (
-                format!("Practice Phase {}", mid_idx + 1),
-                format!("Progressive skill building for '{}'.", goal_short),
-                vec!["Execute practice routine".to_string()],
-                vec!["Progress artifact".to_string()],
-                "practice_checkpoint".to_string()
-            )
-        }
-    } else if is_learning {
-        match (mid_count, mid_idx) {
-            (1, 0) => (
-                "Core Learning & Hands-On Exercises".to_string(),
-                format!("Work through primary course material and build foundational exercises for '{}'.", goal_short),
-                vec!["Study core concepts and syntax".to_string(), "Complete guided coding/theory exercises".to_string(), "Build mini-projects to reinforce learning".to_string()],
-                vec!["Completed exercise code/notes".to_string(), "Mini-project repository".to_string()],
-                "learning_checkpoint".to_string()
-            ),
-            (2, 0) => (
-                "Core Concepts & Guided Practice".to_string(),
-                format!("Master core concepts and complete guided tutorials for '{}'.", goal_short),
-                vec!["Study fundamental principles".to_string(), "Complete structured tutorials and quizzes".to_string(), "Implement sample exercises".to_string()],
-                vec!["Tutorial notes and code samples".to_string(), "Progress log".to_string()],
-                "learning_checkpoint".to_string()
-            ),
-            (2, 1) => (
-                "Advanced Topics & Practical Applications".to_string(),
-                format!("Deep dive into advanced topics and real-world problem solving for '{}'.", goal_short),
-                vec!["Study advanced patterns and edge cases".to_string(), "Solve real-world practice problems".to_string(), "Start building unguided projects".to_string()],
-                vec!["Practice project source code".to_string(), "Advanced topic notes".to_string()],
-                "learning_checkpoint".to_string()
-            ),
-            (3, 0) => (
-                "Fundamental Principles & Syntax".to_string(),
-                format!("Build strong foundational understanding of key concepts in '{}'.", goal_short),
-                vec!["Review core documentation and courses".to_string(), "Complete beginner coding labs".to_string(), "Take concept quizzes".to_string()],
-                vec!["Study notes and exercise repository".to_string()],
-                "learning_checkpoint".to_string()
-            ),
-            (3, 1) => (
-                "Core Mechanics & Guided Building".to_string(),
-                format!("Apply core mechanics to construct mini-projects for '{}'.", goal_short),
-                vec!["Build 2-3 small standalone projects".to_string(), "Practice debugging and problem solving".to_string(), "Participate in code reviews / community".to_string()],
-                vec!["Mini-project implementations".to_string(), "Code review notes".to_string()],
-                "learning_checkpoint".to_string()
-            ),
-            (3, 2) => (
-                "Advanced Architecture & Best Practices".to_string(),
-                format!("Explore advanced architecture and industry best practices for '{}'.", goal_short),
-                vec!["Learn design patterns and optimization".to_string(), "Study production-grade codebases".to_string(), "Refactor existing projects".to_string()],
-                vec!["Refactored codebase".to_string(), "Best practices guide".to_string()],
-                "learning_checkpoint".to_string()
-            ),
-            _ => (
-                format!("Skill Deepening Phase {}", mid_idx + 1),
-                format!("Progressive mastery and practical execution for '{}'.", goal_short),
-                vec!["Execute scheduled study topics".to_string(), "Solve complex challenges".to_string(), "Document key insights".to_string()],
-                vec!["Phase progress report".to_string(), "Code/notes artifact".to_string()],
-                "learning_checkpoint".to_string()
-            )
-        }
-    } else if is_business {
-        match (mid_count, mid_idx) {
-            (1, 0) => (
-                "MVP Development & User Validation".to_string(),
-                format!("Build core product features and test with early users for '{}'.", goal_short),
-                vec!["Develop minimum viable product (MVP)".to_string(), "Set up user authentication and basic flow".to_string(), "Conduct user testing with 10+ target users".to_string()],
-                vec!["Working MVP build".to_string(), "User feedback summary".to_string()],
-                "prototype".to_string()
-            ),
-            (2, 0) => (
-                "MVP Core Feature Development".to_string(),
-                format!("Build the primary product capabilities and essential workflows for '{}'.", goal_short),
-                vec!["Implement core user value proposition features".to_string(), "Build seamless onboarding flow".to_string(), "Integrate analytics tracking".to_string()],
-                vec!["Core product prototype".to_string(), "Onboarding flow complete".to_string()],
-                "prototype".to_string()
-            ),
-            (2, 1) => (
-                "Beta Testing, Feedback & Monetization Setup".to_string(),
-                format!("Run closed beta, iterate based on feedback, and set up billing for '{}'.", goal_short),
-                vec!["Run closed beta program with select users".to_string(), "Integrate payment processing (Stripe/Paddle)".to_string(), "Iterate on user UX pain points".to_string()],
-                vec!["Beta testing feedback analysis".to_string(), "Integrated payment gateway".to_string()],
-                "feature_complete".to_string()
-            ),
-            (3, 0) => (
-                "Core MVP Development".to_string(),
-                format!("Construct the foundational product architecture and core features for '{}'.", goal_short),
-                vec!["Build core backend APIs and user interface".to_string(), "Set up database and data persistence".to_string(), "Implement core business logic".to_string()],
-                vec!["Functional MVP core".to_string(), "API & DB schema document".to_string()],
-                "prototype".to_string()
-            ),
-            (3, 1) => (
-                "User Onboarding & Closed Beta".to_string(),
-                format!("Onboard early adopters and refine product mechanics for '{}'.", goal_short),
-                vec!["Launch closed beta for target cohort".to_string(), "Gather qualitative and quantitative analytics".to_string(), "Refine core UX based on feedback".to_string()],
-                vec!["Beta user feedback report".to_string(), "UX improvement list executed".to_string()],
-                "prototype".to_string()
-            ),
-            (3, 2) => (
-                "Monetization & Infrastructure Scaling".to_string(),
-                format!("Implement revenue mechanics and prepare scalable operations for '{}'.", goal_short),
-                vec!["Build subscription/checkout billing system".to_string(), "Implement transactional emails and support".to_string(), "Harden security and cloud infrastructure".to_string()],
-                vec!["Billing & payout system ready".to_string(), "Support workflow configured".to_string()],
-                "feature_complete".to_string()
-            ),
-            _ => (
-                format!("Business Execution Phase {}", mid_idx + 1),
-                format!("Develop, test, and iterate on product/business operations for '{}'.", goal_short),
-                vec!["Execute planned business milestones".to_string(), "Gather customer data".to_string(), "Optimize key metrics".to_string()],
-                vec!["Milestone deliverable".to_string(), "Metrics log".to_string()],
-                "feature_complete".to_string()
-            )
-        }
-    } else if is_research {
-        match (mid_count, mid_idx) {
-            (1, 0) => (
-                "Data Collection & Analysis".to_string(),
-                format!("Execute research methodology, collect empirical data, and analyze results for '{}'.", goal_short),
-                vec!["Execute data collection / experimentation plan".to_string(), "Perform statistical analysis and hypothesis testing".to_string(), "Document empirical findings".to_string()],
-                vec!["Research dataset".to_string(), "Analysis notebooks and code".to_string()],
-                "research_milestone".to_string()
-            ),
-            (2, 0) => (
-                "Data Collection & Experimentation".to_string(),
-                format!("Gather data and run experimental trials for '{}'.", goal_short),
-                vec!["Set up experimental environment".to_string(), "Collect raw data and benchmarks".to_string(), "Clean and structure research dataset".to_string()],
-                vec!["Raw dataset".to_string(), "Experimental execution log".to_string()],
-                "research_milestone".to_string()
-            ),
-            (2, 1) => (
-                "Data Analysis & Manuscript Drafting".to_string(),
-                format!("Analyze data, produce visualizations, and draft research manuscript for '{}'.", goal_short),
-                vec!["Perform statistical tests and evaluation".to_string(), "Generate publication-grade figures".to_string(), "Draft Methods and Results sections".to_string()],
-                vec!["Analysis figures & tables".to_string(), "Draft manuscript sections".to_string()],
-                "research_milestone".to_string()
-            ),
-            _ => (
-                format!("Research Progress Phase {}", mid_idx + 1),
-                format!("Execute research plan and synthesize findings for '{}'.", goal_short),
-                vec!["Run experimental pipeline".to_string(), "Analyze results".to_string(), "Draft paper sections".to_string()],
-                vec!["Research output data".to_string(), "Draft section".to_string()],
-                "research_milestone".to_string()
-            )
-        }
-    } else if is_creative_writing {
-        match (mid_count, mid_idx) {
-            (1, 0) => (
-                "Drafting & Manuscript Creation".to_string(),
-                format!("Write the primary draft and develop core story arcs for '{}'.", goal_short),
-                vec!["Write first draft of chapters / scenes".to_string(), "Maintain character consistency and tone".to_string(), "Complete core manuscript text".to_string()],
-                vec!["First manuscript draft".to_string(), "Progress word count log".to_string()],
-                "draft".to_string()
-            ),
-            (2, 0) => (
-                "First Draft Writing".to_string(),
-                format!("Focus on raw content creation and scene drafting for '{}'.", goal_short),
-                vec!["Write daily word count target".to_string(), "Complete major plot points".to_string(), "Finish rough first draft".to_string()],
-                vec!["Rough manuscript draft".to_string()],
-                "draft".to_string()
-            ),
-            (2, 1) => (
-                "Revision, Editing & Refinement".to_string(),
-                format!("Revise structure, edit prose, and polish manuscript for '{}'.", goal_short),
-                vec!["Perform self-edit pass for story flow".to_string(), "Gather beta reader feedback".to_string(), "Line edit for tone and clarity".to_string()],
-                vec!["Revised manuscript".to_string(), "Editorial notes log".to_string()],
-                "draft".to_string()
-            ),
-            _ => (
-                format!("Writing Phase {}", mid_idx + 1),
-                format!("Write and edit manuscript content for '{}'.", goal_short),
-                vec!["Draft assigned sections".to_string(), "Review and revise text".to_string()],
-                vec!["Drafted manuscript section".to_string()],
-                "draft".to_string()
-            )
-        }
-    } else if is_creative_design {
-        match (mid_count, mid_idx) {
-            (1, 0) => (
-                "Prototyping & Asset Creation".to_string(),
-                format!("Develop visual assets, components, and interactive prototypes for '{}'.", goal_short),
-                vec!["Build core UI components / 3D models".to_string(), "Create visual asset library".to_string(), "Assemble interactive prototype".to_string()],
-                vec!["Component library".to_string(), "Interactive prototype".to_string()],
-                "design_prototype".to_string()
-            ),
-            (2, 0) => (
-                "Wireframing & Visual Exploration".to_string(),
-                format!("Create low-fidelity wireframes and visual design options for '{}'.", goal_short),
-                vec!["Create low-fidelity screen layouts / sketches".to_string(), "Define typography and color palette".to_string(), "Review visual directions".to_string()],
-                vec!["Wireframe layouts".to_string(), "Style guide draft".to_string()],
-                "design_prototype".to_string()
-            ),
-            (2, 1) => (
-                "High-Fidelity Design & Polish".to_string(),
-                format!("Refine visual fidelity, micro-interactions, and design specs for '{}'.", goal_short),
-                vec!["Construct high-fidelity component designs".to_string(), "Add animations and micro-interactions".to_string(), "Conduct usability testing on prototype".to_string()],
-                vec!["High-fidelity prototype".to_string(), "Usability test summary".to_string()],
-                "design_prototype".to_string()
-            ),
-            _ => (
-                format!("Design Phase {}", mid_idx + 1),
-                format!("Create and refine visual designs for '{}'.", goal_short),
-                vec!["Design visual components".to_string(), "Integrate user feedback".to_string()],
-                vec!["Design assets".to_string()],
-                "design_prototype".to_string()
-            )
-        }
-    } else if is_ai {
-        match (mid_count, mid_idx) {
-            (1, 0) => (
-                "Model Development & Pipeline Integration".to_string(),
-                format!("Implement data pipeline, train/fine-tune models, and build evaluation suite for '{}'.", goal_short),
-                vec!["Set up dataset preprocessing and augmentations".to_string(), "Train baseline and fine-tuned models".to_string(), "Evaluate model performance against benchmarks".to_string()],
-                vec!["Trained model weights".to_string(), "Evaluation metric report".to_string()],
-                "model_checkpoint".to_string()
-            ),
-            (2, 0) => (
-                "Data Engineering & Baseline Training".to_string(),
-                format!("Build data pipeline and train initial baseline models for '{}'.", goal_short),
-                vec!["Build clean data extraction & preprocessing pipeline".to_string(), "Implement baseline model pipeline".to_string(), "Log training metrics".to_string()],
-                vec!["Data pipeline code".to_string(), "Baseline model evaluation".to_string()],
-                "model_checkpoint".to_string()
-            ),
-            (2, 1) => (
-                "Model Optimization & System Integration".to_string(),
-                format!("Fine-tune model hyperparameters, optimize inference latency, and integrate with backend for '{}'.", goal_short),
-                vec!["Optimize hyperparameters and prompt engineering".to_string(), "Quantize / optimize model inference".to_string(), "Integrate model serving API with main app".to_string()],
-                vec!["Optimized model artifact".to_string(), "Inference API endpoint".to_string()],
-                "model_checkpoint".to_string()
-            ),
-            (3, 0) => (
-                "Data Pipeline & Feature Engineering".to_string(),
-                format!("Construct robust data ingestion and feature processing for '{}'.", goal_short),
-                vec!["Build automated data pipeline".to_string(), "Engineered feature set / embeddings".to_string(), "Set up experiment tracking (MLflow/W&B)".to_string()],
-                vec!["Data pipeline repository".to_string(), "Feature store setup".to_string()],
-                "model_checkpoint".to_string()
-            ),
-            (3, 1) => (
-                "Model Training & Architecture Exploration".to_string(),
-                format!("Train multiple model candidates and optimize performance for '{}'.", goal_short),
-                vec!["Train candidate architectures".to_string(), "Perform hyperparameter sweeps".to_string(), "Analyze error cases and edge failures".to_string()],
-                vec!["Trained model candidates".to_string(), "Experiment leaderboard".to_string()],
-                "model_checkpoint".to_string()
-            ),
-            (3, 2) => (
-                "Inference Engine & MLOps Integration".to_string(),
-                format!("Build low-latency inference engine and monitoring for '{}'.", goal_short),
-                vec!["Build optimized inference server".to_string(), "Add model monitoring and drift alerts".to_string(), "Integrate end-to-end with frontend".to_string()],
-                vec!["Inference service build".to_string(), "MLOps dashboard".to_string()],
-                "model_checkpoint".to_string()
-            ),
-            _ => (
-                format!("AI Model Phase {}", mid_idx + 1),
-                format!("Train and optimize AI components for '{}'.", goal_short),
-                vec!["Train model iterations".to_string(), "Evaluate performance".to_string()],
-                vec!["Model artifact".to_string()],
-                "model_checkpoint".to_string()
-            )
-        }
+        let objs = match specifics {
+            Some(s) => split_into_points(s),
+            None => vec!["Define your own objectives for this starting phase based on your goal.".to_string()],
+        };
+        let dels = match vision {
+            Some(v) => vec![format!("Progress toward: {}", v)],
+            None => vec![format!("A defined starting point for '{}'.", goal_short)],
+        };
+        (title, desc, objs, dels, "foundation".to_string())
+    } else if idx == total - 1 {
+        let title = format!("Final Phase: Deliver '{}'", goal_short);
+        let desc = match vision {
+            Some(v) => format!("Drive '{}' to the finish. Your stated aim was: '{}'.", goal_short, v),
+            None => format!("Drive '{}' to a finish you define.", goal_short),
+        };
+        let objs = match vision {
+            Some(v) => vec![format!("Achieve your stated goal: {}", v)],
+            None => vec!["Complete the work so it is delivered to your satisfaction.".to_string()],
+        };
+        let dels = match vision {
+            Some(v) => vec![format!("Deliverable: {}", v)],
+            None => vec![format!("A finished result for '{}'.", goal_short)],
+        };
+        (title, desc, objs, dels, "final_delivery".to_string())
     } else {
-        // Technical / General-Tech / Web-App / API-Backend / DevOps / Systems
-        match (mid_count, mid_idx) {
-            (1, 0) => (
-                "Core Implementation & Building".to_string(),
-                format!("Build core features, components, and integrations for '{}'.", goal_short),
-                vec!["Implement core business logic and services".to_string(), "Build main application UI / API routes".to_string(), "Integrate database models and external APIs".to_string(), "Write unit tests for core modules".to_string()],
-                vec!["Working prototype with core features".to_string(), "API endpoints complete".to_string(), "Unit test suite".to_string()],
-                "prototype".to_string()
-            ),
-            (2, 0) => (
-                "Core Feature Implementation".to_string(),
-                format!("Implement primary functionality and core application modules for '{}'.", goal_short),
-                vec!["Build foundational modules and data structures".to_string(), "Implement primary API endpoints".to_string(), "Create core user interface views".to_string()],
-                vec!["Working core prototype".to_string(), "API documentation draft".to_string()],
-                "prototype".to_string()
-            ),
-            (2, 1) => (
-                "System Integration & Comprehensive Testing".to_string(),
-                format!("Wire together frontend, backend, and external services for '{}'.", goal_short),
-                vec!["Integrate frontend and backend communication".to_string(), "Implement integration and E2E test suite".to_string(), "Optimize queries and network requests".to_string()],
-                vec!["Fully wired application".to_string(), "Test coverage report".to_string()],
-                "feature_complete".to_string()
-            ),
-            (3, 0) => (
-                "Foundational Core Development".to_string(),
-                format!("Build the foundational services and database layer for '{}'.", goal_short),
-                vec!["Implement database schema and ORM/query layer".to_string(), "Create core domain logic services".to_string(), "Set up authentication and authorization".to_string()],
-                vec!["Data layer and auth build".to_string(), "Core service endpoints".to_string()],
-                "prototype".to_string()
-            ),
-            (3, 1) => (
-                "Advanced Feature Expansion".to_string(),
-                format!("Build secondary feature set and interactive user flows for '{}'.", goal_short),
-                vec!["Implement secondary application features".to_string(), "Add real-time updates / background tasks".to_string(), "Polish user interface components".to_string()],
-                vec!["Expanded feature build".to_string(), "UI component library".to_string()],
-                "prototype".to_string()
-            ),
-            (3, 2) => (
-                "Integration, Security & Load Testing".to_string(),
-                format!("Perform full system integration, security hardening, and performance tuning for '{}'.", goal_short),
-                vec!["Conduct end-to-end integration testing".to_string(), "Perform security vulnerability scan and fix issues".to_string(), "Benchmark and tune database queries / response times".to_string()],
-                vec!["Security audit clean report".to_string(), "Load test results".to_string()],
-                "feature_complete".to_string()
-            ),
-            (4, 0) => (
-                "Core Data & API Architecture".to_string(),
-                format!("Build fundamental data structures and API framework for '{}'.", goal_short),
-                vec!["Build core data models and database migrations".to_string(), "Construct REST / GraphQL API endpoints".to_string(), "Write unit tests for business logic".to_string()],
-                vec!["Data models build".to_string(), "API endpoints".to_string()],
-                "prototype".to_string()
-            ),
-            (4, 1) => (
-                "Primary Feature Set Implementation".to_string(),
-                format!("Implement primary feature workflows and user interfaces for '{}'.", goal_short),
-                vec!["Build main user dashboard and interactive components".to_string(), "Wire frontend components to backend APIs".to_string(), "Implement state management".to_string()],
-                vec!["Primary feature suite".to_string(), "Interactive UI build".to_string()],
-                "prototype".to_string()
-            ),
-            (4, 2) => (
-                "External Integrations & Real-Time Sync".to_string(),
-                format!("Integrate third-party services, webhooks, and real-time messaging for '{}'.", goal_short),
-                vec!["Integrate third-party APIs and services".to_string(), "Build WebSocket / async event queues".to_string(), "Implement error resilience and retry logic".to_string()],
-                vec!["Integration middleware".to_string(), "Event queue build".to_string()],
-                "prototype".to_string()
-            ),
-            (4, 3) => (
-                "Comprehensive Testing & Security Audit".to_string(),
-                format!("Execute rigorous end-to-end testing, security audits, and performance tuning for '{}'.", goal_short),
-                vec!["Run E2E automated testing suite".to_string(), "Perform security hardening and dependency audit".to_string(), "Optimize memory usage and response latency".to_string()],
-                vec!["Automated test suite".to_string(), "Performance and security benchmark report".to_string()],
-                "feature_complete".to_string()
-            ),
-            _ => (
-                format!("Technical Development Phase {}", mid_idx + 1),
-                format!("Develop and test system components for '{}'.", goal_short),
-                vec!["Implement scheduled feature tasks".to_string(), "Perform code quality checks".to_string()],
-                vec!["Feature module build".to_string()],
-                "prototype".to_string()
-            )
-        }
+        let title = format!("Phase {}: Progress on '{}'", idx + 1, goal_short);
+        let desc = match specifics {
+            Some(s) => format!("Continue '{}'. Focus areas you named: '{}'.", goal_short, s),
+            None => format!("Continue making progress on '{}'. You set the focus for this phase.", goal_short),
+        };
+        let objs = match specifics {
+            Some(s) => split_into_points(s),
+            None => vec![format!("Advance '{}' during this phase.", goal_short)],
+        };
+        let dels = match vision {
+            Some(v) => vec![format!("Step toward: {}", v)],
+            None => vec![format!("Tangible output advancing '{}'.", goal_short)],
+        };
+        (title, desc, objs, dels, "checkpoint".to_string())
     };
 
     (title, desc, objs, dels, ctype)
 }
+
+// Split a free-text user answer into up to a few objective points so the user's
+// own words become the roadmap objectives (real state, not authored content).
+fn split_into_points(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return vec!["Define objectives for this phase based on your goal.".to_string()];
+    }
+    let parts: Vec<String> = trimmed
+        .split(|c| c == '\n' || c == '.' || c == ';')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return vec![trimmed.to_string()];
+    }
+    parts.into_iter().take(4).collect()
+}
+
+
 
 fn curate_resources(phase: usize, total: usize, search_resources: &[Resource], goal: &str) -> Vec<Resource> {
     if !search_resources.is_empty() {
@@ -1475,18 +635,27 @@ fn curate_resources(phase: usize, total: usize, search_resources: &[Resource], g
         }
     }
 
+    // No curated resources were found from the live search for this goal.
+    // Rather than fabricate descriptions that pretend these are vetted guides,
+    // emit honest web-search links built from the goal text itself. The URL is
+    // derived real state (a real search query); the description states what the
+    // link actually is — not what we imagine the page contains.
     let encoded = urlencoding::encode(goal);
+    let search_desc = format!(
+        "Open web search for '{}' (no curated source matched; results are unfiltered).",
+        goal
+    );
     match phase {
         0 => vec![
-            Resource { title: format!("Getting Started: {}", goal), url: format!("https://www.google.com/search?q=get+started+with+{}", encoded), resource_type: "article".to_string(), description: "A comprehensive guide to getting started.".to_string() },
-            Resource { title: "Best Practices & Prerequisites".to_string(), url: format!("https://www.google.com/search?q={}+best+practices+tutorial", encoded), resource_type: "documentation".to_string(), description: "Learn foundational knowledge.".to_string() },
+            Resource { title: format!("Getting Started: {}", goal), url: format!("https://www.google.com/search?q=get+started+with+{}", encoded), resource_type: "search".to_string(), description: search_desc.clone() },
+            Resource { title: "Best Practices & Prerequisites".to_string(), url: format!("https://www.google.com/search?q={}+best+practices+tutorial", encoded), resource_type: "search".to_string(), description: search_desc.clone() },
         ],
         1 => vec![
-            Resource { title: "Core Concepts & Fundamentals".to_string(), url: format!("https://www.google.com/search?q={}+core+concepts+guide", encoded), resource_type: "article".to_string(), description: "Deep dive into core concepts.".to_string() },
+            Resource { title: "Core Concepts & Fundamentals".to_string(), url: format!("https://www.google.com/search?q={}+core+concepts+guide", encoded), resource_type: "search".to_string(), description: search_desc.clone() },
         ],
         _ => vec![
-            Resource { title: format!("Advanced Techniques for {}", goal), url: format!("https://www.google.com/search?q=advanced+{}+tutorial+guide", encoded), resource_type: "article".to_string(), description: "Advanced techniques and best practices.".to_string() },
-            Resource { title: "Real-world Examples".to_string(), url: format!("https://www.google.com/search?q={}+case+study+example", encoded), resource_type: "article".to_string(), description: "Learn from real implementations.".to_string() },
+            Resource { title: format!("Advanced Techniques for {}", goal), url: format!("https://www.google.com/search?q=advanced+{}+tutorial+guide", encoded), resource_type: "search".to_string(), description: search_desc.clone() },
+            Resource { title: "Real-world Examples".to_string(), url: format!("https://www.google.com/search?q={}+case+study+example", encoded), resource_type: "search".to_string(), description: search_desc },
         ],
     }
 }
