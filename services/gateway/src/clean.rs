@@ -1010,6 +1010,14 @@ pub fn is_listicle(title: &str, content: &str, url: &str) -> bool {
     has_numbered_title || (listicle_marker && (t.contains("joke") || t.contains("pun") || t.contains("riddle"))) || is_joke_setup
 }
 
+/// True if a result title is a generic "Top N" / "Best N" listicle title
+/// (e.g. "Top 10 Java Frameworks", "15 Best Smartphones", "7 Best Budget Laptops").
+pub fn is_generic_listicle_title(title: &str) -> bool {
+    let t = title.to_lowercase();
+    let re_listicle = re(r"(?i)\b(?:top|best)\s+\d{1,2}\b|\b\d{1,2}\s+(?:best|top)\b");
+    re_listicle.map(|r| r.is_match(&t)).unwrap_or(false)
+}
+
 /// True if a result is a dictionary/glossary definition page, detected by
 /// content structure (phonetic notation, part-of-speech labels, single-word
 /// title) — NOT by hardcoded domain. Used to demote dictionary matches for
@@ -1033,7 +1041,15 @@ pub fn is_definition_site(title_lc: &str, content_lc: &str) -> bool {
         || content_prefix.starts_with("abbreviation");
     let content_is_short = content_lc.len() < 200;
     let short_title = title_words.len() <= 3;
-    (has_phonetic || has_pos_label) && short_title
+    let dictionary_title_pattern = title_lc.contains("| meaning")
+        || title_lc.contains(": meaning")
+        || title_lc.contains("definition & meaning")
+        || title_lc.contains("cambridge dictionary")
+        || title_lc.contains("dictionary.com")
+        || title_lc.contains("merriam-webster")
+        || title_lc.contains("wiktionary");
+    dictionary_title_pattern
+        || (has_phonetic || has_pos_label) && short_title
         || has_pos_label && content_is_short
         || has_phonetic && short_title
 }

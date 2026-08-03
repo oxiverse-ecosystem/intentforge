@@ -145,12 +145,18 @@ engines:
   # ── Academic engines via Tor ──
   - name: arxiv
     disabled: false
-    categories: [general, science]
+    categories: [science]  # not 'general': arxiv/crossref pollute every
+                         # non-academic query with papers (see gateway
+                         # ACADEMIC PAPER DEMOTE); gateway web searches
+                         # use the general category only
     timeout: 4.0
 
   - name: crossref
     disabled: false
-    categories: [general, science]
+    categories: [science]  # not 'general': arxiv/crossref pollute every
+                         # non-academic query with papers (see gateway
+                         # ACADEMIC PAPER DEMOTE); gateway web searches
+                         # use the general category only
     timeout: 4.0
 
   # ── Image engines via Tor (multiple for redundancy) ──

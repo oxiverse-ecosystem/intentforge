@@ -276,6 +276,20 @@ impl SymSpellIndex {
             }
         }
 
+        // ABSENT-WORD GUARD (biryani->bryan bug): a word ABSENT from the dictionary
+        // must NOT be distance->=2 corrected into a different dictionary word. Such a
+        // word is almost certainly a real term (foreign / coined / name) the 15k
+        // dictionary lacks, not a typo. Distance-1 typo fixes of real dictionary words
+        // (e.g. "pythn"->"python") are distance 1 so unaffected, and explicit
+        // known-misspelling entries (e.g. "ngnix"->"nginx") are exempt.
+        let best_dist = self.compute_edit_distance(word, best);
+        if best_dist >= 2
+            && !self.exact_map.contains_key(&word.to_lowercase())
+            && !self.is_known_misspelling(word)
+        {
+            return None;
+        }
+
         // Only accept if candidate is at least as common as the original word
         // (prevents correcting a legitimate rare word to a rarer misspelling)
         if input_freq.is_none_or(|f| candidate_freq(best) >= f) {
@@ -414,7 +428,23 @@ impl SymSpellIndex {
             let input_perp = self.char_bigram_model.perplexity(word);
             let cand_perp = self.char_bigram_model.perplexity(best_word);
             let natural_threshold = self.char_bigram_model.reference_perplexity;
+            // Block when BOTH words look natural (existing rule: ramen->raven etc.)
             if input_perp <= natural_threshold && cand_perp <= natural_threshold {
+                return None;
+            }
+            // EXTENDED GUARD (biryani->bryant bug): a single-character SUBSTITUTION
+            // that turns a HIGH-perplexity (unusual-bigram / foreign / coined) input
+            // word into a natural English word is almost never a typo — it is the
+            // spell checker English-ifying a real word absent from the 15k
+            // dictionary. Genuine typos of this shape are insertions/deletions/
+            // transpositions (housr->house, pythn->python, beleive->believe), NOT
+            // pure single-substitutions, so this guard does not affect them. We only
+            // act when the input is also NOT already a dictionary word (a real typo
+            // of a dictionary word like "pythn" is a deletion, not caught here).
+            if input_perp > natural_threshold
+                && cand_perp <= natural_threshold
+                && !self.exact_map.contains_key(&word.to_lowercase())
+            {
                 return None;
             }
         }

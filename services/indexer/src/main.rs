@@ -42,6 +42,10 @@ struct IngestRequest {
     authority: Option<f64>,
     #[serde(default)]
     quality: Option<f64>,
+    #[serde(default)]
+    price: Option<f64>,
+    #[serde(default)]
+    currency: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -83,6 +87,10 @@ struct SearchResult {
     /// 1.0 when no query is present so non-search callers are unaffected.
     #[serde(default = "default_quality")]
     quality: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    currency: Option<String>,
 }
 
 fn default_quality() -> f32 { 1.0 }
@@ -275,6 +283,8 @@ async fn main() -> anyhow::Result<()> {
     schema_builder.add_u64_field("timestamp", INDEXED | FAST | STORED);
     // `embedding` is intentionally NOT a Tantivy field anymore — offloaded to sled.
     schema_builder.add_f64_field("authority", STORED | FAST);
+    schema_builder.add_f64_field("price", FAST | STORED);
+    schema_builder.add_text_field("currency", STRING | STORED);
     
     let schema = schema_builder.build();
 
@@ -387,6 +397,8 @@ async fn handle_ingest(
     let content_field = state.schema.get_field("content").unwrap();
     let timestamp_field = state.schema.get_field("timestamp").unwrap();
     let authority_field = state.schema.get_field("authority").unwrap();
+    let price_field = state.schema.get_field("price").unwrap();
+    let currency_field = state.schema.get_field("currency").unwrap();
 
     let mut writer = state.writer.lock().await;
     let mut doc = TantivyDocument::default();
@@ -401,6 +413,13 @@ async fn handle_ingest(
             .as_secs()
     });
     doc.add_u64(timestamp_field, ts);
+
+    if let Some(p) = payload.price {
+        doc.add_f64(price_field, p);
+    }
+    if let Some(ref c) = payload.currency {
+        doc.add_text(currency_field, c.clone());
+    }
 
     // Embedding offloaded to sled KV store (keyed by URL), not Tantivy.
     // Remove any prior embedding for this URL (upsert) BEFORE storing the new
@@ -444,6 +463,8 @@ async fn handle_ingest_batch(
     let content_field = state.schema.get_field("content").unwrap();
     let timestamp_field = state.schema.get_field("timestamp").unwrap();
     let authority_field = state.schema.get_field("authority").unwrap();
+    let price_field = state.schema.get_field("price").unwrap();
+    let currency_field = state.schema.get_field("currency").unwrap();
 
     let mut writer = state.writer.lock().await;
     for doc_payload in &payload.documents {
@@ -459,6 +480,13 @@ async fn handle_ingest_batch(
                 .as_secs()
         });
         doc.add_u64(timestamp_field, ts);
+
+        if let Some(p) = doc_payload.price {
+            doc.add_f64(price_field, p);
+        }
+        if let Some(ref c) = &doc_payload.currency {
+            doc.add_text(currency_field, c.clone());
+        }
 
         // Embeddings are offloaded to the sled KV store (keyed by URL), not
         // stored in Tantivy anymore. This keeps the index text-only (~1.5GB saved).
@@ -535,6 +563,8 @@ async fn handle_search(
         let timestamp_field = state_clone.schema.get_field("timestamp").unwrap();
         let authority_field = state_clone.schema.get_field("authority").unwrap();
         let content_field = state_clone.schema.get_field("content").unwrap();
+        let price_field = state_clone.schema.get_field("price").unwrap();
+        let currency_field = state_clone.schema.get_field("currency").unwrap();
         // Embeddings live in the sled KV store now (keyed by URL), not Tantivy.
         let embedding_store = state_clone.embedding_store.clone();
 
@@ -589,11 +619,33 @@ async fn handle_search(
 
         let mut bm25_ranked: Vec<String> = Vec::new();
         let mut semantic_ranked: Vec<(String, f32, String, u64)> = Vec::new();
-        let mut metadata: HashMap<String, (String, u64, f64, String)> = HashMap::new();
+        let mut metadata: HashMap<String, (String, u64, f64, String, Option<f64>, Option<String>)> = HashMap::new();
         let mut urls_without_embeddings: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let threshold = min_score.unwrap_or(0.75);
+
+        // Distinctive query terms (stopword-free) used to measure TOPIC overlap per
+        // result. A page that matches the query only on its function-word skeleton
+        // ("how to make ... at home") earns a high BM25 score but shares ZERO
+        // distinctive terms with the query — that is crawl noise, not a real match.
+        // Folding term overlap into `quality` lets the gateway demote such pages.
+        const LOCAL_STOPWORDS: &[&str] = &[
+            "the","and","for","with","that","this","from","into","your","you","are","was","were",
+            "how","what","why","when","where","who","which","can","will","would","should","could",
+            "make","made","get","got","use","using","best","top","home","house","way","ways","like",
+            "need","want","know","find","finds","help","helping","about","than","then","them","they",
+            "does","did","doing","easy","simple","quick","guide","tutorial","recipe","recipes",
+        ];
+        let q_distinctive: Vec<String> = q
+            .split_whitespace()
+            .map(|w| w.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+            .filter(|w| w.len() >= 3 && !LOCAL_STOPWORDS.contains(&w.as_str()))
+            .collect();
+        let q_distinctive_dedup: Vec<&str> = {
+            let mut seen = std::collections::HashSet::new();
+            q_distinctive.iter().filter(|w| seen.insert(w.as_str())).map(|w| w.as_str()).collect()
+        };
 
         let mut semantic_pass_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
         let is_semantic = query_vector.is_some();
@@ -619,8 +671,10 @@ async fn handle_search(
             let timestamp = retrieved_doc.get_first(timestamp_field).and_then(|v| v.as_u64()).unwrap_or(0);
             let authority = retrieved_doc.get_first(authority_field).and_then(|v| v.as_f64()).unwrap_or(0.5);
             let content = retrieved_doc.get_first(content_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let price = retrieved_doc.get_first(price_field).and_then(|v| v.as_f64());
+            let currency = retrieved_doc.get_first(currency_field).and_then(|v| v.as_str()).map(|s| s.to_string());
 
-            metadata.insert(url.clone(), (title.clone(), timestamp, authority, content));
+            metadata.insert(url.clone(), (title.clone(), timestamp, authority, content, price, currency));
 
             let mut has_embedding = false;
             if let Some(ref q_vec) = query_vector {
@@ -729,7 +783,7 @@ async fn handle_search(
         let mut results: Vec<SearchResult> = rrf_scores
             .into_iter()
             .map(|(url, score)| {
-                let (title, ts, auth, content) = metadata.get(&url).cloned().unwrap_or(("No Title".to_string(), 0, 0.5, String::new()));
+                let (title, ts, auth, content, price, currency) = metadata.get(&url).cloned().unwrap_or(("No Title".to_string(), 0, 0.5, String::new(), None, None));
                 let mut final_score = score;
                 if freshness_boost.unwrap_or(false) && ts > 0 {
                     let age = now.saturating_sub(ts);
@@ -748,9 +802,27 @@ async fn handle_search(
                 // lexical strength so pages that barely matched (low BM25 vs the best
                 // hit) read as lower-quality. Fail-safe: 1.0 when strength is unknown.
                 let strength = bm25_strength.get(&url).copied().unwrap_or(1.0);
+                // Topic-overlap factor: what fraction of the query's DISTINCTIVE terms
+                // (stopword-free) actually appear in this page's title/content. A page
+                // that scored on the function-word skeleton ("how to make ... home")
+                // but shares none of the query's real topic terms is crawl noise and
+                // must read as low quality so the gateway can demote it.
+                let term_overlap = if q_distinctive_dedup.is_empty() {
+                    1.0
+                } else {
+                    let hay = format!(" {} {}", title.to_lowercase(), content.to_lowercase());
+                    let mut hits = 0usize;
+                    for t in &q_distinctive_dedup {
+                        if hay.contains(&format!(" {} ", t)) || hay.contains(&format!("{}.", t)) || hay.contains(&format!("{} ", t)) {
+                            hits += 1;
+                        }
+                    }
+                    (hits as f32 / q_distinctive_dedup.len() as f32).clamp(0.0, 1.0)
+                };
                 let quality = if *genuine_match.get(&url).unwrap_or(&false) {
                     // Strong match (>=0.5 of best) = full quality; weaker = linearly damped.
-                    0.5 + 0.5 * strength.clamp(0.0, 1.0)
+                    // Then multiply by topic overlap so structure-only matches collapse.
+                    (0.5 + 0.5 * strength.clamp(0.0, 1.0)) * (0.3 + 0.7 * term_overlap)
                 } else {
                     // Should not happen (RRF set ⊆ genuine), but fail-safe low.
                     0.3
@@ -762,6 +834,8 @@ async fn handle_search(
                     authority: auth as f32,
                     content: if content.len() > 500 { content.chars().take(500).collect() } else { content },
                     quality,
+                    price,
+                    currency,
                 }
             })
             .collect();

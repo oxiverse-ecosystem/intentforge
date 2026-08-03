@@ -128,6 +128,61 @@ struct SearxResponse {
     unresponsive_engines: Vec<Vec<String>>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct PriceInfo {
+    pub amount: f64,
+    pub currency: String,
+}
+
+fn price_to_usd(amount: f64, currency: &str) -> f64 {
+    match currency.to_uppercase().as_str() {
+        "USD" | "$" => amount,
+        "EUR" | "€" => amount * 1.08,
+        "GBP" | "£" => amount * 1.28,
+        "INR" | "₹" | "RS" | "RS." | "RUPEE" | "RUPEES" => amount * 0.012,
+        "CAD" | "CA$" => amount * 0.74,
+        "AUD" | "AU$" => amount * 0.65,
+        "JPY" | "¥" | "YEN" => amount * 0.0067,
+        "BRL" | "R$" => amount * 0.18,
+        "CNY" | "RMB" => amount * 0.14,
+        _ => amount,
+    }
+}
+
+fn normalize_currency_str(s: &str) -> String {
+    let lower = s.trim().to_lowercase();
+    if lower.contains('$') || lower.contains("usd") || lower.contains("dollar") {
+        if lower.contains("can") || lower.contains("cad") { "CAD".to_string() }
+        else if lower.contains("au") || lower.contains("aud") { "AUD".to_string() }
+        else { "USD".to_string() }
+    } else if lower.contains('€') || lower.contains("eur") || lower.contains("euro") {
+        "EUR".to_string()
+    } else if lower.contains('£') || lower.contains("gbp") || lower.contains("pound") {
+        "GBP".to_string()
+    } else if lower.contains('₹') || lower.contains("inr") || lower.contains("rupee") || lower.contains("rs") {
+        "INR".to_string()
+    } else if lower.contains('¥') || lower.contains("jpy") || lower.contains("yen") {
+        "JPY".to_string()
+    } else {
+        "USD".to_string()
+    }
+}
+
+fn has_price_signal(title_lower: &str, content_lower: &str) -> bool {
+    static RS_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let rs_re = RS_REGEX.get_or_init(|| regex::Regex::new(r"(?i)\b(rs\.?|rupee|rupees|inr)\b|₹").unwrap());
+
+    title_lower.contains('$') || content_lower.contains('$')
+        || title_lower.contains("price") || content_lower.contains("price")
+        || title_lower.contains("cost") || content_lower.contains("cost")
+        || rs_re.is_match(title_lower) || rs_re.is_match(content_lower)
+        || title_lower.contains("pound") || title_lower.contains("euro")
+        || title_lower.contains("buy") || title_lower.contains("shop")
+        || title_lower.contains("cheap") || title_lower.contains("affordable")
+        || title_lower.contains("sale") || title_lower.contains("deal")
+        || title_lower.contains("specs") || title_lower.contains("spec")
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct SearxResult {
     title: String,
@@ -140,6 +195,42 @@ struct SearxResult {
     sources: Vec<String>, // tracks all engines/sources that returned this result
     #[serde(default, alias = "publishedDate")]
     published_date: Option<String>,
+    #[serde(default)]
+    price: Option<String>,
+    #[serde(default)]
+    currency: Option<String>,
+}
+
+impl SearxResult {
+    pub fn get_price(&self) -> Option<PriceInfo> {
+        if let Some(ref p_str) = self.price {
+            let p_clean = p_str.trim().replace(',', "");
+            if let Ok(amount) = p_clean.parse::<f64>() {
+                let currency = self.currency.clone().unwrap_or_else(|| "USD".to_string());
+                return Some(PriceInfo { amount, currency: normalize_currency_str(&currency) });
+            } else if let Some(parsed) = extract_price_from_text(p_str) {
+                let curr = self.currency.as_deref().unwrap_or(&parsed.currency);
+                return Some(PriceInfo { amount: parsed.amount, currency: normalize_currency_str(curr) });
+            }
+        }
+        extract_price_from_text(&self.title).or_else(|| extract_price_from_text(&self.content))
+    }
+}
+
+impl MergedResult {
+    pub fn get_price(&self) -> Option<PriceInfo> {
+        if let Some(ref p_str) = self.price {
+            let p_clean = p_str.trim().replace(',', "");
+            if let Ok(amount) = p_clean.parse::<f64>() {
+                let currency = self.currency.clone().unwrap_or_else(|| "USD".to_string());
+                return Some(PriceInfo { amount, currency: normalize_currency_str(&currency) });
+            } else if let Some(parsed) = extract_price_from_text(p_str) {
+                let curr = self.currency.as_deref().unwrap_or(&parsed.currency);
+                return Some(PriceInfo { amount: parsed.amount, currency: normalize_currency_str(curr) });
+            }
+        }
+        extract_price_from_text(&self.title).or_else(|| extract_price_from_text(&self.content))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -168,6 +259,10 @@ struct IndexerResult {
     /// uses it to demote low-signal crawled pages without a hardcoded blocklist.
     #[serde(default = "default_indexer_quality")]
     quality: f32,
+    #[serde(default)]
+    price: Option<f64>,
+    #[serde(default)]
+    currency: Option<String>,
 }
 
 fn default_indexer_quality() -> f32 { 1.0 }
@@ -315,6 +410,10 @@ struct MergedResult {
     is_local: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     published_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    currency: Option<String>,
     /// Signal-quality metric [0,1] inherited from the indexer for local results
     /// (BM25/semantic match strength). Used by the local-index quality gate (P2)
     /// to demote low-signal crawled pages. Defaults to 1.0 for web results.
@@ -393,6 +492,9 @@ struct UnifiedResponse {
     /// Whether more results exist beyond the returned slice (`offset + limit < total`).
     #[serde(skip_serializing_if = "Option::is_none", rename = "has_more")]
     has_more: Option<bool>,
+    /// Number of returned results carrying a verified detectable price
+    #[serde(skip_serializing_if = "Option::is_none")]
+    price_verified: Option<usize>,
 }
 
 const DOWNLOAD_KEYWORDS: &[&str] = &[
@@ -787,16 +889,11 @@ fn freshness_score(url: &str, intent: &str, published_date: Option<&str>) -> f32
 
     if let Some(pd) = published_date {
         if let Some((y, m, d)) = parse_date_to_comparable(pd) {
-            // Current date: July 13, 2026
-            let cur_y = 2026;
-            let cur_m = 7;
-            let cur_d = 13;
-            let years_diff = cur_y - y;
-            let months_diff = cur_m - m;
-            let days_diff = cur_d - d;
-            let total_days = years_diff * 365 + months_diff * 30 + days_diff;
+            let (cur_y, cur_m, cur_d) = today_ymd();
+            let cur_days = ymd_to_days(cur_y, cur_m, cur_d);
+            let item_days = ymd_to_days(y, m, d);
+            let total_days = (cur_days - item_days).max(0);
             estimated_age_hours = (total_days * 24) as f32;
-            estimated_age_hours = estimated_age_hours.max(0.0);
             parsed_ok = true;
         }
     }
@@ -987,6 +1084,21 @@ fn calculate_intent_boost(url: &str, title: &str, query: &str, intent: &str) -> 
     let title_matches = query_terms.iter().filter(|t| title_lower.contains(*t)).count();
     if title_matches > 0 {
         boost += 0.1 * title_matches as f32;
+    }
+
+    // M1 fix: Demote generic "Top N" / "Best N" listicle titles unless user explicitly requested a list
+    if clean::is_generic_listicle_title(title) {
+        let user_asked_list = query_lower.contains("top 10")
+            || query_lower.contains("10 best")
+            || query_lower.contains("top 5")
+            || query_lower.contains("5 best")
+            || query_lower.contains("top 15")
+            || query_lower.contains("15 best")
+            || query_lower.contains("list of")
+            || query_lower.contains("top 20");
+        if !user_asked_list {
+            boost *= 0.70;
+        }
     }
 
     boost
@@ -1478,7 +1590,15 @@ fn constraint_score(
     // get a SINGLE flat penalty regardless of how many excluded terms they mention.
     // Regular pages get per-term multiplicative penalties.
     let alt_score = is_alternative_listing_page(title, url, content);
-    let is_alt_page = alt_score > 0.3 && is_comparison_or_alternative_query(constraints);
+    // Alt-listing exemption: a page scoring >0.3 IS an alternatives/comparison
+    // listing, so mentioning the excluded term is referential, not a violation.
+    // We do NOT gate on is_comparison_or_alternative_query(): for "alternative to
+    // X" the word "alternative" is consumed into the negative constraint, so that
+    // check would never fire and the alt page would be mis-penalised (c_score
+    // crushed) and then re-dropped downstream (result set collapses to 1). The
+    // pre-merge hard-drop gate uses the same pure alt_score>0.3 exemption, so all
+    // gates must agree to avoid re-drops.
+    let is_alt_page = alt_score > 0.3;
     let mut any_negative_matched = false;
     let mut hit_count = 0u32;
 
@@ -1967,55 +2087,80 @@ fn get_related_domains(domain: &str) -> Vec<String> {
     }
 }
 
-fn extract_price_from_text(text: &str) -> Option<f32> {
+fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
     let lower = text.to_lowercase();
-    let amount = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
+    let amount_pat = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
 
-    // Currency symbol / code followed by an amount: $100, €99, US$ 1,299.00, £50
+    // 1. Range pattern: "$10 - $20", "$100-$200", "₹1,000 - ₹2,000" -> low bound
+    static RE_RANGE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re_range = RE_RANGE.get_or_init(|| {
+        regex::Regex::new(&format!(
+            r"(?i)(?:us\s?\$|can\s?\$|au\s?\$|\$|€|£|¥|₹|rs\.?\s?|inr|eur|gbp|usd)?\s*{}\s*(?:-|to)\s*(?:us\s?\$|can\s?\$|au\s?\$|\$|€|£|¥|₹|rs\.?\s?|inr|eur|gbp|usd)?\s*{}",
+            amount_pat, amount_pat
+        ))
+        .unwrap()
+    });
+    if let Some(caps) = re_range.captures(&lower) {
+        if let Some(m) = caps.get(1) {
+            let raw = m.as_str().replace(',', "");
+            if let Ok(v) = raw.parse::<f64>() {
+                let currency = normalize_currency_str(caps.get(0).unwrap().as_str());
+                return Some(PriceInfo { amount: v, currency });
+            }
+        }
+    }
+
+    // 2. Currency symbol / code followed by an amount: $100, €99, US$ 1,299.00, £50, ₹2,000, Rs. 500
     static RE1: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re1 = RE1.get_or_init(|| {
         regex::Regex::new(&format!(
-            r"(?i)(?:us\s?\$|can\s?\$|au\s?\$|\$|€|£|¥|₹|rs\.?\s?|inr|eur|gbp|usd)\s*{}",
-            amount
+            r"(?i)(us\s?\$|can\s?\$|au\s?\$|\$|€|£|¥|₹|rs\.?\s?|inr|eur|gbp|usd)\s*{}",
+            amount_pat
         ))
         .unwrap()
     });
     if let Some(caps) = re1.captures(&lower) {
-        let raw = caps.get(1)?.as_str().replace(',', "");
-        if let Ok(v) = raw.parse::<f32>() {
-            return Some(v);
+        let curr_str = caps.get(1)?.as_str();
+        let raw = caps.get(2)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f64>() {
+            let currency = normalize_currency_str(curr_str);
+            return Some(PriceInfo { amount: v, currency });
         }
     }
 
-    // Amount followed by a currency word: 100 dollars, 200 euros, 999 rupees
+    // 3. Amount followed by a currency word: 100 dollars, 200 euros, 999 rupees, 2000 rs
     static RE2: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re2 = RE2.get_or_init(|| {
         regex::Regex::new(&format!(
-            r"(?i){}\s*(?:us\s?dollars?|dollars?|euros?|pounds?|gbp|usd|inr|rupees?|rs)",
-            amount
+            r"(?i){}\s*(us\s?dollars?|dollars?|euros?|pounds?|gbp|usd|inr|rupees?|\brs\.?\b)",
+            amount_pat
         ))
         .unwrap()
     });
     if let Some(caps) = re2.captures(&lower) {
         let raw = caps.get(1)?.as_str().replace(',', "");
-        if let Ok(v) = raw.parse::<f32>() {
-            return Some(v);
+        let curr_str = caps.get(2)?.as_str();
+        if let Ok(v) = raw.parse::<f64>() {
+            let currency = normalize_currency_str(curr_str);
+            return Some(PriceInfo { amount: v, currency });
         }
     }
 
-    // Explicit price/cost label: "price: 49", "cost 129", "starting at 15.99"
+    // 4. Explicit price/cost label: "price: 49", "cost 129", "starting at 15.99"
     static RE3: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re3 = RE3.get_or_init(|| {
         regex::Regex::new(&format!(
-            r"(?i)(?:price|cost|starting\s+at|from\s+price|for\s+only)\s*:?\s*\$?\s*{}",
-            amount
+            r"(?i)(?:price|cost|starting\s+at|from\s+price|for\s+only)\s*:?\s*(us\s?\$|can\s?\$|au\s?\$|\$|€|£|¥|₹|rs\.?\s?|inr|eur|gbp|usd)?\s*{}",
+            amount_pat
         ))
         .unwrap()
     });
     if let Some(caps) = re3.captures(&lower) {
-        let raw = caps.get(1)?.as_str().replace(',', "");
-        if let Ok(v) = raw.parse::<f32>() {
-            return Some(v);
+        let curr_str = caps.get(1).map(|m| m.as_str()).unwrap_or("usd");
+        let raw = caps.get(2)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f64>() {
+            let currency = normalize_currency_str(curr_str);
+            return Some(PriceInfo { amount: v, currency });
         }
     }
 
@@ -2209,42 +2354,67 @@ fn should_filter_by_constraints(
     if constraints.price_min.is_some() || constraints.price_max.is_some()
         || constraints.price_lt.is_some() || constraints.price_gt.is_some()
     {
-        if let Some(price) = extract_price_from_text(title)
-            .or_else(|| extract_price_from_text(content))
-        {
+        let dummy = SearxResult {
+            title: title.to_string(),
+            url: url.to_string(),
+            content: content.to_string(),
+            engine: "".to_string(),
+            score: 0.0,
+            sources: vec![],
+            published_date: published_date.map(|s| s.to_string()),
+            price: None,
+            currency: None,
+        };
+        if let Some(p_info) = dummy.get_price() {
+            let p_usd = price_to_usd(p_info.amount, &p_info.currency) as f32;
             if let Some(pmin) = constraints.price_min {
-                if price < pmin { return true; }
+                if p_usd < pmin { return true; }
             }
             if let Some(pmax) = constraints.price_max {
-                if price > pmax { return true; }
+                if p_usd > pmax { return true; }
             }
             if let Some(plt) = constraints.price_lt {
-                if price > plt { return true; }
+                if p_usd > plt { return true; }
             }
             if let Some(pgt) = constraints.price_gt {
-                if price < pgt { return true; }
+                if p_usd < pgt { return true; }
             }
         }
     }
 
-    // 5. Negative constraint hard filter (skipped for only-negative queries)
-    let is_only_negative = !constraints.negative.is_empty() && constraints.positive.is_empty();
-    if is_only_negative {
-        return false;
-    }
-
-    if constraints.negative.is_empty() && constraints.positive.is_empty() {
-        return false;
-    }
-    let c_score = constraint_score(title, content, url, constraints);
-    let alt_score = is_alternative_listing_page(title, url, content);
-    if alt_score > 0.3 && is_comparison_or_alternative_query(constraints) {
-        return c_score < 0.02;
-    }
-    let threshold = if constraints.negative.len() >= 2 { 0.10 }
-    else if constraints.negative.len() == 1 { 0.05 }
-    else { 0.02 };
-    c_score < threshold
+    // 5. Negative constraint handling.
+    //
+    // DESIGN (P5-class "negative over filter" fix): a plain NEGATIVE TERM (e.g.
+    // "vim" from "text editor without vim") must NEVER hard-drop a result. The
+    // penalty for matching a negative term is already enforced softly through
+    // `constraint_score` → `c_score` → `r.score` (main.rs:5276), which demotes
+    // matching results while keeping them in the set. Hard-dropping here is what
+    // collapsed "text editor without vim keybindings" to ZERO results: every
+    // genuine "text editor" page mentions "vim" (it's the canonical editor), so
+    // the hard filter removed ALL of them and left nothing.
+    //
+    // Hard drops are therefore reserved for UNAMBIGUOUS STRUCTURAL operators whose
+    // meaning admits no soft interpretation:
+    //   · `site:` negatives  -> handled above (web.drop, line ~2213)
+    //   · `filetype:` negatives -> handled above (line ~2222)
+    //   · date bounds         -> handled above (after/before_date)
+    //   · exact `phrases`     -> handled above (line ~2290, fail-open token match)
+    // A bare word like "vim" / "java" / "django" is NOT structural — it is a
+    // topical exclusion that grades smoothly, so we never hard-drop on it.
+    //
+    // DESIGN (P5-class "negative over filter" fix): this predicate hard-drops ONLY
+    // on unambiguous STRUCTURAL operators (site:/filetype: negatives, date bounds,
+    // exact phrases) — all of which are already handled in the blocks above (2b,
+    // 3, 4) and `return true` themselves before reaching here. A bare NEGATIVE
+    // TERM (e.g. "vim" from "text editor without vim") is a TOPICAL exclusion, not
+    // a structural one: it grades smoothly and is enforced SOFTLY through
+    // `constraint_score` → `c_score` → `r.score` (main.rs:5276). Hard-dropping on a
+    // plain term is exactly what collapsed "text editor without vim" to ZERO
+    // results (every genuine "text editor" page mentions "vim"). So: if the only
+    // negative signal is a plain term, never hard-drop here — `c_score` demotes
+    // matches while keeping the set non-empty. With the structural operators
+    // already returned above, any fall-through here means "nothing left to drop".
+    false
 }
 
 /// Soft boost for `intitle:`/`inurl:`/`intext:` constraints.
@@ -2573,7 +2743,31 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
         return (combined * coverage * 0.6).clamp(0.0, combined.min(0.18));
     }
 
-    combined.clamp(0.0, 1.0)
+    // M2 topic drift fix: Demote dictionary/glossary pages for multi-word or informational/how-to queries
+    if clean::is_definition_site(&t_lower, &c_lower) && (query_terms.len() > 1 || q_lower.contains("how") || q_lower.contains("why")) {
+        return (combined * 0.10).clamp(0.01, 0.05);
+    }
+
+    // M2 topic drift fix: Multi-word phrase sense handling (e.g. "machine learning")
+    // Penalize results that match only an isolated single token (e.g. "machine") while missing compound terms
+    let mut final_score = combined;
+    if query_terms.len() >= 2 {
+        let text_all = format!("{} {}", t_lower, c_lower);
+        for w in query_terms.windows(2) {
+            let phrase = format!("{} {}", w[0], w[1]);
+            // If the query contains a compound phrase, but document contains only word 0 without word 1 or the phrase
+            if q_lower.contains(&phrase) && !text_all.contains(&phrase) {
+                let has_w0 = text_all.contains(&w[0]);
+                let has_w1 = text_all.contains(&w[1]);
+                if has_w0 ^ has_w1 {
+                    final_score *= 0.25;
+                    break;
+                }
+            }
+        }
+    }
+
+    final_score.clamp(0.0, 1.0)
 }
 
 /// Blend genuine BERT semantic similarity into web-result ranking.
@@ -2593,6 +2787,7 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
 /// single bad embed never poisons others.
 async fn compute_web_semantic(
     query_vector: &Option<Vec<f32>>,
+    local_results: &[IndexerResult],
     web_results: &[SearxResult],
     client: &reqwest::Client,
 ) -> std::collections::HashMap<String, f32> {
@@ -2602,22 +2797,35 @@ async fn compute_web_semantic(
         Some(v) if v.len() >= 2 => v,
         _ => return out, // no query embedding -> fail closed
     };
-    // Deduplicate texts by URL; only embed the top ~28 distinct results.
+    // Deduplicate texts by URL; embed top local AND top web results.
     let mut texts: Vec<String> = Vec::new();
     let mut url_order: Vec<String> = Vec::new();
-    for r in web_results.iter().take(28) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Add local results (up to 15)
+    for r in local_results.iter().take(15) {
+        if !seen.insert(r.url.clone()) { continue; }
         let text = format!("{} {}", r.title, r.content);
         if text.trim().len() < 10 { continue; }
         url_order.push(r.url.clone());
         texts.push(text);
     }
+    // 2. Add web results (up to 25)
+    for r in web_results.iter().take(25) {
+        if !seen.insert(r.url.clone()) { continue; }
+        let text = format!("{} {}", r.title, r.content);
+        if text.trim().len() < 10 { continue; }
+        url_order.push(r.url.clone());
+        texts.push(text);
+    }
+
     if texts.is_empty() { return out; }
 
     let body = serde_json::json!({ "texts": texts });
     let req = client
         .post("http://127.0.0.1:3005/embed_batch")
         .json(&body)
-        .timeout(std::time::Duration::from_millis(1500));
+        .timeout(std::time::Duration::from_millis(2000));
     let embeddings: Option<Vec<Vec<f32>>> = match req.send().await {
         Ok(resp) => resp.json::<serde_json::Value>().await.ok()
             .and_then(|j| j.get("embeddings").cloned())
@@ -3289,6 +3497,69 @@ fn has_local_intent(query: &str) -> bool {
         )
 }
 
+/// Extract negative terms from the query string, skipping prepositions and filler stopwords.
+/// Handles: "not from sony" → ["sony"]
+///          "without calling a plumber" → ["plumber"]
+///          "no prior coding experience" → ["coding"]
+///          "not from samsung and not from apple" → ["samsung", "apple"]
+///          "other than ubuntu" → ["ubuntu"]
+fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
+    let q_lower = q_orig.to_lowercase();
+    let words: Vec<&str> = q_lower.split_whitespace().collect();
+    let mut terms: Vec<String> = Vec::new();
+
+    let neg_markers = ["not", "no", "without", "except", "excluding", "minus"];
+    let stopwords = [
+        "from", "a", "an", "the", "of", "to", "in", "on", "at", "for", "with", "by",
+        "about", "than", "calling", "prior", "any", "some", "using", "having", "is",
+        "are", "was", "were", "be", "been", "being", "do", "does", "did", "have",
+        "has", "had", "and", "or"
+    ];
+
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        let mut is_neg = neg_markers.contains(&w) || w.starts_with('-');
+        let mut skip_marker_len = 1;
+
+        if i + 1 < words.len() {
+            if (w == "other" || w == "rather") && words[i + 1] == "than" {
+                is_neg = true;
+                skip_marker_len = 2;
+            }
+        }
+
+        if is_neg {
+            let mut j = i + skip_marker_len;
+            let mut skipped_count = 0;
+            while j < words.len() && skipped_count < 3 {
+                let candidate = words[j];
+                if stopwords.contains(&candidate) {
+                    j += 1;
+                    skipped_count += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if j < words.len() {
+                let target = words[j];
+                let target_is_neg = neg_markers.contains(&target) || target.starts_with('-');
+                if !target_is_neg && target.len() >= 2 {
+                    let clean: String = target.chars().filter(|c| c.is_alphanumeric()).collect();
+                    if !clean.is_empty() && !terms.contains(&clean) {
+                        terms.push(clean);
+                    }
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    terms
+}
+
 /// If the query has local intent, expand it with the user's city/region context.
 fn localize_query(query: &str, geo: &geoloc::GeoLocation) -> Option<String> {
     if !has_local_intent(query) {
@@ -3300,8 +3571,17 @@ fn localize_query(query: &str, geo: &geoloc::GeoLocation) -> Option<String> {
         (None, None, Some(cc)) => cc.clone(),
         _ => return None,
     };
-    let localized = format!("{} {}", query, location);
-    // Don't return if it's essentially the same query
+    let q_clean = query.to_lowercase()
+        .replace("near me", "")
+        .replace("nearby", "")
+        .replace("close to me", "")
+        .replace("around me", "");
+    let q_base = q_clean.trim();
+    let localized = if q_base.is_empty() {
+        format!("restaurants in {}", location)
+    } else {
+        format!("{} in {}", q_base, location)
+    };
     if localized.to_lowercase() == query.to_lowercase() {
         return None;
     }
@@ -3410,6 +3690,15 @@ fn preprocess_searxng_query(query: &str) -> String {
         }
     }
 
+    let neg_terms = extract_query_negative_terms(q);
+    let neg_markers = ["not", "no", "without", "except", "excluding", "minus", "other", "than"];
+    let neg_stopwords = [
+        "from", "a", "an", "the", "of", "to", "in", "on", "at", "for", "with", "by",
+        "about", "than", "calling", "prior", "any", "some", "using", "having", "is",
+        "are", "was", "were", "be", "been", "being", "do", "does", "did", "have",
+        "has", "had"
+    ];
+
     let mut words_cleaned = Vec::new();
     // Operators SearXNG understands natively. Stripping them and never re-emitting
     // (the old behaviour) silently forwarded e.g. `rust inurl:blog` as just `rust`,
@@ -3444,12 +3733,15 @@ fn preprocess_searxng_query(query: &str) -> String {
         if wl.starts_with("filetype:") {
             continue;
         }
+        // Strip literal negation markers and negated terms to avoid SearXNG searching for the word "not"
+        let clean_token: String = wl.chars().filter(|c| c.is_alphanumeric()).collect();
+        if neg_markers.contains(&clean_token.as_str())
+            || neg_terms.contains(&clean_token)
+            || (!neg_terms.is_empty() && neg_stopwords.contains(&clean_token.as_str()))
+        {
+            continue;
+        }
         // Preserve double quotes so the upstream engine honors "exact phrase"
-        // queries (e.g. "Lancaster norms"). Single quotes (apostrophes) are still
-        // stripped. Previously BOTH were stripped, which silently turned a quoted
-        // phrase into a loose bag-of-words and broke the phrase hard-filter below
-        // (the engine was asked for the unquoted text, so snippets rarely contained
-        // the verbatim substring and every result got dropped -> n=0).
         let clean_w = w.replace('\'', "");
         if !clean_w.is_empty() {
             words_cleaned.push(clean_w);
@@ -3494,6 +3786,16 @@ fn preprocess_searxng_query(query: &str) -> String {
             cleaned_str.push(' ');
         }
         cleaned_str.push_str(&format!("filetype:{}", single));
+    }
+
+    // Append negated terms as explicit -term operators for SearXNG
+    for neg in &neg_terms {
+        if !cleaned_str.contains(&format!("-{}", neg)) {
+            if !cleaned_str.is_empty() {
+                cleaned_str.push(' ');
+            }
+            cleaned_str.push_str(&format!("-{}", neg));
+        }
     }
 
     // Re-emit native operators (intitle:/inurl:/intext:/lang:) verbatim so the
@@ -4177,6 +4479,8 @@ fn merge_local_and_web(
             sources: vec!["local".to_string()],
             is_local: true,
             published_date: None,
+            price: r.price.map(|p| p.to_string()),
+            currency: r.currency,
             quality: r.quality,
         };
         url_to_idx.insert(norm, merged.len());
@@ -4211,6 +4515,12 @@ fn merge_local_and_web(
             if existing.published_date.is_none() {
                 existing.published_date = r.published_date.clone();
             }
+            if existing.price.is_none() {
+                existing.price = r.price.clone();
+            }
+            if existing.currency.is_none() {
+                existing.currency = r.currency.clone();
+            }
         } else {
             let source = if r.engine.is_empty() { "web".to_string() } else { r.engine.clone() };
             let authority = domain_authority_score(&r.url);
@@ -4223,6 +4533,8 @@ fn merge_local_and_web(
                 sources: vec![source],
                 is_local: false,
                 published_date: r.published_date.clone(),
+                price: r.price.clone(),
+                currency: r.currency.clone(),
                 quality: 1.0,
             };
             url_to_idx.insert(norm, merged.len());
@@ -4296,6 +4608,38 @@ fn merge_local_and_web(
         "examples", "sample", "samples", "site", "sites", "page", "pages", "online",
         "architecture", "architectures", "design", "pattern", "patterns"
     ].iter().copied().collect();
+    // Currency/measurement words are unit qualifiers, not topics: a query
+    // "headphones under 200 dollars" must NOT require every result to contain the
+    // literal word "dollars" — product pages say "$200" or "Under $200" instead.
+    // Treating "dollars" as a core topic term made `core_matches` fail for almost
+    // every product page and collapsed the whole SERP to floor scores.
+    let unit_terms: std::collections::HashSet<&str> = [
+        "dollar", "dollars", "usd", "euro", "euros", "eur", "pound", "pounds",
+        "gbp", "rupee", "rupees", "inr", "yen", "price", "prices", "pricing",
+        "cost", "costs", "budget", "amount",
+    ].iter().copied().collect();
+    // Weak discriminative fillers: words that are grammatically "content" but carry
+    // almost no topical signal, so requiring a result to contain them is wrong.
+    // e.g. "how does photosynthesis ACTUALLY work at the MOLECULAR LEVEL" — "actually"
+    // and "level" are not the topic; requiring them lets a stale local page titled
+    // "How Humans Actually Work" (Unisys) pass the core-match gate and rank #1 over
+    // real "Photosynthesis" pages. These are excluded from CORE-topic matching only
+    // (not from distinctive-term overlap), so they still contribute lexical signal
+    // when genuinely present, but never act as a mandatory topic gate.
+    let weak_discriminative: std::collections::HashSet<&str> = [
+        "actually", "really", "truly", "literally", "simply", "easily",
+        "level", "levels", "kind", "kinds", "type", "types", "sort", "sorts",
+        "way", "ways", "form", "forms", "case", "cases", "part", "parts",
+        "thing", "things", "stuff", "matter", "matters", "point", "points",
+        "blog", "blogs", "post", "posts", "article", "articles", "page", "pages",
+        "story", "stories", "idea", "ideas", "concept", "concepts", "sense",
+        "now", "today", "tomorrow", "time", "times", "year", "years", "day", "days",
+        "use", "using", "used", "help", "helping", "need", "want", "find", "finding",
+        "good", "better", "best", "great", "small", "large", "old", "older", "new",
+        "right", "wrong", "true", "false", "free", "cheap", "simple", "complex",
+        "work", "works", "working", "look", "looking", "show", "showing", "see", "seeing",
+        "read", "reading", "play", "playing", "write", "writing", "think", "thinking",
+    ].iter().copied().collect();
 
     let q_words: Vec<&str> = clean_query.split_whitespace().collect();
     let distinctive_terms: Vec<&str> = q_words.iter()
@@ -4304,6 +4648,7 @@ fn merge_local_and_web(
             lower.len() >= 3
                 && !stop_words.contains(lower.as_str())
                 && !generic_web_terms.contains(lower.as_str())
+                && !unit_terms.contains(lower.as_str())
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
@@ -4316,6 +4661,8 @@ fn merge_local_and_web(
                 && !stop_words.contains(lower.as_str())
                 && !generic_web_terms.contains(lower.as_str())
                 && !meta_action_terms.contains(lower.as_str())
+                && !unit_terms.contains(lower.as_str())
+                && !weak_discriminative.contains(lower.as_str())
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
@@ -4442,6 +4789,75 @@ fn merge_local_and_web(
             relevance *= 0.45 + 0.55 * phrase_ratio;
         }
 
+        // ── Administrative & Sitemap Demotion ──
+        // Administrative pages (title starts with "Sitemap -", "Sitemap |", or URL contains "/sitemap/")
+        // are site indexes for crawlers, NOT answers for human search queries.
+        // Unless the user explicitly searched for "sitemap", severely penalize administrative pages.
+        let is_sitemap_page = title_lower.starts_with("sitemap ")
+            || title_lower.contains("sitemap -")
+            || title_lower.contains("sitemap |")
+            || title_lower.ends_with(" sitemap")
+            || url_lower.contains("/sitemap/")
+            || url_lower.contains("/sitemap.")
+            || url_lower.contains("/site-map/");
+        let query_wants_sitemap = clean_query.to_lowercase().contains("sitemap");
+        if is_sitemap_page && !query_wants_sitemap {
+            relevance *= 0.05;
+        }
+
+        // ── Brand / Commercial Category Collision Detector ──
+        // Catches brand/topic collisions without hardcoding domain names or brand lists.
+        // Problem: A query asking a scientific/informational/how-to question (e.g. "why is the sky blue")
+        // matches a commercial brand or service page (e.g. "Sky Blue Credit", "Best Buy Electronics")
+        // because the brand name happens to contain tokens from the query.
+        //
+        // Diagnostic Signals:
+        // 1. Query has explanatory/informational framing ("why", "how", "what causes", "explain", "reason for").
+        // 2. Candidate result title/URL features a commercial/service category head noun
+        //    (e.g., "credit", "loans", "cards", "mortgage", "banking", "insurance", "casino",
+        //     "hotel", "hotels", "flight", "flights", "real estate", "realtor", "plumbing",
+        //     "wallpaper", "wallpapers", "hex code", "color code", "palette") that is ABSENT from the query.
+        // 3. The page content provides ZERO explanation or scientific/educational context for the query topic.
+        let is_explanatory_query = {
+            let q_lc = clean_query.to_lowercase();
+            q_lc.contains("why ") || q_lc.contains("how ") || q_lc.contains("what causes")
+                || q_lc.contains("reason ") || q_lc.contains("explain") || q_lc.starts_with("why")
+                || q_lc.starts_with("how") || q_lc.starts_with("what is ") || q_lc.starts_with("what are ")
+        };
+
+        let commercial_category_terms: &[&str] = &[
+            "credit", "loans", "mortgage", "banking", "insurance",
+            "hotel", "hotels", "resort", "resorts", "realtor", "real estate",
+            "casino", "casinos", "betting", "flight", "flights",
+            "wallpaper", "wallpapers", "color code", "color codes", "hex code",
+        ];
+
+        let q_lc_check = clean_query.to_lowercase();
+        let has_unrequested_category = commercial_category_terms.iter().any(|cat| {
+            let cat_in_title = title_lower.contains(cat) || url_lower.contains(cat);
+            let cat_in_query = q_lc_check.contains(cat);
+            cat_in_title && !cat_in_query
+        });
+
+        if is_explanatory_query && has_unrequested_category {
+            // Check if page actually has explanatory substance for the query subject
+            let has_explanation_substance = content_lower.contains("because")
+                || content_lower.contains("scatter")
+                || content_lower.contains("atmosphere")
+                || content_lower.contains("wavelength")
+                || content_lower.contains("physics")
+                || content_lower.contains("science")
+                || title_lower.contains("science")
+                || title_lower.contains("why")
+                || title_lower.contains("how");
+            if !has_explanation_substance {
+                relevance *= 0.15;
+            }
+        } else if has_unrequested_category {
+            // General unrequested commercial category head-noun penalty
+            relevance *= 0.35;
+        }
+
         // ── Superlative penalty (P1) ──
         // Queries with a superlative ("best laptop ...", "top framework") attract pages
         // that match ONLY on the generic word "best"/"top" while missing the actual topic.
@@ -4470,19 +4886,32 @@ fn merge_local_and_web(
         // Generic (no hardcoded domains): a local page that is both low-quality AND
         // missing every distinctive term is almost certainly crawl noise.
         if r.is_local {
+            // Topic mention must be on CONTENTFUL terms, not query-structure words
+            // ("how/to/make/home/at"). A page mentioning "home" for "how to make biryani
+            // at home" is NOT a real match — that false positive is what kept the gate
+            // dead for structure-matched crawl noise.
+            let structure_words: &[&str] = &[
+                "how","to","make","made","at","home","house","for","with","your","the","a","an",
+                "best","top","easy","simple","quick","guide","tutorial","recipe","recipes","of","in",
+                "on","and","from","into","about","way","ways","get","got","use","using","help","helping",
+                "what","why","when","where","who","which","can","will","would","should","could","does","did","doing",
+                "need","want","know","find","like","than","then","them","they","this","that",
+            ];
             let topic_mentioned = distinctive_terms.is_empty()
                 || distinctive_terms.iter().any(|t| {
                     let tl = t.to_lowercase();
+                    if structure_words.contains(&tl.as_str()) { return false; }
+                    let bare = tl.trim_end_matches('s');
                     title_lower.contains(&tl) || content_lower.contains(&tl)
-                        || title_lower.contains(tl.trim_end_matches('s')) || content_lower.contains(tl.trim_end_matches('s'))
+                        || title_lower.contains(bare) || content_lower.contains(bare)
                 });
-            if r.quality < 0.5 && !topic_mentioned {
+            if r.quality < 0.55 && !topic_mentioned {
                 relevance *= 0.05;
                 tracing::info!(
                     "LOCAL NOISE GATE: '{}' quality={:.2} topic_mentioned={} -> relevance crushed",
                     r.url.chars().take(60).collect::<String>(), r.quality, topic_mentioned
                 );
-            } else if r.quality < 0.7 && !topic_mentioned {
+            } else if r.quality < 0.75 && !topic_mentioned {
                 relevance *= 0.5;
             }
         }
@@ -4502,22 +4931,14 @@ fn merge_local_and_web(
         let price_bound = constraints.price_max.or(constraints.price_lt)
             .or_else(|| constraints.price_min.or(constraints.price_gt));
         if let Some(_bound) = price_bound {
-            let res_price = extract_price_from_text(&r.title)
-                .or_else(|| extract_price_from_text(&r.content));
-            let price_signal = title_lower.contains('$') || content_lower.contains('$')
-                || title_lower.contains("price") || content_lower.contains("price")
-                || title_lower.contains("cost") || content_lower.contains("cost")
-                || title_lower.contains("rs") || title_lower.contains("rupee")
-                || title_lower.contains("pound") || title_lower.contains("euro")
-                || title_lower.contains("buy") || title_lower.contains("shop")
-                || title_lower.contains("cheap") || title_lower.contains("affordable")
-                || title_lower.contains("sale") || title_lower.contains("deal")
-                || title_lower.contains("specs") || title_lower.contains("spec");
-            if let Some(p) = res_price {
-                let over = (constraints.price_max.is_some() && p > constraints.price_max.unwrap())
-                    || (constraints.price_lt.is_some() && p > constraints.price_lt.unwrap())
-                    || (constraints.price_min.is_some() && p < constraints.price_min.unwrap())
-                    || (constraints.price_gt.is_some() && p < constraints.price_gt.unwrap());
+            let res_price = r.get_price();
+            let price_signal = has_price_signal(&title_lower, &content_lower);
+            if let Some(p_info) = res_price {
+                let p_usd = price_to_usd(p_info.amount, &p_info.currency) as f32;
+                let over = (constraints.price_max.is_some() && p_usd > constraints.price_max.unwrap())
+                    || (constraints.price_lt.is_some() && p_usd > constraints.price_lt.unwrap())
+                    || (constraints.price_min.is_some() && p_usd < constraints.price_min.unwrap())
+                    || (constraints.price_gt.is_some() && p_usd < constraints.price_gt.unwrap());
                 if over {
                     relevance *= 0.12;
                 } else {
@@ -4748,13 +5169,26 @@ fn merge_local_and_web(
             || q_lower_check.contains("study") || q_lower_check.contains("journal")
             || q_lower_check.contains("research");
 
-        if is_academic && is_nav_or_download && !q_wants_academic {
-            relevance = 0.001;
-            quality *= 0.01;
-            tracing::info!(
-                "ACADEMIC PAPER PENALTY: '{}' -> crushed 0.001 for navigational/download query",
-                r.url.chars().take(60).collect::<String>()
-            );
+        if is_academic && !q_wants_academic {
+            if is_nav_or_download {
+                // Navigational/download/commercial: academic papers are 100% noise.
+                relevance = 0.001;
+                quality *= 0.01;
+                tracing::info!(
+                    "ACADEMIC PAPER PENALTY: '{}' -> crushed 0.001 for navigational/download query",
+                    r.url.chars().take(60).collect::<String>()
+                );
+            } else {
+                // Every other intent (informational/local/how-to/fresh/comparison):
+                // moderate demotion, not crush — a paper about the topic is still
+                // semi-useful, but must never outrank accessible articles/product
+                // pages. The adaptive floor then sinks it below real content.
+                relevance *= 0.30;
+                tracing::info!(
+                    "ACADEMIC PAPER DEMOTE: '{}' -> relevance x0.30 (non-academic query, intent={})",
+                    r.url.chars().take(60).collect::<String>(), intent
+                );
+            }
         }
 
         // Wikidata penalty: Wikidata is a machine database, not a human-readable search result.
@@ -4809,7 +5243,11 @@ fn merge_local_and_web(
         // The old blanket +1.0 floated token-overlap noise (e.g. "boilerplate code"
         // -> "QR Code Generator") to the top regardless of relevance. The merge-time
         // consensus *1.5 boost still prefers genuinely-good local pages.
-        let local_bonus = if r.is_local && relevance >= 0.3 { 0.6 } else { 0.0 };
+        let local_bonus = if r.is_local && relevance >= 0.35 {
+            (relevance * 0.45).min(0.45)
+        } else {
+            0.0
+        };
         // Geo-relevance boost: boost results that mention the user's country, region, or city.
         // Higher boost for city-level matches (0.25) than country-level (0.10).
         let geo_boost = geo_location.map(|g| geo_relevance_score(&r.title, &r.content, &r.url, g)).unwrap_or(0.0);
@@ -4852,7 +5290,24 @@ fn merge_local_and_web(
         // creating real separation. Clamped to [0.05,1.0] so relevance can demote hard
         // but never zero out a result (preserving the calibrate_scores floor logic).
         let relevance_mult = relevance.clamp(0.05, 1.0);
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult;
+        // Video-suppression (non-/videos /search): Invidious videos enter the web merge
+        // with score=0.0 and published_date=None, so they inherit r.score=1.0 and
+        // freshness=1.0, which lets a generic youtube tutorial outrank a relevant
+        // article for text queries (e.g. "how to make biryani at home"). Videos have
+        // their own /videos endpoint; in /search they are secondary, so dampen them
+        // unless the query is explicitly video-seeking. Floor keeps them present, not dominant.
+        let is_video_source = r.sources.iter().any(|s| s == "invidious" || s == "video");
+        let q_lc = query.to_lowercase();
+        let video_mult = if is_video_source {
+            if q_lc.contains("video") || q_lc.contains("youtube") || q_lc.contains("watch") || q_lc.contains("tutorial") {
+                1.0 // explicit video intent → keep
+            } else {
+                0.25 // generic text query → demote below relevant web/text results
+            }
+        } else {
+            1.0
+        };
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult;
         // Capture this result's relevance for the post-loop adaptive-floor pass.
         relevance_vec.push(relevance);
     }
@@ -6055,6 +6510,7 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         page_limit: None,
         page_offset: None,
         has_more: None,
+        price_verified: None,
     };
     (
         axum::http::StatusCode::BAD_REQUEST,
@@ -6258,7 +6714,7 @@ async fn handle_search(
     // extraction. A spell correction must NEVER silently change the user's
     // intent/constraints (the vegan→vegas data-loss bug). Corruption can only
     // ever touch the engine query string + spell_corrected_query display.
-    let q = if spell_changed {
+    let mut q = if spell_changed {
         let mut reconstructed = q_corrected_cleaned;
         let gateway_extracted = extract_gateway_constraints(q_trimmed);
         for phrase in gateway_extracted.phrases {
@@ -6328,7 +6784,7 @@ async fn handle_search(
     // "restaurants in london") MUST override the IP-derived geolocation. Without
     // this, a user in India searching "restaurants in tokyo japan" got
     // IN-localised results. Explicit user intent wins over inferred IP location.
-    let geo_location: Option<geoloc::GeoLocation> = match detect_explicit_location(&q) {
+    let mut geo_location: Option<geoloc::GeoLocation> = match detect_explicit_location(&q) {
         Some(explicit) => {
             tracing::info!("GEO: explicit location '{}' overrides IP geolocation",
                 explicit.country_code.as_deref().unwrap_or("?"));
@@ -6336,6 +6792,21 @@ async fn handle_search(
         }
         None => geo_location,
     };
+
+    // M3 fix: fallback location for loopback/private IP or missing geo DB when query has local intent ("near me")
+    if geo_location.is_none() && has_local_intent(&q) {
+        geo_location = Some(geoloc::GeoLocation {
+            country_code: Some("US".to_string()),
+            country_name: Some("United States".to_string()),
+            region: Some("New York".to_string()),
+            city: Some("New York".to_string()),
+            postal_code: Some("10001".to_string()),
+            latitude: Some(40.7128),
+            longitude: Some(-74.0060),
+            time_zone: Some("America/New_York".to_string()),
+        });
+        tracing::info!("GEO: local intent detected, applied default geolocation fallback (New York, US)");
+    }
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
     // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
@@ -6806,6 +7277,40 @@ async fn handle_search(
         }
     };
 
+    let is_shopping_intent = q_lower.contains("buy") || q_lower.contains("price") || q_lower.contains("shop")
+        || constraints.price_max.is_some() || constraints.price_min.is_some()
+        || constraints.price_lt.is_some() || constraints.price_gt.is_some();
+
+    let shopping_fut = async {
+        if !is_shopping_intent || all_searx_open {
+            return Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] });
+        }
+        let shop_url = searxng_url_with_categories(
+            "http://127.0.0.1:8080", &q, "shopping", geo_location.as_ref(), lang
+        );
+        let s_client = client.clone();
+        let task = tokio::spawn(async move {
+            let resp = match tokio::time::timeout(Duration::from_millis(1200), s_client.get(&shop_url).send()).await {
+                Ok(Ok(r)) => r,
+                _ => return Ok::<SearxResponse, anyhow::Error>(SearxResponse { results: vec![], unresponsive_engines: vec![] }),
+            };
+            let raw = match tokio::time::timeout(Duration::from_millis(1200), resp.text()).await {
+                Ok(Ok(t)) => t,
+                _ => return Ok::<SearxResponse, anyhow::Error>(SearxResponse { results: vec![], unresponsive_engines: vec![] }),
+            };
+            let sanitized = sanitize_json_text(&raw);
+            match serde_json::from_str::<SearxResponse>(&sanitized) {
+                Ok(data) => Ok(data),
+                Err(e) => { tracing::warn!("SearXNG shopping fan-out parse error: {}", e); Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] }) }
+            }
+        });
+        match tokio::time::timeout(Duration::from_millis(1500), task).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => { tracing::warn!("SearXNG shopping task error"); Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] }) }
+            Err(_) => { tracing::warn!("SearXNG shopping task timed out (budget)"); Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] }) }
+        }
+    };
+
     let has_site = !constraints.sites.is_empty();
     let searx_partial_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let partial_collector_inner = searx_partial_collector.clone();
@@ -6979,7 +7484,7 @@ async fn handle_search(
     // The SearXNG internal budget remains 10s for retries, but we surface
     // whatever results arrived within the deadline. The other backends (intent,
     // indexer, invidious, news, images) still get their full budget.
-    let (intent_result, embed_res, indexer_res, searx_results, invidious_res, news_res, image_res) = tokio::join!(
+    let (intent_result, embed_res, indexer_res, mut searx_results, invidious_res, news_res, image_res, shopping_res) = tokio::join!(
         intent_fut,
         embed_fut,
         indexer_task,
@@ -7012,7 +7517,15 @@ async fn handle_search(
         invidious_fut,
         news_fut,
         image_fut,
+        shopping_fut,
     );
+
+    if let Ok(shopping_data) = shopping_res {
+        if !shopping_data.results.is_empty() {
+            tracing::info!("SearXNG shopping category returned {} results", shopping_data.results.len());
+            searx_results.push((0, Ok(shopping_data)));
+        }
+    }
     // 2. Process Intent & Embedding (now available alongside engine results)
     let mut intent: IntentResponse = match intent_result {
         Ok(parsed) => parsed,
@@ -7178,13 +7691,13 @@ async fn handle_search(
         // Override 2b: a fresh intent with no derived date window must still
         // apply a real recency cutoff (not just re-weight scoring). Without this,
         // "latest ai news" would rank newer items higher but never drop stale ones.
+        // The actual hard window is applied AFTER the web merge (see dated_result_count
+        // guard near line ~8485): we only set it when at least one web result actually
+        // carries a parseable date, so date-less fresh queries (e.g. "latest movies
+        // released in 2026") fail OPEN and keep recency as a scoring boost instead of
+        // collapsing to 0 results.
         if intent.intent == "fresh" && intent.structured_constraints.after_date.is_none() {
-            let today = today_ymd();
-            intent.structured_constraints.after_date = Some(format_ymd(add_days(today, -7)));
-            if intent.structured_constraints.before_date.is_none() {
-                intent.structured_constraints.before_date = Some(format_ymd(today));
-            }
-            tracing::info!("FRESH OVERRIDE: applied default 7-day recency window");
+            tracing::info!("FRESH OVERRIDE: fresh intent without date window — window applied post-merge (fail-open if no dated results)");
         }
 
         // Override 3: "other than X" with low confidence → boost comparison + technical
@@ -7200,40 +7713,71 @@ async fn handle_search(
             intent.distribution.insert("technical".to_string(), tech + 0.1);
         }
 
-        // Override 4: local intent signals with low confidence → force local
-        // e.g. "pizza near me" (conf=0.12, classified comparison → should be local)
+        // Override 4: local intent signals → force local intent
         let has_local_keywords = q_lower.contains(" near me") || q_lower.starts_with("near me")
             || q_lower.contains("nearby") || q_lower.contains(" close to")
             || q_lower.starts_with("close to") || q_lower.contains("coffee shop");
-        if has_local_keywords && intent.intent != "local" && intent.confidence < 0.50 {
+        if has_local_keywords && intent.intent != "local" {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): local query '{}' was '{}' (conf={:.3}) -> local",
                 q, intent.intent, intent.confidence
             );
             intent.intent = "local".to_string();
-            intent.confidence = intent.confidence.max(0.45);
+            intent.confidence = intent.confidence.max(0.75);
             let local_prob = intent.distribution.get("local").copied().unwrap_or(0.0);
             let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-            intent.distribution.insert("local".to_string(), (local_prob + current_top_prob * 0.5).min(0.85));
+            intent.distribution.insert("local".to_string(), (local_prob + current_top_prob * 0.5 + 0.4).min(0.90));
+        }
+
+        // Override 5: Comparison & Alternatives signals (H2 fix)
+        // e.g. "alternatives to adobe photoshop that are free", "best budget smartphones under 30000 rupees"
+        let comp_signals = [
+            "alternatives to", "alternative to", "alternatives for", "alternative for",
+            "similar to", "apps like", "tools like", "software like", "sites like",
+            "equivalent to", "replacement for", "competing with", "vs", "versus",
+            "best budget", "best ... under", "top ... under", "compared to", "difference between",
+            "which is better", "comparison"
+        ];
+        let has_comp_signal = comp_signals.iter().any(|s| {
+            if s.contains("...") {
+                let parts: Vec<&str> = s.split("...").collect();
+                parts.len() == 2 && q_lower.contains(parts[0].trim()) && q_lower.contains(parts[1].trim())
+            } else {
+                q_lower.contains(s)
+            }
+        });
+        if has_comp_signal {
+            tracing::info!(
+                "INTENT OVERRIDE (DECISIVE): comparison query '{}' was '{}' (conf={:.3}) -> comparison",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "comparison".to_string();
+            intent.confidence = intent.confidence.max(0.85);
+            intent.distribution.insert("comparison".to_string(), 0.85);
+            if intent.distribution.get("informational").copied().unwrap_or(0.0) > 0.4 {
+                intent.distribution.insert("informational".to_string(), 0.15);
+            }
         }
 
         // Override 6: transactional keywords -> force/boost transactional intent
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon "];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(&format!(" {}", k)) || q_lower.contains("headphones"));
-        if has_tx_signal && !has_local_keywords && intent.intent != "transactional" && intent.confidence < 0.50 {
-            tracing::info!(
-                "INTENT OVERRIDE (STRONG): transactional query '{}' was '{}' (conf={:.3}) -> transactional",
-                q, intent.intent, intent.confidence
-            );
-            intent.intent = "transactional".to_string();
-            intent.confidence = intent.confidence.max(0.45);
-            let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
-            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-            intent.distribution.insert("transactional".to_string(), (tx_prob + current_top_prob * 0.5).min(0.85));
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+        if has_tx_signal && !has_local_keywords {
+            if intent.intent != "comparison" && (intent.intent != "transactional" || intent.confidence < 0.60) {
+                tracing::info!(
+                    "INTENT OVERRIDE (STRONG): transactional query '{}' was '{}' (conf={:.3}) -> transactional",
+                    q, intent.intent, intent.confidence
+                );
+                if intent.intent != "comparison" {
+                    intent.intent = "transactional".to_string();
+                }
+                intent.confidence = intent.confidence.max(0.80);
+                let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
+                intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
+            }
         }
 
         // Override 8: Driver / Software Download Intent -> force decisive Navigational + Download intent
-        // Handles queries like "find the driver download", "nvidia rtx 4090 driver download", "download vlc"
         let download_keywords = [
             "driver", "drivers", "download", "downloads", "installer", "installers",
             "firmware", "patch", "software download", "official download", "setup.exe"
@@ -7251,111 +7795,72 @@ async fn handle_search(
             intent.distribution.insert("download".to_string(), 0.90);
         }
 
-        // Override 5: "vs" or "versus" signals in query with low comparison confidence
-        // boost comparison intent. Handles queries like "react vs vue vs angular comparison"
-        // that the engine may misclassify as informational.
-        let has_vs_signal = q_lower.contains(" vs ") || q_lower.starts_with("vs ")
-            || q_lower.contains(" versus ") || q_lower.starts_with("versus");
-        if has_vs_signal {
-            let comp_prob = intent.distribution.get("comparison").copied().unwrap_or(0.0);
-            if comp_prob < 0.30 {
-                tracing::info!(
-                    "INTENT OVERRIDE: vs query '{}' was '{}' (conf={:.3}) — boosting comparison",
-                    q, intent.intent, intent.confidence
-                );
-                intent.distribution.insert("comparison".to_string(), comp_prob + 0.25);
-            }
-            // If intent is informational or navigational with low confidence, force comparison
-            if intent.intent != "comparison" && intent.confidence < 0.40 {
-                let cur_top = intent.distribution.iter()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(k, _)| k.clone())
-                    .unwrap_or_default();
-                let cur_prob = intent.distribution.get(&cur_top).copied().unwrap_or(0.0);
-                let new_comp = intent.distribution.get("comparison").copied().unwrap_or(0.0);
-                let threshold = if intent.intent == "informational" { 0.35 } else { 0.25 };
-                if new_comp + 0.25 > cur_prob.min(threshold) {
-                    tracing::info!(
-                        "INTENT OVERRIDE (STRONG): vs query '{}' was '{}' (conf={:.3}) — comparison now dominant",
-                        q, intent.intent, intent.confidence
-                    );
-                    intent.intent = "comparison".to_string();
-                    intent.confidence = intent.confidence.max(0.30);
-                }
-            }
+        // Override 7: weather / forecast queries → fresh
+        let weather_signals = [
+            "weather", "forecast", "temperature", "rain", "snow", "humidity",
+            "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
+        ];
+        let has_weather_signal = weather_signals.iter().any(|s| q_lower.contains(s));
+        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "fresh".to_string();
+            intent.confidence = intent.confidence.max(0.45);
+            let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
+            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+            intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
+        }
 
-            // Override 7: weather / forecast queries → fresh (time-sensitive, never navigational).
-            // "weather forecast tomorrow" is routinely mislabeled navigational by the engine.
-            let weather_signals = [
-                "weather", "forecast", "temperature", "rain", "snow", "humidity",
-                "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
-            ];
-            let has_weather_signal = weather_signals.iter().any(|s| q_lower.contains(s));
-            if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" {
-                tracing::info!(
-                    "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
-                    q, intent.intent, intent.confidence
-                );
-                intent.intent = "fresh".to_string();
-                intent.confidence = intent.confidence.max(0.45);
-                let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
-                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-                intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
-            }
+        // Override 8: procedural / how-to queries → how-to
+        let howto_signals = [
+            "how to", "how do i", "how do you", "how can i", "how can you", "how to's",
+            "tutorial", "step by step", "step-by-step", "ways to", "guide to", "guide:",
+            "find files", "find the", "modified", "fix ", "install", "configure",
+            "set up", "setup", "uninstall", "upgrade", "build from", "compile",
+            "debug", "troubleshoot", "resolve", "workaround",
+        ];
+        let has_howto_signal = howto_signals.iter().any(|s| q_lower.contains(s));
+        if has_howto_signal
+            && (intent.intent == "navigational" || intent.confidence < 0.40)
+            && intent.intent != "how-to"
+        {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): how-to query '{}' was '{}' (conf={:.3}) → how-to",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "how-to".to_string();
+            intent.confidence = intent.confidence.max(0.45);
+            let howto_prob = intent.distribution.get("how-to").copied().unwrap_or(0.0);
+            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+            intent.distribution.insert("how-to".to_string(), (howto_prob + current_top_prob * 0.5).min(0.85));
+            let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
+            intent.distribution.insert("technical".to_string(), tech_prob + 0.15);
+        }
 
-            // Override 8: procedural / how-to queries → how-to (with technical secondary).
-            // e.g. "linux find files modified last 7 days", "how to fix npm ERR_MODULE_NOT_FOUND".
-            // The engine often mislabels step-by-step operational queries as navigational.
-            let howto_signals = [
-                "how to", "how do i", "how do you", "how can i", "how can you", "how to's",
-                "tutorial", "step by step", "step-by-step", "ways to", "guide to", "guide:",
-                "find files", "find the", "modified", "fix ", "install", "configure",
-                "set up", "setup", "uninstall", "upgrade", "build from", "compile",
-                "debug", "troubleshoot", "resolve", "workaround",
-            ];
-            let has_howto_signal = howto_signals.iter().any(|s| q_lower.contains(s));
-            if has_howto_signal
-                && (intent.intent == "navigational" || intent.confidence < 0.40)
-                && intent.intent != "how-to"
-            {
-                tracing::info!(
-                    "INTENT OVERRIDE (STRONG): how-to query '{}' was '{}' (conf={:.3}) → how-to",
-                    q, intent.intent, intent.confidence
-                );
-                intent.intent = "how-to".to_string();
-                intent.confidence = intent.confidence.max(0.45);
-                let howto_prob = intent.distribution.get("how-to").copied().unwrap_or(0.0);
-                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-                intent.distribution.insert("how-to".to_string(), (howto_prob + current_top_prob * 0.5).min(0.85));
-                // Technical is a natural secondary intent for operational/dev queries.
-                let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
-                intent.distribution.insert("technical".to_string(), tech_prob + 0.15);
-            }
-
-            // Override 9: research / study queries → informational (with technical secondary).
-            // e.g. "covid vaccine efficacy studies", "attention is all you need paper".
-            let research_signals = [
-                "study", "studies", "efficacy", "research", "analysis", "literature",
-                "paper", "survey", "whitepaper", "benchmark", "experiment", "findings",
-                "meta-analysis", "peer review", "journal", "abstract",
-            ];
-            let has_research_signal = research_signals.iter().any(|s| q_lower.contains(s));
-            if has_research_signal
-                && (intent.intent == "navigational" || intent.confidence < 0.40)
-                && intent.intent != "informational"
-            {
-                tracing::info!(
-                    "INTENT OVERRIDE (STRONG): research query '{}' was '{}' (conf={:.3}) → informational",
-                    q, intent.intent, intent.confidence
-                );
-                intent.intent = "informational".to_string();
-                intent.confidence = intent.confidence.max(0.45);
-                let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-                intent.distribution.insert("informational".to_string(), (info_prob + current_top_prob * 0.5).min(0.85));
-                let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
-                intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
-            }
+        // Override 9: research / study queries → informational
+        let research_signals = [
+            "study", "studies", "efficacy", "research", "analysis", "literature",
+            "paper", "survey", "whitepaper", "benchmark", "experiment", "findings",
+            "meta-analysis", "peer review", "journal", "abstract",
+        ];
+        let has_research_signal = research_signals.iter().any(|s| q_lower.contains(s));
+        if has_research_signal
+            && (intent.intent == "navigational" || intent.confidence < 0.40)
+            && intent.intent != "informational"
+        {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): research query '{}' was '{}' (conf={:.3}) → informational",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "informational".to_string();
+            intent.confidence = intent.confidence.max(0.45);
+            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+            intent.distribution.insert("informational".to_string(), (info_prob + current_top_prob * 0.5).min(0.85));
+            let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
+            intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
         }
     }
 
@@ -7825,6 +8330,8 @@ async fn handle_search(
                             score: 0.0,
                             sources: vec!["invidious".to_string(), "video".to_string()],
                             published_date: None,
+                            price: None,
+                            currency: None,
                         });
                     }
                 }
@@ -7859,6 +8366,8 @@ async fn handle_search(
                         score: 0.0,
                         sources: vec!["news".to_string()],
                         published_date: r.published_date.clone(),
+                        price: None,
+                        currency: None,
                     });
                 }
             }
@@ -7891,6 +8400,8 @@ async fn handle_search(
                         score: 0.0,
                         sources: vec!["images".to_string()],
                         published_date: None,
+                        price: None,
+                        currency: None,
                     });
                 }
             }
@@ -8037,28 +8548,85 @@ async fn handle_search(
     // cause of the "sparse/off-topic 3-result" symptom. In that degenerate
     // case we trust the search-engine ranking (RRF) instead and keep the
     // merged results rather than discarding them.
-    if is_garbage_cluster {
+    // When the relevance model cannot discriminate (garbage cluster), we trust
+    // the engine ranking (RRF) and keep ALL candidates; otherwise keep those
+    // above the adaptive threshold (with a top-3 floor). The superlative-junk
+    // exclusion below then applies to BOTH paths, so off-topic "best"-brand
+    // pages are removed even in the degenerate RRF case (where they dominate).
+    let mut keep_indices: Vec<usize> = if is_garbage_cluster {
         tracing::warn!(
             "SEMANTIC FILTER SKIPPED (degenerate scorer, trusting RRF): web_results.len={}",
             web_results.len()
         );
+        (0..web_results.len()).collect()
     } else {
-    let mut keep_indices: Vec<usize> = Vec::new();
-    for (i, &score) in semantic_scores_web.iter().enumerate() {
-        if score >= semantic_threshold {
-            keep_indices.push(i);
+        let mut keep: Vec<usize> = Vec::new();
+        for (i, &score) in semantic_scores_web.iter().enumerate() {
+            if score >= semantic_threshold {
+                keep.push(i);
+            }
+        }
+        // Always keep at least 3 results (but only if they have ANY relevance)
+        if keep.len() < 3 && !web_results.is_empty() {
+            // Take top-3 by semantic score, even if below threshold
+            let mut scored: Vec<(usize, f32)> = semantic_scores_web.iter().enumerate()
+                .map(|(i, &s)| (i, s)).collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            keep = scored.iter().take(3).map(|(i, _)| *i).collect();
+        }
+        keep
+    };
+    // Superlative-junk exclusion: "best X" queries attract pages whose TITLE is
+    // about the superlative word itself ("Best Buy | Official Store", "10BEST",
+    // "BEST Definition") while containing NONE of the query's topic terms. These
+    // are off-topic, not merely low-relevance — drop them outright so they never
+    // fill the page with floor scores. Structural (title-pattern based), no
+    // hardcoded domains. Skipped when it would leave < 3 results (degenerate
+    // pool fallback) or the query has no topic terms to check.
+    let q_lower_sf = q.to_lowercase();
+    let superlative_set: &[&str] = &["best", "top", "greatest", "cheapest", "finest"];
+    let q_has_superlative = superlative_set.iter().any(|s| q_lower_sf.contains(s));
+    // Fire even for tiny pools: a single "Best Buy" squeezed into a 3-result
+    // web pool is exactly the junk that must not be shown. The inner guard
+    // below keeps the degenerate all-junk fallback alive.
+    if q_has_superlative && !keep_indices.is_empty() {
+        let topic_terms: Vec<String> = q.split_whitespace()
+            .map(|w| w.to_lowercase())
+            .filter(|w| {
+                w.len() >= 3
+                    && !superlative_set.contains(&w.as_str())
+                    && !w.chars().all(|c| c.is_ascii_digit())
+                    && !["the","a","an","and","or","for","of","in","on","at","to","with",
+                        "from","by","under","over","is","are","was","were","be","that",
+                        "this","these","those","your","you","how","what","which","more",
+                        "most","than","then","very","just","not","no","only","also","any"].contains(&w.as_str())
+            })
+            .collect();
+        if !topic_terms.is_empty() {
+            let filtered: Vec<usize> = keep_indices.iter().copied()
+                .filter(|&i| {
+                    let t = web_results[i].title.to_lowercase();
+                    let title_has_superlative = superlative_set.iter().any(|s| t.contains(s));
+                    if !title_has_superlative { return true; }
+                    topic_terms.iter().any(|w| t.contains(w.as_str()))
+                })
+                .collect();
+            // Keep the exclusion whenever any non-junk survivor exists — dropping
+            // junk down to even 1-2 results beats showing it. In a garbage-cluster
+            // pool (everything off-topic) the junk goes even to zero; the local
+            // index + surviving web results fill the page instead. Only when the
+            // pool is 100% superlative-junk AND the scorer is discriminating do
+            // we keep it (degenerate fallback, better than an empty page).
+            if filtered.len() > 0 || is_garbage_cluster {
+                let removed = keep_indices.len() - filtered.len();
+                if removed > 0 {
+                    tracing::info!("Superlative-junk exclusion: removed {} off-topic superlative-only web result(s)", removed);
+                }
+                keep_indices = filtered;
+            }
         }
     }
-    // Always keep at least 3 results (but only if they have ANY relevance)
-    if keep_indices.len() < 3 && !web_results.is_empty() {
-        // Take top-3 by semantic score, even if below threshold
-        let mut scored: Vec<(usize, f32)> = semantic_scores_web.iter().enumerate()
-            .map(|(i, &s)| (i, s)).collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        keep_indices = scored.iter().take(3).map(|(i, _)| *i).collect();
-    }
     web_results = keep_indices.into_iter().map(|i| web_results[i].clone()).collect();
-    }
 
     // Constraint transparency bookkeeping: capture the result count before any
     // constraint filtering, and how many results actually carry a parseable
@@ -8068,9 +8636,26 @@ async fn handle_search(
     let dated_result_count = web_results.iter().filter(|r| {
         resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
     }).count();
-    let priced_result_count = web_results.iter().filter(|r| {
-        extract_price_from_text(&r.title).or_else(|| extract_price_from_text(&r.content)).is_some()
-    }).count();
+    let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
+
+    // FRESH fail-open (prevents 0-result collapse): the FRESH OVERRIDE may have
+    // flagged this as a recency query, and should_filter_by_constraints DROPS any
+    // result without a parseable date. When NO merged web result actually carries a
+    // date (typical for "latest movies released in 2026", "latest ai news this week"),
+    // a hard window would delete every result -> n=0. In that case we clear the
+    // derived date bounds so recency stays a pure SCORING boost (freshness half-life)
+    // and results are retained. If dated results DO exist, the hard window stands.
+    if intent.intent == "fresh"
+        && (intent.structured_constraints.after_date.is_some() || intent.structured_constraints.before_date.is_some())
+        && dated_result_count == 0
+    {
+        tracing::info!(
+            "FRESH FAIL-OPEN: {} web results but 0 carried a parseable date — clearing hard recency window (recency stays scoring-only)",
+            pre_filter_count
+        );
+        intent.structured_constraints.after_date = None;
+        intent.structured_constraints.before_date = None;
+    }
 
     // --- Hard filter: remove web results that violate negative constraints ---
     // Uses a graduated penalty approach instead of a single threshold:
@@ -8298,41 +8883,67 @@ async fn handle_search(
         }
     }
 
-    // --- Price constraint: real narrowing (BUG: price silently passed) ---
-    // When a price range is requested we drop results whose snippet carries a
-    // price outside the range. More importantly, if ANY result carries an
-    // in-range price, we also drop results with no detectable price at all —
-    // an explicit price intent is not satisfied by unpriced pages. If NO result
-    // has a detectable price, we keep everything (we cannot verify) but flag it.
+    // --- Price constraint: real narrowing, but NEVER gut the result set ---
+    // Out-of-range PRICED results are already hard-dropped upstream by
+    // `should_filter_by_constraints` (4f). This block only decides what to do
+    // with UNPRICED results. The old rule dropped every unpriced result the
+    // moment ANY result carried an in-range price — which wrecked exactly the
+    // queries this feature was meant to serve: "best noise cancelling
+    // headphones under 200 dollars" collapsed to 3 YouTube videos (their
+    // titles contain "$200") and dropped every product page/listicle (whose
+    // snippets rarely expose a machine-parseable price).
+    //
+    // Robust policy (fail-open, mirroring the date filters):
+    //   • Out-of-range priced results: hard-dropped (upstream, 4f).
+    //   • Unpriced results: KEPT — most pages don't expose a price in their
+    //     snippet, and a natural-language bound ("under $200") describes the
+    //     TOPIC (a category of product), not a demand for machine-readable
+    //     prices. Ranking (P3 price-aware) already boosts in-range priced
+    //     results and demotes unpriced ones.
+    //   • Explicit operator: when the user literally typed `price:<N` (not a
+    //     natural-language phrase normalized to it) we MAY hard-drop unpriced
+    //     results — but only while enough in-range priced results remain to
+    //     fill the page (>= 6), so we never collapse to 1-3 arbitrary hits.
     {
         let pmin = intent.structured_constraints.price_min;
         let pmax = intent.structured_constraints.price_max;
         if pmin.is_some() || pmax.is_some() {
-            let lo = pmin.unwrap_or(0.0);
-            let hi = pmax.unwrap_or(f32::MAX);
-            let has_in_range = web_results.iter().any(|r| {
-                extract_price_from_text(&r.title)
-                    .or_else(|| extract_price_from_text(&r.content))
-                    .map(|p| p >= lo && p <= hi)
-                    .unwrap_or(false)
-            });
-            if has_in_range {
+            let lo = pmin.unwrap_or(0.0) as f64;
+            let hi = pmax.unwrap_or(f32::MAX) as f64;
+            let in_range_price = |r: &SearxResult| -> Option<bool> {
+                r.get_price().map(|pi| {
+                    let usd = price_to_usd(pi.amount, &pi.currency);
+                    usd >= lo && usd <= hi
+                })
+            };
+            let in_range_count = web_results.iter().filter(|r| {
+                in_range_price(r).unwrap_or(false)
+            }).count();
+            // The price bound is EXPLICIT only when the raw query contains a
+            // `price:` operator. Natural-language phrases ("under $200", "less
+            // than 100 dollars") are normalized to `price:<N` by
+            // normalize_nl_operators, but they express query intent, not a
+            // hard filter — they must not gut the pool.
+            let q_raw_lower = q_orig.to_lowercase();
+            let explicit_price_op = q_raw_lower.contains("price:")
+                || q_raw_lower.contains("price<") || q_raw_lower.contains("price>");
+            if explicit_price_op && in_range_count >= 6 {
                 let before = web_results.len();
-                web_results.retain(|r| {
-                    extract_price_from_text(&r.title)
-                        .or_else(|| extract_price_from_text(&r.content))
-                        .map(|p| p >= lo && p <= hi)
-                        .unwrap_or(false)
-                });
+                web_results.retain(|r| in_range_price(r).unwrap_or(false));
                 let after = web_results.len();
                 tracing::info!(
-                    "Price constraint: narrowed {} → {} results (dropped {} unpriced/out-of-range)",
+                    "Price constraint (explicit operator): narrowed {} → {} results (dropped {} unpriced/out-of-range)",
                     before, after, before - after
                 );
-            } else {
+            } else if in_range_count == 0 {
                 tracing::warn!(
                     "Price constraint specified ({:?}-{:?}) but no result snippets carried a detectable price — cannot narrow",
                     pmin, pmax
+                );
+            } else {
+                tracing::info!(
+                    "Price constraint (soft/derived): kept {} unpriced result(s); {} in-range priced result(s) rank ahead via P3",
+                    web_results.iter().filter(|r| in_range_price(r).is_none()).count(), in_range_count
                 );
             }
         }
@@ -8412,37 +9023,7 @@ async fn handle_search(
     // Handles: "not react not vue" → ["react", "vue"]
     //          "without node not django" → ["node", "django"]
     //          "not prometheus not grafana not datadog" → ["prometheus", "grafana", "datadog"]
-    let query_neg_terms: Vec<String> = if query_has_negation {
-        let q_lower = q_orig.to_lowercase(); // Phase 1 (A3): original query (not corrected)
-        let negation_markers = ["not ", "no ", "without "];
-        let mut terms: Vec<String> = Vec::new();
-        let words: Vec<&str> = q_lower.split_whitespace().collect();
-        for (i, word) in words.iter().enumerate() {
-            // Check if this word is a negation marker
-            let neg_words: [&str; 3] = ["no", "not", "without"];
-            let is_neg = negation_markers.iter().any(|m| *m == format!("{} ", word))
-                || neg_words.contains(word)
-                || word.starts_with("-");
-            if is_neg {
-                // Grab the next word (unless it's also a negation marker)
-                if i + 1 < words.len() {
-                    let next = words[i + 1];
-                    let next_is_neg = negation_markers.iter().any(|m| *m == format!("{} ", next))
-                        || neg_words.contains(&next)
-                        || next.starts_with("-");
-                    if !next_is_neg && next.len() >= 2 {
-                        let clean: String = next.chars().filter(|c| c.is_alphanumeric()).collect();
-                        if !terms.contains(&clean) && !clean.is_empty() {
-                            terms.push(clean);
-                        }
-                    }
-                }
-            }
-        }
-        terms
-    } else {
-        vec![]
-    };
+    let query_neg_terms: Vec<String> = extract_query_negative_terms(&q_orig);
     
     // Fallback: if query_has_negation but intent engine put terms in positive instead of negative,
     // use the query-derived terms. If the intent engine correctly classified them as negative,
@@ -8452,13 +9033,12 @@ async fn handle_search(
     
     // Use query-derived terms when available (they're more reliable for negation),
     // otherwise fall back to intent engine's negative constraints.
-    let neg_terms: Vec<String> = if !query_neg_terms.is_empty() {
-        query_neg_terms.clone()
-    } else {
-        intent.structured_constraints.negative.iter()
-            .map(|n| n.to_lowercase())
-            .collect()
-    };
+    if !query_neg_terms.is_empty() {
+        intent.structured_constraints.negative = query_neg_terms.clone();
+    }
+    let neg_terms: Vec<String> = intent.structured_constraints.negative.iter()
+        .map(|n| n.to_lowercase())
+        .collect();
     let mut neg_terms_expanded: Vec<String> = Vec::new();
     for nt in &neg_terms {
         for syn in expand_negative_synonyms(nt) {
@@ -8524,7 +9104,7 @@ async fn handle_search(
 // to the query embedding, so word-sense collisions (square-a-circle, promise,
 // crash) resolve correctly. Fail-closed: returns empty on any error and the
 // ranking falls back to the existing substring scorer (no behaviour change).
-let web_semantic = compute_web_semantic(&vector, &web_results, &client).await;
+let web_semantic = compute_web_semantic(&vector, &local_results, &web_results, &client).await;
 
 let mut results = match tokio::task::spawn_blocking(move || {
     merge_local_and_web(
@@ -8630,7 +9210,19 @@ let mut results = match tokio::task::spawn_blocking(move || {
             // Alternative-listing page check: keep comparison/alternative pages
             // even if they mention excluded terms (they are HIGHLY relevant).
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-            if alt_score > 0.3 && is_comparison_or_alternative_query(&intent.structured_constraints) {
+            // Exempt alternative-listing pages from the hard negative drop. A page
+            // scoring >0.3 here is, by construction, an "alternatives to X" /
+            // comparison listing that mentions the excluded term *referentially* —
+            // exactly what an "alternative to X", "except X", or "without X" query
+            // wants. This MUST match the pre-merge gate (line ~8650) and the
+            // penalty path's strong-alt exemption, otherwise legit alt pages like
+            // "25 Alternative Search Engines You Can Use Instead Google" get
+            // hard-dropped for "search engine alternative to google" (result set
+            // collapses to 1). We do NOT also require
+            // is_comparison_or_alternative_query(): for "alternative to X" the word
+            // "alternative" is consumed into the negative constraint, so that check
+            // would never fire and would wrongly re-enable the drop.
+            if alt_score > 0.3 {
                 return true;
             }
 
@@ -8775,6 +9367,13 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 q_trimmed, q
             );
             spell_changed = false;
+            // Actually restore the ORIGINAL query for the engine search. Logging a
+            // revert without restoring `q` left the corrupted form ("bryan") in the
+            // search path even though validation flagged it as wrong — so a valid
+            // word like "biryani" got English-ified and the bad correction still ran.
+            // `q_trimmed` is the user's original query (operators intact), which is
+            // exactly what we want to search with when the correction is rejected.
+            q = q_trimmed.to_string();
         }
     }
 
@@ -9048,12 +9647,13 @@ let mut results = match tokio::task::spawn_blocking(move || {
         applied_constraints: if applied.is_empty() { None } else { Some(applied) },
         ignored_constraints: if ignored.is_empty() { None } else { Some(ignored) },
         warnings: if warnings.is_empty() { None } else { Some(warnings) },
-        results_before_filter: Some(pre_filter_count),
+        results_before_filter: Some(pre_filter_count.max(post_filter_count)),
         results_after_filter: Some(post_filter_count),
         total: Some(post_filter_count),
         page_limit: Some(limit),
         page_offset: Some(offset),
         has_more: if post_filter_count > 0 { Some(offset + limit < post_filter_count) } else { Some(false) },
+        price_verified: if sc.price_min.is_some() || sc.price_max.is_some() || sc.price_lt.is_some() || sc.price_gt.is_some() || priced_result_count > 0 { Some(priced_result_count) } else { None },
     };
 
     // Cache for 5 minutes — but never cache empty results
@@ -9425,6 +10025,8 @@ async fn handle_search_fast(
                         sources: vec!["local".to_string()],
                         is_local: true,
                         published_date: None,
+                        price: r.price.map(|p| p.to_string()),
+                        currency: r.currency,
                         quality: r.quality,
                     }).collect::<Vec<_>>()
                 }
@@ -9519,12 +10121,27 @@ mod constraint_fix_tests {
 
     #[test]
     fn price_extraction_broadened() {
-        // BUG4: more price formats detected.
-        assert_eq!(extract_price_from_text("Only $99 today"), Some(99.0));
-        assert_eq!(extract_price_from_text("Cost is €149.99"), Some(149.99));
-        assert_eq!(extract_price_from_text("from 250 dollars"), Some(250.0));
-        assert_eq!(extract_price_from_text("price: 49"), Some(49.0));
+        assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
+        assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
+        assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
+        assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
         assert_eq!(extract_price_from_text("no monetary value here"), None);
+        assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
+        assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
+    }
+
+    #[test]
+    fn rs_signal_no_false_positives() {
+        assert!(!has_price_signal("resources for learning python", "coursera course rsvp"));
+        assert!(has_price_signal("buy shoes rs. 500", "cheap deal"));
+        assert!(has_price_signal("item cost 200 rupees", "deal"));
+    }
+
+    #[test]
+    fn fx_conversion_test() {
+        assert_eq!(price_to_usd(100.0, "USD"), 100.0);
+        let inr_usd = price_to_usd(2000.0, "INR");
+        assert!(inr_usd < 30.0 && inr_usd > 20.0, "2000 INR should be ~24 USD, got {}", inr_usd);
     }
 
     #[test]

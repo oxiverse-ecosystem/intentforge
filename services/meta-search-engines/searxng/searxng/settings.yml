@@ -25,6 +25,9 @@ use_default_settings:
       - bing videos
       - google videos
       - duckduckgo videos
+      # ── Shopping engines ──
+      - google shopping
+      - ebay
 
 server:
   port: 8080
@@ -114,12 +117,18 @@ engines:
   # ── Academic engines (via VPN) ──
   - name: arxiv
     disabled: false
-    categories: [general, science]
+    categories: [science]  # not 'general': arxiv/crossref pollute every
+                         # non-academic query with papers (see gateway
+                         # ACADEMIC PAPER DEMOTE); gateway web searches
+                         # use the general category only
     timeout: 4.0
 
   - name: crossref
     disabled: false
-    categories: [general, science]
+    categories: [science]  # not 'general': arxiv/crossref pollute every
+                         # non-academic query with papers (see gateway
+                         # ACADEMIC PAPER DEMOTE); gateway web searches
+                         # use the general category only
     timeout: 4.0
 
   # ── Onion engines (via Tor SOCKS5) ──
@@ -191,5 +200,16 @@ engines:
     engine: duckduckgo_extra
     ddg_category: videos
     shortcut: ddv
+    disabled: false
+    timeout: 4.0
+
+  # ── Shopping engines (via VPN) ──
+  - name: google shopping
+    engine: google_shopping
+    disabled: false
+    timeout: 4.0
+
+  - name: ebay
+    engine: ebay
     disabled: false
     timeout: 4.0

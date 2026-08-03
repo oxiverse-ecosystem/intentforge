@@ -1256,6 +1256,102 @@ fn parse_date_string(date_str: &str) -> Option<u64> {
     None
 }
 
+// ─── Price & Currency Extraction ─────────────────────────────────────
+// Extracts schema.org JSON-LD (Product/Offer/AggregateOffer) and microdata
+// price/priceCurrency attributes from HTML before content stripping.
+
+fn normalize_crawler_currency(s: &str) -> String {
+    let lower = s.trim().to_lowercase();
+    if lower.contains('$') || lower.contains("usd") || lower.contains("dollar") {
+        if lower.contains("can") || lower.contains("cad") { "CAD".to_string() }
+        else if lower.contains("au") || lower.contains("aud") { "AUD".to_string() }
+        else { "USD".to_string() }
+    } else if lower.contains('€') || lower.contains("eur") || lower.contains("euro") {
+        "EUR".to_string()
+    } else if lower.contains('£') || lower.contains("gbp") || lower.contains("pound") {
+        "GBP".to_string()
+    } else if lower.contains('₹') || lower.contains("inr") || lower.contains("rupee") || lower.contains("rs") {
+        "INR".to_string()
+    } else if lower.contains('¥') || lower.contains("jpy") || lower.contains("yen") {
+        "JPY".to_string()
+    } else {
+        "USD".to_string()
+    }
+}
+
+fn extract_price_and_currency(document: &Html) -> (Option<f64>, Option<String>) {
+    // 1. Try parsing JSON-LD script tags (<script type="application/ld+json">)
+    if let Ok(script_selector) = Selector::parse("script[type='application/ld+json']") {
+        for script_elem in document.select(&script_selector) {
+            let json_text = script_elem.text().collect::<Vec<_>>().join("");
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_text) {
+                if let Some((p, c)) = find_price_in_json_ld(&val) {
+                    return (Some(p), Some(c));
+                }
+            }
+        }
+    }
+
+    // 2. Try Microdata / meta tags: itemprop="price" and itemprop="priceCurrency"
+    let price_meta = Selector::parse("meta[itemprop='price'], span[itemprop='price'], [itemprop='price']").ok();
+    let curr_meta = Selector::parse("meta[itemprop='priceCurrency'], span[itemprop='priceCurrency'], [itemprop='priceCurrency']").ok();
+
+    if let Some(price_sel) = price_meta {
+        if let Some(elem) = document.select(&price_sel).next() {
+            let price_str = elem.value().attr("content")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| elem.text().collect::<Vec<_>>().join(""));
+            if let Ok(parsed_p) = price_str.trim().replace(',', "").parse::<f64>() {
+                let curr_str = curr_meta.and_then(|c_sel| {
+                    document.select(&c_sel).next().and_then(|e| {
+                        e.value().attr("content").map(|s| s.to_string())
+                            .or_else(|| Some(e.text().collect::<Vec<_>>().join("")))
+                    })
+                }).unwrap_or_else(|| "USD".to_string());
+                return (Some(parsed_p), Some(normalize_crawler_currency(&curr_str)));
+            }
+        }
+    }
+
+    (None, None)
+}
+
+fn find_price_in_json_ld(val: &serde_json::Value) -> Option<(f64, String)> {
+    match val {
+        serde_json::Value::Object(map) => {
+            let p_val = map.get("price").or_else(|| map.get("lowPrice"));
+            let c_val = map.get("priceCurrency").or_else(|| map.get("currency"));
+
+            if let Some(pv) = p_val {
+                let amount = match pv {
+                    serde_json::Value::Number(num) => num.as_f64(),
+                    serde_json::Value::String(s) => s.trim().replace(',', "").parse::<f64>().ok(),
+                    _ => None,
+                };
+                if let Some(a) = amount {
+                    let currency = c_val.and_then(|c| c.as_str()).unwrap_or("USD");
+                    return Some((a, normalize_crawler_currency(currency)));
+                }
+            }
+
+            for (_k, v) in map {
+                if let Some(res) = find_price_in_json_ld(v) {
+                    return Some(res);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                if let Some(res) = find_price_in_json_ld(v) {
+                    return Some(res);
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 // ─── Crawl + Index ───────────────────────────────────────────────────
 
 async fn crawl_and_index(
@@ -1271,7 +1367,7 @@ async fn crawl_and_index(
 
     // Parse + extract everything from Html in a block so it's dropped before any .await
     // (scraper::Html contains Cell<usize> which is not Send)
-    let (title, cleaned_content, raw_len, links, pub_date, quality_score) = {
+    let (title, cleaned_content, raw_len, links, pub_date, price, currency, quality_score) = {
         let document = Html::parse_document(&html_content);
 
         let title_selector = Selector::parse("title").unwrap();
@@ -1306,10 +1402,13 @@ async fn crawl_and_index(
         // Extract publication date from meta tags, <time> elements, or URL
         let pub_date = extract_publication_date(&document, &entry.url);
 
+        // Extract structured price and currency from JSON-LD and Microdata
+        let (price, currency) = extract_price_and_currency(&document);
+
         // Compute content quality score
         let quality_score = compute_content_quality(&cleaned_content);
 
-        (title, cleaned_content, raw_len, links, pub_date, quality_score)
+        (title, cleaned_content, raw_len, links, pub_date, price, currency, quality_score)
     };
 
     // Feed the content-length distribution for the adaptive cap: record this
@@ -1366,6 +1465,13 @@ async fn crawl_and_index(
         "quality": quality_score as f64,
         "authority": authority as f64,
     });
+
+    if let Some(p) = price {
+        index_payload["price"] = serde_json::json!(p);
+    }
+    if let Some(ref c) = currency {
+        index_payload["currency"] = serde_json::json!(c);
+    }
 
     // Include publication timestamp if found (enables real freshness scoring)
     if let Some(ts) = pub_date {
