@@ -5043,9 +5043,30 @@ fn merge_local_and_web(
             // it — so CAP relevance to a low value so the adaptive floor crushes it.
             relevance = relevance.min(0.12);
         }
-        let intent_boost = calculate_intent_boost(&r.url, &r.title, &clean_query, intent);
+        let mut intent_boost = calculate_intent_boost(&r.url, &r.title, &clean_query, intent);
         let mut freshness = freshness_score(&r.url, intent, r.published_date.as_deref());
         let mut quality = content_quality_score(&r.content);
+
+        // ── Off-topic structural starvation (this round, #01) ──
+        // The generic-word guard above already crushes relevance (×0.12) for results that
+        // match NONE of the query's distinctive topic terms. But `freshness` (for news/date
+        // queries) and `intent_boost` (structural URL/title signals) are computed
+        // independently of relevance and feed `base` at full weight. A high-authority or
+        // recency-flavored off-topic page (e.g. water.ca.gov "...Late December Storms
+        // Deliver..." for "vegetarian restaurants in bengaluru that deliver late") keeps a
+        // large `base`, and `calibrate_scores` then rescales the max raw score to 1.0 —
+        // undoing the relevance crush (the classic "penalties only bite if folded into the
+        // FINAL r.score" lesson). Zeroing freshness + intent_boost for off-topic results
+        // starves the raw base so it stays below on-topic results even after calibration.
+        // `off_topic` is recomputed here (not reused from the base block) to stay in scope.
+        let off_topic_struct = !distinctive_terms.is_empty() && !distinctive_terms.iter().any(|t| {
+            let tl = t.to_lowercase();
+            title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
+        });
+        if off_topic_struct {
+            freshness = 0.0;
+            intent_boost = 0.0;
+        }
 
         // ── Fresh-intent news-portal demotion (this round, #16/#22) ──
         // For FRESH intent, upstream often returns ONLY the bare homepage or top-level
