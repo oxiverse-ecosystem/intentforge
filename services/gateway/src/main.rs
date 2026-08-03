@@ -817,6 +817,15 @@ fn extract_date_from_text(text: &str) -> Option<(i32, i32, i32)> {
     None
 }
 
+/// True when `word` appears as a whole word in `q_lower` (alphanumeric-boundary
+/// delimited). Avoids the substring false-positive where `contains("fresh")` also
+/// matches "fresher", "freshman", or "refresh" and wrongly injects a recency window.
+fn q_has_word(q_lower: &str, word: &str) -> bool {
+    q_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| w == word)
+}
+
 /// Map a natural-language recency phrase to a concrete (after, before) window
 /// expressed as `YYYY-MM-DD`. Returns None when no recency signal is present, so
 /// literal after:/before: and explicit dates are left untouched.
@@ -864,7 +873,10 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
         }
     }
 
-    if q_lower.contains("recent") || q_lower.contains("latest") || q_lower.contains("fresh") {
+    // Whole-word match only: a substring match on "fresh" wrongly fired for
+    // "fresher"/"freshman"/"refresh" and injected a 7-day date window that
+    // collapsed otherwise-normal informational queries to zero results.
+    if q_has_word(q_lower, "recent") || q_has_word(q_lower, "latest") || q_has_word(q_lower, "fresh") {
         return Some((format_ymd(add_days(today, -7)), today_s));
     }
 
