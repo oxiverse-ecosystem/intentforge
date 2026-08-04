@@ -517,6 +517,24 @@ fn extract_constraints(query: &str) -> Constraints {
         "competitor of ", "competitors of ",
     ]; // Note: "like " is omitted — too common as a non-reference word
 
+    // Generic function words must never become negative constraints. A bare
+    // negation marker followed by a stopword ("how to ... without [how]",
+    // "...that does not require...") is syntactic, not a topical exclusion —
+    // extracting "how"/"require"/"use" as a negative constraint penalises
+    // every otherwise-relevant page and collapses the result set. Generic
+    // (no topic-specific blocklist): covers the common closed-class words.
+    let is_generic_negatable = |w: &str| -> bool {
+        const GENERIC: &[&str] = &[
+            "how", "what", "why", "when", "where", "who", "which", "that", "this",
+            "these", "those", "the", "a", "an", "and", "or", "but", "use", "using",
+            "require", "required", "requires", "need", "needed", "needs", "do",
+            "does", "did", "can", "could", "would", "should", "will", "with", "without",
+            "from", "into", "onto", "upon", "over", "under", "before", "after", "than",
+            "them", "they", "their", "our", "your", "its", "his", "her", "not", "no",
+        ];
+        GENERIC.contains(&w.to_lowercase().as_str())
+    };
+
     // Process start-of-string markers first (negatives)
     for marker in &negative_start_markers {
         if q_lower.starts_with(marker) {
@@ -525,7 +543,7 @@ fn extract_constraints(query: &str) -> Constraints {
             // Phase 5: negatives use max_words=1 (head-noun only) so
             // "without prior experience" → "prior" not "prior experience".
             let term = extract_constraint_term(remaining, 1);
-            if !term.is_empty() && term.len() > 1 {
+            if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
                 negative.push(term);
             }
             break; // only one start marker can match
@@ -563,7 +581,7 @@ fn extract_constraints(query: &str) -> Constraints {
                 // Phase 5: negatives max_words=1 (head-noun) — "without node and react" → ["node","react"].
                 let terms = extract_conjunctive_terms(remaining, 1);
                 for term in terms {
-                    if !term.is_empty() && term.len() > 1 {
+                    if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
                         negative.push(term);
                     }
                 }
