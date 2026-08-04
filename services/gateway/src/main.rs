@@ -877,6 +877,17 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
     // "fresher"/"freshman"/"refresh" and injected a 7-day date window that
     // collapsed otherwise-normal informational queries to zero results.
     if q_has_word(q_lower, "recent") || q_has_word(q_lower, "latest") || q_has_word(q_lower, "fresh") {
+        // A version-pinned query ("rust 1.80", "version 3 of X", "python 3.13")
+        // is asking for the CONTENT of a specific release, not "news from the
+        // last 7 days". A 7-day recency window would drop that (often older)
+        // content and leave only date-stamped noise. When a software-version
+        // pattern is present, do NOT inject a fresh window — leave recency as a
+        // pure scoring boost (freshness half-life). Generic: matches the shape
+        // "X.Y[.Z]" / "version N" / "vN", not any specific product name.
+        let version_pinned = regex::Regex::new(r"(?i)(\bv?\d+\.\d+(\.\d+)?\b|version\s+\d+)").unwrap();
+        if version_pinned.is_match(q_lower) {
+            return None;
+        }
         return Some((format_ymd(add_days(today, -7)), today_s));
     }
 
@@ -3590,7 +3601,25 @@ fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
                 let target_is_neg = neg_markers.contains(&target) || target.starts_with('-');
                 if !target_is_neg && target.len() >= 2 {
                     let clean: String = target.chars().filter(|c| c.is_alphanumeric()).collect();
-                    if !clean.is_empty() && !terms.contains(&clean) {
+                    // Generic function words must never become negative constraints.
+                    // A bare negation marker followed by a closed-class word
+                    // ("does not REQUIRE", "without using the WORD", "not the THING")
+                    // is syntactic, not a topical exclusion. Extracting "require"/
+                    // "word"/"thing" as a negative penalises every otherwise-relevant
+                    // page and collapses the result set. Generic (no topic blocklist):
+                    // covers common verbs/pronouns/determiners that are never the
+                    // thing being excluded.
+                    const GENERIC_NEG: &[&str] = &[
+                        "how", "what", "why", "when", "where", "who", "which", "that", "this",
+                        "these", "those", "the", "a", "an", "and", "or", "but", "use", "using",
+                        "require", "required", "requires", "need", "needed", "needs", "do",
+                        "does", "did", "can", "could", "would", "should", "will", "with", "without",
+                        "from", "into", "onto", "upon", "over", "under", "before", "after", "than",
+                        "them", "they", "their", "our", "your", "its", "his", "her", "not", "no",
+                        "word", "thing", "things", "way", "something", "anything", "everything",
+                        "anyone", "anybody", "someone", "help", "saying", "said", "one", "it",
+                    ];
+                    if !clean.is_empty() && !terms.contains(&clean) && !GENERIC_NEG.contains(&clean.as_str()) {
                         terms.push(clean);
                     }
                 }
@@ -8834,6 +8863,33 @@ async fn handle_search(
         );
         intent.structured_constraints.after_date = None;
         intent.structured_constraints.before_date = None;
+    }
+
+    // PRICE fail-open (mirrors the date fail-open above, P3-class): a price
+    // constraint (`price:<60000`, `price_max`, etc.) can only meaningfully
+    // narrow results when at least one merged web result actually carries a
+    // detectable price. Web/local snippets almost never do, so when
+    // `priced_result_count == 0` the P3 ranking block would demote EVERY result
+    // (×0.45, no detectable price signal) and the hard filter would drop the
+    // single surviving item — collapsing a valid product query ("best budget
+    // mirrorless camera under 60000 rupees") to 0 results. Fail open: clear the
+    // price bound so normal relevance/authority ranking proceeds, and report the
+    // gap via `ignored_constraints`. The bound still bites when real prices are
+    // present (e.g. price-comparison pages). Generic; no merchant/domain bias.
+    if (intent.structured_constraints.price_min.is_some()
+        || intent.structured_constraints.price_max.is_some()
+        || intent.structured_constraints.price_lt.is_some()
+        || intent.structured_constraints.price_gt.is_some())
+        && priced_result_count == 0
+    {
+        tracing::info!(
+            "PRICE FAIL-OPEN: {} web results but 0 carried a detectable price — clearing price bound (remains ranking-only boost/skip)",
+            pre_filter_count
+        );
+        intent.structured_constraints.price_min = None;
+        intent.structured_constraints.price_max = None;
+        intent.structured_constraints.price_lt = None;
+        intent.structured_constraints.price_gt = None;
     }
 
     // --- Hard filter: remove web results that violate negative constraints ---
