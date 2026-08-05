@@ -227,11 +227,12 @@ Fast search endpoint. Returns results from the local crawl index only — no Sea
 
 **Response** `200 OK`
 
-> **Verified (this session):** the real body is `{ "count": <int>, "results": [ ... ] }`. There is **no top-level `source` field** despite the earlier docs; each result carries `sources: ["local"]` internally. `count` reflects the number returned (default 10 in this run; `limit` is accepted but the local fast path returned 10).
+> **Verified (this session):** the real body is `{ "count": <int>, "results": [ ... ], "source": <str> }`. The top-level `source` field IS present (observed value `"local"` on this instance); each result also carries `sources: ["local"]` internally. `count` reflects the number returned (default 10 in this run; `limit` is accepted but the local fast path returned 10).
 
 ```json
 {
   "count": 10,
+  "source": "local",
   "results": [
     {
       "url": "https://rustwebframework.org/",
