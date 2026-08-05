@@ -188,6 +188,72 @@ See **[API_REFERENCE.md](API_REFERENCE.md)** for the complete API documentation.
 
 ---
 
+## Goals
+
+IntentForge includes a **Goals** feature that turns a long-term goal into a personalized, phased roadmap with curated resources, deadlines, and progress tracking. It runs on the same gateway and exposes a small REST surface. All endpoints were exercised live against `localhost:4000` on 2026-08-05 (full transcript: `docs/_generated/_round_v2_raw.md`).
+
+**Two flows:**
+
+1. **Quick flow** — one call, full roadmap immediately:
+   ```bash
+   curl -s -X POST "http://localhost:4000/goals/quick" \
+     -H "Content-Type: application/json" \
+     -d '{"goal":"learn to build a privacy-first search engine using Rust"}' | head -c 400
+   # → {"goal_id":"goal_0001","goal":"...","intent":"learning","resource_count":11,
+   #    "roadmap":{"overview":"A 12-week journey (5-10 hours/week) across 4 phases.",
+   #    "phases":[...],"total_duration_weeks":12,"total_buffer_days":28},
+   #    "status":"active","completed_phases":0,"total_phases":4,"score":0}
+   ```
+2. **Discovery flow** — create, answer questions, get roadmap:
+   ```bash
+   # 1. Create → get questions
+   curl -s -X POST "http://localhost:4000/goals" \
+     -H "Content-Type: application/json" \
+     -d '{"goal":"write a novel in 6 months"}'
+   # → {"goal_id":"goal_0002","intent":"creative-writing","total_questions":4,
+   #    "questions":[...],"next_step":{"method":"POST","path":"/goals/goal_0002/answers",...}}
+
+   # 2. Submit answers (question_id is 0-indexed in the answers body)
+   curl -s -X POST "http://localhost:4000/goals/goal_0002/answers" \
+     -H "Content-Type: application/json" \
+     -d '{"answers":[{"question_id":0,"answer":"6 months — Half-year journey"},
+                      {"question_id":1,"answer":"5-10 hours — Evenings & weekends"},
+                      {"question_id":2,"answer":"fiction"},
+                      {"question_id":3,"answer":"a finished draft"}]}' | head -c 300
+   # → {"goal_id":"goal_0002", ..., "roadmap":{...},"status":"active",...}
+
+   # 3. Track progress (phase_id is 1-indexed!) and read status
+   curl -s -X POST "http://localhost:4000/goals/goal_0002/progress" \
+     -H "Content-Type: application/json" -d '{"phase_id":1,"is_completed":true}'
+   curl -s "http://localhost:4000/goals/goal_0002" | head -c 200
+   curl -s "http://localhost:4000/goals/leaderboard" | head -c 200
+   ```
+
+**Endpoints**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/goals` | Create a goal → returns `goal_id` + tailored questions |
+| `POST` | `/goals/quick` | One-shot: goal → full roadmap immediately (no questions) |
+| `GET`  | `/goals/:goal_id` | Get goal status and roadmap |
+| `POST` | `/goals/:goal_id/answers` | Submit answers → generate the phased roadmap |
+| `POST` | `/goals/:goal_id/progress` | Update a phase's completion (`{"phase_id":N,"is_completed":bool}`) |
+| `POST` | `/goals/:goal_id/phases/:phase_id/complete` | Mark a phase complete (1-indexed `:phase_id`) |
+| `GET`  | `/goals/leaderboard` | All goals sorted by score |
+
+**Verified behavior notes (2026-08-05):**
+
+- A roadmap has **4 phases** by default (timeline answer can change this to 3–6). Each phase carries `id` (1-indexed), `title`, `description`, `duration_weeks`, `deadline` (`"YYYY-MM-DD (buffer: YYYY-MM-DD)"`), `buffer_days` (7), `objectives`, `resources`, `deliverables`, `completion_type`, `is_completed`.
+- **Phase IDs are 1-indexed.** `POST /goals/:id/progress` with `{"phase_id":0}` returns `400 invalid_phase` (`"Phase 0 does not exist"`). Use the `id` from each roadmap phase.
+- Completing a phase via `/progress` or `/phases/:id/complete` sets `completed_phases` and adds **+100** to `score` (observed: 1 completed phase → `score:100`).
+- Questions are `0-indexed` in the **answers** body (`question_id:0..n`) but phases are `1-indexed` in the **roadmap** — a common source of confusion; the `invalid_phase` 400 is the tell.
+- Goals are stored **in-memory** (non-persistent across gateway restarts). `GET /goals/leaderboard` returns `{"entries":[...],"total_entries":N}`.
+- Error codes: `400 empty_goal` (goal < 3 chars), `400 invalid_phase`, `404 not_found` (unknown goal id), `422 invalid_payload` (bad JSON).
+
+See **[API_REFERENCE.md → Goals API](API_REFERENCE.md#goals-api)** for the full request/response schemas and domain-specific question banks.
+
+---
+
 ## Query Operators
 
 Search operators are parsed directly from the query string:

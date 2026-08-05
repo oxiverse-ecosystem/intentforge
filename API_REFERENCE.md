@@ -991,7 +991,7 @@ Quick Flow (one-shot):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/goals` | Create a goal → get 6–9 domain-specific questions |
+| `POST` | `/goals` | Create a goal → get domain-specific questions (observed 4 for `creative-writing`; varies by domain) |
 | `POST` | `/goals/:goal_id/answers` | Submit answers → get full phased roadmap |
 | `GET`  | `/goals/:goal_id` | Get goal status and roadmap by ID |
 | `GET`  | `/goals/leaderboard` | Get leaderboard of all goals (sorted by score) |
