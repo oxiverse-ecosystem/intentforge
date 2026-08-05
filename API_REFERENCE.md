@@ -260,7 +260,7 @@ Raw observed body: `docs/_generated/api-transcript.md` block 13.
 
 ### `GET /images`
 
-Image search via SearXNG (`categories=images`).
+Image search via SearXNG (`categories=images`). Returns a flat list with image + page metadata.
 
 **Query Parameters**
 
@@ -268,31 +268,33 @@ Image search via SearXNG (`categories=images`).
 |-----------|--------|----------|---------|----------------------------|
 | `q`       | string | yes      | —       | Search query (URL-encoded) |
 
-**Response** `200 OK`
+**Response** `200 OK` — top-level `{ count, query, results[] }`. Each result (verified live, 2026-08-05):
 
 ```json
 {
+  "count": 32,
+  "query": "rust programming",
   "results": [
     {
-      "title": "Image Title",
-      "url": "https://example.com/page",
-      "image_url": "https://example.com/image.jpg",
-      "thumbnail_url": "https://example.com/thumb.jpg",
-      "description": "Image description or alt text",
+      "title": "Getting started - Rust Programming Language",
+      "url": "https://rust-lang.org/learn/get-started/",
+      "image_url": "https://www.rust-lang.org/static/images/rust-social-wide.jpg",
+      "thumbnail_url": "https://ts2.mm.bing.net/th?id=OIP.W8KBrJgmsIlYtn24AhHfSQHaDt&pid=15.1",
+      "description": "Getting started - Rust Programming Language",
       "source": "bing images",
-      "score": 0.92
+      "score": 0.9000000357627869
     }
-  ],
-  "count": 20,
-  "query": "rust programming"
+  ]
 }
 ```
+
+> **Verified fields:** `title`, `url`, `image_url`, `thumbnail_url`, `description`, `source`, `score`. Note the image endpoint returns **`image_url`** (full image) and **`thumbnail_url`** — not the `thumbnail` field used by `/videos`. Full raw body: `docs/_generated/_round_v2_raw.md` block `### IMAGES rust programming`.
 
 ---
 
 ### `GET /videos`
 
-Video search via SearXNG (`categories=videos`).
+Video search via SearXNG (`categories=videos`). Returns a flat list with `thumbnail` (not `thumbnail_url`) and `video_id`.
 
 **Query Parameters**
 
@@ -300,31 +302,33 @@ Video search via SearXNG (`categories=videos`).
 |-----------|--------|----------|---------|----------------------------|
 | `q`       | string | yes      | —       | Search query (URL-encoded) |
 
-**Response** `200 OK`
+**Response** `200 OK` — top-level `{ count, query, results[] }`. Each result (verified live, 2026-08-05):
 
 ```json
 {
+  "count": 31,
+  "query": "rust tutorial",
   "results": [
     {
-      "title": "Video Title",
-      "url": "https://youtube.com/watch?v=...",
-      "description": "Video description...",
+      "title": "Learn Rust Programming - Complete Course 🦀",
+      "url": "https://www.youtube.com/watch?v=BpPEoZW5IiY",
+      "description": "1.2M views - Jun 8, 2023 - YouTube - freeCodeCamp.org",
+      "thumbnail": "https://th.bing.com/th/id/OVP.X9INETUn2tEG8KJL2Wrl3QHgFo?w=243&h=136&c=7&rs=1&qlt=70&o=7&pid=2.1&rm=3",
       "video_id": "",
-      "thumbnail": "https://i.ytimg.com/vi/.../hqdefault.jpg",
       "source": "bing videos",
-      "score": 0.95
+      "score": 0.6499999761581421
     }
-  ],
-  "count": 20,
-  "query": "rust tutorial"
+  ]
 }
 ```
+
+> **Verified fields:** `title`, `url`, `description`, `thumbnail`, `video_id` (observed empty in this run), `source`, `score`. Note `thumbnail` here vs `thumbnail_url` in `/images`. `video_id` was empty on all observed results. Full raw body: `docs/_generated/_round_v2_raw.md` block `### VIDEOS rust tutorial`.
 
 ---
 
 ### `GET /news`
 
-News search via SearXNG (`categories=news`).
+News search via SearXNG (`categories=news`). Returns a flat list with `published_at`.
 
 **Query Parameters**
 
@@ -332,24 +336,26 @@ News search via SearXNG (`categories=news`).
 |-----------|--------|----------|---------|----------------------------|
 | `q`       | string | yes      | —       | Search query (URL-encoded) |
 
-**Response** `200 OK`
+**Response** `200 OK` — top-level `{ count, query, results[] }`. Each result (verified live, 2026-08-05):
 
 ```json
 {
+  "count": 39,
+  "query": "artificial intelligence",
   "results": [
     {
-      "title": "News Article Title",
-      "url": "https://news.example.com/article",
-      "description": "Article summary or snippet...",
-      "published_at": "2026-05-30T12:00:00",
-      "source": "hackernews",
-      "score": 0.90
+      "title": "As computer science enrollments drop, artificial intelligence classes fill up",
+      "url": "https://www.msn.com/en-us/money/careersandeducation/as-computer-science-enrollments-drop-artificial-intelligence-classes-fill-up/ar-AA29jdXb",
+      "description": "Hiring for entry-level software developers has slowed, and college enrollment in computer science is declining ...",
+      "published_at": "",
+      "source": "bing news",
+      "score": 0.800000011920929
     }
-  ],
-  "count": 10,
-  "query": "AI news"
+  ]
 }
 ```
+
+> **Verified fields:** `title`, `url`, `description`, `published_at` (observed empty string `""` on most bing-news items; hackernews items carried ISO timestamps like `"2019-11-13T23:17:23"`), `source` (`"bing news"` / `"hackernews"`), `score`. Full raw body: `docs/_generated/_round_v2_raw.md` block `### NEWS artificial intelligence`.
 
 ---
 
@@ -993,7 +999,18 @@ Quick Flow (one-shot):
 
 ---
 
-### `POST /goals`
+### Goals Error Codes (verified live, 2026-08-05)
+
+All Goals errors return a JSON body with `error` + `message`.
+
+| Status | `error` | When (verified) |
+|--------|---------|-----------------|
+| `400` | `empty_goal` | `goal` missing or `< 3` characters (e.g. `{"goal":"ab"}`) |
+| `400` | `invalid_phase` | `phase_id` not in `1..total_phases`. Phase IDs are **1-indexed** — `phase_id:0` returns this (verified: `POST /goals/goal_0002/progress` with `{"phase_id":0}` → `invalid_phase`). Use the `id` field from each roadmap phase. |
+| `404` | `not_found` | Goal ID does not exist (e.g. `GET /goals/goal_does_not_exist`) |
+| `422` | `invalid_payload` | Malformed JSON body or missing required field (from the custom `AppJson` extractor) |
+
+See `docs/_generated/_round_v2_raw.md` for the exact raw bodies (`GOALS update progress ...` and the corrected `phase_id:1` blocks).
 
 Creates a new goal and returns domain-specific questions tailored to the goal type.
 
@@ -1422,15 +1439,9 @@ If search fails (timeout or zero results), fallback resources with Google search
 
 ### Intent Classification
 
-Goals are classified using the intent engine (same endpoint used by `/search`). The engine extracts one of:
+Goals are classified using the intent engine (same endpoint used by `/search`) or keyword detection. Observed `intent` values (verified live, 2026-08-05) include `learning` (e.g. `"learn to build a privacy-first search engine using Rust"`), `creative-writing` (e.g. `"write a novel in 6 months"`), and `technical`. Other documented goal domains include `ai-ml`, `web-app`, `api-backend`, `mobile`, `systems`, `devops`, `research`, `creative-design`, `business`, `lifestyle`, `general-tech`, and `general`.
 
-| Intent | Typical Goal Keywords |
-|--------|----------------------|
-| `technical` | build, develop, create app, software |
-| `informational` | research, paper, study |
-| `how-to` | learn, understand, master |
-| `comparison` | compare, vs, alternative |
-| `informational` (default) | falls through with no strong signal |
+> **Note on question count (verified):** a `creative-writing` goal returned `total_questions: 4` (timeline, hours, 2× free_text). The domain-specific question-bank table below lists `creative-writing` as 6 questions — this may not match the live generator, which can emit a smaller tailored set. Treat the per-domain counts as descriptive, not a hard contract.
 
 The classification uses keyword detection first (fast path), then falls back to the intent engine HTTP call.
 
