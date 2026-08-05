@@ -40,4 +40,9 @@ ROADMAP.md
 # QA / Oxiverse Testing round scratch (gitignored — keep out of the tracked tree)
 # Use tmp/ (already ignored above) for throwaway round artifacts; see tmp/INSTRUCTIONS.md
 .hermes-qa/
+
+# Editor / tool backup files
+*.new
+*.bak
+*.tmp
 services/crawler/queue_data/
