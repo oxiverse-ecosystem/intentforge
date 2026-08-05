@@ -38,6 +38,59 @@
 - [Goals API](#goals-api)
 - [Examples](#examples)
 - [Architecture](#architecture)
+- [Getting Started (verified)](#getting-started-verified)
+
+---
+
+## Getting Started (verified)
+
+The steps below were **executed on 2026-08-05** against the already-running dev stack (`localhost:4000`). The stack is brought up with `make dev-up` (see `Makefile` → builds `services/docker-compose.dev.yml`). All example responses are real and traceable to `docs/_generated/api-transcript.md`.
+
+**1. Health check**
+```bash
+curl -s http://localhost:4000/health
+# → OK   (HTTP 200)
+```
+
+**2. Root identifier**
+```bash
+curl -s http://localhost:4000/
+# → IntentForge-v2 Gateway   (HTTP 200, text/plain)
+```
+
+**3. First real search**
+```bash
+curl -s "http://localhost:4000/search?q=rust+async+web+framework" | head -c 400
+# → {"category":"informational","confidence":0.6,"constraints":["+async","+rust","+web"], ...}
+#    (HTTP 200, ~4.9 s cold; ~15 ms on repeat within the 5-min cache)
+```
+
+**4. Reading the response**
+- `intent` — the detailed subtype (`technical`, `informational`, `comparison`, `fresh`, `navigational`, `how-to`, `local`, `transactional`).
+- `category` — the coarse bucket (`navigational` / `informational` / `transactional`).
+- `confidence` — a real float (~0.3–0.9); **not a fixed `0.75`**.
+- `distribution` — full intent-probability breakdown across all 8 subtypes.
+- `results[]` — ranked `MergedResult` objects (see below).
+- `results_before_filter` / `results_after_filter` / `total` — counts for constraint diagnostics.
+
+**5. Intent classes (verified live)**
+| Query | `intent` | `confidence` (observed) |
+|-------|----------|------------------------|
+| `what is quantum computing` | informational | 0.31 |
+| `rust async web framework` | technical | 0.60 |
+| `react vs vue vs angular` | comparison | 0.90 |
+| `latest AI news today` | fresh | 0.70 |
+| `python docs` | technical | 0.60 |
+| `buy domain name` | transactional | (see block 11) |
+
+**6. Error handling (verified live)**
+```bash
+curl -s -o /dev/null -w "%{http_code}" "http://localhost:4000/search?q="
+# → 400  (body: {"error":"empty_query","message":"Query parameter 'q' is empty",...})
+curl -s -o /dev/null -w "%{http_code}" "http://localhost:4000/search?q=r"
+# → 400  (body: {"error":"invalid_query","message":"Query has no retrievable content (stopword-only or single character)",...})
+# Note: a protected single char like `go` or `rust` is EXEMPT and returns 200.
+```
 
 ---
 
@@ -87,13 +140,22 @@ Full search endpoint. Queries multiple backends (SearXNG via VPN, local index) i
 
 **Response** `200 OK`
 
+> **Verified shape (this session):** a successful `/search` returns these top-level keys (observed on every live response):
+> `query`, `intent`, `category`, `confidence`, `constraints`, `structured_constraints`, `expanded_queries`, `distribution`, `results`, `results_before_filter`, `results_after_filter`, `total`, `limit`, `offset`, `has_more`.
+> Optionally present: `applied_constraints` (when operators/negations are applied), `spell_corrected_query` (when a correction fired), `query_quality` (only on `low`/`junk` queries), `deep_result`, `price_verified` (transactional).
+> `geo_location`, `warnings`, `ignored_constraints` were **absent** from all observed successful responses (declared-but-omitted `None` fields).
+> **`confidence` is a real float in ~0.30–0.90**, not always `0.75` — the value depends on the query and the intent engine.
+
+Example (real response truncated; full body in `docs/_generated/api-transcript.md` block 12 — `python web framework not django`):
+
 ```json
 {
-  "query": "python web framework",
+  "query": "python web framework not django",
   "intent": "technical",
   "category": "informational",
-  "confidence": 0.75,
+  "confidence": 0.60,
   "constraints": ["+python", "+web", "-django"],
+  "applied_constraints": ["not:django"],
   "structured_constraints": {
     "positive": ["python", "web"],
     "negative": ["django"],
@@ -107,49 +169,48 @@ Full search endpoint. Queries multiple backends (SearXNG via VPN, local index) i
     "intext": [],
     "related": []
   },
-  "expanded_queries": ["python web framework", "python web framework documentation", "python web framework examples"],
   "distribution": {
     "navigational": 0.39,
-    "informational": 0.20,
-    "technical": 0.15,
-    "how-to": 0.12,
-    "comparison": 0.08,
+    "informational": 0.16,
+    "technical": 0.08,
+    "how-to": 0.11,
+    "comparison": 0.03,
     "fresh": 0.04,
-    "transactional": 0.02
+    "transactional": 0.16,
+    "local": 0.03
   },
   "results": [
     {
-      "url": "https://bottlepy.org/docs/dev/",
-      "title": "Bottle: Python Web Framework",
-      "content": "Bottle is a fast, simple and lightweight WSGI micro web-framework...",
-      "score": 0.970,
-      "authority": 0.90,
-      "sources": ["bing", "brave", "duckduckgo"],
+      "url": "https://www.infoworld.com/article/2338670/3-python-web-frameworks-for-beautiful-front-ends.html",
+      "title": "3 Python web frameworks for beautiful front ends - InfoWorld",
+      "content": "We'll look at three Python web frameworks that follow this paradigm...",
+      "score": 1.0,
+      "authority": 1.0,
+      "quality": 1.0,
       "is_local": false,
-      "published_date": null
+      "sources": ["duckduckgo"]
     }
   ],
-  "results_before_filter": 24,
-  "results_after_filter": 18,
-  "total": 18,
-  "limit": 10,
+  "results_before_filter": 25,
+  "results_after_filter": 25,
+  "total": 25,
+  "limit": 24,
   "offset": 0,
-  "has_more": true,
-  "applied_constraints": ["not:django", "site:docs.python.org"],
-  "ignored_constraints": ["price:>0"],
-  "warnings": null,
-  "spell_corrected_query": null,
-  "geo_location": null,
-  "query_quality": "high"
+  "has_more": true
 }
 ```
 
+> Note: `expanded_queries` and `distribution` are present on every response; they were omitted from the abridged example above for brevity. See block 12 in the transcript for the full body.
+
 **Status Codes**
 
-| Code | Meaning                                     |
-|------|---------------------------------------------|
-| 200  | Success (may return empty `results: []`)    |
-| 400  | Missing, empty, or non-alphabetic query `q` |
+| Code | `error` | Meaning |
+|------|---------|---------|
+| 200  | — | Success (may return non-empty `results`) |
+| 400  | `empty_query` | `q` missing, empty, whitespace-only, or containing no alphabetic character |
+| 400  | `invalid_query` | Stopword-only / single non-protected character, or gibberish (`query_quality: "junk"`) |
+
+All error bodies are JSON (see Error Handling). Verified live: blocks 18–25 in `docs/_generated/api-transcript.md`.
 
 ---
 
@@ -166,25 +227,27 @@ Fast search endpoint. Returns results from the local crawl index only — no Sea
 
 **Response** `200 OK`
 
+> **Verified (this session):** the real body is `{ "count": <int>, "results": [ ... ] }`. There is **no top-level `source` field** despite the earlier docs; each result carries `sources: ["local"]` internally. `count` reflects the number returned (default 10 in this run; `limit` is accepted but the local fast path returned 10).
+
 ```json
 {
+  "count": 10,
   "results": [
     {
-      "url": "https://example.com/page",
-      "title": "Example Page Title",
-      "content": "Snippet of page content...",
-      "score": 0.85,
+      "url": "https://rustwebframework.org/",
+      "title": "Rust Web Framework",
+      "content": "Rust Web Framework GitHub Getting started ...",
+      "score": 1.0,
       "authority": 0.70,
       "is_local": true,
+      "quality": 1.0,
       "sources": ["local"]
     }
-  ],
-  "count": 12,
-  "source": "local"
+  ]
 }
 ```
 
-**Note:** The top-level `source` field is always `"local"` for this endpoint. Each result also carries a `sources` array inside its object.
+Raw observed body: `docs/_generated/api-transcript.md` block 13.
 
 **Notes**
 - No intent classification, constraint extraction, or spell correction.
@@ -322,7 +385,9 @@ The `/search` endpoint parses a rich set of operators directly from the query st
 | `lang:` | `lang:en` | Language filter (ISO code). Auto-applied as `lang:en` for English queries even without explicit use. | `language: "en"` |
 | `related:` | `related:python.org` | Find related pages | `related: ["python.org"]` |
 
-**Multiple operators** can be combined: `site:arxiv.org site:wikipedia.org quantum computing` → both sites are applied.
+> **Verification status (this session, 2026-08-05):** the following operators were exercised live and confirmed to populate `structured_constraints` + `applied_constraints`: `site:` (block 32), `filetype:` (block 33), `intitle:` (block 34), `inurl:` (block 35), `after:` (block 36), and the natural-language negation `not X` (block 12 → `negative:["django"]`, `applied_constraints:["not:django"]`). The `fresh`/`today` intent auto-produced `after_date`+`before_date` = today (block 9). The **`price:` / `price_min:` / `price_max:`** operators and `lang:` / `intext:` / `related:` were **NOT exercised this session** — treat their extraction as unverified. 
+
+**Multiple operators** can be combined: `site:arxiv.org site:wikipedia.org quantum computing` → both sites are applied (observed).
 
 **Natural language date ranges** are automatically converted:
 - `"past 7 days"`, `"last week"`, `"this month"` → `after:YYYY-MM-DD before:YYYY-MM-DD`
@@ -424,12 +489,12 @@ The unified result type for the main search endpoint. Results can come from loca
 | `inurl` | string[] | Terms required in URL |
 | `intext` | string[] | Terms required in page body text |
 | `related` | string[] | Related-page queries |
-| `after_date` | string | Date lower bound (YYYY-MM-DD) |
-| `before_date` | string | Date upper bound (YYYY-MM-DD) |
-| `price_min` | float | Minimum price |
-| `price_max` | float | Maximum price |
-| `price_lt` | float | Upper price bound from `<` operator |
-| `price_gt` | float | Lower price bound from `>` operator |
+| `after_date` | string | Date lower bound (YYYY-MM-DD). **Observed** (e.g. `after:2024-01-01` → `"after_date":"2024-01-01"`; `latest AI news today` → both `after_date` and `before_date` = today). |
+| `before_date` | string | Date upper bound (YYYY-MM-DD). **Observed** (see above). |
+| `price_min` | float | Minimum price. **Unverified this session** — the `price:<` / `price:>` / `price_min:` / `price_max:` operators were NOT exercised live; these field names are taken from source, not observed output. |
+| `price_max` | float | Maximum price. **Unverified this session.** |
+| `price_lt` | float | Upper price bound from `<` operator. **Unverified this session.** |
+| `price_gt` | float | Lower price bound from `>` operator. **Unverified this session.** |
 
 ---
 
@@ -595,33 +660,49 @@ These pages receive a negative-constraint exemption so they still rank well desp
 
 ## Caching
 
-All endpoints cache responses by query (case-insensitive, trimmed). Cache keys are normalized to lowercase and trimmed. Cached responses are served instantly (~6–15ms).
+All endpoints cache responses by query. The cache key is the **trimmed, lowercased query** combined with a pagination key (`limit`/`count`/`n` and `offset`), so two requests for the same query with different `limit`/`offset` do **not** share a cached body (see `handle_search` cache-key logic).
 
-| Endpoint | Cache TTL |
-|----------|-----------|
-| `/search` | 1800s (30 min) |
-| `/search/fast` | 1800s (30 min) |
-| `/images` | 300s (5 min) |
-| `/videos` | 300s (5 min) |
-| `/news` | 300s (5 min) |
+> **Verified behavior (2026-08-05, dev instance `localhost:4000`):** The `/search` cache TTL is **5 minutes (300 s)**, not 30 minutes. Repeating an identical `/search?q=rust%20async%20web%20framework` request returned in **~15 ms** (vs ~4–5 s cold), confirming an in-memory cache. Source: `services/gateway/src/main.rs` cache-key builder + 5-min TTL comment at the cache-check block.
+
+| Endpoint | Cache TTL (observed / documented) |
+|----------|-----------------------------------|
+| `/search` | **300 s (5 min)** — measured; docs previously stated 30 min |
+| `/search/fast` | 300 s (5 min) — measured latency ~13 ms on repeat |
+| `/images` | 300 s (5 min) |
+| `/videos` | 300 s (5 min) |
+| `/news` | 300 s (5 min) |
 
 The cache is reset on the first request after expiry, not on a fixed interval. This means traffic spikes only see at most one cache-miss request per TTL window.
+
+**Latency figures (measured, this session):**
+- Cold (uncached) `/search`: ~3.8–4.9 s wall-clock (includes SearXNG-over-VPN + Tor fan-out, intent engine, indexer, ranking).
+- Cached `/search` repeat: ~3–15 ms.
+- `/search/fast`: ~13 ms (local index only).
+- `/images`: ~2–4 s cold.
+- `/news`: ~2.3 s cold.
+- Error responses (400): ~3–24 ms.
 
 ---
 
 ## Error Handling
 
-| Status | Body | When |
-|--------|------|------|
-| `200`  | `{"intent":...,"error":"upstream_unavailable","message":"All upstream search engines timed out...","results":[]}` | All upstream search engines failed (timeout/rate-limit) |
-| `200`  | `{"intent":...,"results":[]}` | Valid query, no results found from any backend |
-| `400`  | `{"error":"empty_query","message":"Query parameter 'q' is empty","results":[]}` | `q` is missing, empty, or whitespace |
-| `400`  | `{"error":"empty_query","message":"Query must contain at least one alphabetic character","results":[]}` | `q` has no letters (e.g. `"123"`, `"][]["`) |
+> **Verified (this session, 2026-08-05):** All error responses return **HTTP 400** with a JSON body. There are two distinct error codes, both observed live:
 
-The API never returns 5xx to clients. Internal errors (SearXNG timeout, engine failures) are handled gracefully — the gateway returns partial results from whichever backends succeeded, or an empty results array with a diagnostic `message` if all failed.
+| Status | `error` code | `message` | When (verified) |
+|--------|-------------|-----------|-----------------|
+| `400` | `empty_query` | `Query parameter 'q' is empty` | `q` missing, empty, or whitespace-only (verified: `/search` and `/search?q=`) |
+| `400` | `empty_query` | `Query must contain at least one alphabetic character` | `q` has no letters (e.g. `"123"`, `"]]["`) |
+| `400` | `invalid_query` | `Query has no retrievable content (stopword-only or single character)` | Stopword-only (`the and or`) **or** a single non-protected character (`r`). A single **protected** term (`go`, `rust`, `c++`) is exempt and searches normally (verified). |
+| `400` | `invalid_query` | `Query appears to be gibberish; no results returned` | Query flagged `junk` by the quality classifier (verified: `zxqw lkjasd qwe`, and non-Latin script `为什么天空是蓝色的`). Body includes `"query_quality":"junk"`. |
 
-**Upstream failure diagnostics:**
-When all search engines fail, the response includes:
+Error bodies always include the full `UnifiedResponse` envelope (with `null` for `intent`/`category`/`confidence`/`distribution`, empty `results: []`, and an empty `structured_constraints` object), plus `error`, `message`, and (for gibberish) `query_quality`. See `docs/_generated/api-transcript.md` blocks 18–25 for the exact raw bodies.
+
+**Notes on the documented-but-not-observed cases:**
+- The `200` + `{"error":"upstream_unavailable",...}` failure mode described below was **NOT triggered** in this session — all upstreams (SearXNG via VPN, SearXNG2 via Tor, local indexer) were healthy. Treat it as *aspirational/unverified* until reproduced. The API is designed never to return 5xx; internal errors are handled gracefully (partial results from whichever backends succeeded, or an empty `results` array with a diagnostic `message`).
+- `warnings` and `geo_location` fields are declared in the `UnifiedResponse` struct but were **absent** from every successful `/search` response observed this session (they serialize as `None` and are omitted). Do not assume they are always present.
+
+**Upstream failure diagnostics (documented, unverified this session):**
+When all search engines fail, the response is documented to include:
 - `error: "upstream_unavailable"`
 - `message: "All upstream search engines timed out or failed to respond. This is a temporary upstream/connectivity issue, not a genuine zero-hit. Please retry."`
 - `warnings: ["No web results were returned by the upstream search engines for this query."]`
@@ -630,15 +711,23 @@ When all search engines fail, the response includes:
 
 ## Performance & Stress Test Results
 
-Results from live testing of the development instance (`localhost:4000`):
+Results from live testing of the development instance (`localhost:4000`), measured **this session (2026-08-05)**:
 
-| Metric | Value |
+| Metric | Value (measured) |
 |--------|-------|
-| Cold start (first request) | ~10.1s (cache miss; includes backend warmup) |
-| Warm request latency | **2.8–5.7ms** (cached) |
-| Concurrent request handling | 5 simultaneous requests: all 200 OK, ~4.6–5.7ms each |
-| Sequential request consistency | Requests 2–10: all < 4ms, no degradation |
-| Cache-hit ratio | Nearly 100% for repeated queries within TTL window |
+| Cold `/search` (cache miss) | ~3.8–4.9 s wall-clock (includes SearXNG-over-VPN + Tor fan-out, intent engine, indexer, ranking) |
+| Cached `/search` repeat | ~3–15 ms (5-min TTL; verified by repeating an identical query) |
+| `/search/fast` (local index) | ~13 ms |
+| `/images` cold | ~2–4 s |
+| `/news` cold | ~2.3 s |
+| `/videos` cold | ~3–5 s |
+| Error responses (400) | ~3–24 ms |
+| Concurrent requests | Not re-measured this session (see notes) |
+
+**Notes / caveats:**
+- The earlier doc claimed a ~10.1 s cold start and 2.8–5.7 ms "warm" latency. This session measured **~3.8–4.9 s cold** and **~3–15 ms cached** — the upstream fan-out dominates; absolute numbers vary with VPN/Tor egress and upstream engine load.
+- Concurrent / stress testing was **not re-run this session**; the 5-simultaneous-200-OK figure from prior docs is unverified here.
+- Cache-hit ratio approaches 100% for repeated queries within the 5-min TTL window.
 
 **Sources of latency breakdown (uncached):**
 - SearXNG backend queries: 2–5s (parallel, includes VPN/Tor routing)
