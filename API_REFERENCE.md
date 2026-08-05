@@ -1012,6 +1012,8 @@ All Goals errors return a JSON body with `error` + `message`.
 
 See `docs/_generated/_round_v2_raw.md` for the exact raw bodies (`GOALS update progress ...` and the corrected `phase_id:1` blocks).
 
+### POST /goals
+
 Creates a new goal and returns domain-specific questions tailored to the goal type.
 
 **Request Body**
