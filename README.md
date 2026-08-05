@@ -157,7 +157,7 @@ curl "http://localhost:4000/search?q=rust+web+framework&limit=3"
 {
   "query": "python web framework not django",
   "intent": "technical",
-  "confidence": 0.75,
+  "confidence": 0.60,
   "constraints": ["+python", "+web", "-django"],
   "structured_constraints": {
     "positive": ["python", "web"],
@@ -182,6 +182,7 @@ curl "http://localhost:4000/search?q=rust+web+framework&limit=3"
   "has_more": true
 }
 ```
+> **Note:** `confidence` is a real float (≈0.3–0.9) that varies per query — it is **not** always `0.75`. `geo_location` and `spell_corrected_query` are omitted from the JSON on clean queries (they serialize as `None`). The full, verified response schema (including `category`, `distribution`, `expanded_queries`, `results_before_filter`, `results_after_filter`, `total`, `limit`, `offset`) is in [API_REFERENCE.md](API_REFERENCE.md).
 
 See **[API_REFERENCE.md](API_REFERENCE.md)** for the complete API documentation.
 
@@ -213,7 +214,7 @@ Search operators are parsed directly from the query string:
 ### Search Pipeline
 
 1. **Query Validation** — Reject empty, non-alphabetic, or gibberish queries
-2. **Cache Check** — Return cached response if within TTL (30 min for `/search`)
+2. **Cache Check** — Return cached response if within TTL (**5 min** for `/search`; verified this session — see [API_REFERENCE.md#caching](API_REFERENCE.md#caching))
 3. **Parallel Fan-out** — Query all backends simultaneously:
    - SearXNG1 (via VPN — bing, brave, wikipedia, arxiv, crossref, marginalia)
    - SearXNG2 (via Tor exit — bing, brave, wikipedia, duckduckgo, marginalia)
@@ -279,7 +280,7 @@ Two mechanisms:
 | **Warm request (cached)** | 3–6ms |
 | **Normal query latency (uncached)** | ~3.7s avg, ~5.8s max |
 | **Operator query latency (uncached)** | ~4.8s avg, ~5.1s max |
-| **Fast local search** | ~100ms |
+| **Fast local search** (`/search/fast`) | ~13ms (measured, local index only) |
 | **Concurrent requests** | 5 simultaneous → all 200 OK |
 | **Cache hit rate** | ~100% for repeated queries within TTL |
 
