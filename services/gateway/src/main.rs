@@ -3414,9 +3414,28 @@ fn calibrate_scores(scores: &mut [f32]) {
     // relevance fold) and only lift the floor. On-topic queries with a healthy result
     // have raw_max >= 0.10, so the standard [0.05,1.0] remap runs unchanged (no regression).
     if raw_max < 0.10 {
-        // Preserve raw ordering, just enforce the 0.05 floor; do not stretch to 1.0.
+        // WEAK-SET SPREAD (round-7 fix): the original guard pinned every score to
+        // the 0.05 floor whenever the best raw score was < 0.10. That regime is
+        // NORMAL for web queries: RRF contributions for top positions are ~0.05-0.08
+        // and authority/semantic weights are small, so base scores land at
+        // 0.005-0.02. Pinning to floor destroyed the ranker's ordering, so a leaked
+        // off-topic page (e.g. a Vale earnings release for "noise cancelling
+        // earbuds", thesaurus.com/"biggest" for "cybersecurity breaches", a Zomato
+        // "Thai Restaurants in Jaipur" for "vegetarian thali ... jaipur") tied with
+        // the genuinely on-topic page at 0.05 and won by insertion order.
+        // Instead, rescale the weak set onto a CONSTRAINED low sub-range
+        // [0.05, 0.12] that preserves the raw relative order. This keeps the round-6
+        // off-topic defense (no weak result is stretched to ~1.0, so an off-topic
+        // survivor cannot invert the ranking — on-topic pages have higher raw base
+        // and stay above) while differentiating on-topic pages from leaked ones.
+        // The off-topic sole-survivor case is already removed pre-scoring by the
+        // distinctive-term hard-drop, so the only remaining weak sets are legit.
+        let lo = 0.05f32;
+        let hi = 0.12f32;
+        let norm = (raw_max - raw_min).max(1e-6);
         for score in scores.iter_mut() {
-            *score = (*score).max(floor);
+            let t = ((*score - raw_min) / norm).clamp(0.0, 1.0);
+            *score = lo + t * (hi - lo);
         }
         return;
     }
@@ -5753,6 +5772,32 @@ fn merge_local_and_web(
     calibrate_scores(&mut scores);
     for (i, r) in merged.iter_mut().enumerate() {
         r.score = scores[i];
+    }
+
+    // POST-CALIBRATION VIDEO CAP (round-7 P8 fix, recalibration-proof).
+    // The pre-loop video_mult (×0.08 for non-video text queries) is DEFEATED by
+    // calibrate_scores, which rescales the whole set onto [0.05, 1.0] and thus
+    // stretches the dampened video's score right back up — so a generic YouTube
+    // tutorial could still rank #1 for a text query (observed: "free weather app
+    // for android" returned a youtube.com result at score 1.0). Applying the cap
+    // AFTER calibration guarantees the dampening survives any rescale.
+    // Videos keep their own /videos endpoint; in /search they are secondary, so for
+    // a TEXT query we cap them well below the top of the band. Explicit video intent
+    // ("video"/"youtube"/"watch"/"tutorial"/"animation") leaves them untouched.
+    {
+        let q_lc_cap = query.to_lowercase();
+        let video_intent = q_lc_cap.contains("video") || q_lc_cap.contains("youtube")
+            || q_lc_cap.contains("watch") || q_lc_cap.contains("tutorial")
+            || q_lc_cap.contains("animation");
+        if !video_intent {
+            let cap = 0.25f32; // videos may appear but never outrank topical articles
+            for r in merged.iter_mut() {
+                let is_video = r.sources.iter().any(|s| s == "invidious" || s == "video");
+                if is_video && r.score > cap {
+                    r.score = cap;
+                }
+            }
+        }
     }
 
     merged
