@@ -4732,6 +4732,19 @@ fn merge_local_and_web(
         "right", "wrong", "true", "false", "free", "cheap", "simple", "complex",
         "work", "works", "working", "look", "looking", "show", "showing", "see", "seeing",
         "read", "reading", "play", "playing", "write", "writing", "think", "thinking",
+        // Generic question-framing words: carry no topical signal, so requiring a
+        // result to contain them is wrong and lets an off-topic page survive the
+        // off-topic / local-noise gate via a coincidental lexical match.
+        // Root cause of round-6 s21: "recent earthquakes ... warning sign" ranked a
+        // macular-degeneration page ("Early Warning Signs of Macular Degeneration")
+        // at #1 because "warning"/"sign" were in distinctive_terms and the medical
+        // page matched them. Excluding these framing words from distinctive-term
+        // overlap (they remain ordinary content words elsewhere) keeps relevance
+        // anchored on the real subject (earthquake/himalayan/region). General set
+        // of "what are the X of Y" framing words; no query/domain-specific entries.
+        "warning", "warnings", "sign", "signs", "symptom", "symptoms",
+        "cause", "causes", "reason", "reasons", "effect", "effects",
+        "impact", "impacts", "solution", "solutions", "problem", "problems",
     ].iter().copied().collect();
 
     let q_words: Vec<&str> = clean_query.split_whitespace().collect();
@@ -4743,6 +4756,7 @@ fn merge_local_and_web(
                 && !generic_web_terms.contains(lower.as_str())
                 && !unit_terms.contains(lower.as_str())
                 && !role_descriptor_terms.contains(lower.as_str())
+                && !weak_discriminative.contains(lower.as_str())
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
@@ -5487,9 +5501,16 @@ fn merge_local_and_web(
         // them, so "Sky Blue Credit" kept outranking the real "Why Is the Sky Blue?".
         // Multiplying the final score by relevance makes those penalties bite: a result
         // whose relevance was halved by the phrase gate (×0.45) also has its score halved,
-        // creating real separation. Clamped to [0.05,1.0] so relevance can demote hard
-        // but never zero out a result (preserving the calibrate_scores floor logic).
-        let relevance_mult = relevance.clamp(0.05, 1.0);
+        // creating real separation.
+        // Floor lowered from 0.05 -> 0.005 (round-6 D1): an off-topic local page (e.g. a
+        // crawler-index match whose lexical relevance is ~0 after the local-noise gate's
+        // ×0.05) was still keeping 5% of its (large) indexer-BM25 base, which — combined
+        // with calibrate_scores forcing the max raw score to 1.0 — floated it to #1 above
+        // genuinely on-topic pages. A 0.005 floor lets a truly off-topic page (relevance
+        // ~0.0025) demote to ~0.25% of its base, so on-topic pages win. On-topic pages have
+        // relevance >= 0.05, so for them this clamp is unchanged (no regression). Never
+        // zeroed (0.005 floor) so calibrate_scores' floor logic still holds.
+        let relevance_mult = relevance.clamp(0.005, 1.0);
         // Video-suppression (non-/videos /search): Invidious videos enter the web merge
         // with score=0.0 and published_date=None, so they inherit r.score=1.0 and
         // freshness=1.0, which lets a generic youtube tutorial outrank a relevant
@@ -5564,6 +5585,22 @@ fn merge_local_and_web(
             // ADDITIONAL GATE: Check if the best-scoring result matches at least 2 unique
             // query terms (after stemming). Single-term matches are usually dictionary
             // definitions or tangentially related content that shouldn't be amplified.
+            // CRITICAL (round-6 D1 fix): the boost multiplies EVERY result, so if the
+            // current MAX raw score is itself off-topic (e.g. a local page that survived
+            // only on a coincidental BERT cosine), amplifying it floats the junk to #1.
+            // We therefore require the TOP result (highest raw score) to be genuinely
+            // ON-TOPIC — i.e. its lexical relevance overlap must be high. BERT cosine alone
+            // is NOT sufficient (it conflates polysemous tokens: "warning"/"sign" for a
+            // macular-degeneration page vs an earthquakes query). If the max-scoring page
+            // has low relevance, the set has no trustworthy anchor and we must NOT boost.
+            // General: anchored on the top result's relevance signal, no query/domain bias.
+            let mut max_idx: Option<usize> = None;
+            let mut max_s = f32::NEG_INFINITY;
+            for (i, r) in merged.iter().enumerate() {
+                if r.score > max_s { max_s = r.score; max_idx = Some(i); }
+            }
+            let top_relevance = max_idx.map(|i| relevance_vec.get(i).copied().unwrap_or(0.0)).unwrap_or(0.0);
+            let top_is_ontopic = top_relevance >= 0.35;
             let query_terms_raw: Vec<&str> = query.split_whitespace()
                 .filter(|w| w.len() >= 2)
                 .collect();
@@ -5579,7 +5616,7 @@ fn merge_local_and_web(
                 let rel = relevance_vec.get(i).copied().unwrap_or(0.0);
                 match_count >= min_terms && rel >= 0.2
             });
-            if has_good_result {
+            if has_good_result && top_is_ontopic {
                 let boost_factor = (0.30 / max_score.max(0.01)).min(2.5);
                 tracing::info!(
                     "THIN RESULTS: merged.len={} max_score={:.3} max_sem={:.3} boost={:.2}x",
