@@ -3405,6 +3405,21 @@ fn calibrate_scores(scores: &mut [f32]) {
         return;
     }
     let floor = 0.05f32;
+    // WEAK-SET GUARD (round-6 D1 defense-in-depth): calibrate_scores linearly rescales
+    // the whole result set onto [0.05, 1.0], which forces the MAX raw score to 1.0.
+    // When the entire set is weak (best raw score < 0.10 — e.g. sparse web upstream
+    // plus a coincidental local hit), the off-topic page can be the max and gets
+    // rescaled UP to 1.0, inverting the ranking. In that regime we must NOT inflate:
+    // preserve the raw relative ordering (which already demotes off-topic pages via the
+    // relevance fold) and only lift the floor. On-topic queries with a healthy result
+    // have raw_max >= 0.10, so the standard [0.05,1.0] remap runs unchanged (no regression).
+    if raw_max < 0.10 {
+        // Preserve raw ordering, just enforce the 0.05 floor; do not stretch to 1.0.
+        for score in scores.iter_mut() {
+            *score = (*score).max(floor);
+        }
+        return;
+    }
     let ceil = 1.0f32;
     let span = ceil - floor;
     let norm = raw_max - raw_min;
