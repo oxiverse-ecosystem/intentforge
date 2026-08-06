@@ -7944,7 +7944,7 @@ async fn handle_search(
             "similar to", "apps like", "tools like", "software like", "sites like",
             "equivalent to", "replacement for", "competing with", "vs", "versus",
             "best budget", "best ... under", "top ... under", "compared to", "difference between",
-            "which is better", "comparison"
+            "which is better", "comparison", "compare "
         ];
         let has_comp_signal = comp_signals.iter().any(|s| {
             if s.contains("...") {
