@@ -5556,6 +5556,38 @@ fn merge_local_and_web(
         relevance_vec.push(relevance);
     }
 
+    // ── Off-topic LOCAL hard-drop (round-6 D1, sole-survivor case) ──
+    // A local-index result whose title/content/url shares ZERO of the query's
+    // distinctive topic terms is off-topic (e.g. a crawler-indexed
+    // "Early Warning Signs of Macular Degeneration" page for an "earthquakes in
+    // the himalayan region" query). When web upstream is sparse it can be the ONLY
+    // surviving result, and calibrate_scores then inflates it to 1.0 — confidently
+    // returning off-topic junk. Drop it outright. This uses the SAME distinctive-term
+    // overlap test as the in-loop `off_topic_struct` gate, so genuinely relevant
+    // local pages (which DO contain a distinctive term — e.g. an iPhone-vs-S24
+    // article for a "compare iphone and samsung" query) are kept. General: keyed on
+    // (is_local && zero distinctive-term overlap), no query/domain bias.
+    if !distinctive_terms.is_empty() {
+        let before = merged.len();
+        merged.retain(|r| {
+            if !r.is_local {
+                return true;
+            }
+            let tl = r.title.to_lowercase();
+            let cl = r.content.to_lowercase();
+            let ul = r.url.to_lowercase();
+            let overlaps = distinctive_terms.iter().any(|t| {
+                let lt = t.to_lowercase();
+                tl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
+            });
+            overlaps
+        });
+        let removed = before - merged.len();
+        if removed > 0 {
+            tracing::info!("OFF_TOPIC_LOCAL_DROP: removed {}/{} local result(s) with zero distinctive-term overlap", removed, before);
+        }
+    }
+
     // ── Adaptive relevance floor (distribution-driven, no fixed threshold) ──
     // Demote results whose relevance sits far below THIS query's own relevance
     // distribution. The floor tracks the shape of the results returned, so it
