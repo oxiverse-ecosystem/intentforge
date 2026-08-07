@@ -8975,23 +8975,54 @@ async fn handle_search(
     }).count();
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
 
-    // FRESH fail-open (prevents 0-result collapse): the FRESH OVERRIDE may have
+    // FRESH/date fail-open (prevents 0-result collapse): the FRESH OVERRIDE may have
     // flagged this as a recency query, and should_filter_by_constraints DROPS any
-    // result without a parseable date. When NO merged web result actually carries a
-    // date (typical for "latest movies released in 2026", "latest ai news this week"),
-    // a hard window would delete every result -> n=0. In that case we clear the
-    // derived date bounds so recency stays a pure SCORING boost (freshness half-life)
-    // and results are retained. If dated results DO exist, the hard window stands.
-    if intent.intent == "fresh"
-        && (intent.structured_constraints.after_date.is_some() || intent.structured_constraints.before_date.is_some())
-        && dated_result_count == 0
-    {
-        tracing::info!(
-            "FRESH FAIL-OPEN: {} web results but 0 carried a parseable date — clearing hard recency window (recency stays scoring-only)",
-            pre_filter_count
-        );
-        intent.structured_constraints.after_date = None;
-        intent.structured_constraints.before_date = None;
+    // result without a parseable date OR with a date outside the hard window.
+    // Two collapse cases exist:
+    //   (A) NO merged web result carries a parseable date (typical for "latest ai
+    //       news this week") -> a hard window deletes every result -> n=0.
+    //   (B) Every returned result IS dated but falls OUTSIDE the narrow window
+    //       (e.g. "google io 2026" snippets dated earlier in 2026, outside a
+    //       7-day after:/before: range) -> the hard window still drops them all
+    //       -> n=0. The original P6 guard only handled (A); (B) slipped through
+    //       because dated_result_count > 0, so the window stood and emptied the set.
+    // In BOTH cases we clear the derived date bounds so recency stays a pure
+    // SCORING boost (freshness half-life) and the results survive. Fail-open is
+    // keyed on "the hard window would remove every result", not on any specific
+    // query/domain/window — so it is general and never over-drops.
+    let date_window_present = intent.structured_constraints.after_date.is_some()
+        || intent.structured_constraints.before_date.is_some();
+    if date_window_present && pre_filter_count > 0 {
+        // Dry-run the same date test should_filter_by_constraints applies.
+        let survivors_after_window = web_results.iter().filter(|r| {
+            let mut ok = true;
+            if let Some(ref ad) = intent.structured_constraints.after_date {
+                if let Some(limit) = parse_date_to_comparable(ad) {
+                    if let Some(pd) = resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content) {
+                        if !date_gte(pd, limit) { ok = false; }
+                    }
+                }
+            }
+            if ok {
+                if let Some(ref bd) = intent.structured_constraints.before_date {
+                    if let Some(limit) = parse_date_to_comparable(bd) {
+                        if let Some(pd) = resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content) {
+                            if !date_lte(pd, limit) { ok = false; }
+                        }
+                    }
+                }
+            }
+            ok
+        }).count();
+        // (A) no dates at all, or (B) all dated-but-out-of-range -> would empty.
+        if survivors_after_window == 0 {
+            tracing::info!(
+                "DATE WINDOW FAIL-OPEN (would-empty): {} web results but 0 would survive the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
+                pre_filter_count, dated_result_count
+            );
+            intent.structured_constraints.after_date = None;
+            intent.structured_constraints.before_date = None;
+        }
     }
 
     // PRICE fail-open (mirrors the date fail-open above, P3-class): a price
@@ -9698,7 +9729,30 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // Results from trusted academic/technical domains (arxiv, PubMed, etc.) are
     // exempted from the minimum-length floor: a short snippet there is still a
     // legitimate paper, not noise (see is_junk_content_for_url).
-    results.retain(|r| !clean::is_junk_content_for_url(&r.content, &r.url));
+    // FAIL-OPEN (sparse-draw guard): never let this gate collapse a non-empty
+    // result set to ZERO. When the only surviving candidates are video snippets
+    // with no real text (invidious) or other low-information pages — which happens
+    // for niche queries on a weak upstream SearXNG draw — dropping them all yields
+    // `total=0`, the worst failure mode (reads as "nothing exists"). An empty SERP
+    // for a genuine query is strictly worse than showing the best available, even
+    // if imperfect. So: drop individual junk results normally, but if the gate
+    // would empty the set, keep the results (the score already demoted them).
+    // General: keyed on "would-empty", no query/domain bias, no magic threshold.
+    {
+        let before_junk = results.len();
+        let keep_idx: Vec<usize> = (0..results.len())
+            .filter(|&i| !clean::is_junk_content_for_url(&results[i].content, &results[i].url))
+            .collect();
+        if keep_idx.len() < before_junk && !keep_idx.is_empty() {
+            let kept: Vec<MergedResult> = keep_idx.into_iter().map(|i| results[i].clone()).collect();
+            results = kept;
+        } else if keep_idx.is_empty() && before_junk > 0 {
+            tracing::warn!(
+                "JUNK FILTER FAIL-OPEN: all {} results flagged junk — keeping set rather than returning empty (sparse upstream draw)",
+                before_junk
+            );
+        }
+    }
 
     // 8. Validate spelling correction against actual search result signals.
     // If the original (pre-correction) words appear more frequently in result
