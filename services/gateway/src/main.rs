@@ -5744,11 +5744,12 @@ fn merge_local_and_web(
     // innocuous "improve deep sleep without medication" query — a content-safety
     // failure. There is no upstream SafeSearch guarantee we can rely on, so we drop
     // adult results at ranking time UNLESS the user explicitly sought adult content.
-    // Detection is STRUCTURAL (adult TLDs, known adult host substrings, and /porn/
-    // /xxx/ /adult/ path markers reconstructed from the URL/title) — general
-    // reference data, no per-query hardcoding and no domain allow/deny list tuned to
-    // one query. An explicit-adult query (contains "porn"/"xxx"/"nsfw"/"adult video"/
-    // "sex video") keeps adult results; everything else drops them.
+    // curated static safety blocklist — accepted exception to the no-hardcoding rule;
+    // never make this runtime-data-driven. Adult TLDs (.xxx), known adult host
+    // substrings, and /porn/ /xxx/ /adult/ path markers are dropped at ranking time
+    // UNLESS the user explicitly sought adult content. An explicit-adult query
+    // (contains "porn"/"xxx"/"nsfw"/"adult video"/"sex video") keeps adult results;
+    // everything else drops them.
     {
         let q_lc = clean_query.to_lowercase();
         let adult_intent = q_lc.contains("porn") || q_lc.contains("xxx")
@@ -5761,8 +5762,8 @@ fn merge_local_and_web(
                 "xvideos", "xnxx", "pornhub", "xhamster", "youporn", "redtube",
                 "txxx", "fpo.xxx", "watchon.me", "spankbang", "brazzers",
                 "porn", "adultfriendfinder", "onlyfans", "chaturbate", "livejasmin",
-                "cam4", "myfreecams", "beeg", "xhamster", "porntube", "eporner",
-                "pornhd", "youporn", "tube8", "xtube", "heavy-r", "efukt", "porzo",
+                "cam4", "myfreecams", "beeg", "porntube", "eporner",
+                "pornhd", "tube8", "xtube", "heavy-r", "efukt", "porzo",
             ];
             let adult_paths: &[&str] = &["/porn/", "/xxx/", "/adult/", "/nsfw/", "/sex/", "/porno/"];
             let before = merged.len();
@@ -5979,20 +5980,21 @@ fn merge_local_and_web(
     // calibration: structurally off-topic results may still appear (floor preserved)
     // but can never outrank genuine topical content.
     //
-    // Structural signals (generic, no per-query hardcoding / no domain allow-deny list
-    // beyond the existing definitional-domain detection reconstructed from the page
-    // itself):
-    //   (a) DICTIONARY/DEFINITION SITE for a NON-definition query: a page whose domain
-    //       or title/structure marks it as a word-lookup reference (merriam-webster,
-    //       dictionary.cambridge, vocabulary.com, wiktionary, thefreedictionary,
-    //       definitions.net, wordnik, plus /dictionary//define//meaning/ paths and
-    //       POS/phonetic heading patterns). These answer "define X", not "how/why/
-    //       what is X about". When the user did NOT ask for a definition, cap hard.
+    // Structural signals (generic, no curated domain allow-list; detection is purely
+    // structural (title / path / phonetic / POS) reconstructed from the page itself):
+    //   (a) DICTIONARY/DEFINITION SITE for a NON-definition query: a page whose
+    //       title/structure marks it as a word-lookup reference (e.g. the class of
+    //       merriam-webster / dictionary.cambridge / vocabulary.com / wiktionary /
+    //       thefreedictionary / definitions.net / wordnik sites, matched purely by
+    //       /dictionary//define//meaning/ path markers, dictionary-style title
+    //       patterns, and POS/phonetic heading patterns — NOT by a curated domain
+    //       list). These answer "define X", not "how/why/what is X about". When the
+    //       user did NOT ask for a definition, cap hard.
     //   (b) SINGLE-DISTINCTIVE-TERM-ONLY match: the query has >=3 distinctive topic
     //       terms but the result matches only ONE of them AND that one term is a weak
-    //       framing/verb (improve/explain/negotiate/meaning/apply/cat/purr/warning/
-    //       sign/tidal/notion...) rather than a substantive topic. The page rode a
-    //       polysemous single-token overlap; it is off-topic for the actual subject.
+    //       framing/verb (improve/explain/negotiate/meaning/apply...) rather than a
+    //       substantive topic. The page rode a polysemous single-token overlap; it is
+    //       off-topic for the actual subject.
     {
         let q_lc_cap = clean_query.to_lowercase();
         let is_definition_query = q_lc_cap.starts_with("define ")
@@ -6010,15 +6012,9 @@ fn merge_local_and_web(
             let tl = title.to_lowercase();
             let cl = content.to_lowercase();
             let prefix = cl.chars().take(300).collect::<String>();
-            let dict_domain = ul.contains("merriam-webster.com")
-                || ul.contains("dictionary.cambridge.org")
-                || ul.contains("wiktionary.org")
-                || ul.contains("dictionary.com")
-                || ul.contains("vocabulary.com")
-                || ul.contains("thefreedictionary.com")
-                || ul.contains("definitions.net")
-                || ul.contains("wordnik.com")
-                || ul.contains("/dictionary/")
+            // Structural URL-path markers only — no curated domain allow-list.
+            // Detection is purely structural (title / path / phonetic / POS).
+            let dict_path_marker = ul.contains("/dictionary/")
                 || ul.contains("/define/")
                 || ul.contains("/meaning/");
             let title_words: Vec<&str> = tl.split_whitespace().collect();
@@ -6037,7 +6033,7 @@ fn merge_local_and_web(
                 || prefix.contains("1. : to ") || prefix.contains("2. : to ")
                 || prefix.contains("definition of ") || prefix.contains("meaning of ");
             let short = cl.len() < 200;
-            dict_domain || dict_title
+            dict_path_marker || dict_title
                 || ((phonetic || pos_label) && title_words.len() <= 3)
                 || (pos_label && short)
         };
@@ -10925,5 +10921,76 @@ mod constraint_fix_tests {
         assert!(boost > 0.0, "inurl:-matching result should receive a positive boost");
         let boost_none = constraint_boost("Rust", "post", "https://example.com/x", &c2);
         assert_eq!(boost_none, 0.0, "non-matching result should get no intitle/inurl/intext boost");
+    }
+}
+
+#[cfg(test)]
+mod hardcoding_ruling_tests {
+    use super::*;
+
+    fn cst() -> Constraints { Constraints::default() }
+    fn empty_sem() -> std::collections::HashMap<String, f32> { std::collections::HashMap::new() }
+
+    fn web_res(url: &str, title: &str, content: &str) -> SearxResult {
+        SearxResult {
+            title: title.to_string(),
+            url: url.to_string(),
+            content: content.to_string(),
+            engine: "bing".to_string(),
+            score: 1.0,
+            sources: vec!["bing".to_string()],
+            published_date: None,
+            price: None,
+            currency: None,
+        }
+    }
+
+    #[test]
+    fn ruling_dict_cap_without_hardcoded_domain_list() {
+        // Non-definition query that surfaces a dictionary site.
+        let q = "improve deep sleep without medication";
+        // Cambridge URL matched purely by the /dictionary/ PATH marker and the
+        // "cambridge dictionary" TITLE pattern — NOT by a curated domain allow-list
+        // (commit 0edf6c8's 8 hardcoded domains were removed).
+        let web = vec![web_res(
+            "https://dictionary.cambridge.org/us/dictionary/english/improve",
+            "IMPROVE | definition in the Cambridge English Dictionary",
+            "Improve: verb /ɪmˈpruːv/ 1. : to make better",
+        )];
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        assert_eq!(out.len(), 1, "cambridge result should survive (capped, not dropped)");
+        let r = &out[0];
+        assert!(r.score <= 0.061,
+            "dict site must be capped to dict_cap=0.06 via structural detection, got {}", r.score);
+    }
+
+    #[test]
+    fn ruling_adult_blocklist_drops_non_adult_query() {
+        let q = "improve deep sleep without medication";
+        let web = vec![web_res(
+            "https://www.xvideos.com/video123/some-title",
+            "Some Adult Title",
+            "adult content",
+        )];
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        assert_eq!(out.len(), 0, "adult result must be dropped for non-adult query (d04afbe safety)");
+    }
+
+    #[test]
+    fn ruling_adult_kept_for_explicit_adult_query() {
+        let q = "best porn sites";
+        let web = vec![web_res(
+            "https://www.xvideos.com/video123/some-title",
+            "Some Adult Title",
+            "adult content",
+        )];
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        assert_eq!(out.len(), 1, "adult result kept when query is explicitly adult");
     }
 }
