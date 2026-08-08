@@ -3631,31 +3631,62 @@ fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
             }
 
             if j < words.len() {
-                let target = words[j];
-                let target_is_neg = neg_markers.contains(&target) || target.starts_with('-');
-                if !target_is_neg && target.len() >= 2 {
-                    let clean: String = target.chars().filter(|c| c.is_alphanumeric()).collect();
-                    // Generic function words must never become negative constraints.
-                    // A bare negation marker followed by a closed-class word
-                    // ("does not REQUIRE", "without using the WORD", "not the THING")
-                    // is syntactic, not a topical exclusion. Extracting "require"/
-                    // "word"/"thing" as a negative penalises every otherwise-relevant
-                    // page and collapses the result set. Generic (no topic blocklist):
-                    // covers common verbs/pronouns/determiners that are never the
-                    // thing being excluded.
-                    const GENERIC_NEG: &[&str] = &[
-                        "how", "what", "why", "when", "where", "who", "which", "that", "this",
-                        "these", "those", "the", "a", "an", "and", "or", "but", "use", "using",
-                        "require", "required", "requires", "need", "needed", "needs", "do",
-                        "does", "did", "can", "could", "would", "should", "will", "with", "without",
-                        "from", "into", "onto", "upon", "over", "under", "before", "after", "than",
-                        "them", "they", "their", "our", "your", "its", "his", "her", "not", "no",
-                        "word", "thing", "things", "way", "something", "anything", "everything",
-                        "anyone", "anybody", "someone", "help", "saying", "said", "one", "it",
-                    ];
-                    if !clean.is_empty() && !terms.contains(&clean) && !GENERIC_NEG.contains(&clean.as_str()) {
-                        terms.push(clean);
+                // Greedily collect a COMPOUND negative from consecutive content
+                // words (e.g. "without a computer science degree" -> "computer
+                // science degree", not just "computer"). The first token must be a
+                // non-generic content word; we then extend across further content
+                // words until we hit a stopword, a new negation marker, or a weak
+                // generic connector. This keeps the exclusion anchored on the full
+                // entity the user meant to exclude, so the hard-drop / penalty logic
+                // (constraint_score / should_filter / post-merge) actually removes
+                // "computer science" pages instead of letting "science" tutorials survive.
+                let first = words[j];
+                let first_is_neg = neg_markers.contains(&first) || first.starts_with('-');
+                const GENERIC_NEG: &[&str] = &[
+                    "how", "what", "why", "when", "where", "who", "which", "that", "this",
+                    "these", "those", "the", "a", "an", "and", "or", "but", "use", "using",
+                    "require", "required", "requires", "need", "needed", "needs", "do",
+                    "does", "did", "can", "could", "would", "should", "will", "with", "without",
+                    "from", "into", "onto", "upon", "over", "under", "before", "after", "than",
+                    "them", "they", "their", "our", "your", "its", "his", "her", "not", "no",
+                    "word", "thing", "things", "way", "something", "anything", "everything",
+                    "anyone", "anybody", "someone", "help", "saying", "said", "one", "it",
+                ];
+                let first_clean: String = first.chars().filter(|c| c.is_alphanumeric()).collect();
+                if !first_is_neg && first.len() >= 2
+                    && !first_clean.is_empty()
+                    && !GENERIC_NEG.contains(&first_clean.as_str())
+                {
+                    // Build the compound: start at j, extend while the next token
+                    // is a content word that is NOT a new negation marker and NOT a
+                    // generic function word.
+                    let mut compound: Vec<String> = vec![first_clean.clone()];
+                    let mut k = j + 1;
+                    while k < words.len() {
+                        let w = words[k];
+                        if neg_markers.contains(&w) || w.starts_with('-') {
+                            break; // next exclusion starts here
+                        }
+                        if stopwords.contains(&w) {
+                            break; // "a", "the", "of" — stop the compound
+                        }
+                        if GENERIC_NEG.contains(&w) {
+                            break; // generic connector — won't extend past it
+                        }
+                        let wc: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                        if wc.is_empty() {
+                            break;
+                        }
+                        compound.push(wc);
+                        k += 1;
                     }
+                    let joined = compound.join(" ");
+                    if !terms.contains(&joined) {
+                        terms.push(joined);
+                    }
+                    // Advance past the consumed compound so we don't re-scan it.
+                    i = j + compound.len();
+                    continue;
                 }
             }
             i = j;
