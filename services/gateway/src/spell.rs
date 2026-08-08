@@ -295,8 +295,8 @@ impl SymSpellIndex {
             && !self.exact_map.contains_key(&word.to_lowercase())
             && !self.is_known_misspelling(word)
         {
-            let collapsed_input = collapse_doubles(word);
-            let collapsed_best = collapse_doubles(&best);
+            let collapsed_input = Self::collapse_doubles(word);
+            let collapsed_best = Self::collapse_doubles(&best);
             if collapsed_input != collapsed_best {
                 return None;
             }
