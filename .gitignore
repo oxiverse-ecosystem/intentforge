@@ -46,3 +46,9 @@ ROADMAP.md
 *.bak
 *.tmp
 services/crawler/queue_data/
+.pytest_cache/
+node_modules/
+dist/
+*.log
+.venv/
+build/
