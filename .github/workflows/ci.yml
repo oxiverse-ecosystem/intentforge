@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gateway-tests:
+    name: gateway unit tests (pure logic, no Docker)
+    runs-on: ubuntu-latest
+    # Only the gateway crate has real unit tests (clean.rs, spell.rs, main.rs).
+    # We deliberately DO NOT build the full Rust+Docker stack here — that would
+    # burn 10-20 min of Actions compute for no signal. The gateway tests cover
+    # the pure ranking/cleaning/spell-correction logic that actually regresses.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            services/gateway/target
+          key: ${{ runner.os }}-cargo-gateway-${{ hashFiles('services/gateway/Cargo.lock', 'services/gateway/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-gateway-
+
+      - name: Build gateway tests (compile only)
+        working-directory: services/gateway
+        run: cargo test --no-run --locked
+
+      - name: Run gateway unit tests
+        working-directory: services/gateway
+        run: cargo test --locked
