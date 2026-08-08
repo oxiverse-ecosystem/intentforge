@@ -282,12 +282,24 @@ impl SymSpellIndex {
         // dictionary lacks, not a typo. Distance-1 typo fixes of real dictionary words
         // (e.g. "pythn"->"python") are distance 1 so unaffected, and explicit
         // known-misspelling entries (e.g. "ngnix"->"nginx") are exempt.
+        //
+        // NARROW EXCEPTION: permit the correction when the ONLY differences between
+        // input and candidate are missing doubled letters (e.g. "embaras"->"embarrass",
+        // "recieve"->"receive"). Detected structurally via collapse_doubles(): both
+        // strings must collapse to the same form when each run of identical consecutive
+        // chars is reduced to one. This re-opens the single most common English typo
+        // class WITHOUT weakening the biryani->bryan guard (that is a deletion of a
+        // distinct letter, not a doubled-letter insertion; the collapsed forms differ).
         let best_dist = self.compute_edit_distance(word, best);
         if best_dist >= 2
             && !self.exact_map.contains_key(&word.to_lowercase())
             && !self.is_known_misspelling(word)
         {
-            return None;
+            let collapsed_input = collapse_doubles(word);
+            let collapsed_best = collapse_doubles(&best);
+            if collapsed_input != collapsed_best {
+                return None;
+            }
         }
 
         // Only accept if candidate is at least as common as the original word
@@ -309,6 +321,23 @@ impl SymSpellIndex {
         } else {
             false
         }
+    }
+
+    /// Collapse each run of identical consecutive chars to a single char.
+    /// Used by the narrow ABSENT-WORD GUARD exception to detect doubled-letter
+    /// typos: "embarass" and "embarrass" both collapse to "embaras", so a
+    /// distance-2 correction between them is permitted; "biryani" and "bryan"
+    /// collapse to different strings, so that correction stays blocked.
+    fn collapse_doubles(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut prev: Option<char> = None;
+        for c in s.chars() {
+            if Some(c) != prev {
+                out.push(c);
+                prev = Some(c);
+            }
+        }
+        out
     }
 
     /// SymSpell O(1) lookup: generate deletions of the input word and check
@@ -1062,6 +1091,27 @@ mod tests {
         assert!(result.is_some(), "Should correct 'embarass'");
         assert_eq!(result.unwrap(), "embarrass",
             "Should correct misspelling 'embarass' to 'embarrass'");
+    }
+
+    #[test]
+    fn test_embaras_double_typo_corrects_to_embarrass() {
+        let index = SymSpellIndex::build();
+        // "embaras" (one r, one s) -> "embarrass" (doubled r + doubled s) is a
+        // distance-2 typo of the dropped-doubled-letter class, now permitted by the
+        // narrow ABSENT-WORD GUARD exception.
+        let result = index.correct("embaras");
+        assert!(result.is_some(), "Should correct 'embaras' to 'embarrass'");
+        assert_eq!(result.unwrap(), "embarrass");
+    }
+
+    #[test]
+    fn test_absent_word_guard_still_blocks_biryani() {
+        let index = SymSpellIndex::build();
+        // The doubled-letter exception must NOT open the biryani->bryan hole:
+        // "biryani" is a real (foreign) word absent from the dictionary and its
+        // collapsed form differs from any candidate, so it stays uncorrected.
+        let result = index.correct("biryani");
+        assert_eq!(result, None, "biryani must NOT be English-ified to bryan");
     }
 
     // ─── Result-based validation tests ─────────────────────────────
