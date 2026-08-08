@@ -2190,6 +2190,78 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
     None
 }
 
+/// Extract a natural-language price bound from a raw query (no operator syntax).
+/// Powers the P3 ranking fix for queries like "wireless headphones under 150 dollars"
+/// or "laptop below 1000 rupees" — these never matched the `price:<` operator parser,
+/// so the bound stayed None and ranking fell back to pure relevance (always surfacing
+/// "under $200" pages). Returns (max_price, currency_code) for an upper bound, or
+/// (None, _) for a lower bound.
+///
+/// Patterns (case-insensitive, currency-agnostic — no merchant/region hardcoding):
+///   A) "<upper-marker> <number> [currency]"  e.g. "under 150 dollars", "below 1000 rs"
+///   B) "<currency-symbol><number> <upper-marker>" e.g. "₹20000 or less", "$600 max"
+///   C) "<number> <currency> <upper-marker>" e.g. "1000 rupees max"
+fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
+    let lower = q.to_lowercase();
+    let upper_markers = [
+        "under", "below", "less than", "cheaper than", "max", "maximum", "at most", "no more than", "within", "up to", "around", "about", "budget",
+    ];
+    let lower_markers = ["over", "more than", "above", "minimum", "at least", "from"];
+    let amount_pat = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
+    let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.", "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw"];
+
+    // Pattern A: upper-marker then number (+ optional currency word)
+    for marker in upper_markers {
+        if let Some(pos) = lower.find(marker) {
+            let rest = &lower[pos + marker.len()..];
+            let re_num = regex::Regex::new(&format!(r"\s*{}\b", amount_pat)).ok()?;
+            if let Some(caps) = re_num.captures(rest) {
+                if let Some(m) = caps.get(1) {
+                    if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
+                        let currency = currency_words.iter().find(|c| rest.contains(*c))
+                            .map(|c| normalize_currency_str(c)).unwrap_or_else(|| "usd".to_string());
+                        return Some((v, currency));
+                    }
+                }
+            }
+        }
+    }
+    // Pattern B: currency symbol/word then number then upper-marker
+    let re_b = regex::Regex::new(&format!(r"(₹|¥|€|£|\$|usd|inr|rs|rupees?|eur|euros?|gbp|pounds?)\s*{}?\s*({})", amount_pat, upper_markers.join("|"))).ok()?;
+    if let Some(caps) = re_b.captures(&lower) {
+        if let (Some(cur), Some(num)) = (caps.get(1), caps.get(2)) {
+            if let Ok(v) = num.as_str().replace(',', "").parse::<f32>() {
+                return Some((v, normalize_currency_str(cur.as_str())));
+            }
+        }
+    }
+    // Pattern C: number then currency word then upper-marker
+    let re_c = regex::Regex::new(&format!(r"{}\s*({})\s*({})", amount_pat, currency_words.join("|"), upper_markers.join("|"))).ok()?;
+    if let Some(caps) = re_c.captures(&lower) {
+        if let (Some(num), Some(cur)) = (caps.get(1), caps.get(2)) {
+            if let Ok(v) = num.as_str().replace(',', "").parse::<f32>() {
+                return Some((v, normalize_currency_str(cur.as_str())));
+            }
+        }
+    }
+    // Lower bound (return with None so caller treats as gt)
+    for marker in lower_markers {
+        if let Some(pos) = lower.find(marker) {
+            let rest = &lower[pos + marker.len()..];
+            let re_num = regex::Regex::new(&format!(r"\s*{}\b", amount_pat)).ok()?;
+            if let Some(caps) = re_num.captures(rest) {
+                if let Some(m) = caps.get(1) {
+                    if let Ok(_v) = m.as_str().replace(',', "").parse::<f32>() {
+                        // Lower-bound only; signal via currency "GT"
+                        return None; // keep simple: NL lower bounds not yet wired to price_gt
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn should_filter_by_constraints(
     title: &str, content: &str, url: &str, published_date: Option<&str>, constraints: &Constraints,
 ) -> bool {
@@ -7945,6 +8017,21 @@ async fn handle_search(
     }
     if gateway_extracted.price_max.is_some() {
         intent.structured_constraints.price_max = gateway_extracted.price_max;
+    }
+    // P3 NL-price fix: also derive a bound from natural-language price words
+    // ("under 150 dollars", "below 1000 rupees") — these never matched the
+    // `price:<` operator parser, so the bound stayed None and ranking fell back
+    // to pure relevance (always surfacing "under $200" pages). This feeds the
+    // SAME price-aware ranking path as the operator form. Only set when the
+    // operator form did not already provide a bound.
+    if intent.structured_constraints.price_lt.is_none()
+        && intent.structured_constraints.price_max.is_none()
+    {
+        if let Some((lt, _currency)) = extract_nl_price_bound(&q_orig) {
+            intent.structured_constraints.price_lt = Some(lt);
+            intent.structured_constraints.price_max = Some(lt);
+            tracing::info!("NL PRICE BOUND: extracted lt={} from query", lt);
+        }
     }
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
 
