@@ -5905,27 +5905,130 @@ fn merge_local_and_web(
         r.score = scores[i];
     }
 
-    // POST-CALIBRATION VIDEO CAP (round-7 P8 fix, recalibration-proof).
-    // The pre-loop video_mult (×0.08 for non-video text queries) is DEFEATED by
-    // calibrate_scores, which rescales the whole set onto [0.05, 1.0] and thus
-    // stretches the dampened video's score right back up — so a generic YouTube
-    // tutorial could still rank #1 for a text query (observed: "free weather app
-    // for android" returned a youtube.com result at score 1.0). Applying the cap
-    // AFTER calibration guarantees the dampening survives any rescale.
-    // Videos keep their own /videos endpoint; in /search they are secondary, so for
-    // a TEXT query we cap them well below the top of the band. Explicit video intent
-    // ("video"/"youtube"/"watch"/"tutorial"/"animation") leaves them untouched.
+    // POST-CALIBRATION OFF-TOPIC CAP (this round, D1/D2/D3).
+    // The in-loop relevance penalties (dictionary-site relevance=0.001 at ~5506,
+    // generic-word ×0.12 guard at ~5061, local-noise ×0.05 at ~5202) are DEFEATED
+    // by calibrate_scores, which rescales the WHOLE set onto [0.05,1.0]. When the
+    // candidate set is dominated by off-topic pages (dictionary/definition sites for
+    // a substantive question, or a page that matches only ONE polysemous framing
+    // verb like "improve"/"explain"/"negotiate" while missing the real topic), the
+    // rescale stretches the off-topic survivor right back into the top band — so
+    // Merriam-Webster ranks #1 for "improve deep sleep", VS Code docs for "ikigai",
+    // Wikipedia "Cats (musical)" for "why do cats purr". This is the exact
+    // "penalties only bite if folded into the FINAL r.score AND survive calibration"
+    // failure (see P8 video cap above, which uses the same post-calibration pattern
+    // to make its dampening durable). We therefore re-apply a hard cap AFTER
+    // calibration: structurally off-topic results may still appear (floor preserved)
+    // but can never outrank genuine topical content.
+    //
+    // Structural signals (generic, no per-query hardcoding / no domain allow-deny list
+    // beyond the existing definitional-domain detection reconstructed from the page
+    // itself):
+    //   (a) DICTIONARY/DEFINITION SITE for a NON-definition query: a page whose domain
+    //       or title/structure marks it as a word-lookup reference (merriam-webster,
+    //       dictionary.cambridge, vocabulary.com, wiktionary, thefreedictionary,
+    //       definitions.net, wordnik, plus /dictionary//define//meaning/ paths and
+    //       POS/phonetic heading patterns). These answer "define X", not "how/why/
+    //       what is X about". When the user did NOT ask for a definition, cap hard.
+    //   (b) SINGLE-DISTINCTIVE-TERM-ONLY match: the query has >=3 distinctive topic
+    //       terms but the result matches only ONE of them AND that one term is a weak
+    //       framing/verb (improve/explain/negotiate/meaning/apply/cat/purr/warning/
+    //       sign/tidal/notion...) rather than a substantive topic. The page rode a
+    //       polysemous single-token overlap; it is off-topic for the actual subject.
     {
-        let q_lc_cap = query.to_lowercase();
-        let video_intent = q_lc_cap.contains("video") || q_lc_cap.contains("youtube")
-            || q_lc_cap.contains("watch") || q_lc_cap.contains("tutorial")
-            || q_lc_cap.contains("animation");
-        if !video_intent {
-            let cap = 0.25f32; // videos may appear but never outrank topical articles
-            for r in merged.iter_mut() {
-                let is_video = r.sources.iter().any(|s| s == "invidious" || s == "video");
-                if is_video && r.score > cap {
-                    r.score = cap;
+        let q_lc_cap = clean_query.to_lowercase();
+        let is_definition_query = q_lc_cap.starts_with("define ")
+            || q_lc_cap.starts_with("definition of ")
+            || q_lc_cap.contains("definition of ")
+            || q_lc_cap.contains(" meaning of ")
+            || q_lc_cap.contains("word meaning")
+            || (q_lc_cap.starts_with("what does ") && q_lc_cap.contains(" mean"))
+            || q_lc_cap.starts_with("what is the definition");
+
+        // Definitional-domain / structure detector (mirrors the in-loop block at ~5447
+        // but is recomputed here so the cap is independent of that block's scope).
+        let is_def_site = |url: &str, title: &str, content: &str| -> bool {
+            let ul = url.to_lowercase();
+            let tl = title.to_lowercase();
+            let cl = content.to_lowercase();
+            let prefix = cl.chars().take(300).collect::<String>();
+            let dict_domain = ul.contains("merriam-webster.com")
+                || ul.contains("dictionary.cambridge.org")
+                || ul.contains("wiktionary.org")
+                || ul.contains("dictionary.com")
+                || ul.contains("vocabulary.com")
+                || ul.contains("thefreedictionary.com")
+                || ul.contains("definitions.net")
+                || ul.contains("wordnik.com")
+                || ul.contains("/dictionary/")
+                || ul.contains("/define/")
+                || ul.contains("/meaning/");
+            let title_words: Vec<&str> = tl.split_whitespace().collect();
+            let dict_title = tl.contains("meaning & definition")
+                || tl.contains("definition & meaning")
+                || tl.contains("definition of ")
+                || tl.contains("meaning of ")
+                || tl.ends_with("- wiktionary")
+                || tl.contains("cambridge dictionary")
+                || tl.contains("merriam-webster")
+                || (title_words.len() <= 3 && (tl.contains("definition") || tl.contains("dictionary")));
+            let phonetic = prefix.contains("/ˈ") || prefix.contains("/ˌ")
+                || prefix.contains("/'") || prefix.contains("/-");
+            let pos_label = prefix.starts_with("noun") || prefix.starts_with("verb")
+                || prefix.starts_with("adjective") || prefix.starts_with("adverb")
+                || prefix.contains("1. : to ") || prefix.contains("2. : to ")
+                || prefix.contains("definition of ") || prefix.contains("meaning of ");
+            let short = cl.len() < 200;
+            dict_domain || dict_title
+                || ((phonetic || pos_label) && title_words.len() <= 3)
+                || (pos_label && short)
+        };
+
+        // Count how many DISTINCTIVE topic terms a result actually contains (excludes
+        // weak framing/anchor words, so a page matching only "improve" while the query
+        // is "improve deep sleep without medication" counts as 1 weak match, not a
+        // substantive one).
+        let strong_topics: Vec<&str> = strong_distinctive_terms.iter()
+            .filter(|t| !is_weak_anchor_word(&t.to_lowercase()))
+            .copied().collect();
+        let query_has_many_topics = strong_topics.len() >= 3;
+
+        let dict_cap = 0.06f32;   // dictionary sites may appear but never rank top
+        let weak_cap = 0.08f32;   // single-polysemous-token matches capped low
+
+        for r in merged.iter_mut() {
+            let rl = r.title.to_lowercase();
+            let cl = r.content.to_lowercase();
+            let ul = r.url.to_lowercase();
+
+            // (a) definitional site for a non-definition query
+            if !is_definition_query && is_def_site(&ul, &rl, &cl) {
+                if r.score > dict_cap {
+                    tracing::info!(
+                        "POST-CAL DICT CAP -> {:.2}: '{}' (def site, non-def query)",
+                        dict_cap, r.url.chars().take(60).collect::<String>()
+                    );
+                    r.score = dict_cap;
+                }
+                continue;
+            }
+
+            // (b) single-distinctive-term-only match on a multi-topic query
+            if query_has_many_topics {
+                let matched_strong = strong_topics.iter().filter(|t| {
+                    let lt = t.to_lowercase();
+                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
+                }).count();
+                // matched_strong is at most strong_topics.len(); we want the page to
+                // contain at least 2 of the query's real topic terms to be on-topic.
+                if matched_strong < 2 {
+                    if r.score > weak_cap {
+                        tracing::info!(
+                            "POST-CAL WEAK-MATCH CAP -> {:.2}: '{}' (matched {} of {} topics)",
+                            weak_cap, r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len()
+                        );
+                        r.score = weak_cap;
+                    }
                 }
             }
         }
