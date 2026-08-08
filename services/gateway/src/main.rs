@@ -5738,6 +5738,64 @@ fn merge_local_and_web(
         }
     }
 
+    // ── Adult-content hard-drop for non-adult queries (this round, D4) ──
+    // Privacy-first search must not surface pornographic/NSFW results for ordinary
+    // queries. The web fan-out (SearXNG-via-VPN) returned XNXX adult forums for an
+    // innocuous "improve deep sleep without medication" query — a content-safety
+    // failure. There is no upstream SafeSearch guarantee we can rely on, so we drop
+    // adult results at ranking time UNLESS the user explicitly sought adult content.
+    // Detection is STRUCTURAL (adult TLDs, known adult host substrings, and /porn/
+    // /xxx/ /adult/ path markers reconstructed from the URL/title) — general
+    // reference data, no per-query hardcoding and no domain allow/deny list tuned to
+    // one query. An explicit-adult query (contains "porn"/"xxx"/"nsfw"/"adult video"/
+    // "sex video") keeps adult results; everything else drops them.
+    {
+        let q_lc = clean_query.to_lowercase();
+        let adult_intent = q_lc.contains("porn") || q_lc.contains("xxx")
+            || q_lc.contains("nsfw") || q_lc.contains("adult video")
+            || q_lc.contains("adult film") || q_lc.contains("sex video")
+            || q_lc.contains("pornhub") || q_lc.contains("xvideos")
+            || q_lc.contains("onlyfans");
+        if !adult_intent {
+            let adult_hosts: &[&str] = &[
+                "xvideos", "xnxx", "pornhub", "xhamster", "youporn", "redtube",
+                "txxx", "fpo.xxx", "watchon.me", "spankbang", "brazzers",
+                "porn", "adultfriendfinder", "onlyfans", "chaturbate", "livejasmin",
+                "cam4", "myfreecams", "beeg", "xhamster", "porntube", "eporner",
+                "pornhd", "youporn", "tube8", "xtube", "heavy-r", "efukt", "porzo",
+            ];
+            let adult_paths: &[&str] = &["/porn/", "/xxx/", "/adult/", "/nsfw/", "/sex/", "/porno/"];
+            let before = merged.len();
+            merged.retain(|r| {
+                let ul = r.url.to_lowercase();
+                let tl = r.title.to_lowercase();
+                let host = reqwest::Url::parse(&r.url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                    .unwrap_or_default();
+                // adult TLD (.xxx) is unambiguously adult
+                let tld_adult = host.ends_with(".xxx");
+                let host_adult = adult_hosts.iter().any(|h| host.contains(h));
+                let path_adult = adult_paths.iter().any(|p| ul.contains(p));
+                let title_adult = tl.contains("porn") || tl.contains("xxx ")
+                    || tl.contains("nude") || tl.contains("naked")
+                    || tl.contains("sex video") || tl.contains("adult film");
+                let is_adult = tld_adult || host_adult || path_adult || title_adult;
+                if is_adult {
+                    tracing::info!(
+                        "ADULT DROP (non-adult query): '{}'",
+                        r.url.chars().take(60).collect::<String>()
+                    );
+                }
+                !is_adult
+            });
+            let removed = before - merged.len();
+            if removed > 0 {
+                tracing::info!("ADULT DROP: removed {}/{} adult result(s) for non-adult query", removed, before);
+            }
+        }
+    }
+
     // ── Adaptive relevance floor (distribution-driven, no fixed threshold) ──
     // Demote results whose relevance sits far below THIS query's own relevance
     // distribution. The floor tracks the shape of the results returned, so it
