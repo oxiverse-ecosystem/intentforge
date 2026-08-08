@@ -4650,6 +4650,23 @@ fn renormalize_distribution(distribution: &mut std::collections::HashMap<String,
 // get merged with a consensus boost. This is the strongest relevance signal.
 // Returns a single sorted list by final score.
 
+/// High-frequency common-English words that carry weak topical signal.
+/// Used to keep them OUT of the "distinctive anchor" set that drives the
+/// off-topic guard: a query like "open source privacy search engine" should
+/// anchor on "source"/"privacy"/"search"/"engine", not the ultra-common "open",
+/// so pages matching only "open" (OpenAI, Open Library) get correctly crushed
+/// as off-topic instead of surviving the guard.
+fn is_weak_anchor_word(w: &str) -> bool {
+    const WEAK: &[&str] = &[
+        "open", "source", "most", "best", "top", "free", "good", "great", "common",
+        "buy", "reduce", "history", "pack", "search", "engine", "use", "using",
+        "learn", "learning", "way", "ways", "how", "what", "why", "when", "make",
+        "making", "build", "building", "find", "finding", "get", "getting", "vs",
+        "versus", "and", "the", "for", "with", "without", "from", "into",
+    ];
+    WEAK.contains(&w)
+}
+
 fn merge_local_and_web(
     local: Vec<IndexerResult>,
     web: Vec<SearxResult>,
@@ -4899,6 +4916,17 @@ fn merge_local_and_web(
         .copied()
         .collect();
 
+    // Strong distinctive terms = distinctive terms MINUS high-frequency weak
+    // anchors (open/source/most/buy/reduce/history/common/great/free/best/top/
+    // search/engine/learn/...). The off-topic guard below anchors on THESE so a
+    // query whose only matched terms are weak generics (e.g. "open", "most") does
+    // not let off-topic pages (OpenAI, "MOST" museum) survive the guard.
+    let strong_distinctive_terms: Vec<&str> = distinctive_terms
+        .iter()
+        .copied()
+        .filter(|w| !is_weak_anchor_word(&w.to_lowercase()))
+        .collect();
+
     let core_topic_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
             let lower = w.to_lowercase();
@@ -5024,8 +5052,8 @@ fn merge_local_and_web(
         // words — treat it as off-topic and crush relevance so topic-bearing pages
         // (which DO contain a distinctive term) can outrank it. Fully generic queries
         // with no distinctive terms are untouched (nothing to miss).
-        if !distinctive_terms.is_empty() {
-            let matched_distinctive = distinctive_terms.iter().any(|t| {
+        if !strong_distinctive_terms.is_empty() {
+            let matched_distinctive = strong_distinctive_terms.iter().any(|t| {
                 let tl = t.to_lowercase();
                 title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
             });
@@ -5251,7 +5279,7 @@ fn merge_local_and_web(
         // FINAL r.score" lesson). Zeroing freshness + intent_boost for off-topic results
         // starves the raw base so it stays below on-topic results even after calibration.
         // `off_topic` is recomputed here (not reused from the base block) to stay in scope.
-        let off_topic_struct = !distinctive_terms.is_empty() && !distinctive_terms.iter().any(|t| {
+        let off_topic_struct = !strong_distinctive_terms.is_empty() && !strong_distinctive_terms.iter().any(|t| {
             let tl = t.to_lowercase();
             title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
         });
@@ -5375,8 +5403,8 @@ fn merge_local_and_web(
             let title_lower = r.title.to_lowercase();
             let content_lower = r.content.to_lowercase();
 
-            if !distinctive_terms.is_empty() {
-                let any_distinctive_match = distinctive_terms.iter().any(|t| {
+            if !strong_distinctive_terms.is_empty() {
+                let any_distinctive_match = strong_distinctive_terms.iter().any(|t| {
                     title_lower.contains(t) || content_lower.contains(t)
                 });
 
@@ -5596,7 +5624,7 @@ fn merge_local_and_web(
         // authority here makes the off-topic crush actually bite. This never hurts a
         // result that contains a real topic term, and authority is only halved (not
         // zeroed) so a borderline page still earns a little trust.
-        let off_topic = !distinctive_terms.is_empty() && !distinctive_terms.iter().any(|t| {
+        let off_topic = !strong_distinctive_terms.is_empty() && !strong_distinctive_terms.iter().any(|t| {
             let tl = t.to_lowercase();
             title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
         });
@@ -5689,7 +5717,7 @@ fn merge_local_and_web(
     // local pages (which DO contain a distinctive term — e.g. an iPhone-vs-S24
     // article for a "compare iphone and samsung" query) are kept. General: keyed on
     // (is_local && zero distinctive-term overlap), no query/domain bias.
-    if !distinctive_terms.is_empty() {
+    if !strong_distinctive_terms.is_empty() {
         let before = merged.len();
         merged.retain(|r| {
             if !r.is_local {
@@ -5698,7 +5726,7 @@ fn merge_local_and_web(
             let tl = r.title.to_lowercase();
             let cl = r.content.to_lowercase();
             let ul = r.url.to_lowercase();
-            let overlaps = distinctive_terms.iter().any(|t| {
+            let overlaps = strong_distinctive_terms.iter().any(|t| {
                 let lt = t.to_lowercase();
                 tl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
             });
