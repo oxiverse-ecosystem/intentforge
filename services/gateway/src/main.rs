@@ -3750,9 +3750,16 @@ fn query_is_contrastive(q_orig: &str) -> bool {
     }
     // Double negation: two+ negation markers → genuine exclusion set
     // ("not react not vue", "javascript not java not typescript").
+    // Count OCCURRENCES of each marker (not distinct markers) and pad the query
+    // with a leading space so a negation at the very START of the query
+    // ("not react not vue") is also counted. This is what makes double-negation
+    // queries keep BOTH excluded terms through the is_real_exclusion gate in
+    // handle_search — a single distinct-marker count collapsed "not react not
+    // vue" to one marker and dropped every non-protected exclusion.
     let neg_markers = [" not ", " no ", " without ", " except ", " excluding ", " minus ",
         " other than ", " instead of ", " besides ", " alternative to "];
-    let count = neg_markers.iter().filter(|m| q_lower.contains(*m)).count();
+    let q_pad = format!(" {}", q_lower);
+    let count: usize = neg_markers.iter().map(|m| q_pad.matches(m).count()).sum();
     count >= 2
 }
 
@@ -11105,6 +11112,22 @@ mod constraint_fix_tests {
         assert!(query_is_contrastive("javascript not java not typescript"));
         assert!(!query_is_contrastive("how to clean a skillet without soap"));
         assert!(!query_is_contrastive("how to learn guitar with no music background"));
+    }
+
+    #[test]
+    fn query_is_contrastive_counts_negation_occurrences() {
+        // D1 regression: double-negation must be detected by OCCURRENCE count, not
+        // distinct-marker count, AND a negation at the very START of the query must
+        // still be counted (leading-space pad). If this fails, the handle_search gate
+        // drops the non-protected exclusion term (e.g. "not react not vue" → []).
+        assert!(query_is_contrastive("not react not vue"), "leading double-negation must be contrastive");
+        assert!(query_is_contrastive("javascript not java not typescript"), "interior double-negation must be contrastive");
+        assert!(query_is_contrastive("python not django not flask"), "interior double-negation must be contrastive");
+        assert!(query_is_contrastive("text editor not vim not emacs"), "interior double-negation must be contrastive");
+        // Single negation is NOT contrastive.
+        assert!(!query_is_contrastive("python web framework not django"));
+        // Manner qualifiers (one negation) are not contrastive.
+        assert!(!query_is_contrastive("how to clean a cast iron skillet without soap after cooking eggs"));
     }
 
 
