@@ -7196,7 +7196,18 @@ async fn main() {
         rate_limits: Arc::new(RateLimitTracker::new()),
         volume_tracker: ResultVolumeTracker::new(),
         http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))  // Allow up to 10s for external engines (VPN/Tor overhead)
+            // 25s for external engines. Tor2 (SearXNG2 / Tor) cold-circuit builds
+            // after a NEWNYM IP rotation take 10-15s to answer (see tor-warmup
+            // path, which already uses a 25s client). A 10s cap classified those
+            // cold-circuit Tor responses as `instance request failed ... TimedOut`,
+            // and two such hits tripped the circuit breaker (`Circuit OPEN` for
+            // engine 'searxng1'), silently skipping the entire Tor path for up to
+            // 30s — collapsing the "two independent egress paths" design to one.
+            // Raising to 25s lets the slow-but-valid Tor response through so both
+            // paths genuinely serve (self-heals once the circuit is warm). The
+            // per-branch budget (searx_fut) and the fan-out join deadline still
+            // bound end-to-end latency for the fast (gluetun-VPN) path.
+            .timeout(Duration::from_secs(25))  // Allow up to 25s for external engines (VPN/Tor overhead, cold Tor circuit)
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .pool_max_idle_per_host(128)
             .connect_timeout(Duration::from_secs(1))
@@ -8450,6 +8461,9 @@ async fn handle_search(
     let has_site = !constraints.sites.is_empty();
     let searx_partial_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let partial_collector_inner = searx_partial_collector.clone();
+    // Captured by value before `searx_fut_with_timeout` moves `searx_urls` into its
+    // async block. Used at the fan-out JOIN to pick a Tor-aware deadline.
+    let tor2_in_fanout = searx_urls.iter().any(|u| u.contains("tor2") || u.contains("8081"));
     let searx_fut_with_timeout = async move {
         use futures::future::FutureExt;
 
@@ -8626,14 +8640,30 @@ async fn handle_search(
         indexer_task,
         // ⚠️  NOTE: tokio::time::timeout cancels the inner future, which drops any
         // partial results already collected by searx_fut_with_timeout (from faster
-        // SearXNG instances that completed within the 5s window). This means on
-        // timeout we return Vec::new() for SearXNG — we don't preserve partial
-        // results. The ROADMAP.md "Return early + merge stragglers" plan item
+        // SearXNG instances that completed within the window). On timeout we fall
+        // back to the partial collector (results the faster instances already
+        // returned). The ROADMAP.md "Return early + merge stragglers" plan item
         // describes the proper fix: return completed results immediately and merge
         // slow instances' results in the background.
+        //
+        // The join deadline is Tor-aware: the gluetun-VPN (SearXNG1) instance is
+        // bounded ~4.2s and the fan-out early-returns at 15 results, so a 5s join
+        // is plenty for it. BUT the SearXNG2/Tor (tor2) instance runs over an
+        // independent Tor circuit whose COLD build (after a NEWNYM rotation) takes
+        // 10-15s; its own branch budget is 15s (see is_tor_url branch_timeout_ms)
+        // and the per-instance attempt budget is 10s (non-site). A flat 5s join cut
+        // the legitimate slow Tor response before it arrived, discarding the whole
+        // second egress path. When tor2 is in the fan-out we extend the join to 15s
+        // so its valid results are captured instead of dropped (the partial collector
+        // is still used if even 15s is exceeded). Fast-path behaviour is unchanged.
         async {
             let partial_collector_ref = searx_partial_collector.clone();
-            match tokio::time::timeout(Duration::from_secs(5), searx_fut_with_timeout).await {
+            let join_deadline = if tor2_in_fanout {
+                Duration::from_secs(15)
+            } else {
+                Duration::from_secs(5)
+            };
+            match tokio::time::timeout(join_deadline, searx_fut_with_timeout).await {
                 Ok(res) => {
                     if res.is_empty() {
                         let mut guard = partial_collector_ref.lock().unwrap();
@@ -8644,7 +8674,7 @@ async fn handle_search(
                     res
                 }
                 Err(_) => {
-                    tracing::warn!("SearXNG fan-out exceeded 5s deadline; preserving partial results from completed instances");
+                    tracing::warn!("SearXNG fan-out exceeded {}s deadline; preserving partial results from completed instances", join_deadline.as_secs());
                     let mut guard = partial_collector_ref.lock().unwrap();
                     std::mem::take(&mut *guard)
                 }
