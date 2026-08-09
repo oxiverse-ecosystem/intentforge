@@ -385,7 +385,7 @@ Spelling-correction preview. Exposes the engine's in-process SymSpell + LinSpell
 }
 ```
 
-> **Verified (this round, 2026-08-10):** a typo string returns `changed: true` with a `correction` per changed token. Protected brands/tech terms (`openai`, `rust`, `kubernetes`, …) are never "corrected" — `"openai rust tutorial"` returns `changed: false` and an empty `corrections` array. URL tokens, code tokens (`.` `/` `@` `#` `$` or containing a digit), and very short words (< 4 chars) are left as-is (`in_dictionary: true`) so the client does not flag them as typos. The whole-query `corrected` string matches what `/search` would actually run.
+> **Verified (this round, 2026-08-10):** a typo string returns `changed: true` with a `correction` per changed token. Protected brands/tech terms (`openai`, `rust`, `kubernetes`, …) are never "corrected" — `"openai rust tutorial"` returns `changed: false` and an empty `corrections` array. URL tokens, code tokens (`.` `/` `@` `#` `$` or containing a digit), and very short words (< 4 chars) are skipped by the corrector and **omitted entirely from the `corrections` array** — the endpoint only lists tokens it actually proposed fixing, so the client never flags skipped tokens as typos. They are still preserved verbatim in the whole-query `corrected` string. The `corrected` string matches what `/search` runs for the same query (verified 2026-08-10: `/spellcheck?q=pythn+programing+langauge` → `corrected: "python programming language"`, and `/search?q=pythn+programing+langauge` returns `"query":"python programming language"`). Example: `/spellcheck?q=pythn+kubernetes.io` returns `changed:true` with `corrections` containing **only** `pythn→python` (the `kubernetes.io` URL token is skipped and absent from `corrections`, but retained in `corrected`).
 
 **Empty query** returns `400` with the standard error envelope (same shape as `/search`):
 
@@ -616,7 +616,7 @@ The API automatically detects and corrects spelling errors in queries using a tw
 **Protection against false positives:**
 - Protected brand/tech terms (`openai`, `kubernetes`, `podman`, etc.) are NEVER corrected
 - Tech terms with unusual character bigrams (e.g. `"podman"`) are not English-ified
-- Short words (< 3 chars) and known 3-letter terms are left unchanged
+- Short words (< 4 chars; `MIN_CORRECT_LENGTH`) and known 3-letter terms are left unchanged
 - URLs, code terms, and words with numbers/special characters are never touched
 - Single-character substitutions between two natural-looking words are blocked (prevents `"ramen"` → `"raven"`)
 
