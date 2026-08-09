@@ -5359,6 +5359,18 @@ fn merge_local_and_web(
         if distinctive_terms.len() >= 2 && overlap > 0.0 && overlap < 1.0 {
             let coverage_mult = 0.25f32 + 0.75f32 * overlap;
             relevance *= coverage_mult;
+            // D-B STEEPENING (dictionary-collision defect): the linear curve above is
+            // too shallow at the bottom end. A page matching a SINGLE scattered token
+            // of an N>=3-term query (coverage <= 1/N, the dictionary-collision
+            // signature — e.g. "Difference - Wikipedia" for "difference between hedge
+            // fund and mutual fund") still retained ~0.44 of its relevance, enough for
+            // a high-authority domain to outrank genuinely fuller matches. Near-zero
+            // coverage is qualitatively different from partial coverage, so it gets a
+            // qualitatively steeper penalty rather than a blindly lowered constant.
+            let n = distinctive_terms.len() as f32;
+            if n >= 3.0 && overlap <= 1.0 / n + f32::EPSILON {
+                relevance *= 0.35;
+            }
         }
 
         // ── Phrase-entity fidelity (P1) ──
@@ -6232,6 +6244,60 @@ fn merge_local_and_web(
             }
         }
         // Re-sort after diversity penalty
+        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    // 4b-ii. OFF-TOPIC DOMAIN SATURATION GUARD (D-C: a single unrelated brand
+    // domain filling every slot, e.g. a hotel group for "how to grow basil
+    // indoors"). This happens when the upstream draw degrades (VPN/SearXNG
+    // flapping) and one authoritative-but-unrelated domain survives into every
+    // position; the per-appearance diversity penalty above is RELATIVE, so when
+    // the whole set is one domain it re-sorts them but cannot dislodge them.
+    // Signal (no domain/query literals): the query has distinctive topic terms,
+    // one host holds a MAJORITY of the result set, and NONE of that host's
+    // results contain ANY distinctive term. Crush those results so any
+    // topic-bearing result (however weak) outranks them. FAIL-OPEN: if the
+    // saturating host is the entire set, we still keep the results — an empty
+    // SERP is worse — but they are demoted so late-arriving on-topic results win.
+    if !strong_distinctive_terms.is_empty() && merged.len() >= 3 {
+        let host_of = |u: &str| -> String {
+            reqwest::Url::parse(u)
+                .ok()
+                .and_then(|p| p.host_str().map(|h| h.to_lowercase()))
+                .unwrap_or_default()
+        };
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for r in &merged {
+            *counts.entry(host_of(&r.url)).or_insert(0) += 1;
+        }
+        let total = merged.len();
+        for (host, count) in counts.iter() {
+            if host.is_empty() || (*count as f32) < 0.6 * total as f32 {
+                continue;
+            }
+            let host_results: Vec<&MergedResult> =
+                merged.iter().filter(|r| &host_of(&r.url) == host).collect();
+            let any_on_topic = host_results.iter().any(|r| {
+                let rl = r.title.to_lowercase();
+                let cl = r.content.to_lowercase();
+                let ul = r.url.to_lowercase();
+                strong_distinctive_terms.iter().any(|t| {
+                    let lt = t.to_lowercase();
+                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
+                })
+            });
+            if !any_on_topic {
+                tracing::warn!(
+                    "OFF-TOPIC DOMAIN SATURATION: host '{}' holds {}/{} results and matches no distinctive query term — crushing",
+                    host, count, total
+                );
+                for r in merged.iter_mut() {
+                    if &host_of(&r.url) == host {
+                        r.score *= 0.05;
+                    }
+                }
+            }
+        }
         merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     }
 
