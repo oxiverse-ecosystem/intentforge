@@ -3745,7 +3745,25 @@ fn is_real_exclusion(
 /// "alternative to", "instead of", "other than", "besides", or a double negation).
 fn query_is_contrastive(q_orig: &str) -> bool {
     let q_lower = q_orig.to_lowercase();
-    if CONTRASTIVE_MARKERS.iter().any(|m| q_lower.contains(m)) {
+    // Word-boundary matching: a marker only counts if it appears as a whole
+    // whitespace- or punctuation-delimited token (or a multi-word phrase), not
+    // as a substring of another word. This prevents false positives like
+    // "comparative".contains("compare") → true (which wrongly excluded "python"
+    // in "comparative analysis not python"). Tokens are split on runs of
+    // non-alphanumeric characters so punctuation is treated as a boundary.
+    let q_tokens: Vec<&str> = q_lower.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).collect();
+    if CONTRASTIVE_MARKERS.iter().any(|m| {
+        let m_tokens: Vec<&str> = m.split_whitespace().collect();
+        if m_tokens.len() == 1 {
+            // Single-word marker: whole-token match only.
+            q_tokens.contains(&m)
+        } else {
+            // Multi-word phrase marker ("rather than", "other than", "besides" is
+            // single; only the `than`-phrases are multi-word here): match the
+            // contiguous token sequence in the query token stream.
+            q_tokens.windows(m_tokens.len()).any(|w| w == m_tokens.as_slice())
+        }
+    }) {
         return true;
     }
     // Double negation: two+ negation markers → genuine exclusion set
@@ -11109,9 +11127,27 @@ mod constraint_fix_tests {
     fn query_is_contrastive_detects_framing() {
         assert!(query_is_contrastive("compare postgresql and mysql"));
         assert!(query_is_contrastive("search engine alternative to google"));
+        assert!(query_is_contrastive("react vs vue"));
         assert!(query_is_contrastive("javascript not java not typescript"));
         assert!(!query_is_contrastive("how to clean a skillet without soap"));
         assert!(!query_is_contrastive("how to learn guitar with no music background"));
+        // D2 regression: word-boundary matching — a marker embedded as a SUBSTRING
+        // of a *different* word must NOT trip contrastive framing. "comparative"
+        // contains "compare", "comparisons" contains "comparison", "uncomparable"
+        // contains "compare", but none of these are the marker words themselves, so
+        // they must NOT make an otherwise-innocent negation (e.g. "not python")
+        // wrongly exclude the term. The whole-word markers ("compare", "comparison",
+        // "versus", "alternatives", "replacement") still flag correctly — that is
+        // intended, not a false positive.
+        assert!(!query_is_contrastive("comparative analysis not python"));
+        assert!(!query_is_contrastive("comparable frameworks not python"));
+        assert!(!query_is_contrastive("comparisons review not python"));
+        assert!(!query_is_contrastive("uncomparable design not flask"));
+        // Whole-word markers still flag (intended):
+        assert!(query_is_contrastive("comparison essay not python"));
+        assert!(query_is_contrastive("versus-mode ranking not python"));
+        assert!(query_is_contrastive("alternatives-market report not django"));
+        assert!(query_is_contrastive("replacement-parts list not flask"));
     }
 
     #[test]
