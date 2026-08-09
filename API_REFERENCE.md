@@ -18,6 +18,7 @@
   - [GET /images](#get-images)
   - [GET /videos](#get-videos)
   - [GET /news](#get-news)
+  - [GET /spellcheck](#get-spellcheck)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -356,6 +357,51 @@ News search via SearXNG (`categories=news`). Returns a flat list with `published
 ```
 
 > **Verified fields:** `title`, `url`, `description`, `published_at` (observed empty string `""` on most bing-news items; hackernews items carried ISO timestamps like `"2019-11-13T23:17:23"`), `source` (`"bing news"` / `"hackernews"`), `score`. Full raw body: `docs/_generated/_round_v2_raw.md` block `### NEWS artificial intelligence`.
+
+---
+
+### `GET /spellcheck`
+
+Spelling-correction preview. Exposes the engine's in-process SymSpell + LinSpell index (the same one `/search` uses to auto-correct) as a standalone "did you mean?" service, so a client can warn the user *before* issuing a search. No LLM, no network, no extra indexing — it reads the dictionary that is already built at gateway startup.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                |
+|-----------|--------|----------|---------|----------------------------|
+| `q`       | string | yes      | —       | The query/phrase to check  |
+
+**Response** `200 OK` — top-level `{ query, corrected, changed, corrections[] }`:
+
+```json
+{
+  "query": "pythn programing langauge",
+  "corrected": "python programming language",
+  "changed": true,
+  "corrections": [
+    { "original": "pythn", "suggestion": "python", "in_dictionary": false },
+    { "original": "programing", "suggestion": "programming", "in_dictionary": true },
+    { "original": "langauge", "suggestion": "language", "in_dictionary": false }
+  ]
+}
+```
+
+> **Verified (this round, 2026-08-10):** a typo string returns `changed: true` with a `correction` per changed token. Protected brands/tech terms (`openai`, `rust`, `kubernetes`, …) are never "corrected" — `"openai rust tutorial"` returns `changed: false` and an empty `corrections` array. URL tokens, code tokens (`.` `/` `@` `#` `$` or containing a digit), and very short words (< 4 chars) are left as-is (`in_dictionary: true`) so the client does not flag them as typos. The whole-query `corrected` string matches what `/search` would actually run.
+
+**Empty query** returns `400` with the standard error envelope (same shape as `/search`):
+
+```json
+{ "error": "empty_query", "message": "Query parameter 'q' is empty", "results": [], "query": "", "corrected": "", "changed": false, "corrections": [] }
+```
+
+**Notes**
+- Pure function of the query + the built dictionary; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, negation gating, or calibration. It is a read-only preview of the existing correction path.
+
+```bash
+# See what the engine would correct in a query
+curl "http://localhost:4000/spellcheck?q=pythn+programing+langauge"
+# → {"query":"pythn programing langauge","corrected":"python programming language","changed":true,"corrections":[...]}
+```
 
 ---
 
