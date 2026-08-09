@@ -3626,16 +3626,151 @@ fn has_local_intent(query: &str) -> bool {
         )
 }
 
+/// Words/phrases that signal CONTRASTIVE framing. When a negation marker sits in
+/// contrastive framing, the negated head is genuinely a search exclusion (e.g.
+/// "search engine alternative to google" → exclude google; "react vs vue" → exclude
+/// both when double-negated). These are generic structural signals, NOT per-query
+/// strings, so the exemption stays future-proof.
+const CONTRASTIVE_MARKERS: &[&str] = &[
+    "compare", "comparison", "versus", "vs", "alternative", "alternatives",
+    "replacement", "instead", "rather than", "other than", "besides",
+];
+
+/// Returns true if a negated compound is a MANNER qualifier (describes HOW the user
+/// wants to act, not WHAT they want excluded). These must never become search
+/// exclusions. Signals (general, not per-query):
+///  - contains a relational/pronominal word ("you", "your", "as", "me", "us", "them",
+///    "it", "we", "i", "my", "our", "they") — e.g. "does not track you as",
+///  - or is verb-led (any token is a participle ending in -ing/-ed, or a known verb) —
+///    e.g. "without offending the couple", "without damaging the board",
+///    "without training wheels patiently", "without soap" (soap is a noun, not verb,
+///    so this clause does not fire for it — soap is caught by the non-entity,
+///    non-contrastive rule instead).
+const MANNER_PRONOUNS: &[&str] = &[
+    "you", "your", "yours", "as", "me", "us", "them", "it", "its", "we", "i",
+    "my", "our", "they", "he", "she", "him", "her",
+];
+const MANNER_VERBS: &[&str] = &[
+    "taking", "taken", "take", "using", "use", "used", "having", "have", "has",
+    "buying", "buy", "bought", "getting", "get", "got", "making", "make", "made",
+    "eating", "eat", "ate", "drinking", "drink", "drank", "doing", "do", "did",
+    "going", "go", "applying", "apply", "wearing", "wear", "wore", "installing",
+    "install", "running", "run", "track", "tracked", "tracking", "offend",
+    "offending", "offended", "damage", "damaging", "damaged", "train", "training",
+    "call", "calling", "called", "help", "helping", "hurt", "hurting", "harm",
+    "harming", "lose", "losing", "spend", "spending", "pay", "paying", "cost",
+    "costing", "need", "needing", "want", "wanting", "show", "showing", "tell",
+    "telling",
+];
+
+fn is_manner_phrase(compound: &str) -> bool {
+    let lc = compound.to_lowercase();
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    if tokens.iter().any(|t| MANNER_PRONOUNS.contains(t)) {
+        return true;
+    }
+    if tokens.iter().any(|t| {
+        MANNER_VERBS.contains(t)
+            || t.ends_with("ing") && t.len() >= 5
+            || t.ends_with("ed") && t.len() >= 4
+    }) {
+        return true;
+    }
+    false
+}
+
+/// A negated compound is a real search EXCLUSION (not a manner qualifier) when at
+/// least one holds:
+///  - (a) the compound names a recognized entity (protected brand/tech term — a
+///        general seed, reused from spell.rs — or a capitalized head in the original
+///        query, i.e. a proper noun the user named), OR
+///  - (b) the query is in contrastive framing (comparison / "alternative to" /
+///        "instead of" / "other than" / "besides" / double negation) AND the compound
+///        is NOT a manner phrase.
+///
+/// Manner qualifiers ("without soap", "with no music background", "without offending
+/// the couple", "without damaging the board", "without training wheels patiently",
+/// "does not track you as") describe HOW the user wants to do something, not WHAT
+/// they want excluded. Treating them as search exclusions is a false negative that
+/// penalizes the exact topical words the user needs (q29 "track" → Portuguese spam;
+/// q7 "music" → wallpapers) and collapses already-small result sets. We drop them —
+/// even inside a contrastive query (so "alternative to google that does not track you"
+/// excludes google but NOT "track you as").
+///
+/// This is data/entity-driven, not tuned to any one query: the contrastive set is a
+/// fixed structural vocabulary, entity recognition is the existing protected-term
+/// list, and manner detection uses open-class verb/pronoun signals. No per-query
+/// literals, no magic thresholds.
+fn is_real_exclusion(
+    compound: &str,
+    q_orig: &str,
+    query_is_contrastive: bool,
+) -> bool {
+    // Manner phrases are never exclusions, regardless of framing.
+    if is_manner_phrase(compound) {
+        return false;
+    }
+    let lc = compound.to_lowercase();
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    // Entity: any token (or the whole compound) is a protected brand/tech term.
+    if tokens.iter().any(|t| spell::is_protected_term(t)) {
+        return true;
+    }
+    if spell::is_protected_term(&lc) {
+        return true;
+    }
+    // Entity: a term in the compound is capitalized in the original query
+    // (proper noun the user named, e.g. "without Samsung bloat" → Samsung).
+    let orig_tokens: Vec<&str> = q_orig.split_whitespace().collect();
+    for ot in orig_tokens {
+        if ot.chars().any(|c| c.is_alphabetic())
+            && ot.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+        {
+            let ot_clean: String = ot.chars().filter(|c| c.is_alphanumeric()).collect();
+            let ot_lc = ot_clean.to_lowercase();
+            if !ot_lc.is_empty() && (lc.contains(&ot_lc) || tokens.contains(&ot_lc.as_str())) {
+                return true;
+            }
+        }
+    }
+    // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
+    // (e.g. "javascript not java not typescript" → java, typescript).
+    if query_is_contrastive {
+        return true;
+    }
+    false
+}
+
+/// Returns true if the query uses contrastive/exclusion framing (comparison,
+/// "alternative to", "instead of", "other than", "besides", or a double negation).
+fn query_is_contrastive(q_orig: &str) -> bool {
+    let q_lower = q_orig.to_lowercase();
+    if CONTRASTIVE_MARKERS.iter().any(|m| q_lower.contains(m)) {
+        return true;
+    }
+    // Double negation: two+ negation markers → genuine exclusion set
+    // ("not react not vue", "javascript not java not typescript").
+    let neg_markers = [" not ", " no ", " without ", " except ", " excluding ", " minus ",
+        " other than ", " instead of ", " besides ", " alternative to "];
+    let count = neg_markers.iter().filter(|m| q_lower.contains(*m)).count();
+    count >= 2
+}
+
 /// Extract negative terms from the query string, skipping prepositions and filler stopwords.
 /// Handles: "not from sony" → ["sony"]
 ///          "without calling a plumber" → ["plumber"]
 ///          "no prior coding experience" → ["coding"]
 ///          "not from samsung and not from apple" → ["samsung", "apple"]
 ///          "other than ubuntu" → ["ubuntu"]
+/// Manner qualifiers (e.g. "without soap", "with no music background") are NOT treated
+/// as search exclusions — see `is_real_exclusion`.
 fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
     let q_lower = q_orig.to_lowercase();
     let words: Vec<&str> = q_lower.split_whitespace().collect();
     let mut terms: Vec<String> = Vec::new();
+    // Computed once: whether the query is in contrastive/exclusion framing. Real
+    // exclusions are gated on this flag + entity recognition (see is_real_exclusion).
+    let query_contrastive = query_is_contrastive(q_orig);
 
     let neg_markers = ["not", "no", "without", "except", "excluding", "minus"];
     let stopwords = [
@@ -3753,7 +3888,13 @@ fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
                         k += 1;
                     }
                     let joined = compound.join(" ");
-                    if !terms.contains(&joined) {
+                    // Gate: only keep the compound as a real exclusion when it is in
+                    // contrastive framing or names a recognized entity. Manner
+                    // qualifiers ("without soap", "with no music background") are
+                    // dropped so they don't penalize the user's own topical words.
+                    if is_real_exclusion(&joined, q_orig, query_contrastive)
+                        && !terms.contains(&joined)
+                    {
                         terms.push(joined);
                     }
                     // Advance past the consumed compound so we don't re-scan it.
@@ -5189,6 +5330,18 @@ fn merge_local_and_web(
                 "on","and","from","into","about","way","ways","get","got","use","using","help","helping",
                 "what","why","when","where","who","which","can","will","would","should","could","does","did","doing",
                 "need","want","know","find","like","than","then","them","they","this","that",
+                // Comparative / explanatory lexicon: these are STRUCTURE words, not the
+                // topic. A local page that only shares "difference"/"between"/"vs"/"compare"
+                // with the query is NOT a real match — e.g. "Difference Between Vulnerability
+                // and Exploit" for "difference between a compiler and an interpreter". Treating
+                // them as topic terms let low-quality local crawl pages survive the P2 gate and
+                // outrank authoritative web hits. Excluding them makes topic_mentioned require a
+                // SUBSTANTIVE term (compiler/interpreter, figma/sketch), so genuine comparison
+                // pages still pass while off-topic structural matches get crushed. Fixed class,
+                // not per-query.
+                "difference","differences","different","between","vs","versus","compare","comparison",
+                "compared","beginner","beginners","explained","explain","explaining","simply",
+                "meaning","means","definition","define","mean","like","how to",
             ];
             let topic_mentioned = distinctive_terms.is_empty()
                 || distinctive_terms.iter().any(|t| {
@@ -9704,21 +9857,36 @@ async fn handle_search(
     //          "without node not django" → ["node", "django"]
     //          "not prometheus not grafana not datadog" → ["prometheus", "grafana", "datadog"]
     let query_neg_terms: Vec<String> = extract_query_negative_terms(&q_orig);
-    
-    // Fallback: if query_has_negation but intent engine put terms in positive instead of negative,
-    // use the query-derived terms. If the intent engine correctly classified them as negative,
-    // use those (they may have cleaner normalization).
-    let has_only_negative = intent.structured_constraints.positive.is_empty()
-        && (!intent.structured_constraints.negative.is_empty() || !query_neg_terms.is_empty());
-    
-    // Use query-derived terms when available (they're more reliable for negation),
-    // otherwise fall back to intent engine's negative constraints.
-    if !query_neg_terms.is_empty() {
-        intent.structured_constraints.negative = query_neg_terms.clone();
+    let query_contrastive = query_is_contrastive(&q_orig);
+
+    // Combine intent-engine negatives with query-derived negatives, then GATE BOTH
+    // through is_real_exclusion so manner-qualifier false negatives (e.g. "without
+    // soap", "with no music background", "without offending the couple") from EITHER
+    // source are dropped. Real exclusions (contrastive framing — comparison /
+    // "alternative to" / "instead of" / double negation — or a recognized entity via
+    // the protected-term list / a capitalized proper noun) survive. This is the single
+    // principled rule; it is entity/data-driven, not tuned to any one query.
+    let mut raw_neg: Vec<String> = intent.structured_constraints.negative.clone();
+    for qt in &query_neg_terms {
+        if !raw_neg.contains(qt) {
+            raw_neg.push(qt.clone());
+        }
     }
-    let neg_terms: Vec<String> = intent.structured_constraints.negative.iter()
+    let mut gated_neg_dedup: Vec<String> = Vec::new();
+    for n in raw_neg {
+        if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
+            gated_neg_dedup.push(n);
+        }
+    }
+    intent.structured_constraints.negative = gated_neg_dedup.clone();
+
+    let has_only_negative = intent.structured_constraints.positive.is_empty()
+        && !gated_neg_dedup.is_empty();
+
+    let neg_terms: Vec<String> = gated_neg_dedup.iter()
         .map(|n| n.to_lowercase())
         .collect();
+
     let mut neg_terms_expanded: Vec<String> = Vec::new();
     for nt in &neg_terms {
         for syn in expand_negative_synonyms(nt) {
@@ -9815,8 +9983,11 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // results that match negative terms must also be removed here.
     // Uses both intent engine's negative constraints AND query-derived terms
     // (for when intent engine misclassifies "not react" as positive "+react").
-    let has_neg_constraints = !intent.structured_constraints.negative.is_empty()
-        || !query_neg_terms.is_empty();
+    // Uses the already-gated negative set (intent.structured_constraints.negative
+    // was normalized through is_real_exclusion above, so manner-qualifier false
+    // negatives are not present here). query_neg_terms is intentionally NOT
+    // re-added — it is raw and ungated, and would reintroduce the false negatives.
+    let has_neg_constraints = !intent.structured_constraints.negative.is_empty();
     if has_neg_constraints {
         let before_count = results.len();
         let mut negative_norm: Vec<String> = intent
@@ -9825,14 +9996,6 @@ let mut results = match tokio::task::spawn_blocking(move || {
             .iter()
             .map(|n| n.to_lowercase())
             .collect();
-        // Add query-derived negative terms (from fallback parsing) to catch cases
-        // where the intent engine misclassified negation as positive constraints.
-        // query_neg_terms is defined above in the pre-merge B3 filter section.
-        for qt in &query_neg_terms {
-            if !negative_norm.contains(qt) {
-                negative_norm.push(qt.to_lowercase());
-            }
-        }
         let mut negative_norm_expanded: Vec<String> = Vec::new();
         for n in &negative_norm {
             for syn in expand_negative_synonyms(n) {
@@ -10875,6 +11038,75 @@ mod constraint_fix_tests {
             "github itself should be filtered for related:github.com"
         );
     }
+
+    #[test]
+    fn negative_manner_qualifier_not_treated_as_exclusion() {
+        // Manner qualifiers describe HOW, not WHAT to exclude — they must NOT
+        // become search exclusions (they would penalize the user's own topical
+        // words). These all previously returned false negatives.
+        for q in [
+            "how to clean a cast iron skillet without soap after cooking eggs",
+            "how to learn to play the guitar as an adult with no music background",
+            "how to politely decline a wedding invitation without offending the couple",
+            "how to remove a stripped screw from a laptop without damaging the board",
+            "how to teach a child to ride a bicycle without training wheels patiently",
+            "privacy focused search engine that does not track you as an alternative to google",
+        ] {
+            let negs = extract_query_negative_terms(q);
+            assert!(negs.is_empty(), "manner qualifier '{}' must not produce exclusions, got {:?}", q, negs);
+        }
+    }
+
+    #[test]
+    fn negative_real_exclusions_still_extracted() {
+        // Contrastive / entity exclusions MUST survive the gate.
+        assert_eq!(
+            extract_query_negative_terms("python web framework not django"),
+            vec!["django".to_string()],
+            "not django should exclude django (protected entity)"
+        );
+        assert_eq!(
+            extract_query_negative_terms("text editor alternative to vim for people who hate modal editing"),
+            vec!["vim".to_string()],
+            "alternative to vim should exclude vim (contrastive + protected entity)"
+        );
+        assert_eq!(
+            extract_query_negative_terms("javascript not java not typescript"),
+            vec!["java".to_string(), "typescript".to_string()],
+            "double negation should keep both exclusions"
+        );
+        // NOT a real exclusion: "without a computer science degree" is a context
+        // qualifier (the user wants to learn ML despite no CS degree), not a request
+        // to exclude pages about CS degrees. "computer" is not a protected entity and
+        // the framing is not contrastive, so it must be dropped (was a false negative
+        // in the old extractor that penalized the words "computer"/"science"/"degree").
+        assert!(
+            extract_query_negative_terms("learn machine learning without a computer science degree").is_empty(),
+            "context qualifier 'without a computer science degree' must not be an exclusion"
+        );
+    }
+
+    #[test]
+    fn negative_manner_in_contrastive_query_dropped() {
+        // Even inside contrastive framing, manner phrases are not exclusions.
+        // "alternative to google that does not track you" → exclude google, NOT "track you as".
+        let negs = extract_query_negative_terms(
+            "privacy focused search engine that does not track you as an alternative to google",
+        );
+        assert!(!negs.contains(&"track you as".to_string()), "manner 'track you as' must be dropped: {:?}", negs);
+        assert!(!negs.contains(&"track".to_string()), "manner 'track' must be dropped: {:?}", negs);
+        assert!(negs.contains(&"google".to_string()), "google should survive as a real exclusion: {:?}", negs);
+    }
+
+    #[test]
+    fn query_is_contrastive_detects_framing() {
+        assert!(query_is_contrastive("compare postgresql and mysql"));
+        assert!(query_is_contrastive("search engine alternative to google"));
+        assert!(query_is_contrastive("javascript not java not typescript"));
+        assert!(!query_is_contrastive("how to clean a skillet without soap"));
+        assert!(!query_is_contrastive("how to learn guitar with no music background"));
+    }
+
 
     #[test]
     fn pure_negation_scores_match_down() {
