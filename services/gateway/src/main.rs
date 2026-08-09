@@ -8086,13 +8086,7 @@ async fn handle_search(
                         // long window so every subsequent fan-out SKIPS it instead of
                         // re-burning the full branch timeout. Detected by error KIND,
                         // so it also self-heals: a successful request resets open_until.
-                        let err_chain = format!("{:?}", e).to_lowercase();
-                        let is_connect_err = err_chain.contains("dns error")
-                            || err_chain.contains("name or service")
-                            || err_chain.contains("connection refused")
-                            || err_chain.contains("unreachable")
-                            || err_chain.contains("no address")
-                            || err_chain.contains("connecterror");
+                        let is_connect_err = e.is_connect() || e.is_dns();
                         tracing::warn!("SearXNG instance request failed: {:?}", e);
                         if let Some(ref key) = instance_key_for_searx {
                             if is_connect_err {
@@ -8105,6 +8099,9 @@ async fn handle_search(
                     }
                     Err(_) => {
                         tracing::warn!("SearXNG instance timed out (4s): {}", &url[..url.find('?').unwrap_or(url.len())]);
+                        if let Some(ref key) = instance_key_for_searx {
+                            circuit_for_searx.record_failure(key);
+                        }
                         return SearxResponse { results: vec![], unresponsive_engines: vec![] };
                     }
                 };
@@ -9117,13 +9114,16 @@ async fn handle_search(
             Ok(searx_data) => {
                 let n = searx_data.results.len();
                 tracing::info!("SearXNG variation {} returned {} results", orig_idx, n);
+                // Record success for any valid parsed response (including zero-result)
+                // to clear open_until and reset circuit breaker state
+                circuit_ref.record_success(instance_key);
+                // Track last-used time for connection-cooldown aware routing
+                if let Some(url) = searx_key_to_url.get(instance_key) {
+                    state.searx_last_used.lock().insert(url.clone(), Instant::now());
+                }
                 if n > 0 {
                     searx_instances_ok += 1;
-                    circuit_ref.record_success(instance_key);
-                    // Track last-used time for connection-cooldown aware routing
-                    if let Some(url) = searx_key_to_url.get(instance_key) {
-                        state.searx_last_used.lock().insert(url.clone(), Instant::now());
-                    }
+                    // Record result count metrics only when there are actual results
                     circuit_ref.record_results(instance_key, n as u64);
                     for r in &searx_data.results {
                         *engine_counts.entry(r.engine.clone()).or_insert(0) += 1;
