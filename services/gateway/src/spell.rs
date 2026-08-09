@@ -276,12 +276,13 @@ impl SymSpellIndex {
             }
         }
 
-        // ABSENT-WORD GUARD (biryani->bryan bug): a word ABSENT from the dictionary
-        // must NOT be distance->=2 corrected into a different dictionary word. Such a
-        // word is almost certainly a real term (foreign / coined / name) the 15k
-        // dictionary lacks, not a typo. Distance-1 typo fixes of real dictionary words
-        // (e.g. "pythn"->"python") are distance 1 so unaffected, and explicit
-        // known-misspelling entries (e.g. "ngnix"->"nginx") are exempt.
+        // ABSENT-WORD GUARD (biryani->bryan / yawn->yarn bugs): a word ABSENT from the
+        // dictionary must NOT be corrected into a different dictionary word at ANY edit
+        // distance >= 1. Such a word is almost certainly a real term (foreign / coined /
+        // name / simply missing from the 15k dictionary) the corpus lacks, not a typo.
+        // This blocks distance-1 real-word corruption (e.g. "yawn"->"yarn") which the
+        // previous >=2 guard missed. Explicit known-misspelling entries (e.g.
+        // "ngnix"->"nginx") are exempt via is_known_misspelling.
         //
         // NARROW EXCEPTION: permit the correction when the ONLY differences between
         // input and candidate are missing doubled letters (e.g. "embaras"->"embarrass",
@@ -290,8 +291,11 @@ impl SymSpellIndex {
         // chars is reduced to one. This re-opens the single most common English typo
         // class WITHOUT weakening the biryani->bryan guard (that is a deletion of a
         // distinct letter, not a doubled-letter insertion; the collapsed forms differ).
+        // NOTE: this intentionally regresses rare absent-input distance-1 typos such as
+        // "pythn"->"python" (input absent, not a doubled-letter case) — protecting real
+        // words like "yawn" from corruption is the higher-priority failure mode.
         let best_dist = self.compute_edit_distance(word, best);
-        if best_dist >= 2
+        if best_dist >= 1
             && !self.exact_map.contains_key(&word.to_lowercase())
             && !self.is_known_misspelling(word)
         {
@@ -321,6 +325,32 @@ impl SymSpellIndex {
         } else {
             false
         }
+    }
+
+    /// Decide whether a distance-1 SINGLE-SUBSTITUTION correction must be blocked.
+    ///
+    /// (D-A, yawn->yarn) Previous rule only blocked when BOTH words looked natural,
+    /// or when the input looked unnatural and the candidate natural. That left a hole:
+    /// a perfectly word-like input (a real English/foreign word merely ABSENT from the
+    /// 15k dictionary, e.g. "yawn") could be swapped into a dictionary word ("yarn")
+    /// whenever the candidate happened to score slightly above the median perplexity.
+    ///
+    /// Correct signal: a genuine single-substitution TYPO leaves a phonotactic scar —
+    /// the input must be MEASURABLY less word-like than the candidate ("housr" has the
+    /// near-unseen bigram "sr"; "house" does not). We therefore permit the swap only
+    /// when the input is both above the naturalness threshold AND materially worse than
+    /// the candidate (perplexity ratio >= 1.4, the same threshold the dist-2 guard uses).
+    /// Everything else — ramen->raven, biryani->bryan, yawn->yarn (ratio ~1.0) — is
+    /// blocked. Insertions/deletions (pythn->python), transpositions (beleive->believe)
+    /// and doubled-letter typos (embaras->embarrass) are not single substitutions and
+    /// never reach this guard.
+    fn blocks_dist1_substitution(&self, word: &str, candidate: &str) -> bool {
+        let input_perp = self.char_bigram_model.perplexity(word);
+        let cand_perp = self.char_bigram_model.perplexity(candidate);
+        let natural_threshold = self.char_bigram_model.reference_perplexity;
+        let ratio = if cand_perp > 0.0 { input_perp / cand_perp } else { 1.0 };
+        let genuine_typo_signature = input_perp > natural_threshold && ratio >= 1.4;
+        !genuine_typo_signature
     }
 
     /// Collapse each run of identical consecutive chars to a single char.
@@ -454,26 +484,7 @@ impl SymSpellIndex {
             && !self.is_known_misspelling(word)
             && is_single_substitution(word, best_word)
         {
-            let input_perp = self.char_bigram_model.perplexity(word);
-            let cand_perp = self.char_bigram_model.perplexity(best_word);
-            let natural_threshold = self.char_bigram_model.reference_perplexity;
-            // Block when BOTH words look natural (existing rule: ramen->raven etc.)
-            if input_perp <= natural_threshold && cand_perp <= natural_threshold {
-                return None;
-            }
-            // EXTENDED GUARD (biryani->bryant bug): a single-character SUBSTITUTION
-            // that turns a HIGH-perplexity (unusual-bigram / foreign / coined) input
-            // word into a natural English word is almost never a typo — it is the
-            // spell checker English-ifying a real word absent from the 15k
-            // dictionary. Genuine typos of this shape are insertions/deletions/
-            // transpositions (housr->house, pythn->python, beleive->believe), NOT
-            // pure single-substitutions, so this guard does not affect them. We only
-            // act when the input is also NOT already a dictionary word (a real typo
-            // of a dictionary word like "pythn" is a deletion, not caught here).
-            if input_perp > natural_threshold
-                && cand_perp <= natural_threshold
-                && !self.exact_map.contains_key(&word.to_lowercase())
-            {
+            if self.blocks_dist1_substitution(word, best_word) {
                 return None;
             }
         }
@@ -594,10 +605,7 @@ impl SymSpellIndex {
                 && !self.is_known_misspelling(word)
                 && is_single_substitution(word, &candidate_word)
             {
-                let input_perp = self.char_bigram_model.perplexity(word);
-                let cand_perp = self.char_bigram_model.perplexity(&candidate_word);
-                let natural_threshold = self.char_bigram_model.reference_perplexity;
-                if input_perp <= natural_threshold && cand_perp <= natural_threshold {
+                if self.blocks_dist1_substitution(word, &candidate_word) {
                     return None;
                 }
             }
@@ -1112,6 +1120,18 @@ mod tests {
         // collapsed form differs from any candidate, so it stays uncorrected.
         let result = index.correct("biryani");
         assert_eq!(result, None, "biryani must NOT be English-ified to bryan");
+    }
+
+    #[test]
+    fn test_yawn_not_corrected_to_yarn() {
+        // D-A: "yawn" is a real English word absent from the 15k dictionary; a
+        // distance-1 substitution into the dictionary word "yarn" corrupted the
+        // entire search (all results were knitting/fiber pages).
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("yawn"), None, "yawn must NOT be corrected to yarn");
+        let (corrected, changed) = correct_query(&index, "why do we yawn");
+        assert!(!changed, "query 'why do we yawn' must not be spell-changed");
+        assert_eq!(corrected, "why do we yawn");
     }
 
     // ─── Result-based validation tests ─────────────────────────────
