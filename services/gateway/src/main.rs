@@ -6444,6 +6444,40 @@ fn merge_local_and_web(
                 continue;
             }
 
+            // (b0) POST-CALIBRATION VIDEO CAP (P8, durable).
+            // The in-loop P8 dampening (r.score *= video_mult; video_mult=0.08 for a
+            // generic text query) is DEFEATED by calibrate_scores, which rescales the
+            // WHOLE set onto [0.05,1.0] AFTER that multiplication. Whenever the only
+            // surviving candidates for a text query are invidious/video snippets, the
+            // rescale stretches the video right back to ~1.0 — so a YouTube tutorial
+            // outranks topical articles (e.g. "messaging app alternative to telegram"
+            // ranked two invidious videos above Signal/Wire write-ups). This cap
+            // re-applies AFTER calibration, so the dampening is durable: videos may
+            // still appear (floor preserved) but can never outrank genuine text
+            // results for a non-video query. Video-intent queries keep full score.
+            let is_video_src = r.sources.iter().any(|s| s == "invidious" || s == "video");
+            if is_video_src {
+                let video_intent = q_lc_cap.contains("video")
+                    || q_lc_cap.contains("youtube")
+                    || q_lc_cap.contains("watch")
+                    || q_lc_cap.contains("tutorial")
+                    || q_lc_cap.contains("animation");
+                if !video_intent {
+                    // 0.12 is below the calibrated top band for real text results
+                    // (~1.0) but above the 0.05 floor, so a video stays present yet
+                    // strictly secondary. Signal-driven (query self-describes intent),
+                    // not tuned to any one query.
+                    let video_cap = 0.12f32;
+                    if r.score > video_cap {
+                        tracing::info!(
+                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source)",
+                            video_cap, r.url.chars().take(60).collect::<String>()
+                        );
+                        r.score = video_cap;
+                    }
+                }
+            }
+
             // (b) single-distinctive-term-only match on a multi-topic query
             if query_has_many_topics {
                 let matched_strong = strong_topics.iter().filter(|t| {
