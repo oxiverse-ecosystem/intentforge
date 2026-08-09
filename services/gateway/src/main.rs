@@ -7486,6 +7486,29 @@ fn strip_bare_token(s: &str, term: &str) -> String {
     filtered.join(" ")
 }
 
+/// Walk an error's `source()` chain looking for a DNS-resolver signature.
+///
+/// `reqwest` 0.12 exposes no `is_dns()`, and a resolver failure can surface
+/// nested under a non-connect error kind (hyper/hickory). Callers should OR
+/// this with `Error::is_connect()`. Matching is on the SOURCE chain only, so a
+/// user query containing "dns" in the top-level request URL cannot trip it.
+fn error_chain_is_dns(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        let msg = s.to_string().to_lowercase();
+        if msg.contains("dns")
+            || msg.contains("failed to lookup")
+            || msg.contains("name or service not known")
+            || msg.contains("nodename nor servname")
+            || msg.contains("no such host")
+        {
+            return true;
+        }
+        src = std::error::Error::source(s);
+    }
+    false
+}
+
 fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bool) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let response = UnifiedResponse {
         query: query.to_string(),
@@ -8091,25 +8114,7 @@ async fn handle_search(
                         // source chain for a resolver signature so a hyper/hickory DNS
                         // error nested under a non-connect kind is still classified as
                         // a dead instance rather than a transient failure.
-                        let is_connect_err = e.is_connect() || {
-                            let mut src: Option<&(dyn std::error::Error + 'static)> =
-                                std::error::Error::source(&e);
-                            let mut dns_like = false;
-                            while let Some(s) = src {
-                                let msg = s.to_string().to_lowercase();
-                                if msg.contains("dns")
-                                    || msg.contains("failed to lookup")
-                                    || msg.contains("name or service not known")
-                                    || msg.contains("nodename nor servname")
-                                    || msg.contains("no such host")
-                                {
-                                    dns_like = true;
-                                    break;
-                                }
-                                src = std::error::Error::source(s);
-                            }
-                            dns_like
-                        };
+                        let is_connect_err = e.is_connect() || error_chain_is_dns(&e);
                         tracing::warn!("SearXNG instance request failed: {:?}", e);
                         if let Some(ref key) = instance_key_for_searx {
                             if is_connect_err {
@@ -11638,5 +11643,86 @@ mod hardcoding_ruling_tests {
             vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
         assert_eq!(out.len(), 1, "adult result kept when query is explicitly adult");
+    }
+}
+
+#[cfg(test)]
+mod dns_classifier_tests {
+    use super::error_chain_is_dns;
+    use std::error::Error;
+    use std::fmt;
+
+    /// Minimal std::error::Error with a settable source, so we can build
+    /// arbitrary-depth chains like the ones hyper/hickory produce under reqwest.
+    #[derive(Debug)]
+    struct ChainErr {
+        msg: String,
+        src: Option<Box<ChainErr>>,
+    }
+    impl fmt::Display for ChainErr {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.msg)
+        }
+    }
+    impl Error for ChainErr {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.src.as_deref().map(|e| e as &(dyn Error + 'static))
+        }
+    }
+
+    /// Build a chain where `msgs[0]` is the outermost error.
+    fn chain(msgs: &[&str]) -> ChainErr {
+        let mut it = msgs.iter().rev();
+        let mut cur = ChainErr { msg: it.next().expect("non-empty chain").to_string(), src: None };
+        for m in it {
+            cur = ChainErr { msg: m.to_string(), src: Some(Box::new(cur)) };
+        }
+        cur
+    }
+
+    #[test]
+    fn dns_signatures_in_source_chain_are_detected() {
+        let cases: &[(&str, &[&str])] = &[
+            ("nested hickory resolver error", &["error sending request", "client error", "dns error: no record found"]),
+            ("reqwest failed-to-lookup", &["error sending request", "failed to lookup address information"]),
+            ("linux getaddrinfo", &["hyper client error", "Name or service not known"]),
+            ("macos getaddrinfo", &["hyper client error", "nodename nor servname provided"]),
+            ("windows resolver os error 11001", &["hyper client error", "No such host is known. (os error 11001)"]),
+            ("deeply nested at depth 4", &["a", "b", "c", "DNS resolution failed"]),
+        ];
+        for (name, msgs) in cases {
+            assert!(error_chain_is_dns(&chain(msgs)), "expected DNS classification for: {name}");
+        }
+    }
+
+    #[test]
+    fn transient_and_unrelated_errors_are_not_dns() {
+        let cases: &[(&str, &[&str])] = &[
+            ("plain timeout", &["error sending request", "operation timed out"]),
+            ("body decode failure", &["error decoding response body", "unexpected end of file"]),
+            ("tls handshake", &["error sending request", "invalid peer certificate"]),
+            ("no source at all", &["connection closed before message completed"]),
+        ];
+        for (name, msgs) in cases {
+            assert!(!error_chain_is_dns(&chain(msgs)), "expected NON-DNS classification for: {name}");
+        }
+    }
+
+    #[test]
+    fn top_level_message_alone_never_triggers_dns() {
+        // Guard against a user query like "what is dns" reaching the top-level
+        // error Display (e.g. via the request URL) and faking a dead instance:
+        // only the SOURCE chain is inspected.
+        let top_only = ChainErr {
+            msg: "error sending request for url (http://searx.example/?q=what+is+dns)".to_string(),
+            src: None,
+        };
+        assert!(!error_chain_is_dns(&top_only), "top-level-only 'dns' text must not classify as DNS failure");
+    }
+
+    #[test]
+    fn matching_is_case_insensitive() {
+        assert!(error_chain_is_dns(&chain(&["outer", "DNS ERROR: SERVFAIL"])));
+        assert!(error_chain_is_dns(&chain(&["outer", "No Such Host Is Known"])));
     }
 }
