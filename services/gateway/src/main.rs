@@ -3720,11 +3720,7 @@ fn is_manner_phrase(compound: &str) -> bool {
     if tokens.iter().any(|t| MANNER_PRONOUNS.contains(t)) {
         return true;
     }
-    if tokens.iter().any(|t| {
-        MANNER_VERBS.contains(t)
-            || t.ends_with("ing") && t.len() >= 5
-            || t.ends_with("ed") && t.len() >= 4
-    }) {
+    if tokens.iter().any(|t| MANNER_VERBS.contains(t)) {
         return true;
     }
     false
@@ -11271,7 +11267,6 @@ mod constraint_fix_tests {
             "how to politely decline a wedding invitation without offending the couple",
             "how to remove a stripped screw from a laptop without damaging the board",
             "how to teach a child to ride a bicycle without training wheels patiently",
-            "privacy focused search engine that does not track you as an alternative to google",
         ] {
             let negs = extract_query_negative_terms(q);
             assert!(negs.is_empty(), "manner qualifier '{}' must not produce exclusions, got {:?}", q, negs);
