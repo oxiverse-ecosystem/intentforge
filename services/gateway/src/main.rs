@@ -4614,8 +4614,12 @@ fn deduplicate_json_keys(json_str: &str) -> String {
 // Tracks per-engine health. States: Closed (ok), Open (skip), HalfOpen (probe).
 // No hardcoded skip lists — engines auto-recover after backoff window.
 
+#[derive(Clone)]
 struct CircuitBreaker {
-    engines: Mutex<HashMap<String, EngineHealth>>,
+    // Arc-wrapped so a clone shares the same health map — the per-instance fetch
+    // task (spawned, 'static) can own a clone and report connection-level failures
+    // back into the shared breaker without restructuring AppState.
+    engines: Arc<Mutex<HashMap<String, EngineHealth>>>,
 }
 
 struct EngineHealth {
@@ -4632,7 +4636,7 @@ struct EngineHealth {
 impl CircuitBreaker {
     fn new() -> Self {
         Self {
-            engines: Mutex::new(HashMap::new()),
+            engines: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -4687,6 +4691,36 @@ impl CircuitBreaker {
         tracing::warn!(
             "Circuit OPEN for engine '{}' — {} failures, backing off {:?}",
             engine, health.consecutive_failures, backoff
+        );
+    }
+
+    /// Connection-level failure (DNS / Connect refused / host unreachable): the
+    /// instance is almost certainly down for this process lifetime, so open the
+    /// circuit for a LONG window (10 min) instead of the short exponential backoff.
+    /// This makes a dead backend (e.g. an unresolvable Tor2 hostname because the
+    /// gateway's mounted /etc/resolv.conf bypasses Docker's embedded DNS) skip in
+    /// ALL subsequent per-query fan-outs instead of burning the full branch timeout
+    /// on every single search. Detected by ERROR KIND, never by hostname — so it
+    /// also fires for any genuinely dead instance and self-heals once the host
+    /// resolves again (a successful request clears open_until via record_success).
+    fn record_connection_failure(&self, engine: &str) {
+        let mut engines = self.engines.lock();
+        let health = engines.entry(engine.to_string()).or_insert(EngineHealth {
+            consecutive_failures: 0,
+            last_failure: None,
+            open_until: None,
+            total_successes: 0,
+            total_failures: 0,
+            total_results_returned: 0,
+            last_success: None,
+        });
+        health.consecutive_failures += 1;
+        health.last_failure = Some(Instant::now());
+        health.total_failures += 1;
+        health.open_until = Some(Instant::now() + Duration::from_secs(600));
+        tracing::warn!(
+            "Circuit OPEN (connection failure) for engine '{}' — host unreachable, skipping for 10m",
+            engine
         );
     }
 
@@ -5306,6 +5340,36 @@ fn merge_local_and_web(
             });
             if !matched_distinctive {
                 relevance *= 0.12;
+            }
+        }
+
+        // ── Partial distinctive-coverage dampening (round defect) ──
+        // When a query has >= 2 distinctive topic terms, a result that matches only
+        // a SUBSET (overlap 1/N) is a weak partial match — e.g. the dictionary page
+        // for "difference" / "grow" / "negotiate" / "calm" ranks #1 for a multi-word
+        // query whose other terms it ignores. The all-or-nothing guard above only
+        // fires at zero distinctive coverage; here we additionally dampen PARTIAL
+        // coverage so a page that addresses the FULL multi-word topic (overlap 1.0)
+        // reliably outranks a page that shares only one scattered term. Smooth,
+        // signal-driven curve: full coverage untouched; coverage p scaled by
+        // (0.25 + 0.75*p) so a single-term match on a 4-term query (~0.25 coverage)
+        // drops to ~0.44 of its raw relevance, below any fuller match. Single-term
+        // (N==1, p is 0 or 1) and generic (0 distinctive terms) queries are
+        // unaffected. No query/domain terms referenced — purely term-count math.
+        if distinctive_terms.len() >= 2 && overlap > 0.0 && overlap < 1.0 {
+            let coverage_mult = 0.25f32 + 0.75f32 * overlap;
+            relevance *= coverage_mult;
+            // D-B STEEPENING (dictionary-collision defect): the linear curve above is
+            // too shallow at the bottom end. A page matching a SINGLE scattered token
+            // of an N>=3-term query (coverage <= 1/N, the dictionary-collision
+            // signature — e.g. "Difference - Wikipedia" for "difference between hedge
+            // fund and mutual fund") still retained ~0.44 of its relevance, enough for
+            // a high-authority domain to outrank genuinely fuller matches. Near-zero
+            // coverage is qualitatively different from partial coverage, so it gets a
+            // qualitatively steeper penalty rather than a blindly lowered constant.
+            let n = distinctive_terms.len() as f32;
+            if n >= 3.0 && overlap <= 1.0 / n + f32::EPSILON {
+                relevance *= 0.35;
             }
         }
 
@@ -6180,6 +6244,60 @@ fn merge_local_and_web(
             }
         }
         // Re-sort after diversity penalty
+        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    // 4b-ii. OFF-TOPIC DOMAIN SATURATION GUARD (D-C: a single unrelated brand
+    // domain filling every slot, e.g. a hotel group for "how to grow basil
+    // indoors"). This happens when the upstream draw degrades (VPN/SearXNG
+    // flapping) and one authoritative-but-unrelated domain survives into every
+    // position; the per-appearance diversity penalty above is RELATIVE, so when
+    // the whole set is one domain it re-sorts them but cannot dislodge them.
+    // Signal (no domain/query literals): the query has distinctive topic terms,
+    // one host holds a MAJORITY of the result set, and NONE of that host's
+    // results contain ANY distinctive term. Crush those results so any
+    // topic-bearing result (however weak) outranks them. FAIL-OPEN: if the
+    // saturating host is the entire set, we still keep the results — an empty
+    // SERP is worse — but they are demoted so late-arriving on-topic results win.
+    if !strong_distinctive_terms.is_empty() && merged.len() >= 3 {
+        let host_of = |u: &str| -> String {
+            reqwest::Url::parse(u)
+                .ok()
+                .and_then(|p| p.host_str().map(|h| h.to_lowercase()))
+                .unwrap_or_default()
+        };
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for r in &merged {
+            *counts.entry(host_of(&r.url)).or_insert(0) += 1;
+        }
+        let total = merged.len();
+        for (host, count) in counts.iter() {
+            if host.is_empty() || (*count as f32) < 0.6 * total as f32 {
+                continue;
+            }
+            let host_results: Vec<&MergedResult> =
+                merged.iter().filter(|r| &host_of(&r.url) == host).collect();
+            let any_on_topic = host_results.iter().any(|r| {
+                let rl = r.title.to_lowercase();
+                let cl = r.content.to_lowercase();
+                let ul = r.url.to_lowercase();
+                strong_distinctive_terms.iter().any(|t| {
+                    let lt = t.to_lowercase();
+                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
+                })
+            });
+            if !any_on_topic {
+                tracing::warn!(
+                    "OFF-TOPIC DOMAIN SATURATION: host '{}' holds {}/{} results and matches no distinctive query term — crushing",
+                    host, count, total
+                );
+                for r in merged.iter_mut() {
+                    if &host_of(&r.url) == host {
+                        r.score *= 0.05;
+                    }
+                }
+            }
+        }
         merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     }
 
@@ -7933,6 +8051,8 @@ async fn handle_search(
         let is_open = if force { false } else { searx_instance_open[i] };
         let client_for_searx = client.clone();
         let ratelimit_for_searx = state.rate_limits.clone();
+        let circuit_for_searx = state.circuit.clone();
+        let instance_key_for_searx = searx_instance_keys.get(i).cloned();
         let fut = async move {
             if is_open {
                 return Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] });
@@ -7959,11 +8079,29 @@ async fn handle_search(
                 ).await {
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => {
+                        // DEAD-INSTANCE FAIL-FAST (round defect): a Connection-level
+                        // error (DNS resolution failure, connection refused, host
+                        // unreachable) means the instance is down for this process
+                        // lifetime, NOT a transient timeout. Open the circuit for a
+                        // long window so every subsequent fan-out SKIPS it instead of
+                        // re-burning the full branch timeout. Detected by error KIND,
+                        // so it also self-heals: a successful request resets open_until.
+                        let is_connect_err = e.is_connect() || e.is_dns();
                         tracing::warn!("SearXNG instance request failed: {:?}", e);
+                        if let Some(ref key) = instance_key_for_searx {
+                            if is_connect_err {
+                                circuit_for_searx.record_connection_failure(key);
+                            } else {
+                                circuit_for_searx.record_failure(key);
+                            }
+                        }
                         return SearxResponse { results: vec![], unresponsive_engines: vec![] };
                     }
                     Err(_) => {
                         tracing::warn!("SearXNG instance timed out (4s): {}", &url[..url.find('?').unwrap_or(url.len())]);
+                        if let Some(ref key) = instance_key_for_searx {
+                            circuit_for_searx.record_failure(key);
+                        }
                         return SearxResponse { results: vec![], unresponsive_engines: vec![] };
                     }
                 };
@@ -8976,13 +9114,16 @@ async fn handle_search(
             Ok(searx_data) => {
                 let n = searx_data.results.len();
                 tracing::info!("SearXNG variation {} returned {} results", orig_idx, n);
+                // Record success for any valid parsed response (including zero-result)
+                // to clear open_until and reset circuit breaker state
+                circuit_ref.record_success(instance_key);
+                // Track last-used time for connection-cooldown aware routing
+                if let Some(url) = searx_key_to_url.get(instance_key) {
+                    state.searx_last_used.lock().insert(url.clone(), Instant::now());
+                }
                 if n > 0 {
                     searx_instances_ok += 1;
-                    circuit_ref.record_success(instance_key);
-                    // Track last-used time for connection-cooldown aware routing
-                    if let Some(url) = searx_key_to_url.get(instance_key) {
-                        state.searx_last_used.lock().insert(url.clone(), Instant::now());
-                    }
+                    // Record result count metrics only when there are actual results
                     circuit_ref.record_results(instance_key, n as u64);
                     for r in &searx_data.results {
                         *engine_counts.entry(r.engine.clone()).or_insert(0) += 1;

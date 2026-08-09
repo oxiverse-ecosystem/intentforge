@@ -265,7 +265,7 @@ pub(crate) const WORD_FREQUENCIES: &[(&str, f64)] = &[
     ("dollars", 0.301), ("websites", 0.301), ("religion", 0.301), ("claim", 0.301), ("driving", 0.301), ("permission", 0.301), ("surgery", 0.301), ("patch", 0.301),
     ("heat", 0.301), ("wild", 0.301), ("measures", 0.301), ("generation", 0.301), ("kansas", 0.301), ("miss", 0.301), ("chemical", 0.301), ("doctor", 0.301),
     ("task", 0.301), ("reduce", 0.301), ("brought", 0.301), ("himself", 0.300), ("nor", 0.300), ("component", 0.300), ("enable", 0.300), ("exercise", 0.300),
-    ("bug", 0.300), ("santa", 0.300), ("mid", 0.300), ("guarantee", 0.300), ("http", 0.300), ("cargo", 0.300), ("yarn", 0.300), ("sdk", 0.300),
+    ("bug", 0.300), ("santa", 0.300), ("mid", 0.300), ("guarantee", 0.300), ("http", 0.300), ("cargo", 0.300), ("yarn", 0.300), ("yawn", 0.300), ("sdk", 0.300),
     ("nodejs", 0.300), ("django", 0.300), ("postgres", 0.300), ("azure", 0.300), ("json", 0.300), ("gitlab", 0.300), ("pip", 0.300), ("webpack", 0.300),
     ("tailwind", 0.300), ("leader", 0.300), ("diamond", 0.300), ("israel", 0.300), ("se", 0.300), ("processes", 0.300), ("soft", 0.300), ("servers", 0.299),
     ("alone", 0.299), ("meetings", 0.299), ("seconds", 0.299), ("jones", 0.299), ("arizona", 0.299), ("keyword", 0.299), ("interests", 0.299), ("flight", 0.299),
