@@ -4614,8 +4614,12 @@ fn deduplicate_json_keys(json_str: &str) -> String {
 // Tracks per-engine health. States: Closed (ok), Open (skip), HalfOpen (probe).
 // No hardcoded skip lists — engines auto-recover after backoff window.
 
+#[derive(Clone)]
 struct CircuitBreaker {
-    engines: Mutex<HashMap<String, EngineHealth>>,
+    // Arc-wrapped so a clone shares the same health map — the per-instance fetch
+    // task (spawned, 'static) can own a clone and report connection-level failures
+    // back into the shared breaker without restructuring AppState.
+    engines: Arc<Mutex<HashMap<String, EngineHealth>>>,
 }
 
 struct EngineHealth {
@@ -4632,7 +4636,7 @@ struct EngineHealth {
 impl CircuitBreaker {
     fn new() -> Self {
         Self {
-            engines: Mutex::new(HashMap::new()),
+            engines: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -4687,6 +4691,36 @@ impl CircuitBreaker {
         tracing::warn!(
             "Circuit OPEN for engine '{}' — {} failures, backing off {:?}",
             engine, health.consecutive_failures, backoff
+        );
+    }
+
+    /// Connection-level failure (DNS / Connect refused / host unreachable): the
+    /// instance is almost certainly down for this process lifetime, so open the
+    /// circuit for a LONG window (10 min) instead of the short exponential backoff.
+    /// This makes a dead backend (e.g. an unresolvable Tor2 hostname because the
+    /// gateway's mounted /etc/resolv.conf bypasses Docker's embedded DNS) skip in
+    /// ALL subsequent per-query fan-outs instead of burning the full branch timeout
+    /// on every single search. Detected by ERROR KIND, never by hostname — so it
+    /// also fires for any genuinely dead instance and self-heals once the host
+    /// resolves again (a successful request clears open_until via record_success).
+    fn record_connection_failure(&self, engine: &str) {
+        let mut engines = self.engines.lock();
+        let health = engines.entry(engine.to_string()).or_insert(EngineHealth {
+            consecutive_failures: 0,
+            last_failure: None,
+            open_until: None,
+            total_successes: 0,
+            total_failures: 0,
+            total_results_returned: 0,
+            last_success: None,
+        });
+        health.consecutive_failures += 1;
+        health.last_failure = Some(Instant::now());
+        health.total_failures += 1;
+        health.open_until = Some(Instant::now() + Duration::from_secs(600));
+        tracing::warn!(
+            "Circuit OPEN (connection failure) for engine '{}' — host unreachable, skipping for 10m",
+            engine
         );
     }
 
@@ -5307,6 +5341,24 @@ fn merge_local_and_web(
             if !matched_distinctive {
                 relevance *= 0.12;
             }
+        }
+
+        // ── Partial distinctive-coverage dampening (round defect) ──
+        // When a query has >= 2 distinctive topic terms, a result that matches only
+        // a SUBSET (overlap 1/N) is a weak partial match — e.g. the dictionary page
+        // for "difference" / "grow" / "negotiate" / "calm" ranks #1 for a multi-word
+        // query whose other terms it ignores. The all-or-nothing guard above only
+        // fires at zero distinctive coverage; here we additionally dampen PARTIAL
+        // coverage so a page that addresses the FULL multi-word topic (overlap 1.0)
+        // reliably outranks a page that shares only one scattered term. Smooth,
+        // signal-driven curve: full coverage untouched; coverage p scaled by
+        // (0.25 + 0.75*p) so a single-term match on a 4-term query (~0.25 coverage)
+        // drops to ~0.44 of its raw relevance, below any fuller match. Single-term
+        // (N==1, p is 0 or 1) and generic (0 distinctive terms) queries are
+        // unaffected. No query/domain terms referenced — purely term-count math.
+        if distinctive_terms.len() >= 2 && overlap > 0.0 && overlap < 1.0 {
+            let coverage_mult = 0.25f32 + 0.75f32 * overlap;
+            relevance *= coverage_mult;
         }
 
         // ── Phrase-entity fidelity (P1) ──
@@ -7933,6 +7985,8 @@ async fn handle_search(
         let is_open = if force { false } else { searx_instance_open[i] };
         let client_for_searx = client.clone();
         let ratelimit_for_searx = state.rate_limits.clone();
+        let circuit_for_searx = state.circuit.clone();
+        let instance_key_for_searx = searx_instance_keys.get(i).cloned();
         let fut = async move {
             if is_open {
                 return Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] });
@@ -7959,7 +8013,28 @@ async fn handle_search(
                 ).await {
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => {
+                        // DEAD-INSTANCE FAIL-FAST (round defect): a Connection-level
+                        // error (DNS resolution failure, connection refused, host
+                        // unreachable) means the instance is down for this process
+                        // lifetime, NOT a transient timeout. Open the circuit for a
+                        // long window so every subsequent fan-out SKIPS it instead of
+                        // re-burning the full branch timeout. Detected by error KIND,
+                        // so it also self-heals: a successful request resets open_until.
+                        let err_chain = format!("{:?}", e).to_lowercase();
+                        let is_connect_err = err_chain.contains("dns error")
+                            || err_chain.contains("name or service")
+                            || err_chain.contains("connection refused")
+                            || err_chain.contains("unreachable")
+                            || err_chain.contains("no address")
+                            || err_chain.contains("connecterror");
                         tracing::warn!("SearXNG instance request failed: {:?}", e);
+                        if let Some(ref key) = instance_key_for_searx {
+                            if is_connect_err {
+                                circuit_for_searx.record_connection_failure(key);
+                            } else {
+                                circuit_for_searx.record_failure(key);
+                            }
+                        }
                         return SearxResponse { results: vec![], unresponsive_engines: vec![] };
                     }
                     Err(_) => {
