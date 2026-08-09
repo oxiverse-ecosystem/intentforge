@@ -3777,7 +3777,7 @@ const CONTRASTIVE_MARKERS: &[&str] = &[
     "compare", "comparison", "versus", "vs", "alternative", "alternatives",
     "replacement", "instead", "rather than", "other than", "besides",
     // P9: unambiguous single-marker exclusion words. `extract_query_negative_terms`
-    // already treats these as neg markers (lines ~3873, ~3899), but they were
+    // already treats these as neg markers (lines ~3824, ~3854), but they were
     // missing here — so a SINGLE "<except/excluding/minus> X" with a non-protected
     // target (e.g. "javascript framework except react", "search engine except
     // google") returned `constraints: null` (the exclusion was declined because
@@ -11337,23 +11337,32 @@ let mut results = match tokio::task::spawn_blocking(move || {
         }
     }
 
-    // For negative-only queries ("not django"), skip the hard removal retain filter.
-    // All search results for the negated term will mention it — removing them all
-    // leaves zero results. Instead, rely on the title penalty + constraint scoring
-    // (applied in score_rerank) to appropriately demote results about the excluded topic.
-    // Queries with BOTH positive and negative constraints (e.g. "python framework not django")
-    // still use the hard filter since there are non-excluded results to keep.
-    // BUT: if a result contains ANY positive term, skip hard removal — the title penalty
-    // already demotes it. This prevents removing genuinely relevant results that merely
-    // mention the excluded term in passing (e.g. "cars not suv" removes all car results
-    // because they all mention "SUV").
-    if has_only_negative {
-        tracing::info!(
-            "NEGATIVE CONSTRAINT: skipping hard removal for {} results (title penalty + constraint scoring will penalize instead)",
-            before_count
-        );
-    } else {
-        results.retain(|r| {
+    // Post-merge hard negative drop.
+    //
+    // The web pre-merge filter (8a) drops violating web results when a clean
+    // alternative exists, but it only sees web results — local index hits
+    // (src=['local']) bypass it. So a query like "javascript framework except
+    // react" would keep the local React pages unless we drop them HERE too.
+    //
+    // The old behavior blanket-skipped the drop for negative-only queries
+    // ("not django"): search engines treat "not" as a stop word, so EVERY result
+    // mentions the excluded term and dropping all of them leaves zero results.
+    // That reasoning is correct for PURE negation, but it conflated two cases:
+    //   • Pure negation ("not django", "except google"): degenerate — almost all
+    //     results violate, so the drop would empty the set. KEEP the skip.
+    //   • Topic + single exclusion ("javascript framework except react"): there ARE
+    //     clean non-react results (Vue, Svelte, Angular), so the React pages must
+    //     be removed, not just penalized.
+    //
+    // Fix: always compute the keep-set, then DROP; but if `has_only_negative` AND the
+    // drop would empty the result set (degenerate pure-negation), keep everything
+    // (the title penalty + constraint scoring already demote the offenders). This
+    // mirrors the graduated logic the web filter already uses and never returns an
+    // empty page. The keep-set is computed exactly once so the closure logic is not
+    // duplicated.
+    let retained: Vec<bool> = results
+        .iter()
+        .map(|r| {
             // Alternative-listing page check: keep comparison/alternative pages
             // even if they mention excluded terms (they are HIGHLY relevant).
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
@@ -11411,18 +11420,25 @@ let mut results = match tokio::task::spawn_blocking(move || {
             if !should_keep {
                 tracing::info!("HARD NEGATIVE DROP (post-merge): result \"{}\" (local={}) removed because negative constraint matched (not alt page)",
                     &r.title.chars().take(50).collect::<String>(), r.is_local);
-            } else {
-                // TITLE-ONLY HARD CHECK: even if alt page, demote by 90% if title contains excluded term
-                let title_lower = r.title.to_lowercase();
-                for nt_after in &negative_norm {
-                    if text_matches_negative(&title_lower, &nt_after.to_lowercase()) {
-                        // Score penalty moved to separate loop before retain
-                        tracing::info!("TITLE HARD PENALTY: title contains excluded term -> score *= 0.01 (penalty applied in separate loop)");
-                        break;
-                    }
-                }
             }
             should_keep
+        })
+        .collect();
+    let kept_count = retained.iter().filter(|k| **k).count();
+    let would_empty = kept_count == 0 && !results.is_empty();
+    if has_only_negative && would_empty {
+        // Degenerate pure-negation: dropping everything leaves zero results.
+        // Keep all; the title penalty + constraint scoring demote offenders.
+        tracing::info!(
+            "NEGATIVE CONSTRAINT: skipping hard removal for {} results (pure-negation degenerate set — title penalty + constraint scoring will penalize instead)",
+            before_count
+        );
+    } else {
+        let mut vi = 0;
+        results.retain(|_r| {
+            let keep = retained[vi];
+            vi += 1;
+            keep
         });
     }
         let removed = before_count.saturating_sub(results.len());
