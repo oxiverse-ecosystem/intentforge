@@ -11890,4 +11890,32 @@ mod spellcheck_endpoint_tests {
         assert_eq!(res["corrected"].as_str(), Some(""));
         assert!(res["corrections"].as_array().unwrap().is_empty());
     }
+
+    #[test]
+    fn spellcheck_skipped_tokens_are_omitted_not_listed() {
+        // URL/code tokens (<4 chars, contain '.'/'/'/'@'/'#'/'$' or a digit) are
+        // skipped by the corrector and must NOT appear in `corrections` — the
+        // endpoint only lists tokens it proposed fixing. Regression for the
+        // doc claim that skipped tokens would be returned as `in_dictionary:true`.
+        let index = spell::SymSpellIndex::build();
+        let res = spellcheck_query(&index, "pythn kubernetes.io");
+        assert_eq!(res["changed"].as_bool(), Some(true));
+        let corr = res["corrections"].as_array().unwrap();
+        assert_eq!(corr.len(), 1, "exactly the real typo should be listed");
+        assert_eq!(corr[0]["original"].as_str(), Some("pythn"));
+        assert_eq!(corr[0]["suggestion"].as_str(), Some("python"));
+        // The skipped URL token is retained verbatim in the whole-query form.
+        assert_eq!(res["corrected"].as_str(), Some("python kubernetes.io"));
+    }
+
+    #[test]
+    fn spellcheck_short_word_token_is_skipped() {
+        // A <4-char word is below MIN_CORRECT_LENGTH and must be omitted from
+        // `corrections` (not flagged as a typo).
+        let index = spell::SymSpellIndex::build();
+        let res = spellcheck_query(&index, "go rust");
+        assert_eq!(res["changed"].as_bool(), Some(false));
+        assert!(res["corrections"].as_array().unwrap().is_empty());
+        assert_eq!(res["corrected"].as_str(), Some("go rust"));
+    }
 }
