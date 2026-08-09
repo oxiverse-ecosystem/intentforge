@@ -47,6 +47,10 @@ struct Constraints {
     positive: Vec<String>,
     #[serde(default)]
     negative: Vec<String>,
+    /// Declined (non-manner) candidate exclusions the `is_real_exclusion` gate did
+    /// not apply, surfaced for transparency (D3) so they are not silently dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ignored_constraints: Option<Vec<String>>,
     /// Semantic entities with roles (Query Graph IR)
     #[serde(default)]
     entities: Vec<QueryEntity>,
@@ -2086,6 +2090,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         price_max,
         price_lt,
         price_gt,
+        ignored_constraints: None,
     }
 }
 
@@ -3663,6 +3668,52 @@ const MANNER_VERBS: &[&str] = &[
     "telling",
 ];
 
+/// Tokens that must never be surfaced as a "declined exclusion" in
+/// `ignored_constraints`. These are grammar/prepositions ("in", "about", "of",
+/// "the", "a") or generic function words that the extractor may emit as a
+/// negative candidate when it fails to find a real content target. Surfacing
+/// them would confuse users ("not:in — exclusion not applied"). This mirrors the
+/// `GENERIC_NEG` / `stopwords` lists used inside the extractor; it is a
+/// structural vocabulary, not per-query literals (consistent with the
+/// hardcoding doctrine).
+const IGNORED_CONSTRAINT_NOISE: &[&str] = &[
+    "in", "about", "of", "the", "a", "an", "to", "on", "at", "for", "with",
+    "by", "from", "than", "as", "into", "onto", "upon", "over", "under",
+    "before", "after", "and", "or", "but", "is", "are", "was", "were",
+];
+
+/// D3: precise manner-frame detection at the PHRASE level (not the bare-token
+/// level that `is_manner_phrase` uses). A declined candidate is a manner
+/// qualifier when it appears inside a "without/with-no <optional article> <term>"
+/// frame, or carries a manner pronoun (e.g. "does not track you as"). These
+/// describe HOW the user wants to act, not WHAT they want excluded, so they must
+/// NOT be surfaced in `ignored_constraints` — surfacing "not:soap — exclusion not
+/// applied" would be confusing and contradict the round's manner-suppression.
+///
+/// Structural, not per-query: it tests whether the *extracted compound* sits in a
+/// known manner frame within the query. Reuses the open-class `MANNER_PRONOUNS`
+/// set; no per-query literals, no tuned thresholds (consistent with the
+/// hardcoding doctrine and the existing `is_manner_phrase`).
+fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
+    let lc = q_orig.to_lowercase();
+    let c = compound.to_lowercase();
+    let frames = [
+        format!("without {}", c),
+        format!("without a {}", c),
+        format!("without an {}", c),
+        format!("without the {}", c),
+        format!("with no {}", c),
+        format!("with no a {}", c),
+    ];
+    if frames.iter().any(|f| lc.contains(f.as_str())) {
+        return true;
+    }
+    // Manner pronouns anywhere in the compound ("track you as", "offend the couple")
+    // mark it as a manner qualifier even without the "without" frame.
+    let c_tokens: Vec<&str> = c.split_whitespace().collect();
+    c_tokens.iter().any(|t| MANNER_PRONOUNS.contains(t))
+}
+
 fn is_manner_phrase(compound: &str) -> bool {
     let lc = compound.to_lowercase();
     let tokens: Vec<&str> = lc.split_whitespace().collect();
@@ -3789,10 +3840,17 @@ fn query_is_contrastive(q_orig: &str) -> bool {
 ///          "other than ubuntu" → ["ubuntu"]
 /// Manner qualifiers (e.g. "without soap", "with no music background") are NOT treated
 /// as search exclusions — see `is_real_exclusion`.
-fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
+/// Like `extract_query_negative_terms`, but also returns the SECOND element:
+/// genuine candidate negations (built compounds) that the `is_real_exclusion`
+/// gate DECLINED and that are NOT manner qualifiers. These are surfaced to the
+/// user via `ignored_constraints` (D3 transparency) so a legitimate attribute
+/// exclusion like "recipes not spicy" is not silently dropped. Manner qualifiers
+/// ("without soap") are intentionally absent from both vectors.
+fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<String>) {
     let q_lower = q_orig.to_lowercase();
     let words: Vec<&str> = q_lower.split_whitespace().collect();
     let mut terms: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
     // Computed once: whether the query is in contrastive/exclusion framing. Real
     // exclusions are gated on this flag + entity recognition (see is_real_exclusion).
     let query_contrastive = query_is_contrastive(q_orig);
@@ -3921,6 +3979,16 @@ fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
                         && !terms.contains(&joined)
                     {
                         terms.push(joined);
+                    } else if !is_manner_phrase(&joined) {
+                        // D3 transparency: a genuine candidate exclusion that the
+                        // gate declined (not a recognized entity, not contrastive
+                        // framing) AND is not a manner qualifier. It was silently
+                        // dropped before (regression); now we record it so it can
+                        // be surfaced in `ignored_constraints`. Never includes
+                        // manner qualifiers ("without soap"), which stay excluded.
+                        if !dropped.contains(&joined) {
+                            dropped.push(joined);
+                        }
                     }
                     // Advance past the consumed compound so we don't re-scan it.
                     i = j + compound.len();
@@ -3932,7 +4000,16 @@ fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
             i += 1;
         }
     }
-    terms
+    (terms, dropped)
+}
+
+/// Backward-compatible thin wrapper: returns only the kept exclusions.
+/// Behavior is identical to the pre-D3 `extract_query_negative_terms` (the
+/// gate's drop logic is unchanged here). Use
+/// `extract_query_negative_terms_with_dropped` when the declined candidates
+/// are also needed (D3 transparency).
+fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
+    extract_query_negative_terms_with_dropped(q_orig).0
 }
 
 /// If the query has local intent, expand it with the user's city/region context.
@@ -9857,6 +9934,12 @@ async fn handle_search(
 
     // 8. Unified Merge: Local + Web → Single Ranked List
     // Cross-source dedup, consensus boosting, unified ranking
+    //
+    // D3 transparency: declared up-front so the negation gate (which runs during
+    // constraint normalization, BEFORE the `applied`/`ignored` block at ~10309)
+    // can push declined non-manner exclusions into it. The later `let mut ignored`
+    // is changed to a reassignment that preserves whatever we added here.
+    let mut ignored: Vec<String> = Vec::new();
     // Pass intent distribution for distribution-aware ranking (intent as hint, not gate)
     // Clone data for CPU-intensive scoring on blocking thread
     let q_clone = q.clone();
@@ -9881,7 +9964,8 @@ async fn handle_search(
     // Handles: "not react not vue" → ["react", "vue"]
     //          "without node not django" → ["node", "django"]
     //          "not prometheus not grafana not datadog" → ["prometheus", "grafana", "datadog"]
-    let query_neg_terms: Vec<String> = extract_query_negative_terms(&q_orig);
+    let (query_neg_terms, query_neg_dropped): (Vec<String>, Vec<String>) =
+        extract_query_negative_terms_with_dropped(&q_orig);
     let query_contrastive = query_is_contrastive(&q_orig);
 
     // Combine intent-engine negatives with query-derived negatives, then GATE BOTH
@@ -9898,11 +9982,49 @@ async fn handle_search(
         }
     }
     let mut gated_neg_dedup: Vec<String> = Vec::new();
-    for n in raw_neg {
+    for n in raw_neg.clone() {
         if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
             gated_neg_dedup.push(n);
         }
     }
+    intent.structured_constraints.negative = gated_neg_dedup.clone();
+
+    // D3 transparency: surface genuine (non-manner) candidate exclusions that the
+    // gate declined, so they are not silently dropped. Two sources: (1) intent-engine
+    // negatives the gate declined, and (2) query-derived compounds the extractor
+    // declined but that are not manner qualifiers. Manner qualifiers ("without soap")
+    // are intentionally never surfaced — they describe HOW, not WHAT to exclude.
+    let mut declined: Vec<String> = Vec::new();
+    for n in &raw_neg {
+        if !gated_neg_dedup.contains(n) && !declined.contains(n) {
+            declined.push(n.clone());
+        }
+    }
+    for d in &query_neg_dropped {
+        if !declined.contains(d) {
+            declined.push(d.clone());
+        }
+    }
+    let mut ignored_vec: Vec<String> = Vec::new();
+    for n in declined {
+        if is_manner_phrase(&n) {
+            continue;
+        }
+        // Skip grammar/preposition noise the intent engine may emit as a negative
+        // candidate (e.g. "in", "about"). Surfacing these would confuse users.
+        if n.split_whitespace().any(|t| IGNORED_CONSTRAINT_NOISE.contains(&t)) {
+            continue;
+        }
+        let note = format!(
+            "not:{} — exclusion not applied (unrecognized entity, no contrastive 'alternative/versus/compare' framing)",
+            n
+        );
+        if !ignored_vec.contains(&note) {
+            ignored_vec.push(note);
+        }
+    }
+    intent.structured_constraints.ignored_constraints =
+        if ignored_vec.is_empty() { None } else { Some(ignored_vec) };
     intent.structured_constraints.negative = gated_neg_dedup.clone();
 
     let has_only_negative = intent.structured_constraints.positive.is_empty()
@@ -10307,7 +10429,10 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // ─── Constraint transparency (applied / ignored / warnings) ───
     let sc = &intent.structured_constraints;
     let mut applied: Vec<String> = Vec::new();
-    let mut ignored: Vec<String> = Vec::new();
+    // NOTE: `ignored` was declared up-front (near the constraint-normalization /
+    // negation gate, ~9891) so D3 transparency can prepopulate it with declined
+    // non-manner exclusions. We reuse that same Vec here (no second `let`) so the
+    // negation-gate entries survive into the response.
     let mut warnings: Vec<String> = Vec::new();
 
     if let Some(l) = &sc.language { applied.push(format!("lang:{}", l)); }
@@ -10842,6 +10967,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         price_max,
         price_lt,
         price_gt,
+        ignored_constraints: None,
     }
 }
 
@@ -11062,6 +11188,68 @@ mod constraint_fix_tests {
             should_filter_by_constraints("Git", "https://github.com/x", "https://github.com/x", None, &c),
             "github itself should be filtered for related:github.com"
         );
+    }
+
+    #[test]
+    fn d3_non_entity_negations_surfaced_not_silently_dropped() {
+        // D3 regression: genuine attribute/topic exclusions that the `is_real_exclusion`
+        // gate declines (not a recognized entity, not contrastive framing) must NOT be
+        // silently discarded — they must be reported via `ignored_constraints` so the
+        // user knows the exclusion was not applied. Manner qualifiers stay excluded and
+        // are NEVER surfaced.
+        for q in [
+            "recipes not spicy",
+            "movies not rated r",
+            "songs not in english",
+            "news not about politics",
+        ] {
+            let (kept, dropped) = extract_query_negative_terms_with_dropped(q);
+            // The gate still declines the attribute exclusion (no entity / no contrastive
+            // framing) — that behaviour is UNCHANGED from the regression. What changed is
+            // that the declined term is now reported rather than discarded.
+            assert!(
+                !kept.iter().any(|t| t.contains("spicy")
+                    || t.contains("rated")
+                    || t.contains("english")
+                    || t.contains("politics")),
+                "D3: attribute exclusion must not be applied as a hard filter for '{}', kept={:?}",
+                q,
+                kept
+            );
+            // The declined non-manner candidate MUST appear in `dropped` so it can be
+            // surfaced in `ignored_constraints`.
+            let joined = dropped.join(" ");
+            assert!(
+                !dropped.is_empty()
+                    && (joined.contains("spicy")
+                        || joined.contains("rated")
+                        || joined.contains("english")
+                        || joined.contains("politics")),
+                "D3: declined attribute exclusion must be surfaced (dropped={:?}) for '{}'",
+                dropped,
+                q
+            );
+        }
+    }
+
+    #[test]
+    fn d3_manner_qualifier_not_surfaced() {
+        // Manner qualifiers describe HOW, not WHAT to exclude. They must stay out of
+        // both `kept` and the `dropped` vector (so they are NEVER surfaced in
+        // `ignored_constraints`).
+        for q in [
+            "how to clean a cast iron skillet without soap after cooking eggs",
+            "how to learn guitar with no music background",
+        ] {
+            let (kept, dropped) = extract_query_negative_terms_with_dropped(q);
+            assert!(kept.is_empty(), "manner '{}' must not be kept: {:?}", q, kept);
+            assert!(
+                dropped.is_empty(),
+                "manner qualifier '{}' must NOT be surfaced in ignored_constraints: dropped={:?}",
+                q,
+                dropped
+            );
+        }
     }
 
     #[test]
