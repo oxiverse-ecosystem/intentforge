@@ -3873,6 +3873,14 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
             if (w == "other" || w == "rather") && words[i + 1] == "than" {
                 is_neg = true;
                 skip_marker_len = 2;
+            } else if w == "alternative" && words[i + 1] == "to" {
+                // "alternative to X" → exclude X (contrastive framing).
+                is_neg = true;
+                skip_marker_len = 2;
+            } else if w == "instead" && words[i + 1] == "of" {
+                // "instead of X" → exclude X (contrastive framing).
+                is_neg = true;
+                skip_marker_len = 2;
             }
         }
 
@@ -3979,7 +3987,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         && !terms.contains(&joined)
                     {
                         terms.push(joined);
-                    } else if !is_manner_phrase(&joined) {
+                    } else if !is_manner_phrase(&joined) && !is_manner_frame(q_orig, &joined) {
                         // D3 transparency: a genuine candidate exclusion that the
                         // gate declined (not a recognized entity, not contrastive
                         // framing) AND is not a manner qualifier. It was silently
@@ -10007,7 +10015,7 @@ async fn handle_search(
     }
     let mut ignored_vec: Vec<String> = Vec::new();
     for n in declined {
-        if is_manner_phrase(&n) {
+        if is_manner_phrase(&n) || is_manner_frame(&q_orig, &n) {
             continue;
         }
         // Skip grammar/preposition noise the intent engine may emit as a negative
