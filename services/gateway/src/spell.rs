@@ -276,13 +276,12 @@ impl SymSpellIndex {
             }
         }
 
-        // ABSENT-WORD GUARD (biryani->bryan / yawn->yarn bugs): a word ABSENT from the
-        // dictionary must NOT be corrected into a different dictionary word at ANY edit
-        // distance >= 1. Such a word is almost certainly a real term (foreign / coined /
-        // name / simply missing from the 15k dictionary) the corpus lacks, not a typo.
-        // This blocks distance-1 real-word corruption (e.g. "yawn"->"yarn") which the
-        // previous >=2 guard missed. Explicit known-misspelling entries (e.g.
-        // "ngnix"->"nginx") are exempt via is_known_misspelling.
+        // ABSENT-WORD GUARD (biryani->bryan bug): a word ABSENT from the dictionary
+        // must NOT be distance->=2 corrected into a different dictionary word. Such a
+        // word is almost certainly a real term (foreign / coined / name) the 15k
+        // dictionary lacks, not a typo. Distance-1 typo fixes of real dictionary words
+        // (e.g. "pythn"->"python") are distance 1 so unaffected, and explicit
+        // known-misspelling entries (e.g. "ngnix"->"nginx") are exempt.
         //
         // NARROW EXCEPTION: permit the correction when the ONLY differences between
         // input and candidate are missing doubled letters (e.g. "embaras"->"embarrass",
@@ -291,11 +290,12 @@ impl SymSpellIndex {
         // chars is reduced to one. This re-opens the single most common English typo
         // class WITHOUT weakening the biryani->bryan guard (that is a deletion of a
         // distinct letter, not a doubled-letter insertion; the collapsed forms differ).
-        // NOTE: this intentionally regresses rare absent-input distance-1 typos such as
-        // "pythn"->"python" (input absent, not a doubled-letter case) — protecting real
-        // words like "yawn" from corruption is the higher-priority failure mode.
+        // NOTE: distance-1 real-word corruption (e.g. "yawn"->"yarn") is handled NOT here
+        // but by ensuring such real words are PRESENT in dictionary.rs (so correct()
+        // returns None at the exact-match stage). That keeps the >=2 guard intact and
+        // preserves legitimate distance-1 typo fixes like pythn->python.
         let best_dist = self.compute_edit_distance(word, best);
-        if best_dist >= 1
+        if best_dist >= 2
             && !self.exact_map.contains_key(&word.to_lowercase())
             && !self.is_known_misspelling(word)
         {
