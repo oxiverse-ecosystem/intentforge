@@ -8086,7 +8086,30 @@ async fn handle_search(
                         // long window so every subsequent fan-out SKIPS it instead of
                         // re-burning the full branch timeout. Detected by error KIND,
                         // so it also self-heals: a successful request resets open_until.
-                        let is_connect_err = e.is_connect() || e.is_dns();
+                        // NOTE: reqwest 0.12 has no `is_dns()`. DNS resolution failures
+                        // surface as connect-kind errors; we additionally walk the error
+                        // source chain for a resolver signature so a hyper/hickory DNS
+                        // error nested under a non-connect kind is still classified as
+                        // a dead instance rather than a transient failure.
+                        let is_connect_err = e.is_connect() || {
+                            let mut src: Option<&(dyn std::error::Error + 'static)> =
+                                std::error::Error::source(&e);
+                            let mut dns_like = false;
+                            while let Some(s) = src {
+                                let msg = s.to_string().to_lowercase();
+                                if msg.contains("dns")
+                                    || msg.contains("failed to lookup")
+                                    || msg.contains("name or service not known")
+                                    || msg.contains("nodename nor servname")
+                                    || msg.contains("no such host")
+                                {
+                                    dns_like = true;
+                                    break;
+                                }
+                                src = std::error::Error::source(s);
+                            }
+                            dns_like
+                        };
                         tracing::warn!("SearXNG instance request failed: {:?}", e);
                         if let Some(ref key) = instance_key_for_searx {
                             if is_connect_err {
