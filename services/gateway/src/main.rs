@@ -3639,6 +3639,15 @@ fn has_local_intent(query: &str) -> bool {
 const CONTRASTIVE_MARKERS: &[&str] = &[
     "compare", "comparison", "versus", "vs", "alternative", "alternatives",
     "replacement", "instead", "rather than", "other than", "besides",
+    // P9: unambiguous single-marker exclusion words. `extract_query_negative_terms`
+    // already treats these as neg markers (lines ~3824, ~3854), but they were
+    // missing here — so a SINGLE "<except/excluding/minus> X" with a non-protected
+    // target (e.g. "javascript framework except react", "search engine except
+    // google") returned `constraints: null` (the exclusion was declined because
+    // `query_is_contrastive` was false) and React/Google pages dominated. Unlike
+    // "not"/"no"/"without", these words only ever mean exclusion, so flagging them
+    // as contrastive is structurally safe (no manner-qualifier ambiguity).
+    "except", "excluding", "minus",
 ];
 
 /// Returns true if a negated compound is a MANNER qualifier (describes HOW the user
@@ -5521,6 +5530,31 @@ fn merge_local_and_web(
                     title_lower.contains(&tl) || content_lower.contains(&tl)
                         || title_lower.contains(bare) || content_lower.contains(bare)
                 });
+            // P2b: high-quality local pages that match the query ONLY on comparison
+            // STRUCTURE ("difference between X and Y", "X vs Y") but share NONE of the
+            // query's substantive entity terms are off-topic crawl noise — e.g.
+            // "Difference Between Maven, ANT, Jenkins", "Hedge Fund vs Mutual Fund",
+            // "Orthopedics vs Rheumatology" surfacing for "router vs modem". The
+            // indexer scored them high (they ARE real comparison pages) so the
+            // quality-only P2 gate above spares them, yet they crowd out the
+            // authoritative web result that actually mentions the query's subject.
+            // Crush only comparison-structured local pages missing the query entities.
+            // General: keyed on result structure + substantive-term absence, no domains.
+            let comparison_structure_words: &[&str] = &[
+                "difference", "between", "vs", "versus", "compare", "compared", "comparison",
+            ];
+            let substantive_terms: Vec<String> = distinctive_terms.iter()
+                .map(|t| t.to_lowercase())
+                .filter(|tl| !comparison_structure_words.contains(&tl.as_str()))
+                .filter(|tl| !structure_words.contains(&tl.as_str()))
+                .collect();
+            let mentions_substantive = substantive_terms.iter().any(|t| {
+                title_lower.contains(t) || content_lower.contains(t)
+            });
+            let result_is_comparison_structured =
+                title_lower.contains(" vs ") || title_lower.contains(" versus ")
+                || title_lower.contains("difference between") || title_lower.contains(" compared ");
+            let is_comparison_intent = intent == "comparison" || intent == "technical";
             if r.quality < 0.55 && !topic_mentioned {
                 relevance *= 0.05;
                 tracing::info!(
@@ -5529,6 +5563,13 @@ fn merge_local_and_web(
                 );
             } else if r.quality < 0.75 && !topic_mentioned {
                 relevance *= 0.5;
+            } else if is_comparison_intent && result_is_comparison_structured
+                && !substantive_terms.is_empty() && !mentions_substantive {
+                relevance *= 0.3;
+                tracing::info!(
+                    "LOCAL NOISE GATE (off-topic comparison): '{}' is a comparison page but mentions none of the query entities {:?} -> relevance *= 0.3",
+                    r.title.chars().take(60).collect::<String>(), substantive_terms
+                );
             }
         }
 
@@ -8861,11 +8902,15 @@ async fn handle_search(
         }
 
         // Override 7: weather / forecast queries → fresh
+        // WHOLE-WORD match only: a naive `contains("rain")` wrongly fired inside
+        // "fe**rain**al" (a rescue-cat query) and forced fresh intent on a how-to
+        // question, which then re-ranked results by recency instead of relevance.
+        // Use the same `q_has_word` boundary helper that guards "fresh"/"latest".
         let weather_signals = [
             "weather", "forecast", "temperature", "rain", "snow", "humidity",
             "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
         ];
-        let has_weather_signal = weather_signals.iter().any(|s| q_lower.contains(s));
+        let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
         if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
@@ -9746,10 +9791,24 @@ async fn handle_search(
             ok
         }).count();
         // (A) no dates at all, or (B) all dated-but-out-of-range -> would empty.
-        if survivors_after_window == 0 {
+        // (C) RESIDUAL P6: the window keeps SOME results but crushes the set
+        //     pathologically (e.g. date-less upstream snippets for "latest X this
+        //     week" → 8/9 dropped, 1 survives = 11%). A near-empty result set is
+        //     the same user-facing failure as a zero one: relevant, date-less
+        //     results get discarded in favour of a single stale-but-dated item.
+        //     Fail-open when the surviving fraction is below a general 25% floor
+        //     AND the surviving count is too small to be useful (< 3). This is
+        //     keyed on survival ratio, not on any query/window, so it stays general.
+        let survivor_fraction = if pre_filter_count > 0 {
+            survivors_after_window as f32 / pre_filter_count as f32
+        } else {
+            1.0
+        };
+        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.25;
+        if survivors_after_window == 0 || fraction_too_low {
             tracing::info!(
-                "DATE WINDOW FAIL-OPEN (would-empty): {} web results but 0 would survive the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
-                pre_filter_count, dated_result_count
+                "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
+                pre_filter_count, survivors_after_window, survivor_fraction, dated_result_count
             );
             intent.structured_constraints.after_date = None;
             intent.structured_constraints.before_date = None;
@@ -10353,23 +10412,32 @@ let mut results = match tokio::task::spawn_blocking(move || {
         }
     }
 
-    // For negative-only queries ("not django"), skip the hard removal retain filter.
-    // All search results for the negated term will mention it — removing them all
-    // leaves zero results. Instead, rely on the title penalty + constraint scoring
-    // (applied in score_rerank) to appropriately demote results about the excluded topic.
-    // Queries with BOTH positive and negative constraints (e.g. "python framework not django")
-    // still use the hard filter since there are non-excluded results to keep.
-    // BUT: if a result contains ANY positive term, skip hard removal — the title penalty
-    // already demotes it. This prevents removing genuinely relevant results that merely
-    // mention the excluded term in passing (e.g. "cars not suv" removes all car results
-    // because they all mention "SUV").
-    if has_only_negative {
-        tracing::info!(
-            "NEGATIVE CONSTRAINT: skipping hard removal for {} results (title penalty + constraint scoring will penalize instead)",
-            before_count
-        );
-    } else {
-        results.retain(|r| {
+    // Post-merge hard negative drop.
+    //
+    // The web pre-merge filter (8a) drops violating web results when a clean
+    // alternative exists, but it only sees web results — local index hits
+    // (src=['local']) bypass it. So a query like "javascript framework except
+    // react" would keep the local React pages unless we drop them HERE too.
+    //
+    // The old behavior blanket-skipped the drop for negative-only queries
+    // ("not django"): search engines treat "not" as a stop word, so EVERY result
+    // mentions the excluded term and dropping all of them leaves zero results.
+    // That reasoning is correct for PURE negation, but it conflated two cases:
+    //   • Pure negation ("not django", "except google"): degenerate — almost all
+    //     results violate, so the drop would empty the set. KEEP the skip.
+    //   • Topic + single exclusion ("javascript framework except react"): there ARE
+    //     clean non-react results (Vue, Svelte, Angular), so the React pages must
+    //     be removed, not just penalized.
+    //
+    // Fix: always compute the keep-set, then DROP; but if `has_only_negative` AND the
+    // drop would empty the result set (degenerate pure-negation), keep everything
+    // (the title penalty + constraint scoring already demote the offenders). This
+    // mirrors the graduated logic the web filter already uses and never returns an
+    // empty page. The keep-set is computed exactly once so the closure logic is not
+    // duplicated.
+    let retained: Vec<bool> = results
+        .iter()
+        .map(|r| {
             // Alternative-listing page check: keep comparison/alternative pages
             // even if they mention excluded terms (they are HIGHLY relevant).
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
@@ -10398,8 +10466,8 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     if c == '.' || c == '-' || c == '_' {
                         if i > 0
                             && i + 1 < chars.len()
-                            && chars[i-1].is_alphanumeric()
-                            && chars[i+1].is_alphanumeric()
+                            && chars[i - 1].is_alphanumeric()
+                            && chars[i + 1].is_alphanumeric()
                         {
                         } else {
                             out.push(c);
@@ -10427,18 +10495,25 @@ let mut results = match tokio::task::spawn_blocking(move || {
             if !should_keep {
                 tracing::info!("HARD NEGATIVE DROP (post-merge): result \"{}\" (local={}) removed because negative constraint matched (not alt page)",
                     &r.title.chars().take(50).collect::<String>(), r.is_local);
-            } else {
-                // TITLE-ONLY HARD CHECK: even if alt page, demote by 90% if title contains excluded term
-                let title_lower = r.title.to_lowercase();
-                for nt_after in &negative_norm {
-                    if text_matches_negative(&title_lower, &nt_after.to_lowercase()) {
-                        // Score penalty moved to separate loop before retain
-                        tracing::info!("TITLE HARD PENALTY: title contains excluded term -> score *= 0.01 (penalty applied in separate loop)");
-                        break;
-                    }
-                }
             }
             should_keep
+        })
+        .collect();
+    let kept_count = retained.iter().filter(|k| **k).count();
+    let would_empty = kept_count == 0 && !results.is_empty();
+    if has_only_negative && would_empty {
+        // Degenerate pure-negation: dropping everything leaves zero results.
+        // Keep all; the title penalty + constraint scoring demote offenders.
+        tracing::info!(
+            "NEGATIVE CONSTRAINT: skipping hard removal for {} results (pure-negation degenerate set — title penalty + constraint scoring will penalize instead)",
+            before_count
+        );
+    } else {
+        let mut vi = 0;
+        results.retain(|_r| {
+            let keep = retained[vi];
+            vi += 1;
+            keep
         });
     }
         let removed = before_count.saturating_sub(results.len());
@@ -11508,6 +11583,37 @@ mod constraint_fix_tests {
         assert!(query_is_contrastive("versus-mode ranking not python"));
         assert!(query_is_contrastive("alternatives-market report not django"));
         assert!(query_is_contrastive("replacement-parts list not flask"));
+    }
+
+    #[test]
+    fn p9_except_exclusion_is_contrastive_and_extracted() {
+        // P9: "except" is an unambiguous single-marker exclusion. A single
+        // "<except> X" with a NON-protected target (react) must be recognized as
+        // contrastive framing AND extracted as a real exclusion. Before the fix,
+        // `query_is_contrastive` returned false (CONTRASTIVE_MARKERS lacked
+        // "except"), so `is_real_exclusion("react", false)` declined it and the
+        // gateway returned `constraints: null` — React pages dominated the result
+        // set instead of being filtered out. (Only happened to "work" for targets
+        // already in PROTECTED_TERMS like vim/ubuntu/tailwind.)
+        assert!(
+            query_is_contrastive("javascript framework except react"),
+            "'except' must flag contrastive framing"
+        );
+        assert_eq!(
+            extract_query_negative_terms("javascript framework except react"),
+            vec!["react".to_string()],
+            "'javascript framework except react' must exclude react"
+        );
+        // Also covers 'excluding'/'minus' variants (same structural class).
+        assert!(
+            query_is_contrastive("search engine excluding google"),
+            "'excluding' must flag contrastive framing"
+        );
+        assert_eq!(
+            extract_query_negative_terms("text editor minus vim"),
+            vec!["vim".to_string()],
+            "'text editor minus vim' must exclude vim"
+        );
     }
 
     #[test]
