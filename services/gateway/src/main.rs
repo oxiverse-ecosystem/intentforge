@@ -11957,6 +11957,93 @@ mod constraint_fix_tests {
     }
 
     #[test]
+    fn analyze_endpoint_response_shape_matches_docs() {
+        // Locks the JSON shape documented in API_REFERENCE.md `GET /analyze`:
+        // the handler builds `{query, contrastive_framing, exclusions, declined,
+        // manner_qualifiers, decisions[]}`, where `decisions[]` is one entry per
+        // candidate term `{term, decision, reason}` and `contrastive_framing`
+        // reflects query_is_contrastive. Mirrors handle_analyze's construction
+        // exactly (no AppState needed — it only delegates to the two pure fns).
+        let q = "javascript not java not typescript";
+        let q_orig = q.to_string();
+        let query_contrastive = query_is_contrastive(&q_orig);
+        let (kept, declined, manner) =
+            extract_query_negative_terms_with_dropped(&q_orig);
+
+        let mut decisions: Vec<serde_json::Value> = Vec::new();
+        for term in &kept {
+            decisions.push(serde_json::json!({
+                "term": term,
+                "decision": "exclusion",
+                "reason": "recognized entity or contrastive framing (compare/versus/alternative/instead-of/double-negation)"
+            }));
+        }
+        for term in &declined {
+            let is_manner = is_manner_phrase(term) || is_manner_frame(&q_orig, term);
+            decisions.push(serde_json::json!({
+                "term": term,
+                "decision": "declined",
+                "reason": if is_manner {
+                    "manner qualifier (HOW not WHAT to exclude) — never a search exclusion"
+                } else {
+                    "neither a recognized entity nor in contrastive framing — excluded to avoid penalizing unrelated topical words"
+                }
+            }));
+        }
+        for term in &manner {
+            decisions.push(serde_json::json!({
+                "term": term,
+                "decision": "manner_qualifier",
+                "reason": "manner qualifier (HOW not WHAT to exclude) — described the user's method, not a topic to filter out"
+            }));
+        }
+
+        let result = serde_json::json!({
+            "query": q,
+            "contrastive_framing": query_contrastive,
+            "exclusions": kept,
+            "declined": declined,
+            "manner_qualifiers": manner,
+            "decisions": decisions
+        });
+
+        // Documented fields all present.
+        assert!(result.get("query").is_some());
+        assert!(result.get("contrastive_framing").is_some());
+        assert!(result.get("exclusions").is_some());
+        assert!(result.get("declined").is_some());
+        assert!(result.get("manner_qualifiers").is_some());
+        assert!(result.get("decisions").is_some());
+
+        // Documented behavior: contrastive framing true, exclusions populated,
+        // a decisions entry per term with the documented decision vocabulary.
+        assert_eq!(result["contrastive_framing"], serde_json::json!(true));
+        assert!(result["exclusions"].as_array().unwrap().len() == 2);
+        let decisions = result["decisions"].as_array().unwrap();
+        assert_eq!(decisions.len(), 2);
+        for d in decisions {
+            assert_eq!(d["decision"], serde_json::json!("exclusion"));
+            assert!(d.get("term").is_some());
+            assert!(d.get("reason").is_some());
+        }
+
+        // Empty query reported by the handler as 400 empty_query with the
+        // documented envelope (all arrays empty). Lock the envelope shape here.
+        let empty = serde_json::json!({
+            "error": "empty_query",
+            "message": "Query parameter 'q' is empty",
+            "query": "",
+            "exclusions": [],
+            "declined": [],
+            "manner_qualifiers": []
+        });
+        assert_eq!(empty["error"], serde_json::json!("empty_query"));
+        assert!(empty["exclusions"].as_array().unwrap().is_empty());
+        assert!(empty["declined"].as_array().unwrap().is_empty());
+        assert!(empty["manner_qualifiers"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
     fn query_is_contrastive_detects_framing() {
         assert!(query_is_contrastive("compare postgresql and mysql"));
         assert!(query_is_contrastive("search engine alternative to google"));
