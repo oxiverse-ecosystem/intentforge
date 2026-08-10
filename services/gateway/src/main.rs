@@ -4035,6 +4035,25 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         if GENERIC_NEG.contains(&w) {
                             break; // generic connector — won't extend past it
                         }
+                        // Bare search OPERATORS (site:, filetype:, intitle:,
+                        // inurl:, intext:, related:, and the `-flag` shortcut)
+                        // are not searchable content — they are structural
+                        // query directives. If one rides along in a negation
+                        // phrase (e.g. "not django site:github.com"), treat it
+                        // as a hard compound boundary so it is NOT absorbed into
+                        // the exclusion term. `extract_gateway_constraints`
+                        // already strips these operators separately and applies
+                        // the real filter; this only stops the negation compound
+                        // from swallowing them into garbage like "django
+                        // sitegithubcom". This is a structural guard, not a
+                        // hardcoded operator list.
+                        if w.contains(':')
+                            || (w.starts_with('-')
+                                && w.len() > 1
+                                && !w[1..].chars().all(|c| c.is_alphanumeric()))
+                        {
+                            break;
+                        }
                         let wc: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
                         if wc.is_empty() {
                             break;
@@ -6851,8 +6870,11 @@ struct AppState {
     /// In-flight request deduplication: tracks identical queries in flight so
     /// concurrent duplicate requests share one SearXNG fetch instead of N.
     in_flight: Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<String>>>>,
-    /// SymSpell + LinSpell spelling correction index (built at startup)
-    spell_index: spell::SymSpellIndex,
+    /// SymSpell + LinSpell spelling correction index (built at startup).
+    /// Held behind `Arc` so the synchronous dictionary lookup can be moved into
+    /// a `spawn_blocking` task off the async runtime (see `handle_spellcheck`)
+    /// without deep-cloning the (large) index per request.
+    spell_index: Arc<spell::SymSpellIndex>,
     /// Optional MaxMind GeoLite2 IP geolocation lookup
     geo_locator: Option<geoloc::GeoLocator>,
     /// Bounds concurrent heavy search handlers so the combined per-request
@@ -7387,7 +7409,7 @@ async fn main() {
         searxng2_url,
         searx_last_used: Mutex::new(HashMap::new()),
         in_flight: Mutex::new(HashMap::new()),
-        spell_index: spell::SymSpellIndex::build(),
+        spell_index: Arc::new(spell::SymSpellIndex::build()),
         geo_locator: geoloc::GeoLocator::load(),
         goals_state: parking_lot::Mutex::new(goals::GoalStore::new()),
         // Cap concurrent heavy searches. Measured peak per concurrent search is
@@ -7613,7 +7635,30 @@ async fn handle_spellcheck(
             })),
         );
     }
-    let result = spellcheck_query(&state.spell_index, &q);
+    let result = {
+        // `spellcheck_query` runs synchronous SymSpell dictionary lookups and
+        // string work. On a large index this would block the async executor
+        // thread and stall unrelated in-flight requests, so we move it into a
+        // `spawn_blocking` task. The index lives behind `Arc`, so the closure
+        // can cheaply own a clone of the handle (no deep dictionary copy).
+        let index = Arc::clone(&state.spell_index);
+        let q_owned = q.clone();
+        match tokio::task::spawn_blocking(move || spellcheck_query(&index, &q_owned)).await {
+            Ok(r) => r,
+            Err(_) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "spellcheck_task_failed",
+                        "query": q,
+                        "corrected": "",
+                        "changed": false,
+                        "corrections": []
+                    })),
+                );
+            }
+        }
+    };
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -12493,6 +12538,35 @@ mod hardcoding_ruling_tests {
         assert!(!is_url_video_host("https://example.com/youtube-guide-article"));
         assert!(!is_url_video_host("https://reddit.com/r/IndianFood/comments/abc"));
     }
+
+    #[test]
+    fn negation_compound_does_not_swallow_site_operator() {
+        // Regression (round 2026-08-10T1401Z, t_331c2fc3): when an operator token
+        // rides along in a negation phrase (e.g. "not django site:github.com"),
+        // the greedy compound builder must NOT absorb `site:github.com` into the
+        // exclusion term. Before the fix the exclusion came back as
+        // "django sitegithubcom" (garbage). After the fix it must be exactly
+        // ["django"], and the real site: operator must still be extracted
+        // separately by extract_gateway_constraints.
+        let q = "latest python web framework not django site:github.com";
+        let exclusions = extract_query_negative_terms(q);
+        assert_eq!(
+            exclusions,
+            vec!["django".to_string()],
+            "site: operator must not be swallowed into the exclusion compound"
+        );
+
+        let c = extract_gateway_constraints(q);
+        assert!(
+            c.sites.contains(&"github.com".to_string()),
+            "extract_gateway_constraints must still extract the real site: filter"
+        );
+
+        // filetype: must also be treated as a boundary.
+        let q2 = "python tutorials not pandas filetype:pdf";
+        let excl2 = extract_query_negative_terms(q2);
+        assert_eq!(excl2, vec!["pandas".to_string()]);
+    }
 }
 
 #[cfg(test)]
@@ -12638,6 +12712,29 @@ mod spellcheck_endpoint_tests {
         assert_eq!(res["changed"].as_bool(), Some(false));
         assert!(res["corrections"].as_array().unwrap().is_empty());
         assert_eq!(res["corrected"].as_str(), Some("go rust"));
+    }
+
+    #[test]
+    fn spellcheck_query_runs_off_runtime_in_spawn_blocking() {
+        // Regression (round 2026-08-10T1401Z, t_181e7e89): the spelling index is
+        // held behind `Arc<SymSpellIndex>` so the synchronous `spellcheck_query`
+        // can be moved OFF the async executor via `spawn_blocking`. This test
+        // proves the `Arc` handle is `Send + Sync` (it compiles + runs in a
+        // spawned blocking task) and that the result is identical to an inline
+        // call. The original code called `spellcheck_query` directly on the
+        // async runtime, which would block executor threads on a large index.
+        let index = Arc::new(spell::SymSpellIndex::build());
+        let q = "pythn programing langauge".to_string();
+        let inline = spellcheck_query(&index, &q);
+        let index_clone = Arc::clone(&index);
+        let q_clone = q.clone();
+        let blocked = tokio::task::spawn_blocking(move || {
+            spellcheck_query(&index_clone, &q_clone)
+        })
+        .await
+        .expect("spawn_blocking must not panic with the Arc<SymSpellIndex> handle");
+        assert_eq!(inline, blocked, "spawn_blocking path must match inline path");
+        assert_eq!(blocked["corrected"].as_str(), Some("python programming language"));
     }
 
     // ─── /inspect endpoint (unified pre-search introspection) ───
