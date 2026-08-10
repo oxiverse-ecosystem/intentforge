@@ -6219,6 +6219,7 @@ fn merge_local_and_web(
     // removes that carve-out so the same gate protects web results.
     if !strong_distinctive_terms.is_empty() {
         let before = merged.len();
+        let retained_pre_offtopic: Vec<MergedResult> = merged.iter().cloned().collect();
         merged.retain(|r| {
             // Adult exemption: when the query is explicitly adult, an adult result
             // must survive the off-topic gate — the adult block below keeps it
@@ -6254,6 +6255,41 @@ fn merge_local_and_web(
         let removed = before - merged.len();
         if removed > 0 {
             tracing::info!("OFF_TOPIC_HARD_DROP: removed {}/{} result(s) (local+web) with zero distinctive-term overlap", removed, before);
+        }
+        // Fail-open rescue (mirrors the date/price fail-opens above): if the
+        // off-topic drop would EMPTY the merged set, the "distinctive-term
+        // overlap" signal is too strict for this query (e.g. fresh+price queries
+        // where upstream results legitimately omit the exact distinctive tokens
+        // in their title/content/url snippets) and we must not return a blank
+        // page. Restore the survivors but STILL enforce the adult hard-drop below
+        // (safety is never fail-open), and keep an explicit warning so the gap is
+        // visible. Keyed on "would-empty", not on any query/domain — general.
+        if merged.is_empty() && before > 0 {
+            let restored: Vec<MergedResult> = retained_pre_offtopic
+                .into_iter()
+                .filter(|r| {
+                    let ul = r.url.to_lowercase();
+                    let tl = r.title.to_lowercase();
+                    let host = reqwest::Url::parse(&r.url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                        .unwrap_or_default();
+                    let tld_adult = host.ends_with(".xxx");
+                    let host_adult = adult_hosts.iter().any(|h| host.contains(h));
+                    let path_adult = adult_paths.iter().any(|p| ul.contains(p));
+                    let title_adult = tl.contains("porn") || tl.contains("xxx ")
+                        || tl.contains("nude") || tl.contains("naked")
+                        || tl.contains("sex video") || tl.contains("adult film");
+                    let is_adult = tld_adult || host_adult || path_adult || title_adult;
+                    !is_adult
+                })
+                .collect();
+            tracing::warn!(
+                "OFF_TOPIC_HARD_DROP FAIL-OPEN: {} result(s) all lacked distinctive-term overlap but dropping them would empty the set — restoring {} non-adult survivor(s) (recency/authority ranking still applies)",
+                before,
+                restored.len()
+            );
+            merged = restored;
         }
     }
 
