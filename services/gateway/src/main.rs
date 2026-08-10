@@ -3631,6 +3631,32 @@ fn has_local_intent(query: &str) -> bool {
         )
 }
 
+/// Known video-hosting domains. Used by the P8 video dampening so that videos
+/// arriving through the GENERAL web result set (e.g. a youtube.com URL returned by
+/// SearXNG, which is NOT tagged with the `invidious`/`video` source) are still
+/// recognized as video results and dampened for non-video queries. This is a struct-
+/// ural allow-list of platforms the engine explicitly treats as "video surfaces",
+/// not a per-query tuned list — it is the same platform set the dedicated /videos
+/// endpoint uses, so the policy is consistent and future-proof.
+const VIDEO_HOSTS: &[&str] = &[
+    "youtube.com", "youtu.be", "m.youtube.com", "youtube-nocookie.com",
+    "vimeo.com", "dailymotion.com", "twitch.tv", "rumble.com", "odysee.com",
+    "bitchute.com", "lbry.tv", "peer.tube", "invidious",
+];
+
+/// Returns true if `url` points at a known video platform (see VIDEO_HOSTS).
+/// Cheap, allocation-free host suffix check — no DNS, no per-request config.
+fn is_url_video_host(url: &str) -> bool {
+    let u = url.to_lowercase();
+    let host = if let Some(idx) = u.find("://") {
+        &u[idx + 3..]
+    } else {
+        &u
+    };
+    let host = host.split(['/', '?', '#']).next().unwrap_or(host);
+    VIDEO_HOSTS.iter().any(|h| host == *h || host.ends_with(&format!(".{}", h)))
+}
+
 /// Words/phrases that signal CONTRASTIVE framing. When a negation marker sits in
 /// contrastive framing, the negated head is genuinely a search exclusion (e.g.
 /// "search engine alternative to google" → exclude google; "react vs vue" → exclude
@@ -6091,7 +6117,15 @@ fn merge_local_and_web(
         // article for text queries (e.g. "how to make biryani at home"). Videos have
         // their own /videos endpoint; in /search they are secondary, so dampen them
         // unless the query is explicitly video-seeking. Floor keeps them present, not dominant.
-        let is_video_source = r.sources.iter().any(|s| s == "invidious" || s == "video");
+        // A result is a "video" if it is tagged with the video source OR its URL
+        // points at a known video platform. SearXNG often returns youtube.com /
+        // vimeo.com / etc. URLs inside the GENERAL web result set WITHOUT a
+        // video source tag (e.g. the "authentic poha indore style" query returned a
+        // youtube.com recipe video at score 1.0 for a non-video query). Treating
+        // those as text allowed them to outrank the real recipe article. is_url_video_host
+        // catches them so the same dampening applies.
+        let is_video_source = r.sources.iter().any(|s| s == "invidious" || s == "video")
+            || is_url_video_host(&r.url);
         let q_lc = query.to_lowercase();
         let video_mult = if is_video_source {
             if q_lc.contains("video") || q_lc.contains("youtube") || q_lc.contains("watch") || q_lc.contains("tutorial") || q_lc.contains("animation") {
@@ -6541,7 +6575,8 @@ fn merge_local_and_web(
             // re-applies AFTER calibration, so the dampening is durable: videos may
             // still appear (floor preserved) but can never outrank genuine text
             // results for a non-video query. Video-intent queries keep full score.
-            let is_video_src = r.sources.iter().any(|s| s == "invidious" || s == "video");
+            let is_video_src = r.sources.iter().any(|s| s == "invidious" || s == "video")
+                || is_url_video_host(&r.url);
             if is_video_src {
                 let video_intent = q_lc_cap.contains("video")
                     || q_lc_cap.contains("youtube")
@@ -11940,6 +11975,24 @@ mod hardcoding_ruling_tests {
             vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
         assert_eq!(out.len(), 1, "adult result kept when query is explicitly adult");
+    }
+
+    #[test]
+    fn video_host_detection_covers_web_merge_urls() {
+        // P8 (YouTube-host gap): SearXNG returns youtube.com / youtu.be / vimeo.com /
+        // etc. URLs inside the GENERAL web result set WITHOUT a `video` source tag.
+        // A non-video query ("authentic poha indore style") then ranked a
+        // youtube.com recipe video at score 1.0 above the real recipe article.
+        // is_url_video_host must catch these hosts so the P8 dampening applies.
+        assert!(is_url_video_host("https://www.youtube.com/watch?v=gUEa825kTjQ"));
+        assert!(is_url_video_host("https://youtu.be/gUEa825kTjQ"));
+        assert!(is_url_video_host("https://m.youtube.com/watch?v=abc"));
+        assert!(is_url_video_host("https://www.vimeo.com/123456"));
+        assert!(is_url_video_host("https://invidious.example.net/watch?v=x"));
+        // Non-video hosts must NOT match.
+        assert!(!is_url_video_host("https://www.python.org/doc"));
+        assert!(!is_url_video_host("https://example.com/youtube-guide-article"));
+        assert!(!is_url_video_host("https://reddit.com/r/IndianFood/comments/abc"));
     }
 }
 
