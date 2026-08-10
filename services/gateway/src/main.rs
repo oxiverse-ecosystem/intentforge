@@ -12714,8 +12714,8 @@ mod spellcheck_endpoint_tests {
         assert_eq!(res["corrected"].as_str(), Some("go rust"));
     }
 
-    #[test]
-    fn spellcheck_query_runs_off_runtime_in_spawn_blocking() {
+    #[tokio::test]
+    async fn spellcheck_query_runs_off_runtime_in_spawn_blocking() {
         // Regression (round 2026-08-10T1401Z, t_181e7e89): the spelling index is
         // held behind `Arc<SymSpellIndex>` so the synchronous `spellcheck_query`
         // can be moved OFF the async executor via `spawn_blocking`. This test
