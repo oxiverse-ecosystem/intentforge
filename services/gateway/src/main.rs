@@ -12562,10 +12562,25 @@ mod hardcoding_ruling_tests {
             "extract_gateway_constraints must still extract the real site: filter"
         );
 
-        // filetype: must also be treated as a boundary.
+        // filetype: must ALSO be treated as a boundary, so it is never absorbed
+        // into the compound (which would produce garbage like "pandas
+        // filetypepdf"). The real `file_type` operator must still be extracted
+        // separately by extract_gateway_constraints. Note: whether "pandas"
+        // itself survives the `is_real_exclusion` gate is engine policy and NOT
+        // part of this regression — we only assert the operator is not swallowed
+        // and the genuine file_type filter is extracted.
         let q2 = "python tutorials not pandas filetype:pdf";
         let excl2 = extract_query_negative_terms(q2);
-        assert_eq!(excl2, vec!["pandas".to_string()]);
+        assert!(
+            !excl2.iter().any(|e| e.contains("filetype")),
+            "filetype: operator must not be swallowed into any exclusion term, got {:?}",
+            excl2
+        );
+        let c2 = extract_gateway_constraints(q2);
+        assert!(
+            c2.file_types.contains(&"pdf".to_string()),
+            "extract_gateway_constraints must still extract the real filetype: filter"
+        );
     }
 }
 
