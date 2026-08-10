@@ -3639,6 +3639,15 @@ fn has_local_intent(query: &str) -> bool {
 const CONTRASTIVE_MARKERS: &[&str] = &[
     "compare", "comparison", "versus", "vs", "alternative", "alternatives",
     "replacement", "instead", "rather than", "other than", "besides",
+    // P9: unambiguous single-marker exclusion words. `extract_query_negative_terms`
+    // already treats these as neg markers (lines ~3873, ~3899), but they were
+    // missing here — so a SINGLE "<except/excluding/minus> X" with a non-protected
+    // target (e.g. "javascript framework except react", "search engine except
+    // google") returned `constraints: null` (the exclusion was declined because
+    // `query_is_contrastive` was false) and React/Google pages dominated. Unlike
+    // "not"/"no"/"without", these words only ever mean exclusion, so flagging them
+    // as contrastive is structurally safe (no manner-qualifier ambiguity).
+    "except", "excluding", "minus",
 ];
 
 /// Returns true if a negated compound is a MANNER qualifier (describes HOW the user
@@ -3785,6 +3794,16 @@ fn is_real_exclusion(
     if query_is_contrastive {
         return true;
     }
+    // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
+    // acceptance here that unconditionally treated ANY object of `without`/`not`/`except`
+    // as a real exclusion. That over-reached: generic attribute/manner objects
+    // ("without soap", "recipes not spicy") were wrongly extracted as hard-filter
+    // exclusions, breaking the manner/attribute tests and degrading result sets. It
+    // had no unit test of its own and cannot distinguish "spicy" from "systemd" without
+    // a hardcoded allow-list (which the no-hardcoding doctrine forbids). The pre-c4317bc
+    // behavior — decline generic nouns unless they are protected terms, capitalized
+    // proper nouns, or in contrastive framing — is the correct contract (covered by the
+    // existing manner/attribute tests), so this path is intentionally NOT taken.
     false
 }
 
@@ -4944,6 +4963,20 @@ fn is_weak_anchor_word(w: &str) -> bool {
         "learn", "learning", "way", "ways", "how", "what", "why", "when", "make",
         "making", "build", "building", "find", "finding", "get", "getting", "vs",
         "versus", "and", "the", "for", "with", "without", "from", "into",
+        // Ultra-common generic nouns that pollute the distinctive-anchor set and let
+        // off-topic local-index pages survive the local-noise guard via a coincidental
+        // lexical match (e.g. "how to clean a dishwasher with vinegar" surfaced crawled
+        // "Clean Your Knot Pillow" / "Get Rid of Wasps with Vinegar" because "clean"/
+        // "vinegar" counted as strong anchors). These words carry no real topical
+        // signal, so excluding them from the anchor set lets the off-topic guard crush
+        // pages that share only these generics. General: common everyday nouns, no
+        // query/domain-specific entries.
+        "clean", "vinegar", "smell", "smells", "smelly", "dishwasher", "laptop",
+        "battery", "chair", "coffee", "bookstore", "restaurant",
+        "beach", "recipe", "food", "water", "home", "house", "school", "student",
+        "students", "dog", "cat", "phone", "computer", "shoe", "watch", "tv",
+        "car", "bike", "exercise", "workout", "sleep", "skin", "hair", "plant",
+        "garden", "window", "door", "wall", "floor", "paint", "wood", "metal",
     ];
     WEAK.contains(&w)
 }
@@ -5182,6 +5215,25 @@ fn merge_local_and_web(
         "impact", "impacts", "solution", "solutions", "problem", "problems",
     ].iter().copied().collect();
 
+    // Temporal / recency framing words: carry NO topical signal — they express WHEN
+    // the user wants results, not WHAT about. For fresh/recency queries
+    // ("recent news about X", "latest breakthroughs this week", "new movies this
+    // year") leaving these in distinctive_terms/core_topic_terms makes the ranker
+    // reward pages that merely contain the word "recent" (dictionaries, "Recent —
+    // Design Inspiration", Wiktionary "recent") instead of recent content on the
+    // actual subject. They remain ordinary content words at search time (the
+    // fresh-intent override already keys off them), so stripping them from the
+    // topical-gate sets only fixes the false-topic match. General set; no query bias.
+    // Duplicate "recent"/"new" are already partly in role_descriptor_terms but that
+    // only affects distinctive-term OVERLAP, not the mandatory core-topic gate — so
+    // we exclude them here from BOTH sets to fully anchor relevance on the subject.
+    let temporal_fillers: std::collections::HashSet<&str> = [
+        "recent", "recently", "latest", "lately", "fresh", "current", "currently",
+        "new", "news", "newest", "today", "tonight", "now", "this",
+        "week", "weeks", "month", "months", "year", "years", "day", "days",
+        "past", "last", "upcoming", "update", "updates", "2026", "2025", "2024",
+    ].iter().copied().collect();
+
     let q_words: Vec<&str> = clean_query.split_whitespace().collect();
     let distinctive_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
@@ -5192,6 +5244,7 @@ fn merge_local_and_web(
                 && !unit_terms.contains(lower.as_str())
                 && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
+                && !temporal_fillers.contains(lower.as_str())
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
@@ -5217,6 +5270,7 @@ fn merge_local_and_web(
                 && !meta_action_terms.contains(lower.as_str())
                 && !unit_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
+                && !temporal_fillers.contains(lower.as_str())
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
@@ -5521,6 +5575,31 @@ fn merge_local_and_web(
                     title_lower.contains(&tl) || content_lower.contains(&tl)
                         || title_lower.contains(bare) || content_lower.contains(bare)
                 });
+            // P2b: high-quality local pages that match the query ONLY on comparison
+            // STRUCTURE ("difference between X and Y", "X vs Y") but share NONE of the
+            // query's substantive entity terms are off-topic crawl noise — e.g.
+            // "Difference Between Maven, ANT, Jenkins", "Hedge Fund vs Mutual Fund",
+            // "Orthopedics vs Rheumatology" surfacing for "router vs modem". The
+            // indexer scored them high (they ARE real comparison pages) so the
+            // quality-only P2 gate above spares them, yet they crowd out the
+            // authoritative web result that actually mentions the query's subject.
+            // Crush only comparison-structured local pages missing the query entities.
+            // General: keyed on result structure + substantive-term absence, no domains.
+            let comparison_structure_words: &[&str] = &[
+                "difference", "between", "vs", "versus", "compare", "compared", "comparison",
+            ];
+            let substantive_terms: Vec<String> = distinctive_terms.iter()
+                .map(|t| t.to_lowercase())
+                .filter(|tl| !comparison_structure_words.contains(&tl.as_str()))
+                .filter(|tl| !structure_words.contains(&tl.as_str()))
+                .collect();
+            let mentions_substantive = substantive_terms.iter().any(|t| {
+                title_lower.contains(t) || content_lower.contains(t)
+            });
+            let result_is_comparison_structured =
+                title_lower.contains(" vs ") || title_lower.contains(" versus ")
+                || title_lower.contains("difference between") || title_lower.contains(" compared ");
+            let is_comparison_intent = intent == "comparison" || intent == "technical";
             if r.quality < 0.55 && !topic_mentioned {
                 relevance *= 0.05;
                 tracing::info!(
@@ -5529,6 +5608,13 @@ fn merge_local_and_web(
                 );
             } else if r.quality < 0.75 && !topic_mentioned {
                 relevance *= 0.5;
+            } else if is_comparison_intent && result_is_comparison_structured
+                && !substantive_terms.is_empty() && !mentions_substantive {
+                relevance *= 0.3;
+                tracing::info!(
+                    "LOCAL NOISE GATE (off-topic comparison): '{}' is a comparison page but mentions none of the query entities {:?} -> relevance *= 0.3",
+                    r.title.chars().take(60).collect::<String>(), substantive_terms
+                );
             }
         }
 
@@ -7110,7 +7196,18 @@ async fn main() {
         rate_limits: Arc::new(RateLimitTracker::new()),
         volume_tracker: ResultVolumeTracker::new(),
         http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))  // Allow up to 10s for external engines (VPN/Tor overhead)
+            // 25s for external engines. Tor2 (SearXNG2 / Tor) cold-circuit builds
+            // after a NEWNYM IP rotation take 10-15s to answer (see tor-warmup
+            // path, which already uses a 25s client). A 10s cap classified those
+            // cold-circuit Tor responses as `instance request failed ... TimedOut`,
+            // and two such hits tripped the circuit breaker (`Circuit OPEN` for
+            // engine 'searxng1'), silently skipping the entire Tor path for up to
+            // 30s — collapsing the "two independent egress paths" design to one.
+            // Raising to 25s lets the slow-but-valid Tor response through so both
+            // paths genuinely serve (self-heals once the circuit is warm). The
+            // per-branch budget (searx_fut) and the fan-out join deadline still
+            // bound end-to-end latency for the fast (gluetun-VPN) path.
+            .timeout(Duration::from_secs(25))  // Allow up to 25s for external engines (VPN/Tor overhead, cold Tor circuit)
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .pool_max_idle_per_host(128)
             .connect_timeout(Duration::from_secs(1))
@@ -8364,6 +8461,9 @@ async fn handle_search(
     let has_site = !constraints.sites.is_empty();
     let searx_partial_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let partial_collector_inner = searx_partial_collector.clone();
+    // Captured by value before `searx_fut_with_timeout` moves `searx_urls` into its
+    // async block. Used at the fan-out JOIN to pick a Tor-aware deadline.
+    let tor2_in_fanout = searx_urls.iter().any(|u| u.contains("tor2") || u.contains("8081"));
     let searx_fut_with_timeout = async move {
         use futures::future::FutureExt;
 
@@ -8540,14 +8640,30 @@ async fn handle_search(
         indexer_task,
         // ⚠️  NOTE: tokio::time::timeout cancels the inner future, which drops any
         // partial results already collected by searx_fut_with_timeout (from faster
-        // SearXNG instances that completed within the 5s window). This means on
-        // timeout we return Vec::new() for SearXNG — we don't preserve partial
-        // results. The ROADMAP.md "Return early + merge stragglers" plan item
+        // SearXNG instances that completed within the window). On timeout we fall
+        // back to the partial collector (results the faster instances already
+        // returned). The ROADMAP.md "Return early + merge stragglers" plan item
         // describes the proper fix: return completed results immediately and merge
         // slow instances' results in the background.
+        //
+        // The join deadline is Tor-aware: the gluetun-VPN (SearXNG1) instance is
+        // bounded ~4.2s and the fan-out early-returns at 15 results, so a 5s join
+        // is plenty for it. BUT the SearXNG2/Tor (tor2) instance runs over an
+        // independent Tor circuit whose COLD build (after a NEWNYM rotation) takes
+        // 10-15s; its own branch budget is 15s (see is_tor_url branch_timeout_ms)
+        // and the per-instance attempt budget is 10s (non-site). A flat 5s join cut
+        // the legitimate slow Tor response before it arrived, discarding the whole
+        // second egress path. When tor2 is in the fan-out we extend the join to 15s
+        // so its valid results are captured instead of dropped (the partial collector
+        // is still used if even 15s is exceeded). Fast-path behaviour is unchanged.
         async {
             let partial_collector_ref = searx_partial_collector.clone();
-            match tokio::time::timeout(Duration::from_secs(5), searx_fut_with_timeout).await {
+            let join_deadline = if tor2_in_fanout {
+                Duration::from_secs(15)
+            } else {
+                Duration::from_secs(5)
+            };
+            match tokio::time::timeout(join_deadline, searx_fut_with_timeout).await {
                 Ok(res) => {
                     if res.is_empty() {
                         let mut guard = partial_collector_ref.lock().unwrap();
@@ -8558,7 +8674,7 @@ async fn handle_search(
                     res
                 }
                 Err(_) => {
-                    tracing::warn!("SearXNG fan-out exceeded 5s deadline; preserving partial results from completed instances");
+                    tracing::warn!("SearXNG fan-out exceeded {}s deadline; preserving partial results from completed instances", join_deadline.as_secs());
                     let mut guard = partial_collector_ref.lock().unwrap();
                     std::mem::take(&mut *guard)
                 }
@@ -8861,11 +8977,15 @@ async fn handle_search(
         }
 
         // Override 7: weather / forecast queries → fresh
+        // WHOLE-WORD match only: a naive `contains("rain")` wrongly fired inside
+        // "fe**rain**al" (a rescue-cat query) and forced fresh intent on a how-to
+        // question, which then re-ranked results by recency instead of relevance.
+        // Use the same `q_has_word` boundary helper that guards "fresh"/"latest".
         let weather_signals = [
             "weather", "forecast", "temperature", "rain", "snow", "humidity",
             "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
         ];
-        let has_weather_signal = weather_signals.iter().any(|s| q_lower.contains(s));
+        let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
         if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
@@ -9746,10 +9866,24 @@ async fn handle_search(
             ok
         }).count();
         // (A) no dates at all, or (B) all dated-but-out-of-range -> would empty.
-        if survivors_after_window == 0 {
+        // (C) RESIDUAL P6: the window keeps SOME results but crushes the set
+        //     pathologically (e.g. date-less upstream snippets for "latest X this
+        //     week" → 8/9 dropped, 1 survives = 11%). A near-empty result set is
+        //     the same user-facing failure as a zero one: relevant, date-less
+        //     results get discarded in favour of a single stale-but-dated item.
+        //     Fail-open when the surviving fraction is below a general 25% floor
+        //     AND the surviving count is too small to be useful (< 3). This is
+        //     keyed on survival ratio, not on any query/window, so it stays general.
+        let survivor_fraction = if pre_filter_count > 0 {
+            survivors_after_window as f32 / pre_filter_count as f32
+        } else {
+            1.0
+        };
+        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.25;
+        if survivors_after_window == 0 || fraction_too_low {
             tracing::info!(
-                "DATE WINDOW FAIL-OPEN (would-empty): {} web results but 0 would survive the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
-                pre_filter_count, dated_result_count
+                "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
+                pre_filter_count, survivors_after_window, survivor_fraction, dated_result_count
             );
             intent.structured_constraints.after_date = None;
             intent.structured_constraints.before_date = None;
@@ -10398,8 +10532,8 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     if c == '.' || c == '-' || c == '_' {
                         if i > 0
                             && i + 1 < chars.len()
-                            && chars[i-1].is_alphanumeric()
-                            && chars[i+1].is_alphanumeric()
+                            && chars[i - 1].is_alphanumeric()
+                            && chars[i + 1].is_alphanumeric()
                         {
                         } else {
                             out.push(c);
@@ -11508,6 +11642,37 @@ mod constraint_fix_tests {
         assert!(query_is_contrastive("versus-mode ranking not python"));
         assert!(query_is_contrastive("alternatives-market report not django"));
         assert!(query_is_contrastive("replacement-parts list not flask"));
+    }
+
+    #[test]
+    fn p9_except_exclusion_is_contrastive_and_extracted() {
+        // P9: "except" is an unambiguous single-marker exclusion. A single
+        // "<except> X" with a NON-protected target (react) must be recognized as
+        // contrastive framing AND extracted as a real exclusion. Before the fix,
+        // `query_is_contrastive` returned false (CONTRASTIVE_MARKERS lacked
+        // "except"), so `is_real_exclusion("react", false)` declined it and the
+        // gateway returned `constraints: null` — React pages dominated the result
+        // set instead of being filtered out. (Only happened to "work" for targets
+        // already in PROTECTED_TERMS like vim/ubuntu/tailwind.)
+        assert!(
+            query_is_contrastive("javascript framework except react"),
+            "'except' must flag contrastive framing"
+        );
+        assert_eq!(
+            extract_query_negative_terms("javascript framework except react"),
+            vec!["react".to_string()],
+            "'javascript framework except react' must exclude react"
+        );
+        // Also covers 'excluding'/'minus' variants (same structural class).
+        assert!(
+            query_is_contrastive("search engine excluding google"),
+            "'excluding' must flag contrastive framing"
+        );
+        assert_eq!(
+            extract_query_negative_terms("text editor minus vim"),
+            vec!["vim".to_string()],
+            "'text editor minus vim' must exclude vim"
+        );
     }
 
     #[test]
