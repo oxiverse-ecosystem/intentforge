@@ -6181,6 +6181,26 @@ fn merge_local_and_web(
         relevance_vec.push(relevance);
     }
 
+    // ── Adult-intent + adult-marker detection (lifted above the off-topic drop) ──
+    // Computed once here so BOTH the off-topic hard-drop below and the adult
+    // hard-drop further down can use it without re-detecting. The adult host/path
+    // lists are the curated static safety blocklist — accepted exception to the
+    // no-hardcoding rule (never runtime-data-driven).
+    let q_lc_adult = clean_query.to_lowercase();
+    let adult_intent = q_lc_adult.contains("porn") || q_lc_adult.contains("xxx")
+        || q_lc_adult.contains("nsfw") || q_lc_adult.contains("adult video")
+        || q_lc_adult.contains("adult film") || q_lc_adult.contains("sex video")
+        || q_lc_adult.contains("pornhub") || q_lc_adult.contains("xvideos")
+        || q_lc_adult.contains("onlyfans");
+    let adult_hosts: &[&str] = &[
+        "xvideos", "xnxx", "pornhub", "xhamster", "youporn", "redtube",
+        "txxx", "fpo.xxx", "watchon.me", "spankbang", "brazzers",
+        "porn", "adultfriendfinder", "onlyfans", "chaturbate", "livejasmin",
+        "cam4", "myfreecams", "beeg", "porntube", "eporner",
+        "pornhd", "tube8", "xtube", "heavy-r", "efukt", "porzo",
+    ];
+    let adult_paths: &[&str] = &["/porn/", "/xxx/", "/adult/", "/nsfw/", "/sex/", "/porno/"];
+
     // ── Off-topic hard-drop (round-6 D1 LOCAL sole-survivor case; extended to WEB this round) ──
     // A result (local OR web) whose title/content/url shares ZERO of the query's
     // distinctive topic terms is off-topic (e.g. a crawler-indexed
@@ -6200,6 +6220,28 @@ fn merge_local_and_web(
     if !strong_distinctive_terms.is_empty() {
         let before = merged.len();
         merged.retain(|r| {
+            // Adult exemption: when the query is explicitly adult, an adult result
+            // must survive the off-topic gate — the adult block below keeps it
+            // intentionally. Without this, the web off-topic drop would remove the
+            // adult URL first (it shares zero food/recipe/etc. distinctive terms),
+            // regressing "adult kept for explicit-adult query".
+            if adult_intent {
+                let ul = r.url.to_lowercase();
+                let tl = r.title.to_lowercase();
+                let host = reqwest::Url::parse(&r.url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                    .unwrap_or_default();
+                let tld_adult = host.ends_with(".xxx");
+                let host_adult = adult_hosts.iter().any(|h| host.contains(h));
+                let path_adult = adult_paths.iter().any(|p| ul.contains(p));
+                let title_adult = tl.contains("porn") || tl.contains("xxx ")
+                    || tl.contains("nude") || tl.contains("naked")
+                    || tl.contains("sex video") || tl.contains("adult film");
+                if tld_adult || host_adult || path_adult || title_adult {
+                    return true;
+                }
+            }
             let tl = r.title.to_lowercase();
             let cl = r.content.to_lowercase();
             let ul = r.url.to_lowercase();
@@ -6221,28 +6263,11 @@ fn merge_local_and_web(
     // innocuous "improve deep sleep without medication" query — a content-safety
     // failure. There is no upstream SafeSearch guarantee we can rely on, so we drop
     // adult results at ranking time UNLESS the user explicitly sought adult content.
-    // curated static safety blocklist — accepted exception to the no-hardcoding rule;
-    // never make this runtime-data-driven. Adult TLDs (.xxx), known adult host
-    // substrings, and /porn/ /xxx/ /adult/ path markers are dropped at ranking time
-    // UNLESS the user explicitly sought adult content. An explicit-adult query
-    // (contains "porn"/"xxx"/"nsfw"/"adult video"/"sex video") keeps adult results;
-    // everything else drops them.
+    // The adult host/path lists are the curated static safety blocklist — accepted
+    // exception to the no-hardcoding rule; never runtime-data-driven. An explicit-adult
+    // query keeps adult results; everything else drops them.
     {
-        let q_lc = clean_query.to_lowercase();
-        let adult_intent = q_lc.contains("porn") || q_lc.contains("xxx")
-            || q_lc.contains("nsfw") || q_lc.contains("adult video")
-            || q_lc.contains("adult film") || q_lc.contains("sex video")
-            || q_lc.contains("pornhub") || q_lc.contains("xvideos")
-            || q_lc.contains("onlyfans");
         if !adult_intent {
-            let adult_hosts: &[&str] = &[
-                "xvideos", "xnxx", "pornhub", "xhamster", "youporn", "redtube",
-                "txxx", "fpo.xxx", "watchon.me", "spankbang", "brazzers",
-                "porn", "adultfriendfinder", "onlyfans", "chaturbate", "livejasmin",
-                "cam4", "myfreecams", "beeg", "porntube", "eporner",
-                "pornhd", "tube8", "xtube", "heavy-r", "efukt", "porzo",
-            ];
-            let adult_paths: &[&str] = &["/porn/", "/xxx/", "/adult/", "/nsfw/", "/sex/", "/porno/"];
             let before = merged.len();
             merged.retain(|r| {
                 let ul = r.url.to_lowercase();
