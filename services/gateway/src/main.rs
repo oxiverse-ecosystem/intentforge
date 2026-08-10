@@ -6499,6 +6499,10 @@ fn merge_local_and_web(
         }
     }
 
+    // Re-sort by score descending after post-calibration caps to ensure capped
+    // results (video/dict/weak-match) move below higher-scoring text results.
+    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
     merged
 }
 
