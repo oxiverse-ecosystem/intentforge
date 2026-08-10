@@ -7573,7 +7573,50 @@ async fn handle_spellcheck(
             })),
         );
     }
-    let result = spellcheck_query(&state.spell_index, &q);
+
+    // Reject excessively long queries before doing correction work.
+    // 500 characters is ~100 words, far beyond typical search queries.
+    const MAX_QUERY_LENGTH: usize = 500;
+    if q.len() > MAX_QUERY_LENGTH {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "query_too_long",
+                "message": format!("Query exceeds maximum length of {} characters", MAX_QUERY_LENGTH),
+                "results": [],
+                "query": q,
+                "corrected": "",
+                "changed": false,
+                "corrections": []
+            })),
+        );
+    }
+
+    // Execute spellcheck work through spawn_blocking to avoid blocking the async
+    // runtime with synchronous dictionary lookups and string operations.
+    let spell_index = state.spell_index.clone();
+    let q_clone = q.clone();
+    let result = match tokio::task::spawn_blocking(move || {
+        spellcheck_query(&spell_index, &q_clone)
+    }).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Spellcheck task failed for query '{}': {:?}", q, e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "spellcheck_failed",
+                    "message": "Spellcheck operation failed internally; please retry",
+                    "results": [],
+                    "query": q,
+                    "corrected": "",
+                    "changed": false,
+                    "corrections": []
+                })),
+            );
+        }
+    };
+
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -8964,12 +9007,15 @@ async fn handle_search(
         // and the per-instance attempt budget is 10s (non-site). A flat 5s join cut
         // the legitimate slow Tor response before it arrived, discarding the whole
         // second egress path. When tor2 is in the fan-out we extend the join to 15s
-        // so its valid results are captured instead of dropped (the partial collector
-        // is still used if even 15s is exceeded). Fast-path behaviour is unchanged.
+        // for the request itself, PLUS the 12s warm-up wait budget (so tor2 gets
+        // the full 15s for its request even after waiting for warm-up), so its valid
+        // results are captured instead of dropped (the partial collector is still
+        // used if even 27s is exceeded). Fast-path behaviour is unchanged.
         async {
             let partial_collector_ref = searx_partial_collector.clone();
             let join_deadline = if tor2_in_fanout {
-                Duration::from_secs(15)
+                // 15s for tor2 request + 12s max warm-up wait = 27s total
+                Duration::from_secs(27)
             } else {
                 Duration::from_secs(5)
             };
