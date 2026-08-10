@@ -517,18 +517,23 @@ constants.
 }
 ```
 
-> **Verified (this round, 2026-08-10T1401Z):** the endpoint reuses the same pure
-> functions `/search` runs (no network, deterministic). Examples below were
-> executed against the live dev stack at `localhost:4000` (gateway rebuilt at the
-> round's feature commit). A contrastive `not X` → `negation.exclusions=[X]` with
-> `contrastive_framing:true` (e.g. `javascript not java not typescript` →
-> `["java","typescript"]`). A manner phrase `without an oven` →
-> `negation.manner_qualifiers=["oven"]`, `exclusions=[]`. A fresh phrase `latest
-> AI news this week` → `recency.phrase_detected:true` with a non-null `window`.
-> Operators are parsed into `applied_constraints` verbatim (`site:github.com`,
-> `filetype:rs`). A typo query → `spelling.changed:true` with the same corrections
-> `/spellcheck` returns. The transparency invariant holds: every negation candidate
-> appears in exactly one negation bucket.
+> **Verified (this round, 2026-08-10T1401Z):** every claim below was executed
+> against the live dev stack at `localhost:4000` (gateway rebuilt at the round's
+> feature commit `ca4362c`/`ea11acd`). All 6 cases returned `200` unless noted. The
+> endpoint reuses the same pure functions `/search` runs (no network, deterministic).
+>
+> | Query | What was observed |
+> |-------|-------------------|
+> | `python web framework not django` | `negation.exclusions:["django"]`, but `contrastive_framing:false` (plain `not X` without compare/versus framing); `constraints.applied_constraints:["lang:en"]` (plain words are not operator-extracted, and `django` is a negation *exclusion*, not a `+django` positive); `intent: informational`, `confidence: 0.3`. |
+> | `javascript not java not typescript` | `contrastive_framing:true`, `negation.exclusions:["java","typescript"]`, `declined:[]`, `manner_qualifiers:[]`. |
+> | `best way to cook salmon without an oven` | `negation.manner_qualifiers:["oven"]`, `exclusions:[]`, `declined:[]` — the manner HOW-not-WHAT term is correctly NOT excluded. |
+> | `latest AI news this week` | `recency.phrase_detected:true`, `recency.window:{"after":"2026-08-03","before":"2026-08-10"}`; `applied_constraints` also gained `after:2026-08-03`, `before:2026-08-10`. |
+> | `rust async web framework site:github.com filetype:rs` | `applied_constraints:["lang:en","site:github.com","filetype:rs"]`; `structured.sites:["github.com"]`, `structured.file_types:["rs"]`. |
+> | `pythn programing langauge` | `spelling.changed:true`, `spelling.corrected:"python programming language"`, 3 `corrections` (`pythn→python`, `programing→programming`, `langauge→language`). |
+> | `openai rust tutorial` | `spelling.changed:false`, `corrections:[]` — protected brand terms are never "corrected" (shared protected-term set, no hardcoded allow list). |
+>
+> The transparency invariant holds: every negation candidate appears in exactly one
+> negation bucket (`exclusions` / `declined` / `manner_qualifiers`).
 
 **Empty query** returns `400` with the standard error envelope (same shape as `/search`, `/spellcheck`, `/analyze`):
 
@@ -539,7 +544,7 @@ constants.
 **Notes**
 - Pure function of the query + the loaded signal state; no per-query tuned constants, no domain allow/deny lists, no magic constants.
 - The endpoint is additive — it does not change `/search` ranking, negation gating, or calibration. It is a read-only preview of the existing engine path, generalized to the full pipeline.
-- A test (`inspect_endpoint_shape_matches_docs` + 6 behavior tests) locks the shape and the negation/constraints/recency/spelling/quality contracts; the 7 tests are pure-fn (`build_inspect`) and run via `cargo test -p gateway` on the GitHub Actions runner.
+- The feature commit `ca4362c` added 6 inspect tests (`inspect_endpoint_shape_matches_docs` + 5 behavior tests) locking the shape and the negation/constraints/recency/spelling/quality contracts; this docs pass adds a 7th (`inspect_pure_fn_handles_empty_input_safely`) covering the pure-fn path behind the documented `400` empty_query envelope. All 7 are pure-fn (`build_inspect`) and run via `cargo test -p gateway` on the GitHub Actions runner (no live server needed). CI verified this round: 81 tests passed, 0 failed.
 
 ```bash
 # See the full /search reasoning surface for a query in one call
@@ -1103,6 +1108,9 @@ curl -s "https://api.oxiverse.com/search?q=rust+progamming" | jq '{query, spell_
 
 # Inspect the negation gate (DEFECT A transparency)
 curl -s "http://localhost:4000/analyze?q=javascript+not+java+not+typescript" | jq '{contrastive_framing, exclusions, declined, manner_qualifiers}'
+
+# Inspect the FULL /search reasoning surface in one additive call (no fetch)
+curl -s "http://localhost:4000/inspect?q=best+way+to+cook+salmon+without+an+oven" | jq '{negation, recency, intent}'
 
 # Get pagination metadata
 curl -s "https://api.oxiverse.com/search?q=python&limit=5" | jq '{total, limit, offset, has_more}'
