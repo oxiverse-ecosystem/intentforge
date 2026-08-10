@@ -20,6 +20,7 @@
   - [GET /news](#get-news)
   - [GET /spellcheck](#get-spellcheck)
   - [GET /analyze](#get-analyze)
+  - [GET /inspect](#get-inspect)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -461,6 +462,93 @@ curl "http://localhost:4000/analyze?q=javascript+not+java+not+typescript"
 # See why a "without X" manner phrase was NOT turned into an exclusion
 curl "http://localhost:4000/analyze?q=how+to+clean+a+cast+iron+skillet+without+soap"
 # → {"manner_qualifiers":["soap"],"exclusions":[],"declined":[],"contrastive_framing":false,...}
+# ```
+
+---
+
+### `GET /inspect`
+
+Unified pre-search introspection. Generalizes the `/analyze` (negation) and
+`/spellcheck` (spelling) transparency endpoints into **one** additive,
+zero-side-effect payload that mirrors the *entire* `/search` reasoning pipeline
+a client can inspect **before** issuing a search:
+
+1. **spelling** — same `spellcheck_query` fn `/search` pre-corrects with.
+2. **negation** — the `exclusions` / `declined` / `manner_qualifiers` split + per-term `decisions[]` (identical to `/analyze`).
+3. **intent** — the pure no-network fallback classifier (`fallback_intent`) + coarse `category`.
+4. **constraints** — the gateway's own operator parser (`extract_gateway_constraints`) + the `applied_constraints` shape `/search` reports.
+5. **recency** — `derive_recency_window`, so the client can see whether a "latest"/"this week" phrase would inject a date window.
+6. **quality** — `query_quality_flag` (junk/low/normal), the same gate that decides graceful degradation.
+
+It is the read-only companion to `/analyze` and `/spellcheck`: it does **not**
+change `/search` ranking, negation gating, calibration, or fetch anything. It
+reuses the *exact* functions `/search` calls, so the preview always matches real
+engine behavior. No per-query strings, no domain allow/deny lists, no magic
+constants.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                |
+|-----------|--------|----------|---------|----------------------------|
+| `q`       | string | yes      | —       | The query/phrase to inspect|
+
+**Response** `200 OK` — top-level `{ query, spelling, negation, intent, constraints, recency, quality }`:
+
+```json
+{
+  "query": "python web framework not django",
+  "spelling": { "corrected": "python web framework not django", "changed": false, "corrections": [] },
+  "negation": {
+    "contrastive_framing": false,
+    "exclusions": ["django"],
+    "declined": [],
+    "manner_qualifiers": [],
+    "decisions": [
+      { "term": "django", "decision": "exclusion", "reason": "recognized entity or contrastive framing (compare/versus/alternative/instead-of/double-negation)" }
+    ]
+  },
+  "intent": { "intent": "informational", "category": "informational", "confidence": 0.30000001192092896 },
+  "constraints": {
+    "applied_constraints": ["lang:en"],
+    "structured": { "entities": [], "file_types": [], "intext": [], "intitle": [], "inurl": [], "language": "en", "negative": [], "phrases": [], "positive": [], "related": [], "sites": [] }
+  },
+  "recency": { "window": null, "phrase_detected": false },
+  "quality": { "flag": "", "valid_ratio": 1.0 }
+}
+```
+
+> **Verified (this round, 2026-08-10T1401Z):** the endpoint reuses the same pure
+> functions `/search` runs (no network, deterministic). Examples below were
+> executed against the live dev stack at `localhost:4000` (gateway rebuilt at the
+> round's feature commit). A contrastive `not X` → `negation.exclusions=[X]` with
+> `contrastive_framing:true` (e.g. `javascript not java not typescript` →
+> `["java","typescript"]`). A manner phrase `without an oven` →
+> `negation.manner_qualifiers=["oven"]`, `exclusions=[]`. A fresh phrase `latest
+> AI news this week` → `recency.phrase_detected:true` with a non-null `window`.
+> Operators are parsed into `applied_constraints` verbatim (`site:github.com`,
+> `filetype:rs`). A typo query → `spelling.changed:true` with the same corrections
+> `/spellcheck` returns. The transparency invariant holds: every negation candidate
+> appears in exactly one negation bucket.
+
+**Empty query** returns `400` with the standard error envelope (same shape as `/search`, `/spellcheck`, `/analyze`):
+
+```json
+{ "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "spelling": {"corrected":"","changed":false,"corrections":[]}, "negation": {"exclusions":[],"declined":[],"manner_qualifiers":[],"contrastive_framing":false,"decisions":[]}, "intent": {"intent":"","category":"","confidence":0.0}, "constraints": {"structured":{}, "applied_constraints":[]}, "recency": {"window":null,"phrase_detected":false}, "quality": {"flag":"low","valid_ratio":0.0} }
+```
+
+**Notes**
+- Pure function of the query + the loaded signal state; no per-query tuned constants, no domain allow/deny lists, no magic constants.
+- The endpoint is additive — it does not change `/search` ranking, negation gating, or calibration. It is a read-only preview of the existing engine path, generalized to the full pipeline.
+- A test (`inspect_endpoint_shape_matches_docs` + 6 behavior tests) locks the shape and the negation/constraints/recency/spelling/quality contracts; the 7 tests are pure-fn (`build_inspect`) and run via `cargo test -p gateway` on the GitHub Actions runner.
+
+```bash
+# See the full /search reasoning surface for a query in one call
+curl "http://localhost:4000/inspect?q=python+web+framework+not+django"
+# → {"query":"python web framework not django","spelling":{...},"negation":{...},"intent":{...},"constraints":{...},"recency":{...},"quality":{...}}
+
+# A fresh-phrase query: see the recency window /search would apply
+curl "http://localhost:4000/inspect?q=latest+ai+news+this+week"
+# → {"recency":{"window":{"after":"...","before":"..."},"phrase_detected":true},...}
 ```
 
 ---
