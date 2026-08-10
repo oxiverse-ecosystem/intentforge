@@ -18,6 +18,8 @@
   - [GET /images](#get-images)
   - [GET /videos](#get-videos)
   - [GET /news](#get-news)
+  - [GET /spellcheck](#get-spellcheck)
+  - [GET /analyze](#get-analyze)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -359,6 +361,110 @@ News search via SearXNG (`categories=news`). Returns a flat list with `published
 
 ---
 
+### `GET /spellcheck`
+
+Spelling-correction preview. Exposes the engine's in-process SymSpell + LinSpell index (the same one `/search` uses to auto-correct) as a standalone "did you mean?" service, so a client can warn the user *before* issuing a search. No LLM, no network, no extra indexing — it reads the dictionary that is already built at gateway startup.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                |
+|-----------|--------|----------|---------|----------------------------|
+| `q`       | string | yes      | —       | The query/phrase to check  |
+
+**Response** `200 OK` — top-level `{ query, corrected, changed, corrections[] }`:
+
+```json
+{
+  "query": "pythn programing langauge",
+  "corrected": "python programming language",
+  "changed": true,
+  "corrections": [
+    { "original": "pythn", "suggestion": "python", "in_dictionary": false },
+    { "original": "programing", "suggestion": "programming", "in_dictionary": true },
+    { "original": "langauge", "suggestion": "language", "in_dictionary": false }
+  ]
+}
+```
+
+> **Verified (this round, 2026-08-09):** a typo string returns `changed: true` with a `correction` per changed token. Protected brands/tech terms (`openai`, `rust`, `kubernetes`, …) are never "corrected" — `"openai rust tutorial"` returns `changed: false` and an empty `corrections` array. URL tokens, code tokens (`.` `/` `@` `#` `$` or containing a digit), and very short words (< 4 chars) are skipped by the corrector and **omitted entirely from the `corrections` array** — the endpoint only lists tokens it actually proposed fixing, so the client never flags skipped tokens as typos. They are still preserved verbatim in the whole-query `corrected` string. The `corrected` string matches what `/search` runs for the same query (verified 2026-08-09: `/spellcheck?q=pythn+programing+langauge` → `corrected: "python programming language"`, and `/search?q=pythn+programing+langauge` returns `"query":"python programming language"`). Example: `/spellcheck?q=pythn+kubernetes.io` returns `changed:true` with `corrections` containing **only** `pythn→python` (the `kubernetes.io` URL token is skipped and absent from `corrections`, but retained in `corrected`).
+
+**Empty query** returns `400` with the standard error envelope (same shape as `/search`):
+
+```json
+{ "error": "empty_query", "message": "Query parameter 'q' is empty", "results": [], "query": "", "corrected": "", "changed": false, "corrections": [] }
+```
+
+**Notes**
+- Pure function of the query + the built dictionary; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, negation gating, or calibration. It is a read-only preview of the existing correction path.
+
+```bash
+# See what the engine would correct in a query
+curl "http://localhost:4000/spellcheck?q=pythn+programing+langauge"
+# → {"query":"pythn programing langauge","corrected":"python programming language","changed":true,"corrections":[...]}
+```
+
+---
+
+### `GET /analyze`
+
+Engine-introspection endpoint for the query negation / `is_real_exclusion` gate (DEFECT A transparency). Exposes the same extraction + gating functions `/search` runs (`extract_query_negative_terms_with_dropped` + `is_real_exclusion`) as inspectable JSON, so a client can see **why** a negative term was kept as a search exclusion, declined as an unrecognized entity, or dropped as a HOW-not-WHAT manner qualifier. No LLM, no network — it is a pure function of the query over the already-loaded signal state.
+
+This is the read-only companion to `/spellcheck`: it does **not** change `/search` ranking, negation gating, or calibration. It only makes the engine's negation reasoning *legible*. (The actual DEFECT A ranking behavior — a `without oven` query still ranking "Cook Salmon IN the Oven" at the top — is **not** fixed by this endpoint; `/analyze` surfaces the cause so a future fix is observable and testable.)
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                |
+|-----------|--------|----------|---------|----------------------------|
+| `q`       | string | yes      | —       | The query/phrase to analyze|
+
+**Response** `200 OK` — top-level `{ query, contrastive_framing, exclusions[], declined[], manner_qualifiers[], decisions[] }`:
+
+- `exclusions` — terms kept as real search exclusions (recognized entity or contrastive framing).
+- `declined` — negation candidates the gate declined (neither a recognized entity nor in contrastive framing — kept to avoid penalizing unrelated topical words).
+- `manner_qualifiers` — HOW-not-WHAT terms (e.g. `without soap`) the engine deliberately does NOT exclude.
+- `contrastive_framing` — `true` when the query reads as a compare/versus/alternative/instead-of/double-negation expression.
+- `decisions[]` — one per candidate term, each `{ term, decision, reason }`, covering every negation candidate exactly once (never silently dropped).
+
+```json
+{
+  "query": "javascript not java not typescript",
+  "contrastive_framing": true,
+  "exclusions": ["java", "typescript"],
+  "declined": [],
+  "manner_qualifiers": [],
+  "decisions": [
+    { "term": "java", "decision": "exclusion", "reason": "recognized entity or contrastive framing (compare/versus/alternative/instead-of/double-negation)" },
+    { "term": "typescript", "decision": "exclusion", "reason": "recognized entity or contrastive framing (compare/versus/alternative/instead-of/double-negation)" }
+  ]
+}
+```
+
+> **Verified (this round, 2026-08-10):** all examples below were executed against the live dev stack at `localhost:4000` (gateway rebuilt at commit `c31cea0`). Contrastive `not X` → `exclusions` with `contrastive_framing: true` (e.g. `javascript not java not typescript` → `["java","typescript"]`). A manner phrase `without soap` → `manner_qualifiers` with empty `exclusions`/`declined` (`how to clean a cast iron skillet without soap after cooking eggs` → `["soap"]`). A generic `not spicy` with no contrastive framing → `declined` (`best spicy ramen not spicy` → `["spicy"]`). The DEFECT A trigger `best way to cook salmon without an oven` → `manner_qualifiers: ["oven"]` — the root cause is now *visible* instead of silent. The transparency invariant holds: every negation candidate appears in exactly one bucket.
+
+**Empty query** returns `400` with the standard error envelope (same shape as `/search` and `/spellcheck`):
+
+```json
+{ "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "exclusions": [], "declined": [], "manner_qualifiers": [] }
+```
+
+**Notes**
+- Pure function of the query + the loaded signal state; no per-query tuned constants, no domain allow/deny lists, no magic constants.
+- The endpoint is additive — it does not change `/search` ranking, negation gating, or calibration. It is a read-only preview of the existing negation path.
+- A test (`analyze_endpoint_exposes_negation_decisions`) locks the bucket-routing behavior; the gateway suite is 80/80 passing.
+
+```bash
+# Inspect how the engine gated a query's negation terms
+curl "http://localhost:4000/analyze?q=javascript+not+java+not+typescript"
+# → {"query":"javascript not java not typescript","contrastive_framing":true,"exclusions":["java","typescript"],"declined":[],"manner_qualifiers":[],"decisions":[...]}
+
+# See why a "without X" manner phrase was NOT turned into an exclusion
+curl "http://localhost:4000/analyze?q=how+to+clean+a+cast+iron+skillet+without+soap"
+# → {"manner_qualifiers":["soap"],"exclusions":[],"declined":[],"contrastive_framing":false,...}
+```
+
+---
+
 ## Query Parameters
 
 All search endpoints accept the following standard parameters:
@@ -556,6 +662,8 @@ The engine prevents false-positive hits for negative constraints:
 - `vscode` → also matches `"vs code"`, `"visual studio code"`
 - `google workspace` → also matches `"gsuite"`, `"google docs"`, etc.
 
+**Inspecting the gate:** the same extraction + `is_real_exclusion` decision is exposed read-only by `GET /analyze` (see [endpoint reference](#get-analyze)). Use it to confirm whether a negative phrase was turned into a real exclusion, declined as an unrecognized entity, or dropped as a HOW-not-WHAT manner qualifier (e.g. `without soap`).
+
 ---
 
 ## Spell Correction
@@ -570,7 +678,7 @@ The API automatically detects and corrects spelling errors in queries using a tw
 **Protection against false positives:**
 - Protected brand/tech terms (`openai`, `kubernetes`, `podman`, etc.) are NEVER corrected
 - Tech terms with unusual character bigrams (e.g. `"podman"`) are not English-ified
-- Short words (< 3 chars) and known 3-letter terms are left unchanged
+- Short words (< 4 chars; `MIN_CORRECT_LENGTH`) and known 3-letter terms are left unchanged
 - URLs, code terms, and words with numbers/special characters are never touched
 - Single-character substitutions between two natural-looking words are blocked (prevents `"ramen"` → `"raven"`)
 
@@ -904,6 +1012,9 @@ curl -s "https://api.oxiverse.com/search?q=how+to+deploy+docker" | jq '{intent, 
 
 # Get spell correction info
 curl -s "https://api.oxiverse.com/search?q=rust+progamming" | jq '{query, spell_corrected_query}'
+
+# Inspect the negation gate (DEFECT A transparency)
+curl -s "http://localhost:4000/analyze?q=javascript+not+java+not+typescript" | jq '{contrastive_framing, exclusions, declined, manner_qualifiers}'
 
 # Get pagination metadata
 curl -s "https://api.oxiverse.com/search?q=python&limit=5" | jq '{total, limit, offset, has_more}'
