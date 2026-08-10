@@ -6530,6 +6530,40 @@ fn merge_local_and_web(
                 continue;
             }
 
+            // (b0) POST-CALIBRATION VIDEO CAP (P8, durable).
+            // The in-loop P8 dampening (r.score *= video_mult; video_mult=0.08 for a
+            // generic text query) is DEFEATED by calibrate_scores, which rescales the
+            // WHOLE set onto [0.05,1.0] AFTER that multiplication. Whenever the only
+            // surviving candidates for a text query are invidious/video snippets, the
+            // rescale stretches the video right back to ~1.0 — so a YouTube tutorial
+            // outranks topical articles (e.g. "messaging app alternative to telegram"
+            // ranked two invidious videos above Signal/Wire write-ups). This cap
+            // re-applies AFTER calibration, so the dampening is durable: videos may
+            // still appear (floor preserved) but can never outrank genuine text
+            // results for a non-video query. Video-intent queries keep full score.
+            let is_video_src = r.sources.iter().any(|s| s == "invidious" || s == "video");
+            if is_video_src {
+                let video_intent = q_lc_cap.contains("video")
+                    || q_lc_cap.contains("youtube")
+                    || q_lc_cap.contains("watch")
+                    || q_lc_cap.contains("tutorial")
+                    || q_lc_cap.contains("animation");
+                if !video_intent {
+                    // 0.12 is below the calibrated top band for real text results
+                    // (~1.0) but above the 0.05 floor, so a video stays present yet
+                    // strictly secondary. Signal-driven (query self-describes intent),
+                    // not tuned to any one query.
+                    let video_cap = 0.12f32;
+                    if r.score > video_cap {
+                        tracing::info!(
+                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source)",
+                            video_cap, r.url.chars().take(60).collect::<String>()
+                        );
+                        r.score = video_cap;
+                    }
+                }
+            }
+
             // (b) single-distinctive-term-only match on a multi-topic query
             if query_has_many_topics {
                 let matched_strong = strong_topics.iter().filter(|t| {
@@ -6550,6 +6584,10 @@ fn merge_local_and_web(
             }
         }
     }
+
+    // Re-sort by score descending after post-calibration caps to ensure capped
+    // results (video/dict/weak-match) move below higher-scoring text results.
+    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     merged
 }
@@ -7297,6 +7335,7 @@ async fn main() {
         .route("/images", get(handle_images))
         .route("/videos", get(handle_videos))
         .route("/news", get(handle_news))
+        .route("/spellcheck", get(handle_spellcheck))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
         .route("/goals/quick", post(goals::handle_quick_roadmap))
@@ -7348,6 +7387,99 @@ fn is_valid_word(w: &str, spell_index: &spell::SymSpellIndex) -> bool {
             // gibberish. Treat it as valid rather than down-ranking the query.
             || part.chars().any(|c| c.is_numeric())
     })
+}
+
+/// Build a data-driven "did you mean" analysis for a raw query string.
+///
+/// Reuses the in-process `SymSpellIndex` (already built once at startup and stored
+/// in `AppState.spell_index`) — no LLM, no network, no per-query hardcoded strings.
+/// For every token we report whether it is a known dictionary word / protected brand
+/// (`in_dictionary`), and, when `correct()` proposes a different word, the suggestion.
+/// The whole-query `corrected` form is produced via the same `correct_query` path the
+/// live `/search` uses, so the preview is consistent with what the engine would search.
+///
+/// This is a pure function of the query + the index; it is exported (and unit-tested)
+/// so behavior is locked independently of the HTTP layer.
+fn spellcheck_query(index: &spell::SymSpellIndex, q: &str) -> serde_json::Value {
+    let words: Vec<&str> = q.split_whitespace().collect();
+    let mut corrections: Vec<serde_json::Value> = Vec::with_capacity(words.len());
+
+    for word in &words {
+        let wl = word.to_lowercase();
+        // Mirror correct_query's skips: URLs/code tokens and very short words are
+        // never corrected, so they are reported as already-fine (in_dictionary=true
+        // conservatively so the client doesn't flag them as typos).
+        let is_code = word.contains('.') || word.contains('/') || word.contains('\\')
+            || word.contains('@') || word.contains('#') || word.contains('$')
+            || word.chars().any(|c| c.is_numeric());
+        if is_code || word.len() < spell::MIN_CORRECT_LENGTH {
+            corrections.push(serde_json::json!({
+                "original": word,
+                "suggestion": null,
+                "in_dictionary": true
+            }));
+            continue;
+        }
+        let in_dict = spell::is_protected_term(&wl) || index.contains_word(&wl);
+        match index.correct(word) {
+            Some(corrected) if corrected != *word => {
+                corrections.push(serde_json::json!({
+                    "original": word,
+                    "suggestion": corrected,
+                    "in_dictionary": in_dict
+                }));
+            }
+            _ => {
+                corrections.push(serde_json::json!({
+                    "original": word,
+                    "suggestion": null,
+                    "in_dictionary": in_dict
+                }));
+            }
+        }
+    }
+
+    let (corrected, changed) = spell::correct_query(index, q.trim());
+    let corrections_array: Vec<serde_json::Value> = corrections
+        .into_iter()
+        .filter(|c| c["suggestion"].is_string())
+        .collect();
+
+    serde_json::json!({
+        "query": q,
+        "corrected": corrected,
+        "changed": changed,
+        "corrections": corrections_array
+    })
+}
+
+/// `GET /spellcheck?q=...` — expose the engine's spelling-correction index as a
+/// preview service so clients can warn users ("did you mean X?") before searching.
+///
+/// No new ranking logic, no per-query hardcoding: it reuses `spell::correct_query`
+/// and the per-token `correct()` used by `/search`, so the preview matches the
+/// engine's actual behavior. JSON envelope mirrors the rest of the API reference.
+async fn handle_spellcheck(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
+    if q.trim().is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "empty_query",
+                "message": "Query parameter 'q' is empty",
+                "results": [],
+                "query": "",
+                "corrected": "",
+                "changed": false,
+                "corrections": []
+            })),
+        );
+    }
+    let result = spellcheck_query(&state.spell_index, &q);
+    (axum::http::StatusCode::OK, Json(result))
 }
 
 fn is_pronounceable(w: &str) -> bool {
@@ -11889,5 +12021,70 @@ mod dns_classifier_tests {
     fn matching_is_case_insensitive() {
         assert!(error_chain_is_dns(&chain(&["outer", "DNS ERROR: SERVFAIL"])));
         assert!(error_chain_is_dns(&chain(&["outer", "No Such Host Is Known"])));
+    }
+}
+
+#[cfg(test)]
+mod spellcheck_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn spellcheck_query_reports_typo_corrections() {
+        let index = spell::SymSpellIndex::build();
+        let res = spellcheck_query(&index, "pythn programing langauge");
+        assert_eq!(res["changed"].as_bool(), Some(true), "expected changed=true for a typo query");
+        assert_eq!(res["corrected"].as_str(), Some("python programming language"));
+        let corr = res["corrections"].as_array().unwrap();
+        assert!(!corr.is_empty(), "expected at least one per-word correction");
+        for c in corr {
+            assert!(c["original"].is_string());
+            assert!(c["suggestion"].is_string());
+            assert!(c["in_dictionary"].is_boolean());
+        }
+    }
+
+    #[test]
+    fn spellcheck_query_keeps_protected_brands() {
+        let index = spell::SymSpellIndex::build();
+        let res = spellcheck_query(&index, "openai rust tutorial");
+        assert_eq!(res["changed"].as_bool(), Some(false));
+        assert_eq!(res["corrected"].as_str(), Some("openai rust tutorial"));
+    }
+
+    #[test]
+    fn spellcheck_query_empty_is_safe() {
+        let index = spell::SymSpellIndex::build();
+        let res = spellcheck_query(&index, "   ");
+        assert_eq!(res["changed"].as_bool(), Some(false));
+        assert_eq!(res["corrected"].as_str(), Some(""));
+        assert!(res["corrections"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn spellcheck_skipped_tokens_are_omitted_not_listed() {
+        // URL/code tokens (<4 chars, contain '.'/'/'/'@'/'#'/'$' or a digit) are
+        // skipped by the corrector and must NOT appear in `corrections` — the
+        // endpoint only lists tokens it proposed fixing. Regression for the
+        // doc claim that skipped tokens would be returned as `in_dictionary:true`.
+        let index = spell::SymSpellIndex::build();
+        let res = spellcheck_query(&index, "pythn kubernetes.io");
+        assert_eq!(res["changed"].as_bool(), Some(true));
+        let corr = res["corrections"].as_array().unwrap();
+        assert_eq!(corr.len(), 1, "exactly the real typo should be listed");
+        assert_eq!(corr[0]["original"].as_str(), Some("pythn"));
+        assert_eq!(corr[0]["suggestion"].as_str(), Some("python"));
+        // The skipped URL token is retained verbatim in the whole-query form.
+        assert_eq!(res["corrected"].as_str(), Some("python kubernetes.io"));
+    }
+
+    #[test]
+    fn spellcheck_short_word_token_is_skipped() {
+        // A <4-char word is below MIN_CORRECT_LENGTH and must be omitted from
+        // `corrections` (not flagged as a typo).
+        let index = spell::SymSpellIndex::build();
+        let res = spellcheck_query(&index, "go rust");
+        assert_eq!(res["changed"].as_bool(), Some(false));
+        assert!(res["corrections"].as_array().unwrap().is_empty());
+        assert_eq!(res["corrected"].as_str(), Some("go rust"));
     }
 }

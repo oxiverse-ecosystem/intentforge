@@ -18,6 +18,7 @@
   - [GET /images](#get-images)
   - [GET /videos](#get-videos)
   - [GET /news](#get-news)
+  - [GET /spellcheck](#get-spellcheck)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -359,6 +360,51 @@ News search via SearXNG (`categories=news`). Returns a flat list with `published
 
 ---
 
+### `GET /spellcheck`
+
+Spelling-correction preview. Exposes the engine's in-process SymSpell + LinSpell index (the same one `/search` uses to auto-correct) as a standalone "did you mean?" service, so a client can warn the user *before* issuing a search. No LLM, no network, no extra indexing — it reads the dictionary that is already built at gateway startup.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                |
+|-----------|--------|----------|---------|----------------------------|
+| `q`       | string | yes      | —       | The query/phrase to check  |
+
+**Response** `200 OK` — top-level `{ query, corrected, changed, corrections[] }`:
+
+```json
+{
+  "query": "pythn programing langauge",
+  "corrected": "python programming language",
+  "changed": true,
+  "corrections": [
+    { "original": "pythn", "suggestion": "python", "in_dictionary": false },
+    { "original": "programing", "suggestion": "programming", "in_dictionary": true },
+    { "original": "langauge", "suggestion": "language", "in_dictionary": false }
+  ]
+}
+```
+
+> **Verified (this round, 2026-08-09):** a typo string returns `changed: true` with a `correction` per changed token. Protected brands/tech terms (`openai`, `rust`, `kubernetes`, …) are never "corrected" — `"openai rust tutorial"` returns `changed: false` and an empty `corrections` array. URL tokens, code tokens (`.` `/` `@` `#` `$` or containing a digit), and very short words (< 4 chars) are skipped by the corrector and **omitted entirely from the `corrections` array** — the endpoint only lists tokens it actually proposed fixing, so the client never flags skipped tokens as typos. They are still preserved verbatim in the whole-query `corrected` string. The `corrected` string matches what `/search` runs for the same query (verified 2026-08-09: `/spellcheck?q=pythn+programing+langauge` → `corrected: "python programming language"`, and `/search?q=pythn+programing+langauge` returns `"query":"python programming language"`). Example: `/spellcheck?q=pythn+kubernetes.io` returns `changed:true` with `corrections` containing **only** `pythn→python` (the `kubernetes.io` URL token is skipped and absent from `corrections`, but retained in `corrected`).
+
+**Empty query** returns `400` with the standard error envelope (same shape as `/search`):
+
+```json
+{ "error": "empty_query", "message": "Query parameter 'q' is empty", "results": [], "query": "", "corrected": "", "changed": false, "corrections": [] }
+```
+
+**Notes**
+- Pure function of the query + the built dictionary; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, negation gating, or calibration. It is a read-only preview of the existing correction path.
+
+```bash
+# See what the engine would correct in a query
+curl "http://localhost:4000/spellcheck?q=pythn+programing+langauge"
+# → {"query":"pythn programing langauge","corrected":"python programming language","changed":true,"corrections":[...]}
+```
+
+---
+
 ## Query Parameters
 
 All search endpoints accept the following standard parameters:
@@ -570,7 +616,7 @@ The API automatically detects and corrects spelling errors in queries using a tw
 **Protection against false positives:**
 - Protected brand/tech terms (`openai`, `kubernetes`, `podman`, etc.) are NEVER corrected
 - Tech terms with unusual character bigrams (e.g. `"podman"`) are not English-ified
-- Short words (< 3 chars) and known 3-letter terms are left unchanged
+- Short words (< 4 chars; `MIN_CORRECT_LENGTH`) and known 3-letter terms are left unchanged
 - URLs, code terms, and words with numbers/special characters are never touched
 - Single-character substitutions between two natural-looking words are blocked (prevents `"ramen"` → `"raven"`)
 
