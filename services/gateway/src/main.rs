@@ -12798,4 +12798,28 @@ mod spellcheck_endpoint_tests {
         let r2 = build_inspect(&index, "how to learn rust programming");
         assert_eq!(r["quality"]["flag"], r2["quality"]["flag"]);
     }
+
+    #[test]
+    fn inspect_pure_fn_handles_empty_input_safely() {
+        // The HTTP handler (`handle_inspect`) returns the `400` empty_query
+        // envelope documented in API_REFERENCE.md for empty/whitespace `q`
+        // (see the endpoint's "Empty query" block). It does so BEFORE calling
+        // `build_inspect`, so this test locks the guarded pure-fn path is
+        // panic-free + well-formed on the exact inputs the handler screens.
+        // This is the regression guard behind the documented 400 — if the
+        // handler ever called `build_inspect("")` directly, it must not panic.
+        let index = spell::SymSpellIndex::build();
+        for q in ["", "   ", "\t", "\n"] {
+            let r = build_inspect(&index, q);
+            // All 7 documented top-level sections must still be present + typed.
+            for section in ["query", "spelling", "negation", "intent", "constraints", "recency", "quality"] {
+                assert!(r.get(section).is_some(), "empty-input missing section: {}", section);
+            }
+            assert!(r["spelling"]["corrections"].is_array());
+            assert!(r["negation"]["decisions"].is_array());
+            assert!(r["constraints"]["applied_constraints"].is_array());
+            // Empty query is scored as low-quality / invalid (matches the 400 body).
+            assert_eq!(r["quality"]["flag"].as_str(), Some("low"));
+        }
+    }
 }
