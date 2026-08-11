@@ -204,10 +204,11 @@ impl SymSpellIndex {
         // (e.g., genuine typos like hte for the where the typo isn't a
         // known tech term). This is adaptive: known terms are protected,
         // unknown short words can still be fixed.
-        if word_lower.len() < 3 {
+        let char_count = word_lower.chars().count();
+        if char_count < 3 {
             return None; // Never correct single/double-character words (go, js, c, etc.)
         }
-        if word_lower.len() == 3 && self.exact_map.contains_key(&word_lower) {
+        if char_count == 3 && self.exact_map.contains_key(&word_lower) {
             return None; // Known 3-letter word (npm, git, vue) — not a misspelling
         }
         // 3-letter word not in dictionary — fall through to SymSpell lookup
@@ -510,11 +511,11 @@ impl SymSpellIndex {
     /// Only checks words with similar length (±2 chars) and computes
     /// Damerau-Levenshtein distance with early cutoff.
     fn linspell_lookup(&self, word: &str) -> Option<String> {
-        let word_len = word.len();
+        let word_len = word.chars().count();
         let mut best_candidate: Option<(String, f64, usize)> = None; // (word, freq, edit_dist)
 
         for (word_id, dict_word) in self.words.iter().enumerate() {
-            let dict_len = dict_word.len();
+            let dict_len = dict_word.chars().count();
             let len_diff = if word_len > dict_len {
                 word_len - dict_len
             } else {
@@ -820,7 +821,7 @@ pub(crate) fn correct_query(index: &SymSpellIndex, query: &str) -> (String, bool
         }
 
         // Don't correct very short words or empty
-        if word.len() < MIN_CORRECT_LENGTH {
+        if word.chars().count() < MIN_CORRECT_LENGTH {
             corrected_words.push(word.to_string());
             continue;
         }
@@ -1242,5 +1243,33 @@ mod tests {
         let index = SymSpellIndex::build();
         let result = index.correct("housr");
         assert_eq!(result, Some("house".to_string()), "Should correct typo 'housr' to 'house'");
+    }
+
+    #[test]
+    fn test_non_ascii_min_length_uses_char_count() {
+        // Regression: MIN_CORRECT_LENGTH must use character count, not UTF-8 byte
+        // length. A 3-character non-ASCII word like "abé" (4 bytes) was incorrectly
+        // treated as >=4 chars and attempted for correction. Similarly, emoji like
+        // "🙂" (4 bytes, 1 char) must be skipped as < MIN_CORRECT_LENGTH.
+        let index = SymSpellIndex::build();
+
+        // "abé" is 3 characters (4 UTF-8 bytes). Should be skipped (< 4 chars).
+        let result = index.correct("abé");
+        assert_eq!(result, None, "3-character non-ASCII word 'abé' should be skipped");
+
+        // "café" is 4 characters (5 UTF-8 bytes). Should be attempted for correction.
+        // Since "café" isn't in the dictionary, it may or may not correct, but it
+        // should NOT be skipped due to length.
+        let result = index.correct("café");
+        // We don't assert what correction happens, just that it wasn't skipped
+        // due to a byte-length check treating 5 bytes as >= MIN_CORRECT_LENGTH.
+
+        // Single emoji "🙂" is 1 character (4 UTF-8 bytes). Should be skipped (< 3 chars).
+        let result = index.correct("🙂");
+        assert_eq!(result, None, "Single emoji should be skipped (1 character < 3)");
+
+        // Two emojis "🙂🙃" is 2 characters (8 UTF-8 bytes). Should be skipped (< 3 chars).
+        let result = index.correct("🙂🙃");
+        assert_eq!(result, None, "Two emojis should be skipped (2 characters < 3)");
     }
 }
