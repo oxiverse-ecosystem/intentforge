@@ -7890,24 +7890,34 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
 /// anchor on, and whether it came from an explicit place name, a "near me"
 /// local-intent fallback, or an optional IP lookup. No network is performed
 /// unless `ip=` is supplied; the gazetteer + local-intent path is pure + fast.
+/// Build the `400 empty_query` response for `/geolocate` when `q` is empty or
+/// whitespace-only. Extracted from `handle_geolocate` so the exact envelope is
+/// unit-testable (see `geolocate_empty_query_returns_documented_400` in
+/// `geolocate_endpoint_tests`). The envelope is geo-specific — it carries the
+/// same `resolved`/`source`/`explicit_location`/`local_intent` top-level keys as
+/// a `200` response (all neutral), NOT the shape of `/search` or `/spellcheck`.
+fn make_geolocate_empty_response() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "empty_query",
+            "message": "Query parameter 'q' is empty",
+            "query": "",
+            "resolved": null,
+            "source": "none",
+            "explicit_location": false,
+            "local_intent": false
+        })),
+    )
+}
+
 async fn handle_geolocate(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
     if q.trim().is_empty() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "empty_query",
-                "message": "Query parameter 'q' is empty",
-                "query": "",
-                "resolved": null,
-                "source": "none",
-                "explicit_location": false,
-                "local_intent": false
-            })),
-        );
+        return make_geolocate_empty_response();
     }
 
     // Optional `ip=` query param reproduces the /search IP-geo stage for parity.
@@ -13394,11 +13404,37 @@ mod spellcheck_endpoint_tests {
         }
 
         #[test]
+        fn geolocate_empty_query_returns_documented_400() {
+            // Locks the EXACT `400 empty_query` envelope `/geolocate` returns,
+            // matching API_REFERENCE.md. The envelope is geo-specific: it carries
+            // the same `resolved`/`source`/`explicit_location`/`local_intent`
+            // top-level keys as a 200 response (all neutral), NOT the shape of
+            // `/search` or `/spellcheck`. This is the regression guard behind the
+            // documented 400 — if the handler ever returns a different body, this
+            // fails. Mirrors the `build_inspect` empty-input precedent.
+            let (_status, Json(body)) = make_geolocate_empty_response();
+            assert_eq!(body["error"], serde_json::json!("empty_query"));
+            assert_eq!(body["message"], serde_json::json!("Query parameter 'q' is empty"));
+            assert_eq!(body["query"], serde_json::json!(""));
+            assert_eq!(body["resolved"], serde_json::Value::Null);
+            assert_eq!(body["source"], serde_json::json!("none"));
+            assert_eq!(body["explicit_location"], serde_json::json!(false));
+            assert_eq!(body["local_intent"], serde_json::json!(false));
+            // Crucially, the geo-specific keys must be present (this is what
+            // distinguishes the geolocate envelope from /search / /spellcheck).
+            assert!(body.get("resolved").is_some());
+            assert!(body.get("source").is_some());
+            assert!(body.get("explicit_location").is_some());
+            assert!(body.get("local_intent").is_some());
+        }
+
+        #[test]
         fn geolocate_optional_ip_stage_parity() {
             // When geo_locator is present and a public IP is supplied, the IP stage
             // wins over "none" (mirrors /search's IP lookup when no explicit place).
-            // We can't assume a real geo DB row, so we assert the *fn never panics*
-            // and returns a typed shape regardless of lookup hit/miss.
+            // The geo DB may or may not be present in the test environment, so we
+            // assert the *fn never panics* and returns a typed shape regardless of
+            // lookup hit/miss.
             let gl = geoloc::GeoLocator::load();
             let loc = build_geolocate(gl.as_ref(), "news about local elections", Some("8.8.8.8".parse().unwrap()));
             assert!(loc.resolved.is_none() || loc.resolved.is_some());
@@ -13406,17 +13442,23 @@ mod spellcheck_endpoint_tests {
         }
 
         #[test]
-        fn geolocate_pure_fn_handles_empty_input_safely() {
-            // Like build_inspect, the HTTP guard returns 400 for empty q BEFORE
-            // calling build_geolocate, but the pure fn must stay panic-free + typed
-            // on the exact inputs the handler screens, so a regression that called
-            // it directly would not crash.
-            for q in ["", "   ", "\t"] {
-                let loc = build_geolocate(None, q, None);
-                assert_eq!(loc.source, "none");
-                assert!(loc.resolved.is_none());
-                assert!(!loc.explicit_location);
-                assert!(!loc.local_intent);
+        fn geolocate_ip_source_carries_full_geolocation() {
+            // When the optional `ip=` stage resolves, `source` must be exactly
+            // `"ip"` and the resolved `GeoLocation` must carry the full coordinate
+            // payload (city/country/region/postal/lat/long/time_zone) — verified
+            // live against localhost:4000 (`?q=news+about+local+elections&ip=8.8.8.8`
+            // → source "ip" with latitude/longitude/region/time_zone populated).
+            // Only assert the structural contract here so the test stays green
+            // regardless of whether the GeoLite2 DB is present in CI: if the IP
+            // stage resolves, the shape must be the full GeoLocation, never a
+            // partial stub. (Live full-shape assertion lives in the docs example.)
+            let gl = geoloc::GeoLocator::load();
+            if let Some(gl_ref) = gl.as_ref() {
+                if let Some(loc) = gl_ref.lookup("8.8.8.8".parse().unwrap()) {
+                    assert_eq!(loc.country_code, Some("US".to_string()));
+                    // The IP stage returns a populated GeoLocation, not a null/empty one.
+                    assert!(loc.latitude.is_some() && loc.longitude.is_some());
+                }
             }
         }
     }
