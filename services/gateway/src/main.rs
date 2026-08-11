@@ -5868,10 +5868,13 @@ fn merge_local_and_web(
         // FINAL r.score" lesson). Zeroing freshness + intent_boost for off-topic results
         // starves the raw base so it stays below on-topic results even after calibration.
         // `off_topic` is recomputed here (not reused from the base block) to stay in scope.
+        let geo_ok_struct = geo_location
+            .map(|g| geo_relevance_score(&title_lower, &content_lower, &url_lower, g) > 0.0)
+            .unwrap_or(false);
         let off_topic_struct = !strong_distinctive_terms.is_empty() && !strong_distinctive_terms.iter().any(|t| {
             let tl = t.to_lowercase();
             title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
-        });
+        }) && !geo_ok_struct;
         if off_topic_struct {
             freshness = 0.0;
             intent_boost = 0.0;
@@ -6213,10 +6216,16 @@ fn merge_local_and_web(
         // authority here makes the off-topic crush actually bite. This never hurts a
         // result that contains a real topic term, and authority is only halved (not
         // zeroed) so a borderline page still earns a little trust.
+        // Geo-aware exemption (mirrors the off_topic_struct gate above): a result
+        // naming the resolved location is on-topic for a geo/local query even if it
+        // lacks the descriptive adjectives, so it must not lose its authority signal.
+        let geo_ok_authority = geo_location
+            .map(|g| geo_relevance_score(&title_lower, &content_lower, &url_lower, g) > 0.0)
+            .unwrap_or(false);
         let off_topic = !strong_distinctive_terms.is_empty() && !strong_distinctive_terms.iter().any(|t| {
             let tl = t.to_lowercase();
             title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
-        });
+        }) && !geo_ok_authority;
         let authority_eff = if off_topic { r.authority * 0.3 } else { r.authority };
 
         let base = (weights.rrf * r.score)
@@ -6372,7 +6381,18 @@ fn merge_local_and_web(
                 let lt = t.to_lowercase();
                 tl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
             });
-            overlaps
+            // Geo-aware exemption: a query with a resolved location is a LOCAL/geo
+            // intent; a result that names that location (city/country) is genuinely
+            // on-topic even if its snippet omits the descriptive adjectives
+            // (quiet/wifi/outlets/...). Without this, "quiet places to study near
+            // chennai" hard-drops every chennai-mentioning result that didn't also
+            // repeat "quiet"/"wifi", collapsing the set to one generic page.
+            // General: reuses geo_relevance_score, no query/domain bias; only
+            // exempts results that actually mention the resolved location.
+            let geo_ok = geo_location
+                .map(|g| geo_relevance_score(&tl, &cl, &ul, g) > 0.0)
+                .unwrap_or(false);
+            overlaps || geo_ok
         });
         let removed = before - merged.len();
         if removed > 0 {
