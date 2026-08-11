@@ -21,6 +21,7 @@
   - [GET /spellcheck](#get-spellcheck)
   - [GET /analyze](#get-analyze)
   - [GET /inspect](#get-inspect)
+  - [GET /geolocate](#get-geolocate)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -554,6 +555,78 @@ curl "http://localhost:4000/inspect?q=python+web+framework+not+django"
 # A fresh-phrase query: see the recency window /search would apply
 curl "http://localhost:4000/inspect?q=latest+ai+news+this+week"
 # → {"recency":{"window":{"after":"...","before":"..."},"phrase_detected":true},...}
+```
+
+---
+
+### `GET /geolocate`
+
+Additive geo-introspection endpoint. Mirrors the `/spellcheck` `/analyze` `/inspect`
+precedent: it does **not** change `/search` ranking, geo-boost, or calibration. It
+reuses the *exact* location-resolution functions `/search` calls
+(`detect_explicit_location` + `has_local_intent`) so a client can see — **before**
+issuing a search — which location the engine will anchor on, and *why*. No network
+is performed unless an optional `ip=` param is supplied; the gazetteer + local-intent
+path is pure and fast.
+
+This endpoint makes the round-2026-08-11T1556Z geo fix *legible*: a query that names
+a gazetteer place (e.g. `quiet places to study near chennai`) now resolves explicitly,
+and a client can confirm the resolved location matches the one `/search` will use to
+rescue location-specific results from the off-topic gate.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                                  |
+|-----------|--------|----------|---------|----------------------------------------------|
+| `q`       | string | yes      | —       | The query/phrase to resolve a location for   |
+| `ip`      | string | no       | —       | Optional client IP to reproduce `/search`'s IP-geolocation stage for parity (unparseable/missing disables that stage) |
+
+**Response** `200 OK` — top-level `{ query, resolved, source, explicit_location, local_intent }`:
+
+- `resolved` — the resolved `geoloc::GeoLocation` (serialized struct: `country_code`, `country_name`, `region`, `city`, `postal_code`, `latitude`, `longitude`, `time_zone`), or `null` when no location can be inferred.
+- `source` — one of: `"explicit"` (query named a gazetteer place → overrides IP geo), `"local_intent_fallback"` (no explicit place but "near me"/"nearby" intent → stable New York, US default), `"ip"` (only when `ip=` supplied and the geo DB resolved it), or `"none"` (no signal).
+- `explicit_location` — `true` when `source == "explicit"`.
+- `local_intent` — `true` when the query carries local-intent signals ("near me", "nearby", "around me", …).
+
+```json
+{
+  "query": "quiet places to study near chennai with power outlets and free wifi",
+  "resolved": {
+    "city": "chennai",
+    "country_code": "IN",
+    "country_name": "India",
+    "latitude": null,
+    "longitude": null,
+    "postal_code": null,
+    "region": null,
+    "time_zone": null
+  },
+  "source": "explicit",
+  "explicit_location": true,
+  "local_intent": true
+}
+```
+
+> **Verified (this round, 2026-08-11):** all four `source` branches confirmed live against `localhost:4000`:
+> - `?q=quiet+places+to+study+near+chennai...` → `source: "explicit"`, `city: "chennai"`, `country_code: "IN"`
+> - `?q=best+sushi+restaurants+in+new+york` → `source: "explicit"`, `city: "new york"`
+> - `?q=coffee+shops+near+me+open+now` → `source: "local_intent_fallback"`, `city: "New York"` (US default)
+> - `?q=how+does+a+cpu+pipeline+work` → `source: "none"`, `resolved: null`
+>
+> Empty/whitespace `q` returns `400` with the standard `empty_query` envelope (same shape as `/search` and `/spellcheck`).
+
+**Notes**
+- Pure function of the query (+ optional `ip`) over the loaded gazetteer; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, geo-boost, negation gating, or calibration. It is a read-only preview of the existing location-resolution path.
+- A test module (`geolocate_endpoint_tests`, 6 cases) locks the `source`-routing behavior; the gateway suite is 102/102 passing.
+
+```bash
+# See how the engine would localize a query before searching
+curl "http://localhost:4000/geolocate?q=quiet+places+to+study+near+chennai"
+# → {"query":"...","resolved":{"city":"chennai",...},"source":"explicit","explicit_location":true,"local_intent":true}
+
+# Reproduce the IP-geolocation stage with a public IP for parity
+curl "http://localhost:4000/geolocate?q=news+about+local+elections&ip=8.8.8.8"
 ```
 
 ---
