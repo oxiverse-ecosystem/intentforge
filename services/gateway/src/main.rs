@@ -1394,6 +1394,38 @@ const LOCATION_GAZETTEER: &[(&str, &str)] = &[
     ("toronto", "CA"), ("vancouver", "CA"), ("sao paulo", "BR"), ("mexico city", "MX"),
     ("dubai", "AE"), ("cairo", "EG"), ("bangkok", "TH"), ("jakarta", "ID"),
     ("cape town", "ZA"), ("lagos", "NG"),
+    // ── Expanded Indian cities ── (round 2026-08-11: the original gazetteer only
+    //    listed delhi/mumbai/bangalore, so "cafes in kolkata" / "near pune" failed
+    //    to detect an explicit location and fell back to the IP/VPN geo — which
+    //    leaked a wrong "+New York" constraint and boosted the wrong region).
+    //    Whole-word matched; no overlap with common query words or country codes.
+    ("kolkata", "IN"), ("calcutta", "IN"), ("pune", "IN"), ("hyderabad", "IN"),
+    ("chennai", "IN"), ("madras", "IN"), ("ahmedabad", "IN"), ("coimbatore", "IN"),
+    ("jaipur", "IN"), ("goa", "IN"), ("lucknow", "IN"), ("kanpur", "IN"),
+    ("nagpur", "IN"), ("indore", "IN"), ("bhopal", "IN"), ("surat", "IN"),
+    ("vadodara", "IN"), ("baroda", "IN"), ("visakhapatnam", "IN"), ("vijayawada", "IN"),
+    ("patna", "IN"), ("ranchi", "IN"), ("raipur", "IN"), ("thiruvananthapuram", "IN"),
+    ("kochi", "IN"), ("cochin", "IN"), ("kozhikode", "IN"), ("calicut", "IN"),
+    ("mysore", "IN"), ("mysuru", "IN"), ("amritsar", "IN"), ("chandigarh", "IN"),
+    ("gwalior", "IN"), ("udaipur", "IN"), ("jaisalmer", "IN"), ("varanasi", "IN"),
+    ("banaras", "IN"), ("agra", "IN"), ("shimla", "IN"), ("manali", "IN"),
+    ("dehradun", "IN"), ("guwahati", "IN"), ("bhubaneswar", "IN"), ("rajkot", "IN"),
+    ("jabalpur", "IN"), ("guntur", "IN"), ("thane", "IN"), ("navi mumbai", "IN"),
+    ("ghaziabad", "IN"), ("noida", "IN"), ("ludhiana", "IN"), ("allahabad", "IN"),
+    ("prayagraj", "IN"), ("guwahati", "IN"), ("nashik", "IN"), ("aurangabad", "IN"),
+    ("madurai", "IN"), ("cochin", "IN"), ("trivandrum", "IN"),
+    // ── Expanded global cities ──
+    ("miami", "US"), ("dallas", "US"), ("denver", "US"), ("atlanta", "US"),
+    ("washington", "US"), ("philadelphia", "US"), ("houston", "US"), ("minneapolis", "US"),
+    ("munich", "DE"), ("hamburg", "DE"), ("frankfurt", "DE"), ("cologne", "DE"),
+    ("lyon", "FR"), ("marseille", "FR"), ("nice", "FR"), ("milan", "IT"),
+    ("naples", "IT"), ("turin", "IT"), ("florence", "IT"), ("valencia", "ES"),
+    ("seville", "ES"), ("malaga", "ES"), ("porto", "PT"), ("lisbon", "PT"),
+    ("brussels", "BE"), ("vienna", "AT"), ("zurich", "CH"), ("geneva", "CH"),
+    ("osaka", "JP"), ("kyoto", "JP"), ("busan", "KR"), ("taipei", "TW"),
+    ("kuala lumpur", "MY"), ("manila", "PH"), ("ho chi minh", "VN"), ("hanoi", "VN"),
+    ("doha", "QA"), ("riyadh", "SA"), ("tel aviv", "IL"), ("nairobi", "KE"),
+    ("accra", "GH"), ("casablanca", "MA"), ("addis ababa", "ET"), ("dar es salaam", "TZ"),
 ];
 
 /// If the query explicitly names a location (via whole-word match against the
@@ -1453,6 +1485,23 @@ fn is_city(name: &str) -> bool {
         "new york", "san francisco", "los angeles", "chicago", "seattle", "boston",
         "austin", "toronto", "vancouver", "sao paulo", "mexico city", "dubai",
         "cairo", "bangkok", "jakarta", "cape town", "lagos",
+        // Expanded Indian + global cities (mirror of LOCATION_GAZETTEER additions)
+        "kolkata", "calcutta", "pune", "hyderabad", "chennai", "madras", "ahmedabad",
+        "coimbatore", "jaipur", "goa", "lucknow", "kanpur", "nagpur", "indore",
+        "bhopal", "surat", "vadodara", "baroda", "visakhapatnam", "vijayawada",
+        "patna", "ranchi", "raipur", "thiruvananthapuram", "kochi", "cochin",
+        "kozhikode", "calicut", "mysore", "mysuru", "amritsar", "chandigarh",
+        "gwalior", "udaipur", "jaisalmer", "varanasi", "banaras", "agra", "shimla",
+        "manali", "dehradun", "guwahati", "bhubaneswar", "rajkot", "jabalpur",
+        "guntur", "thane", "navi mumbai", "ghaziabad", "noida", "ludhiana",
+        "allahabad", "prayagraj", "nashik", "aurangabad", "madurai", "trivandrum",
+        "miami", "dallas", "denver", "atlanta", "washington", "philadelphia",
+        "houston", "minneapolis", "munich", "hamburg", "frankfurt", "cologne",
+        "lyon", "marseille", "nice", "milan", "naples", "turin", "florence",
+        "valencia", "seville", "malaga", "porto", "lisbon", "brussels", "vienna",
+        "zurich", "geneva", "osaka", "kyoto", "busan", "taipei", "kuala lumpur",
+        "manila", "ho chi minh", "hanoi", "doha", "riyadh", "tel aviv", "nairobi",
+        "accra", "casablanca", "addis ababa", "dar es salaam",
     ];
     CITIES.contains(&name)
 }
