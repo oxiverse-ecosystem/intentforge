@@ -583,7 +583,7 @@ rescue location-specific results from the off-topic gate.
 
 **Response** `200 OK` — top-level `{ query, resolved, source, explicit_location, local_intent }`:
 
-- `resolved` — the resolved `geoloc::GeoLocation` (serialized struct: `country_code`, `country_name`, `region`, `city`, `postal_code`, `latitude`, `longitude`, `time_zone`), or `null` when no location can be inferred.
+- `resolved` — the resolved `geoloc::GeoLocation` (serialized struct: `country_code`, `country_name`, `region`, `city`, `postal_code`, `latitude`, `longitude`, `time_zone`), or `null` when no location can be inferred. The `source: "explicit"` branch (query named a gazetteer place) returns this struct with **`latitude`/`longitude`/`postal_code`/`region`/`time_zone` set to `null`** (the gazetteer knows the city/country but not coordinates). The `source: "local_intent_fallback"` and `source: "ip"` branches return the **full** struct, including `latitude`, `longitude`, `postal_code`, `region`, and `time_zone` (verified live — see examples).
 - `source` — one of: `"explicit"` (query named a gazetteer place → overrides IP geo), `"local_intent_fallback"` (no explicit place but "near me"/"nearby" intent → stable New York, US default), `"ip"` (only when `ip=` supplied and the geo DB resolved it), or `"none"` (no signal).
 - `explicit_location` — `true` when `source == "explicit"`.
 - `local_intent` — `true` when the query carries local-intent signals ("near me", "nearby", "around me", …).
@@ -607,18 +607,22 @@ rescue location-specific results from the off-topic gate.
 }
 ```
 
-> **Verified (this round, 2026-08-11):** all four `source` branches confirmed live against `localhost:4000`:
-> - `?q=quiet+places+to+study+near+chennai...` → `source: "explicit"`, `city: "chennai"`, `country_code: "IN"`
-> - `?q=best+sushi+restaurants+in+new+york` → `source: "explicit"`, `city: "new york"`
-> - `?q=coffee+shops+near+me+open+now` → `source: "local_intent_fallback"`, `city: "New York"` (US default)
+> **Verified (this round, 2026-08-11):** all four `source` branches + the `400` empty-query path confirmed live against `localhost:4000`:
+> - `?q=quiet+places+to+study+near+chennai...` → `source: "explicit"`, `city: "chennai"`, `country_code: "IN"` (coordinates null)
+> - `?q=best+sushi+restaurants+in+new+york` → `source: "explicit"`, `city: "new york"`, `country_code: "US"`
+> - `?q=coffee+shops+near+me+open+now` → `source: "local_intent_fallback"`, `city: "New York"`, `country_code: "US"`, `latitude: 40.7128`, `longitude: -74.006`, `region: "New York"`, `postal_code: "10001"`, `time_zone: "America/New_York"`
 > - `?q=how+does+a+cpu+pipeline+work` → `source: "none"`, `resolved: null`
+> - `?q=news+about+local+elections&ip=8.8.8.8` → `source: "ip"`, `country_code: "US"`, `latitude: 37.751`, `longitude: -97.822`, `time_zone: "America/Chicago"`
 >
-> Empty/whitespace `q` returns `400` with the standard `empty_query` envelope (same shape as `/search` and `/spellcheck`).
+> Empty/whitespace `q` returns `400` with a **geo-specific** `empty_query` envelope (the `resolved`/`source`/`explicit_location`/`local_intent` keys, all neutral — NOT the shape of `/search` or `/spellcheck`). Verified live: `GET /geolocate?q=` → `HTTP 400` with body:
+> ```json
+> {"error":"empty_query","message":"Query parameter 'q' is empty","query":"","resolved":null,"source":"none","explicit_location":false,"local_intent":false}
+> ```
 
 **Notes**
 - Pure function of the query (+ optional `ip`) over the loaded gazetteer; no per-query tuned constants, no domain allow/deny lists.
 - The endpoint is additive — it does not change `/search` ranking, geo-boost, negation gating, or calibration. It is a read-only preview of the existing location-resolution path.
-- A test module (`geolocate_endpoint_tests`, 6 cases) locks the `source`-routing behavior; the gateway suite is 102/102 passing.
+- A test module (`geolocate_endpoint_tests`, 7 cases) locks the `source`-routing behavior, the exact `400` envelope, and the `ip`-stage contract; the gateway suite is 103/103 passing.
 
 ```bash
 # See how the engine would localize a query before searching
