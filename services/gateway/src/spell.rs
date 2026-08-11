@@ -21,7 +21,7 @@ const MAX_EDIT_DISTANCE: usize = 2;
 /// Minimum word length to attempt correction (avoid correcting short words)
 /// Set to 4 to avoid false positives on 3-letter words (doc→down, app→api).
 /// All common 3-letter tech terms (npm, pip, git, vue, etc.) are in the dict.
-const MIN_CORRECT_LENGTH: usize = 4;
+pub(crate) const MIN_CORRECT_LENGTH: usize = 4;
 
 /// Minimum frequency ratio for auto-correction (corrected word must be
 /// more common than 5% of the most common word)
