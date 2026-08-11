@@ -9416,6 +9416,17 @@ async fn handle_search(
     if gateway_extracted.price_max.is_some() {
         intent.structured_constraints.price_max = gateway_extracted.price_max;
     }
+    // NOT: hard-exclusion operator (DEFECT-A escape hatch). The gateway parser
+    // extracts `NOT:term` into `gateway_extracted.hard_exclusions`; it must be
+    // copied into the merged `structured_constraints` or the term is silently
+    // dropped from BOTH the hard-drop gate (should_filter_by_constraints) and the
+    // `applied_constraints` report — leaving flask/React pages in results despite
+    // an explicit `NOT:`. This matches how file_types/sites/phrases are merged above.
+    for he in gateway_extracted.hard_exclusions {
+        if !intent.structured_constraints.hard_exclusions.contains(&he) {
+            intent.structured_constraints.hard_exclusions.push(he);
+        }
+    }
     // P3 NL-price fix: also derive a bound from natural-language price words
     // ("under 150 dollars", "below 1000 rupees") — these never matched the
     // `price:<` operator parser, so the bound stayed None and ranking fell back
@@ -12667,6 +12678,25 @@ mod constraint_fix_tests {
         let c = extract_gateway_constraints("editor NOT:\"visual studio code\"");
         assert!(c.hard_exclusions.iter().any(|h| h == "visual studio code"),
             "quoted multi-word NOT: term must be captured, got: {:?}", c.hard_exclusions);
+    }
+
+    #[test]
+    fn not_operator_reported_in_inspect_applied_constraints() {
+        // Regression contract for the `NOT:` reporting path (the fix that copied
+        // `gateway_extracted.hard_exclusions` into the merged structured_constraints
+        // so /search and /inspect both surface the term). `build_inspect` reads the
+        // SAME merged constraints /search reports, so this locks the JSON shape the
+        // docs promise: `constraints.structured.hard_exclusions == ["flask"]` and
+        // `constraints.applied_constraints` contains "not:flask".
+        let index = spell::SymSpellIndex::build();
+        let res = build_inspect(&index, "python web framework NOT:flask");
+        let c = &res["constraints"];
+        let hard = c["structured"]["hard_exclusions"].as_array().expect("hard_exclusions must be an array");
+        assert!(hard.iter().any(|h| h.as_str() == Some("flask")),
+            "NOT:flask must appear in structured.hard_exclusions, got: {:?}", hard);
+        let applied = c["applied_constraints"].as_array().expect("applied_constraints must be an array");
+        assert!(applied.iter().any(|a| a.as_str() == Some("not:flask")),
+            "NOT:flask must appear in applied_constraints as 'not:flask', got: {:?}", applied);
     }
 
 
