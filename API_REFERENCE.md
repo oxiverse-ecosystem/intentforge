@@ -691,11 +691,34 @@ per-query strings, no domain allow/deny lists, no magic constants.
 }
 ```
 
-> **Verified (this round, 2026-08-12T0613Z):** endpoint shape + derived signals confirmed via the `intent_endpoint_tests` module (5 cases) on the pure path:
+**Real request / response (executed against live `localhost:4000` this round, 2026-08-12T0613Z):**
+
+```bash
+# Contrastive framing + category
+curl "http://localhost:4000/intent?q=violin%20vs%20viola%20for%20beginner"
+# -> {"query":"violin vs viola for beginner","intent":"informational","category":"informational",
+#     "confidence":0.3,"contrastive_framing":true,"local_intent":false,
+#     "structured_constraints":{...all-empty...},"expanded_queries":["violin vs viola for beginner"]}
+
+# Local intent ("near me")
+curl "http://localhost:4000/intent?q=coffee%20shops%20near%20me%20open%20now"
+# -> ... "local_intent":true ...
+
+# Empty / whitespace query -> 400 empty_query envelope
+curl -i "http://localhost:4000/intent?q=%20%20"
+# HTTP/1.1 400 Bad Request
+# {"error":"empty_query","message":"Query parameter 'q' is empty","query":"",
+#  "intent":"","category":"","confidence":0.0,"contrastive_framing":false,
+#  "local_intent":false,"structured_constraints":{},"expanded_queries":[]}
+```
+
+> **Verified (this round, 2026-08-12T0613Z):** endpoint shape + derived signals confirmed live against `localhost:4000` AND via the `intent_endpoint_tests` module (5 cases) on the pure path:
 > - `?q=coffee+shops+near+me+open+now` → `local_intent: true`; `?q=how+does+a+cpu+pipeline+work` → `local_intent: false`
 > - `?q=violin+vs+viola+for+beginner` → `contrastive_framing: true`; `?q=why+is+the+sky+blue` → `contrastive_framing: false`
-> - `?q=python+rest+api+framework+not+flask` → `intent: "informational"`, `category: "informational"`, `confidence > 0`
+> - `?q=python+rest+api+framework+not+flask` → `intent: "informational"`, `category: "informational"`, `confidence: 0.3`
 > - empty/whitespace `q` returns `400` with the `/intent`-shaped `empty_query` envelope (`intent`/`category`/`contrastive_framing`/`local_intent` all neutral) — distinguishable from `/search`/`spellcheck`'s empty response.
+>
+> **Doc-audit correction (this card):** the 5th unit test (`intent_empty_query_envelope_distinct_from_search`) originally called `build_intent("")` and asserted an `error` key — but `build_intent` classifies a *non-empty* query and never adds `error`, so that test would panic and provided no real coverage of the empty envelope. Fixed by extracting the empty envelope into a pure `build_intent_empty()` builder (now reused by `handle_intent`) and pointing the test at it. The 5 tests now compile + pass and genuinely lock the documented shape + empty envelope.
 >
 
 **Notes**
