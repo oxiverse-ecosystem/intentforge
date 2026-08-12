@@ -448,7 +448,7 @@ This is the read-only companion to `/spellcheck`: it does **not** change `/searc
 **Empty query** returns `400` with the standard error envelope (same shape as `/search` and `/spellcheck`):
 
 ```json
-{ "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "exclusions": [], "declined": [], "manner_qualifiers": [] }
+{ "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "exclusions": [], "declined": [], "manner_qualifiers": [], "decisions": [] }
 ```
 
 **Notes**
@@ -464,7 +464,7 @@ curl "http://localhost:4000/analyze?q=javascript+not+java+not+typescript"
 # See why a "without X" manner phrase was NOT turned into an exclusion
 curl "http://localhost:4000/analyze?q=how+to+clean+a+cast+iron+skillet+without+soap"
 # → {"manner_qualifiers":["soap"],"exclusions":[],"declined":[],"contrastive_framing":false,...}
-# ```
+```
 
 ---
 
@@ -521,7 +521,7 @@ constants.
 
 > **Verified (this round, 2026-08-10T1401Z):** every claim below was executed
 > against the live dev stack at `localhost:4000` (gateway rebuilt at the round's
-> feature commit `ca4362c`/`ea11acd`). All 6 cases returned `200` unless noted. The
+> feature commit `ca4362c`/`ea11acd`). All 7 cases returned `200` unless noted. The
 > endpoint reuses the same pure functions `/search` runs (no network, deterministic).
 >
 > | Query | What was observed |
@@ -781,7 +781,7 @@ The `/search` endpoint parses a rich set of operators directly from the query st
 `NOT:` is an **explicit, unconditional structural exclude** — the general, non-hardcoded escape hatch for the DEFECT-A class of limitations. It is parsed by the gateway's own operator extractor (`extract_gateway_constraints`), independent of the intent engine's entity/contrastive recognition.
 
 - **Syntax:** `NOT:<term>` for a single token, or `NOT:"<phrase>"` for a multi-word term (up to 4 words). Terms are lowercased for case-insensitive matching.
-- **Behaviour:** any result whose **title, content, or URL contains the term** (substring match) is hard-dropped by `should_filter_by_constraints`. This fires *before* the soft-penalty ranking path, so it removes the page entirely rather than demoting it.
+- **Behaviour:** any non-exempt result whose **title, content, or URL contains the term** (substring match) is hard-dropped by `should_filter_by_constraints`. This fires *before* the soft-penalty ranking path, so it removes the page entirely rather than demoting it. See the alt-listing exemption below for how comparison/"alternatives" pages are retained.
 - **Surfaced as:** `structured_constraints.hard_exclusions: ["<term>"]` and `applied_constraints: ["not:<term>"]` on `/search` and `/inspect`.
 - **Never forwarded upstream:** `preprocess_searxng_query` strips `NOT:` so SearXNG does not treat `<term>` as a literal search word and re-surface it.
 - **Alt-listing exemption (by design):** a comparison / "alternatives" page that merely *mentions* the excluded term in a referential context (alt-score > 0.3) is **kept**, exactly like the `site:` / `filetype:` negative gates and the committed test `not_operator_keeps_alt_listing_page`. So `"Best Flask Alternatives"` survives `NOT:flask`.
