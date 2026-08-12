@@ -6217,7 +6217,23 @@ fn merge_local_and_web(
         // The old blanket +1.0 floated token-overlap noise (e.g. "boilerplate code"
         // -> "QR Code Generator") to the top regardless of relevance. The merge-time
         // consensus *1.5 boost still prefers genuinely-good local pages.
-        let local_bonus = if r.is_local && relevance >= 0.35 {
+        // Inverse-geo gate (this round, D1): when the query resolved an EXPLICIT
+        // location (e.g. "temples in madurai"), a LOCAL-INDEX page that does NOT
+        // mention that location is geo-off-topic even if it matched generic topic
+        // tokens ("temple quiet"). Without this, the wrong-city local page keeps
+        // its full `local_bonus` + authority and floats above the right-city web
+        // results (the Madurai/Busan case). A right-city local page still earns the
+        // full bonus (geo_ok_local is true). This mirrors the off_topic authority
+        // suppression below — same signal (geo_relevance_score > 0), no per-query
+        // tuning, no hardcoded city/domain list. Only fires for explicit-location
+        // queries so non-geo local results are untouched.
+        let geo_ok_local = geo_location
+            .map(|g| geo_relevance_score(&title_lower, &content_lower, &url_lower, g) > 0.0)
+            .unwrap_or(false);
+        let geo_local_offtopic = r.is_local
+            && geo_location.is_some()
+            && !geo_ok_local;
+        let local_bonus = if r.is_local && relevance >= 0.35 && !geo_local_offtopic {
             (relevance * 0.45).min(0.45)
         } else {
             0.0
@@ -6245,7 +6261,15 @@ fn merge_local_and_web(
             let tl = t.to_lowercase();
             title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
         }) && !geo_ok_authority;
-        let authority_eff = if off_topic { r.authority * 0.3 } else { r.authority };
+        // Inverse-geo authority suppression (this round, D1): a local page from the
+        // WRONG city (explicit geo resolved, page does not name the location) is
+        // geo-off-topic and must lose its authority signal too, not just its bonus —
+        // otherwise its high authority floats it above right-city web results (the
+        // Madurai/Busan case). Same signal as the off_topic gate; a right-city local
+        // page (geo_ok_local) is exempt. Authority is halved (not zeroed) so a
+        // borderline page keeps a little trust, and the existing 0.3 floor logic holds.
+        let geo_authority_suppressed = off_topic || geo_local_offtopic;
+        let authority_eff = if geo_authority_suppressed { r.authority * 0.3 } else { r.authority };
 
         let base = (weights.rrf * r.score)
             + (weights.semantic * semantic)
@@ -6326,7 +6350,22 @@ fn merge_local_and_web(
         } else {
             1.0
         };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult;
+        // Inverse-geo final-fold (D1, this round): a LOCAL-INDEX page from the
+        // WRONG resolved city (explicit geo resolved + page names no location)
+        // must be crushed in the FINAL score — not merely stripped of its bonus
+        // and authority. Its indexer RRF/base score is still high (it matched
+        // generic tokens like "temple quiet"), so even after local_bonus=0 and
+        // authority*0.3 it stays ~0.12 and outranks the thin right-city web
+        // results (which sit at the 0.05 calibration floor). Folding the geo
+        // signal here — exactly like the relevance_mult fold above — pulls the
+        // wrong-city page below the right-city results. Keyed on
+        // geo_local_offtopic (the same geo_relevance_score > 0 test as the
+        // off_topic gate), NO per-query tuning, NO hardcoded city/domain list.
+        // A right-city local page or any web result is unaffected (geo_mult=1.0).
+        // calibrate_scores still rescales a lone survivor onto [0.05,1.0], so a
+        // thin-result set with only a wrong-city page is not made worse.
+        let geo_mult = if geo_local_offtopic { 0.05 } else { 1.0 };
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * geo_mult;
         // Capture this result's relevance for the post-loop adaptive-floor pass.
         relevance_vec.push(relevance);
     }
@@ -6416,6 +6455,42 @@ fn merge_local_and_web(
         let removed = before - merged.len();
         if removed > 0 {
             tracing::info!("OFF_TOPIC_HARD_DROP: removed {}/{} result(s) (local+web) with zero distinctive-term overlap", removed, before);
+        }
+        // ── Inverse-geo hard-drop (D1, this round): WRONG-CITY local pages ──
+        // When an EXPLICIT location is resolved (e.g. "temples in madurai"),
+        // a LOCAL-INDEX result that does NOT name that location is geo-off-topic:
+        // it matched only generic tokens ("temple quiet") and is from the wrong
+        // city (Madurai query → Busan page). The off-topic drop above CANNOT
+        // catch this, because when strong_distinctive_terms is empty (common for
+        // geo queries whose descriptive adjectives aren't distinctive tokens),
+        // that whole block is skipped. So we drop wrong-city local pages here,
+        // keyed purely on geo_relevance_score>0 (same signal as the off_topic
+        // gate / geo boost) — NO per-query tuning, NO hardcoded city/domain list.
+        // Only fires for explicit-location queries, so non-geo local results are
+        // untouched. Fail-open: never empty the merged set on this alone (safety
+        // over aggression — if it were the only survivor, keep it rather than
+        // show nothing). Mirrors the off-topic fail-open structure.
+        if geo_location.is_some() {
+            let before_geo = merged.len();
+            let retained_pre_geo: Vec<MergedResult> = merged.iter().cloned().collect();
+            merged.retain(|r| {
+                let is_wrong_city_local = r.is_local
+                    && geo_location
+                        .map(|g| geo_relevance_score(&r.title, &r.content, &r.url, g) == 0.0)
+                        .unwrap_or(false);
+                !is_wrong_city_local
+            });
+            let removed_geo = before_geo - merged.len();
+            if removed_geo > 0 {
+                tracing::info!(
+                    "INVERSE_GEO_HARD_DROP: removed {}/{} wrong-city local result(s) for resolved geo",
+                    removed_geo, before_geo
+                );
+            }
+            // Fail-open: if the geo drop would empty the set, restore survivors.
+            if merged.is_empty() && before_geo > 0 {
+                merged.extend(retained_pre_geo);
+            }
         }
         // Fail-open rescue (mirrors the date/price fail-opens above): if the
         // off-topic drop would EMPTY the merged set, the "distinctive-term
@@ -13549,23 +13624,53 @@ mod spellcheck_endpoint_tests {
         }
 
         #[test]
-        fn geolocate_ip_source_carries_full_geolocation() {
-            // When the optional `ip=` stage resolves, `source` must be exactly
-            // `"ip"` and the resolved `GeoLocation` must carry the full coordinate
-            // payload (city/country/region/postal/lat/long/time_zone) — verified
-            // live against localhost:4000 (`?q=news+about+local+elections&ip=8.8.8.8`
-            // → source "ip" with latitude/longitude/region/time_zone populated).
-            // Only assert the structural contract here so the test stays green
-            // regardless of whether the GeoLite2 DB is present in CI: if the IP
-            // stage resolves, the shape must be the full GeoLocation, never a
-            // partial stub. (Live full-shape assertion lives in the docs example.)
-            let gl = geoloc::GeoLocator::load();
-            if let Some(gl_ref) = gl.as_ref() {
-                if let Some(loc) = gl_ref.lookup("8.8.8.8".parse().unwrap()) {
-                    assert_eq!(loc.country_code, Some("US".to_string()));
-                    // The IP stage returns a populated GeoLocation, not a null/empty one.
-                    assert!(loc.latitude.is_some() && loc.longitude.is_some());
-                }
+        fn geo_relevance_score_distinguishes_right_from_wrong_city() {
+            // Inverse-geo gate (round 2026-08-12T1234Z, D1): the ranking demotes a
+            // local-index page from the WRONG city when an explicit location is
+            // resolved. This locks the exact signal the fix keys on
+            // (`geo_relevance_score` > 0 iff the page names the resolved location),
+            // so the Madurai/Busan regression cannot silently return: a Busan
+            // local page must score 0.0 against a madurai geo, while a Madurai page
+            // scores > 0.0. No per-query strings, no city/domain allow-list.
+            let madurai = geoloc::GeoLocation {
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                region: None,
+                city: Some("madurai".to_string()),
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
+            };
+            // Busan local page — must NOT match madurai geo.
+            assert_eq!(
+                geo_relevance_score("Busan for First-Time Visitors: Port-City Views, Temple Quiet", "", "https://example.com/busan", &madurai),
+                0.0
+            );
+            // Madurai page — MUST match (city token present).
+            assert!(
+                geo_relevance_score("Quiet Temples in Madurai with Good Sculpture", "", "https://example.com/madurai", &madurai) > 0.0
+            );
+        }
+    }
+
+    #[test]
+    fn geolocate_ip_source_carries_full_geolocation() {
+        // When the optional `ip=` stage resolves, `source` must be exactly
+        // `"ip"` and the resolved `GeoLocation` must carry the full coordinate
+        // payload (city/country/region/postal/lat/long/time_zone) — verified
+        // live against localhost:4000 (`?q=news+about+local+elections&ip=8.8.8.8`
+        // → source "ip" with latitude/longitude/region/time_zone populated).
+        // Only assert the structural contract here so the test stays green
+        // regardless of whether the GeoLite2 DB is present in CI: if the IP
+        // stage resolves, the shape must be the full GeoLocation, never a
+        // partial stub. (Live full-shape assertion lives in the docs example.)
+        let gl = geoloc::GeoLocator::load();
+        if let Some(gl_ref) = gl.as_ref() {
+            if let Some(loc) = gl_ref.lookup("8.8.8.8".parse().unwrap()) {
+                assert_eq!(loc.country_code, Some("US".to_string()));
+                // The IP stage returns a populated GeoLocation, not a null/empty one.
+                assert!(loc.latitude.is_some() && loc.longitude.is_some());
             }
         }
     }
