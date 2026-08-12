@@ -8132,6 +8132,28 @@ fn build_intent(q: &str) -> serde_json::Value {
     })
 }
 
+/// Build the `400 empty_query` envelope for `/intent` when `q` is empty or
+/// whitespace. Pure + unit-testable (see `intent_endpoint_tests`). Mirrors
+/// `/inspect`'s empty-envelope contract: it carries the neutral
+/// `intent`/`category`/`confidence`/`contrastive_framing`/`local_intent`
+/// top-level keys so the envelope is distinguishable from `/search`/`spellcheck`'s
+/// empty response, but with neutral values. `structured_constraints` is the empty
+/// object `{}` (no operators were parsed from an empty query).
+fn build_intent_empty() -> serde_json::Value {
+    serde_json::json!({
+        "error": "empty_query",
+        "message": "Query parameter 'q' is empty",
+        "query": "",
+        "intent": "",
+        "category": "",
+        "confidence": 0.0,
+        "contrastive_framing": false,
+        "local_intent": false,
+        "structured_constraints": {},
+        "expanded_queries": []
+    })
+}
+
 /// `GET /intent?q=...` — expose `/search`'s full intent object before a search runs.
 /// Additive + zero-side-effect (see `build_intent`). Empty/whitespace `q` returns
 /// `400` with the SAME standard `empty_query` envelope shape `/inspect` uses
@@ -8144,21 +8166,7 @@ async fn handle_intent(
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
     if q.trim().is_empty() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "empty_query",
-                "message": "Query parameter 'q' is empty",
-                "query": "",
-                "intent": "",
-                "category": "",
-                "confidence": 0.0,
-                "contrastive_framing": false,
-                "local_intent": false,
-                "structured_constraints": {},
-                "expanded_queries": []
-            })),
-        );
+        return (axum::http::StatusCode::BAD_REQUEST, Json(build_intent_empty()));
     }
     let result = build_intent(&q);
     (axum::http::StatusCode::OK, Json(result))
@@ -13631,7 +13639,10 @@ mod spellcheck_endpoint_tests {
             // The empty envelope carries the /intent key set (so clients can
             // distinguish it from /search /spellcheck empty responses) but with
             // neutral values — mirrors /inspect's empty envelope contract.
-            let res = build_intent("");
+            // NOTE: the empty envelope is produced by the HTTP handler
+            // (handle_intent), NOT by build_intent (which classifies a non-empty
+            // query). It is exposed via the pure builder build_intent_empty().
+            let res = build_intent_empty();
             assert_eq!(res["error"].as_str(), Some("empty_query"));
             assert_eq!(res["intent"].as_str(), Some(""));
             assert_eq!(res["category"].as_str(), Some(""));
