@@ -686,7 +686,7 @@ per-query strings, no domain allow/deny lists, no magic constants.
   "confidence": 0.3,
   "contrastive_framing": true,
   "local_intent": false,
-  "structured_constraints": { "language": null, "after_date": null, "before_date": null, "sites": [], "file_types": [], "phrases": [], "intitle": [], "inurl": [], "intext": [], "related": [], "price_min": null, "price_max": null, "price_lt": null, "price_gt": null, "negative": [], "hard_exclusions": [] },
+  "structured_constraints": { "positive": [], "negative": [], "hard_exclusions": [], "entities": [], "language": "en", "file_types": [], "sites": [], "phrases": [], "intitle": [], "inurl": [], "intext": [], "related": [] },
   "expanded_queries": ["violin vs viola for beginner"]
 }
 ```
