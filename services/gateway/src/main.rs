@@ -5360,6 +5360,22 @@ fn merge_local_and_web(
         "released", "release", "announced", "announce", "according", "recent",
         "studies", "study", "research", "risks", "risk", "top", "rated", "versus",
         "vs", "official", "history", "cultural", "significance", "free", "old", "older",
+        // Comparator / contrast connective words (P1 collision fix, this round):
+        // "difference", "compare", "comparison", "similarities", etc. are QUERY
+        // STRUCTURE, not the topic. For "what is the difference between X and Y" the
+        // subject is X and Y, not the word "difference". When these connectives stay
+        // in distinctive_terms, an off-topic page that merely contains the connective
+        // (e.g. "Percentage Difference Calculator" for "violin vs viola", a Berlin
+        // HOTEL for "meteor vs meteorite", a car-driving GAME for "suzuki swift vs
+        // hyundai i20") shares a "distinctive" token with the query, survives the
+        // off-topic hard-drop, and — boosted by BERT cosine on that one token —
+        // outranks the genuinely on-topic X-vs-Y pages. Treating them as role
+        // descriptors removes them from distinctive/strong term overlap, so a page
+        // must actually mention the comparison SUBJECTS (violin+viola, meteor+
+        // meteorite, suzuki+hyundai) to survive. No query/domain terms — purely
+        // comparative framing lexicon already partially present ("versus"/"vs").
+        "difference", "different", "differences", "compare", "comparison",
+        "comparisons", "similarities", "similarity", "contrast", "contrasts",
     ].iter().copied().collect();
     // Weak discriminative fillers: words that are grammatically "content" but carry
     // almost no topical signal, so requiring a result to contain them is wrong.
@@ -5451,6 +5467,7 @@ fn merge_local_and_web(
                 && !generic_web_terms.contains(lower.as_str())
                 && !meta_action_terms.contains(lower.as_str())
                 && !unit_terms.contains(lower.as_str())
+                && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
                 && !temporal_fillers.contains(lower.as_str())
                 && !lower.chars().all(|c| c.is_ascii_digit())
