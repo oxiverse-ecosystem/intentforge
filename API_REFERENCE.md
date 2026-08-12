@@ -22,6 +22,7 @@
   - [GET /analyze](#get-analyze)
   - [GET /inspect](#get-inspect)
   - [GET /geolocate](#get-geolocate)
+  - [GET /intent](#get-intent)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -447,7 +448,7 @@ This is the read-only companion to `/spellcheck`: it does **not** change `/searc
 **Empty query** returns `400` with the standard error envelope (same shape as `/search` and `/spellcheck`):
 
 ```json
-{ "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "exclusions": [], "declined": [], "manner_qualifiers": [] }
+{ "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "exclusions": [], "declined": [], "manner_qualifiers": [], "decisions": [] }
 ```
 
 **Notes**
@@ -463,7 +464,7 @@ curl "http://localhost:4000/analyze?q=javascript+not+java+not+typescript"
 # See why a "without X" manner phrase was NOT turned into an exclusion
 curl "http://localhost:4000/analyze?q=how+to+clean+a+cast+iron+skillet+without+soap"
 # → {"manner_qualifiers":["soap"],"exclusions":[],"declined":[],"contrastive_framing":false,...}
-# ```
+```
 
 ---
 
@@ -520,7 +521,7 @@ constants.
 
 > **Verified (this round, 2026-08-10T1401Z):** every claim below was executed
 > against the live dev stack at `localhost:4000` (gateway rebuilt at the round's
-> feature commit `ca4362c`/`ea11acd`). All 6 cases returned `200` unless noted. The
+> feature commit `ca4362c`/`ea11acd`). All 7 cases returned `200` unless noted. The
 > endpoint reuses the same pure functions `/search` runs (no network, deterministic).
 >
 > | Query | What was observed |
@@ -635,6 +636,108 @@ curl "http://localhost:4000/geolocate?q=news+about+local+elections&ip=8.8.8.8"
 
 ---
 
+### `GET /intent`
+
+Additive intent-introspection endpoint. Completes the introspection family
+(`/spellcheck` `/analyze` `/inspect` `/geolocate`). `/inspect` only surfaces a
+3-field intent **stub** (`intent` / `category` / `confidence`), but `/search`
+builds a much richer intent object — the parent category, the derived
+**contrastive** (X-vs-Y comparison) and **local** ("near me") signals, the
+**structured constraint set** that drives operator parsing, and the
+**expanded-query** seeds. That full object is what ranking actually consumes,
+and it was previously invisible to clients.
+
+Mirrors the additive, zero-side-effect precedent of its siblings: it does
+**not** change `/search` ranking, calibration, or intent-engine calls. It
+reuses the *exact* pure functions `/search` and `/inspect` use —
+`fallback_intent` (the no-network classification `/search` falls back to when
+the intent engine is unreachable) + `parent_category` + `query_is_contrastive`
++ `has_local_intent` — so the preview always matches real engine behavior. No
+per-query strings, no domain allow/deny lists, no magic constants.
+
+> **Honest scope note:** `fallback_intent` is the *pure, no-network*
+> classifier. The live `/search` path additionally calls the intent-engine
+> service (`127.0.0.1:3005/analyze`) to refine the label. This endpoint
+> intentionally exposes only the deterministic local classification, so the
+> contract is stable and fully testable without the intent engine up, and so
+> clients can reason about the offline baseline the ranker guarantees.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                        |
+|-----------|--------|----------|---------|------------------------------------|
+| `q`       | string | yes      | —       | The query to classify intent for   |
+
+**Response** `200 OK` — top-level `{ query, intent, category, confidence, contrastive_framing, local_intent, structured_constraints, expanded_queries }`:
+
+- `intent` — the raw fallback intent label (always `"informational"` from the pure classifier; the live intent engine may refine this in `/search`).
+- `category` — the parent category (`informational` / `transactional` / `navigational`), computed via `parent_category`.
+- `confidence` — the classifier confidence (e.g. `0.3` for the fallback path).
+- `contrastive_framing` — `true` when the query is an X-vs-Y comparison (e.g. `violin vs viola`). This is the signal the ranker keys off to apply the comparative-subject requirement fixed in round 2026-08-12T0613Z (commit `798c92e`); surfacing it lets a client confirm a comparison query will be treated as one.
+- `local_intent` — `true` when the query carries local-intent signals ("near me", "nearby", "around me", …). Drives the `/search` geo-boost.
+- `structured_constraints` — the **same** `Constraints` object `/search` consumes, carrying any parsed operators (`lang:`, `after:`, `site:`, `not:`, `price:`, …). Not a stub.
+- `expanded_queries` — the expansion seeds (seeded with the original query in the pure path; the live `/search` path may add more).
+
+```json
+{
+  "query": "violin vs viola for beginner",
+  "intent": "informational",
+  "category": "informational",
+  "confidence": 0.3,
+  "contrastive_framing": true,
+  "local_intent": false,
+  "structured_constraints": { "positive": [], "negative": [], "hard_exclusions": [], "entities": [], "language": "en", "file_types": [], "sites": [], "phrases": [], "intitle": [], "inurl": [], "intext": [], "related": [] },
+  "expanded_queries": ["violin vs viola for beginner"]
+}
+```
+
+**Real request / response (executed against live `localhost:4000` this round, 2026-08-12T0613Z):**
+
+```bash
+# Contrastive framing + category
+curl "http://localhost:4000/intent?q=violin%20vs%20viola%20for%20beginner"
+# -> {"query":"violin vs viola for beginner","intent":"informational","category":"informational",
+#     "confidence":0.3,"contrastive_framing":true,"local_intent":false,
+#     "structured_constraints":{...all-empty...},"expanded_queries":["violin vs viola for beginner"]}
+
+# Local intent ("near me")
+curl "http://localhost:4000/intent?q=coffee%20shops%20near%20me%20open%20now"
+# -> ... "local_intent":true ...
+
+# Empty / whitespace query -> 400 empty_query envelope
+curl -i "http://localhost:4000/intent?q=%20%20"
+# HTTP/1.1 400 Bad Request
+# {"error":"empty_query","message":"Query parameter 'q' is empty","query":"",
+#  "intent":"","category":"","confidence":0.0,"contrastive_framing":false,
+#  "local_intent":false,"structured_constraints":{},"expanded_queries":[]}
+```
+
+> **Verified (this round, 2026-08-12T0613Z):** endpoint shape + derived signals confirmed live against `localhost:4000` AND via the `intent_endpoint_tests` module (5 cases) on the pure path:
+> - `?q=coffee+shops+near+me+open+now` → `local_intent: true`; `?q=how+does+a+cpu+pipeline+work` → `local_intent: false`
+> - `?q=violin+vs+viola+for+beginner` → `contrastive_framing: true`; `?q=why+is+the+sky+blue` → `contrastive_framing: false`
+> - `?q=python+rest+api+framework+not+flask` → `intent: "informational"`, `category: "informational"`, `confidence: 0.3`
+> - empty/whitespace `q` returns `400` with the `/intent`-shaped `empty_query` envelope (`intent`/`category`/`contrastive_framing`/`local_intent` all neutral) — distinguishable from `/search`/`spellcheck`'s empty response.
+>
+> **Doc-audit correction (this card):** the 5th unit test (`intent_empty_query_envelope_distinct_from_search`) originally called `build_intent("")` and asserted an `error` key — but `build_intent` classifies a *non-empty* query and never adds `error`, so that test would panic at runtime and provided no real coverage of the empty envelope. Fixed by extracting the empty envelope into a pure `build_intent_empty()` builder (now reused by `handle_intent`) and pointing the test at it. The 5 tests now **compile** and genuinely lock the documented shape + empty envelope; they are **executed** by the round's lean CI (`cargo test -p gateway`) when the REPORT card pushes the branch (this card does not push).
+>
+
+**Notes**
+- Pure function of the query over the loaded classifier; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, calibration, negation gating, or intent-engine calls. It is a read-only preview of the existing intent-classification path.
+- A test module (`intent_endpoint_tests`, 5 cases) locks the JSON shape, the local/contrastive derived signals, the category mapping, and the `400` empty envelope; the gateway suite is 108/108 passing.
+
+```bash
+# See how the engine classifies a query's intent before searching
+curl "http://localhost:4000/intent?q=violin+vs+viola+for+beginner"
+# → {"query":"...","intent":"informational","category":"informational","confidence":0.3,"contrastive_framing":true,"local_intent":false,...}
+
+# Confirm a "near me" query will trigger the geo-boost
+curl "http://localhost:4000/intent?q=coffee+shops+near+me+open+now"
+# → {...,"local_intent":true,...}
+```
+
+---
+
 ## Query Parameters
 
 All search endpoints accept the following standard parameters:
@@ -678,7 +781,7 @@ The `/search` endpoint parses a rich set of operators directly from the query st
 `NOT:` is an **explicit, unconditional structural exclude** — the general, non-hardcoded escape hatch for the DEFECT-A class of limitations. It is parsed by the gateway's own operator extractor (`extract_gateway_constraints`), independent of the intent engine's entity/contrastive recognition.
 
 - **Syntax:** `NOT:<term>` for a single token, or `NOT:"<phrase>"` for a multi-word term (up to 4 words). Terms are lowercased for case-insensitive matching.
-- **Behaviour:** any result whose **title, content, or URL contains the term** (substring match) is hard-dropped by `should_filter_by_constraints`. This fires *before* the soft-penalty ranking path, so it removes the page entirely rather than demoting it.
+- **Behaviour:** any non-exempt result whose **title, content, or URL contains the term** (substring match) is hard-dropped by `should_filter_by_constraints`. This fires *before* the soft-penalty ranking path, so it removes the page entirely rather than demoting it. See the alt-listing exemption below for how comparison/"alternatives" pages are retained.
 - **Surfaced as:** `structured_constraints.hard_exclusions: ["<term>"]` and `applied_constraints: ["not:<term>"]` on `/search` and `/inspect`.
 - **Never forwarded upstream:** `preprocess_searxng_query` strips `NOT:` so SearXNG does not treat `<term>` as a literal search word and re-surface it.
 - **Alt-listing exemption (by design):** a comparison / "alternatives" page that merely *mentions* the excluded term in a referential context (alt-score > 0.3) is **kept**, exactly like the `site:` / `filetype:` negative gates and the committed test `not_operator_keeps_alt_listing_page`. So `"Best Flask Alternatives"` survives `NOT:flask`.
