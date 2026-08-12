@@ -5247,7 +5247,7 @@ fn compute_recall_gap_terms(
     }
     // Build one lowercase haystack per result (title + content preview + url),
     // matching the off-topic guard's overlap check shape.
-    let covered: std::collections::HashSet<String> = results
+    let covered: Vec<String> = results
         .iter()
         .map(|r| {
             let preview = r.content.chars().take(500).collect::<String>();
@@ -11873,6 +11873,18 @@ let mut results = match tokio::task::spawn_blocking(move || {
     let limit = params.limit.or(params.count).or(params.n).unwrap_or(24);
     let offset = params.offset.unwrap_or(0);
     let post_filter_count = results.len();
+    // ── Honest recall-gap signal (round-2026-08-12T1234Z D2 disposition) ──
+    // Compute which of the query's distinctive terms are absent from ALL
+    // returned results. This is an upstream recall limitation, NOT a ranking
+    // defect. Computed over the full post-filter result set (pre-pagination)
+    // so a term missing from every page is caught. Borrowed here BEFORE the
+    // `into_iter` move below consumes `results`.
+    let recall_gap_terms: Option<Vec<String>> =
+        if results.is_empty() {
+            None
+        } else {
+            compute_recall_gap_terms(&q_trimmed, &results)
+        };
     let mut paginated_results = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
 
     // ─── Constraint transparency (applied / ignored / warnings) ───
@@ -12094,19 +12106,8 @@ let mut results = match tokio::task::spawn_blocking(move || {
         });
     }
 
-    // ── Honest recall-gap signal (round-2026-08-12T1234Z D2 disposition) ──
-    // Compute which of the query's distinctive terms are absent from ALL
-    // returned results. This is an upstream recall limitation, NOT a ranking
-    // defect, and the engine surfaces it rather than fabricating a result.
-    // Keyed on generic stopword + weak-anchor filtering only — no per-query
-    // strings, no domain allow/deny lists. Computed over the full post-filter
-    // result set (pre-pagination) so a term missing from every page is caught.
-    let recall_gap_terms: Option<Vec<String>> =
-        if paginated_results.is_empty() {
-            None
-        } else {
-            compute_recall_gap_terms(&q_trimmed, &results)
-        };
+    // ── Honest recall-gap signal ──
+    // (computed earlier, before pagination, over the full post-filter result set)
 
     let response = UnifiedResponse {
         query: q.clone(),
@@ -13146,60 +13147,6 @@ mod constraint_fix_tests {
     }
 
     #[test]
-    fn recall_gap_detects_missing_distinctive_term() {
-        // Round-2026-08-12T1234Z D2: the parrot-recall gap is an upstream
-        // limitation, not a ranking defect. The honest signal is that the
-        // query's distinctive term ("parrot") appears in NONE of the results.
-        // This must be detectable without hardcoding the word "parrot".
-        let web = vec![web_res(
-            "https://example.com/introducing-cat-to-kitten",
-            "How to Introduce a Kitten to Your Home",
-            "Bringing a new kitten home and introducing it to your resident cat safely.",
-        )];
-        let out = merge_local_and_web(
-            vec![], web, "introduce a rescue parrot to a home with cats",
-            "informational", &cst(), None, None, &empty_sem(),
-        );
-        let gap = compute_recall_gap_terms(
-            "introduce a rescue parrot to a home with cats", &out,
-        );
-        assert!(gap.is_some(), "gap must be detected for an absent distinctive term");
-        let gap = gap.unwrap();
-        assert!(gap.iter().any(|t| t == "parrot"),
-            "expected 'parrot' in recall_gap_terms, got {:?}", gap);
-        assert!(!gap.iter().any(|t| t == "cat"),
-            "covered term 'cat' must NOT be in the gap, got {:?}", gap);
-    }
-
-    #[test]
-    fn recall_gap_absent_when_distinctive_term_covered() {
-        // When the result set genuinely covers the distinctive term, the gap
-        // signal stays silent (None) — no false alarms.
-        let web = vec![web_res(
-            "https://example.com/parrot-care",
-            "Caring for a Rescue Parrot",
-            "How to introduce a rescue parrot to your home with cats and other pets safely.",
-        )];
-        let out = merge_local_and_web(
-            vec![], web, "introduce a rescue parrot to a home with cats",
-            "informational", &cst(), None, None, &empty_sem(),
-        );
-        let gap = compute_recall_gap_terms(
-            "introduce a rescue parrot to a home with cats", &out,
-        );
-        assert!(gap.is_none(),
-            "no gap expected when 'parrot' is covered, got {:?}", gap);
-    }
-
-    #[test]
-    fn recall_gap_none_for_empty_results() {
-        // Empty SERP is a different problem class (see `warnings`); the recall
-        // gap signal must never fire on an empty result set.
-        let gap = compute_recall_gap_terms("introduce a rescue parrot to cats", &[]);
-        assert!(gap.is_none(), "gap must be None for empty results");
-    }
-
-    #[test]
     fn not_operator_allows_two_word_term() {
         // Multi-word hard-exclusion via quoting (e.g. "visual studio code") must be
         // supported so users can exclude exact phrases, not just single tokens.
@@ -13360,6 +13307,59 @@ mod hardcoding_ruling_tests {
             c2.file_types.contains(&"pdf".to_string()),
             "extract_gateway_constraints must still extract the real filetype: filter"
         );
+    }
+
+    #[test]
+    fn recall_gap_detects_missing_distinctive_term() {
+        // Round-2026-08-12T1234Z D2: the parrot-recall gap is an upstream
+        // limitation, not a ranking defect. The honest signal is that the
+        // query's distinctive term ("parrot") appears in NONE of the results.
+        let web = vec![web_res(
+            "https://example.com/introducing-cat-to-kitten",
+            "How to Introduce a Kitten to Your Home",
+            "Bringing a new kitten home and introducing it to your resident cat safely.",
+        )];
+        let out = merge_local_and_web(
+            vec![], web, "introduce a rescue parrot to a home with cats",
+            "informational", &cst(), None, None, &empty_sem(),
+        );
+        let gap = compute_recall_gap_terms(
+            "introduce a rescue parrot to a home with cats", &out,
+        );
+        assert!(gap.is_some(), "gap must be detected for an absent distinctive term");
+        let gap = gap.unwrap();
+        assert!(gap.iter().any(|t| t == "parrot"),
+            "expected 'parrot' in recall_gap_terms, got {:?}", gap);
+        assert!(!gap.iter().any(|t| t == "cat"),
+            "covered term 'cat' must NOT be in the gap, got {:?}", gap);
+    }
+
+    #[test]
+    fn recall_gap_absent_when_distinctive_term_covered() {
+        // When the result set genuinely covers the distinctive term, the gap
+        // signal stays silent (None) — no false alarms.
+        let web = vec![web_res(
+            "https://example.com/parrot-care",
+            "Caring for a Rescue Parrot",
+            "How to introduce a rescue parrot to your home with cats and other pets safely.",
+        )];
+        let out = merge_local_and_web(
+            vec![], web, "introduce a rescue parrot to a home with cats",
+            "informational", &cst(), None, None, &empty_sem(),
+        );
+        let gap = compute_recall_gap_terms(
+            "introduce a rescue parrot to a home with cats", &out,
+        );
+        assert!(gap.is_none(),
+            "no gap expected when 'parrot' is covered, got {:?}", gap);
+    }
+
+    #[test]
+    fn recall_gap_none_for_empty_results() {
+        // Empty SERP is a different problem class (see `warnings`); the recall
+        // gap signal must never fire on an empty result set.
+        let gap = compute_recall_gap_terms("introduce a rescue parrot to cats", &[]);
+        assert!(gap.is_none(), "gap must be None for empty results");
     }
 }
 
