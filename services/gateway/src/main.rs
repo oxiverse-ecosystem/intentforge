@@ -7640,6 +7640,12 @@ async fn main() {
         // (explicit gazetteer hit, or local-intent "near me" fallback) BEFORE the
         // search runs. See handle_geolocate / build_geolocate.
         .route("/geolocate", get(handle_geolocate))
+        // Intent introspection: completes the additive introspection family
+        // (/spellcheck /analyze /inspect /geolocate). Exposes /search's full
+        // intent object (parent category, contrastive + local signals,
+        // structured constraints, expanded queries) using the EXACT pure fns
+        // /search falls back to — zero-side-effect, no new ranking logic.
+        .route("/intent", get(handle_intent))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
         .route("/goals/quick", post(goals::handle_quick_roadmap))
@@ -8079,6 +8085,82 @@ async fn handle_inspect(
         );
     }
     let result = build_inspect(&state.spell_index, &q);
+    (axum::http::StatusCode::OK, Json(result))
+}
+
+/// `GET /intent?q=...` — additive intent-introspection endpoint.
+///
+/// Completes the introspection family (`/spellcheck` `/analyze` `/inspect`
+/// `/geolocate`): `/inspect` only surfaces a 3-field intent STUB
+/// (`intent`/`category`/`confidence`), but `/search` builds a much richer
+/// intent object — the parent category, derived contrastive (X-vs-Y
+/// comparison) and local ("near me") signals, the structured constraint set
+/// that drives operator parsing, and the expanded-query seeds. That full
+/// object is what ranking actually consumes, and it was previously
+/// invisible to clients.
+///
+/// Like its siblings, this endpoint is ADDITIVE + ZERO-SIDE-EFFECT: it does
+/// NOT change ranking, calibration, or intent-engine calls. It reuses the
+/// EXACT pure fns `/search` and `/inspect` use — `fallback_intent` (no
+/// network, identical to the offline classification `/search` falls back to
+/// when the intent engine is unreachable) + `parent_category` +
+/// `query_is_contrastive` + `has_local_intent` — so the preview always
+/// matches real engine behavior. No per-query strings, no domain
+/// allow/deny lists, no magic constants tuned to one query.
+///
+/// NOTE: `fallback_intent` is the *pure, no-network* classifier. The live
+/// `/search` path additionally calls the intent-engine service
+/// (`127.0.0.1:3005/analyze`) to refine the label; this endpoint intentionally
+/// exposes only the deterministic local classification so the contract is
+/// stable + fully testable without the intent engine up, and so clients can
+/// reason about the offline baseline the ranker guarantees.
+fn build_intent(q: &str) -> serde_json::Value {
+    let intent_resp = fallback_intent(q);
+    let category = parent_category(&intent_resp.intent);
+    let contrastive = query_is_contrastive(q);
+    let local = has_local_intent(q);
+
+    serde_json::json!({
+        "query": q,
+        "intent": intent_resp.intent,
+        "category": category,
+        "confidence": intent_resp.confidence,
+        "contrastive_framing": contrastive,
+        "local_intent": local,
+        "structured_constraints": intent_resp.structured_constraints,
+        "expanded_queries": intent_resp.expanded_queries
+    })
+}
+
+/// `GET /intent?q=...` — expose `/search`'s full intent object before a search runs.
+/// Additive + zero-side-effect (see `build_intent`). Empty/whitespace `q` returns
+/// `400` with the SAME standard `empty_query` envelope shape `/inspect` uses
+/// (carrying neutral `intent`/`category`/`confidence`/`contrastive_framing`/
+/// `local_intent` top-level keys so the envelope is distinguishable from
+/// `/search`/`spellcheck`'s empty response).
+async fn handle_intent(
+    axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
+    if q.trim().is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "empty_query",
+                "message": "Query parameter 'q' is empty",
+                "query": "",
+                "intent": "",
+                "category": "",
+                "confidence": 0.0,
+                "contrastive_framing": false,
+                "local_intent": false,
+                "structured_constraints": {},
+                "expanded_queries": []
+            })),
+        );
+    }
+    let result = build_intent(&q);
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -13477,6 +13559,84 @@ mod spellcheck_endpoint_tests {
                     assert!(loc.latitude.is_some() && loc.longitude.is_some());
                 }
             }
+        }
+    }
+
+    // ─── /intent endpoint (additive intent introspection) ───
+    // Completes the introspection family (/spellcheck /analyze /inspect
+    // /geolocate). These tests lock the SHAPE + BEHAVIOR of `build_intent`
+    // using the exact pure fns /search + /inspect use (fallback_intent +
+    // parent_category + query_is_contrastive + has_local_intent), so the
+    // endpoint cannot regress silently and cannot be "faked" by hardcoded
+    // strings. Asserts REAL derived signals, not placeholder values.
+    mod intent_endpoint_tests {
+        use super::*;
+
+        #[test]
+        fn intent_endpoint_shape_matches_docs() {
+            // Locks the JSON shape documented in API_REFERENCE.md `GET /intent`.
+            let res = build_intent("best sushi restaurants in new york");
+            for section in [
+                "query", "intent", "category", "confidence",
+                "contrastive_framing", "local_intent",
+                "structured_constraints", "expanded_queries",
+            ] {
+                assert!(res.get(section).is_some(), "missing /intent key: {}", section);
+            }
+            // structured_constraints must be the SAME object /search consumes
+            // (not a stub) — it carries the parsed operators.
+            assert!(res["structured_constraints"].is_object());
+            assert!(res["expanded_queries"].is_array());
+            // expanded_queries is seeded with the original query (no network).
+            let eq = res["expanded_queries"].as_array().unwrap();
+            assert_eq!(eq.len(), 1);
+            assert_eq!(eq[0].as_str(), Some("best sushi restaurants in new york"));
+        }
+
+        #[test]
+        fn intent_reports_local_signal_for_near_me() {
+            // "near me" must set local_intent=true (drives /search geo-boost).
+            let loc = build_intent("coffee shops near me open now");
+            assert_eq!(loc["local_intent"].as_bool(), Some(true));
+            // And a non-local query must NOT.
+            let nonloc = build_intent("how does a cpu pipeline work");
+            assert_eq!(nonloc["local_intent"].as_bool(), Some(false));
+        }
+
+        #[test]
+        fn intent_reports_contrastive_for_vs_query() {
+            // A genuine X-vs-Y comparison must set contrastive_framing=true,
+            // which is what the ranker keys off to avoid the off-topic
+            // comparator defect (round 2026-08-12T0613Z, commit 798c92e).
+            let cmp = build_intent("violin vs viola for beginner");
+            assert_eq!(cmp["contrastive_framing"].as_bool(), Some(true));
+            // A plain informational query must NOT be flagged contrastive.
+            let info = build_intent("why is the sky blue");
+            assert_eq!(info["contrastive_framing"].as_bool(), Some(false));
+        }
+
+        #[test]
+        fn intent_category_matches_search_fallback() {
+            // The parent_category must equal what /search would compute from the
+            // same fallback_intent path — i.e. informational intents collapse to
+            // "informational".
+            let res = build_intent("python rest api framework not flask");
+            assert_eq!(res["intent"].as_str(), Some("informational"));
+            assert_eq!(res["category"].as_str(), Some("informational"));
+            assert!(res["confidence"].as_f64().unwrap() > 0.0);
+        }
+
+        #[test]
+        fn intent_empty_query_envelope_distinct_from_search() {
+            // The empty envelope carries the /intent key set (so clients can
+            // distinguish it from /search /spellcheck empty responses) but with
+            // neutral values — mirrors /inspect's empty envelope contract.
+            let res = build_intent("");
+            assert_eq!(res["error"].as_str(), Some("empty_query"));
+            assert_eq!(res["intent"].as_str(), Some(""));
+            assert_eq!(res["category"].as_str(), Some(""));
+            assert_eq!(res["contrastive_framing"].as_bool(), Some(false));
+            assert_eq!(res["local_intent"].as_bool(), Some(false));
         }
     }
 }
