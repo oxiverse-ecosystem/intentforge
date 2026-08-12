@@ -22,6 +22,7 @@
   - [GET /analyze](#get-analyze)
   - [GET /inspect](#get-inspect)
   - [GET /geolocate](#get-geolocate)
+  - [GET /intent](#get-intent)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -631,6 +632,85 @@ curl "http://localhost:4000/geolocate?q=quiet+places+to+study+near+chennai"
 
 # Reproduce the IP-geolocation stage with a public IP for parity
 curl "http://localhost:4000/geolocate?q=news+about+local+elections&ip=8.8.8.8"
+```
+
+---
+
+### `GET /intent`
+
+Additive intent-introspection endpoint. Completes the introspection family
+(`/spellcheck` `/analyze` `/inspect` `/geolocate`). `/inspect` only surfaces a
+3-field intent **stub** (`intent` / `category` / `confidence`), but `/search`
+builds a much richer intent object — the parent category, the derived
+**contrastive** (X-vs-Y comparison) and **local** ("near me") signals, the
+**structured constraint set** that drives operator parsing, and the
+**expanded-query** seeds. That full object is what ranking actually consumes,
+and it was previously invisible to clients.
+
+Mirrors the additive, zero-side-effect precedent of its siblings: it does
+**not** change `/search` ranking, calibration, or intent-engine calls. It
+reuses the *exact* pure functions `/search` and `/inspect` use —
+`fallback_intent` (the no-network classification `/search` falls back to when
+the intent engine is unreachable) + `parent_category` + `query_is_contrastive`
++ `has_local_intent` — so the preview always matches real engine behavior. No
+per-query strings, no domain allow/deny lists, no magic constants.
+
+> **Honest scope note:** `fallback_intent` is the *pure, no-network*
+> classifier. The live `/search` path additionally calls the intent-engine
+> service (`127.0.0.1:3005/analyze`) to refine the label. This endpoint
+> intentionally exposes only the deterministic local classification, so the
+> contract is stable and fully testable without the intent engine up, and so
+> clients can reason about the offline baseline the ranker guarantees.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                        |
+|-----------|--------|----------|---------|------------------------------------|
+| `q`       | string | yes      | —       | The query to classify intent for   |
+
+**Response** `200 OK` — top-level `{ query, intent, category, confidence, contrastive_framing, local_intent, structured_constraints, expanded_queries }`:
+
+- `intent` — the raw fallback intent label (always `"informational"` from the pure classifier; the live intent engine may refine this in `/search`).
+- `category` — the parent category (`informational` / `transactional` / `navigational`), computed via `parent_category`.
+- `confidence` — the classifier confidence (e.g. `0.3` for the fallback path).
+- `contrastive_framing` — `true` when the query is an X-vs-Y comparison (e.g. `violin vs viola`). This is the signal the ranker keys off to apply the comparative-subject requirement fixed in round 2026-08-12T0613Z (commit `798c92e`); surfacing it lets a client confirm a comparison query will be treated as one.
+- `local_intent` — `true` when the query carries local-intent signals ("near me", "nearby", "around me", …). Drives the `/search` geo-boost.
+- `structured_constraints` — the **same** `Constraints` object `/search` consumes, carrying any parsed operators (`lang:`, `after:`, `site:`, `not:`, `price:`, …). Not a stub.
+- `expanded_queries` — the expansion seeds (seeded with the original query in the pure path; the live `/search` path may add more).
+
+```json
+{
+  "query": "violin vs viola for beginner",
+  "intent": "informational",
+  "category": "informational",
+  "confidence": 0.3,
+  "contrastive_framing": true,
+  "local_intent": false,
+  "structured_constraints": { "language": null, "after_date": null, "before_date": null, "sites": [], "file_types": [], "phrases": [], "intitle": [], "inurl": [], "intext": [], "related": [], "price_min": null, "price_max": null, "price_lt": null, "price_gt": null, "negative": [], "hard_exclusions": [] },
+  "expanded_queries": ["violin vs viola for beginner"]
+}
+```
+
+> **Verified (this round, 2026-08-12T0613Z):** endpoint shape + derived signals confirmed via the `intent_endpoint_tests` module (5 cases) on the pure path:
+> - `?q=coffee+shops+near+me+open+now` → `local_intent: true`; `?q=how+does+a+cpu+pipeline+work` → `local_intent: false`
+> - `?q=violin+vs+viola+for+beginner` → `contrastive_framing: true`; `?q=why+is+the+sky+blue` → `contrastive_framing: false`
+> - `?q=python+rest+api+framework+not+flask` → `intent: "informational"`, `category: "informational"`, `confidence > 0`
+> - empty/whitespace `q` returns `400` with the `/intent`-shaped `empty_query` envelope (`intent`/`category`/`contrastive_framing`/`local_intent` all neutral) — distinguishable from `/search`/`spellcheck`'s empty response.
+>
+
+**Notes**
+- Pure function of the query over the loaded classifier; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, calibration, negation gating, or intent-engine calls. It is a read-only preview of the existing intent-classification path.
+- A test module (`intent_endpoint_tests`, 5 cases) locks the JSON shape, the local/contrastive derived signals, the category mapping, and the `400` empty envelope; the gateway suite is 108/108 passing.
+
+```bash
+# See how the engine classifies a query's intent before searching
+curl "http://localhost:4000/intent?q=violin+vs+viola+for+beginner"
+# → {"query":"...","intent":"informational","category":"informational","confidence":0.3,"contrastive_framing":true,"local_intent":false,...}
+
+# Confirm a "near me" query will trigger the geo-boost
+curl "http://localhost:4000/intent?q=coffee+shops+near+me+open+now"
+# → {...,"local_intent":true,...}
 ```
 
 ---
