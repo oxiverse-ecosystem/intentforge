@@ -513,6 +513,15 @@ struct UnifiedResponse {
     /// Number of returned results carrying a verified detectable price
     #[serde(skip_serializing_if = "Option::is_none")]
     price_verified: Option<usize>,
+    /// Honest recall-gap signal. When a salient (distinctive) query term is
+    /// mentioned by NONE of the returned results, it appears here — signalling
+    /// an upstream recall gap for that facet of the query rather than a ranking
+    /// failure. Empty/absent = the result set plausibly covers the query's
+    /// subject. The engine surfaces this; it never fabricates a result to fill
+    /// the gap (round-2026-08-12T1234Z D2 disposition). No query-specific
+    /// tuning, no domain/term allow-or-deny lists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recall_gap_terms: Option<Vec<String>>,
 }
 
 const DOWNLOAD_KEYWORDS: &[&str] = &[
@@ -5163,6 +5172,106 @@ fn is_weak_anchor_word(w: &str) -> bool {
     WEAK.contains(&w)
 }
 
+/// Generic stopwords shared by the recall-gap / distinctive-term extractors.
+/// A general, fixed set (no query/domain-specific entries) so the gap signal
+/// never keys on a particular phrase. Mirrors the broad stopword philosophy
+/// used by the off-topic guard's distinctive-term set.
+fn recall_gap_stopwords() -> std::collections::HashSet<&'static str> {
+    [
+        // articles / conjunctions / prepositions
+        "the", "a", "an", "and", "or", "but", "if", "then", "else", "of", "to",
+        "in", "on", "at", "by", "for", "with", "without", "from", "into", "onto",
+        "as", "is", "are", "was", "were", "be", "been", "being", "it", "this",
+        "that", "these", "those", "my", "your", "our", "their", "his", "her",
+        "i", "you", "he", "she", "we", "they", "me", "us", "him", "them",
+        // common question / framing verbs and helpers
+        "how", "what", "when", "where", "why", "who", "which", "way", "ways",
+        "best", "good", "great", "better", "top", "free", "cheap", "easy",
+        "simple", "quick", "fast", "new", "recent", "latest", "safe", "natural",
+        "home", "house", "make", "making", "get", "getting", "use", "using",
+        "find", "finding", "help", "need", "want", "like", "near", "nearby",
+        // negations (handled as constraints, not recall gaps)
+        "not", "no", "without", "except", "besides", "minus", "other", "than",
+        "nor",
+        // temporal fillers (fresh intent keys off these; not a topical gap)
+        "today", "tonight", "now", "this", "week", "weeks", "month", "months",
+        "year", "years", "day", "days", "past", "last", "upcoming",
+    ]
+    .iter()
+    .copied()
+    .collect()
+}
+
+/// Extract the salient (distinctive) query terms worth checking for recall
+/// coverage. These are the query's content-bearing words after removing
+/// generic stopwords, weak anchor words, pure numbers, and single chars.
+/// Pure function of the query — no per-query strings, no domain lists.
+fn distinctive_query_terms(query: &str) -> Vec<String> {
+    let stops = recall_gap_stopwords();
+    query
+        .split_whitespace()
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            lower.len() >= 3
+                && !stops.contains(lower.as_str())
+                && !is_weak_anchor_word(&lower)
+                && !lower.chars().all(|c| c.is_ascii_digit())
+        })
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// Honest recall-gap detector (round-2026-08-12T1234Z D2 disposition).
+///
+/// Given the final merged results and the original query, returns the subset of
+/// the query's distinctive terms that appear in NONE of the returned results'
+/// title/content/url. Those terms represent facets of the query the upstream
+/// index could not supply — an honest signal to the user, NOT a ranking defect
+/// and NOT a reason to fabricate a result. When the empty/!single-doc-facet
+/// case (e.g. a single leading result that legitimately dominates) would be
+/// mis-flagged, the caller decides; this fn is pure and general.
+///
+/// Returns `None` when there are no results at all (nothing to compare against)
+/// so the signal is never emitted for an empty SERP (that's a different problem
+/// class — see `warnings`).
+fn compute_recall_gap_terms(
+    query: &str,
+    results: &[MergedResult],
+) -> Option<Vec<String>> {
+    if results.is_empty() {
+        return None;
+    }
+    let topics = distinctive_query_terms(query);
+    if topics.is_empty() {
+        return None;
+    }
+    // Build one lowercase haystack per result (title + content preview + url),
+    // matching the off-topic guard's overlap check shape.
+    let covered: std::collections::HashSet<String> = results
+        .iter()
+        .map(|r| {
+            let preview = r.content.chars().take(500).collect::<String>();
+            format!(
+                "{} {} {}",
+                r.title.to_lowercase(),
+                preview.to_lowercase(),
+                r.url.to_lowercase()
+            )
+        })
+        .collect::<Vec<String>>();
+
+    let missing: Vec<String> = topics
+        .into_iter()
+        .filter(|t| !covered.iter().any(|hay| hay.contains(t.as_str())))
+        .collect();
+
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing)
+    }
+}
+
 fn merge_local_and_web(
     local: Vec<IndexerResult>,
     web: Vec<SearxResult>,
@@ -8654,6 +8763,7 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         page_offset: None,
         has_more: None,
         price_verified: None,
+        recall_gap_terms: None,
     };
     (
         axum::http::StatusCode::BAD_REQUEST,
@@ -11984,6 +12094,20 @@ let mut results = match tokio::task::spawn_blocking(move || {
         });
     }
 
+    // ── Honest recall-gap signal (round-2026-08-12T1234Z D2 disposition) ──
+    // Compute which of the query's distinctive terms are absent from ALL
+    // returned results. This is an upstream recall limitation, NOT a ranking
+    // defect, and the engine surfaces it rather than fabricating a result.
+    // Keyed on generic stopword + weak-anchor filtering only — no per-query
+    // strings, no domain allow/deny lists. Computed over the full post-filter
+    // result set (pre-pagination) so a term missing from every page is caught.
+    let recall_gap_terms: Option<Vec<String>> =
+        if paginated_results.is_empty() {
+            None
+        } else {
+            compute_recall_gap_terms(&q_trimmed, &results)
+        };
+
     let response = UnifiedResponse {
         query: q.clone(),
         intent: Some(intent.intent.clone()),
@@ -12010,6 +12134,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         page_offset: Some(offset),
         has_more: if post_filter_count > 0 { Some(offset + limit < post_filter_count) } else { Some(false) },
         price_verified: if sc.price_min.is_some() || sc.price_max.is_some() || sc.price_lt.is_some() || sc.price_gt.is_some() || priced_result_count > 0 { Some(priced_result_count) } else { None },
+        recall_gap_terms,
     };
 
     // Cache for 5 minutes — but never cache empty results
@@ -13018,6 +13143,60 @@ mod constraint_fix_tests {
             "NOT:flask must be stripped before forwarding to SearXNG, got: '{}'", q);
         assert!(q.to_lowercase().contains("python"),
             "plain term must remain, got: '{}'", q);
+    }
+
+    #[test]
+    fn recall_gap_detects_missing_distinctive_term() {
+        // Round-2026-08-12T1234Z D2: the parrot-recall gap is an upstream
+        // limitation, not a ranking defect. The honest signal is that the
+        // query's distinctive term ("parrot") appears in NONE of the results.
+        // This must be detectable without hardcoding the word "parrot".
+        let web = vec![web_res(
+            "https://example.com/introducing-cat-to-kitten",
+            "How to Introduce a Kitten to Your Home",
+            "Bringing a new kitten home and introducing it to your resident cat safely.",
+        )];
+        let out = merge_local_and_web(
+            vec![], web, "introduce a rescue parrot to a home with cats",
+            "informational", &cst(), None, None, &empty_sem(),
+        );
+        let gap = compute_recall_gap_terms(
+            "introduce a rescue parrot to a home with cats", &out,
+        );
+        assert!(gap.is_some(), "gap must be detected for an absent distinctive term");
+        let gap = gap.unwrap();
+        assert!(gap.iter().any(|t| t == "parrot"),
+            "expected 'parrot' in recall_gap_terms, got {:?}", gap);
+        assert!(!gap.iter().any(|t| t == "cat"),
+            "covered term 'cat' must NOT be in the gap, got {:?}", gap);
+    }
+
+    #[test]
+    fn recall_gap_absent_when_distinctive_term_covered() {
+        // When the result set genuinely covers the distinctive term, the gap
+        // signal stays silent (None) — no false alarms.
+        let web = vec![web_res(
+            "https://example.com/parrot-care",
+            "Caring for a Rescue Parrot",
+            "How to introduce a rescue parrot to your home with cats and other pets safely.",
+        )];
+        let out = merge_local_and_web(
+            vec![], web, "introduce a rescue parrot to a home with cats",
+            "informational", &cst(), None, None, &empty_sem(),
+        );
+        let gap = compute_recall_gap_terms(
+            "introduce a rescue parrot to a home with cats", &out,
+        );
+        assert!(gap.is_none(),
+            "no gap expected when 'parrot' is covered, got {:?}", gap);
+    }
+
+    #[test]
+    fn recall_gap_none_for_empty_results() {
+        // Empty SERP is a different problem class (see `warnings`); the recall
+        // gap signal must never fire on an empty result set.
+        let gap = compute_recall_gap_terms("introduce a rescue parrot to cats", &[]);
+        assert!(gap.is_none(), "gap must be None for empty results");
     }
 
     #[test]
