@@ -5289,6 +5289,41 @@ fn is_weak_anchor_word(w: &str) -> bool {
         "matches", "match", "stream", "streaming",
         "drinking", "cups", "cup", "single", "solve", "solving", "problems", "problem",
         "cannot", "track", "speed", "three", "twenty", "hundred", "thousand",
+        // Round-2026-08-13T1656Z: generic CONTAINER / framing nouns that carry no
+        // specific topical signal but keep leaking into strong_distinctive_terms and
+        // let off-topic pages survive the zero-overlap off-topic gate via one
+        // coincidental token match. Observed from this round's live queries:
+        //   "latest iphone operating system new features" -> Android feature pages
+        //     ranked #1 (engine honestly flagged recall_gap_terms:['iphone']) because
+        //     "features"/"version" counted as strong anchors. Marking them weak makes
+        //     the gate anchor on the genuine subject ("iphone").
+        //   "festival of onam ... what dishes traditionally prepared" -> German beer
+        //     festival / Oktoberfest pages ranked above Onam results because
+        //     "festival"/"dishes"/"celebrated"/"traditionally" were strong anchors.
+        //   "best places in gokarna ... quiet beach holiday away from crowds" -> a
+        //     generic "best places May 2026" page ranked #1 because "holiday"/"quiet"/
+        //     "crowds"/"away" were strong anchors.
+        //   "signal and whatsapp ... who can read your messages" -> a privacy-policy
+        //     template page ranked #1 because "policies"/"regarding" anchored it.
+        //   "indian states best government schools ... performance measured" -> an IRS
+        //     page ranked #1 because "government"/"measured"/"performance" anchored it.
+        //   "free password manager ... offline sync" -> a task-manager page ranked #1
+        //     because "manager" anchored it (genuine subject "password" was present
+        //     but the shared generic kept the off-topic page alive).
+        // General fixed lexicon of common everyday/container/framing nouns — no
+        // query/domain-specific entries, no per-query tuning. Mechanism identical to
+        // the existing "school"/"student"/"laptop"/"restaurant" entries: treating
+        // these as weak removes them from strong_distinctive_terms so the off-topic
+        // gate requires a GENUINE subject term to survive, instead of a word that
+        // off-topic pages also contain. Genuine SUBJECT nouns are intentionally NOT
+        // listed (marking a real subject weak empties the anchor set and makes the
+        // gate skip — increasing leakage, the opposite of the goal).
+        "features", "version", "brand", "festival", "festivals", "dish", "dishes",
+        "prepared", "preparation", "celebrated", "celebrate", "celebrating",
+        "traditionally", "tradition", "traditional", "holiday", "holidays",
+        "crowds", "crowd", "quiet", "away", "government", "governments",
+        "measured", "measurement", "performance", "policies", "policy",
+        "regarding", "manager", "managers",
     ];
     WEAK.contains(&w)
 }
