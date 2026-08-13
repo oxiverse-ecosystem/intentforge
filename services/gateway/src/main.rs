@@ -3623,7 +3623,7 @@ fn calibrate_scores(scores: &mut [f32]) {
         }
         return;
     }
-    let ceil = 1.0f32;
+    let ceil = CALIBRATE_CEIL;
     let span = ceil - floor;
     let norm = raw_max - raw_min;
     for score in scores.iter_mut() {
@@ -3631,6 +3631,14 @@ fn calibrate_scores(scores: &mut [f32]) {
         *score = (floor + t * span).clamp(floor, ceil);
     }
 }
+
+/// Ceiling for the healthy-set calibration remap. The standard remap forces the
+/// max raw score onto exactly 1.0, which can resurrect an off-topic page (high
+/// authority, coincidental token match) above a lower-raw but genuinely on-topic
+/// page when the whole set is otherwise weak. Leaving a small margin below the
+/// ceiling shrinks that resurrection without flattening legitimately good sets.
+/// A pure constant — no query/domain bias, applies uniformly to every result.
+const CALIBRATE_CEIL: f32 = 0.92f32;
 
 // ─── Search URL Builder with Location Support ──────────────────────
 
@@ -6409,6 +6417,28 @@ fn merge_local_and_web(
         // borderline page keeps a little trust, and the existing 0.3 floor logic holds.
         let geo_authority_suppressed = off_topic || geo_local_offtopic;
         let authority_eff = if geo_authority_suppressed { r.authority * 0.3 } else { r.authority };
+
+        // P1 residual (this round): when a multi-term informational query has strong
+        // distinctive topic terms, a HIGH-authority page that matches NONE of them still
+        // floated above the genuine on-topic page (e.g. a TP-Link modem article ranking #1
+        // for "differential gear ... explained simply", a Namecheap URL-redirect page for
+        // "mesh wifi network"). The `off_topic` gate above only fires when the page has no
+        // relevance signal at all; a page that coincidentally matches ONE weak/distinctive
+        // token keeps full authority and wins via calibrate_scores rescaling. For queries
+        // with >=2 strong distinctive terms, halve authority for results that match NONE of
+        // them, so topic coverage — not raw domain trust — decides #1. General (term-count
+        // + overlap based, no query/domain names); authority halved not zeroed so a
+        // borderline page keeps some trust. Single-term queries unaffected.
+        let authority_topicsuppressed = if strong_distinctive_terms.len() >= 2 && !off_topic {
+            let matches_any = strong_distinctive_terms.iter().any(|t| {
+                let tl = t.to_lowercase();
+                title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
+            });
+            !matches_any
+        } else {
+            false
+        };
+        let authority_eff = if authority_topicsuppressed { authority_eff * 0.5 } else { authority_eff };
 
         let base = (weights.rrf * r.score)
             + (weights.semantic * semantic)
@@ -11203,7 +11233,17 @@ async fn handle_search(
         } else {
             1.0
         };
-        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.25;
+        let is_fresh_intent = intent.intent.to_lowercase() == "fresh";
+        // (C) RESIDUAL P6 (broadened this round): a recency / fresh intent expects
+        // recent content, but upstream date coverage is sparse, so a hard window that
+        // removes >50% of the set is almost always a recall failure rather than a
+        // genuine out-of-window cull. Fail open to scoring-only recency (the
+        // freshness half-life already demotes stale items) so the genuinely relevant,
+        // date-less fresh snippets survive. Keyed on survivor ratio + fresh intent
+        // -- no query/domain/window constants, so it stays general and never
+        // over-drops a genuinely dated fresh set (those keep >60% survivors).
+        let fraction_too_low = (survivors_after_window < 3 && survivor_fraction < 0.5)
+            || (is_fresh_intent && survivor_fraction < 0.6);
         if survivors_after_window == 0 || fraction_too_low {
             tracing::info!(
                 "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
