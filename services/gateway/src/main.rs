@@ -14201,5 +14201,32 @@ mod spellcheck_endpoint_tests {
             assert!(res["video_intent_markers"].is_array());
             assert!(res["is_video_source_examples"].is_object());
         }
+
+        #[test]
+        fn video_note_field_matches_documented_contract() {
+            // API_REFERENCE.md documents `note` as a human-readable explanation of
+            // the endpoint. Lock the EXACT shipped string so a future copy edit is
+            // caught (keeps docs ↔ code in sync) and so the field is never silently
+            // dropped or hardcoded to a placeholder.
+            let res = build_video("rust vs go high concurrency servers");
+            let note = res["note"].as_str().expect("note field must be a string");
+            assert_eq!(
+                note,
+                "Additive introspection of the P8 video-dominance fix (commit 3938da6). Does not change ranking. A video source is any url matching is_url_video_host (youtube/youtu.be/vimeo/invidious self-hosted / m.youtube). video_intent=true exempts a query from the non-video pin."
+            );
+        }
+
+        #[test]
+        fn video_empty_envelope_message_matches_contract() {
+            // API_REFERENCE.md shows the 400 empty_query envelope carries `message`:
+            // "Query parameter 'q' is empty". Lock it so the documented error copy
+            // cannot drift from the shipped value, and confirm `query` echoes "".
+            let res = build_video_empty();
+            assert_eq!(
+                res["message"].as_str(),
+                Some("Query parameter 'q' is empty")
+            );
+            assert_eq!(res["query"].as_str(), Some(""));
+        }
     }
 }
