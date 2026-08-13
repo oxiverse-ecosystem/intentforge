@@ -5567,8 +5567,26 @@ fn merge_local_and_web(
                 "compared","beginner","beginners","explained","explain","explaining","simply",
                 "meaning","means","definition","define","mean","like","how to",
             ];
-            let topic_mentioned = distinctive_terms.is_empty()
-                || distinctive_terms.iter().any(|t| {
+            // P2 gate anchors on STRONG distinctive terms (the stricter set also used
+            // by the post-loop OFF_TOPIC_LOCAL_DROP at line ~6129 and the off_topic_struct
+            // guard). Strong terms exclude weak-anchor nouns ("symptoms", "sign", "effect",
+            // "cause", ...) that are shared across unrelated topics. Anchoring on the looser
+            // `distinctive_terms` let an off-topic local page ("Heart Disease in Cats:
+            // Early Symptoms") pass the gate at full relevance for "early symptoms of a
+            // failing laptop ssd" because it matched the generic word "symptoms" — then
+            // outrank the genuinely-relevant web result. Strong terms require the page to
+            // name a SUBSTANTIVE query entity (ssd/laptop), so the off-topic page is
+            // crushed. General: same distinctive-term overlap test as the hard-drop; no
+            // query or domain bias. Falls back to the looser set only when the query has no
+            // strong distinctive terms at all (so generic-anchor-only queries still gate on
+            // whatever contentful terms exist).
+            let topic_anchor_terms: &Vec<&str> = if strong_distinctive_terms.is_empty() {
+                &distinctive_terms
+            } else {
+                &strong_distinctive_terms
+            };
+            let topic_mentioned = topic_anchor_terms.is_empty()
+                || topic_anchor_terms.iter().any(|t| {
                     let tl = t.to_lowercase();
                     if structure_words.contains(&tl.as_str()) { return false; }
                     let bare = tl.trim_end_matches('s');
@@ -5729,12 +5747,23 @@ fn merge_local_and_web(
                 ].iter().any(|p| host == *p || host.ends_with(&format!(".{}", p)));
                 known_portal && shallow
             };
+            // Anchor the topic test on the TITLE only. A news-portal HOMEPAGE
+            // aggregates links to every story on the site, so its page BODY matches
+            // almost any distinctive term (e.g. nytimes.com/ "sodium" appears in some
+            // sidebar link) — scanning content wrongly exempts the generic homepage from
+            // demotion. The genuine failure mode is a GENERIC TITLE ("The New York Times
+            // - Breaking News, US News, World News and…") with no specific article; that
+            // is exactly what should be demoted. A real portal ARTICLE (title names the
+            // topic, e.g. "solid-state battery breakthrough") still carries the term in
+            // its title and is correctly preserved. Title-only test is general: it keys
+            // on whether the page's own headline names the query subject, not on what
+            // random links the homepage happens to collect.
             let title_has_topic = if distinctive_terms.is_empty() {
                 false
             } else {
                 distinctive_terms.iter().any(|t| {
                     let tl = t.to_lowercase();
-                    title_lower.contains(&tl) || content_lower.contains(&tl)
+                    title_lower.contains(&tl)
                 })
             };
             if is_portal_home && !title_has_topic {
@@ -6496,9 +6525,22 @@ fn merge_local_and_web(
                 || prefix.contains("1. : to ") || prefix.contains("2. : to ")
                 || prefix.contains("definition of ") || prefix.contains("meaning of ");
             let short = cl.len() < 200;
+            // Wikipedia disambiguation stubs ("Hill - Wikipedia", "Java - Wikipedia"):
+            // a bare title with no descriptive body, just a list of links to the
+            // article's possible meanings. For a non-definition query they are
+            // off-topic junk (ranked #1 for "why is the hill blue?"-style polysemy and
+            // for "what is the difference between java the language and java the island").
+            // Detection is structural (en.wikipedia.org/wiki/<Word> with a " - Wikipedia"
+            // title and a content prefix that is just the title echoed, i.e. no
+            // encyclopedic lead) — no curated disambiguation allow-list. A definition
+            // query (handled by is_definition_query above) is exempt and keeps them.
+            let wiki_disambig = ul.contains("en.wikipedia.org/wiki/")
+                && tl.ends_with("- wikipedia")
+                && (cl.trim().is_empty() || cl.trim().to_lowercase() == tl.trim() || prefix.contains("may refer to") || prefix.contains("can refer to") || prefix.starts_with(tl.trim()));
             dict_path_marker || dict_title
                 || ((phonetic || pos_label) && title_words.len() <= 3)
                 || (pos_label && short)
+                || wiki_disambig
         };
 
         // Count how many DISTINCTIVE topic terms a result actually contains (excludes
@@ -6510,8 +6552,16 @@ fn merge_local_and_web(
             .copied().collect();
         let query_has_many_topics = strong_topics.len() >= 3;
 
-        let dict_cap = 0.06f32;   // dictionary sites may appear but never rank top
-        let weak_cap = 0.08f32;   // single-polysemous-token matches capped low
+        // These caps MUST sit strictly BELOW the calibrated article floor so the
+        // spam is demoted *under* every genuine article, not merely tied with it.
+        // calibrate_scores maps the raw set onto [0.05, 1.0]; a relevant article's
+        // calibrated score is therefore >= 0.05. The post-cal caps below use 0.03
+        // (dict) and 0.04 (weak/any-cap) — UNDER 0.05 — so a capped result can never
+        // outrank or tie a real article (e.g. Vocabulary.com "Cause" at 0.03 now sits
+        // below the relevant fridge-article at 0.05, and an invidious tutorial at 0.04
+        // sits below the topical write-up). Floor preserved so they remain present.
+        let dict_cap = 0.03f32;   // dictionary sites may appear but never rank top
+        let weak_cap = 0.04f32;   // single-polysemous-token matches capped low
 
         for r in merged.iter_mut() {
             let rl = r.title.to_lowercase();
@@ -6549,11 +6599,13 @@ fn merge_local_and_web(
                     || q_lc_cap.contains("tutorial")
                     || q_lc_cap.contains("animation");
                 if !video_intent {
-                    // 0.12 is below the calibrated top band for real text results
-                    // (~1.0) but above the 0.05 floor, so a video stays present yet
-                    // strictly secondary. Signal-driven (query self-describes intent),
-                    // not tuned to any one query.
-                    let video_cap = 0.12f32;
+                    // 0.04 sits UNDER the calibrated article floor (0.05) so a video
+                    // is demoted *below* every genuine text result for a non-video
+                    // query (e.g. an invidious tutorial at 0.04 now ranks under the
+                    // topical article at 0.05, instead of tying it via insertion order
+                    // as the old 0.12 did). Floor preserved so videos remain present.
+                    // Signal-driven (query self-describes intent), not tuned to a query.
+                    let video_cap = 0.04f32;
                     if r.score > video_cap {
                         tracing::info!(
                             "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source)",
