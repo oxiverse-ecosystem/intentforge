@@ -23,6 +23,7 @@
   - [GET /inspect](#get-inspect)
   - [GET /geolocate](#get-geolocate)
   - [GET /intent](#get-intent)
+  - [GET /video](#get-video)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -726,6 +727,104 @@ curl -i "http://localhost:4000/intent?q=%20%20"
 - Pure function of the query over the loaded classifier; no per-query tuned constants, no domain allow/deny lists.
 - The endpoint is additive — it does not change `/search` ranking, calibration, negation gating, or intent-engine calls. It is a read-only preview of the existing intent-classification path.
 - A test module (`intent_endpoint_tests`, 5 cases) locks the JSON shape, the local/contrastive derived signals, the category mapping, and the `400` empty envelope; the gateway suite is 108/108 passing.
+
+### `GET /video`
+
+Additive video-introspection endpoint. Completes the introspection family
+(`/spellcheck` `/analyze` `/inspect` `/geolocate` `/intent`). The parent round
+(2026-08-13T0634Z, commit `3938da6`) fixed **P8 video dominance** — invidious/youtube
+snippets were outranking genuine text results for non-video queries — by pinning
+video sources *strictly* below the weakest text result *after* calibration. That
+fix was invisible to clients: there was no way to see **which** urls the engine
+classifies as video, whether a query is treated as **video-intent** (which exempts
+it from the non-video pin), or which exact markers drive that exemption.
+
+Mirrors the additive, zero-side-effect precedent of its siblings: it does **not**
+change `/search` ranking, calibration, or the P8 pin. It reuses the *exact* pure
+functions `/search` uses — `is_url_video_host` (the same structural host-class
+check the P8 pin applies to every result: youtube / youtu.be / vimeo / invidious
+self-hosted / m.youtube) + the P8 `video_intent` markers (video / youtube / watch /
+tutorial / animation) — so the preview always matches real engine behavior. No
+per-query strings, no domain allow/deny lists, no magic constants.
+
+> **Honest scope note:** this endpoint surfaces the P8 **decision**, not the
+> calibrated score band (which depends on the live result set). `would_pin_non_video_sources`
+> reproduces the ranker's rule: `true` for a non-video query (videos are pinned
+> below text results), `false` for a video-intent query (videos keep full score).
+> When NO text result survives (all-video set) the ranker falls back to a flat
+> cap so videos still rank among themselves — the exemption decision here still
+> reports `would_pin_non_video_sources: true`, because the *pin logic* is what
+> fires for non-video queries; an all-video set is an edge case the ranker
+> handles via the fallback, not via this flag.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                          |
+|-----------|--------|----------|---------|--------------------------------------|
+| `q`       | string | yes      | —       | The query to classify for video handling |
+
+**Response** `200 OK` — top-level `{ query, video_intent, video_intent_markers, would_pin_non_video_sources, is_video_source_examples, intent, note }`:
+
+- `video_intent` — `true` when the query carries a video-intent marker (video / youtube / watch / tutorial / animation), via the *same* `simple_negation_strip` + marker check `/search` uses. When `true`, the P8 non-video pin does NOT apply.
+- `video_intent_markers` — the exact marker set driving the exemption (data, not branching logic), so a future drift between this endpoint and the ranker's P8 check is itself observable + unit-tested.
+- `would_pin_non_video_sources` — `true` for a non-video query (the P8 pin applies: videos pinned below text); `false` when `video_intent` is `true`.
+- `is_video_source_examples` — a set of worked url classifications using `is_url_video_host`, so a client can see exactly which hosts the engine treats as video (and that a non-video host whose *path* merely contains "youtube" is NOT matched).
+- `intent` — the raw fallback intent label for the query (`fallback_intent`, the no-network classifier `/search` falls back to).
+- `note` — a human-readable explanation of what the endpoint does.
+
+```json
+{
+  "query": "rust vs go high concurrency servers",
+  "video_intent": false,
+  "video_intent_markers": ["video", "youtube", "watch", "tutorial", "animation"],
+  "would_pin_non_video_sources": true,
+  "is_video_source_examples": {
+    "youtube_watch": true,
+    "youtu_be": true,
+    "invidious_selfhosted": true,
+    "vimeo": true,
+    "python_org_article": false,
+    "example_video_word_in_path": false
+  },
+  "intent": "informational",
+  "note": "Additive introspection of the P8 video-dominance fix (commit 3938da6). Does not change ranking. A video source is any url matching is_url_video_host (youtube/youtu.be/vimeo/invidious self-hosted / m.youtube). video_intent=true exempts a query from the non-video pin."
+}
+```
+
+**Real request / response (executed against live `localhost:4000` this card, 2026-08-13T0634Z):**
+
+```bash
+# Non-video text query -> pin applies
+curl "http://localhost:4000/video?q=rust%20vs%20go%20high%20concurrency%20servers"
+# -> {"query":"rust vs go high concurrency servers","video_intent":false,
+#     "video_intent_markers":["video","youtube","watch","tutorial","animation"],
+#     "would_pin_non_video_sources":true, ...}
+
+# Video-intent query -> exempt from pin
+curl "http://localhost:4000/video?q=best%20youtube%20tutorial%20for%20rust%20async"
+# -> {"query":"best youtube tutorial for rust async","video_intent":true,
+#     "would_pin_non_video_sources":false, ...}
+
+# Empty / whitespace query -> 400 empty_query envelope
+curl -i "http://localhost:4000/video?q=%20%20"
+# HTTP/1.1 400 Bad Request
+# {"error":"empty_query","message":"Query parameter 'q' is empty","query":"",
+#  "video_intent":false,"video_intent_markers":["video","youtube","watch","tutorial","animation"],
+#  "would_pin_non_video_sources":true,"is_video_source_examples":{}}
+```
+
+> **Verified (this card, 2026-08-13T0634Z):** endpoint shipped via `docker compose build gateway` + `up -d` (health `OK`), confirmed live for both the text and video-intent cases above, AND via the `video_endpoint_tests` module (4 cases) on the pure path:
+> - `?q=rust+vs+go+high+concurrency+servers` → `video_intent: false`, `would_pin_non_video_sources: true`; `?q=best+youtube+tutorial+for+rust+async` → `video_intent: true`, `would_pin_non_video_sources: false`
+> - `is_video_source_examples` matches `is_url_video_host`: youtube/youtu.be/invidious/vimeo → `true`; python.org article → `false`; host `example.com/youtube-guide-article` (word in path only) → `false`
+> - empty/whitespace `q` returns `400` with the `/video`-shaped `empty_query` envelope (neutral `video_intent` + markers present) — distinguishable from `/search`/`spellcheck` empty responses.
+>
+> **No hardcoding:** the endpoint reuses the *exact* pure fns `/search` uses (`is_url_video_host` + the P8 marker set + `simple_negation_strip` + `fallback_intent`). The marker set is fixed general data (no per-query tuning). The contract is locked by `video_endpoint_tests` (4 tests) which run under the round's lean CI (`cargo test -p gateway`).
+
+**Notes**
+- Pure function of the query; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, calibration, the P8 video pin, or intent-engine calls. It is a read-only preview of the existing P8 video-classification path.
+- A test module (`video_endpoint_tests`, 4 cases) locks the JSON shape, the host-classification parity with `is_url_video_host`, the video-intent detection, and the `400` empty envelope.
+
 
 ```bash
 # See how the engine classifies a query's intent before searching
