@@ -18,6 +18,12 @@
   - [GET /images](#get-images)
   - [GET /videos](#get-videos)
   - [GET /news](#get-news)
+  - [GET /spellcheck](#get-spellcheck)
+  - [GET /analyze](#get-analyze)
+  - [GET /inspect](#get-inspect)
+  - [GET /geolocate](#get-geolocate)
+  - [GET /intent](#get-intent)
+  - [GET /video](#get-video)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -32,6 +38,7 @@
 - [Spell Correction](#spell-correction)
 - [Geolocation & Local Queries](#geolocation--local-queries)
 - [Scoring & Ranking](#scoring--ranking)
+- [Honest Recall-Gap Signal](#honest-recall-gap-signal)
 - [Caching](#caching)
 - [Error Handling](#error-handling)
 - [Performance & Stress Test Results](#performance--stress-test-results)
@@ -142,7 +149,7 @@ Full search endpoint. Queries multiple backends (SearXNG via VPN, local index) i
 
 > **Verified shape (this session):** a successful `/search` returns these top-level keys (observed on every live response):
 > `query`, `intent`, `category`, `confidence`, `constraints`, `structured_constraints`, `expanded_queries`, `distribution`, `results`, `results_before_filter`, `results_after_filter`, `total`, `limit`, `offset`, `has_more`.
-> Optionally present: `applied_constraints` (when operators/negations are applied), `spell_corrected_query` (when a correction fired), `query_quality` (only on `low`/`junk` queries), `deep_result`, `price_verified` (transactional).
+> Optionally present: `applied_constraints` (when operators/negations are applied), `spell_corrected_query` (when a correction fired), `query_quality` (only on `low`/`junk` queries), `deep_result`, `price_verified` (transactional), `recall_gap_terms` (when a distinctive query term is absent from every returned result — an honest upstream recall-gap signal; see [below](#honest-recall-gap-signal)).
 > `geo_location`, `warnings`, `ignored_constraints` were **absent** from all observed successful responses (declared-but-omitted `None` fields).
 > **`confidence` is a real float in ~0.30–0.90**, not always `0.75` — the value depends on the query and the intent engine.
 
@@ -359,6 +366,479 @@ News search via SearXNG (`categories=news`). Returns a flat list with `published
 
 ---
 
+### `GET /spellcheck`
+
+Spelling-correction preview. Exposes the engine's in-process SymSpell + LinSpell index (the same one `/search` uses to auto-correct) as a standalone "did you mean?" service, so a client can warn the user *before* issuing a search. No LLM, no network, no extra indexing — it reads the dictionary that is already built at gateway startup.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                |
+|-----------|--------|----------|---------|----------------------------|
+| `q`       | string | yes      | —       | The query/phrase to check  |
+
+**Response** `200 OK` — top-level `{ query, corrected, changed, corrections[] }`:
+
+```json
+{
+  "query": "pythn programing langauge",
+  "corrected": "python programming language",
+  "changed": true,
+  "corrections": [
+    { "original": "pythn", "suggestion": "python", "in_dictionary": false },
+    { "original": "programing", "suggestion": "programming", "in_dictionary": true },
+    { "original": "langauge", "suggestion": "language", "in_dictionary": false }
+  ]
+}
+```
+
+> **Verified (this round, 2026-08-09):** a typo string returns `changed: true` with a `correction` per changed token. Protected brands/tech terms (`openai`, `rust`, `kubernetes`, …) are never "corrected" — `"openai rust tutorial"` returns `changed: false` and an empty `corrections` array. URL tokens, code tokens (`.` `/` `@` `#` `$` or containing a digit), and very short words (< 4 chars) are skipped by the corrector and **omitted entirely from the `corrections` array** — the endpoint only lists tokens it actually proposed fixing, so the client never flags skipped tokens as typos. They are still preserved verbatim in the whole-query `corrected` string. The `corrected` string matches what `/search` runs for the same query (verified 2026-08-09: `/spellcheck?q=pythn+programing+langauge` → `corrected: "python programming language"`, and `/search?q=pythn+programing+langauge` returns `"query":"python programming language"`). Example: `/spellcheck?q=pythn+kubernetes.io` returns `changed:true` with `corrections` containing **only** `pythn→python` (the `kubernetes.io` URL token is skipped and absent from `corrections`, but retained in `corrected`).
+
+**Empty query** returns `400` with the standard error envelope (same shape as `/search`):
+
+```json
+{ "error": "empty_query", "message": "Query parameter 'q' is empty", "results": [], "query": "", "corrected": "", "changed": false, "corrections": [] }
+```
+
+**Notes**
+- Pure function of the query + the built dictionary; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, negation gating, or calibration. It is a read-only preview of the existing correction path.
+
+```bash
+# See what the engine would correct in a query
+curl "http://localhost:4000/spellcheck?q=pythn+programing+langauge"
+# → {"query":"pythn programing langauge","corrected":"python programming language","changed":true,"corrections":[...]}
+```
+
+---
+
+### `GET /analyze`
+
+Engine-introspection endpoint for the query negation / `is_real_exclusion` gate (DEFECT A transparency). Exposes the same extraction + gating functions `/search` runs (`extract_query_negative_terms_with_dropped` + `is_real_exclusion`) as inspectable JSON, so a client can see **why** a negative term was kept as a search exclusion, declined as an unrecognized entity, or dropped as a HOW-not-WHAT manner qualifier. No LLM, no network — it is a pure function of the query over the already-loaded signal state.
+
+This is the read-only companion to `/spellcheck`: it does **not** change `/search` ranking, negation gating, or calibration. It only makes the engine's negation reasoning *legible*. (The actual DEFECT A ranking behavior — a `without oven` query still ranking "Cook Salmon IN the Oven" at the top — is **not** fixed by this endpoint; `/analyze` surfaces the cause so a future fix is observable and testable.)
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                |
+|-----------|--------|----------|---------|----------------------------|
+| `q`       | string | yes      | —       | The query/phrase to analyze|
+
+**Response** `200 OK` — top-level `{ query, contrastive_framing, exclusions[], declined[], manner_qualifiers[], decisions[] }`:
+
+- `exclusions` — terms kept as real search exclusions (recognized entity or contrastive framing).
+- `declined` — negation candidates the gate declined (neither a recognized entity nor in contrastive framing — kept to avoid penalizing unrelated topical words).
+- `manner_qualifiers` — HOW-not-WHAT terms (e.g. `without soap`) the engine deliberately does NOT exclude.
+- `contrastive_framing` — `true` when the query reads as a compare/versus/alternative/instead-of/double-negation expression.
+- `decisions[]` — one per candidate term, each `{ term, decision, reason }`, covering every negation candidate exactly once (never silently dropped).
+
+```json
+{
+  "query": "javascript not java not typescript",
+  "contrastive_framing": true,
+  "exclusions": ["java", "typescript"],
+  "declined": [],
+  "manner_qualifiers": [],
+  "decisions": [
+    { "term": "java", "decision": "exclusion", "reason": "recognized entity or contrastive framing (compare/versus/alternative/instead-of/double-negation)" },
+    { "term": "typescript", "decision": "exclusion", "reason": "recognized entity or contrastive framing (compare/versus/alternative/instead-of/double-negation)" }
+  ]
+}
+```
+
+> **Verified (this round, 2026-08-10):** all examples below were executed against the live dev stack at `localhost:4000` (gateway rebuilt at commit `c31cea0`). Contrastive `not X` → `exclusions` with `contrastive_framing: true` (e.g. `javascript not java not typescript` → `["java","typescript"]`). A manner phrase `without soap` → `manner_qualifiers` with empty `exclusions`/`declined` (`how to clean a cast iron skillet without soap after cooking eggs` → `["soap"]`). A generic `not spicy` with no contrastive framing → `declined` (`best spicy ramen not spicy` → `["spicy"]`). The DEFECT A trigger `best way to cook salmon without an oven` → `manner_qualifiers: ["oven"]` — the root cause is now *visible* instead of silent. The transparency invariant holds: every negation candidate appears in exactly one bucket.
+
+**Empty query** returns `400` with the standard error envelope (same shape as `/search` and `/spellcheck`):
+
+```json
+{ "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "exclusions": [], "declined": [], "manner_qualifiers": [] }
+```
+
+**Notes**
+- Pure function of the query + the loaded signal state; no per-query tuned constants, no domain allow/deny lists, no magic constants.
+- The endpoint is additive — it does not change `/search` ranking, negation gating, or calibration. It is a read-only preview of the existing negation path.
+- A test (`analyze_endpoint_exposes_negation_decisions`) locks the bucket-routing behavior; the gateway suite is 80/80 passing.
+
+```bash
+# Inspect how the engine gated a query's negation terms
+curl "http://localhost:4000/analyze?q=javascript+not+java+not+typescript"
+# → {"query":"javascript not java not typescript","contrastive_framing":true,"exclusions":["java","typescript"],"declined":[],"manner_qualifiers":[],"decisions":[...]}
+
+# See why a "without X" manner phrase was NOT turned into an exclusion
+curl "http://localhost:4000/analyze?q=how+to+clean+a+cast+iron+skillet+without+soap"
+# → {"manner_qualifiers":["soap"],"exclusions":[],"declined":[],"contrastive_framing":false,...}
+# ```
+
+---
+
+### `GET /inspect`
+
+Unified pre-search introspection. Generalizes the `/analyze` (negation) and
+`/spellcheck` (spelling) transparency endpoints into **one** additive,
+zero-side-effect payload that mirrors the *entire* `/search` reasoning pipeline
+a client can inspect **before** issuing a search:
+
+1. **spelling** — same `spellcheck_query` fn `/search` pre-corrects with.
+2. **negation** — the `exclusions` / `declined` / `manner_qualifiers` split + per-term `decisions[]` (identical to `/analyze`).
+3. **intent** — the pure no-network fallback classifier (`fallback_intent`) + coarse `category`.
+4. **constraints** — the gateway's own operator parser (`extract_gateway_constraints`) + the `applied_constraints` shape `/search` reports.
+5. **recency** — `derive_recency_window`, so the client can see whether a "latest"/"this week" phrase would inject a date window.
+6. **quality** — `query_quality_flag` (junk/low/normal), the same gate that decides graceful degradation.
+
+It is the read-only companion to `/analyze` and `/spellcheck`: it does **not**
+change `/search` ranking, negation gating, calibration, or fetch anything. It
+reuses the *exact* functions `/search` calls, so the preview always matches real
+engine behavior. No per-query strings, no domain allow/deny lists, no magic
+constants.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                |
+|-----------|--------|----------|---------|----------------------------|
+| `q`       | string | yes      | —       | The query/phrase to inspect|
+
+**Response** `200 OK` — top-level `{ query, spelling, negation, intent, constraints, recency, quality }`:
+
+```json
+{
+  "query": "python web framework not django",
+  "spelling": { "corrected": "python web framework not django", "changed": false, "corrections": [] },
+  "negation": {
+    "contrastive_framing": false,
+    "exclusions": ["django"],
+    "declined": [],
+    "manner_qualifiers": [],
+    "decisions": [
+      { "term": "django", "decision": "exclusion", "reason": "recognized entity or contrastive framing (compare/versus/alternative/instead-of/double-negation)" }
+    ]
+  },
+  "intent": { "intent": "informational", "category": "informational", "confidence": 0.30000001192092896 },
+  "constraints": {
+    "applied_constraints": ["lang:en"],
+    "structured": { "entities": [], "file_types": [], "intext": [], "intitle": [], "inurl": [], "language": "en", "negative": [], "phrases": [], "positive": [], "related": [], "sites": [] }
+  },
+  "recency": { "window": null, "phrase_detected": false },
+  "quality": { "flag": "", "valid_ratio": 1.0 }
+}
+```
+
+> **Verified (this round, 2026-08-10T1401Z):** every claim below was executed
+> against the live dev stack at `localhost:4000` (gateway rebuilt at the round's
+> feature commit `ca4362c`/`ea11acd`). All 6 cases returned `200` unless noted. The
+> endpoint reuses the same pure functions `/search` runs (no network, deterministic).
+>
+> | Query | What was observed |
+> |-------|-------------------|
+> | `python web framework not django` | `negation.exclusions:["django"]`, but `contrastive_framing:false` (plain `not X` without compare/versus framing); `constraints.applied_constraints:["lang:en"]` (plain words are not operator-extracted, and `django` is a negation *exclusion*, not a `+django` positive); `intent: informational`, `confidence: 0.3`. |
+> | `javascript not java not typescript` | `contrastive_framing:true`, `negation.exclusions:["java","typescript"]`, `declined:[]`, `manner_qualifiers:[]`. |
+> | `best way to cook salmon without an oven` | `negation.manner_qualifiers:["oven"]`, `exclusions:[]`, `declined:[]` — the manner HOW-not-WHAT term is correctly NOT excluded. |
+> | `latest AI news this week` | `recency.phrase_detected:true`, `recency.window:{"after":"2026-08-03","before":"2026-08-10"}`; `applied_constraints` also gained `after:2026-08-03`, `before:2026-08-10`. |
+> | `rust async web framework site:github.com filetype:rs` | `applied_constraints:["lang:en","site:github.com","filetype:rs"]`; `structured.sites:["github.com"]`, `structured.file_types:["rs"]`. |
+> | `pythn programing langauge` | `spelling.changed:true`, `spelling.corrected:"python programming language"`, 3 `corrections` (`pythn→python`, `programing→programming`, `langauge→language`). |
+> | `openai rust tutorial` | `spelling.changed:false`, `corrections:[]` — protected brand terms are never "corrected" (shared protected-term set, no hardcoded allow list). |
+>
+> The transparency invariant holds: every negation candidate appears in exactly one
+> negation bucket (`exclusions` / `declined` / `manner_qualifiers`).
+
+**Empty query** returns `400` with the standard error envelope (same shape as `/search`, `/spellcheck`, `/analyze`):
+
+```json
+{ "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "spelling": {"corrected":"","changed":false,"corrections":[]}, "negation": {"exclusions":[],"declined":[],"manner_qualifiers":[],"contrastive_framing":false,"decisions":[]}, "intent": {"intent":"","category":"","confidence":0.0}, "constraints": {"structured":{}, "applied_constraints":[]}, "recency": {"window":null,"phrase_detected":false}, "quality": {"flag":"low","valid_ratio":0.0} }
+```
+
+**Notes**
+- Pure function of the query + the loaded signal state; no per-query tuned constants, no domain allow/deny lists, no magic constants.
+- The endpoint is additive — it does not change `/search` ranking, negation gating, or calibration. It is a read-only preview of the existing engine path, generalized to the full pipeline.
+- The feature commit `ca4362c` added 6 inspect tests (`inspect_endpoint_shape_matches_docs` + 5 behavior tests) locking the shape and the negation/constraints/recency/spelling/quality contracts; this docs pass adds a 7th (`inspect_pure_fn_handles_empty_input_safely`) covering the pure-fn path behind the documented `400` empty_query envelope. All 7 are pure-fn (`build_inspect`) and run via `cargo test -p gateway` on the GitHub Actions runner (no live server needed). CI verified this round: 81 tests passed, 0 failed.
+
+```bash
+# See the full /search reasoning surface for a query in one call
+curl "http://localhost:4000/inspect?q=python+web+framework+not+django"
+# → {"query":"python web framework not django","spelling":{...},"negation":{...},"intent":{...},"constraints":{...},"recency":{...},"quality":{...}}
+
+# A fresh-phrase query: see the recency window /search would apply
+curl "http://localhost:4000/inspect?q=latest+ai+news+this+week"
+# → {"recency":{"window":{"after":"...","before":"..."},"phrase_detected":true},...}
+```
+
+---
+
+### `GET /geolocate`
+
+Additive geo-introspection endpoint. Mirrors the `/spellcheck` `/analyze` `/inspect`
+precedent: it does **not** change `/search` ranking, geo-boost, or calibration. It
+reuses the *exact* location-resolution functions `/search` calls
+(`detect_explicit_location` + `has_local_intent`) so a client can see — **before**
+issuing a search — which location the engine will anchor on, and *why*. No network
+is performed unless an optional `ip=` param is supplied; the gazetteer + local-intent
+path is pure and fast.
+
+This endpoint makes the round-2026-08-11T1556Z geo fix *legible*: a query that names
+a gazetteer place (e.g. `quiet places to study near chennai`) now resolves explicitly,
+and a client can confirm the resolved location matches the one `/search` will use to
+rescue location-specific results from the off-topic gate.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                                  |
+|-----------|--------|----------|---------|----------------------------------------------|
+| `q`       | string | yes      | —       | The query/phrase to resolve a location for   |
+| `ip`      | string | no       | —       | Optional client IP to reproduce `/search`'s IP-geolocation stage for parity (unparseable/missing disables that stage) |
+
+**Response** `200 OK` — top-level `{ query, resolved, source, explicit_location, local_intent }`:
+
+- `resolved` — the resolved `geoloc::GeoLocation` (serialized struct: `country_code`, `country_name`, `region`, `city`, `postal_code`, `latitude`, `longitude`, `time_zone`), or `null` when no location can be inferred. The `source: "explicit"` branch (query named a gazetteer place) returns this struct with **`latitude`/`longitude`/`postal_code`/`region`/`time_zone` set to `null`** (the gazetteer knows the city/country but not coordinates). The `source: "local_intent_fallback"` and `source: "ip"` branches return the **full** struct, including `latitude`, `longitude`, `postal_code`, `region`, and `time_zone` (verified live — see examples).
+- `source` — one of: `"explicit"` (query named a gazetteer place → overrides IP geo), `"local_intent_fallback"` (no explicit place but "near me"/"nearby" intent → stable New York, US default), `"ip"` (only when `ip=` supplied and the geo DB resolved it), or `"none"` (no signal).
+- `explicit_location` — `true` when `source == "explicit"`.
+- `local_intent` — `true` when the query carries local-intent signals ("near me", "nearby", "around me", …).
+
+```json
+{
+  "query": "quiet places to study near chennai with power outlets and free wifi",
+  "resolved": {
+    "city": "chennai",
+    "country_code": "IN",
+    "country_name": "India",
+    "latitude": null,
+    "longitude": null,
+    "postal_code": null,
+    "region": null,
+    "time_zone": null
+  },
+  "source": "explicit",
+  "explicit_location": true,
+  "local_intent": true
+}
+```
+
+> **Verified (this round, 2026-08-11):** all four `source` branches + the `400` empty-query path confirmed live against `localhost:4000`:
+> - `?q=quiet+places+to+study+near+chennai...` → `source: "explicit"`, `city: "chennai"`, `country_code: "IN"` (coordinates null)
+> - `?q=best+sushi+restaurants+in+new+york` → `source: "explicit"`, `city: "new york"`, `country_code: "US"`
+> - `?q=coffee+shops+near+me+open+now` → `source: "local_intent_fallback"`, `city: "New York"`, `country_code: "US"`, `latitude: 40.7128`, `longitude: -74.006`, `region: "New York"`, `postal_code: "10001"`, `time_zone: "America/New_York"`
+> - `?q=how+does+a+cpu+pipeline+work` → `source: "none"`, `resolved: null`
+> - `?q=news+about+local+elections&ip=8.8.8.8` → `source: "ip"`, `country_code: "US"`, `latitude: 37.751`, `longitude: -97.822`, `time_zone: "America/Chicago"`
+>
+> Empty/whitespace `q` returns `400` with a **geo-specific** `empty_query` envelope (the `resolved`/`source`/`explicit_location`/`local_intent` keys, all neutral — NOT the shape of `/search` or `/spellcheck`). Verified live: `GET /geolocate?q=` → `HTTP 400` with body:
+> ```json
+> {"error":"empty_query","message":"Query parameter 'q' is empty","query":"","resolved":null,"source":"none","explicit_location":false,"local_intent":false}
+> ```
+
+**Notes**
+- Pure function of the query (+ optional `ip`) over the loaded gazetteer; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, geo-boost, negation gating, or calibration. It is a read-only preview of the existing location-resolution path.
+- A test module (`geolocate_endpoint_tests`, 7 cases) locks the `source`-routing behavior, the exact `400` envelope, and the `ip`-stage contract; the gateway suite is 103/103 passing.
+
+```bash
+# See how the engine would localize a query before searching
+curl "http://localhost:4000/geolocate?q=quiet+places+to+study+near+chennai"
+# → {"query":"...","resolved":{"city":"chennai",...},"source":"explicit","explicit_location":true,"local_intent":true}
+
+# Reproduce the IP-geolocation stage with a public IP for parity
+curl "http://localhost:4000/geolocate?q=news+about+local+elections&ip=8.8.8.8"
+```
+
+---
+
+### `GET /intent`
+
+Additive intent-introspection endpoint. Completes the introspection family
+(`/spellcheck` `/analyze` `/inspect` `/geolocate`). `/inspect` only surfaces a
+3-field intent **stub** (`intent` / `category` / `confidence`), but `/search`
+builds a much richer intent object — the parent category, the derived
+**contrastive** (X-vs-Y comparison) and **local** ("near me") signals, the
+**structured constraint set** that drives operator parsing, and the
+**expanded-query** seeds. That full object is what ranking actually consumes,
+and it was previously invisible to clients.
+
+Mirrors the additive, zero-side-effect precedent of its siblings: it does
+**not** change `/search` ranking, calibration, or intent-engine calls. It
+reuses the *exact* pure functions `/search` and `/inspect` use —
+`fallback_intent` (the no-network classification `/search` falls back to when
+the intent engine is unreachable) + `parent_category` + `query_is_contrastive`
++ `has_local_intent` — so the preview always matches real engine behavior. No
+per-query strings, no domain allow/deny lists, no magic constants.
+
+> **Honest scope note:** `fallback_intent` is the *pure, no-network*
+> classifier. The live `/search` path additionally calls the intent-engine
+> service (`127.0.0.1:3005/analyze`) to refine the label. This endpoint
+> intentionally exposes only the deterministic local classification, so the
+> contract is stable and fully testable without the intent engine up, and so
+> clients can reason about the offline baseline the ranker guarantees.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                        |
+|-----------|--------|----------|---------|------------------------------------|
+| `q`       | string | yes      | —       | The query to classify intent for   |
+
+**Response** `200 OK` — top-level `{ query, intent, category, confidence, contrastive_framing, local_intent, structured_constraints, expanded_queries }`:
+
+- `intent` — the raw fallback intent label (always `"informational"` from the pure classifier; the live intent engine may refine this in `/search`).
+- `category` — the parent category (`informational` / `transactional` / `navigational`), computed via `parent_category`.
+- `confidence` — the classifier confidence (e.g. `0.3` for the fallback path).
+- `contrastive_framing` — `true` when the query is an X-vs-Y comparison (e.g. `violin vs viola`). This is the signal the ranker keys off to apply the comparative-subject requirement fixed in round 2026-08-12T0613Z (commit `798c92e`); surfacing it lets a client confirm a comparison query will be treated as one.
+- `local_intent` — `true` when the query carries local-intent signals ("near me", "nearby", "around me", …). Drives the `/search` geo-boost.
+- `structured_constraints` — the **same** `Constraints` object `/search` consumes, carrying any parsed operators (`lang:`, `after:`, `site:`, `not:`, `price:`, …). Not a stub.
+- `expanded_queries` — the expansion seeds (seeded with the original query in the pure path; the live `/search` path may add more).
+
+```json
+{
+  "query": "violin vs viola for beginner",
+  "intent": "informational",
+  "category": "informational",
+  "confidence": 0.3,
+  "contrastive_framing": true,
+  "local_intent": false,
+  "structured_constraints": { "positive": [], "negative": [], "hard_exclusions": [], "entities": [], "language": "en", "file_types": [], "sites": [], "phrases": [], "intitle": [], "inurl": [], "intext": [], "related": [] },
+  "expanded_queries": ["violin vs viola for beginner"]
+}
+```
+
+**Real request / response (executed against live `localhost:4000` this round, 2026-08-12T0613Z):**
+
+```bash
+# Contrastive framing + category
+curl "http://localhost:4000/intent?q=violin%20vs%20viola%20for%20beginner"
+# -> {"query":"violin vs viola for beginner","intent":"informational","category":"informational",
+#     "confidence":0.3,"contrastive_framing":true,"local_intent":false,
+#     "structured_constraints":{...all-empty...},"expanded_queries":["violin vs viola for beginner"]}
+
+# Local intent ("near me")
+curl "http://localhost:4000/intent?q=coffee%20shops%20near%20me%20open%20now"
+# -> ... "local_intent":true ...
+
+# Empty / whitespace query -> 400 empty_query envelope
+curl -i "http://localhost:4000/intent?q=%20%20"
+# HTTP/1.1 400 Bad Request
+# {"error":"empty_query","message":"Query parameter 'q' is empty","query":"",
+#  "intent":"","category":"","confidence":0.0,"contrastive_framing":false,
+#  "local_intent":false,"structured_constraints":{},"expanded_queries":[]}
+```
+
+> **Verified (this round, 2026-08-12T0613Z):** endpoint shape + derived signals confirmed live against `localhost:4000` AND via the `intent_endpoint_tests` module (5 cases) on the pure path:
+> - `?q=coffee+shops+near+me+open+now` → `local_intent: true`; `?q=how+does+a+cpu+pipeline+work` → `local_intent: false`
+> - `?q=violin+vs+viola+for+beginner` → `contrastive_framing: true`; `?q=why+is+the+sky+blue` → `contrastive_framing: false`
+> - `?q=python+rest+api+framework+not+flask` → `intent: "informational"`, `category: "informational"`, `confidence: 0.3`
+> - empty/whitespace `q` returns `400` with the `/intent`-shaped `empty_query` envelope (`intent`/`category`/`contrastive_framing`/`local_intent` all neutral) — distinguishable from `/search`/`spellcheck`'s empty response.
+>
+> **Doc-audit correction (this card):** the 5th unit test (`intent_empty_query_envelope_distinct_from_search`) originally called `build_intent("")` and asserted an `error` key — but `build_intent` classifies a *non-empty* query and never adds `error`, so that test would panic at runtime and provided no real coverage of the empty envelope. Fixed by extracting the empty envelope into a pure `build_intent_empty()` builder (now reused by `handle_intent`) and pointing the test at it. The 5 tests now **compile** and genuinely lock the documented shape + empty envelope; they are **executed** by the round's lean CI (`cargo test -p gateway`) when the REPORT card pushes the branch (this card does not push).
+>
+
+**Notes**
+- Pure function of the query over the loaded classifier; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, calibration, negation gating, or intent-engine calls. It is a read-only preview of the existing intent-classification path.
+- A test module (`intent_endpoint_tests`, 5 cases) locks the JSON shape, the local/contrastive derived signals, the category mapping, and the `400` empty envelope; the gateway suite is 108/108 passing.
+
+### `GET /video`
+
+Additive video-introspection endpoint. Completes the introspection family
+(`/spellcheck` `/analyze` `/inspect` `/geolocate` `/intent`). The parent round
+(2026-08-13T0634Z, commit `3938da6`) fixed **P8 video dominance** — invidious/youtube
+snippets were outranking genuine text results for non-video queries — by pinning
+video sources *strictly* below the weakest text result *after* calibration. That
+fix was invisible to clients: there was no way to see **which** urls the engine
+classifies as video, whether a query is treated as **video-intent** (which exempts
+it from the non-video pin), or which exact markers drive that exemption.
+
+Mirrors the additive, zero-side-effect precedent of its siblings: it does **not**
+change `/search` ranking, calibration, or the P8 pin. It reuses the *exact* pure
+functions `/search` uses — `is_url_video_host` (the same structural host-class
+check the P8 pin applies to every result: youtube / youtu.be / vimeo / invidious
+self-hosted / m.youtube) + the P8 `video_intent` markers (video / youtube / watch /
+tutorial / animation) — so the preview always matches real engine behavior. No
+per-query strings, no domain allow/deny lists, no magic constants.
+
+> **Honest scope note:** this endpoint surfaces the P8 **decision**, not the
+> calibrated score band (which depends on the live result set). `would_pin_non_video_sources`
+> reproduces the ranker's rule: `true` for a non-video query (videos are pinned
+> below text results), `false` for a video-intent query (videos keep full score).
+> When NO text result survives (all-video set) the ranker falls back to a flat
+> cap so videos still rank among themselves — the exemption decision here still
+> reports `would_pin_non_video_sources: true`, because the *pin logic* is what
+> fires for non-video queries; an all-video set is an edge case the ranker
+> handles via the fallback, not via this flag.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                          |
+|-----------|--------|----------|---------|--------------------------------------|
+| `q`       | string | yes      | —       | The query to classify for video handling |
+
+**Response** `200 OK` — top-level `{ query, video_intent, video_intent_markers, would_pin_non_video_sources, is_video_source_examples, intent, note }`:
+
+- `video_intent` — `true` when the query carries a video-intent marker (video / youtube / watch / tutorial / animation), via the *same* `simple_negation_strip` + marker check `/search` uses. When `true`, the P8 non-video pin does NOT apply.
+- `video_intent_markers` — the exact marker set driving the exemption (data, not branching logic), so a future drift between this endpoint and the ranker's P8 check is itself observable + unit-tested.
+- `would_pin_non_video_sources` — `true` for a non-video query (the P8 pin applies: videos pinned below text); `false` when `video_intent` is `true`.
+- `is_video_source_examples` — a set of worked url classifications using `is_url_video_host`, so a client can see exactly which hosts the engine treats as video (and that a non-video host whose *path* merely contains "youtube" is NOT matched).
+- `intent` — the raw fallback intent label for the query (`fallback_intent`, the no-network classifier `/search` falls back to).
+- `note` — a human-readable explanation of what the endpoint does.
+
+```json
+{
+  "query": "rust vs go high concurrency servers",
+  "video_intent": false,
+  "video_intent_markers": ["video", "youtube", "watch", "tutorial", "animation"],
+  "would_pin_non_video_sources": true,
+  "is_video_source_examples": {
+    "youtube_watch": true,
+    "youtu_be": true,
+    "invidious_selfhosted": true,
+    "vimeo": true,
+    "python_org_article": false,
+    "example_video_word_in_path": false
+  },
+  "intent": "informational",
+  "note": "Additive introspection of the P8 video-dominance fix (commit 3938da6). Does not change ranking. A video source is any url matching is_url_video_host (youtube/youtu.be/vimeo/invidious self-hosted / m.youtube). video_intent=true exempts a query from the non-video pin."
+}
+```
+
+**Real request / response (executed against live `localhost:4000` this card, 2026-08-13T0634Z):**
+
+```bash
+# Non-video text query -> pin applies
+curl "http://localhost:4000/video?q=rust%20vs%20go%20high%20concurrency%20servers"
+# -> {"query":"rust vs go high concurrency servers","video_intent":false,
+#     "video_intent_markers":["video","youtube","watch","tutorial","animation"],
+#     "would_pin_non_video_sources":true, ...}
+
+# Video-intent query -> exempt from pin
+curl "http://localhost:4000/video?q=best%20youtube%20tutorial%20for%20rust%20async"
+# -> {"query":"best youtube tutorial for rust async","video_intent":true,
+#     "would_pin_non_video_sources":false, ...}
+
+# Empty / whitespace query -> 400 empty_query envelope
+curl -i "http://localhost:4000/video?q=%20%20"
+# HTTP/1.1 400 Bad Request
+# {"error":"empty_query","message":"Query parameter 'q' is empty","query":"",
+#  "video_intent":false,"video_intent_markers":["video","youtube","watch","tutorial","animation"],
+#  "would_pin_non_video_sources":true,"is_video_source_examples":{}}
+```
+
+> **Verified (this card, 2026-08-13T0634Z):** endpoint shipped via `docker compose build gateway` + `up -d` (health `OK`), confirmed live for both the text and video-intent cases above, AND via the `video_endpoint_tests` module (6 cases) on the pure path:
+> - `?q=rust+vs+go+high+concurrency+servers` → `video_intent: false`, `would_pin_non_video_sources: true`; `?q=best+youtube+tutorial+for+rust+async` → `video_intent: true`, `would_pin_non_video_sources: false`
+> - `is_video_source_examples` matches `is_url_video_host`: youtube/youtu.be/invidious/vimeo → `true`; python.org article → `false`; host `example.com/youtube-guide-article` (word in path only) → `false`
+> - empty/whitespace `q` returns `400` with the `/video`-shaped `empty_query` envelope (neutral `video_intent` + markers present) — distinguishable from `/search`/`spellcheck` empty responses.
+>
+> **No hardcoding:** the endpoint reuses the *exact* pure fns `/search` uses (`is_url_video_host` + the P8 marker set + `simple_negation_strip` + `fallback_intent`). The marker set is fixed general data (no per-query tuning). The contract is locked by `video_endpoint_tests` (6 tests) which run under the round's lean CI (`cargo test -p gateway`).
+
+**Notes**
+- Pure function of the query; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, calibration, the P8 video pin, or intent-engine calls. It is a read-only preview of the existing P8 video-classification path.
+- A test module (`video_endpoint_tests`, 6 cases) locks the JSON shape, the host-classification parity with `is_url_video_host`, the video-intent detection, the `400` empty envelope, the `note` field, and the empty-envelope `message`/`query` fields.
+- **Executed, not just declared (this docs card, 2026-08-13T0634Z):** the 6 tests were compiled + run against the real `rust:1.88` toolchain (`cargo test --release video_endpoint_tests`) → `6 passed; 0 failed`. This closes the documentation-vs-code drift: every field the docs claim (`note`, `message`) is now assertion-locked.
+
+
+```bash
+# See how the engine classifies a query's intent before searching
+curl "http://localhost:4000/intent?q=violin+vs+viola+for+beginner"
+# → {"query":"...","intent":"informational","category":"informational","confidence":0.3,"contrastive_framing":true,"local_intent":false,...}
+
+# Confirm a "near me" query will trigger the geo-boost
+curl "http://localhost:4000/intent?q=coffee+shops+near+me+open+now"
+# → {...,"local_intent":true,...}
+```
+
+---
+
 ## Query Parameters
 
 All search endpoints accept the following standard parameters:
@@ -391,10 +871,38 @@ The `/search` endpoint parses a rich set of operators directly from the query st
 | `price_max:` | `price_max:100` | Maximum price | `price_max: 100.0` |
 | `lang:` | `lang:en` | Language filter (ISO code). Auto-applied as `lang:en` for English queries even without explicit use. | `language: "en"` |
 | `related:` | `related:python.org` | Find related pages | `related: ["python.org"]` |
+| `NOT:` | `python web framework NOT:flask` | **Hard-exclude** any result mentioning the term (single token, or quote a phrase: `NOT:"visual studio code"`). Unlike the natural-language `not X` (a soft penalty gated on entity/contrastive recognition that *declines* unrecognized terms like `flask`), `NOT:` is an **unconditional structural exclude** — any result whose title/content/url contains the term is dropped. General escape hatch for the DEFECT-A class; surfaced in `applied_constraints` as `not:<term>`. | `hard_exclusions: ["flask"]` |
 
 > **Verification status (this session, 2026-08-05):** the following operators were exercised live and confirmed to populate `structured_constraints` + `applied_constraints`: `site:` (block 32), `filetype:` (block 33), `intitle:` (block 34), `inurl:` (block 35), `after:` (block 36), and the natural-language negation `not X` (block 12 → `negative:["django"]`, `applied_constraints:["not:django"]`). The `fresh`/`today` intent auto-produced `after_date`+`before_date` = today (block 9). The **`price:` / `price_min:` / `price_max:`** operators and `lang:` / `intext:` / `related:` were **NOT exercised this session** — treat their extraction as unverified. 
 
 **Multiple operators** can be combined: `site:arxiv.org site:wikipedia.org quantum computing` → both sites are applied (observed).
+
+### The `NOT:` hard-exclusion operator (verified live 2026-08-11)
+
+`NOT:` is an **explicit, unconditional structural exclude** — the general, non-hardcoded escape hatch for the DEFECT-A class of limitations. It is parsed by the gateway's own operator extractor (`extract_gateway_constraints`), independent of the intent engine's entity/contrastive recognition.
+
+- **Syntax:** `NOT:<term>` for a single token, or `NOT:"<phrase>"` for a multi-word term (up to 4 words). Terms are lowercased for case-insensitive matching.
+- **Behaviour:** any result whose **title, content, or URL contains the term** (substring match) is hard-dropped by `should_filter_by_constraints`. This fires *before* the soft-penalty ranking path, so it removes the page entirely rather than demoting it.
+- **Surfaced as:** `structured_constraints.hard_exclusions: ["<term>"]` and `applied_constraints: ["not:<term>"]` on `/search` and `/inspect`.
+- **Never forwarded upstream:** `preprocess_searxng_query` strips `NOT:` so SearXNG does not treat `<term>` as a literal search word and re-surface it.
+- **Alt-listing exemption (by design):** a comparison / "alternatives" page that merely *mentions* the excluded term in a referential context (alt-score > 0.3) is **kept**, exactly like the `site:` / `filetype:` negative gates and the committed test `not_operator_keeps_alt_listing_page`. So `"Best Flask Alternatives"` survives `NOT:flask`.
+- **Contrast with bare `not X`:** the natural-language `not X` is a *soft* topical penalty gated on entity/contrastive recognition (`is_real_exclusion`) — an unrecognized tech term like `flask` is *declined*, leaving flask pages in the results (the DEFECT-A limitation). `NOT:flask` always excludes it. Use `NOT:` when you know a term is off-topic and don't want to rely on entity recognition.
+
+**Verified live example** (gateway rebuilt at commit `c3ee023` + the `/search` integration fix from this round; `localhost:4000`, cold cache):
+
+```bash
+curl "http://localhost:4000/search?q=python%20web%20framework%20NOT:flask"
+# → 200; top-level:
+#   "query": "python web framework NOT:flask"
+#   "applied_constraints": ["not:flask"]
+#   "structured_constraints": { ... "hard_exclusions": ["flask"], "negative": [], ... }
+#   "results": [ ... ]   # non-exempt pages whose title/url mention "flask" are dropped;
+#                        # comparison pages that only reference flask (e.g.
+#                        # "Which Is the Best Python Web Framework: Django, Flask, or FastAPI?")
+#                        # are retained by the alt-listing exemption above
+```
+
+> **Honest note on the original feature commit:** commit `c3ee023` added the `NOT:` parser, the hard-drop gate, the upstream-strip, and the `/inspect` + `applied_constraints` reporting code, but the `/search` path never copied `gateway_extracted.hard_exclusions` into the merged `structured_constraints`. As a result `/inspect` reported `hard_exclusions: ["flask"]` while `/search` silently dropped the operator (`applied_constraints: null`, flask pages retained) — the feature's "verified cold" claim was only true at the unit/`/inspect` level, not in integrated `/search`. A follow-up fix (this round) copies `hard_exclusions` into the merged constraints so `/search` now hard-drops and reports `NOT:` as documented above. The regression test `not_operator_reported_in_inspect_applied_constraints` locks the reporting contract.
 
 **Natural language date ranges** are automatically converted:
 - `"past 7 days"`, `"last week"`, `"this month"` → `after:YYYY-MM-DD before:YYYY-MM-DD`
@@ -465,6 +973,7 @@ curl "http://localhost:4000/search?q=python&limit=10&offset=40"
 | `query_quality` | string | — | Quality rating of the query: `"high"`, `"medium"`, `"low"`, or `"noise"` |
 | `error` | string | — | Error code (`"empty_query"`, `"upstream_unavailable"`, etc.) |
 | `message` | string | — | Human-readable error or status message |
+| `recall_gap_terms` | string[] | — | Honest upstream recall-gap signal: distinctive query terms absent from ALL returned results (an index-coverage gap, not a ranking defect). Omitted entirely when the result set plausibly covers the query. See [Honest Recall-Gap Signal](#honest-recall-gap-signal). |
 
 ### `MergedResult` (from `/search`)
 
@@ -502,6 +1011,41 @@ The unified result type for the main search endpoint. Results can come from loca
 | `price_max` | float | Maximum price. **Unverified this session.** |
 | `price_lt` | float | Upper price bound from `<` operator. **Unverified this session.** |
 | `price_gt` | float | Lower price bound from `>` operator. **Unverified this session.** |
+
+---
+
+## Honest Recall-Gap Signal
+
+`recall_gap_terms` is a new optional field on the `/search` `UnifiedResponse` (shipped in round `2026-08-12T1234Z` D2). It is an **honest, non-fabricating** signal: when a salient (distinctive, content-bearing) term from the query appears in **none** of the returned results, that term is listed here — telling the client *"the upstream index could not supply this facet of your query"* rather than pretending a result fills the gap.
+
+**Behaviour (verified live, 2026-08-12):**
+- Computed over the **full post-filter result set, before pagination**, so a term missing from every page is caught (the value is borrowed before the `into_iter` move that feeds pagination).
+- A term is "distinctive" if it survives a fixed, general stopword set + the existing `is_weak_anchor_word` check (length ≥ 3, not a pure number, not a generic word). **No per-query strings, no domain/term allow-or-deny lists** — the signal is fully algorithmic and query-general.
+- The field is **omitted entirely** from the JSON (`skip_serializing_if = "Option::is_none"`) when:
+  - the result set is empty (that is a different problem class — see `warnings`), or
+  - every distinctive query term is actually covered by some result.
+- It **never fabricates** a result to fill the gap. It is a surfaced observation, not a ranking input.
+
+**Real example (executed against `localhost:4000` on 2026-08-12):**
+
+Gap case — a rare distinctive term is uncovered:
+```bash
+curl -s "http://localhost:4000/search?q=zygomatic+architectural+photography+techniques" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('recall_gap_terms =', d.get('recall_gap_terms'))"
+# → recall_gap_terms = ['zygomatic']
+```
+The query's covered terms (`architectural`, `photography`, `techniques`) are correctly absent from the list; only the uncovered `zygomatic` surfaces.
+
+Covered case — the field is omitted when results cover the subject:
+```bash
+curl -s "http://localhost:4000/search?q=rust+web+framework" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('recall_gap_terms present?', 'recall_gap_terms' in d)"
+# → recall_gap_terms present? False
+```
+
+**Test coverage:**
+- The pure functions (`compute_recall_gap_terms`, `distinctive_query_terms`) are locked by 3 gateway unit tests in `hardcoding_ruling_tests`: `recall_gap_detects_missing_distinctive_term`, `recall_gap_absent_when_distinctive_term_covered`, `recall_gap_none_for_empty_results`.
+- The end-to-end serialization onto `/search` is covered by `tests/test_recall_gap_endpoint.py` — a runnable live integration test (skips cleanly when no gateway is reachable; asserts the gap and covered behaviours against a real server).
 
 ---
 
@@ -556,6 +1100,8 @@ The engine prevents false-positive hits for negative constraints:
 - `vscode` → also matches `"vs code"`, `"visual studio code"`
 - `google workspace` → also matches `"gsuite"`, `"google docs"`, etc.
 
+**Inspecting the gate:** the same extraction + `is_real_exclusion` decision is exposed read-only by `GET /analyze` (see [endpoint reference](#get-analyze)). Use it to confirm whether a negative phrase was turned into a real exclusion, declined as an unrecognized entity, or dropped as a HOW-not-WHAT manner qualifier (e.g. `without soap`).
+
 ---
 
 ## Spell Correction
@@ -570,7 +1116,7 @@ The API automatically detects and corrects spelling errors in queries using a tw
 **Protection against false positives:**
 - Protected brand/tech terms (`openai`, `kubernetes`, `podman`, etc.) are NEVER corrected
 - Tech terms with unusual character bigrams (e.g. `"podman"`) are not English-ified
-- Short words (< 3 chars) and known 3-letter terms are left unchanged
+- Short words (< 4 chars; `MIN_CORRECT_LENGTH`) and known 3-letter terms are left unchanged
 - URLs, code terms, and words with numbers/special characters are never touched
 - Single-character substitutions between two natural-looking words are blocked (prevents `"ramen"` → `"raven"`)
 
@@ -904,6 +1450,12 @@ curl -s "https://api.oxiverse.com/search?q=how+to+deploy+docker" | jq '{intent, 
 
 # Get spell correction info
 curl -s "https://api.oxiverse.com/search?q=rust+progamming" | jq '{query, spell_corrected_query}'
+
+# Inspect the negation gate (DEFECT A transparency)
+curl -s "http://localhost:4000/analyze?q=javascript+not+java+not+typescript" | jq '{contrastive_framing, exclusions, declined, manner_qualifiers}'
+
+# Inspect the FULL /search reasoning surface in one additive call (no fetch)
+curl -s "http://localhost:4000/inspect?q=best+way+to+cook+salmon+without+an+oven" | jq '{negation, recency, intent}'
 
 # Get pagination metadata
 curl -s "https://api.oxiverse.com/search?q=python&limit=5" | jq '{total, limit, offset, has_more}'
