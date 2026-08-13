@@ -52,3 +52,6 @@ dist/
 *.log
 .venv/
 build/
+
+# Generated audit/dirt artifacts (do NOT commit)
+/docs/_generated/
