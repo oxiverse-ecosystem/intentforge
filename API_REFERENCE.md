@@ -37,6 +37,7 @@
 - [Spell Correction](#spell-correction)
 - [Geolocation & Local Queries](#geolocation--local-queries)
 - [Scoring & Ranking](#scoring--ranking)
+- [Honest Recall-Gap Signal](#honest-recall-gap-signal)
 - [Caching](#caching)
 - [Error Handling](#error-handling)
 - [Performance & Stress Test Results](#performance--stress-test-results)
@@ -147,7 +148,7 @@ Full search endpoint. Queries multiple backends (SearXNG via VPN, local index) i
 
 > **Verified shape (this session):** a successful `/search` returns these top-level keys (observed on every live response):
 > `query`, `intent`, `category`, `confidence`, `constraints`, `structured_constraints`, `expanded_queries`, `distribution`, `results`, `results_before_filter`, `results_after_filter`, `total`, `limit`, `offset`, `has_more`.
-> Optionally present: `applied_constraints` (when operators/negations are applied), `spell_corrected_query` (when a correction fired), `query_quality` (only on `low`/`junk` queries), `deep_result`, `price_verified` (transactional).
+> Optionally present: `applied_constraints` (when operators/negations are applied), `spell_corrected_query` (when a correction fired), `query_quality` (only on `low`/`junk` queries), `deep_result`, `price_verified` (transactional), `recall_gap_terms` (when a distinctive query term is absent from every returned result — an honest upstream recall-gap signal; see [below](#honest-recall-gap-signal)).
 > `geo_location`, `warnings`, `ignored_constraints` were **absent** from all observed successful responses (declared-but-omitted `None` fields).
 > **`confidence` is a real float in ~0.30–0.90**, not always `0.75` — the value depends on the query and the intent engine.
 
@@ -872,6 +873,7 @@ curl "http://localhost:4000/search?q=python&limit=10&offset=40"
 | `query_quality` | string | — | Quality rating of the query: `"high"`, `"medium"`, `"low"`, or `"noise"` |
 | `error` | string | — | Error code (`"empty_query"`, `"upstream_unavailable"`, etc.) |
 | `message` | string | — | Human-readable error or status message |
+| `recall_gap_terms` | string[] | — | Honest upstream recall-gap signal: distinctive query terms absent from ALL returned results (an index-coverage gap, not a ranking defect). Omitted entirely when the result set plausibly covers the query. See [Honest Recall-Gap Signal](#honest-recall-gap-signal). |
 
 ### `MergedResult` (from `/search`)
 
@@ -909,6 +911,41 @@ The unified result type for the main search endpoint. Results can come from loca
 | `price_max` | float | Maximum price. **Unverified this session.** |
 | `price_lt` | float | Upper price bound from `<` operator. **Unverified this session.** |
 | `price_gt` | float | Lower price bound from `>` operator. **Unverified this session.** |
+
+---
+
+## Honest Recall-Gap Signal
+
+`recall_gap_terms` is a new optional field on the `/search` `UnifiedResponse` (shipped in round `2026-08-12T1234Z` D2). It is an **honest, non-fabricating** signal: when a salient (distinctive, content-bearing) term from the query appears in **none** of the returned results, that term is listed here — telling the client *"the upstream index could not supply this facet of your query"* rather than pretending a result fills the gap.
+
+**Behaviour (verified live, 2026-08-12):**
+- Computed over the **full post-filter result set, before pagination**, so a term missing from every page is caught (the value is borrowed before the `into_iter` move that feeds pagination).
+- A term is "distinctive" if it survives a fixed, general stopword set + the existing `is_weak_anchor_word` check (length ≥ 3, not a pure number, not a generic word). **No per-query strings, no domain/term allow-or-deny lists** — the signal is fully algorithmic and query-general.
+- The field is **omitted entirely** from the JSON (`skip_serializing_if = "Option::is_none"`) when:
+  - the result set is empty (that is a different problem class — see `warnings`), or
+  - every distinctive query term is actually covered by some result.
+- It **never fabricates** a result to fill the gap. It is a surfaced observation, not a ranking input.
+
+**Real example (executed against `localhost:4000` on 2026-08-12):**
+
+Gap case — a rare distinctive term is uncovered:
+```bash
+curl -s "http://localhost:4000/search?q=zygomatic+architectural+photography+techniques" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('recall_gap_terms =', d.get('recall_gap_terms'))"
+# → recall_gap_terms = ['zygomatic']
+```
+The query's covered terms (`architectural`, `photography`, `techniques`) are correctly absent from the list; only the uncovered `zygomatic` surfaces.
+
+Covered case — the field is omitted when results cover the subject:
+```bash
+curl -s "http://localhost:4000/search?q=rust+web+framework" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('recall_gap_terms present?', 'recall_gap_terms' in d)"
+# → recall_gap_terms present? False
+```
+
+**Test coverage:**
+- The pure functions (`compute_recall_gap_terms`, `distinctive_query_terms`) are locked by 3 gateway unit tests in `hardcoding_ruling_tests`: `recall_gap_detects_missing_distinctive_term`, `recall_gap_absent_when_distinctive_term_covered`, `recall_gap_none_for_empty_results`.
+- The end-to-end serialization onto `/search` is covered by `tests/test_recall_gap_endpoint.py` — a runnable live integration test (skips cleanly when no gateway is reachable; asserts the gap and covered behaviours against a real server).
 
 ---
 
