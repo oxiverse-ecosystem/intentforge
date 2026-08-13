@@ -1322,6 +1322,43 @@ fn is_alternative_listing_page(title: &str, url: &str, content: &str) -> f32 {
     (title_signal * 0.70 + url_signal * 0.20 + content_signal * 0.10).clamp(0.0, 1.0)
 }
 
+/// True only when the page is a GENUINE alternatives/comparison listing -- i.e. a
+/// STRONG alternative signal is present (a strong-pattern title marker or a
+/// strong-pattern URL path). Used by the `NOT:` hard-exclusion exemption so that a
+/// generic "Best/Top N X" roundup that merely *lists* the excluded term among many
+/// is still hard-dropped, while a genuine "Flask Alternatives" / "A vs B" page that
+/// *references* the term referentially survives.
+///
+/// This deliberately excludes the weak "*top N*"/"*best N*" title signals and the
+/// weak `/top-` `/best-` `/reviews/` `/review/` URL signals that
+/// `is_alternative_listing_page` blends into its score -- those are listicle framing,
+/// not alternatives intent, and were causing `NOT:react` to leak React-mentioning
+/// "Top 10 JS Frameworks" pages (round-2026-08-13T1136Z defect t_9cb2387b).
+fn is_true_alternatives_page(title: &str, url: &str) -> bool {
+    let title_lower = title.to_lowercase();
+    let url_lower = url.to_lowercase();
+
+    let strong_title_patterns = [
+        "alternative", "alternatives", "alternative to",
+        " vs ", " versus ", "compared", "comparison",
+        "replace", "replacement", "migrate from", "migrating from",
+        "instead of", "switching from", "moving from",
+    ];
+    if strong_title_patterns.iter().any(|p| title_lower.contains(p)) {
+        return true;
+    }
+
+    let strong_url_patterns = [
+        "/alternative", "/alternatives", "/alternative-to",
+        "/vs/", "/compare", "/comparison",
+    ];
+    if strong_url_patterns.iter().any(|p| url_lower.contains(*p)) {
+        return true;
+    }
+
+    false
+}
+
 
 /// Decide whether a result token matches a negative constraint term.
 ///
@@ -2413,19 +2450,23 @@ fn should_filter_by_constraints(
         //     title/content/url contains the term is dropped. It mirrors the
         //     `-site:`/`-filetype:` negatives handled just above — all are dropped
         //     here before the soft-penalty path (section 5) is reached. The
-        //     alt-listing exemption (alt_score > 0.3) is preserved: a comparison /
+        //     genuine-alternatives exemption is preserved via
+        //     `is_true_alternatives_page` (strong alt signal only): a comparison /
         //     "alternatives" page that merely *mentions* the excluded term in a
         //     referential context (e.g. "Flask" in an "alternatives to Django"
         //     listicle) must NOT be hard-dropped, consistent with every other
         //     negative hard-drop gate (constraint_score + post-merge + pre-merge).
-        //     Substring match (not whole-word) because hard-exclusion terms are
-        //     short and user-intended (e.g. "NOT:spam" should catch "spammer").
+        //     Generic "Best/Top N X" listicles that merely *list* the term are NOT
+        //     exempt (round-2026-08-13T1136Z fix t_9cb2387b). Substring match (not
+        //     whole-word) because hard-exclusion terms are short and user-intended
+        //     (e.g. "NOT:spam" should catch "spammer").
         if !constraints.hard_exclusions.is_empty() {
-            let alt_score = is_alternative_listing_page(title, url, content);
-            // Alt-listing exemption: a page scoring > 0.3 IS an alternatives /
-            // comparison listing, so mentioning the excluded term is referential,
-            // not a violation — keep it.
-            if alt_score <= 0.3 {
+            // Alt-listing exemption: a GENUINE alternatives/comparison page (strong
+            // alt signal only) that merely *mentions* the excluded term referentially
+            // must NOT be hard-dropped -- consistent with every other negative
+            // hard-drop gate. Generic "Best/Top N X" listicles that merely *list* the
+            // term among many are NOT exempt (round-2026-08-13T1136Z fix t_9cb2387b).
+            if !is_true_alternatives_page(title, url) {
                 let t_low = title.to_lowercase();
                 let c_low = content.to_lowercase();
                 let u_low = url.to_lowercase();
@@ -13355,6 +13396,25 @@ mod constraint_fix_tests {
             &c,
         );
         assert!(!kept, "alternative-listing page mentioning flask must be kept (alt exemption)");
+    }
+
+    #[test]
+    fn not_operator_hard_drops_top_n_listicle_mentioning_term() {
+        // Regression for round-2026-08-13T1136Z defect t_9cb2387b: a generic
+        // "Top 10 JavaScript Frameworks" listicle that merely *lists* react (among
+        // many) must be hard-dropped by `NOT:react`. The weak "top "/"best " framing
+        // is NOT a genuine alternatives page, so is_true_alternatives_page returns
+        // false and the exemption does not apply.
+        let mut c = cst();
+        c.hard_exclusions = vec!["react".to_string()];
+        let dropped = should_filter_by_constraints(
+            "Top 10 JavaScript Frameworks to Use in 2026",
+            "React, Vue, Angular, Svelte and more compared",
+            "https://example.com/top-10-javascript-frameworks",
+            None,
+            &c,
+        );
+        assert!(dropped, "NOT:react must hard-drop a Top N JS listicle that mentions react");
     }
 
     #[test]
