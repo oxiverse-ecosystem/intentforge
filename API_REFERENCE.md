@@ -813,17 +813,18 @@ curl -i "http://localhost:4000/video?q=%20%20"
 #  "would_pin_non_video_sources":true,"is_video_source_examples":{}}
 ```
 
-> **Verified (this card, 2026-08-13T0634Z):** endpoint shipped via `docker compose build gateway` + `up -d` (health `OK`), confirmed live for both the text and video-intent cases above, AND via the `video_endpoint_tests` module (4 cases) on the pure path:
+> **Verified (this card, 2026-08-13T0634Z):** endpoint shipped via `docker compose build gateway` + `up -d` (health `OK`), confirmed live for both the text and video-intent cases above, AND via the `video_endpoint_tests` module (6 cases) on the pure path:
 > - `?q=rust+vs+go+high+concurrency+servers` → `video_intent: false`, `would_pin_non_video_sources: true`; `?q=best+youtube+tutorial+for+rust+async` → `video_intent: true`, `would_pin_non_video_sources: false`
 > - `is_video_source_examples` matches `is_url_video_host`: youtube/youtu.be/invidious/vimeo → `true`; python.org article → `false`; host `example.com/youtube-guide-article` (word in path only) → `false`
 > - empty/whitespace `q` returns `400` with the `/video`-shaped `empty_query` envelope (neutral `video_intent` + markers present) — distinguishable from `/search`/`spellcheck` empty responses.
 >
-> **No hardcoding:** the endpoint reuses the *exact* pure fns `/search` uses (`is_url_video_host` + the P8 marker set + `simple_negation_strip` + `fallback_intent`). The marker set is fixed general data (no per-query tuning). The contract is locked by `video_endpoint_tests` (4 tests) which run under the round's lean CI (`cargo test -p gateway`).
+> **No hardcoding:** the endpoint reuses the *exact* pure fns `/search` uses (`is_url_video_host` + the P8 marker set + `simple_negation_strip` + `fallback_intent`). The marker set is fixed general data (no per-query tuning). The contract is locked by `video_endpoint_tests` (6 tests) which run under the round's lean CI (`cargo test -p gateway`).
 
 **Notes**
 - Pure function of the query; no per-query tuned constants, no domain allow/deny lists.
 - The endpoint is additive — it does not change `/search` ranking, calibration, the P8 video pin, or intent-engine calls. It is a read-only preview of the existing P8 video-classification path.
-- A test module (`video_endpoint_tests`, 4 cases) locks the JSON shape, the host-classification parity with `is_url_video_host`, the video-intent detection, and the `400` empty envelope.
+- A test module (`video_endpoint_tests`, 6 cases) locks the JSON shape, the host-classification parity with `is_url_video_host`, the video-intent detection, the `400` empty envelope, the `note` field, and the empty-envelope `message`/`query` fields.
+- **Executed, not just declared (this docs card, 2026-08-13T0634Z):** the 6 tests were compiled + run against the real `rust:1.88` toolchain (`cargo test --release video_endpoint_tests`) → `6 passed; 0 failed`. This closes the documentation-vs-code drift: every field the docs claim (`note`, `message`) is now assertion-locked.
 
 
 ```bash
