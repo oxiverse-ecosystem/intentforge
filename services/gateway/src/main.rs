@@ -3746,8 +3746,22 @@ fn geo_relevance_score(title: &str, content: &str, url: &str, geo: &geoloc::GeoL
     }
     if let Some(ref code) = geo.country_code {
         let code_lower = code.to_lowercase();
-        if url.to_lowercase().ends_with(&format!(".{}", code_lower))
-            || url.to_lowercase().contains(&format!("/{}", code_lower))
+        // FIX (round-2026-08-13T1136Z): a bare ccTLD match (url ends with ".in") must
+        // NOT alone grant a geo boost. A `.in` domain whose CONTENT is about a
+        // different place (e.g. "The cheapest Michelin restaurants in Tokyo |
+        // Condé Nast Traveller India" -> cntraveller.in) was hijacking the resolved
+        // "india" geo and being wrongly spared by the off-topic gate via geo_ok.
+        // Require the country NAME (or city) to ALSO appear in the page's VISIBLE
+        // title/preview text before the ccTLD counts. This keeps genuine `.in`
+        // India pages (which mention "india"/city in title/preview) boosted while
+        // dropping same-TLD off-topic pages. General: keyed on (ccTLD AND visible
+        // country/city mention), no per-query/domain tuning.
+        let visible_text = format!("{} {}", title.to_lowercase(), preview);
+        let country_visible = geo.country_name.as_ref().map(|c| visible_text.contains(&c.to_lowercase())).unwrap_or(false);
+        let city_visible = geo.city.as_ref().map(|c| visible_text.contains(&c.to_lowercase())).unwrap_or(false);
+        if (url.to_lowercase().ends_with(&format!(".{}", code_lower))
+            || url.to_lowercase().contains(&format!("/{}", code_lower)))
+            && (country_visible || city_visible)
         {
             boost = boost.max(0.12);
         }
@@ -5248,6 +5262,33 @@ fn is_weak_anchor_word(w: &str) -> bool {
         "local", "nearby", "near", "close", "closest", "top", "bottom", "natural",
         "artificial", "modern", "traditional", "old", "older", "new", "newer",
         "popular", "unpopular", "famous", "unknown", "secret", "hidden", "simple",
+        // Round-2026-08-13T1136Z (probe-confirmed): query-STRUCTURE / audience /
+        // opinion / verb filler words that keep leaking into strong_distinctive_terms
+        // and let off-topic pages survive the zero-overlap off-topic gate via one
+        // coincidental token match. Confirmed from the round's DBG-OFFTOPIC probe of
+        // the live gateway (real strong_distinctive_terms values):
+        //   rajasthan -> [visit,trip,february] (STRUCTURE, not the subject rajastan)
+        //   ferrari   -> [someone,cares,daily,drivability] (audience/opinion/verb)
+        //   coffee    -> [drinking,cups,single] (manner/quantity filler)
+        //   quantum   -> [solve,problems,cannot] (generic verbs)
+        //   cricket   -> [matches] (near-generic sports noun; the Tokyo leak is the
+        //     SEPARATE geo-ccTLD defect, fixed in geo_relevance_score)
+        // Treating these as weak anchors removes them from strong_distinctive_terms so
+        // the off-topic gate requires a GENUINE subject term to survive — identical
+        // mechanism to commit 4fc6d86. Genuine SUBJECT nouns (coffee, car, movie,
+        // book, game, ...) are intentionally NOT listed here: marking a real subject
+        // word "weak" *removes* it from strong_distinctive_terms, which empties the
+        // set for a sole-subject query (e.g. "coffee") and makes the off-topic gate
+        // SKIP entirely — increasing off-topic leakage, the opposite of the goal.
+        // General fixed lexicon; no query/domain-specific entries, no per-query tuning.
+        // (Words already present in the block above — live/season/cheapest/ten — are
+        // omitted here to avoid duplicates.)
+        "visit", "visiting", "trip", "trips", "tour", "tourism", "tourist",
+        "february", "places", "place", "see", "sightseeing", "sights", "destinations",
+        "someone", "cares", "care", "caring", "daily", "drivability", "drives", "driving",
+        "matches", "match", "stream", "streaming",
+        "drinking", "cups", "cup", "single", "solve", "solving", "problems", "problem",
+        "cannot", "track", "speed", "three", "twenty", "hundred", "thousand",
     ];
     WEAK.contains(&w)
 }
@@ -6647,6 +6688,34 @@ fn merge_local_and_web(
     // overlap survived at the 0.05 floor (calibrate_scores re-inflates the bottom
     // onto [0.05,1.0]), so off-topic web junk could not be removed. This round
     // removes that carve-out so the same gate protects web results.
+
+    // Subject terms = the query's distinctive topic terms MINUS the resolved geo
+    // tokens (country_name / country_code / region / city). Used by the geo-aware
+    // off-topic exemption below: when a query has a real (non-geo) subject, the geo
+    // exemption must require the result to ALSO match that subject — otherwise a
+    // `.in` domain whose content is about Tokyo survives an "india" + "cricket"
+    // query. For a pure-geo query (every distinctive term IS the geo token, e.g.
+    // "things to do in madurai") subject_terms is empty and the prior
+    // local-preserving behavior is kept. General: keyed on (distinctive-term set
+    // minus resolved-geo-token set); no per-query/domain tuning.
+    let subject_terms: Vec<String> = {
+        let geo_tokens: Vec<String> = geo_location
+            .map(|g| {
+                let mut t = Vec::new();
+                if let Some(ref c) = g.country_name { t.push(c.to_lowercase()); }
+                if let Some(ref cc) = g.country_code { t.push(cc.to_lowercase()); }
+                if let Some(ref r) = g.region { t.push(r.to_lowercase()); }
+                if let Some(ref c) = g.city { t.push(c.to_lowercase()); }
+                t
+            })
+            .unwrap_or_default();
+        strong_distinctive_terms
+            .iter()
+            .filter(|w| !geo_tokens.iter().any(|gt| gt == &w.to_lowercase()))
+            .map(|w| w.to_lowercase())
+            .collect()
+    };
+
     if !strong_distinctive_terms.is_empty() {
         let before = merged.len();
         let retained_pre_offtopic: Vec<MergedResult> = merged.iter().cloned().collect();
@@ -6688,10 +6757,31 @@ fn merge_local_and_web(
             // repeat "quiet"/"wifi", collapsing the set to one generic page.
             // General: reuses geo_relevance_score, no query/domain bias; only
             // exempts results that actually mention the resolved location.
+            // FIX (round-2026-08-13T1136Z): the geo exemption must not OVERRIDE the
+            // subject-match requirement. "The cheapest Michelin restaurants in Tokyo
+            // | Condé Nast Traveller India" (cntraveller.in) mentions "india" only as
+            // the publisher brand, yet geo_relevance_score returns >0 for it against
+            // the resolved "india" geo and the off-topic gate then wrongly spared it
+            // for an "in india" cricket query (it is about Tokyo, not cricket). So:
+            // when the query has NON-geo subject terms (e.g. "cricket"), the geo
+            // exemption only applies if the result ALSO matches one of those subject
+            // terms. Pure-geo queries (subject_terms empty, e.g. "quiet cafes near
+            // chennai" where the only strong term is the geo token) keep the prior
+            // behavior. General: derived from strong_distinctive_terms minus the
+            // resolved geo tokens; no per-query/domain tuning.
             let geo_ok = geo_location
                 .map(|g| geo_relevance_score(&tl, &cl, &ul, g) > 0.0)
                 .unwrap_or(false);
-            overlaps || geo_ok
+            let subject_overlap = subject_terms.iter().any(|t| {
+                let lt = t.to_lowercase();
+                tl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
+            });
+            let geo_exempt = if subject_terms.is_empty() {
+                geo_ok
+            } else {
+                geo_ok && subject_overlap
+            };
+            overlaps || geo_exempt
         });
         let removed = before - merged.len();
         if removed > 0 {
