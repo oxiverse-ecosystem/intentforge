@@ -5190,6 +5190,36 @@ fn recall_gap_stopwords() -> std::collections::HashSet<&'static str> {
         "simple", "quick", "fast", "new", "recent", "latest", "safe", "natural",
         "home", "house", "make", "making", "get", "getting", "use", "using",
         "find", "finding", "help", "need", "want", "like", "near", "nearby",
+        // function / auxiliary / connective words that carry NO topical signal
+        // and must never be surfaced as a "recall gap" (they are not facets the
+        // upstream index could supply). Adding them here keeps
+        // distinctive_query_terms from flagging them as missing coverage. This
+        // set is a fixed, general list of grammatical function words — no
+        // query/domain-specific entries, no per-query tuning.
+        "does", "do", "did", "doesn", "dont", "don", "can", "could", "should",
+        "would", "will", "may", "might", "has", "have", "had", "is", "are",
+        "was", "were", "be", "been", "being", "the", "a", "an", "and", "or",
+        "but", "if", "then", "else", "of", "to", "in", "on", "at", "by", "for",
+        "with", "without", "from", "into", "onto", "as", "that", "these",
+        "those", "this", "my", "your", "our", "their", "his", "her", "its",
+        "only", "also", "just", "still", "even", "very", "really", "lot",
+        "keep", "keeps", "kept", "stay", "stays", "put", "puts", "set", "sets",
+        "take", "takes", "took", "give", "gives", "show", "shows", "see", "sees",
+        "know", "knows", "think", "thinks", "feel", "feels", "look", "looks",
+        "go", "goes", "come", "comes", "let", "lets", "try", "tries", "sure",
+        "explain", "explained", "explaining", "describe", "description", "tell",
+        "tells", "learn", "learning", "learnt", "study", "studying", "read",
+        "reading", "write", "writing", "watch", "watching", "build", "building",
+        "built", "create", "creating", "start", "starting", "begin", "beginning",
+        "stop", "stopping", "avoid", "avoiding", "prevent", "preventing", "fix",
+        "fixing", "solve", "solving", "choose", "choosing", "choose", "pick",
+        "picking", "select", "selecting", "online", "offline", "local", "remote",
+        "lightweight", "heavy", "heavyweight", "safest", "safe", "unsafe",
+        "healthy", "health", "vegetarian", "vegan", "classic", "digital",
+        "personal", "private", "open", "closed", "thirty", "twenty", "forty",
+        "fifty", "hundred", "thousand", "million", "monthly", "weekly", "daily",
+        "ruining", "ruined", "ruin", "respect", "respects", "respecting",
+        "normal", "abnormal", "regular", "common", "uncommon", "rare", "usual",
         // negations (handled as constraints, not recall gaps)
         "not", "no", "without", "except", "besides", "minus", "other", "than",
         "nor",
@@ -6987,6 +7017,25 @@ fn merge_local_and_web(
         let dict_cap = 0.06f32;   // dictionary sites may appear but never rank top
         let weak_cap = 0.08f32;   // single-polysemous-token matches capped low
 
+        // P8 adaptive video cap (this round): for a NON-video query, every
+        // genuine text result must outrank every video. Capture the weakest
+        // text result's calibrated score so the video cap inside the loop can
+        // pin videos STRICTLY below it — robust even in weak-result-set mode
+        // where calibrate_scores stretches the single highest raw score (the
+        // video) onto its 0.12 ceiling, ABOVE the 0.05-floor articles (the live
+        // "rust vs go high concurrency" query ranked two invidious videos above
+        // the written comparison articles). A fixed cap (0.12) collided with that
+        // ceiling and never fired. Adaptive (derived from the actual text score
+        // band), not a magic constant tuned to one query.
+        let min_text_score = merged
+            .iter()
+            .filter(|t| {
+                !(t.sources.iter().any(|s| s == "invidious" || s == "video")
+                    || is_url_video_host(&t.url))
+            })
+            .map(|t| t.score)
+            .fold(f32::INFINITY, f32::min);
+
         for r in merged.iter_mut() {
             let rl = r.title.to_lowercase();
             let cl = r.content.to_lowercase();
@@ -7024,15 +7073,26 @@ fn merge_local_and_web(
                     || q_lc_cap.contains("tutorial")
                     || q_lc_cap.contains("animation");
                 if !video_intent {
-                    // 0.12 is below the calibrated top band for real text results
-                    // (~1.0) but above the 0.05 floor, so a video stays present yet
-                    // strictly secondary. Signal-driven (query self-describes intent),
-                    // not tuned to any one query.
-                    let video_cap = 0.12f32;
+                    // Adaptive P8 cap (this round): pin videos STRICTLY below the
+                    // weakest genuine text result, not at a fixed 0.12. The fixed cap
+                    // collided with calibrate_scores' weak-set ceiling [0.05,0.12],
+                    // which stretches the single highest raw score (the video) to 0.12,
+                    // so the cap never fired and the video outranked floor articles
+                    // (live "rust vs go high concurrency" ranked two invidious videos
+                    // above the written comparison articles). Derived from the actual
+                    // text-score band -> robust in weak-set mode; 0.03 margin keeps a
+                    // video present but never dominant. When NO text result survived
+                    // (all-video set), fall back to a flat 0.12 so videos still rank
+                    // among themselves instead of collapsing.
+                    let video_cap = if min_text_score.is_finite() {
+                        (min_text_score - 0.03).max(0.05)
+                    } else {
+                        0.12f32
+                    };
                     if r.score > video_cap {
                         tracing::info!(
-                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source)",
-                            video_cap, r.url.chars().take(60).collect::<String>()
+                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source; min_text={:.2})",
+                            video_cap, r.url.chars().take(60).collect::<String>(), min_text_score
                         );
                         r.score = video_cap;
                     }
