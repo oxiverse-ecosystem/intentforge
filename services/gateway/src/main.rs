@@ -5217,6 +5217,37 @@ fn is_weak_anchor_word(w: &str) -> bool {
         "students", "dog", "cat", "phone", "computer", "shoe", "watch", "tv",
         "car", "bike", "exercise", "workout", "sleep", "skin", "hair", "plant",
         "garden", "window", "door", "wall", "floor", "paint", "wood", "metal",
+        // Round-2026-08-13T1136Z: weak framing / structural words that carry NO
+        // substantive topical signal but keep leaking into strong_distinctive_terms and
+        // let off-topic spam pass the zero-overlap off-topic gate via one coincidental
+        // token match. Observed from the round's DBG-OFFTOPIC logs:
+        //   "main differences between ReactJS and VueJS" passed for "main" (Q: buddhism
+        //     vs hinduism); "Difference Between a Modem and a Router" passed for
+        //     "explain"; "Top 10 Signs a Used Car Has Been in an Accident" passed for
+        //     "serious"/"buying"; "cheapest Michelin Bib Gourmand restaurants in Tokyo"
+        //     passed for "cheapest"; "stop my windows laptop waking itself up randomly"
+        //     passed for "waking"/"itself"/"randomly"; "open source alternative to
+        //     adobe photoshop" passed for "alternative"/"runs". These are query STRUCTURE
+        //   (superlative/comparative framing, audience descriptor, how-to verbs, opinion
+        //   adjectives, temporal/recency fluff), not the subject. Treating them as weak
+        //   anchors removes them from strong_distinctive_terms, so the off-topic gate
+        //   then requires a GENUINE subject term (buddhism, hinduism, sociopath,
+        //   cricket, photoshop, marker, ...) to survive — exactly like the existing
+        //   "open/source/most/buy/reduce" entries. General fixed lexicon; no
+        //   query/domain-specific entries, no per-query tuning.
+        "main", "curious", "beginner", "explain", "explained", "explaining",
+        "confused", "teenager", "serious", "buying", "cheapest", "live", "season",
+        "waking", "woke", "itself", "randomly", "alternative", "alternatives",
+        "runs", "run", "running", "staring", "strain", "starting", "ten", "hours",
+        "difference", "differences", "different", "similar", "similarities",
+        "compare", "comparison", "versus", "reduce", "safest", "healthy", "health",
+        "simple", "simplest", "fastest", "best", "worst", "better", "good", "great",
+        "easy", "easily", "quick", "quickly", "cheap", "cheapest", "free", "common",
+        "regular", "normal", "average", "typical", "basic", "fundamental", "core",
+        "real", "right", "wrong", "true", "false", "actual", "actual", "genuine",
+        "local", "nearby", "near", "close", "closest", "top", "bottom", "natural",
+        "artificial", "modern", "traditional", "old", "older", "new", "newer",
+        "popular", "unpopular", "famous", "unknown", "secret", "hidden", "simple",
     ];
     WEAK.contains(&w)
 }
