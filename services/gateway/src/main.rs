@@ -5255,9 +5255,16 @@ fn merge_local_and_web(
         "between","through","under","over","again","then","there","here","into",
         "upon","within","without","out","off","up","down",
     ].iter().copied().collect();
+    // NOTE: intentionally EXCLUDES substantive content nouns like "framework",
+    // "library", "lib", "tool", "tools", "app", "apps", "application",
+    // "applications". Those are real topic words for many queries (e.g. "framework
+    // vs library", "best note taking app", "python web framework") — stripping them
+    // from distinctive_terms makes a "Percentage Difference Calculator" tie with a
+    // genuine framework/library explainer (round 2026-08-14T0608Z, s17). They are
+    // kept as ordinary content words everywhere else (core_topic_terms, overlap).
+    // Only genuinely META words stay here (web, guide, tutorial, docs, ...).
     let generic_web_terms: std::collections::HashSet<&str> = [
-        "web","framework","library","lib","tool","tools","app","apps","application",
-        "applications","guide","guides","tutorial","tutorials","docs","doc",
+        "web","guide","guides","tutorial","tutorials","docs","doc",
         "documentation","example","examples","reference","server","client","best",
         "top","review","reviews","using","getting","started","introduction","overview",
     ].iter().copied().collect();
