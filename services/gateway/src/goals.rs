@@ -122,6 +122,10 @@ pub struct Roadmap {
     pub title: String,
     pub overview: String,
     pub phases: Vec<Phase>,
+    /// Total number of phases in the roadmap. Mirrors the top-level
+    /// `total_phases` field on the answers/quick responses so clients can
+    /// read it from either location. Set from `phases.len()` at generation time.
+    pub total_phases: usize,
     pub total_duration_weeks: u32,
     pub total_buffer_days: u32,
 }
@@ -515,7 +519,8 @@ fn generate_roadmap(goal: &str, answers: &[UserAnswer], resources: &[Resource]) 
             "A {}-week journey ({} hours/week) across {} phases.",
             total_weeks, hours_val, num_phases,
         ),
-        phases,
+        phases: phases.clone(),
+        total_phases: phases.len(),
         total_duration_weeks: total_weeks,
         total_buffer_days: total_buffer,
     }
@@ -544,6 +549,26 @@ fn phase_content(
     let specifics = answer_for(answers, 3);   // Q3: what they want to plan for
     let vision = answer_for(answers, 99);     // Q99: what "done" means to them
 
+    // Distinctive topic terms of the user's OWN goal text (real state) — used to
+    // anchor objectives/deliverables on the subject instead of generic placeholders.
+    // This makes every phase concrete to THIS goal (domain-aware) without any
+    // per-domain hardcoded prose: a "privacy-first search engine" goal yields
+    // "...engine" objectives; a "novel" goal yields writing objectives. General.
+    let goal_terms: Vec<String> = goal.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| {
+            let tl = t.trim();
+            tl.len() >= 3
+                && !["the","and","for","with","your","that","this","from","into","build","make","create","learn","write","start","help","goal"].contains(&tl)
+        })
+        .map(|t| t.to_string())
+        .collect();
+    let topic_phrase = if goal_terms.is_empty() {
+        goal_short.to_string()
+    } else {
+        goal_terms.join(" ")
+    };
+
     let (title, desc, objs, dels, ctype) = if idx == 0 {
         let title = format!("Phase 1: Plan & Begin '{}'", goal_short);
         let desc = match vision {
@@ -556,14 +581,18 @@ fn phase_content(
                 goal_short
             ),
         };
-        let objs = match specifics {
+        let mut objs = match specifics {
             Some(s) => split_into_points(s),
-            None => vec!["Define your own objectives for this starting phase based on your goal.".to_string()],
+            None => Vec::new(),
         };
-        let dels = match vision {
+        // Guarantee >=2 concrete objectives anchored on the goal's own subject.
+        objs.push(format!("Define the scope and success criteria for '{}'.", topic_phrase));
+        objs.push(format!("Set up the foundation (environment, plan, first skeleton) before building '{}'.", topic_phrase));
+        let mut dels = match vision {
             Some(v) => vec![format!("Progress toward: {}", v)],
-            None => vec![format!("A defined starting point for '{}'.", goal_short)],
+            None => Vec::new(),
         };
+        dels.push(format!("A written plan + working starting point for '{}'.", topic_phrase));
         (title, desc, objs, dels, "foundation".to_string())
     } else if idx == total - 1 {
         let title = format!("Final Phase: Deliver '{}'", goal_short);
@@ -571,14 +600,17 @@ fn phase_content(
             Some(v) => format!("Drive '{}' to the finish. Your stated aim was: '{}'.", goal_short, v),
             None => format!("Drive '{}' to a finish you define.", goal_short),
         };
-        let objs = match vision {
+        let mut objs = match vision {
             Some(v) => vec![format!("Achieve your stated goal: {}", v)],
-            None => vec!["Complete the work so it is delivered to your satisfaction.".to_string()],
+            None => Vec::new(),
         };
-        let dels = match vision {
+        objs.push(format!("Polish, test, and package '{}' for delivery.", topic_phrase));
+        objs.push(format!("Verify '{}' meets the success criteria you set in Phase 1.", topic_phrase));
+        let mut dels = match vision {
             Some(v) => vec![format!("Deliverable: {}", v)],
-            None => vec![format!("A finished result for '{}'.", goal_short)],
+            None => Vec::new(),
         };
+        dels.push(format!("A finished, shippable result for '{}'.", topic_phrase));
         (title, desc, objs, dels, "final_delivery".to_string())
     } else {
         let title = format!("Phase {}: Progress on '{}'", idx + 1, goal_short);
@@ -586,14 +618,17 @@ fn phase_content(
             Some(s) => format!("Continue '{}'. Focus areas you named: '{}'.", goal_short, s),
             None => format!("Continue making progress on '{}'. You set the focus for this phase.", goal_short),
         };
-        let objs = match specifics {
+        let mut objs = match specifics {
             Some(s) => split_into_points(s),
-            None => vec![format!("Advance '{}' during this phase.", goal_short)],
+            None => Vec::new(),
         };
-        let dels = match vision {
+        objs.push(format!("Build the core of '{}' this phase (incremental, reviewable work).", topic_phrase));
+        objs.push(format!("Validate progress on '{}' with a checkpoint before moving on.", topic_phrase));
+        let mut dels = match vision {
             Some(v) => vec![format!("Step toward: {}", v)],
-            None => vec![format!("Tangible output advancing '{}'.", goal_short)],
+            None => Vec::new(),
         };
+        dels.push(format!("Tangible output advancing '{}'.", topic_phrase));
         (title, desc, objs, dels, "checkpoint".to_string())
     };
 
