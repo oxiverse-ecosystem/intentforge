@@ -8929,6 +8929,48 @@ async fn handle_search(
         tracing::info!("ONLY NEGATIVE: {} web results — keeping for constraint scoring", before);
     }
 
+    // ─── Contract enforcement: supported-intent normalization ───
+    // The intent-engine is a black box that may emit an intent outside the
+    // documented 8-class API contract (e.g. a trained "chitchat" class). The
+    // public contract guarantees exactly {navigational, informational, technical,
+    // how-to, comparison, fresh, transactional, local}. Any other label is
+    // remapped to the highest-probability SUPPORTED class from the distribution so
+    // the contract holds and downstream ranking/overrides operate on a known
+    // label. Without this, an unsupported intent silently bypasses every
+    // override gate (which all check `intent.intent != "<known>"`) and leaks to
+    // the API as a phantom class with no freshness/half-life semantics.
+    {
+        const SUPPORTED: &[&str] = &[
+            "navigational", "informational", "technical", "how-to",
+            "comparison", "fresh", "transactional", "local",
+        ];
+        if !SUPPORTED.contains(&intent.intent.as_str()) {
+            let best = SUPPORTED.iter()
+                .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            match best {
+                Some((lbl, _)) => {
+                    tracing::warn!(
+                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' — remapping to '{}' (top supported class)",
+                        intent.intent, q, lbl
+                    );
+                    intent.intent = (*lbl).to_string();
+                    // Cap confidence for an inferred label; the distribution arg is
+                    // the proxy we trust, not the engine's unsupported-class score.
+                    intent.confidence = intent.confidence.min(0.6);
+                }
+                None => {
+                    tracing::warn!(
+                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' with no supported distribution entry — falling back to informational",
+                        intent.intent, q
+                    );
+                    intent.intent = "informational".to_string();
+                    intent.confidence = 0.35;
+                }
+            }
+        }
+    }
+
     // ─── Rule-based intent overrides for known misclassification patterns ───
     // Fire when the linear probe has low confidence (<0.30) — the model is guessing,
     // so pattern-based heuristics beat random chance.
@@ -9118,7 +9160,16 @@ async fn handle_search(
             "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
         ];
         let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
-        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" {
+        // Do NOT clobber a decisive action/decision intent (comparison,
+        // transactional, how-to, technical, navigational) to fresh. A weather word
+        // like "rain" legitimately appears inside gear/commercial/how-to queries
+        // ("backpacking tent in the rain", "fix laptop fan after rain") and must not
+        // re-rank them by news-recency. Weather override only applies to
+        // informational/chitchat-style queries; genuine weather queries are still
+        // caught by the "today"/"forecast" temporal signals in other overrides.
+        let weather_skip_intents = ["comparison", "transactional", "how-to", "technical", "navigational"];
+        let weather_should_skip = weather_skip_intents.contains(&intent.intent.as_str());
+        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" && !weather_should_skip {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
                 q, intent.intent, intent.confidence
