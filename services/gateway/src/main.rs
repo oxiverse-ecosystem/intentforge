@@ -1696,7 +1696,14 @@ fn constraint_score(
     // pre-merge hard-drop gate uses the same pure alt_score>0.3 exemption, so all
     // gates must agree to avoid re-drops.
     let is_alt_page = alt_score > 0.3;
-    let mut any_negative_matched = false;
+    // Stricter gate for the title-dominance hard-drop below: a WEAK alt signal
+    // alone (e.g. a "best "/"top " listicle title with no comparison/alternative
+    // wording and no supporting URL/content evidence) must not exempt a page
+    // whose title is otherwise dominated by the excluded term from the hard
+    // drop — only genuine comparison/alternative pages (strong title signal,
+    // or corroborated by URL/content) should be exempt from that check.
+    let is_strong_alt_page = alt_score > 0.5;
+    let mut any_unresolved_violation = false;
     let mut hit_count = 0u32;
 
     for neg in &expanded_negatives {
@@ -1737,59 +1744,63 @@ fn constraint_score(
 
         if title_or_url_matched {
             hit_count += 1;
-            any_negative_matched = true;
-            if !is_alt_page {
-                // NEGATION-CONTEXT BOOST (this round): when the excluded term
-                // appears in a NEGATING context ("without medication", "no pills",
-                // "free of drugs"), the page is FULFILLING the user's exclusion,
-                // so it is MORE relevant — not less. The old code penalised these
-                // pages (×0.02), which collapsed recall for "X without Y" queries
-                // and could surface the opposite of intent (a pill page at #1 for
-                // "sleep without pills"). Boost instead of crush.
-                let neg_ctx_title = term_in_negating_context(neg_lower.as_str(), &title_lower);
-                let neg_ctx_content = term_in_negating_context(neg_lower.as_str(), &content.to_lowercase());
-                if neg_ctx_title || neg_ctx_content {
-                    let boost = 1.18;
-                    tracing::info!("CONSTRAINT NEG-CTX BOOST: '{}' in '{}' → boost={:.2} (excluding term framed negatively)",
-                        neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
-                        boost);
-                    score *= boost;
-                } else {
-                    let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
-                    tracing::info!("CONSTRAINT HIT (TITLE/URL): '{}' in '{}' → penalty={:.4} (non-alt)",
-                        neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
-                        penalty);
-                    score *= penalty;
-                }
+            // NEGATION-CONTEXT BOOST (this round): when the excluded term
+            // appears in a NEGATING context ("without medication", "no pills",
+            // "free of drugs"), the page is FULFILLING the user's exclusion,
+            // so it is MORE relevant — not less. The old code penalised these
+            // pages (×0.02), which collapsed recall for "X without Y" queries
+            // and could surface the opposite of intent (a pill page at #1 for
+            // "sleep without pills"). Boost instead of crush. This applies
+            // regardless of is_alt_page: a title like "natural alternatives
+            // instead of pills" is still fulfilling the exclusion even though
+            // it also reads as an alternative-listing page.
+            let neg_ctx_title = term_in_negating_context(neg_lower.as_str(), &title_lower);
+            let neg_ctx_content = term_in_negating_context(neg_lower.as_str(), &content.to_lowercase());
+            if neg_ctx_title || neg_ctx_content {
+                let boost = 1.18;
+                tracing::info!("CONSTRAINT NEG-CTX BOOST: '{}' in '{}' → boost={:.2} (excluding term framed negatively)",
+                    neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                    boost);
+                score *= boost;
+            } else if !is_alt_page {
+                let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
+                tracing::info!("CONSTRAINT HIT (TITLE/URL): '{}' in '{}' → penalty={:.4} (non-alt)",
+                    neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                    penalty);
+                score *= penalty;
+            } else {
+                any_unresolved_violation = true;
             }
         } else if content_matched {
             hit_count += 1;
-            any_negative_matched = true;
-            if !is_alt_page {
-                let neg_ctx_content = term_in_negating_context(neg_lower.as_str(), &content.to_lowercase());
-                if neg_ctx_content {
-                    let boost = 1.15;
-                    tracing::info!("CONSTRAINT NEG-CTX BOOST (content): '{}' in '{}' → boost={:.2}",
-                        neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
-                        boost);
-                    score *= boost;
-                } else {
-                    let penalty = (0.25 + (neg_count - 1.0) * 0.05).clamp(0.25, 0.50);
-                    tracing::info!("CONSTRAINT HIT (CONTENT): '{}' in '{}' → penalty={:.4} (non-alt)",
-                        neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
-                        penalty);
-                    score *= penalty;
-                }
+            let neg_ctx_content = term_in_negating_context(neg_lower.as_str(), &content.to_lowercase());
+            if neg_ctx_content {
+                let boost = 1.15;
+                tracing::info!("CONSTRAINT NEG-CTX BOOST (content): '{}' in '{}' → boost={:.2}",
+                    neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                    boost);
+                score *= boost;
+            } else if !is_alt_page {
+                let penalty = (0.25 + (neg_count - 1.0) * 0.05).clamp(0.25, 0.50);
+                tracing::info!("CONSTRAINT HIT (CONTENT): '{}' in '{}' → penalty={:.4} (non-alt)",
+                    neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                    penalty);
+                score *= penalty;
+            } else {
+                any_unresolved_violation = true;
             }
         } else {
             tracing::info!("CONSTRAINT MISS: '{}' not in '{}'", neg, &text_lower[..text_lower.char_indices().nth(60).map(|(i,_)| i).unwrap_or(text_lower.len())]);
         }
     }
 
-    if any_negative_matched && is_alt_page {
+    if any_unresolved_violation {
         // Alt pages get one single flat penalty regardless of how many excluded
         // terms they mention. This prevents "Django vs FastAPI vs Flask: Which to
         // Choose" (which mentions all 3) from getting compounded 0.175^3 = 0.005.
+        // Only terms that were NOT already resolved via the negation-context
+        // boost above count as violations here — a boosted term is fulfilling
+        // the exclusion, not violating it, so it must not also be penalized.
         // The alt_score measures how strongly this page is an alternative listing
         // (comparison vs titles, URL patterns, content patterns).
         // High alt_score → barely penalized: alt_score=0.7 → 0.175 single hit
@@ -1825,7 +1836,11 @@ fn constraint_score(
     // "without pills" is FULFILLING the exclusion, not violating it).
     // Incidental mentions inside body/comparison pages are left to the soft
     // penalty above. Fail-closed: if we can't prove dominance, we keep it.
-    if !is_alt_page && !expanded_negatives.is_empty() {
+    // Uses the STRICT alt-page gate: a weak listicle signal alone (e.g. "Best
+    // sleeping pills" — no comparison/alternative wording, no URL/content
+    // corroboration) must not exempt a title genuinely dominated by the
+    // excluded term from this hard drop.
+    if !is_strong_alt_page && !expanded_negatives.is_empty() {
         const STOP: &[&str] = &[
             "the", "a", "an", "and", "or", "for", "of", "in", "on", "to", "with",
             "vs", "versus", "best", "top", "review", "reviews", "guide", "guides",
@@ -2007,7 +2022,11 @@ fn constraint_score(
         }
     }
 
-    score.clamp(0.0, 1.0)
+    // Upper bound raised from 1.0 so the negation-context boost above (a
+    // result that FULFILLS an "X without Y" exclusion) can actually surface
+    // as a score above the neutral 1.0 baseline instead of being clipped back
+    // down to parity with non-boosted results.
+    score.clamp(0.0, 2.0)
 }
 
 /// Parsed price constraint. `min`/`max` describe an explicit range (`price:10-100`);
