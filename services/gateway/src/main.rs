@@ -423,6 +423,11 @@ struct MergedResult {
     /// to demote low-signal crawled pages. Defaults to 1.0 for web results.
     #[serde(default = "default_f32_one")]
     quality: f32,
+    /// Tracks if this result has a post-calibration cap that must be re-applied
+    /// after the final 0.05 clamp to ensure dict/weak/video results stay below
+    /// the article floor. Internal field, not serialized.
+    #[serde(skip)]
+    post_cal_cap: Option<f32>,
 }
 
 fn default_f32_one() -> f32 { 1.0 }
@@ -4981,6 +4986,36 @@ fn is_weak_anchor_word(w: &str) -> bool {
     WEAK.contains(&w)
 }
 
+/// Detects video intent in a query. Uses token-aware detection for "watch" to avoid
+/// false positives on queries like "watch battery" or "watch repair" which are about
+/// timepieces, not videos. Standalone "watch" does not imply video intent; requires
+/// video-oriented phrases like "watch video" or explicit video keywords.
+fn has_video_intent(query: &str) -> bool {
+    let q_lc = query.to_lowercase();
+    // Explicit video keywords that clearly indicate video intent
+    if q_lc.contains("video") || q_lc.contains("youtube") || q_lc.contains("animation") {
+        return true;
+    }
+    // "tutorial" often implies video, though not always
+    if q_lc.contains("tutorial") {
+        return true;
+    }
+    // Token-aware "watch" detection: only recognize video-oriented phrases
+    // "watch video", "watch on youtube", "how to watch", etc.
+    // Reject standalone "watch" to avoid false positives on watch/timepiece queries.
+    if q_lc.contains("watch video")
+        || q_lc.contains("watch on")
+        || q_lc.contains("watch online")
+        || q_lc.contains("how to watch")
+        || q_lc.contains("where to watch")
+        || q_lc.contains("watch tutorial")
+        || q_lc.contains("watch guide")
+    {
+        return true;
+    }
+    false
+}
+
 fn merge_local_and_web(
     local: Vec<IndexerResult>,
     web: Vec<SearxResult>,
@@ -5022,6 +5057,7 @@ fn merge_local_and_web(
             price: r.price.map(|p| p.to_string()),
             currency: r.currency,
             quality: r.quality,
+            post_cal_cap: None,
         };
         url_to_idx.insert(norm, merged.len());
         merged.push(entry);
@@ -5076,6 +5112,7 @@ fn merge_local_and_web(
                 price: r.price.clone(),
                 currency: r.currency.clone(),
                 quality: 1.0,
+                post_cal_cap: None,
             };
             url_to_idx.insert(norm, merged.len());
             merged.push(entry);
@@ -5577,18 +5614,22 @@ fn merge_local_and_web(
             // outrank the genuinely-relevant web result. Strong terms require the page to
             // name a SUBSTANTIVE query entity (ssd/laptop), so the off-topic page is
             // crushed. General: same distinctive-term overlap test as the hard-drop; no
-            // query or domain bias. Falls back to the looser set only when the query has no
-            // strong distinctive terms at all (so generic-anchor-only queries still gate on
-            // whatever contentful terms exist).
-            let topic_anchor_terms: &Vec<&str> = if strong_distinctive_terms.is_empty() {
-                &distinctive_terms
-            } else {
-                &strong_distinctive_terms
-            };
+            // query or domain bias. No fallback to weak-only terms; if only weak/meta terms
+            // exist, topic_mentioned stays false to gate off-topic pages (e.g. "deploy"
+            // alone for "deploy fastapi with postgres on ubuntu" would not validate an
+            // unrelated deployment article; the page must mention fastapi/postgres/ubuntu).
+            let topic_anchor_terms: Vec<&str> = strong_distinctive_terms.iter()
+                .filter(|t| {
+                    let tl = t.to_lowercase();
+                    !structure_words.contains(&tl.as_str())
+                        && !meta_action_terms.contains(tl.as_str())
+                        && !is_weak_anchor_word(&tl)
+                })
+                .copied()
+                .collect();
             let topic_mentioned = topic_anchor_terms.is_empty()
                 || topic_anchor_terms.iter().any(|t| {
                     let tl = t.to_lowercase();
-                    if structure_words.contains(&tl.as_str()) { return false; }
                     let bare = tl.trim_end_matches('s');
                     title_lower.contains(&tl) || content_lower.contains(&tl)
                         || title_lower.contains(bare) || content_lower.contains(bare)
@@ -5757,16 +5798,14 @@ fn merge_local_and_web(
             // topic, e.g. "solid-state battery breakthrough") still carries the term in
             // its title and is correctly preserved. Title-only test is general: it keys
             // on whether the page's own headline names the query subject, not on what
-            // random links the homepage happens to collect.
-            let title_has_topic = if distinctive_terms.is_empty() {
-                false
-            } else {
-                distinctive_terms.iter().any(|t| {
-                    let tl = t.to_lowercase();
-                    title_lower.contains(&tl)
-                })
-            };
-            if is_portal_home && !title_has_topic {
+            // random links the homepage happens to collect. Filler-only queries (no
+            // distinctive terms) skip the penalty so generic portals are not incorrectly
+            // demoted when there is nothing specific to require in the title.
+            let title_has_topic = distinctive_terms.iter().any(|t| {
+                let tl = t.to_lowercase();
+                title_lower.contains(&tl)
+            });
+            if !distinctive_terms.is_empty() && is_portal_home && !title_has_topic {
                 relevance *= 0.12;
                 tracing::info!(
                     "FRESH PORTAL DEMOTE x0.12: '{}' (generic-title portal for fresh intent)",
@@ -6121,9 +6160,8 @@ fn merge_local_and_web(
         // their own /videos endpoint; in /search they are secondary, so dampen them
         // unless the query is explicitly video-seeking. Floor keeps them present, not dominant.
         let is_video_source = r.sources.iter().any(|s| s == "invidious" || s == "video");
-        let q_lc = query.to_lowercase();
         let video_mult = if is_video_source {
-            if q_lc.contains("video") || q_lc.contains("youtube") || q_lc.contains("watch") || q_lc.contains("tutorial") || q_lc.contains("animation") {
+            if has_video_intent(query) {
                 1.0 // explicit video intent → keep
             } else {
                 // P8 fix (this round): for a generic TEXT query, videos must NOT outrank
@@ -6534,9 +6572,20 @@ fn merge_local_and_web(
             // title and a content prefix that is just the title echoed, i.e. no
             // encyclopedic lead) — no curated disambiguation allow-list. A definition
             // query (handled by is_definition_query above) is exempt and keeps them.
-            let wiki_disambig = ul.contains("en.wikipedia.org/wiki/")
-                && tl.ends_with("- wikipedia")
-                && (cl.trim().is_empty() || cl.trim().to_lowercase() == tl.trim() || prefix.contains("may refer to") || prefix.contains("can refer to") || prefix.starts_with(tl.trim()));
+            // Extract the page title without the " - wikipedia" suffix for comparison.
+            let wiki_disambig = if ul.contains("en.wikipedia.org/wiki/") && tl.ends_with("- wikipedia") {
+                let page_title = tl.strip_suffix("- wikipedia").unwrap_or(&tl).trim();
+                // Strict: accept only empty/stub (content == title) or explicit "refer to" phrases
+                // or a link-list form (body starts with the bare page title, no descriptive lead).
+                // Do NOT use unrestricted title-prefix matching that would mis-classify real articles.
+                cl.trim().is_empty()
+                    || cl.trim().to_lowercase() == page_title
+                    || prefix.contains("may refer to")
+                    || prefix.contains("can refer to")
+                    || (prefix.starts_with(page_title) && prefix.len() < page_title.len() + 50)
+            } else {
+                false
+            };
             dict_path_marker || dict_title
                 || ((phonetic || pos_label) && title_words.len() <= 3)
                 || (pos_label && short)
@@ -6575,6 +6624,7 @@ fn merge_local_and_web(
                         "POST-CAL DICT CAP -> {:.2}: '{}' (def site, non-def query)",
                         dict_cap, r.url.chars().take(60).collect::<String>()
                     );
+                    r.post_cal_cap = Some(dict_cap);
                     r.score = dict_cap;
                 }
                 continue;
@@ -6593,12 +6643,7 @@ fn merge_local_and_web(
             // results for a non-video query. Video-intent queries keep full score.
             let is_video_src = r.sources.iter().any(|s| s == "invidious" || s == "video");
             if is_video_src {
-                let video_intent = q_lc_cap.contains("video")
-                    || q_lc_cap.contains("youtube")
-                    || q_lc_cap.contains("watch")
-                    || q_lc_cap.contains("tutorial")
-                    || q_lc_cap.contains("animation");
-                if !video_intent {
+                if !has_video_intent(query) {
                     // 0.04 sits UNDER the calibrated article floor (0.05) so a video
                     // is demoted *below* every genuine text result for a non-video
                     // query (e.g. an invidious tutorial at 0.04 now ranks under the
@@ -6611,6 +6656,7 @@ fn merge_local_and_web(
                             "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source)",
                             video_cap, r.url.chars().take(60).collect::<String>()
                         );
+                        r.post_cal_cap = Some(video_cap);
                         r.score = video_cap;
                     }
                 }
@@ -6630,6 +6676,7 @@ fn merge_local_and_web(
                             "POST-CAL WEAK-MATCH CAP -> {:.2}: '{}' (matched {} of {} topics)",
                             weak_cap, r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len()
                         );
+                        r.post_cal_cap = Some(weak_cap);
                         r.score = weak_cap;
                     }
                 }
@@ -10825,6 +10872,16 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // stream stays valid.
     for r in results.iter_mut() {
         r.score = r.score.clamp(0.05, 1.0);
+        // Re-apply post-calibration caps (dict_cap=0.03, weak_cap=0.04, video_cap=0.04)
+        // AFTER the 0.05 clamp so they remain strictly below the article floor. Without
+        // this, a dict/weak/video result clamped to 0.05 would tie with genuine articles,
+        // defeating the cap's purpose. Applied here so dict/weak/spam stay demoted below
+        // all real articles (floor=0.05) in the final SERP.
+        if let Some(cap) = r.post_cal_cap {
+            if r.score > cap {
+                r.score = cap;
+            }
+        }
         r.title = sanitize_text_content(&r.title);
         r.content = clean::clean_result_content(&sanitize_text_content(&r.content), &r.title);
     }
@@ -11536,6 +11593,7 @@ async fn handle_search_fast(
                         price: r.price.map(|p| p.to_string()),
                         currency: r.currency,
                         quality: r.quality,
+                        post_cal_cap: None,
                     }).collect::<Vec<_>>()
                 }
                 None => vec![]
@@ -11992,6 +12050,173 @@ mod hardcoding_ruling_tests {
             vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
         assert_eq!(out.len(), 1, "adult result kept when query is explicitly adult");
+    }
+
+    #[test]
+    fn topic_mentioned_requires_substantive_terms() {
+        // Finding 1: "deploy fastapi with postgres on ubuntu" should require
+        // substantive terms (fastapi/postgres/ubuntu) for topic_mentioned, not
+        // just the meta-action term "deploy".
+        use super::IndexerResult;
+        let q = "deploy fastapi with postgres on ubuntu";
+        let local = vec![IndexerResult {
+            url: "http://local.test/fastapi-postgres-ubuntu-guide".to_string(),
+            title: "Deploying FastAPI with PostgreSQL on Ubuntu Server".to_string(),
+            content: "Complete guide to deploying a FastAPI application with PostgreSQL database on Ubuntu.".to_string(),
+            score: 0.8,
+            authority: 0.5,
+            price: None,
+            currency: None,
+            quality: 0.8,
+        }];
+        let out = merge_local_and_web(
+            local, vec![], q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        assert_eq!(out.len(), 1, "substantive-term match should survive");
+        let r = &out[0];
+        // Should NOT be crushed by LOCAL NOISE GATE since it mentions substantive terms
+        assert!(r.score > 0.1, "result with fastapi/postgres/ubuntu should have topic_mentioned=true and score > 0.1, got {}", r.score);
+    }
+
+    #[test]
+    fn topic_mentioned_rejects_weak_only_match() {
+        // Finding 1: "clean a dishwasher with vinegar" should NOT validate a page
+        // that only mentions "vinegar" (weak anchor word), not the substantive context.
+        use super::IndexerResult;
+        let q = "clean a dishwasher with vinegar";
+        let local = vec![IndexerResult {
+            url: "http://local.test/wasp-removal".to_string(),
+            title: "Get Rid of Wasps with Vinegar".to_string(),
+            content: "Natural wasp removal using vinegar spray. Safe and effective method.".to_string(),
+            score: 0.75,
+            authority: 0.5,
+            price: None,
+            currency: None,
+            quality: 0.6,
+        }];
+        let out = merge_local_and_web(
+            local, vec![], q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        // The off-topic page (mentions "vinegar" but not dishwasher context) should
+        // be crushed since "clean" and "vinegar" are weak anchor words and it lacks
+        // substantive terms from the query
+        assert_eq!(out.len(), 1, "off-topic result present but demoted");
+        let r = &out[0];
+        assert!(r.score < 0.1, "off-topic weak-match should be crushed below 0.1, got {}", r.score);
+    }
+
+    #[test]
+    fn dict_cap_stays_below_article_floor_after_clamp() {
+        // Finding 4: dict_cap (0.03) must stay below article floor (0.05) even after
+        // the final 0.05 clamp in serialization. The post_cal_cap mechanism re-applies
+        // the cap AFTER the clamp.
+        let q = "improve deep sleep without medication";
+        let dict_result = web_res(
+            "https://www.merriam-webster.com/dictionary/improve",
+            "Improve | Definition of Improve by Merriam-Webster",
+            "improve: verb. to make better",
+        );
+        let article_result = web_res(
+            "https://example.com/sleep-guide",
+            "How to Improve Deep Sleep Without Medication",
+            "Evidence-based techniques for improving sleep quality naturally.",
+        );
+        let web = vec![dict_result, article_result];
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        assert!(out.len() >= 2, "both results should be present");
+        // Find the dict result (capped to 0.03)
+        let dict = out.iter().find(|r| r.url.contains("merriam-webster")).expect("dict result missing");
+        // Find the article (floor at 0.05)
+        let article = out.iter().find(|r| r.url.contains("sleep-guide")).expect("article missing");
+        // Dict must be strictly below article floor
+        assert!(dict.score < 0.05, "dict_cap should be < 0.05, got {}", dict.score);
+        assert!(dict.score <= 0.031, "dict_cap should be ~0.03, got {}", dict.score);
+        assert!(article.score >= 0.05, "article floor should be >= 0.05, got {}", article.score);
+        assert!(dict.score < article.score, "dict (capped) must rank below article");
+    }
+
+    #[test]
+    fn video_intent_rejects_standalone_watch() {
+        // Finding 5: "watch battery" and "watch repair" are about timepieces,
+        // not videos. Standalone "watch" should NOT imply video intent.
+        use super::has_video_intent;
+        assert!(!has_video_intent("watch battery"), "watch battery is NOT video intent");
+        assert!(!has_video_intent("watch repair"), "watch repair is NOT video intent");
+        assert!(!has_video_intent("rolex watch"), "rolex watch is NOT video intent");
+        // But video-oriented phrases should be recognized
+        assert!(has_video_intent("watch video tutorial"), "watch video is video intent");
+        assert!(has_video_intent("how to watch"), "how to watch is video intent");
+        assert!(has_video_intent("youtube tutorial"), "youtube is video intent");
+    }
+
+    #[test]
+    fn video_cap_applied_for_ambiguous_watch_query() {
+        // Finding 5: "watch battery" should cap video results to 0.04 since it's
+        // not a video-intent query (about timepieces, not videos).
+        use super::SearxResult;
+        let q = "watch battery replacement";
+        let video_result = SearxResult {
+            title: "Watch Battery Replacement Tutorial - YouTube".to_string(),
+            url: "https://youtube.com/watch?v=abc123".to_string(),
+            content: "Step by step guide to replacing a watch battery.".to_string(),
+            engine: "invidious".to_string(),
+            score: 1.0,
+            sources: vec!["invidious".to_string()],
+            published_date: None,
+            price: None,
+            currency: None,
+        };
+        let article_result = web_res(
+            "https://example.com/watch-battery-guide",
+            "How to Replace a Watch Battery: Complete Guide",
+            "Professional guide to watch battery replacement with tools and tips.",
+        );
+        let web = vec![video_result, article_result];
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        assert!(out.len() >= 2, "both results should be present");
+        let video = out.iter().find(|r| r.sources.iter().any(|s| s == "invidious")).expect("video missing");
+        let article = out.iter().find(|r| r.url.contains("watch-battery-guide")).expect("article missing");
+        // Video should be capped to 0.04 (below article floor 0.05)
+        assert!(video.score <= 0.041, "video for non-video query should be capped to ~0.04, got {}", video.score);
+        assert!(article.score >= 0.05, "article should be at floor 0.05+, got {}", article.score);
+        assert!(video.score < article.score, "video must rank below article for non-video query");
+    }
+
+    #[test]
+    fn wiki_disambig_strict_detection() {
+        // Finding 3: Wikipedia disambiguation detection should use strict predicates
+        // (empty stub, "may refer to", "can refer to", or link-list with short body)
+        // and NOT use unrestricted title-prefix matching that would mis-classify
+        // normal article leads as disambiguation pages.
+        let q = "java programming";
+        // Real disambiguation page (contains "may refer to")
+        let disambig = web_res(
+            "https://en.wikipedia.org/wiki/Java",
+            "Java - Wikipedia",
+            "Java may refer to: Java (programming language), Java (island), Java coffee, and more.",
+        );
+        // Normal article (title happens to be a prefix of content, but it's a real article)
+        let article = web_res(
+            "https://en.wikipedia.org/wiki/Java_(programming_language)",
+            "Java (programming language) - Wikipedia",
+            "Java is a high-level, class-based, object-oriented programming language that is designed to have as few implementation dependencies as possible.",
+        );
+        let web = vec![disambig, article];
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        // The disambiguation page should be capped (treated as dict-like for non-def query)
+        // while the real article should not be capped
+        let disambig_result = out.iter().find(|r| r.url.contains("/wiki/Java") && !r.url.contains("programming")).expect("disambig missing");
+        let article_result = out.iter().find(|r| r.url.contains("programming_language")).expect("article missing");
+        // Disambig should be capped low (dict-like treatment for non-definition query)
+        assert!(disambig_result.score < 0.05, "disambig should be capped below floor, got {}", disambig_result.score);
+        // Real article should be at or above floor
+        assert!(article_result.score >= 0.05, "article should be >= 0.05, got {}", article_result.score);
     }
 }
 
