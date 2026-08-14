@@ -8982,15 +8982,15 @@ async fn handle_search(
                 .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             match best {
-                Some((lbl, _)) => {
+                Some((lbl, prob)) => {
                     tracing::warn!(
                         "INTENT CONTRACT: engine returned unsupported '{}' for '{}' — remapping to '{}' (top supported class)",
                         intent.intent, q, lbl
                     );
                     intent.intent = (*lbl).to_string();
-                    // Cap confidence for an inferred label; the distribution arg is
-                    // the proxy we trust, not the engine's unsupported-class score.
-                    intent.confidence = intent.confidence.min(0.6);
+                    // Use the distribution probability for the selected supported class
+                    // rather than the original unsupported-class confidence.
+                    intent.confidence = prob;
                 }
                 None => {
                     tracing::warn!(
@@ -9664,10 +9664,18 @@ async fn handle_search(
         if !retry_futs.is_empty() {
             let elapsed = search_start.elapsed();
             let limit = Duration::from_millis(4500); // 4.5s overall target limit (handler budget is 5.5s)
-            if elapsed >= limit {
+            // Allow contrastive-negative retries to bypass the elapsed-time skip (they
+            // are critical for "alternative to X" queries and get a bounded 1s budget),
+            // but still enforce the deadline for ordinary count-based retries.
+            if elapsed >= limit && !has_contrastive_negatives {
                 tracing::warn!("Retry skipped: elapsed time ({:?}) already exceeds target deadline ({:?})", elapsed, limit);
             } else {
-                let retry_budget = limit - elapsed;
+                let retry_budget = if elapsed >= limit {
+                    // Contrastive-negative bypass: grant a bounded 1s budget
+                    Duration::from_secs(1)
+                } else {
+                    limit - elapsed
+                };
                 tracing::info!(
                     "PARALLEL RETRY: {} results < {} expected, firing {} retry variation(s) with budget {:?}",
                     total_results, expected_min, retry_futs.len(), retry_budget
