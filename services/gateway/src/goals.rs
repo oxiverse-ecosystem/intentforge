@@ -1182,10 +1182,7 @@ pub async fn handle_leaderboard(
 ) -> Response {
     let store = state.goals_state.lock();
     let entries = store.leaderboard(50);
-    (StatusCode::OK, Json(serde_json::json!({
-        "entries": entries,
-        "total_entries": entries.len()
-    }))).into_response()
+    (StatusCode::OK, Json(entries)).into_response()
 }
 
 /// POST /goals/quick — one-shot goal to full roadmap (no questions)
