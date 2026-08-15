@@ -2108,7 +2108,10 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         if clean_n.starts_with('+') {
             clean_n = clean_n.strip_prefix('+').unwrap().trim().to_string();
         }
-        if clean_n.split_whitespace().count() <= 2 && !clean_n.is_empty() {
+        // Cap at 4 words: NL negations like "big advertising company" legitimately
+        // span 3 words once the leading verb/preposition is stripped
+        // (extract_negation_term). The prior <=2 cap silently dropped them.
+        if clean_n.split_whitespace().count() <= 4 && !clean_n.is_empty() {
             if !negative.contains(&clean_n) {
                 negative.push(clean_n);
             }
@@ -9018,6 +9021,30 @@ async fn handle_search(
     if gateway_extracted.price_max.is_some() {
         intent.structured_constraints.price_max = gateway_extracted.price_max;
     }
+    // FIX (negation-drop, 2026-08-15): the intent engine emits exclusion
+    // constraints as BOTH a `negative` entry AND an `Exclusion` entity. For some
+    // NL forms (e.g. "restaurants in tokyo not sushi") the gateway's own parser
+    // produces no negative (it only handles operators + a few inline markers), so
+    // the engine's `negative` array is the sole source — and it was being
+    // dropped before reaching ranking/hard-filter, so the exclusion never fired.
+    // We now ALSO mirror any `Exclusion`-role entity into `negative` so the
+    // constraint is always honoured regardless of which layer produced it.
+    // General + signal-driven: no query-specific strings, no denylists.
+    for e in &intent.structured_constraints.entities {
+        if e.role == EntityRole::Exclusion {
+            let t = e.text.trim().to_lowercase();
+            if !t.is_empty()
+                && t.len() >= 2
+                && !intent.structured_constraints.negative.contains(&t)
+            {
+                intent.structured_constraints.negative.push(t);
+            }
+        }
+    }
+    // Re-sanitize so the mirrored exclusion is still subject to the same
+    // validation as every other negative constraint.
+    intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+
     // P3 NL-price fix: also derive a bound from natural-language price words
     // ("under 150 dollars", "below 1000 rupees") — these never matched the
     // `price:<` operator parser, so the bound stayed None and ranking fell back
@@ -10562,9 +10589,28 @@ async fn handle_search(
             raw_neg.push(qt.clone());
         }
     }
+    // The intent engine emits `Exclusion`-role entities via its Query-Graph IR.
+    // That classification is a signal-driven decision (the engine recognized the
+    // clause as a genuine topical exclusion), so we trust it and bypass the
+    // generic `is_real_exclusion` gate for those terms. This fixes NL negations
+    // like "restaurants in tokyo not sushi" / "not controlled by a big advertising
+    // company" that the gate would otherwise decline as generic nouns — while
+    // manner/attribute exclusions the engine did NOT tag as Exclusion are still
+    // declined by the gate. No hardcoded allow-list; entity-role driven.
+    let engine_exclusions: std::collections::HashSet<String> = intent
+        .structured_constraints
+        .entities
+        .iter()
+        .filter(|e| e.role == EntityRole::Exclusion)
+        .map(|e| e.text.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
     let mut gated_neg_dedup: Vec<String> = Vec::new();
     for n in raw_neg.clone() {
-        if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
+        let engine_backed = engine_exclusions.contains(&n.to_lowercase());
+        if (engine_backed || is_real_exclusion(&n, &q_orig, query_contrastive))
+            && !gated_neg_dedup.contains(&n)
+        {
             gated_neg_dedup.push(n);
         }
     }
@@ -10781,19 +10827,36 @@ let mut results = match tokio::task::spawn_blocking(move || {
             // Alternative-listing page check: keep comparison/alternative pages
             // even if they mention excluded terms (they are HIGHLY relevant).
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-            // Exempt alternative-listing pages from the hard negative drop. A page
-            // scoring >0.3 here is, by construction, an "alternatives to X" /
-            // comparison listing that mentions the excluded term *referentially* —
-            // exactly what an "alternative to X", "except X", or "without X" query
-            // wants. This MUST match the pre-merge gate (line ~8650) and the
-            // penalty path's strong-alt exemption, otherwise legit alt pages like
-            // "25 Alternative Search Engines You Can Use Instead Google" get
-            // hard-dropped for "search engine alternative to google" (result set
-            // collapses to 1). We do NOT also require
-            // is_comparison_or_alternative_query(): for "alternative to X" the word
-            // "alternative" is consumed into the negative constraint, so that check
-            // would never fire and would wrongly re-enable the drop.
-            if alt_score > 0.3 {
+            let title_lower = r.title.to_lowercase();
+            // Exempt GENUINE alternative-listing / comparison pages from the hard
+            // negative drop. A genuine alt page (alt_score >= 0.70, or an explicit
+            // comparison marker in the title) mentions the excluded term
+            // *referentially* — exactly what an "alternative to X", "except X", or
+            // "without X" query wants (e.g. "25 Alternative Search Engines You Can
+            // Use Instead of Google" for "search engine alternative to google").
+            //
+            // CRITICAL FIX (round 2026-08-15T0830Z): the old gate exempted anything
+            // with alt_score > 0.3. But is_alternative_listing_page() also assigns a
+            // WEAK alt signal (~0.42) to generic "best/top/review" listicle titles
+            // — including a brand's OWN catalog page like "Dell Laptop Computers -
+            // Best Buy" or "Best Dell Laptops". Those are NOT comparison/alternative
+            // listings; they ARE the excluded brand. Exempting them meant "laptops
+            // not dell" still surfaced 6 Dell pages (auditor: before==after,
+            // dropped=0 for the negative hard-filter). The exemption must require a
+            // STRONG comparison signal, not a generic listicle, so brand-owned /
+            // "best <brand>" pages are correctly hard-dropped while true alt pages
+            // survive. This mirrors constraint_score's is_strong_alt_page (>0.5)
+            // convention. We do NOT also require is_comparison_or_alternative_query()
+            // (the word "alternative" is consumed into the negative constraint).
+            let genuine_alt = alt_score >= 0.70
+                || title_lower.contains("alternative")
+                || title_lower.contains(" vs ")
+                || title_lower.contains(" versus ")
+                || title_lower.contains("instead of")
+                || title_lower.contains("replacement")
+                || title_lower.contains("compared to")
+                || title_lower.contains("migrate from");
+            if genuine_alt {
                 return true;
             }
 
