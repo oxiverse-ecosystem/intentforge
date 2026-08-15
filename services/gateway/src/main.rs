@@ -898,7 +898,7 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
     None
 }
 
-fn freshness_score(url: &str, intent: &str, published_date: Option<&str>) -> f32 {
+fn freshness_score(url: &str, intent: &str, published_date: Option<&str>, title: &str, content: &str) -> f32 {
     // Different half-lives per intent category
     let half_life_hours: f32 = match intent {
         "fresh" => 6.0,            // news: 6-hour half-life
@@ -914,15 +914,21 @@ fn freshness_score(url: &str, intent: &str, published_date: Option<&str>) -> f32
     let mut estimated_age_hours: f32 = 168.0; // default: 7 days (less aggressive decay)
     let mut parsed_ok = false;
 
-    if let Some(pd) = published_date {
-        if let Some((y, m, d)) = parse_date_to_comparable(pd) {
-            let (cur_y, cur_m, cur_d) = today_ymd();
-            let cur_days = ymd_to_days(cur_y, cur_m, cur_d);
-            let item_days = ymd_to_days(y, m, d);
-            let total_days = (cur_days - item_days).max(0);
-            estimated_age_hours = (total_days * 24) as f32;
-            parsed_ok = true;
-        }
+    // Resolve the best date we can from upstream published_date, a URL-embedded
+    // year, or a date written in the title/content text. The upstream `publishedDate`
+    // field is frequently None (SearXNG news backends rarely populate it), so ranking
+    // on it alone leaves recency blind — a "latest X this week" query then ranks
+    // evergreen/undated pages by pure relevance. Falling back to resolve_item_date()
+    // (which already drives the after:/before: hard-filter) lets the freshness score
+    // actually decay stale items and boost recent ones. Generic: no per-query tuning.
+    let resolved = resolve_item_date(published_date, url, title, content);
+    if let Some((y, m, d)) = resolved {
+        let (cur_y, cur_m, cur_d) = today_ymd();
+        let cur_days = ymd_to_days(cur_y, cur_m, cur_d);
+        let item_days = ymd_to_days(y, m, d);
+        let total_days = (cur_days - item_days).max(0);
+        estimated_age_hours = (total_days * 24) as f32;
+        parsed_ok = true;
     }
 
     if !parsed_ok {
@@ -5818,7 +5824,7 @@ fn merge_local_and_web(
             relevance = relevance.min(0.12);
         }
         let mut intent_boost = calculate_intent_boost(&r.url, &r.title, &clean_query, intent);
-        let mut freshness = freshness_score(&r.url, intent, r.published_date.as_deref());
+        let mut freshness = freshness_score(&r.url, intent, r.published_date.as_deref(), &r.title, &r.content);
         let mut quality = content_quality_score(&r.content);
 
         // ── Off-topic structural starvation (this round, #01) ──
