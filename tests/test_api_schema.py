@@ -101,15 +101,16 @@ SEARCH_KEYS = [
 
 
 def test_search_schema(session):
-    """GET /search -> 200, 15 documented top-level keys, confidence is numeric."""
+    """GET /search -> 200, all 15 documented top-level keys present, confidence is numeric.
+
+    The API is allowed to include documented-optional fields (e.g. price_verified,
+    which API_REFERENCE lists as "Optionally present"), so we assert subset inclusion
+    (no *missing* documented field) rather than an exact top-level key count.
+    """
     r = session.get(f"{BASE}/search", params={"q": "schema test rust systems"}, timeout=30)
     assert r.status_code == 200, f"GET /search -> {r.status_code} {r.text[:300]}"
     body = r.json()
     _require_keys("GET /search", body, SEARCH_KEYS)
-    assert len(SEARCH_KEYS) == len(body.keys()), (
-        f"GET /search should expose exactly the 15 documented keys; "
-        f"have {sorted(body.keys())}"
-    )
     confidence = body.get("confidence")
     assert isinstance(confidence, (int, float)) and not isinstance(confidence, bool), (
         f"GET /search 'confidence' must be a real number, got {type(confidence).__name__}: {confidence!r}"
