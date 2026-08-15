@@ -11319,7 +11319,18 @@ let mut results = match tokio::task::spawn_blocking(move || {
         page_limit: Some(limit),
         page_offset: Some(offset),
         has_more: if post_filter_count > 0 { Some(offset + limit < post_filter_count) } else { Some(false) },
-        price_verified: if sc.price_min.is_some() || sc.price_max.is_some() || sc.price_lt.is_some() || sc.price_gt.is_some() || priced_result_count > 0 { Some(priced_result_count) } else { None },
+        // FIX-B: gate price_verified on transactional intent AND a REAL price bound.
+        // The old condition also fired on `priced_result_count > 0` — any web result
+        // merely mentioning a price, regardless of intent — which emitted a spurious
+        // `price_verified` (e.g. value 2) on non-transactional queries with no price
+        // token. API_REFERENCE documents price_verified only in the transactional
+        // context ("a real price constraint was verified"), so we require BOTH the
+        // transactional intent subtype AND a verified price bound (lt/gt, already merged
+        // into structured_constraints from the P3 NL-price + spoken-number wiring).
+        // Signal-driven: no query-specific strings, no allow/deny lists.
+        price_verified: if intent.intent == "transactional"
+            && (sc.price_lt.is_some() || sc.price_gt.is_some() || sc.price_min.is_some() || sc.price_max.is_some())
+        { Some(priced_result_count) } else { None },
     };
 
     // Cache for 5 minutes — but never cache empty results
