@@ -631,7 +631,7 @@ fn extract_constraints(query: &str) -> Constraints {
             // Preserve phrases if possible for negatives.
             // Phase 5: negatives use max_words=1 (head-noun only) so
             // "without prior experience" → "prior" not "prior experience".
-            let term = extract_constraint_term(remaining, 1);
+            let term = extract_negation_term(remaining);
             if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
                 negative.push(term);
             }
@@ -666,13 +666,14 @@ fn extract_constraints(query: &str) -> Constraints {
                     }
                 }
                 let remaining = &q[after_marker..];
-                // Extract multiple terms connected by "and"
-                // Phase 5: negatives max_words=1 (head-noun) — "without node and react" → ["node","react"].
-                let terms = extract_conjunctive_terms(remaining, 1);
-                for term in terms {
-                    if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
-                        negative.push(term);
-                    }
+                // Extract the negation OBJECT from the WHOLE clause at once
+                // (skips leading light verbs like "owned by"), rather than
+                // splitting into individual words first — splitting loses the
+                // multi-word object ("big advertising company" collapsed to the
+                // bare first word "controlled").
+                let term = extract_negation_term(remaining);
+                if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
+                    negative.push(term);
                 }
             }
             search_from = after_marker;
@@ -740,8 +741,8 @@ fn extract_constraints(query: &str) -> Constraints {
     let mut alt_terms: Vec<String> = Vec::new();
     for marker in &alt_neg_start_markers {
         if q_lower.starts_with(marker) {
-            // Phase 5: negatives head-noun only (max_words=1)
-            let term = extract_constraint_term(&q[marker.len()..], 1);
+            // Capture the negation OBJECT (skips leading light verbs).
+            let term = extract_negation_term(&q[marker.len()..]);
             if !term.is_empty() && term.len() > 1 {
                 alt_terms.push(term);
             }
@@ -753,8 +754,8 @@ fn extract_constraints(query: &str) -> Constraints {
         while let Some(pos) = q_lower[sf..].find(marker) {
             let ap = sf + pos + marker.len();
             if ap < q_lower.len() {
-                // Phase 5: negatives head-noun only (max_words=1)
-                let term = extract_constraint_term(&q[ap..], 1);
+                // Capture the negation OBJECT (skips leading light verbs).
+                let term = extract_negation_term(&q[ap..]);
                 if !term.is_empty() && term.len() > 1 {
                     alt_terms.push(term);
                 }
@@ -918,10 +919,10 @@ fn extract_constraints(query: &str) -> Constraints {
                 // "no heavy macros" → "macros" (not "heavy macros")
                 let term_start = seg_lower.find(' ').map(|p| p + 1).unwrap_or(0);
                 if term_start < seg_trimmed.len() {
+                    // Extract the negation OBJECT (skips leading light verbs like
+                    // "controlled by") rather than the bare first word.
                     let rest = &seg_trimmed[term_start..].trim();
-                    let term = rest.split_whitespace().next().unwrap_or("")
-                        .trim_matches(|c: char| c == ',' || c == '.' || c == ';')
-                        .to_string();
+                    let term = extract_negation_term(rest);
                     if !term.is_empty() && term.len() > 1 {
                         negative.push(term);
                     }
@@ -1251,6 +1252,77 @@ fn extract_conjunctive_terms(text: &str, max_words: usize) -> Vec<String> {
     } else {
         vec![extract_constraint_term(&strip_neg(phrase), max_words)]
     }
+}
+
+/// Extract the OBJECT of a natural-language negation, not the head word.
+/// A negation like "not owned by a big tech company" or "without a phone number"
+/// should capture the thing being excluded ("big tech company", "phone number"),
+/// not the leading verb/preposition ("owned", "a"). Head-noun-only extraction
+/// (extract_constraint_term(_, 1)) historically grabbed "owned" for the first
+/// example, which is a useless exclusion token.
+///
+/// Strategy (general, signal-driven — no query-specific strings):
+/// 1. Strip a leading light verb / copula / article / preposition run
+///    ("is", "are", "was", "owned", "made", "built", "by", "a", "an", "the",
+///    "of", "in", "on", "with", "to", "for", "that", "which", "who" …).
+/// 2. Take the remaining noun phrase (up to 3 words, stopping at a hard stop
+///    word / conjunction) as the exclusion object.
+/// This turns "not owned by a big tech company" → "big tech company",
+/// "without a phone number" → "phone number", "not vim" → "vim" (no leading
+/// verb to strip), "not django" → "django".
+fn extract_negation_term(text: &str) -> String {
+    // Light-verb / copula / article / preposition run to skip at the start of a
+    // negated clause. These are function words that precede the actual excluded
+    // entity. Order-independent: we keep stripping while the front token matches.
+    let lead: &[&str] = &[
+        "is", "are", "was", "were", "be", "been", "being",
+        "owned", "made", "built", "done", "created", "produced", "run", "operated",
+        "controlled", "managed", "developed", "designed", "provided", "offered",
+        "supported", "backed", "funded", "maintained", "hosted", "powered",
+        "manufactured", "assembled", "built", "run", "operated", "made", "owned",
+        "too", "very", "so", "really", "quite", "rather",
+        "by", "a", "an", "the", "of", "in", "on", "with", "to", "for", "from",
+        "that", "which", "who", "this", "these", "those",
+    ];
+    let mut tokens: Vec<String> = text
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    // Strip leading function-word run.
+    while let Some(first) = tokens.first() {
+        if lead.contains(&first.as_str()) {
+            tokens.remove(0);
+        } else {
+            break;
+        }
+    }
+    if tokens.is_empty() {
+        return String::new();
+    }
+    // Hard stop words that terminate the excluded phrase.
+    let stop: &[&str] = &[
+        "and", "or", "but", "the", "a", "an", "is", "are", "in", "on",
+        "for", "with", "from", "to", "of", "at", "by", "as", "via",
+        "under", "over", "about", "into", "through", "between", "after", "before",
+        "during", "since", "until", "above", "below", "per", "up", "down", "out",
+        "off", "that", "which", "who", "this", "these", "those",
+        "not", "no", "without", "except", "excluding", "minus", "besides",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for t in &tokens {
+        if stop.contains(&t.as_str()) && !out.is_empty() {
+            break;
+        }
+        if stop.contains(&t.as_str()) {
+            break;
+        }
+        out.push(t.clone());
+        if out.len() >= 3 {
+            break;
+        }
+    }
+    out.join(" ")
 }
 
 /// Extract a constraint term from the text after a marker.
