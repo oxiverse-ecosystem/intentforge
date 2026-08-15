@@ -2188,6 +2188,14 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         } else {
             let pl = clean_p;
             if pl.is_empty() { continue; }
+            // Drop bare currency words that leaked past price extraction
+            // ("four hundred dollars" -> digits + "dollars" left behind). They
+            // never match result text and only pollute lexical-relevance scoring.
+            // Currency-agnostic: covers every supported denomination token.
+            let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee",
+                "inr", "rs", "rs.", "euros", "euro", "eur", "pounds", "pound",
+                "gbp", "yen", "jpy", "won", "krw", "cents", "cent", "paise", "paisa"];
+            if currency_words.contains(&pl.as_str()) { continue; }
             let is_dup = positive.iter().any(|kept| {
                 let kl = kept.to_lowercase();
                 kl == pl || kl.split_whitespace().all(|w| pl.split_whitespace().any(|w2| w2 == w))
@@ -11303,11 +11311,109 @@ fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
     (after_date, before_date)
 }
 
+/// Translate spoken number words into digits so the downstream price
+/// operators fire. Spelled prices like "four hundred dollars" or "two hundred
+/// fifty dollars" were never matched by the digit-only `price:<` regexes, so
+/// they leaked as junk positive constraints (e.g. +four +hundred +dollars)
+/// and no price bound was ever extracted (P3 regression). Converting the words
+/// to digits up front lets the existing `under <N>` / `below <N>` rules produce
+/// a real `price:<N` constraint, which then feeds ranking + the response
+/// struct. Currency-agnostic: it only rewrites the number, never the currency
+/// word, so dollars/rupees/euros all still flow through.
+///
+/// Handles 0-99 directly and any magnitude via "X hundred/thousand [Y]" and
+/// "X thousand Y hundred [Z]" compositions (e.g. "two hundred fifty" -> "250",
+/// "one thousand two hundred" -> "1200", "nineteen" -> "19").
+fn normalize_spoken_numbers(query: &str) -> String {
+    let units: &[(&str, u32)] = &[
+        ("zero", 0), ("ten", 10), ("eleven", 11), ("twelve", 12),
+        ("thirteen", 13), ("fourteen", 14), ("fifteen", 15), ("sixteen", 16),
+        ("seventeen", 17), ("eighteen", 18), ("nineteen", 19),
+        ("one", 1), ("two", 2), ("three", 3), ("four", 4), ("five", 5),
+        ("six", 6), ("seven", 7), ("eight", 8), ("nine", 9),
+        ("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50),
+        ("sixty", 60), ("seventy", 70), ("eighty", 80), ("ninety", 90),
+    ];
+    let tokens: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        // Look for a "hundred" or "thousand" scalar clause ending on that word.
+        if tok == "hundred" || tok == "thousand" {
+            out.push(tok.clone());
+            i += 1;
+            continue;
+        }
+        let is_unit = units.iter().any(|(w, _)| w == tok);
+        if is_unit {
+            // Gather the contiguous run of number words.
+            let mut j = i;
+            let mut run: Vec<String> = Vec::new();
+            while j < tokens.len() {
+                let t = &tokens[j];
+                let is_num = units.iter().any(|(w, _)| w == t) || t == "hundred" || t == "thousand";
+                if !is_num { break; }
+                run.push(t.clone());
+                j += 1;
+            }
+            // Parse the composed value.
+            let mut total: i64 = 0;
+            let mut current: i64 = 0;
+            let mut has_any = false;
+            let mut saw_scale = false;
+            for w in &run {
+                if *w == "hundred" {
+                    if current == 0 { current = 1; }
+                    total += current * 100;
+                    current = 0;
+                    saw_scale = true;
+                } else if *w == "thousand" {
+                    if current == 0 { current = 1; }
+                    total += current * 1000;
+                    current = 0;
+                    saw_scale = true;
+                } else {
+                    let v = units.iter().find(|(w2, _)| w2 == w).map(|(_, v)| *v).unwrap_or(0);
+                    if v >= 10 && v <= 90 && v % 10 == 0 {
+                        // tens (twenty..ninety) add directly
+                        current += v as i64;
+                    } else {
+                        if current > 0 && v < 10 && !saw_scale {
+                            // e.g. "twenty one" -> 21 (tens already in current)
+                        }
+                        if v < 10 { current += v as i64; }
+                        else { current += v as i64; }
+                    }
+                    has_any = true;
+                }
+            }
+            let value = if total == 0 && current == 0 { 0 } else { total + current };
+            if has_any {
+                out.push(value.to_string());
+                i = j;
+                continue;
+            } else {
+                // Not a parseable number run; emit as-is.
+                out.push(tok.clone());
+                i += 1;
+                continue;
+            }
+        }
+        out.push(tok.clone());
+        i += 1;
+    }
+    out.join(" ")
+}
+
 /// Normalize natural-language constraint syntax into canonical operator tokens
 /// (mirror of the intent engine's helper) so the engine query and the gateway's
 /// own constraint parsing honour spoken forms: "under $500" -> price:<500,
 /// "in url:github" -> inurl:github, "on site:reddit" -> site:reddit.
 fn normalize_nl_operators(query: &str) -> String {
+    // Spoken prices ("four hundred dollars") -> digits so the price regexes below
+    // can rewrite them into `price:<N`. Must run before the digit-only rules.
+    let query = normalize_spoken_numbers(query);
     let mut out = query.to_string();
     for (re_src, replacement) in [
         (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
