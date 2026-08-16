@@ -11369,13 +11369,16 @@ fn normalize_spoken_numbers(query: &str) -> String {
                     current = 0;
                     saw_scale = true;
                 } else if *w == "thousand" {
-                    if current == 0 { current = 1; }
-                    // If total > 0 (e.g., "one hundred" yielded 100), multiply it by 1000
-                    // instead of adding current*1000, to handle "one hundred thousand" correctly.
-                    if total > 0 {
-                        total = total * 1000 + current * 1000;
-                    } else {
+                    // If total > 0 with no pending current (e.g., "one hundred" yielded
+                    // total=100, current=0), "thousand" scales the whole total by 1000
+                    // to get "one hundred thousand" -> 100000, rather than adding another
+                    // implicit thousand on top.
+                    if current > 0 {
                         total += current * 1000;
+                    } else if total > 0 {
+                        total *= 1000;
+                    } else {
+                        total += 1000;
                     }
                     current = 0;
                     saw_scale = true;
