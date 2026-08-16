@@ -5809,8 +5809,20 @@ fn merge_local_and_web(
                 "compared","beginner","beginners","explained","explain","explaining","simply",
                 "meaning","means","definition","define","mean","like","how to",
             ];
-            let topic_mentioned = distinctive_terms.is_empty()
-                || distinctive_terms.iter().any(|t| {
+            // P2 fix (this round): anchor `topic_mentioned` on `strong_distinctive_terms`
+            // (substantive subject terms; weak anchors like "places"/"road"/"trip" already
+            // filtered out) instead of the full `distinctive_terms`. An off-topic local
+            // crawl page can match ONLY a weak anchor — e.g. "trawell.in/vizag/100kms" for a
+            // "places to see snowfall near shimla within 100 kilometers" query, where the sole
+            // overlap is the generic word "places" — and the old test (which accepted any
+            // distinctive term) set topic_mentioned=true, so the quality gate never fired and
+            // the page floated to #1 above the on-topic web result. Using strong terms means a
+            // local page must actually mention the query's SUBJECT (shimla/snowfall,
+            // boeing/airbus, hyderabad/goa) to survive; weak-anchor-only matches are correctly
+            // crushed. General, signal-driven, no query/domain bias. Genuine local pages that
+            // contain a real subject term still pass (no regression).
+            let topic_mentioned = strong_distinctive_terms.is_empty()
+                || strong_distinctive_terms.iter().any(|t| {
                     let tl = t.to_lowercase();
                     if structure_words.contains(&tl.as_str()) { return false; }
                     let bare = tl.trim_end_matches('s');
@@ -5856,6 +5868,23 @@ fn merge_local_and_web(
                 tracing::info!(
                     "LOCAL NOISE GATE (off-topic comparison): '{}' is a comparison page but mentions none of the query entities {:?} -> relevance *= 0.3",
                     r.title.chars().take(60).collect::<String>(), substantive_terms
+                );
+            } else if r.is_local && distinctive_terms.len() >= 3 && overlap < 0.34 {
+                // P2c (this round): a LOCAL page that shares only a small FRACTION of the
+                // query's distinctive terms is crawl noise, not a real match. The checks above
+                // are defeated by a SINGLE generic-noun overlap — e.g. "Road Trip Ideas" matching
+                // just "road"+"trip" of a "hyderabad to goa road trip" query, or "Public record
+                // requests" matching just "record"+"safety" of "boeing versus airbus safety" —
+                // so topic_mentioned stays true and the page floats to #1 above on-topic web
+                // results. Use the in-scope lexical `overlap` ratio (present distinctive / total
+                // distinctive) as the signal: < 0.34 with >= 3 distinctive terms means the page
+                // addresses a small minority of the query -> crush it. Short queries (N<3) are
+                // exempt (a 1/2 match there is tolerable and would over-crush legit short matches).
+                // General, signal-driven, no query/domain tuning.
+                relevance *= 0.05;
+                tracing::info!(
+                    "LOCAL NOISE GATE (low distinctive overlap): '{}' overlap={:.2} distinctive_len={} -> relevance x0.05",
+                    r.title.chars().take(60).collect::<String>(), overlap, distinctive_terms.len()
                 );
             }
         }
