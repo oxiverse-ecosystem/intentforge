@@ -898,7 +898,7 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
     None
 }
 
-fn freshness_score(url: &str, intent: &str, published_date: Option<&str>) -> f32 {
+fn freshness_score(url: &str, intent: &str, published_date: Option<&str>, title: &str, content: &str) -> f32 {
     // Different half-lives per intent category
     let half_life_hours: f32 = match intent {
         "fresh" => 6.0,            // news: 6-hour half-life
@@ -914,15 +914,30 @@ fn freshness_score(url: &str, intent: &str, published_date: Option<&str>) -> f32
     let mut estimated_age_hours: f32 = 168.0; // default: 7 days (less aggressive decay)
     let mut parsed_ok = false;
 
-    if let Some(pd) = published_date {
-        if let Some((y, m, d)) = parse_date_to_comparable(pd) {
-            let (cur_y, cur_m, cur_d) = today_ymd();
-            let cur_days = ymd_to_days(cur_y, cur_m, cur_d);
-            let item_days = ymd_to_days(y, m, d);
-            let total_days = (cur_days - item_days).max(0);
-            estimated_age_hours = (total_days * 24) as f32;
-            parsed_ok = true;
-        }
+    // Resolve the best date we can from upstream published_date or a date written
+    // in the title/content text. The upstream `publishedDate` field is frequently
+    // None (SearXNG news backends rarely populate it), so ranking on it alone leaves
+    // recency blind — a "latest X this week" query then ranks evergreen/undated
+    // pages by pure relevance. Falling back to resolve_item_date() (which already
+    // drives the after:/before: hard-filter) lets the freshness score actually decay
+    // stale items and boost recent ones. Generic: no per-query tuning.
+    //
+    // Only accept full dates (from published_date or extract_date_from_text); a bare
+    // URL year represented as January 1 is too imprecise to set parsed_ok or compute
+    // age. Let the existing URL-year heuristic below assign its 24-hour age instead.
+    let resolved = if let Some(pd) = published_date {
+        parse_date_to_comparable(pd)
+    } else {
+        let text = format!("{} {}", title, content);
+        extract_date_from_text(&text)
+    };
+    if let Some((y, m, d)) = resolved {
+        let (cur_y, cur_m, cur_d) = today_ymd();
+        let cur_days = ymd_to_days(cur_y, cur_m, cur_d);
+        let item_days = ymd_to_days(y, m, d);
+        let total_days = (cur_days - item_days).max(0);
+        estimated_age_hours = (total_days * 24) as f32;
+        parsed_ok = true;
     }
 
     if !parsed_ok {
@@ -1554,6 +1569,76 @@ fn is_comparison_or_alternative_query(constraints: &Constraints) -> bool {
     false
 }
 
+/// Detect whether an EXCLUDED term (a negative constraint like "medication")
+/// appears in a NEGATING context within a result — i.e. the page is
+/// *fulfilling* the user's exclusion rather than violating it. For
+/// "lower blood pressure WITHOUT medication" the most relevant pages literally
+/// say "without medication" / "no pills" / "free of drugs". Penalising them
+/// (the old behaviour) collapses recall and can surface the opposite of intent
+/// (a pill page ranking #1 for "sleep without pills"). When the excluded term is
+/// framed negatively, the result should be BOOSTED, not crushed.
+///
+/// General, signal-driven: keyed on a small closed set of English negation
+/// markers + the excluded term's own tokens, no per-query/domain strings.
+fn term_in_negating_context(term_lower: &str, text_lower: &str) -> bool {
+    let term_tokens: Vec<&str> = term_lower
+        .split_whitespace()
+        .filter(|t| t.len() >= 2)
+        .collect();
+    if term_tokens.is_empty() {
+        return false;
+    }
+    // Negation markers that, when appearing shortly BEFORE the excluded term,
+    // signal the page is about avoiding it.
+    // Single-word markers
+    let single_word_markers: &[&str] = &[
+        "without", "no", "not", "never", "avoid", "avoiding",
+        "zero", "minus", "absent", "non",
+    ];
+    // Multi-word markers represented as token sequences
+    let multi_word_markers: &[&[&str]] = &[
+        &["with", "no"],
+        &["free", "of"],
+        &["free", "from"],
+        &["instead", "of"],
+        &["rather", "than"],
+    ];
+    let words: Vec<&str> = text_lower.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()).collect();
+    for (i, w) in words.iter().enumerate() {
+        let is_term_token = term_tokens.iter().any(|t| {
+            let tl = t.trim_end_matches('s'); // loose plural match
+            w == t || w == &tl || (w.len() > t.len() && w.starts_with(t) && (w.len() - t.len()) as f32 / t.len() as f32 <= 0.5)
+        });
+        if !is_term_token {
+            continue;
+        }
+        // Look back up to 3 tokens for a negation marker.
+        let start = i.saturating_sub(3);
+        let preceding_window = &words[start..i];
+
+        // Check single-word markers with exact token equality (no prefix matching)
+        for &prev in preceding_window {
+            if single_word_markers.contains(&prev) {
+                return true;
+            }
+        }
+
+        // Check multi-word markers as token sequences
+        for multi_marker in multi_word_markers {
+            if preceding_window.len() >= multi_marker.len() {
+                // Scan all possible positions in the window
+                for window_start in 0..=(preceding_window.len() - multi_marker.len()) {
+                    let window_slice = &preceding_window[window_start..window_start + multi_marker.len()];
+                    if window_slice == *multi_marker {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn constraint_score(
     title: &str,
     content: &str,
@@ -1626,7 +1711,14 @@ fn constraint_score(
     // pre-merge hard-drop gate uses the same pure alt_score>0.3 exemption, so all
     // gates must agree to avoid re-drops.
     let is_alt_page = alt_score > 0.3;
-    let mut any_negative_matched = false;
+    // Stricter gate for the title-dominance hard-drop below: a WEAK alt signal
+    // alone (e.g. a "best "/"top " listicle title with no comparison/alternative
+    // wording and no supporting URL/content evidence) must not exempt a page
+    // whose title is otherwise dominated by the excluded term from the hard
+    // drop — only genuine comparison/alternative pages (strong title signal,
+    // or corroborated by URL/content) should be exempt from that check.
+    let is_strong_alt_page = alt_score > 0.5;
+    let mut any_unresolved_violation = false;
     let mut hit_count = 0u32;
 
     for neg in &expanded_negatives {
@@ -1667,33 +1759,63 @@ fn constraint_score(
 
         if title_or_url_matched {
             hit_count += 1;
-            any_negative_matched = true;
-            if !is_alt_page {
+            // NEGATION-CONTEXT BOOST (this round): when the excluded term
+            // appears in a NEGATING context ("without medication", "no pills",
+            // "free of drugs"), the page is FULFILLING the user's exclusion,
+            // so it is MORE relevant — not less. The old code penalised these
+            // pages (×0.02), which collapsed recall for "X without Y" queries
+            // and could surface the opposite of intent (a pill page at #1 for
+            // "sleep without pills"). Boost instead of crush. This applies
+            // regardless of is_alt_page: a title like "natural alternatives
+            // instead of pills" is still fulfilling the exclusion even though
+            // it also reads as an alternative-listing page.
+            let neg_ctx_title = term_in_negating_context(neg_lower.as_str(), &title_lower);
+            let neg_ctx_content = term_in_negating_context(neg_lower.as_str(), &content.to_lowercase());
+            if neg_ctx_title || neg_ctx_content {
+                let boost = 1.18;
+                tracing::info!("CONSTRAINT NEG-CTX BOOST: '{}' in '{}' → boost={:.2} (excluding term framed negatively)",
+                    neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                    boost);
+                score *= boost;
+            } else if !is_alt_page {
                 let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
                 tracing::info!("CONSTRAINT HIT (TITLE/URL): '{}' in '{}' → penalty={:.4} (non-alt)",
                     neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
                     penalty);
                 score *= penalty;
+            } else {
+                any_unresolved_violation = true;
             }
         } else if content_matched {
             hit_count += 1;
-            any_negative_matched = true;
-            if !is_alt_page {
+            let neg_ctx_content = term_in_negating_context(neg_lower.as_str(), &content.to_lowercase());
+            if neg_ctx_content {
+                let boost = 1.15;
+                tracing::info!("CONSTRAINT NEG-CTX BOOST (content): '{}' in '{}' → boost={:.2}",
+                    neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                    boost);
+                score *= boost;
+            } else if !is_alt_page {
                 let penalty = (0.25 + (neg_count - 1.0) * 0.05).clamp(0.25, 0.50);
                 tracing::info!("CONSTRAINT HIT (CONTENT): '{}' in '{}' → penalty={:.4} (non-alt)",
                     neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
                     penalty);
                 score *= penalty;
+            } else {
+                any_unresolved_violation = true;
             }
         } else {
             tracing::info!("CONSTRAINT MISS: '{}' not in '{}'", neg, &text_lower[..text_lower.char_indices().nth(60).map(|(i,_)| i).unwrap_or(text_lower.len())]);
         }
     }
 
-    if any_negative_matched && is_alt_page {
+    if any_unresolved_violation {
         // Alt pages get one single flat penalty regardless of how many excluded
         // terms they mention. This prevents "Django vs FastAPI vs Flask: Which to
         // Choose" (which mentions all 3) from getting compounded 0.175^3 = 0.005.
+        // Only terms that were NOT already resolved via the negation-context
+        // boost above count as violations here — a boosted term is fulfilling
+        // the exclusion, not violating it, so it must not also be penalized.
         // The alt_score measures how strongly this page is an alternative listing
         // (comparison vs titles, URL patterns, content patterns).
         // High alt_score → barely penalized: alt_score=0.7 → 0.175 single hit
@@ -1724,9 +1846,16 @@ fn constraint_score(
     // them. Rule: a NON-alt page is dropped only when its TITLE is dominated by
     // the excluded term(s): ≥50% of its non-stopword title tokens are an
     // excluded term (or a sub-brand of it, e.g. "pycharm" ∈ "pycharm-community").
+    // Finding 3: exclude negative-term occurrences when they appear in negating
+    // context (e.g., "Sleep without pills" should NOT be hard-dropped because
+    // "without pills" is FULFILLING the exclusion, not violating it).
     // Incidental mentions inside body/comparison pages are left to the soft
     // penalty above. Fail-closed: if we can't prove dominance, we keep it.
-    if !is_alt_page && !expanded_negatives.is_empty() {
+    // Uses the STRICT alt-page gate: a weak listicle signal alone (e.g. "Best
+    // sleeping pills" — no comparison/alternative wording, no URL/content
+    // corroboration) must not exempt a title genuinely dominated by the
+    // excluded term from this hard drop.
+    if !is_strong_alt_page && !expanded_negatives.is_empty() {
         const STOP: &[&str] = &[
             "the", "a", "an", "and", "or", "for", "of", "in", "on", "to", "with",
             "vs", "versus", "best", "top", "review", "reviews", "guide", "guides",
@@ -1738,6 +1867,12 @@ fn constraint_score(
             .filter(|t| t.len() >= 2 && !STOP.contains(&t.as_str()))
             .collect();
         if !title_tokens.is_empty() {
+            // Check if any of the expanded negatives appear in negating context
+            // in the title. If they do, they're RELEVANT (not violations).
+            let negatives_in_negating_context: Vec<&String> = expanded_negatives.iter()
+                .filter(|neg| term_in_negating_context(&neg.to_lowercase(), &title_lower))
+                .collect();
+
             let dominated = title_tokens.iter().filter(|tok| {
                 expanded_negatives.iter().any(|neg| {
                     if neg.is_empty() { return false; }
@@ -1745,10 +1880,13 @@ fn constraint_score(
                     // Exact word, or the token is a sub-brand/compound of the
                     // excluded term (n ⊂ tok, covering "pycharm-community",
                     // "macbook-pro", "nodejs"-style collisions handled by len gap).
-                    tok.as_str() == n.as_str()
+                    let is_match = tok.as_str() == n.as_str()
                         || (tok.len() > n.len()
                             && tok.starts_with(&n)
-                            && (tok.len() - n.len()) as f32 / n.len() as f32 <= 0.6)
+                            && (tok.len() - n.len()) as f32 / n.len() as f32 <= 0.6);
+
+                    // Exclude this match if the term is in negating context
+                    is_match && !negatives_in_negating_context.contains(&neg)
                 })
             }).count();
             let dom_frac = dominated as f32 / title_tokens.len() as f32;
@@ -1899,7 +2037,11 @@ fn constraint_score(
         }
     }
 
-    score.clamp(0.0, 1.0)
+    // Upper bound raised from 1.0 so the negation-context boost above (a
+    // result that FULFILLS an "X without Y" exclusion) can actually surface
+    // as a score above the neutral 1.0 baseline instead of being clipped back
+    // down to parity with non-boosted results.
+    score.clamp(0.0, 2.0)
 }
 
 /// Parsed price constraint. `min`/`max` describe an explicit range (`price:10-100`);
@@ -1981,7 +2123,10 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         if clean_n.starts_with('+') {
             clean_n = clean_n.strip_prefix('+').unwrap().trim().to_string();
         }
-        if clean_n.split_whitespace().count() <= 2 && !clean_n.is_empty() {
+        // Cap at 4 words: NL negations like "big advertising company" legitimately
+        // span 3 words once the leading verb/preposition is stripped
+        // (extract_negation_term). The prior <=2 cap silently dropped them.
+        if clean_n.split_whitespace().count() <= 4 && !clean_n.is_empty() {
             if !negative.contains(&clean_n) {
                 negative.push(clean_n);
             }
@@ -2061,6 +2206,14 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         } else {
             let pl = clean_p;
             if pl.is_empty() { continue; }
+            // Drop bare currency words that leaked past price extraction
+            // ("four hundred dollars" -> digits + "dollars" left behind). They
+            // never match result text and only pollute lexical-relevance scoring.
+            // Currency-agnostic: covers every supported denomination token.
+            let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee",
+                "inr", "rs", "rs.", "euros", "euro", "eur", "pounds", "pound",
+                "gbp", "yen", "jpy", "won", "krw", "cents", "cent", "paise", "paisa"];
+            if currency_words.contains(&pl.as_str()) { continue; }
             let is_dup = positive.iter().any(|kept| {
                 let kl = kept.to_lowercase();
                 kl == pl || kl.split_whitespace().all(|w| pl.split_whitespace().any(|w2| w2 == w))
@@ -2214,6 +2367,26 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     let lower_markers = ["over", "more than", "above", "minimum", "at least", "from"];
     let amount_pat = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
     let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.", "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw"];
+    // Distance units: a number followed by one of these is a RANGE/DISTANCE
+    // bound (e.g. "within 300 kilometers", "up to 50 miles"), NOT a price.
+    // Without this guard, "within 300 kilometers" was mis-read as price:<300
+    // and the spurious price bound dropped relevant results (round 2026-08-15).
+    // General, unit-aware — no per-query literals.
+    // Inspect only the immediate token following the number, not the entire rest.
+    let distance_units = [
+        "km", "kms", "kilometer", "kilometers", "kilometre", "kilometres",
+        "mile", "miles", "mi", "meter", "meters", "metre", "metres",
+        "foot", "feet", "ft", "yard", "yards", "yd",
+    ];
+    let is_distance_bound = |rest_after_num: &str| -> bool {
+        // Extract the next token after optional whitespace
+        let next_token = rest_after_num.trim_start()
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("");
+        let next_token_lower = next_token.to_lowercase();
+        distance_units.iter().any(|u| next_token_lower == *u)
+    };
 
     // Pattern A: upper-marker then number (+ optional currency word)
     for marker in upper_markers {
@@ -2223,6 +2396,12 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
+                        // Distance-bound guard: "within 300 kilometers" is a
+                        // range, not a price — skip this marker (let a later
+                        // price marker, if any, match instead).
+                        if is_distance_bound(rest) {
+                            continue;
+                        }
                         let currency = currency_words.iter().find(|c| rest.contains(*c))
                             .map(|c| normalize_currency_str(c)).unwrap_or_else(|| "usd".to_string());
                         return Some((v, currency));
@@ -2236,7 +2415,14 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     if let Some(caps) = re_b.captures(&lower) {
         if let (Some(cur), Some(num)) = (caps.get(1), caps.get(2)) {
             if let Ok(v) = num.as_str().replace(',', "").parse::<f32>() {
-                return Some((v, normalize_currency_str(cur.as_str())));
+                // Distance-bound guard (see Pattern A): a currency-symbol amount
+                // followed by a distance unit is not a price.
+                let after_num = &lower[caps.get(2).unwrap().end()..];
+                if is_distance_bound(after_num) {
+                    // fall through; do not return a price bound
+                } else {
+                    return Some((v, normalize_currency_str(cur.as_str())));
+                }
             }
         }
     }
@@ -2245,7 +2431,14 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     if let Some(caps) = re_c.captures(&lower) {
         if let (Some(num), Some(cur)) = (caps.get(1), caps.get(2)) {
             if let Ok(v) = num.as_str().replace(',', "").parse::<f32>() {
-                return Some((v, normalize_currency_str(cur.as_str())));
+                // Distance-bound guard (see Pattern A): number + currency word +
+                // marker, where a distance unit follows, is a range not a price.
+                let after_num = &lower[caps.get(1).unwrap().end()..];
+                if is_distance_bound(after_num) {
+                    // fall through; do not return a price bound
+                } else {
+                    return Some((v, normalize_currency_str(cur.as_str())));
+                }
             }
         }
     }
@@ -3864,6 +4057,39 @@ fn query_is_contrastive(q_orig: &str) -> bool {
 fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<String>) {
     let q_lower = q_orig.to_lowercase();
     let words: Vec<&str> = q_lower.split_whitespace().collect();
+
+    // Find the position of the first negation marker to split subject vs. excluded terms.
+    let neg_markers_for_split = ["not", "no", "without", "except", "excluding", "minus"];
+    let first_neg_pos = words.iter().position(|w| {
+        neg_markers_for_split.contains(w) || w.starts_with('-')
+            || (*w == "other" && words.get(words.iter().position(|x| *x == *w).unwrap() + 1).map(|x| *x == "than").unwrap_or(false))
+            || (*w == "rather" && words.get(words.iter().position(|x| *x == *w).unwrap() + 1).map(|x| *x == "than").unwrap_or(false))
+            || (*w == "alternative" && words.get(words.iter().position(|x| *x == *w).unwrap() + 1).map(|x| *x == "to").unwrap_or(false))
+            || (*w == "instead" && words.get(words.iter().position(|x| *x == *w).unwrap() + 1).map(|x| *x == "of").unwrap_or(false))
+    });
+
+    // Subject terms = every non-stopword content word appearing BEFORE the first
+    // negation marker. When building a compound exclusion we stop the current
+    // target (and finalise it) as soon as one of these subject terms reappears —
+    // that word belongs to the main query topic, not to the thing being excluded
+    // (e.g. "...without django or flask python web frameworks" must not swallow
+    // "python web frameworks" into the `flask` exclusion).
+    let subject_words = if let Some(pos) = first_neg_pos {
+        &words[..pos]
+    } else {
+        &words[..]
+    };
+    let subject_terms: std::collections::HashSet<&str> = subject_words
+        .iter()
+        .copied()
+        .filter(|w| {
+            !["to", "of", "a", "an", "the", "from",
+              "in", "on", "at", "for", "with", "by", "about", "any", "some",
+              "using", "having", "is", "are", "was", "were", "be", "been",
+              "being", "do", "does", "did", "have", "has", "had", "and", "or"]
+                .contains(w)
+        })
+        .collect();
     let mut terms: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
     // Computed once: whether the query is in contrastive/exclusion framing. Real
@@ -3975,10 +4201,46 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                     // generic function word.
                     let mut compound: Vec<String> = vec![first_clean.clone()];
                     let mut k = j + 1;
+                    // Records the current compound as a (possibly dropped) exclusion,
+                    // then resets it so the NEXT exclusion target can be collected.
+                    // Used when we hit a list connector ("or"/"and"/",") inside an
+                    // exclusion frame — e.g. "without django or flask" or "without
+                    // django, flask" must exclude BOTH targets, not just the first.
+                    // (Before this fix only `django` was excluded and a Flask
+                    // tutorial ranked #1 for "python web frameworks without django
+                    // or flask".)
+                    let mut record_and_reset = |compound: &mut Vec<String>,
+                                                terms: &mut Vec<String>,
+                                                dropped: &mut Vec<String>| {
+                        if compound.is_empty() {
+                            return;
+                        }
+                        let joined = compound.join(" ");
+                        if is_real_exclusion(&joined, q_orig, query_contrastive)
+                            && !terms.contains(&joined)
+                        {
+                            terms.push(joined);
+                        } else if !is_manner_phrase(&joined)
+                            && !is_manner_frame(q_orig, &joined)
+                        {
+                            if !dropped.contains(&joined) {
+                                dropped.push(joined);
+                            }
+                        }
+                        compound.clear();
+                    };
                     while k < words.len() {
                         let w = words[k];
                         if neg_markers.contains(&w) || w.starts_with('-') {
                             break; // next exclusion starts here
+                        }
+                        // List connectors between exclusion targets: the current
+                        // target is finalised, then we start collecting the next.
+                        let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
+                        if bare == "or" || bare == "and" {
+                            record_and_reset(&mut compound, &mut terms, &mut dropped);
+                            k += 1;
+                            continue;
                         }
                         if stopwords.contains(&w) {
                             break; // "a", "the", "of" — stop the compound
@@ -3990,31 +4252,32 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         if wc.is_empty() {
                             break;
                         }
+                        // A single exclusion target is a SHORT phrase (an entity or
+                        // a 2-3 word product name). Once we've collected a target
+                        // (compound non-empty) and the next word is a high-frequency
+                        // SUBJECT term (part of the original query topic), the
+                        // current exclusion is complete — finalise it and stop.
+                        // This prevents "without django or flask" from swallowing
+                        // "flask python web frameworks" as one giant (gated-out) phrase.
+                        if !compound.is_empty() && subject_terms.contains(&wc.as_str()) {
+                            record_and_reset(&mut compound, &mut terms, &mut dropped);
+                            break;
+                        }
+                        // A trailing comma on the word (e.g. "django,") also
+                        // separates exclusion targets: "without django, flask".
+                        let trailing_sep = w != wc && (w.ends_with(',') || w.ends_with(';'));
                         compound.push(wc);
+                        if trailing_sep {
+                            record_and_reset(&mut compound, &mut terms, &mut dropped);
+                        }
                         k += 1;
                     }
-                    let joined = compound.join(" ");
-                    // Gate: only keep the compound as a real exclusion when it is in
-                    // contrastive framing or names a recognized entity. Manner
-                    // qualifiers ("without soap", "with no music background") are
-                    // dropped so they don't penalize the user's own topical words.
-                    if is_real_exclusion(&joined, q_orig, query_contrastive)
-                        && !terms.contains(&joined)
-                    {
-                        terms.push(joined);
-                    } else if !is_manner_phrase(&joined) && !is_manner_frame(q_orig, &joined) {
-                        // D3 transparency: a genuine candidate exclusion that the
-                        // gate declined (not a recognized entity, not contrastive
-                        // framing) AND is not a manner qualifier. It was silently
-                        // dropped before (regression); now we record it so it can
-                        // be surfaced in `ignored_constraints`. Never includes
-                        // manner qualifiers ("without soap"), which stay excluded.
-                        if !dropped.contains(&joined) {
-                            dropped.push(joined);
-                        }
-                    }
-                    // Advance past the consumed compound so we don't re-scan it.
-                    i = j + compound.len();
+                    // Finalise the last (or only) target.
+                    record_and_reset(&mut compound, &mut terms, &mut dropped);
+                    // Advance past every word we consumed (first_clean at j plus all
+                    // extensions) so the outer loop doesn't re-scan them. `k` already
+                    // points at the first word we did NOT consume (or words.len()).
+                    i = k;
                     continue;
                 }
             }
@@ -5128,9 +5391,16 @@ fn merge_local_and_web(
         "between","through","under","over","again","then","there","here","into",
         "upon","within","without","out","off","up","down",
     ].iter().copied().collect();
+    // NOTE: intentionally EXCLUDES substantive content nouns like "framework",
+    // "library", "lib", "tool", "tools", "app", "apps", "application",
+    // "applications". Those are real topic words for many queries (e.g. "framework
+    // vs library", "best note taking app", "python web framework") — stripping them
+    // from distinctive_terms makes a "Percentage Difference Calculator" tie with a
+    // genuine framework/library explainer (round 2026-08-14T0608Z, s17). They are
+    // kept as ordinary content words everywhere else (core_topic_terms, overlap).
+    // Only genuinely META words stay here (web, guide, tutorial, docs, ...).
     let generic_web_terms: std::collections::HashSet<&str> = [
-        "web","framework","library","lib","tool","tools","app","apps","application",
-        "applications","guide","guides","tutorial","tutorials","docs","doc",
+        "web","guide","guides","tutorial","tutorials","docs","doc",
         "documentation","example","examples","reference","server","client","best",
         "top","review","reviews","using","getting","started","introduction","overview",
     ].iter().copied().collect();
@@ -5673,7 +5943,7 @@ fn merge_local_and_web(
             relevance = relevance.min(0.12);
         }
         let mut intent_boost = calculate_intent_boost(&r.url, &r.title, &clean_query, intent);
-        let mut freshness = freshness_score(&r.url, intent, r.published_date.as_deref());
+        let mut freshness = freshness_score(&r.url, intent, r.published_date.as_deref(), &r.title, &r.content);
         let mut quality = content_quality_score(&r.content);
 
         // ── Off-topic structural starvation (this round, #01) ──
@@ -8876,6 +9146,30 @@ async fn handle_search(
     if gateway_extracted.price_max.is_some() {
         intent.structured_constraints.price_max = gateway_extracted.price_max;
     }
+    // FIX (negation-drop, 2026-08-15): the intent engine emits exclusion
+    // constraints as BOTH a `negative` entry AND an `Exclusion` entity. For some
+    // NL forms (e.g. "restaurants in tokyo not sushi") the gateway's own parser
+    // produces no negative (it only handles operators + a few inline markers), so
+    // the engine's `negative` array is the sole source — and it was being
+    // dropped before reaching ranking/hard-filter, so the exclusion never fired.
+    // We now ALSO mirror any `Exclusion`-role entity into `negative` so the
+    // constraint is always honoured regardless of which layer produced it.
+    // General + signal-driven: no query-specific strings, no denylists.
+    for e in &intent.structured_constraints.entities {
+        if e.role == EntityRole::Exclusion {
+            let t = e.text.trim().to_lowercase();
+            if !t.is_empty()
+                && t.len() >= 2
+                && !intent.structured_constraints.negative.contains(&t)
+            {
+                intent.structured_constraints.negative.push(t);
+            }
+        }
+    }
+    // Re-sanitize so the mirrored exclusion is still subject to the same
+    // validation as every other negative constraint.
+    intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+
     // P3 NL-price fix: also derive a bound from natural-language price words
     // ("under 150 dollars", "below 1000 rupees") — these never matched the
     // `price:<` operator parser, so the bound stayed None and ranking fell back
@@ -10420,9 +10714,28 @@ async fn handle_search(
             raw_neg.push(qt.clone());
         }
     }
+    // The intent engine emits `Exclusion`-role entities via its Query-Graph IR.
+    // That classification is a signal-driven decision (the engine recognized the
+    // clause as a genuine topical exclusion), so we trust it and bypass the
+    // generic `is_real_exclusion` gate for those terms. This fixes NL negations
+    // like "restaurants in tokyo not sushi" / "not controlled by a big advertising
+    // company" that the gate would otherwise decline as generic nouns — while
+    // manner/attribute exclusions the engine did NOT tag as Exclusion are still
+    // declined by the gate. No hardcoded allow-list; entity-role driven.
+    let engine_exclusions: std::collections::HashSet<String> = intent
+        .structured_constraints
+        .entities
+        .iter()
+        .filter(|e| e.role == EntityRole::Exclusion)
+        .map(|e| e.text.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
     let mut gated_neg_dedup: Vec<String> = Vec::new();
     for n in raw_neg.clone() {
-        if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
+        let engine_backed = engine_exclusions.contains(&n.to_lowercase());
+        if (engine_backed || is_real_exclusion(&n, &q_orig, query_contrastive))
+            && !gated_neg_dedup.contains(&n)
+        {
             gated_neg_dedup.push(n);
         }
     }
@@ -10639,19 +10952,36 @@ let mut results = match tokio::task::spawn_blocking(move || {
             // Alternative-listing page check: keep comparison/alternative pages
             // even if they mention excluded terms (they are HIGHLY relevant).
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-            // Exempt alternative-listing pages from the hard negative drop. A page
-            // scoring >0.3 here is, by construction, an "alternatives to X" /
-            // comparison listing that mentions the excluded term *referentially* —
-            // exactly what an "alternative to X", "except X", or "without X" query
-            // wants. This MUST match the pre-merge gate (line ~8650) and the
-            // penalty path's strong-alt exemption, otherwise legit alt pages like
-            // "25 Alternative Search Engines You Can Use Instead Google" get
-            // hard-dropped for "search engine alternative to google" (result set
-            // collapses to 1). We do NOT also require
-            // is_comparison_or_alternative_query(): for "alternative to X" the word
-            // "alternative" is consumed into the negative constraint, so that check
-            // would never fire and would wrongly re-enable the drop.
-            if alt_score > 0.3 {
+            let title_lower = r.title.to_lowercase();
+            // Exempt GENUINE alternative-listing / comparison pages from the hard
+            // negative drop. A genuine alt page (alt_score >= 0.70, or an explicit
+            // comparison marker in the title) mentions the excluded term
+            // *referentially* — exactly what an "alternative to X", "except X", or
+            // "without X" query wants (e.g. "25 Alternative Search Engines You Can
+            // Use Instead of Google" for "search engine alternative to google").
+            //
+            // CRITICAL FIX (round 2026-08-15T0830Z): the old gate exempted anything
+            // with alt_score > 0.3. But is_alternative_listing_page() also assigns a
+            // WEAK alt signal (~0.42) to generic "best/top/review" listicle titles
+            // — including a brand's OWN catalog page like "Dell Laptop Computers -
+            // Best Buy" or "Best Dell Laptops". Those are NOT comparison/alternative
+            // listings; they ARE the excluded brand. Exempting them meant "laptops
+            // not dell" still surfaced 6 Dell pages (auditor: before==after,
+            // dropped=0 for the negative hard-filter). The exemption must require a
+            // STRONG comparison signal, not a generic listicle, so brand-owned /
+            // "best <brand>" pages are correctly hard-dropped while true alt pages
+            // survive. This mirrors constraint_score's is_strong_alt_page (>0.5)
+            // convention. We do NOT also require is_comparison_or_alternative_query()
+            // (the word "alternative" is consumed into the negative constraint).
+            let genuine_alt = alt_score >= 0.70
+                || title_lower.contains("alternative")
+                || title_lower.contains(" vs ")
+                || title_lower.contains(" versus ")
+                || title_lower.contains("instead of")
+                || title_lower.contains("replacement")
+                || title_lower.contains("compared to")
+                || title_lower.contains("migrate from");
+            if genuine_alt {
                 return true;
             }
 
@@ -11108,7 +11438,18 @@ let mut results = match tokio::task::spawn_blocking(move || {
         page_limit: Some(limit),
         page_offset: Some(offset),
         has_more: if post_filter_count > 0 { Some(offset + limit < post_filter_count) } else { Some(false) },
-        price_verified: if sc.price_min.is_some() || sc.price_max.is_some() || sc.price_lt.is_some() || sc.price_gt.is_some() || priced_result_count > 0 { Some(priced_result_count) } else { None },
+        // FIX-B: gate price_verified on transactional intent AND a REAL price bound.
+        // The old condition also fired on `priced_result_count > 0` — any web result
+        // merely mentioning a price, regardless of intent — which emitted a spurious
+        // `price_verified` (e.g. value 2) on non-transactional queries with no price
+        // token. API_REFERENCE documents price_verified only in the transactional
+        // context ("a real price constraint was verified"), so we require BOTH the
+        // transactional intent subtype AND a verified price bound (lt/gt, already merged
+        // into structured_constraints from the P3 NL-price + spoken-number wiring).
+        // Signal-driven: no query-specific strings, no allow/deny lists.
+        price_verified: if intent.intent == "transactional"
+            && (sc.price_lt.is_some() || sc.price_gt.is_some() || sc.price_min.is_some() || sc.price_max.is_some())
+        { Some(priced_result_count) } else { None },
     };
 
     // Cache for 5 minutes — but never cache empty results
@@ -11169,11 +11510,139 @@ fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
     (after_date, before_date)
 }
 
+/// Translate spoken number words into digits so the downstream price
+/// operators fire. Spelled prices like "four hundred dollars" or "two hundred
+/// fifty dollars" were never matched by the digit-only `price:<` regexes, so
+/// they leaked as junk positive constraints (e.g. +four +hundred +dollars)
+/// and no price bound was ever extracted (P3 regression). Converting the words
+/// to digits up front lets the existing `under <N>` / `below <N>` rules produce
+/// a real `price:<N` constraint, which then feeds ranking + the response
+/// struct. Currency-agnostic: it only rewrites the number, never the currency
+/// word, so dollars/rupees/euros all still flow through.
+///
+/// Handles 0-99 directly and any magnitude via "X hundred/thousand [Y]" and
+/// "X thousand Y hundred [Z]" compositions (e.g. "two hundred fifty" -> "250",
+/// "one thousand two hundred" -> "1200", "nineteen" -> "19").
+///
+/// Only rewrites number-word runs when adjacent to a price marker or currency
+/// word, preserving original text elsewhere (so "nineteen eighty four" remains
+/// unchanged unless it appears in a price context).
+fn normalize_spoken_numbers(query: &str) -> String {
+    let units: &[(&str, u32)] = &[
+        ("zero", 0), ("ten", 10), ("eleven", 11), ("twelve", 12),
+        ("thirteen", 13), ("fourteen", 14), ("fifteen", 15), ("sixteen", 16),
+        ("seventeen", 17), ("eighteen", 18), ("nineteen", 19),
+        ("one", 1), ("two", 2), ("three", 3), ("four", 4), ("five", 5),
+        ("six", 6), ("seven", 7), ("eight", 8), ("nine", 9),
+        ("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50),
+        ("sixty", 60), ("seventy", 70), ("eighty", 80), ("ninety", 90),
+    ];
+    let price_markers = [
+        "under", "below", "less", "cheaper", "max", "maximum", "over", "more",
+        "above", "minimum", "budget", "within", "around", "about", "price",
+    ];
+    let currency_words = [
+        "dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.",
+        "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw",
+        "$", "£", "€", "¥",
+    ];
+
+    let tokens: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        // Look for a "hundred" or "thousand" scalar clause ending on that word.
+        if tok == "hundred" || tok == "thousand" {
+            out.push(tok.clone());
+            i += 1;
+            continue;
+        }
+        let is_unit = units.iter().any(|(w, _)| w == tok);
+        if is_unit {
+            // Check if adjacent to a price marker or currency word
+            let prev_is_price_context = if i > 0 {
+                let prev = &tokens[i - 1];
+                price_markers.contains(&prev.as_str()) || currency_words.contains(&prev.as_str())
+            } else {
+                false
+            };
+
+            // Gather the contiguous run of number words.
+            let mut j = i;
+            let mut run: Vec<String> = Vec::new();
+            while j < tokens.len() {
+                let t = &tokens[j];
+                let is_num = units.iter().any(|(w, _)| w == t) || t == "hundred" || t == "thousand";
+                if !is_num { break; }
+                run.push(t.clone());
+                j += 1;
+            }
+
+            // Check if followed by currency word
+            let next_is_price_context = if j < tokens.len() {
+                currency_words.contains(&tokens[j].as_str())
+            } else {
+                false
+            };
+
+            let in_price_context = prev_is_price_context || next_is_price_context;
+
+            if in_price_context {
+                // Parse the composed value.
+                let mut total: i64 = 0;
+                let mut current: i64 = 0;
+                let mut has_any = false;
+                for w in &run {
+                    if *w == "hundred" {
+                        if current == 0 { current = 1; }
+                        total += current * 100;
+                        current = 0;
+                    } else if *w == "thousand" {
+                        if current == 0 { current = 1; }
+                        total += current * 1000;
+                        current = 0;
+                    } else {
+                        let v = units.iter().find(|(w2, _)| w2 == w).map(|(_, v)| *v).unwrap_or(0);
+                        if v >= 10 && v <= 90 && v % 10 == 0 {
+                            // tens (twenty..ninety) add directly
+                            current += v as i64;
+                        } else {
+                            current += v as i64;
+                        }
+                        has_any = true;
+                    }
+                }
+                let value = if total == 0 && current == 0 { 0 } else { total + current };
+                if has_any {
+                    out.push(value.to_string());
+                    i = j;
+                    continue;
+                }
+            }
+
+            // Not in price context or not parseable; emit original tokens
+            for token in &run {
+                out.push(token.clone());
+            }
+            i = j;
+            continue;
+        }
+        out.push(tok.clone());
+        i += 1;
+    }
+    out.join(" ")
+}
+
 /// Normalize natural-language constraint syntax into canonical operator tokens
 /// (mirror of the intent engine's helper) so the engine query and the gateway's
 /// own constraint parsing honour spoken forms: "under $500" -> price:<500,
 /// "in url:github" -> inurl:github, "on site:reddit" -> site:reddit.
 fn normalize_nl_operators(query: &str) -> String {
+    // Spoken prices ("four hundred dollars") -> digits so the price regexes below
+    // can rewrite them into `price:<N`. Must run before the digit-only rules.
+    let query = normalize_spoken_numbers(query);
     let mut out = query.to_string();
     for (re_src, replacement) in [
         (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
@@ -11823,6 +12292,41 @@ mod constraint_fix_tests {
         assert!(!query_is_contrastive("how to clean a cast iron skillet without soap after cooking eggs"));
     }
 
+    #[test]
+    fn negation_context_no_prefix_false_positives() {
+        // Finding 2 regression: prefix matching on negation markers causes false
+        // positives (e.g., "nonlinear" starting with "no" incorrectly triggers
+        // negation context). Multi-word markers like "free of" and "instead of"
+        // should be matched as token sequences, and single-word markers should use
+        // exact token equality only.
+
+        // "nonlinear" should NOT match the "no" marker
+        assert!(!term_in_negating_context("medication", "nonlinear medication dynamics"),
+            "'nonlinear' must not match 'no' marker");
+
+        // "notable" should NOT match the "not" marker
+        assert!(!term_in_negating_context("pills", "notable pills research"),
+            "'notable' must not match 'not' marker");
+
+        // But genuine negation markers should still work
+        assert!(term_in_negating_context("medication", "no medication needed"),
+            "'no medication' should match");
+        assert!(term_in_negating_context("pills", "without pills"),
+            "'without pills' should match");
+
+        // Multi-word markers should work as token sequences
+        assert!(term_in_negating_context("sugar", "free of sugar"),
+            "'free of sugar' should match multi-word marker");
+        assert!(term_in_negating_context("meat", "instead of meat"),
+            "'instead of meat' should match multi-word marker");
+        assert!(term_in_negating_context("coffee", "rather than coffee"),
+            "'rather than coffee' should match multi-word marker");
+
+        // But partial matches should NOT trigger
+        assert!(!term_in_negating_context("sugar", "free sugar available"),
+            "'free' alone without 'of' should not match");
+    }
+
 
     #[test]
     fn pure_negation_scores_match_down() {
@@ -11831,6 +12335,51 @@ mod constraint_fix_tests {
         c.negative = vec!["trump".to_string()];
         let score = constraint_score("Trump speech", "https://x.com/trump", "trump said things", &c);
         assert!(score < 0.05, "trump-mentioning result should score near-zero for -trump");
+    }
+
+    #[test]
+    fn title_dominance_excludes_negating_context() {
+        // Finding 3 regression: title-dominance check should exclude negative-term
+        // occurrences when they appear in negating context. "Sleep without pills"
+        // should NOT be hard-dropped because "without pills" is FULFILLING the
+        // exclusion (the page is about avoiding pills), not violating it.
+        let mut c = cst();
+        c.negative = vec!["pills".to_string()];
+
+        // "Sleep without pills" should receive a BOOST (not a hard-drop)
+        let score = constraint_score(
+            "Sleep without pills",
+            "https://example.com/sleep",
+            "Natural sleep techniques without pills or medication",
+            &c
+        );
+        assert!(score > 0.0,
+            "'Sleep without pills' should not be hard-dropped (score > 0), got: {}", score);
+        // Should be boosted above 1.0 due to negating context
+        assert!(score > 1.0,
+            "'Sleep without pills' should be boosted (score > 1.0), got: {}", score);
+
+        // But "Best sleeping pills" should be hard-dropped (title dominated, no negating context)
+        let score2 = constraint_score(
+            "Best sleeping pills",
+            "https://example.com/pills",
+            "Top rated sleeping pills for insomnia",
+            &c
+        );
+        assert_eq!(score2, 0.0,
+            "'Best sleeping pills' should be hard-dropped (score = 0), got: {}", score2);
+
+        // "Natural alternatives instead of pills" should also be boosted (not hard-dropped)
+        let score3 = constraint_score(
+            "Natural alternatives instead of pills",
+            "https://example.com/alt",
+            "Try these natural alternatives instead of pills",
+            &c
+        );
+        assert!(score3 > 0.0,
+            "'instead of pills' should not be hard-dropped, got: {}", score3);
+        assert!(score3 > 1.0,
+            "'instead of pills' should be boosted, got: {}", score3);
     }
 
     #[test]

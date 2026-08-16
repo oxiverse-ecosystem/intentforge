@@ -1264,21 +1264,20 @@ Returns all goals sorted by score (descending). Max 50 entries.
 
 **Response** `200 OK`
 
+Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
+
 ```json
-{
-  "entries": [
-    {
-      "goal_id": "goal_0001",
-      "goal": "build a full-stack web app...",
-      "user_name": "Anonymous",
-      "score": 0,
-      "completed_phases": 0,
-      "total_phases": 4,
-      "created_at": "2026-07-29T12:00:00Z"
-    }
-  ],
-  "total_entries": 1
-}
+[
+  {
+    "goal_id": "goal_0001",
+    "goal": "build a full-stack web app...",
+    "user_name": "Anonymous",
+    "score": 0,
+    "completed_phases": 0,
+    "total_phases": 4,
+    "created_at": "2026-07-29T12:00:00Z"
+  }
+]
 ```
 
 ---
@@ -1551,7 +1550,7 @@ curl -s -X POST "http://localhost:4000/goals/quick" \
 #### Leaderboard
 
 ```bash
-curl -s "http://localhost:4000/goals/leaderboard" | jq '.entries[] | {goal, total_phases}'
+curl -s "http://localhost:4000/goals/leaderboard" | jq '.[] | {goal, total_phases}'
 ```
 
 #### Extract phase resources (with jq)

@@ -235,6 +235,126 @@ fn parse_price_range(s: &str) -> Option<(Option<f32>, Option<f32>)> {
     None
 }
 
+/// Translate spoken number words into digits so the downstream price
+/// operators fire. Spelled prices like "four hundred dollars" or "two hundred
+/// fifty dollars" were never matched by the digit-only `price:<` regexes, so
+/// they leaked as junk positive constraints (e.g. +four +hundred +dollars)
+/// and no price bound was ever extracted (P3 regression). Converting the words
+/// to digits up front lets the existing `under <N>` / `below <N>` rules produce
+/// a real `price:<N` constraint, which then feeds extraction. Currency-agnostic:
+/// it only rewrites the number, never the currency word.
+///
+/// Handles 0-99 directly and any magnitude via "X hundred/thousand [Y]" and
+/// "X thousand Y hundred [Z]" compositions (e.g. "two hundred fifty" -> "250",
+/// "one thousand two hundred" -> "1200", "nineteen" -> "19").
+///
+/// Only rewrites number-word runs when adjacent to a price marker or currency
+/// word, preserving original text elsewhere (so "nineteen eighty four" remains
+/// unchanged unless it appears in a price context).
+fn normalize_spoken_numbers(query: &str) -> String {
+    let units: &[(&str, u32)] = &[
+        ("zero", 0), ("ten", 10), ("eleven", 11), ("twelve", 12),
+        ("thirteen", 13), ("fourteen", 14), ("fifteen", 15), ("sixteen", 16),
+        ("seventeen", 17), ("eighteen", 18), ("nineteen", 19),
+        ("one", 1), ("two", 2), ("three", 3), ("four", 4), ("five", 5),
+        ("six", 6), ("seven", 7), ("eight", 8), ("nine", 9),
+        ("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50),
+        ("sixty", 60), ("seventy", 70), ("eighty", 80), ("ninety", 90),
+    ];
+    let price_markers = [
+        "under", "below", "less", "cheaper", "max", "maximum", "over", "more",
+        "above", "minimum", "budget", "within", "around", "about", "price",
+    ];
+    let currency_words = [
+        "dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.",
+        "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw",
+        "$", "£", "€", "¥",
+    ];
+
+    let tokens: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        if tok == "hundred" || tok == "thousand" {
+            out.push(tok.clone());
+            i += 1;
+            continue;
+        }
+        let is_unit = units.iter().any(|(w, _)| w == tok);
+        if is_unit {
+            // Check if adjacent to a price marker or currency word
+            let prev_is_price_context = if i > 0 {
+                let prev = &tokens[i - 1];
+                price_markers.contains(&prev.as_str()) || currency_words.contains(&prev.as_str())
+            } else {
+                false
+            };
+
+            let mut j = i;
+            let mut run: Vec<String> = Vec::new();
+            while j < tokens.len() {
+                let t = &tokens[j];
+                let is_num = units.iter().any(|(w, _)| w == t) || t == "hundred" || t == "thousand";
+                if !is_num { break; }
+                run.push(t.clone());
+                j += 1;
+            }
+
+            // Check if followed by currency word
+            let next_is_price_context = if j < tokens.len() {
+                currency_words.contains(&tokens[j].as_str())
+            } else {
+                false
+            };
+
+            let in_price_context = prev_is_price_context || next_is_price_context;
+
+            if in_price_context {
+                let mut total: i64 = 0;
+                let mut current: i64 = 0;
+                let mut has_any = false;
+                for w in &run {
+                    if *w == "hundred" {
+                        if current == 0 { current = 1; }
+                        total += current * 100;
+                        current = 0;
+                    } else if *w == "thousand" {
+                        if current == 0 { current = 1; }
+                        total += current * 1000;
+                        current = 0;
+                    } else {
+                        let v = units.iter().find(|(w2, _)| w2 == w).map(|(_, v)| *v).unwrap_or(0);
+                        if v >= 10 && v <= 90 && v % 10 == 0 {
+                            current += v as i64;
+                        } else {
+                            current += v as i64;
+                        }
+                        has_any = true;
+                    }
+                }
+                let value = if total == 0 && current == 0 { 0 } else { total + current };
+                if has_any {
+                    out.push(value.to_string());
+                    i = j;
+                    continue;
+                }
+            }
+
+            // Not in price context or not parseable; emit original tokens
+            for token in &run {
+                out.push(token.clone());
+            }
+            i = j;
+            continue;
+        }
+        out.push(tok.clone());
+        i += 1;
+    }
+    out.join(" ")
+}
+
 /// Normalize natural-language constraint syntax into canonical operator tokens
 /// so downstream extraction is surface-form agnostic. Pure, order-independent
 /// regex-free string rewriting:
@@ -246,6 +366,9 @@ fn parse_price_range(s: &str) -> Option<(Option<f32>, Option<f32>)> {
 /// untouched. Only whitespace-delimited surface forms are rewritten; this never
 /// touches quoted phrases (they are stripped before this runs).
 fn normalize_nl_operators(query: &str) -> String {
+    // Spoken prices ("four hundred dollars") -> digits so the price regexes below
+    // can rewrite them into `price:<N`. Must run before the digit-only rules.
+    let query = normalize_spoken_numbers(query);
     let mut out = query.to_string();
 
     // Price: upper-bound forms.
@@ -542,7 +665,7 @@ fn extract_constraints(query: &str) -> Constraints {
             // Preserve phrases if possible for negatives.
             // Phase 5: negatives use max_words=1 (head-noun only) so
             // "without prior experience" → "prior" not "prior experience".
-            let term = extract_constraint_term(remaining, 1);
+            let term = extract_negation_term(remaining);
             if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
                 negative.push(term);
             }
@@ -577,13 +700,14 @@ fn extract_constraints(query: &str) -> Constraints {
                     }
                 }
                 let remaining = &q[after_marker..];
-                // Extract multiple terms connected by "and"
-                // Phase 5: negatives max_words=1 (head-noun) — "without node and react" → ["node","react"].
-                let terms = extract_conjunctive_terms(remaining, 1);
-                for term in terms {
-                    if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
-                        negative.push(term);
-                    }
+                // Extract the negation OBJECT from the WHOLE clause at once
+                // (skips leading light verbs like "owned by"), rather than
+                // splitting into individual words first — splitting loses the
+                // multi-word object ("big advertising company" collapsed to the
+                // bare first word "controlled").
+                let term = extract_negation_term(remaining);
+                if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
+                    negative.push(term);
                 }
             }
             search_from = after_marker;
@@ -651,8 +775,8 @@ fn extract_constraints(query: &str) -> Constraints {
     let mut alt_terms: Vec<String> = Vec::new();
     for marker in &alt_neg_start_markers {
         if q_lower.starts_with(marker) {
-            // Phase 5: negatives head-noun only (max_words=1)
-            let term = extract_constraint_term(&q[marker.len()..], 1);
+            // Capture the negation OBJECT (skips leading light verbs).
+            let term = extract_negation_term(&q[marker.len()..]);
             if !term.is_empty() && term.len() > 1 {
                 alt_terms.push(term);
             }
@@ -664,8 +788,8 @@ fn extract_constraints(query: &str) -> Constraints {
         while let Some(pos) = q_lower[sf..].find(marker) {
             let ap = sf + pos + marker.len();
             if ap < q_lower.len() {
-                // Phase 5: negatives head-noun only (max_words=1)
-                let term = extract_constraint_term(&q[ap..], 1);
+                // Capture the negation OBJECT (skips leading light verbs).
+                let term = extract_negation_term(&q[ap..]);
                 if !term.is_empty() && term.len() > 1 {
                     alt_terms.push(term);
                 }
@@ -829,10 +953,10 @@ fn extract_constraints(query: &str) -> Constraints {
                 // "no heavy macros" → "macros" (not "heavy macros")
                 let term_start = seg_lower.find(' ').map(|p| p + 1).unwrap_or(0);
                 if term_start < seg_trimmed.len() {
+                    // Extract the negation OBJECT (skips leading light verbs like
+                    // "controlled by") rather than the bare first word.
                     let rest = &seg_trimmed[term_start..].trim();
-                    let term = rest.split_whitespace().next().unwrap_or("")
-                        .trim_matches(|c: char| c == ',' || c == '.' || c == ';')
-                        .to_string();
+                    let term = extract_negation_term(rest);
                     if !term.is_empty() && term.len() > 1 {
                         negative.push(term);
                     }
@@ -1162,6 +1286,77 @@ fn extract_conjunctive_terms(text: &str, max_words: usize) -> Vec<String> {
     } else {
         vec![extract_constraint_term(&strip_neg(phrase), max_words)]
     }
+}
+
+/// Extract the OBJECT of a natural-language negation, not the head word.
+/// A negation like "not owned by a big tech company" or "without a phone number"
+/// should capture the thing being excluded ("big tech company", "phone number"),
+/// not the leading verb/preposition ("owned", "a"). Head-noun-only extraction
+/// (extract_constraint_term(_, 1)) historically grabbed "owned" for the first
+/// example, which is a useless exclusion token.
+///
+/// Strategy (general, signal-driven — no query-specific strings):
+/// 1. Strip a leading light verb / copula / article / preposition run
+///    ("is", "are", "was", "owned", "made", "built", "by", "a", "an", "the",
+///    "of", "in", "on", "with", "to", "for", "that", "which", "who" …).
+/// 2. Take the remaining noun phrase (up to 3 words, stopping at a hard stop
+///    word / conjunction) as the exclusion object.
+/// This turns "not owned by a big tech company" → "big tech company",
+/// "without a phone number" → "phone number", "not vim" → "vim" (no leading
+/// verb to strip), "not django" → "django".
+fn extract_negation_term(text: &str) -> String {
+    // Light-verb / copula / article / preposition run to skip at the start of a
+    // negated clause. These are function words that precede the actual excluded
+    // entity. Order-independent: we keep stripping while the front token matches.
+    let lead: &[&str] = &[
+        "is", "are", "was", "were", "be", "been", "being",
+        "owned", "made", "built", "done", "created", "produced", "run", "operated",
+        "controlled", "managed", "developed", "designed", "provided", "offered",
+        "supported", "backed", "funded", "maintained", "hosted", "powered",
+        "manufactured", "assembled", "built", "run", "operated", "made", "owned",
+        "too", "very", "so", "really", "quite", "rather",
+        "by", "a", "an", "the", "of", "in", "on", "with", "to", "for", "from",
+        "that", "which", "who", "this", "these", "those",
+    ];
+    let mut tokens: Vec<String> = text
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    // Strip leading function-word run.
+    while let Some(first) = tokens.first() {
+        if lead.contains(&first.as_str()) {
+            tokens.remove(0);
+        } else {
+            break;
+        }
+    }
+    if tokens.is_empty() {
+        return String::new();
+    }
+    // Hard stop words that terminate the excluded phrase.
+    let stop: &[&str] = &[
+        "and", "or", "but", "the", "a", "an", "is", "are", "in", "on",
+        "for", "with", "from", "to", "of", "at", "by", "as", "via",
+        "under", "over", "about", "into", "through", "between", "after", "before",
+        "during", "since", "until", "above", "below", "per", "up", "down", "out",
+        "off", "that", "which", "who", "this", "these", "those",
+        "not", "no", "without", "except", "excluding", "minus", "besides",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for t in &tokens {
+        if stop.contains(&t.as_str()) && !out.is_empty() {
+            break;
+        }
+        if stop.contains(&t.as_str()) {
+            break;
+        }
+        out.push(t.clone());
+        if out.len() >= 3 {
+            break;
+        }
+    }
+    out.join(" ")
 }
 
 /// Extract a constraint term from the text after a marker.
