@@ -4068,6 +4068,22 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
     // exclusions are gated on this flag + entity recognition (see is_real_exclusion).
     let query_contrastive = query_is_contrastive(q_orig);
 
+    // Operator tokens (site:, filetype:, intitle:, …) are explicit search
+    // operators, never part of a topical exclusion. They must be skipped when
+    // greedily building a compound negative so a phrase like
+    // "not django site:github.com" does not yield the phantom exclusion
+    // "django sitegithubcom" (the `:` is stripped to "sitegithubcom" and swept
+    // into the negative). The site itself is captured elsewhere as a `sites`
+    // constraint. No per-query literals / denylists — pure operator-prefix check.
+    const OPERATOR_PREFIXES: &[&str] = &[
+        "site:", "filetype:", "intitle:", "inurl:", "intext:",
+        "related:", "price:", "lang:", "after:", "before:",
+    ];
+    let is_operator_word = |w: &str| -> bool {
+        let wl = w.to_lowercase();
+        OPERATOR_PREFIXES.iter().any(|p| wl.starts_with(p))
+    };
+
     let neg_markers = ["not", "no", "without", "except", "excluding", "minus"];
     let stopwords = [
         "from", "a", "an", "the", "of", "to", "in", "on", "at", "for", "with", "by",
@@ -4153,6 +4169,14 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                 // "computer science" pages instead of letting "science" tutorials survive.
                 let first = words[j];
                 let first_is_neg = neg_markers.contains(&first) || first.starts_with('-');
+                // An operator token (site:, filetype:, …) as the FIRST word after a
+                // negation marker is not a topical exclusion — skip it so we never
+                // emit "sitegithubcom" as a negative. The operator itself is still
+                // captured as a site:/filetype: constraint by the scanners elsewhere.
+                if is_operator_word(first) {
+                    i = j;
+                    continue;
+                }
                 const GENERIC_NEG: &[&str] = &[
                     "how", "what", "why", "when", "where", "who", "which", "that", "this",
                     "these", "those", "the", "a", "an", "and", "or", "but", "use", "using",
@@ -4205,6 +4229,14 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         let w = words[k];
                         if neg_markers.contains(&w) || w.starts_with('-') {
                             break; // next exclusion starts here
+                        }
+                        // An operator token (site:, filetype:, …) must never be swept
+                        // into a negative exclusion. Finalise the current clause and
+                        // stop consuming — e.g. "not django site:github.com" → "django"
+                        // only (previously emitted the phantom "django sitegithubcom").
+                        if is_operator_word(w) {
+                            record_and_reset(&mut compound, &mut terms, &mut dropped);
+                            break;
                         }
                         // List connectors between exclusion targets: the current
                         // target is finalised, then we start collecting the next.
@@ -12162,6 +12194,40 @@ mod constraint_fix_tests {
                 dropped
             );
         }
+    }
+
+    #[test]
+    fn negation_with_site_operator_no_phantom_negative() {
+        // D3 phantom-negation regression: a `not <X> site:<Y>` clause must NOT
+        // emit the bogus compound exclusion "X siteY" (colon stripped then swept
+        // into the negative). The bare noun is the only exclusion; the site is a
+        // positive `sites` filter handled elsewhere. Pure operator-token skip —
+        // no per-query literals / denylists.
+        for q in [
+            "python web framework not django site:github.com",
+            "best privacy browser not brave site:reddit.com",
+            "rust web server without actix site:reddit.com",
+            "learn spanish not duolingo site:reddit.com",
+        ] {
+            let (kept, dropped) = extract_query_negative_terms_with_dropped(q);
+            let joined = kept.join(" ");
+            assert!(
+                !kept.iter().any(|t| t.contains("site")),
+                "D3: no phantom 'X siteY' negative for '{}', kept={:?}",
+                q,
+                kept
+            );
+            assert!(
+                !joined.contains("githubcom") && !joined.contains("redditcom"),
+                "D3: operator host must not be swept into negative for '{}', kept={:?}",
+                q,
+                kept
+            );
+        }
+        // Exact assertion for the canonical repro.
+        let (kept, _dropped) =
+            extract_query_negative_terms_with_dropped("python web framework not django site:github.com");
+        assert_eq!(kept, vec!["django".to_string()], "D3: 'not django site:github.com' → ['django'] only");
     }
 
     #[test]
