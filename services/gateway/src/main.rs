@@ -4224,10 +4224,22 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         if wc.is_empty() {
                             break;
                         }
-                        compound.push(wc);
+                        // A single exclusion target is a SHORT phrase (an entity or
+                        // a 2-3 word product name). Once we've collected a target
+                        // (compound non-empty) and the next word is a high-frequency
+                        // SUBJECT term (part of the original query topic), the
+                        // current exclusion is complete — finalise it and stop.
+                        // This prevents "without django or flask" from swallowing
+                        // "flask python web frameworks" as one giant (gated-out) phrase.
+                        if !compound.is_empty() && subject_terms.contains(&wc.as_str()) {
+                            record_and_reset(&mut compound, &mut terms, &mut dropped);
+                            break;
+                        }
                         // A trailing comma on the word (e.g. "django,") also
                         // separates exclusion targets: "without django, flask".
-                        if w != wc && (w.ends_with(',') || w.ends_with(';')) {
+                        let trailing_sep = w != wc && (w.ends_with(',') || w.ends_with(';'));
+                        compound.push(wc);
+                        if trailing_sep {
                             record_and_reset(&mut compound, &mut terms, &mut dropped);
                         }
                         k += 1;
