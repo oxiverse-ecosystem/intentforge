@@ -4044,6 +4044,24 @@ fn query_is_contrastive(q_orig: &str) -> bool {
 fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<String>) {
     let q_lower = q_orig.to_lowercase();
     let words: Vec<&str> = q_lower.split_whitespace().collect();
+    // Subject terms = every content word in the query that is NOT a negation
+    // marker and NOT a low-signal stopword. When building a compound exclusion we
+    // stop the current target (and finalise it) as soon as one of these subject
+    // terms reappears — that word belongs to the main query topic, not to the
+    // thing being excluded (e.g. "...without django or flask python web frameworks"
+    // must not swallow "python web frameworks" into the `flask` exclusion).
+    let subject_terms: std::collections::HashSet<&str> = words
+        .iter()
+        .copied()
+        .filter(|w| {
+            !["not", "no", "without", "except", "excluding", "minus", "other",
+              "rather", "instead", "than", "to", "of", "a", "an", "the", "from",
+              "in", "on", "at", "for", "with", "by", "about", "any", "some",
+              "using", "having", "is", "are", "was", "were", "be", "been",
+              "being", "do", "does", "did", "have", "has", "had", "and", "or"]
+                .contains(w)
+        })
+        .collect();
     let mut terms: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
     // Computed once: whether the query is in contrastive/exclusion framing. Real
