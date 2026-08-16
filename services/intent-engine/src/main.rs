@@ -628,12 +628,17 @@ fn extract_constraints(query: &str) -> Constraints {
     for marker in &negative_start_markers {
         if q_lower.starts_with(marker) {
             let remaining = &q[marker.len()..];
-            // Preserve phrases if possible for negatives.
-            // Phase 5: negatives use max_words=1 (head-noun only) so
-            // "without prior experience" → "prior" not "prior experience".
-            let term = extract_negation_term(remaining);
-            if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
-                negative.push(term);
+            // Split the negated clause on " and "/" or " so a list like
+            // "without react or angular" yields BOTH exclusions. Using
+            // extract_conjunctive_terms (not the single-object
+            // extract_negation_term) is what makes "without A or B" / "without
+            // A and B" collect every operand. Negatives use max_words=1
+            // (head-noun only) so "without prior experience" → "prior" not
+            // "prior experience". General + signal-driven; no per-query literals.
+            for term in extract_conjunctive_terms(remaining, 1) {
+                if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
+                    negative.push(term);
+                }
             }
             break; // only one start marker can match
         }
@@ -666,14 +671,17 @@ fn extract_constraints(query: &str) -> Constraints {
                     }
                 }
                 let remaining = &q[after_marker..];
-                // Extract the negation OBJECT from the WHOLE clause at once
-                // (skips leading light verbs like "owned by"), rather than
-                // splitting into individual words first — splitting loses the
-                // multi-word object ("big advertising company" collapsed to the
-                // bare first word "controlled").
-                let term = extract_negation_term(remaining);
-                if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
-                    negative.push(term);
+                // Split the negated clause on " and "/" or " so a list like
+                // "without react or angular" yields BOTH exclusions. Using
+                // extract_conjunctive_terms (not the single-object
+                // extract_negation_term) is what makes "without A or B" /
+                // "without A and B" / "not X or Y" collect every operand.
+                // Negatives use max_words=1 (head-noun only). General +
+                // signal-driven; no per-query literals.
+                for term in extract_conjunctive_terms(remaining, 1) {
+                    if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
+                        negative.push(term);
+                    }
                 }
             }
             search_from = after_marker;
