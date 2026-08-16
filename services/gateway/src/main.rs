@@ -2358,6 +2358,22 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     let lower_markers = ["over", "more than", "above", "minimum", "at least", "from"];
     let amount_pat = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
     let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.", "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw"];
+    // Distance units: a number followed by one of these is a RANGE/DISTANCE
+    // bound (e.g. "within 300 kilometers", "up to 50 miles"), NOT a price.
+    // Without this guard, "within 300 kilometers" was mis-read as price:<300
+    // and the spurious price bound dropped relevant results (round 2026-08-15).
+    // General, unit-aware — no per-query literals.
+    let distance_units = [
+        "km", "kms", "kilometer", "kilometers", "kilometre", "kilometres",
+        "mile", "miles", "mi", "meter", "meters", "metre", "metres",
+        "foot", "feet", "ft", "yard", "yards", "yd",
+    ];
+    let is_distance_bound = |rest_after_num: &str| -> bool {
+        distance_units.iter().any(|u| {
+            let pat = format!(r"(?i)(?:^|[^a-z])\s*{}\b", regex::escape(u));
+            regex::Regex::new(&pat).map(|re| re.is_match(rest_after_num)).unwrap_or(false)
+        })
+    };
 
     // Pattern A: upper-marker then number (+ optional currency word)
     for marker in upper_markers {
@@ -2367,6 +2383,12 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
+                        // Distance-bound guard: "within 300 kilometers" is a
+                        // range, not a price — skip this marker (let a later
+                        // price marker, if any, match instead).
+                        if is_distance_bound(rest) {
+                            continue;
+                        }
                         let currency = currency_words.iter().find(|c| rest.contains(*c))
                             .map(|c| normalize_currency_str(c)).unwrap_or_else(|| "usd".to_string());
                         return Some((v, currency));
