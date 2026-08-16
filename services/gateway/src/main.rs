@@ -11370,7 +11370,13 @@ fn normalize_spoken_numbers(query: &str) -> String {
                     saw_scale = true;
                 } else if *w == "thousand" {
                     if current == 0 { current = 1; }
-                    total += current * 1000;
+                    // If total > 0 (e.g., "one hundred" yielded 100), multiply it by 1000
+                    // instead of adding current*1000, to handle "one hundred thousand" correctly.
+                    if total > 0 {
+                        total = total * 1000 + current * 1000;
+                    } else {
+                        total += current * 1000;
+                    }
                     current = 0;
                     saw_scale = true;
                 } else {
@@ -12189,6 +12195,24 @@ mod constraint_fix_tests {
         assert!(boost > 0.0, "inurl:-matching result should receive a positive boost");
         let boost_none = constraint_boost("Rust", "post", "https://example.com/x", &c2);
         assert_eq!(boost_none, 0.0, "non-matching result should get no intitle/inurl/intext boost");
+    }
+
+    #[test]
+    fn normalize_spoken_numbers_handles_hundred_thousand() {
+        // Finding 5 regression: nested number-scale words like "one hundred thousand"
+        // must parse correctly to 100000, not 100 or 1100.
+        let q1 = preprocess_searxng_query("one hundred thousand dollars");
+        assert!(q1.contains("100000"), "one hundred thousand -> 100000, got: '{}'", q1);
+
+        let q2 = preprocess_searxng_query("two hundred thousand");
+        assert!(q2.contains("200000"), "two hundred thousand -> 200000, got: '{}'", q2);
+
+        // Also verify simpler cases still work
+        let q3 = preprocess_searxng_query("five thousand");
+        assert!(q3.contains("5000"), "five thousand -> 5000, got: '{}'", q3);
+
+        let q4 = preprocess_searxng_query("three hundred");
+        assert!(q4.contains("300"), "three hundred -> 300, got: '{}'", q4);
     }
 }
 
