@@ -2402,7 +2402,14 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     if let Some(caps) = re_b.captures(&lower) {
         if let (Some(cur), Some(num)) = (caps.get(1), caps.get(2)) {
             if let Ok(v) = num.as_str().replace(',', "").parse::<f32>() {
-                return Some((v, normalize_currency_str(cur.as_str())));
+                // Distance-bound guard (see Pattern A): a currency-symbol amount
+                // followed by a distance unit is not a price.
+                let after_num = &lower[caps.get(2).unwrap().end()..];
+                if is_distance_bound(after_num) {
+                    // fall through; do not return a price bound
+                } else {
+                    return Some((v, normalize_currency_str(cur.as_str())));
+                }
             }
         }
     }
@@ -2411,7 +2418,14 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     if let Some(caps) = re_c.captures(&lower) {
         if let (Some(num), Some(cur)) = (caps.get(1), caps.get(2)) {
             if let Ok(v) = num.as_str().replace(',', "").parse::<f32>() {
-                return Some((v, normalize_currency_str(cur.as_str())));
+                // Distance-bound guard (see Pattern A): number + currency word +
+                // marker, where a distance unit follows, is a range not a price.
+                let after_num = &lower[caps.get(1).unwrap().end()..];
+                if is_distance_bound(after_num) {
+                    // fall through; do not return a price bound
+                } else {
+                    return Some((v, normalize_currency_str(cur.as_str())));
+                }
             }
         }
     }
@@ -4141,10 +4155,46 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                     // generic function word.
                     let mut compound: Vec<String> = vec![first_clean.clone()];
                     let mut k = j + 1;
+                    // Records the current compound as a (possibly dropped) exclusion,
+                    // then resets it so the NEXT exclusion target can be collected.
+                    // Used when we hit a list connector ("or"/"and"/",") inside an
+                    // exclusion frame — e.g. "without django or flask" or "without
+                    // django, flask" must exclude BOTH targets, not just the first.
+                    // (Before this fix only `django` was excluded and a Flask
+                    // tutorial ranked #1 for "python web frameworks without django
+                    // or flask".)
+                    let mut record_and_reset = |compound: &mut Vec<String>,
+                                                terms: &mut Vec<String>,
+                                                dropped: &mut Vec<String>| {
+                        if compound.is_empty() {
+                            return;
+                        }
+                        let joined = compound.join(" ");
+                        if is_real_exclusion(&joined, q_orig, query_contrastive)
+                            && !terms.contains(&joined)
+                        {
+                            terms.push(joined);
+                        } else if !is_manner_phrase(&joined)
+                            && !is_manner_frame(q_orig, &joined)
+                        {
+                            if !dropped.contains(&joined) {
+                                dropped.push(joined);
+                            }
+                        }
+                        compound.clear();
+                    };
                     while k < words.len() {
                         let w = words[k];
                         if neg_markers.contains(&w) || w.starts_with('-') {
                             break; // next exclusion starts here
+                        }
+                        // List connectors between exclusion targets: the current
+                        // target is finalised, then we start collecting the next.
+                        let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
+                        if bare == "or" || bare == "and" {
+                            record_and_reset(&mut compound, &mut terms, &mut dropped);
+                            k += 1;
+                            continue;
                         }
                         if stopwords.contains(&w) {
                             break; // "a", "the", "of" — stop the compound
@@ -4157,30 +4207,19 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                             break;
                         }
                         compound.push(wc);
+                        // A trailing comma on the word (e.g. "django,") also
+                        // separates exclusion targets: "without django, flask".
+                        if w != wc && (w.ends_with(',') || w.ends_with(';')) {
+                            record_and_reset(&mut compound, &mut terms, &mut dropped);
+                        }
                         k += 1;
                     }
-                    let joined = compound.join(" ");
-                    // Gate: only keep the compound as a real exclusion when it is in
-                    // contrastive framing or names a recognized entity. Manner
-                    // qualifiers ("without soap", "with no music background") are
-                    // dropped so they don't penalize the user's own topical words.
-                    if is_real_exclusion(&joined, q_orig, query_contrastive)
-                        && !terms.contains(&joined)
-                    {
-                        terms.push(joined);
-                    } else if !is_manner_phrase(&joined) && !is_manner_frame(q_orig, &joined) {
-                        // D3 transparency: a genuine candidate exclusion that the
-                        // gate declined (not a recognized entity, not contrastive
-                        // framing) AND is not a manner qualifier. It was silently
-                        // dropped before (regression); now we record it so it can
-                        // be surfaced in `ignored_constraints`. Never includes
-                        // manner qualifiers ("without soap"), which stay excluded.
-                        if !dropped.contains(&joined) {
-                            dropped.push(joined);
-                        }
-                    }
-                    // Advance past the consumed compound so we don't re-scan it.
-                    i = j + compound.len();
+                    // Finalise the last (or only) target.
+                    record_and_reset(&mut compound, &mut terms, &mut dropped);
+                    // Advance past every word we consumed (first_clean at j plus all
+                    // extensions) so the outer loop doesn't re-scan them. `k` already
+                    // points at the first word we did NOT consume (or words.len()).
+                    i = k;
                     continue;
                 }
             }
