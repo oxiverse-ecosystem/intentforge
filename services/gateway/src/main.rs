@@ -6381,7 +6381,40 @@ fn merge_local_and_web(
         } else {
             1.0
         };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult;
+        // Cross-lingual relevance guard (D2, this round): a result written in a
+        // non-Latin script (CJK, Cyrillic, Devanagari, Arabic, …) is almost never
+        // the answer to an English / Roman-script query, yet upstream engines
+        // returned unrelated zhihu (Chinese) and German pages that outranked the
+        // genuinely relevant English article ("privacy browsers … alternative to
+        // chrome"). We dampen results whose TEXT is predominantly non-Latin when
+        // the QUERY is predominantly Latin-script. Signal-driven: it counts
+        // character scripts, no language tables, no per-language denylist, no
+        // query-specific literals. A Roman-script query vs a Roman-script result
+        // (e.g. English, a Romanised Hindi place name, "Tokyo") is unaffected; two
+        // non-Latin sides are both left alone (we cannot judge them by script).
+        let lang_mismatch_mult = {
+            let q_ascii_ratio = {
+                let chars: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
+                if chars.is_empty() { 1.0 } else {
+                    let non = chars.iter().filter(|c| !c.is_ascii()).count();
+                    (chars.len() - non) as f32 / chars.len() as f32
+                }
+            };
+            let res_text = format!("{} {}", r.title, r.content);
+            let tchars: Vec<char> = res_text.chars().filter(|c| !c.is_whitespace()).collect();
+            let res_ascii_ratio = if tchars.is_empty() { 1.0 } else {
+                let non = tchars.iter().filter(|c| !c.is_ascii()).count();
+                (tchars.len() - non) as f32 / tchars.len() as f32
+            };
+            // Query is Latin-script dominant AND result is non-Latin-script dominant.
+            if q_ascii_ratio >= 0.85 && res_ascii_ratio < 0.50 {
+                0.25 // dampen hard but keep present (fail-soft, not a hard drop)
+            } else {
+                1.0
+            }
+        };
+
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult;
         // Capture this result's relevance for the post-loop adaptive-floor pass.
         relevance_vec.push(relevance);
     }
