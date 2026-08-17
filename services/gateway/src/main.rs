@@ -2145,7 +2145,20 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         // Cap at 4 words: NL negations like "big advertising company" legitimately
         // span 3 words once the leading verb/preposition is stripped
         // (extract_negation_term). The prior <=2 cap silently dropped them.
-        if clean_n.split_whitespace().count() <= 4 && !clean_n.is_empty() {
+        // DA/DB fix (2026-08-17): also drop subjective-quality adjectives and
+        // grammar-noise terms that the intent engine sometimes emits as
+        // `Exclusion` entities or in its direct `negative` array next to a
+        // negation marker ("not too spicy and good for kids" -> "good"/"too").
+        // These are never real search exclusions; keeping them pollutes the
+        // `constraints` field and risks a phantom hard-drop. A genuine topical
+        // exclusion (brand/place/noun) is never in either noise set. This is the
+        // single chokepoint every negative passes through, so it covers both the
+        // engine-direct and engine-Exclusion-entity merge paths.
+        if clean_n.split_whitespace().count() <= 4
+            && !clean_n.is_empty()
+            && !is_exclusion_grammar_noise(&clean_n)
+            && !is_subjective_quality_term(&clean_n)
+        {
             if !negative.contains(&clean_n) {
                 negative.push(clean_n);
             }
