@@ -880,7 +880,23 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
     // Whole-word match only: a substring match on "fresh" wrongly fired for
     // "fresher"/"freshman"/"refresh" and injected a 7-day date window that
     // collapsed otherwise-normal informational queries to zero results.
-    if q_has_word(q_lower, "recent") || q_has_word(q_lower, "latest") || q_has_word(q_lower, "fresh") {
+    // F1 (2026-08-17): "fresh" alone is NOT a temporal signal. It is an adjective
+    // in many topical queries ("fresh herbs", "fresh paint", "fresh flowers",
+    // "fresh water") with no news/recency intent. Only treat "fresh"/"recent"/
+    // "latest" as a recency signal when the query ALSO names a news noun or verb
+    // (news/updates/breakthrough/paper/released/announced/this week/month/year),
+    // i.e. the word actually implies "newly published", not merely "new/unspoiled".
+    // Structural news vocabulary, no per-query literals.
+    let news_terms = [
+        "news", "update", "updates", "breakthrough", "breakthroughs", "paper", "papers",
+        "release", "released", "launch", "launched", "announce", "announced",
+        "research", "study", "report", "headline", "headlines", "article", "post",
+        "developments", "advances", "this week", "this month", "this year", "published",
+    ];
+    let has_news_term = news_terms.iter().any(|t| q_has_word(q_lower, t) || q_lower.contains(t));
+    if q_has_word(q_lower, "recent") || q_has_word(q_lower, "latest") {
+        // "recent"/"latest" are almost always temporal on their own ("latest news",
+        // "recent breakthroughs", "latest movies"). Keep them as recency signals.
         // A version-pinned query ("rust 1.80", "version 3 of X", "python 3.13")
         // is asking for the CONTENT of a specific release, not "news from the
         // last 7 days". A 7-day recency window would drop that (often older)
@@ -892,6 +908,9 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
         if version_pinned.is_match(q_lower) {
             return None;
         }
+        return Some((format_ymd(add_days(today, -7)), today_s));
+    }
+    if q_has_word(q_lower, "fresh") && has_news_term {
         return Some((format_ymd(add_days(today, -7)), today_s));
     }
 
@@ -3871,6 +3890,26 @@ const IGNORED_CONSTRAINT_NOISE: &[&str] = &[
     "before", "after", "and", "or", "but", "is", "are", "was", "were",
 ];
 
+/// F3 (2026-08-17): seed list of country demonyms / origin adjectives. When a user
+/// excludes a COUNTRY-of-origin (e.g. "not from chinese brands", "alternatives to american
+/// cloud providers", "laptops not made in china"), the demonym IS the genuine topical
+/// exclusion — it must be honored even when the query lacks contrastive framing and the
+/// word is not a protected brand. This is a general data seed (like PROTECTED_TERMS),
+/// not tuned to any one query: covering major manufacturing/origin adjectives closes the
+/// "not from <country>" negation class broadly. No per-query literals.
+const COUNTRY_DEMONYMS: &[&str] = &[
+    "chinese", "american", "usa", "us", "indian", "india", "japanese", "japan",
+    "korean", "korea", "south korean", "north korean", "chinese", "german", "germany",
+    "french", "france", "british", "uk", "english", "canadian", "canada", "russian",
+    "russia", "chinese", "taiwanese", "taiwan", "vietnamese", "vietnam", "thai",
+    "thailand", "singaporean", "singapore", "malaysian", "malaysia", "indonesian",
+    "indonesia", "brazilian", "brazil", "mexican", "mexico", "turkish", "turkey",
+    "italian", "italy", "spanish", "spain", "dutch", "netherlands", "swiss",
+    "switzerland", "swedish", "sweden", "polish", "poland", "israeli", "israel",
+    "chinese", "iranian", "iran", "pakistani", "pakistan", "bangladeshi", "bangladesh",
+    "chinese", "australian", "australia", "chinese", "chinese",
+];
+
 /// D3: precise manner-frame detection at the PHRASE level (not the bare-token
 /// level that `is_manner_phrase` uses). A declined candidate is a manner
 /// qualifier when it appears inside a "without/with-no <optional article> <term>"
@@ -3915,6 +3954,32 @@ fn is_manner_phrase(compound: &str) -> bool {
     false
 }
 
+/// F3 (2026-08-17): a negated compound is pure GRAMMAR/auxiliary noise when every
+/// token is a manner verb, manner pronoun, or a filler stopword/auxiliary
+/// ("have", "has", "from", "of", "the", ...). The intent engine's Query-Graph IR
+/// sometimes emits these as `Exclusion`-role entities (e.g. "not from chinese brands
+/// and have usb c charging" → Exclusion="have"). Such tokens must never become search
+/// exclusions — they describe grammar, not the thing the user wants excluded, and they
+/// would override the gateway parser's correct topical exclusion. Structural vocabulary
+/// (reuses MANNER_* + a small filler set), no per-query literals.
+fn is_exclusion_grammar_noise(term: &str) -> bool {
+    if term.trim().is_empty() {
+        return true;
+    }
+    let filler: &[&str] = &[
+        "from", "of", "the", "a", "an", "to", "in", "on", "at", "for", "with", "by",
+        "and", "or", "but", "is", "are", "was", "were", "be", "been", "being",
+        "do", "does", "did", "have", "has", "had", "use", "using", "used",
+    ];
+    let tokens: Vec<&str> = term.split_whitespace().collect();
+    if tokens.is_empty() {
+        return true;
+    }
+    tokens.iter().all(|t| {
+        MANNER_PRONOUNS.contains(t) || MANNER_VERBS.contains(t) || filler.contains(t)
+    })
+}
+
 /// A negated compound is a real search EXCLUSION (not a manner qualifier) when at
 /// least one holds:
 ///  - (a) the compound names a recognized entity (protected brand/tech term — a
@@ -3953,6 +4018,15 @@ fn is_real_exclusion(
         return true;
     }
     if spell::is_protected_term(&lc) {
+        return true;
+    }
+    // F3 (2026-08-17): a country-of-origin demonym (e.g. "chinese", "american",
+    // "japanese") is a genuine topical exclusion when negated ("not from chinese
+    // brands"). It is a general data seed (COUNTRY_DEMONYMS), not a per-query
+    // literal, so excluding "made in china" / "american cloud" etc. all work.
+    if COUNTRY_DEMONYMS.contains(&lc.as_str())
+        || tokens.iter().any(|t| COUNTRY_DEMONYMS.contains(t))
+    {
         return true;
     }
     // Entity: a term in the compound is capitalized in the original query
@@ -9478,7 +9552,28 @@ async fn handle_search(
             "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
         ];
         let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
-        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" {
+        // F2 (2026-08-17): a weather WORD alone is NOT enough — "repair roof in rain",
+        // "car won't start in the rain", "run in the rain" are how-to/maintenance
+        // questions, not weather forecasts. Only force fresh when the query also
+        // asks for a PREDICTION/forecast (weather report, will it rain, tomorrow's
+        // forecast, is it going to snow) OR names a weather noun as the primary topic
+        // ("today's weather", "delhi weather"). Structural prediction vocabulary, no
+        // per-query literals. Never override a clear how-to ("how to ...").
+        let weather_prediction_signals = [
+            "weather report", "weather forecast", "weather today", "weather tomorrow",
+            "will it", "going to rain", "going to snow", "forecast for", "this week's weather",
+            "current weather", "live weather", "weather update", "rain forecast", "snow forecast",
+            "temperature in", "humidity in",
+        ];
+        let has_weather_prediction = weather_prediction_signals.iter().any(|s| q_lower.contains(*s));
+        let is_howto_query = q_lower.starts_with("how to") || q_lower.starts_with("how do")
+            || q_lower.starts_with("how can") || q_lower.contains("how to")
+            || q_lower.contains("fix ") || q_lower.contains("repair") || q_lower.contains("won't start")
+            || q_lower.contains("wont start") || q_lower.contains("leaking") || q_lower.contains("not cooling");
+        if has_weather_signal && (has_weather_prediction || q_has_word(&q_lower, "weather") || q_has_word(&q_lower, "forecast"))
+            && !is_howto_query
+            && intent.intent != "fresh" && intent.intent != "local"
+        {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
                 q, intent.intent, intent.confidence
@@ -10795,6 +10890,7 @@ async fn handle_search(
         .filter(|e| e.role == EntityRole::Exclusion)
         .map(|e| e.text.trim().to_lowercase())
         .filter(|t| !t.is_empty())
+        .filter(|t| !is_exclusion_grammar_noise(t)) // F3 (2026-08-17): drop grammar-noise
         .collect();
     let mut gated_neg_dedup: Vec<String> = Vec::new();
     for n in raw_neg.clone() {
@@ -12245,6 +12341,23 @@ mod constraint_fix_tests {
             let negs = extract_query_negative_terms(q);
             assert!(negs.is_empty(), "manner qualifier '{}' must not produce exclusions, got {:?}", q, negs);
         }
+    }
+
+    #[test]
+    fn f3_engine_exclusion_grammar_noise_rejected() {
+        // F3 (2026-08-17): the intent engine may emit `Exclusion`-role entities that
+        // are pure grammar noise (e.g. "not from chinese brands and have usb c charging"
+        // → Exclusion="have"). is_exclusion_grammar_noise must reject these so they
+        // never become search exclusions and never override the gateway parser's
+        // correct topical exclusion ("chinese"). Legitimate topical/entity exclusions
+        // must still pass through.
+        assert!(is_exclusion_grammar_noise("have"), "auxiliary verb 'have' is grammar noise");
+        assert!(is_exclusion_grammar_noise("from"), "'from' is grammar noise");
+        assert!(is_exclusion_grammar_noise("have usb"), "compound of auxiliaries is grammar noise");
+        assert!(!is_exclusion_grammar_noise("chinese"), "topical exclusion 'chinese' is NOT noise");
+        assert!(!is_exclusion_grammar_noise("sushi"), "topical exclusion 'sushi' is NOT noise");
+        assert!(!is_exclusion_grammar_noise("django"), "brand exclusion 'django' is NOT noise");
+        assert!(!is_exclusion_grammar_noise("systemd"), "topical exclusion 'systemd' is NOT noise");
     }
 
     #[test]
