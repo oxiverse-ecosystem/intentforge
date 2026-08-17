@@ -830,6 +830,22 @@ fn q_has_word(q_lower: &str, word: &str) -> bool {
         .any(|w| w == word)
 }
 
+/// D6 (2026-08-17): relation/comparison FUNCTION words that describe *how* the user
+/// wants results related, not *what* they are about. Granting the generic
+/// title-relevance boost to these lets junk pages that merely contain the word
+/// ("Percentage Difference Calculator", "DIFFERENCE dictionary") outrank the real
+/// subject pages for entity-disambiguation queries. Excluded from the title boost
+/// only — they still contribute to the lexical scorer. General data set, no
+/// per-query literals.
+fn is_relation_stopword(term: &str) -> bool {
+    const RELATION_WORDS: &[&str] = &[
+        "difference", "differences", "differ", "compare", "comparison", "comparisons",
+        "versus", "vs", "similar", "similarities", "similarity", "opposite", "opposites",
+        "between", "among", "amongst", "unlike", "distinct", "distinction",
+    ];
+    RELATION_WORDS.contains(&term)
+}
+
 /// Map a natural-language recency phrase to a concrete (after, before) window
 /// expressed as `YYYY-MM-DD`. Returns None when no recency signal is present, so
 /// literal after:/before: and explicit dates are left untouched.
@@ -1133,7 +1149,24 @@ fn calculate_intent_boost(url: &str, title: &str, query: &str, intent: &str) -> 
     }
 
     // Query-term relevance in title (generic, intent-independent)
-    let title_matches = query_terms.iter().filter(|t| title_lower.contains(*t)).count();
+    let query_terms: Vec<&str> = query_lower
+        .split_whitespace()
+        .filter(|w| w.len() >= 2)
+        .collect();
+    // D6 (2026-08-17): relation/comparison FUNCTION words ("difference", "compare",
+    // "vs", "similar", ...) are not topical terms — they describe the *relation* the
+    // user wants, not the *subject*. Granting the generic title-boost for them lets
+    // junk like "Percentage Difference Calculator" / "DIFFERENCE dictionary" outrank
+    // the real subject pages (e.g. "difference between titan the watch brand and titan
+    // the moon of saturn" → Wikipedia Titan-moon / Titan Company). This is the P1
+    // substring-collision pattern generalized: drop the structural word from the
+    // title-boost, keep it in the lexical scorer. A small general data set, no
+    // per-query literals.
+    let title_matches = query_terms
+        .iter()
+        .filter(|t| !is_relation_stopword(t))
+        .filter(|t| title_lower.contains(**t))
+        .count();
     if title_matches > 0 {
         boost += 0.1 * title_matches as f32;
     }
@@ -2246,6 +2279,16 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
                 "inr", "rs", "rs.", "euros", "euro", "eur", "pounds", "pound",
                 "gbp", "yen", "jpy", "won", "krw", "cents", "cent", "paise", "paisa"];
             if currency_words.contains(&pl.as_str()) { continue; }
+            // D4 (2026-08-17): if this term was already captured as a NEGATIVE
+            // constraint (e.g. the intent engine emits both `+chinese` and `-chinese`
+            // for "not from chinese brands"), it is a contradiction to also keep it as
+            // a positive requirement. The negative is the authoritative intent, so we
+            // drop it from the positive set. This prevents a positive+negative overlap
+            // that no downstream gate can satisfy (a result can't both match and not
+            // match `chinese`), which previously let the negated term leak through.
+            if negative.contains(&pl) {
+                continue;
+            }
             let is_dup = positive.iter().any(|kept| {
                 let kl = kept.to_lowercase();
                 kl == pl || kl.split_whitespace().all(|w| pl.split_whitespace().any(|w2| w2 == w))
@@ -9565,18 +9608,37 @@ async fn handle_search(
             }
         }
 
-        // Override 6: transactional keywords -> force/boost transactional intent
+        // Override 6: transactional keywords OR an explicit price bound -> transactional
         let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
         let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
-        if has_tx_signal && !has_local_keywords {
-            if intent.intent != "comparison" && (intent.intent != "transactional" || intent.confidence < 0.60) {
-                tracing::info!(
-                    "INTENT OVERRIDE (STRONG): transactional query '{}' was '{}' (conf={:.3}) -> transactional",
-                    q, intent.intent, intent.confidence
-                );
-                if intent.intent != "comparison" {
-                    intent.intent = "transactional".to_string();
+        // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
+        // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
+        // `comparison` on the generic "best ... under" signal — but a budget-anchored
+        // buy query is transactional, not a comparison. The price bound is signal-driven
+        // (parsed from NL), not a per-query literal, so this is general and future-proof.
+        let sc = &intent.structured_constraints;
+        let has_price_bound = sc.price_lt.is_some() || sc.price_max.is_some()
+            || sc.price_min.is_some() || sc.price_gt.is_some();
+        if (has_tx_signal || has_price_bound) && !has_local_keywords {
+            if (intent.intent != "comparison" || has_price_bound)
+                && (intent.intent != "transactional" || intent.confidence < 0.60)
+            {
+                if has_price_bound && intent.intent == "comparison" {
+                    tracing::info!(
+                        "INTENT OVERRIDE (STRONG): price-bounded buy query '{}' was 'comparison' (conf={:.3}) -> transactional",
+                        q, intent.confidence
+                    );
+                    // Dampen the spurious comparison probability so ranking blends transactional.
+                    if let Some(c) = intent.distribution.get_mut("comparison") {
+                        *c = (*c * 0.4).min(0.30);
+                    }
+                } else {
+                    tracing::info!(
+                        "INTENT OVERRIDE (STRONG): transactional query '{}' was '{}' (conf={:.3}) -> transactional",
+                        q, intent.intent, intent.confidence
+                    );
                 }
+                intent.intent = "transactional".to_string();
                 intent.confidence = intent.confidence.max(0.80);
                 let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
                 intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
@@ -11006,6 +11068,21 @@ async fn handle_search(
     intent.structured_constraints.ignored_constraints =
         if ignored_vec.is_empty() { None } else { Some(ignored_vec) };
     intent.structured_constraints.negative = gated_neg_dedup.clone();
+
+    // D4b (2026-08-17): a term that became a REAL negative exclusion must not also
+    // remain a positive requirement — that is a contradiction no downstream gate can
+    // satisfy (a result can't both match AND not match `chinese`). The negation here
+    // is derived AFTER the earlier `sanitize_constraints` calls (the engine emits
+    // `+chinese` + a contrastive/`COUNTRY_DEMONYMS` negation that lands in
+    // `gated_neg_dedup`), so the sanitizer's own positive/negative overlap guard
+    // (which only sees negatives present at sanitize time) cannot catch it. Purge the
+    // final negative terms from the positive set at this single chokepoint. General:
+    // driven by the resolved negative set, no per-query literals.
+    if !gated_neg_dedup.is_empty() {
+        let neg_lc: std::collections::HashSet<String> =
+            gated_neg_dedup.iter().map(|n| n.to_lowercase()).collect();
+        intent.structured_constraints.positive.retain(|p| !neg_lc.contains(&p.to_lowercase()));
+    }
 
     let has_only_negative = intent.structured_constraints.positive.is_empty()
         && !gated_neg_dedup.is_empty();
