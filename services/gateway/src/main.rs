@@ -3920,16 +3920,16 @@ const IGNORED_CONSTRAINT_NOISE: &[&str] = &[
 /// not tuned to any one query: covering major manufacturing/origin adjectives closes the
 /// "not from <country>" negation class broadly. No per-query literals.
 const COUNTRY_DEMONYMS: &[&str] = &[
-    "chinese", "american", "usa", "us", "indian", "india", "japanese", "japan",
-    "korean", "korea", "south korean", "north korean", "chinese", "german", "germany",
+    "chinese", "china", "american", "usa", "us", "indian", "india", "japanese", "japan",
+    "korean", "korea", "south korean", "north korean", "german", "germany",
     "french", "france", "british", "uk", "english", "canadian", "canada", "russian",
-    "russia", "chinese", "taiwanese", "taiwan", "vietnamese", "vietnam", "thai",
+    "russia", "taiwanese", "taiwan", "vietnamese", "vietnam", "thai",
     "thailand", "singaporean", "singapore", "malaysian", "malaysia", "indonesian",
     "indonesia", "brazilian", "brazil", "mexican", "mexico", "turkish", "turkey",
     "italian", "italy", "spanish", "spain", "dutch", "netherlands", "swiss",
     "switzerland", "swedish", "sweden", "polish", "poland", "israeli", "israel",
-    "chinese", "iranian", "iran", "pakistani", "pakistan", "bangladeshi", "bangladesh",
-    "chinese", "australian", "australia", "chinese", "chinese",
+    "iranian", "iran", "pakistani", "pakistan", "bangladeshi", "bangladesh",
+    "australian", "australia",
 ];
 
 /// D3: precise manner-frame detection at the PHRASE level (not the bare-token
