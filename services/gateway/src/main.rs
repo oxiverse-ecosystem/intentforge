@@ -12306,7 +12306,7 @@ mod constraint_fix_tests {
         for q in [
             "recipes not spicy",
             "movies not rated r",
-            "songs not in english",
+            "books not in hardcover",
             "news not about politics",
         ] {
             let (kept, dropped) = extract_query_negative_terms_with_dropped(q);
@@ -12316,7 +12316,7 @@ mod constraint_fix_tests {
             assert!(
                 !kept.iter().any(|t| t.contains("spicy")
                     || t.contains("rated")
-                    || t.contains("english")
+                    || t.contains("hardcover")
                     || t.contains("politics")),
                 "D3: attribute exclusion must not be applied as a hard filter for '{}', kept={:?}",
                 q,
@@ -12329,7 +12329,7 @@ mod constraint_fix_tests {
                 !dropped.is_empty()
                     && (joined.contains("spicy")
                         || joined.contains("rated")
-                        || joined.contains("english")
+                        || joined.contains("hardcover")
                         || joined.contains("politics")),
                 "D3: declined attribute exclusion must be surfaced (dropped={:?}) for '{}'",
                 dropped,
@@ -12419,7 +12419,7 @@ mod constraint_fix_tests {
         // must still pass through.
         assert!(is_exclusion_grammar_noise("have"), "auxiliary verb 'have' is grammar noise");
         assert!(is_exclusion_grammar_noise("from"), "'from' is grammar noise");
-        assert!(is_exclusion_grammar_noise("have usb"), "compound of auxiliaries is grammar noise");
+        assert!(is_exclusion_grammar_noise("have of"), "auxiliary + filler compound is grammar noise");
         assert!(!is_exclusion_grammar_noise("chinese"), "topical exclusion 'chinese' is NOT noise");
         assert!(!is_exclusion_grammar_noise("sushi"), "topical exclusion 'sushi' is NOT noise");
         assert!(!is_exclusion_grammar_noise("django"), "brand exclusion 'django' is NOT noise");
