@@ -10915,6 +10915,13 @@ async fn handle_search(
         }
     }
     for d in &query_neg_dropped {
+        // If this dropped negative was ALSO rescued into gated_neg_dedup (engine
+        // tagged it as a genuine Exclusion), it is already reported as applied
+        // — do NOT also surface it as ignored, or it would appear in BOTH
+        // applied_constraints and ignored_constraints (a direct contradiction).
+        if gated_neg_dedup.contains(d) {
+            continue;
+        }
         if !declined.contains(d) {
             declined.push(d.clone());
         }
