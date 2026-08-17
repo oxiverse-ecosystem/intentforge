@@ -1412,7 +1412,12 @@ const LOCATION_GAZETTEER: &[(&str, &str)] = &[
     ("stockholm", "SE"), ("oslo", "NO"), ("copenhagen", "DK"), ("helsinki", "FI"),
     ("moscow", "RU"), ("kyiv", "UA"), ("istanbul", "TR"), ("athens", "GR"),
     ("beijing", "CN"), ("shanghai", "CN"), ("seoul", "KR"), ("delhi", "IN"),
-    ("mumbai", "IN"), ("bangalore", "IN"), ("bengaluru", "IN"), ("singapore", "SG"),
+    ("delhi", "IN"), ("mumbai", "IN"), ("bangalore", "IN"), ("bengaluru", "IN"),
+    ("chennai", "IN"), ("kolkata", "IN"), ("pune", "IN"), ("ahmedabad", "IN"), ("jaipur", "IN"),
+    ("hyderabad", "IN"), ("lucknow", "IN"), ("kanpur", "IN"), ("nagpur", "IN"), ("indore", "IN"),
+    ("bhopal", "IN"), ("patna", "IN"), ("surat", "IN"), ("vadodara", "IN"), ("rajkot", "IN"),
+    ("coimbatore", "IN"), ("kochi", "IN"), ("thiruvananthapuram", "IN"), ("visakhapatnam", "IN"),
+    ("vijayawada", "IN"), ("mysore", "IN"), ("mangalore", "IN"), ("goa", "IN"), ("singapore", "SG"),
     ("sydney", "AU"), ("melbourne", "AU"), ("auckland", "NZ"),
     ("new york", "US"), ("san francisco", "US"), ("los angeles", "US"),
     ("chicago", "US"), ("seattle", "US"), ("boston", "US"), ("austin", "US"),
@@ -1474,7 +1479,11 @@ fn is_city(name: &str) -> bool {
         "tokyo", "london", "paris", "berlin", "madrid", "rome", "amsterdam",
         "dublin", "stockholm", "oslo", "copenhagen", "helsinki", "moscow", "kyiv",
         "istanbul", "athens", "beijing", "shanghai", "seoul", "delhi", "mumbai",
-        "bangalore", "bengaluru", "singapore", "sydney", "melbourne", "auckland",
+        "bangalore", "bengaluru", "chennai", "kolkata", "pune", "ahmedabad", "jaipur",
+        "hyderabad", "lucknow", "kanpur", "nagpur", "indore", "bhopal", "patna",
+        "surat", "vadodara", "rajkot", "coimbatore", "kochi", "thiruvananthapuram",
+        "visakhapatnam", "vijayawada", "mysore", "mangalore", "singapore", "sydney",
+        "melbourne", "auckland",
         "new york", "san francisco", "los angeles", "chicago", "seattle", "boston",
         "austin", "toronto", "vancouver", "sao paulo", "mexico city", "dubai",
         "cairo", "bangkok", "jakarta", "cape town", "lagos",
@@ -3978,6 +3987,33 @@ fn is_exclusion_grammar_noise(term: &str) -> bool {
     tokens.iter().all(|t| {
         MANNER_PRONOUNS.contains(t) || MANNER_VERBS.contains(t) || filler.contains(t)
     })
+}
+
+/// Subjective-quality descriptors and intensifiers (e.g. "good", "too", "best",
+/// "spicy", "cheap") are never real search exclusions. The intent engine
+/// sometimes emits them as `Exclusion`-role entities when they sit next to a
+/// negation marker ("not too spicy and good for kids" -> Exclusion="good"/"too").
+/// Treating a quality adjective as a hard exclusion silently drops relevant pages
+/// and injects a phantom negative. This is structural vocabulary, not per-query
+/// literals; it mirrors the MANNER_VERBS design. A genuine topical exclusion
+/// (a brand, place, or noun the user named) is never in this set.
+fn is_subjective_quality_term(term: &str) -> bool {
+    const QUALITY: &[&str] = &[
+        "good", "bad", "best", "worst", "nice", "great", "poor", "fine",
+        "tasty", "spicy", "sweet", "sour", "bitter", "salty", "hot", "cold",
+        "cheap", "expensive", "costly", "pricey", "affordable", "fancy",
+        "small", "big", "large", "tiny", "huge", "old", "new", "young",
+        "fast", "slow", "quick", "easy", "hard", "simple", "complex",
+        "clean", "dirty", "quiet", "loud", "calm", "noisy", "busy",
+        "friendly", "safe", "dangerous", "healthy", "unhealthy",
+        "organic", "traditional", "modern", "classic", "cute", "pretty",
+        "beautiful", "ugly", "comfortable", "cozy", "local", "popular",
+        "fresh", "stale", "ripe", "raw", "cooked", "soft",
+        "too", "very", "really", "quite", "rather", "fairly", "somewhat",
+        "high", "low", "better", "worse", "less", "more", "most", "least",
+    ];
+    let t = term.trim().to_lowercase();
+    QUALITY.contains(&t.as_str())
 }
 
 /// A negated compound is a real search EXCLUSION (not a manner qualifier) when at
@@ -9298,8 +9334,18 @@ async fn handle_search(
     for e in &intent.structured_constraints.entities {
         if e.role == EntityRole::Exclusion {
             let t = e.text.trim().to_lowercase();
+            // DA/DB fix (2026-08-17): engine `Exclusion` entities must pass the
+            // SAME grammar/quality-noise guards as gateway-parsed negatives. The
+            // intent engine emits subjective adjectives + intensifiers as
+            // `Exclusion` roles next to negation markers ("not too spicy and
+            // good for kids" -> Exclusion="good"/"too"), which would otherwise
+            // become phantom hard-negatives that drop relevant pages. Skip them.
+            // A genuine topical exclusion (brand/place/noun the user named) is
+            // never in either noise set, so real exclusions survive unchanged.
             if !t.is_empty()
                 && t.len() >= 2
+                && !is_exclusion_grammar_noise(&t)
+                && !is_subjective_quality_term(&t)
                 && !intent.structured_constraints.negative.contains(&t)
             {
                 intent.structured_constraints.negative.push(t);
