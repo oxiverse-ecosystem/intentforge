@@ -4045,6 +4045,64 @@ fn is_exclusion_grammar_noise(term: &str) -> bool {
     })
 }
 
+/// A negated clause object is a VERB-LED / ATTRIBUTE exclusion when its head is an
+/// open-class verb or a personal-attribute noun — i.e. it describes *how the user
+/// wants to do something* or *a trait of the user*, NOT a content topic to remove
+/// from results. The intent engine's Query-Graph IR sometimes tags these as
+/// `Exclusion`-role entities (e.g. "alternatives to zoom that do not require
+/// downloading an app and respect privacy" -> Exclusion="respect"; "juggle three
+/// balls with no coordination" -> "coordination"; "young earner with no
+/// dependents" -> "dependents"; "charge overnight without fire risk" -> "fire";
+/// "fix a faucet without replacing the tap" -> "replacing"). These are NEVER real
+/// search exclusions — hard-filtering "respect"/"coordination"/"dependents" drops
+/// every otherwise-relevant page and collapses the result set. The gateway trusts
+/// engine `Exclusion` entities and bypasses the `is_real_exclusion` gate, so we
+/// reject them here at the same merge point. Structural open-class vocabulary
+/// (reused MANNER_VERBS + a verb/attribute seed), no per-query literals — so any
+/// verb-led or attribute exclusion ("without cooking", "with no training",
+/// "apps that do not track you and respect privacy") is caught generally. A
+/// genuine topical exclusion (brand / place / noun the user named) is never in
+/// this set, so real exclusions survive.
+fn is_verb_attribute_exclusion(term: &str) -> bool {
+    let lc = term.trim().to_lowercase();
+    if lc.is_empty() {
+        return true;
+    }
+    // Personal-attribute / trait nouns that describe the USER, not a content topic.
+    const ATTRIBUTE_NOUNS: &[&str] = &[
+        "coordination", "dependents", "experience", "background", "training",
+        "skill", "skills", "knowledge", "degree", "qualification", "qualifications",
+        "subscription", "account", "accounts", "registration", "signup", "sign-up",
+        "login", "log-in", "app", "apps", "application", "applications", "download",
+        "downloading", "install", "installing", "permission", "permissions",
+    ];
+    // Open-class verb seed (reuses MANNER_VERBS where overlapping) — the head of a
+    // negated clause that is a verb is describing an action, not a topic to drop.
+    const VERB_HEADS: &[&str] = &[
+        "respect", "require", "requires", "required", "needing", "need", "needs",
+        "track", "tracks", "tracking", "sell", "sells", "selling", "share", "shares",
+        "sharing", "collect", "collects", "collecting", "replace", "replacing",
+        "replaceing", "charge", "charging", "harm", "harming", "damage", "damaging",
+        "burn", "burning", "fire", "cost", "costs", "spend", "spending", "pay", "pays",
+        "paying", "register", "registering", "download", "downloading", "install",
+        "installing", "sign", "signing", "subscribe", "subscribing", "login",
+        "cook", "cooking", "drive", "driving", "travel", "travelling", "traveling",
+        "learn", "learning", "work", "working", "study", "studying", "read", "reading",
+    ];
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    if tokens.is_empty() {
+        return true;
+    }
+    // Reject if EVERY token is a verb/attribute head or a filler — i.e. the whole
+    // extracted exclusion describes an action/trait, not a named topic.
+    tokens.iter().all(|t| {
+        MANNER_VERBS.contains(t)
+            || VERB_HEADS.contains(t)
+            || ATTRIBUTE_NOUNS.contains(t)
+            || MANNER_PRONOUNS.contains(t)
+    })
+}
+
 /// Subjective-quality descriptors and intensifiers (e.g. "good", "too", "best",
 /// "spicy", "cheap") are never real search exclusions. The intent engine
 /// sometimes emits them as `Exclusion`-role entities when they sit next to a
@@ -11033,6 +11091,8 @@ async fn handle_search(
         .map(|e| e.text.trim().to_lowercase())
         .filter(|t| !t.is_empty())
         .filter(|t| !is_exclusion_grammar_noise(t)) // F3 (2026-08-17): drop grammar-noise
+        .filter(|t| !is_subjective_quality_term(t)) // DA/DB (2026-08-17): drop quality adjectives
+        .filter(|t| !is_verb_attribute_exclusion(t)) // V1: drop verb-led/attribute exclusions
         .collect();
     let mut gated_neg_dedup: Vec<String> = Vec::new();
     for n in raw_neg.clone() {
@@ -12522,6 +12582,21 @@ mod constraint_fix_tests {
         assert!(!is_exclusion_grammar_noise("sushi"), "topical exclusion 'sushi' is NOT noise");
         assert!(!is_exclusion_grammar_noise("django"), "brand exclusion 'django' is NOT noise");
         assert!(!is_exclusion_grammar_noise("systemd"), "topical exclusion 'systemd' is NOT noise");
+    }
+
+    #[test]
+    fn v1_engine_exclusion_verb_attribute_rejected() {
+        assert!(is_verb_attribute_exclusion("respect"));
+        assert!(is_verb_attribute_exclusion("require"));
+        assert!(is_verb_attribute_exclusion("coordination"));
+        assert!(is_verb_attribute_exclusion("dependents"));
+        assert!(is_verb_attribute_exclusion("fire"));
+        assert!(is_verb_attribute_exclusion("replacing"));
+        assert!(is_verb_attribute_exclusion("track"));
+        assert!(!is_verb_attribute_exclusion("zoom"));
+        assert!(!is_verb_attribute_exclusion("sushi"));
+        assert!(!is_verb_attribute_exclusion("django"));
+        assert!(!is_verb_attribute_exclusion("chinese"));
     }
 
     #[test]
