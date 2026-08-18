@@ -11097,6 +11097,18 @@ async fn handle_search(
     let mut gated_neg_dedup: Vec<String> = Vec::new();
     for n in raw_neg.clone() {
         let engine_backed = engine_exclusions.contains(&n.to_lowercase());
+        // V1 (2026-08-18): a verb-led / user-attribute exclusion (e.g. "dependents"
+        // from "with no dependents", "coordination" from "with no coordination") is
+        // NEVER a real content exclusion — it describes the user, not a topic to
+        // drop. It must be rejected here at the FINAL gate regardless of whether the
+        // engine tagged it or the contrastive framing (compare/versus) would
+        // otherwise promote it. Rejecting here — after the engine-exclusion merge
+        // point — covers BOTH sources (engine IR + gateway extractor) with one
+        // structural rule. Genuine topical exclusions (brand/place/demonym) never
+        // match is_verb_attribute_exclusion, so they still survive.
+        if is_verb_attribute_exclusion(&n) {
+            continue;
+        }
         if (engine_backed || is_real_exclusion(&n, &q_orig, query_contrastive))
             && !gated_neg_dedup.contains(&n)
         {
