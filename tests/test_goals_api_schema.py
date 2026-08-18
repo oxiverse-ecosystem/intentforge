@@ -74,21 +74,44 @@ def test_get_goal_schema(session):
     assert "status" in body, "GET /goals/{id} missing 'status'"
 
 
-def test_submit_answers_roadmap_phase_count(session):
-    """#1 POST /goals/{id}/answers -> 200 AND total_phases == len(phases)."""
-    goal_id = _create_goal(session)
-    # Pull the generated questions so we can answer them.
+def _real_answers(session, goal_id):
+    """Build REAL structured answers from the generated questions.
+
+    Picks the first option of each question (falling back to the question
+    text itself when a question has no options) so the gateway's
+    generate_roadmap() consumes genuine user structure instead of a
+    degenerate "yes"-to-everything payload. A degenerate payload previously
+    embedded the literal answer into the roadmap text (e.g. "yes hours/week")
+    while the phase-count invariant still held, so the regression was masked.
+    """
     get_r = session.get(f"{BASE}/goals/{goal_id}", timeout=10)
     assert get_r.status_code == 200
     questions = get_r.json().get("questions", [])
-    answers = [
-        {"question_id": q["id"], "answer": "yes"}
-        for q in questions
-        if "id" in q
-    ]
+    answers = []
+    for q in questions:
+        if "id" not in q:
+            continue
+        opts = q.get("options") or []
+        ans = opts[0] if opts else (q.get("question") or "x")
+        answers.append({"question_id": q["id"], "answer": ans})
+    return answers
+
+
+def test_submit_answers_roadmap_phase_count(session):
+    """#1 POST /goals/{id}/answers -> 200 AND total_phases == len(phases).
+
+    Hardened (round 2026-08-18T0937Z): submits REAL structured answers so the
+    roadmap path is exercised with genuine user state, and guards that the
+    roadmap text is derived from those real answers (not a degenerate "yes"
+    payload silently embedded into the overview/title).
+    """
+    goal_id = _create_goal(session)
+    answers = _real_answers(session, goal_id)
+    # Capture the Q2 (hours/availability) answer the gateway will embed, so we
+    # can assert the real value — not the literal "yes" — lands in the roadmap.
+    hours_answer = next((a["answer"] for a in answers if a["question_id"] == 2), None)
     if not answers:
-        # Some flows answer inline; fall back to a minimal numeric payload.
-        answers = [{"question_id": 1, "answer": "yes"}]
+        answers = [{"question_id": 1, "answer": "3 months — Quarter project"}]
 
     r = session.post(
         f"{BASE}/goals/{goal_id}/answers", json={"answers": answers}, timeout=60
@@ -102,6 +125,24 @@ def test_submit_answers_roadmap_phase_count(session):
     assert total_phases == len(phases), (
         f"roadmap.total_phases ({total_phases}) != len(phases) ({len(phases)})"
     )
+    # Non-degenerate guards: the roadmap must reflect REAL submitted state.
+    assert roadmap.get("title"), "roadmap.title missing/empty"
+    # The original degenerate test embedded the literal answer "yes" into the
+    # overview (e.g. "yes hours/week"). A real regression routing real answers
+    # into that path must be caught.
+    assert "yes hours/week" not in roadmap.get("overview", ""), \
+        f"roadmap overview embedded degenerate 'yes' answer: {roadmap.get('overview')}"
+    if hours_answer:
+        hours_prefix = hours_answer.split("—")[0].strip()
+        assert hours_prefix and hours_prefix in roadmap.get("overview", ""), (
+            f"overview must embed the real hours answer '{hours_prefix}', "
+            f"got: {roadmap.get('overview')}"
+        )
+    # Every phase must carry at least one resource (live-curated or an honest
+    # web-search link) — the real path never emits an empty resources array.
+    for p in phases:
+        assert len(p.get("resources", [])) >= 1, \
+            f"phase {p.get('id')} has no resources: {p}"
 
 
 def test_quick_roadmap_phase_count(session):
