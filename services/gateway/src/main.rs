@@ -7015,6 +7015,16 @@ fn merge_local_and_web(
         let dict_cap = 0.06f32;   // dictionary sites may appear but never rank top
         let weak_cap = 0.08f32;   // single-polysemous-token matches capped low
 
+        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
+        // Used by the P8 video cap (b0): a video must never outrank the best genuine
+        // text result for a non-video query, in any calibration regime (see comment
+        // at (b0)). Computed over post-calibration scores so it reflects the final
+        // text ranking.
+        let best_non_video = merged.iter()
+            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
+            .map(|r| r.score)
+            .fold(0.0f32, f32::max);
+
         for r in merged.iter_mut() {
             let rl = r.title.to_lowercase();
             let cl = r.content.to_lowercase();
@@ -7043,6 +7053,18 @@ fn merge_local_and_web(
             // re-applies AFTER calibration, so the dampening is durable: videos may
             // still appear (floor preserved) but can never outrank genuine text
             // results for a non-video query. Video-intent queries keep full score.
+            //
+            // ROOT-CAUSE (2026-08-17 round): the previous fixed cap of 0.12 was an
+            // ABSOLUTE value. calibrate_scores rescales the whole set onto a band whose
+            // ceiling depends on the regime: healthy sets → [0.05,1.0], weak/thin sets
+            // (raw_max < 0.10) → [0.05,0.12]. A thin-set video caps at 0.12 == the band
+            // ceiling, so it TIES the top text result and wins by tie-break order —
+            // exactly the regression seen on "wifi router rebooting" (youtube #1), "knee
+            // braces" (youtube #1-3), "chess websites" (youtube #1-3), "passport renew"
+            // (youtube #1). Fix: make the cap RELATIVE to the best non-video score, so a
+            // video is always strictly below the best genuine text result regardless of
+            // calibration regime. Signal-driven (query self-describes intent), not tuned
+            // to any one query. floor 0.05 keeps the video present, never dominant.
             let is_video_src = r.sources.iter().any(|s| s == "invidious" || s == "video");
             if is_video_src {
                 let video_intent = q_lc_cap.contains("video")
@@ -7051,15 +7073,14 @@ fn merge_local_and_web(
                     || q_lc_cap.contains("tutorial")
                     || q_lc_cap.contains("animation");
                 if !video_intent {
-                    // 0.12 is below the calibrated top band for real text results
-                    // (~1.0) but above the 0.05 floor, so a video stays present yet
-                    // strictly secondary. Signal-driven (query self-describes intent),
-                    // not tuned to any one query.
-                    let video_cap = 0.12f32;
+                    // Relative cap: a video must never outrank the best non-video
+                    // result for a non-video query. best_non_video is computed from the
+                    // post-calibration scores before any video was capped this pass.
+                    let video_cap = (best_non_video * 0.85).max(0.05);
                     if r.score > video_cap {
                         tracing::info!(
-                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source)",
-                            video_cap, r.url.chars().take(60).collect::<String>()
+                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source; best_text={:.2})",
+                            video_cap, r.url.chars().take(60).collect::<String>(), best_non_video
                         );
                         r.score = video_cap;
                     }
