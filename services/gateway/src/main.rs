@@ -2234,6 +2234,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             && !clean_n.is_empty()
             && !is_exclusion_grammar_noise(&clean_n)
             && !is_subjective_quality_term(&clean_n)
+            && !is_verb_attribute_exclusion(&clean_n)
         {
             if !negative.contains(&clean_n) {
                 negative.push(clean_n);
@@ -4248,6 +4249,27 @@ fn is_exclusion_grammar_noise(term: &str) -> bool {
 /// "apps that do not track you and respect privacy") is caught generally. A
 /// genuine topical exclusion (brand / place / noun the user named) is never in
 /// this set, so real exclusions survive.
+// Inflection-tolerant verb stem: returns the bare stem of a regular English verb
+// inflection so a single seed list (VERB_HEADS/MANNER_VERBS) covers every
+// conjugation. "works"->"work", "turning"->"turn", "required"->"require",
+// "using"->"use". This is derived, not a per-token literal, so it generalises.
+fn verb_stem(t: &str) -> String {
+    let n = t.len();
+    if n > 4 && t.ends_with("ing") {
+        return t[..n - 3].to_string(); // turning -> turn
+    }
+    if n > 3 && t.ends_with("ed") {
+        return t[..n - 2].to_string(); // required -> requir (caller tries +e)
+    }
+    if n > 3 && t.ends_with("es") {
+        return t[..n - 2].to_string(); // matches -> match
+    }
+    if n > 2 && t.ends_with('s') {
+        return t[..n - 1].to_string(); // works -> work
+    }
+    t.to_string()
+}
+
 fn is_verb_attribute_exclusion(term: &str) -> bool {
     let lc = term.trim().to_lowercase();
     if lc.is_empty() {
@@ -4273,18 +4295,44 @@ fn is_verb_attribute_exclusion(term: &str) -> bool {
         "installing", "sign", "signing", "subscribe", "subscribing", "login",
         "cook", "cooking", "drive", "driving", "travel", "travelling", "traveling",
         "learn", "learning", "work", "working", "study", "studying", "read", "reading",
+        "use", "using", "turn", "turning", "compromise", "expose", "exposing",
     ];
+    // Open-class descriptive ADJECTIVES: a negated adjective ("not usual", "not
+    // spicy", "not free") describes the user's preference, NOT a content topic to
+    // remove. Admitting adjectives in the all-match stops phantom single-word
+    // negatives like "usual" (from "without the usual crowds") from becoming
+    // search exclusions. General trait vocabulary, no per-query literals.
+    const ADJECTIVES: &[&str] = &[
+        "usual", "normal", "common", "typical", "standard", "regular",
+        "popular", "free", "cheap", "expensive", "easy", "hard", "simple",
+        "complex", "fast", "slow", "old", "new", "big", "small", "large",
+        "spicy", "sweet", "hot", "cold", "fresh", "clean", "dirty", "safe",
+    ];
+    // A token is verb-like if it is a seed verb OR a regular inflection of one.
+    let is_verb_like = |t: &&str| -> bool {
+        if VERB_HEADS.contains(t) || MANNER_VERBS.contains(t) {
+            return true;
+        }
+        let stem = verb_stem(t);
+        if VERB_HEADS.contains(&stem.as_str()) || MANNER_VERBS.contains(&stem.as_str()) {
+            return true;
+        }
+        // recovery for doubled-consonant stems (requir -> require)
+        let with_e = format!("{}e", stem);
+        VERB_HEADS.contains(&with_e.as_str()) || MANNER_VERBS.contains(&with_e.as_str())
+    };
     let tokens: Vec<&str> = lc.split_whitespace().collect();
     if tokens.is_empty() {
         return true;
     }
-    // Reject if EVERY token is a verb/attribute head or a filler — i.e. the whole
-    // extracted exclusion describes an action/trait, not a named topic.
+    // Reject if EVERY token is a verb/attribute/adj head or a filler — i.e. the
+    // whole extracted exclusion describes an action/trait, not a named topic.
     tokens.iter().all(|t| {
-        MANNER_VERBS.contains(t)
-            || VERB_HEADS.contains(t)
+        is_verb_like(t)
             || ATTRIBUTE_NOUNS.contains(t)
+            || ADJECTIVES.contains(t)
             || MANNER_PRONOUNS.contains(t)
+            || is_exclusion_grammar_noise(t)
     })
 }
 
