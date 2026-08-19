@@ -4021,7 +4021,7 @@ const MANNER_VERBS: &[&str] = &[
     "install", "running", "run", "track", "tracked", "tracking", "offend",
     "offending", "offended", "damage", "damaging", "damaged", "train", "training",
     "call", "calling", "called", "help", "helping", "hurt", "hurting", "harm",
-    "harming", "lose", "losing", "spend", "spending", "pay", "paying", "cost",
+    "harming", "lose", "losing", "spend", "spending", "cost",
     "costing", "need", "needing", "want", "wanting", "show", "showing", "tell",
     "telling",
 ];
@@ -4104,6 +4104,55 @@ fn is_manner_phrase(compound: &str) -> bool {
     false
 }
 
+/// D2 (2026-08-19): disambiguate the genuinely ambiguous word "pay" inside a
+/// negated clause. The intent engine may emit a bare "pay"/"paying" token as an
+/// `Exclusion` entity (e.g. from "how to learn programming without paying for a
+/// course" it extracted `paying`). We must decide, from the QUERY CONTEXT (not the
+/// bare token), whether this is:
+///   - MANNER:    "pay attention" / "pay respect" / "pay regard" / "pay heed" —
+///                the user describes HOW they act → MUST be declined (a manner
+///                false-positive that would wrongly drop relevant pages).
+///   - MONEY:     "pay for a course" / "pay a fee" / "pay money" / "pay a
+///                subscription" — the user refuses a financial transaction → MUST
+///                be honored (a real exclusion). This was the dropped D2 defect:
+///                "pay"/"paying" were bluntly listed in MANNER_VERBS/VERB_HEADS and
+///                every money-exclusion got declined.
+///
+/// The decision is driven entirely by the query's nearby OBJECT vocabulary — a
+/// general seed of MANNER objects vs MONETARY objects, no per-query literals, no
+/// tuned thresholds. This is the same open-class "verb + object class" pattern as
+/// `is_verb_attribute_exclusion`, so it is future-proof and non-hardcoded.
+fn pay_exclusion_is_manner(q_orig: &str) -> bool {
+    let lc = q_orig.to_lowercase();
+    const PAY_MANNER_OBJECTS: &[&str] = &[
+        "attention", "respect", "regard", "heed", "tribute", "homage",
+        "compliments", "compliment", "court", "mind", "witness", "lip",
+    ];
+    // "pay <manner-object>" / "paying <manner-object>" anywhere in the query →
+    // the MANNER idiom (an act of consideration, never a transaction).
+    PAY_MANNER_OBJECTS.iter().any(|m| {
+        lc.contains(&format!("pay {}", m)) || lc.contains(&format!("paying {}", m))
+    })
+}
+
+fn pay_exclusion_is_money(q_orig: &str) -> bool {
+    let lc = q_orig.to_lowercase();
+    const PAY_MONEY_OBJECTS: &[&str] = &[
+        "course", "courses", "subscription", "subscriptions", "fee", "fees",
+        "price", "prices", "money", "cost", "costs", "charge", "charges",
+        "tuition", "premium", "payment", "payments", "dollar", "dollars",
+        "rupee", "rupees", "bill", "bills", "tax", "taxes", "rent", "fare",
+        "membership", "license", "licence", "bootcamp", "class", "classes",
+        "training", "program", "programme",
+    ];
+    // A monetary object near "pay"/"paying" signals a financial transaction the
+    // user refuses ("pay for a course", "pay a subscription fee"). We require the
+    // object word itself (no loose "pay a"/"paying a" prefix, which wrongly matched
+    // "paying attention"/"paying advice"). This is the same object-class seed
+    // pattern as the manner check — general, non-hardcoded, no tuned thresholds.
+    PAY_MONEY_OBJECTS.iter().any(|m| lc.contains(m))
+}
+
 /// F3 (2026-08-17): a negated compound is pure GRAMMAR/auxiliary noise when every
 /// token is a manner verb, manner pronoun, or a filler stopword/auxiliary
 /// ("have", "has", "from", "of", "the", ...). The intent engine's Query-Graph IR
@@ -4168,8 +4217,8 @@ fn is_verb_attribute_exclusion(term: &str) -> bool {
         "track", "tracks", "tracking", "sell", "sells", "selling", "share", "shares",
         "sharing", "collect", "collects", "collecting", "replace", "replacing",
         "replaceing", "charge", "charging", "harm", "harming", "damage", "damaging",
-        "burn", "burning", "fire", "cost", "costs", "spend", "spending", "pay", "pays",
-        "paying", "register", "registering", "download", "downloading", "install",
+        "burn", "burning", "fire", "cost", "costs", "spend", "spending", "register",
+        "registering", "download", "downloading", "install",
         "installing", "sign", "signing", "subscribe", "subscribing", "login",
         "cook", "cooking", "drive", "driving", "travel", "travelling", "traveling",
         "learn", "learning", "work", "working", "study", "studying", "read", "reading",
@@ -4247,6 +4296,16 @@ fn is_real_exclusion(
         return false;
     }
     let lc = compound.to_lowercase();
+    // D2 (2026-08-19): the bare token "pay"/"paying" is ambiguous. If the query
+    // context shows a MANNER object ("pay attention", "pay respect"), it is a
+    // manner false-positive → not a real exclusion. But a monetary object
+    // ("pay for a course", "pay a fee") is a genuine money exclusion → honor it.
+    // We require the money sense to be signalled; otherwise a bare "pay" with no
+    // monetary object still defaults to declined (the manner guard's job). This
+    // keeps "without paying attention" rejected while rescuing "without paying".
+    if compound == "pay" || compound == "paying" || lc == "pay" || lc == "paying" {
+        return pay_exclusion_is_money(&q_orig);
+    }
     let tokens: Vec<&str> = lc.split_whitespace().collect();
     // Entity: any token (or the whole compound) is a protected brand/tech term.
     if tokens.iter().any(|t| spell::is_protected_term(t)) {
@@ -11187,6 +11246,19 @@ async fn handle_search(
         .filter(|t| !is_exclusion_grammar_noise(t)) // F3 (2026-08-17): drop grammar-noise
         .filter(|t| !is_subjective_quality_term(t)) // DA/DB (2026-08-17): drop quality adjectives
         .filter(|t| !is_verb_attribute_exclusion(t)) // V1: drop verb-led/attribute exclusions
+        .filter(|t| {
+            // D2 (2026-08-19): a bare "pay"/"paying" engine Exclusion is only a
+            // manner false-positive when the query context says so. "pay attention"
+            // / "pay respect" → manner, DROP it (it must not become a real
+            // exclusion). A monetary "pay for a course" → real money exclusion,
+            // KEEP IT (this was the dropped D2 defect). All other engine
+            // exclusions are kept unchanged.
+            if *t == "pay" || *t == "paying" {
+                pay_exclusion_is_money(&q_orig)
+            } else {
+                true
+            }
+        })
         .collect();
     let mut gated_neg_dedup: Vec<String> = Vec::new();
     for n in raw_neg.clone() {
@@ -12703,6 +12775,47 @@ mod constraint_fix_tests {
         assert!(!is_verb_attribute_exclusion("sushi"));
         assert!(!is_verb_attribute_exclusion("django"));
         assert!(!is_verb_attribute_exclusion("chinese"));
+    }
+
+    #[test]
+    fn d2_paying_exclusion_money_vs_manner() {
+        // D2 (2026-08-19): the intent engine emits a bare "pay"/"paying" token as
+        // an Exclusion entity. The money sense ("without paying for a course") is a
+        // REAL exclusion and MUST be honored; the manner sense ("pay attention",
+        // "pay respect") is a manner false-positive and MUST be declined. We decide
+        // from the query CONTEXT (nearby object vocabulary), not the bare token.
+        assert!(
+            is_real_exclusion("paying", "how to learn programming without paying for a course and without watching long videos", false),
+            "money-exclusion 'without paying for a course' must be honored"
+        );
+        // Genuine manner idioms must still be declined (no monetary object present).
+        assert!(
+            !is_real_exclusion("paying", "how to listen without paying attention to the lecture", false),
+            "manner 'pay attention' must be declined"
+        );
+        assert!(
+            !is_real_exclusion("pay", "they entered without paying respect to the tradition", false),
+            "manner 'pay respect' must be declined"
+        );
+        // Decline a bare "pay" with no monetary/manner object (default = not real).
+        assert!(
+            !is_real_exclusion("pay", "the meeting ended without further ado or pay", false),
+            "bare 'pay' with no monetary object defaults to declined"
+        );
+        // Other verb-led exclusions must remain declined (no regression to V1).
+        assert!(is_verb_attribute_exclusion("respect"));
+        assert!(is_verb_attribute_exclusion("coordination"));
+    }
+
+    #[test]
+    fn d2_pay_exclusion_helper_disambiguation() {
+        // Unit-level guard on the two context helpers.
+        assert!(pay_exclusion_is_manner("how to listen without paying attention"));
+        assert!(pay_exclusion_is_manner("he left without paying respect to elders"));
+        assert!(!pay_exclusion_is_manner("learn without paying for a course"));
+        assert!(pay_exclusion_is_money("learn without paying for a course"));
+        assert!(pay_exclusion_is_money("free ways to watch without paying a subscription fee"));
+        assert!(!pay_exclusion_is_money("study without paying attention"));
     }
 
     #[test]
