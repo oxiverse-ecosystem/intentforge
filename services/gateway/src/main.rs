@@ -5906,6 +5906,43 @@ fn merge_local_and_web(
         .filter(|w| !is_weak_anchor_word(&w.to_lowercase()))
         .collect();
 
+    // ── Comparison-query compared-entity extraction (D3 fix) ──
+    // For "compare X and Y" / "X vs Y" queries, the SPECIFIC compared entities
+    // (brand+model tokens like "brezza"/"venue") are what make a result on-topic.
+    // Generic attribute words ("mileage"/"petrol"/"range") and comparison-structure
+    // words ("compare"/"vs"/"between"/"and") are NOT entities. A local page that
+    // names NONE of the compared entities is off-topic crawl noise — e.g. a "Honda
+    // City Mileage" page floating above the actual Brezza/Venue results for a
+    // "Brezza vs Venue" query — and must not earn the local_bonus or keep a high
+    // relevance. Extraction is purely derived from the query's own distinctive terms
+    // minus attribute/structure vocab: no per-brand/per-entity tuning, so it
+    // generalises to any comparison ("swift vs nexon", "city vs amaze", ...).
+    let comparison_query = q_words.iter().any(|w| {
+        let l = w.to_lowercase();
+        l == "compare" || l == "comparison" || l == "versus" || l == "vs" || l == "v"
+            || l == "between" || (l == "and" && q_words.len() >= 5) || l == "or"
+    });
+    let comparison_structure_words: &[&str] = &[
+        "compare", "comparison", "versus", "vs", "v", "between", "and", "or", "the",
+        "a", "an", "of", "to", "in", "on", "for", "with", "that", "this", "these",
+        "those", "real", "world", "which", "has", "have", "better", "best", "top",
+        "than", "then",
+    ];
+    let comparison_attribute_terms: &[&str] = &[
+        "mileage", "range", "price", "cost", "specs", "spec", "specification", "boot",
+        "space", "power", "torque", "engine", "fuel", "petrol", "diesel", "electric",
+        "automatic", "manual", "variant", "feature", "features", "performance",
+        "efficiency", "kmpl", "review", "reviews", "launch", "model", "models", "year",
+    ];
+    let comparison_entities: Vec<String> = strong_distinctive_terms
+        .iter()
+        .map(|t| t.to_lowercase())
+        .filter(|tl| !comparison_structure_words.contains(&tl.as_str()))
+        .filter(|tl| !comparison_attribute_terms.contains(&tl.as_str()))
+        .filter(|tl| !is_weak_anchor_word(tl))
+        .collect();
+    let query_entity_count = comparison_entities.len();
+
     let core_topic_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
             let lower = w.to_lowercase();
@@ -6272,6 +6309,29 @@ fn merge_local_and_web(
                     "LOCAL NOISE GATE (off-topic comparison): '{}' is a comparison page but mentions none of the query entities {:?} -> relevance *= 0.3",
                     r.title.chars().take(60).collect::<String>(), substantive_terms
                 );
+            } else if r.is_local && comparison_query && !comparison_entities.is_empty() {
+                // D3 fix: for a comparison query, a LOCAL page that names NONE of
+                // the compared entities (brand+model tokens like "brezza"/"venue")
+                // is off-topic crawl noise EVEN when it shares generic attribute
+                // words ("mileage", "petrol", "real world"). E.g. "Honda City
+                // Mileage" floating above the actual Brezza/Venue results for a
+                // "Brezza vs Venue mileage" query, because the local index scored it
+                // on the shared attribute words and its relevance was never crushed.
+                // The compared entities are derived from the query's OWN distinctive
+                // terms minus attribute/structure vocab, so this is fully general:
+                // it fires for any comparison ("swift vs nexon", "city vs amaze",
+                // ...) and never names a specific brand/model. Crush hard so on-topic
+                // web pages (which DO name the entities) win the slot.
+                let mentions_compared = comparison_entities.iter().any(|e| {
+                    title_lower.contains(e.as_str()) || content_lower.contains(e.as_str())
+                });
+                if !mentions_compared {
+                    relevance *= 0.05;
+                    tracing::info!(
+                        "LOCAL NOISE GATE (D3 compared-entity): '{}' names none of the compared entities {:?} for comparison query -> relevance x0.05",
+                        r.title.chars().take(60).collect::<String>(), comparison_entities
+                    );
+                }
             } else if r.is_local && distinctive_terms.len() >= 3 && overlap < 0.34 {
                 // P2c (this round): a LOCAL page that shares only a small FRACTION of the
                 // query's distinctive terms is crawl noise, not a real match. The checks above
@@ -6690,10 +6750,41 @@ fn merge_local_and_web(
         // -> "QR Code Generator") to the top regardless of relevance. The merge-time
         // consensus *1.5 boost still prefers genuinely-good local pages.
         let local_bonus = if r.is_local && relevance >= 0.35 {
-            (relevance * 0.45).min(0.45)
+            // D3 (this task): a comparison query's local_bonus must require the page
+            // to actually name at least ONE of the compared entities. This stops a
+            // brand-ambiguous local page (e.g. "Honda City Mileage" for a
+            // "Brezza vs Venue" query) from earning the bonus purely on shared
+            // generic attribute words while naming neither compared entity — the
+            // exact mechanism that floated the off-topic brand above on-topic web.
+            // `comparison_entities` is derived from the query (no brand literals), so
+            // this generalises. For non-comparison queries the gate is unchanged.
+            let passes_entity_gate = !comparison_query
+                || comparison_entities.is_empty()
+                || comparison_entities.iter().any(|e| {
+                    title_lower.contains(e.as_str()) || content_lower.contains(e.as_str())
+                });
+            if passes_entity_gate {
+                (relevance * 0.45).min(0.45)
+            } else {
+                0.0
+            }
         } else {
             0.0
         };
+        // Comparison-entity coverage boost: for a comparison query, results that name
+        // BOTH compared entities (or >= half of them) are the genuinely comparative
+        // pages the user wants (e.g. "Brezza vs Venue" mileage page). Lift them
+        // modestly so they surface above single-entity or off-topic pages. Counts are
+        // derived from the query's own entities; no per-brand tuning.
+        if comparison_query && query_entity_count >= 2 {
+            let named = comparison_entities.iter().filter(|e| {
+                title_lower.contains(e.as_str()) || content_lower.contains(e.as_str())
+            }).count() as f32;
+            let frac = named / query_entity_count as f32;
+            if frac >= 0.5 {
+                relevance *= 1.12;
+            }
+        }
         // Geo-relevance boost: boost results that mention the user's country, region, or city.
         // Higher boost for city-level matches (0.25) than country-level (0.10).
         let geo_boost = geo_location.map(|g| geo_relevance_score(&r.title, &r.content, &r.url, g)).unwrap_or(0.0);
@@ -7313,6 +7404,38 @@ fn merge_local_and_web(
                             weak_cap, r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len()
                         );
                         r.score = weak_cap;
+                    }
+                }
+            }
+
+            // (c) COMPARISON off-topic local result (D3, this task).
+            // The in-loop D3 gate crushes the relevance of a local page that names
+            // NONE of the query's compared entities (e.g. "Honda City Mileage" for a
+            // "Brezza vs Venue" query). But calibrate_scores (and the thin-result
+            // boost) rescales it right back to the top band, so the off-topic brand
+            // still outranks the genuine Brezza/Venue pages — the exact bug. Re-apply
+            // the cap AFTER calibration so it survives, matching the durable pattern
+            // used by the D1/D2/D3 (weak-match) caps above. `compared_entities` is
+            // derived from the query's own distinctive terms minus attribute/structure
+            // vocab (no brand literals), so this is fully general: it fires for any
+            // comparison ("swift vs nexon", "city vs amaze", ...) and never names a
+            // specific brand/model. A local page that names none of the compared
+            // entities may still appear (floor preserved) but can never outrank the
+            // genuine comparative web/local pages. RELATIVE cap (like the video cap)
+            // so it holds in both healthy ([0.05,1.0]) and weak-set ([0.05,0.12])
+            // calibration regimes.
+            if r.is_local && comparison_query && !comparison_entities.is_empty() {
+                let names_entity = comparison_entities.iter().any(|e| {
+                    rl.contains(e.as_str()) || cl.contains(e.as_str()) || ul.contains(e.as_str())
+                });
+                if !names_entity {
+                    let d3_cap = (best_non_video * 0.6).max(0.05);
+                    if r.score > d3_cap {
+                        tracing::info!(
+                            "POST-CAL D3 COMP-CAP -> {:.2}: '{}' names none of compared entities {:?} (best_text={:.2})",
+                            d3_cap, r.url.chars().take(60).collect::<String>(), comparison_entities, best_non_video
+                        );
+                        r.score = d3_cap;
                     }
                 }
             }
