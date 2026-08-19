@@ -6480,9 +6480,146 @@ fn merge_local_and_web(
             // it — so CAP relevance to a low value so the adaptive floor crushes it.
             relevance = relevance.min(0.12);
         }
+
+        // D5/D6 flags: set when a generic vendor/affiliate page lacks the query's
+        // specific subject terms; applied as a hard final-score suppression below.
+        let mut vendor_affiliate_suppress = false;
+        let mut vendor_affiliate_final_mult = 1.0f32;
+
+        // ── Vendor / affiliate generic-page dampening (D5/D6) ──
+        // Defect: on transactional / comparison-shopping queries, a GENERIC
+        // vendor / affiliate / buyers-guide page (often carrying the
+        // `official_vendor` source tag, or a /buyers-guide/ / affiliate URL, or a
+        // generic "home warranty" sales title) floats to #1 because it shares a
+        // generic commercial token with the query ("buy", "warranty", "earbuds")
+        // while missing the user's SPECIFIC product / attribute terms (used /
+        // iphone / bangalore; bluetooth / microphone / calls). On thin or
+        // tie-broken result sets the flat official_vendor + local bonuses lift it
+        // above genuinely on-topic product pages. Prior rounds' local-noise gate
+        // only fired on low-indexer-quality local pages, not these.
+        //
+        // General fix (no query/domain literals): a page is a "generic vendor /
+        // affiliate" page when it (a) carries the `official_vendor` source, or
+        // (b) is a buyers-guide / affiliate page by URL or title structure, or
+        // (c) is a generic warranty-sales page. We then require it to actually
+        // name the query's SPECIFIC subject terms — the strong distinctive terms
+        // MINUS generic commerce-function words (buy/warranty/price/used/...). If
+        // it matches fewer than ceil(N/2) of those specific terms, it is a
+        // generic commercial page, not the product the user asked for, so we
+        // dampen relevance (which folds into the FINAL score, so the penalty
+        // bites). This preserves a REAL official_vendor result for a query that
+        // IS about that vendor: when the query literally names a known vendor
+        // brand (the same signal that justified the `official_vendor` tag in the
+        // download/nav deep-dive), we exempt it — so "download nvidia driver" ->
+        // nvidia.com stays boosted, but a mis-tagged "How To Buy a Home Warranty"
+        // for a "used iphone ... bangalore" query is crushed. Fully general:
+        // thresholds are term-count math; the only constant lists are a general
+        // commerce-function vocabulary and the existing vendor-brand concept.
+        {
+            let generic_commerce_terms: &[&str] = &[
+                "buy", "buying", "purchase", "purchasing", "shop", "shopping",
+                "store", "price", "prices", "cheap", "sale", "sales", "deal",
+                "deals", "discount", "coupon", "best", "top", "warranty",
+                "warranties", "cost", "budget", "under", "near", "where", "used",
+                "new", "refurbished", "sell", "selling", "order", "cart", "free",
+                "review", "reviews", "compare", "comparison",
+            ];
+            let vendor_brand_tokens: &[&str] = &[
+                "nvidia", "amd", "intel", "realtek", "microsoft", "dell", "hp",
+                "lenovo", "asus", "msi", "gigabyte", "logitech", "corsair",
+                "razer", "apple", "oracle", "videolan", "vlc",
+            ];
+            let is_vendor_source = r.sources.iter().any(|s| s == "official_vendor");
+            let is_buyers_guide = title_lower.contains("buyer's guide")
+                || title_lower.contains("buyers guide")
+                || title_lower.contains("buying guide")
+                || title_lower.contains("buyer guide")
+                || url_lower.contains("/buyers-guide/")
+                || url_lower.contains("/buyer-guide/")
+                || url_lower.contains("/buyers-guides/")
+                || url_lower.contains("/buyer-guides/")
+                || url_lower.contains("/affiliate/")
+                || url_lower.contains("/affiliates/");
+            // Generic warranty-sales page (e.g. "How To Buy a Home Warranty"):
+            // a "how to buy a <X> warranty" / "<X> warranty plan/company" pattern
+            // is an affiliate sales page, not the product the user searched for.
+            let is_warranty_sales = (title_lower.starts_with("how to buy a")
+                || title_lower.starts_with("how to get a")
+                || title_lower.contains("home warranty")
+                || title_lower.contains("extended warranty")
+                || title_lower.contains("warranty plan")
+                || title_lower.contains("warranty company")
+                || title_lower.contains("warranty companies"))
+                && !strong_distinctive_terms.is_empty();
+            let is_vendor_affiliate = is_vendor_source || is_buyers_guide || is_warranty_sales;
+
+            if is_vendor_affiliate && !strong_distinctive_terms.is_empty() {
+                // Exempt a genuine official_vendor result whose query IS about
+                // that vendor (matches the deep-dive that tagged it).
+                let legit_vendor = is_vendor_source
+                    && vendor_brand_tokens.iter().any(|b| clean_query.to_lowercase().contains(*b));
+                if !legit_vendor {
+                    let specific_terms: Vec<String> = strong_distinctive_terms
+                        .iter()
+                        .map(|t| t.to_lowercase())
+                        .filter(|tl| !generic_commerce_terms.contains(&tl.as_str()))
+                        .collect();
+                    if !specific_terms.is_empty() {
+                        let specific_matches = specific_terms.iter().filter(|tl| {
+                            title_lower.contains(tl.as_str())
+                                || content_lower.contains(tl.as_str())
+                                || url_lower.contains(tl.as_str())
+                        }).count();
+                        let need = if specific_terms.len() <= 1 {
+                            1
+                        } else {
+                            (specific_terms.len() + 1) / 2 // ceil(N/2)
+                        };
+                        if specific_matches < need {
+                            relevance *= 0.3;
+                            // Mark for hard final-score suppression below. `relevance`
+                            // alone is not enough: `intent_boost` / `freshness` are
+                            // computed independently of relevance (see the
+                            // off_topic_struct starvation block) and feed `base` at
+                            // full weight, so calibrate_scores rescales the max raw
+                            // score to 1.0 and undoes a relevance-only crush. We
+                            // therefore also starve those signals and apply a hard
+                            // final multiplier so a generic sales page can never ride
+                            // the transactional intent_boost to #1 over on-topic
+                            // product pages.
+                            vendor_affiliate_suppress = true;
+                            tracing::info!(
+                                "VENDOR/AFFILIATE DAMPEN x0.3: '{}' is generic vendor/affiliate (src={:?}, buyers_guide={}, warranty_sales={}) and matches only {}/{} specific subject terms (need {})",
+                                r.title.chars().take(60).collect::<String>(),
+                                r.sources, is_buyers_guide, is_warranty_sales,
+                                specific_matches, specific_terms.len(), need
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let mut intent_boost = calculate_intent_boost(&r.url, &r.title, &clean_query, intent);
         let mut freshness = freshness_score(&r.url, intent, r.published_date.as_deref(), &r.title, &r.content);
         let mut quality = content_quality_score(&r.content);
+
+        // Hard suppression for generic vendor/affiliate pages (D5/D6), applied
+        // AFTER intent_boost/freshness are computed so we can starve them. Folded
+        // into the FINAL score so it actually bites (a relevance-only multiply is
+        // undone by calibrate_scores' max-rescale). Mirrors the off_topic_struct
+        // block: zero the independently-computed intent_boost + freshness, and
+        // apply a flat final multiplier. Exempts a genuine official_vendor result
+        // whose query names the vendor (the flag stayed false above).
+        if vendor_affiliate_suppress {
+            intent_boost = 0.0;
+            freshness = 0.0;
+            vendor_affiliate_final_mult = 0.2;
+            tracing::info!(
+                "VENDOR/AFFILIATE SUPPRESS: '{}' — intent_boost+freshness zeroed, final x0.2",
+                r.title.chars().take(60).collect::<String>()
+            );
+        }
 
         // ── Off-topic structural starvation (this round, #01) ──
         // The generic-word guard above already crushes relevance (×0.12) for results that
@@ -7045,7 +7182,7 @@ fn merge_local_and_web(
             1.0
         };
 
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult;
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult;
         // Capture this result's relevance for the post-loop adaptive-floor pass.
         relevance_vec.push(relevance);
     }
