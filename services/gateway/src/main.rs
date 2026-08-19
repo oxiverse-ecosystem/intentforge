@@ -3876,6 +3876,91 @@ fn geo_relevance_score(title: &str, content: &str, url: &str, geo: &geoloc::GeoL
     boost
 }
 
+/// Whole-word (or whole multi-word phrase) substring test. `"in"` never matches
+/// inside `"india"`, and `"new york"` requires the full contiguous phrase. Used by
+/// the cross-location mismatch guard below so country/city name collisions don't
+/// fire on incidental substring hits.
+fn whole_word_contains(haystack: &str, needle: &str) -> bool {
+    let n = needle.to_lowercase();
+    if n.contains(' ') {
+        return haystack.contains(&n);
+    }
+    haystack
+        .split_whitespace()
+        .any(|w| w.trim_matches(|c: char| !c.is_alphanumeric()) == n)
+}
+
+/// Cross-location mismatch penalty (local/geo round defect, 2026-08-19).
+///
+/// When the user NAMES a place in the query (explicit geo), a result that talks
+/// about a *different* known place but never mentions the requested place is
+/// almost certainly wrong for that query — e.g. "yoga studios in chennai"
+/// surfacing a page about Orlando, or "street food in bangalore" surfacing a
+/// Chennai page. We dampen such results so the requested-place results win.
+///
+/// Design (no hardcoding):
+///   • Reuses the SAME `LOCATION_GAZETTEER` reference data as geo detection, so it
+///     stays in sync and needs no per-query literals or denylists.
+///   • Only fires on EXPLICIT query locations (`geo_is_explicit`), so a user's
+///     IP-derived country never penalises legitimately different-city pages.
+///   • If the result already mentions the requested place, it is on-topic for the
+///     location → never penalised (covers inclusive "best in <country>" lists that
+///     also name the requested city).
+///   • A result that mentions a different place is dampened hard but kept present
+///     (fail-soft, not a hard drop).
+///   • Country-level requests forgive same-country places (a "india" query should
+///     not penalise a "chennai" page); city-level requests DO penalise other cities
+///     even in the same country (chennai ≠ bangalore).
+///   • 2-letter gazetteer codes ("us", "uk") are skipped as mismatch candidates to
+///     avoid pronoun/function-word false hits ("…let us know…").
+fn cross_location_mismatch_mult(
+    title: &str,
+    content: &str,
+    geo: Option<&geoloc::GeoLocation>,
+) -> f32 {
+    let geo = match geo {
+        Some(g) => g,
+        None => return 1.0,
+    };
+    let req_city = geo.city.as_deref();
+    let req_country = geo.country_name.as_deref();
+    let req_cc = geo.country_code.as_deref();
+    let text = format!("{} {}", title.to_lowercase(), content.to_lowercase());
+
+    // On-topic for the requested location → never penalise.
+    let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
+        || req_country.map_or(false, |c| whole_word_contains(&text, c));
+    if mentions_req {
+        return 1.0;
+    }
+
+    // City-level requests penalise other (even same-country) cities; country-level
+    // requests forgive same-country places.
+    let same_country_ok = req_city.is_none();
+    for (name, cc) in LOCATION_GAZETTEER.iter() {
+        if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        if same_country_ok {
+            if let Some(rc) = req_cc {
+                if cc.eq_ignore_ascii_case(rc) {
+                    continue;
+                }
+            }
+        }
+        if name.len() < 3 {
+            continue; // skip 2-letter codes (us/uk) to avoid false hits
+        }
+        if whole_word_contains(&text, name) {
+            return 0.4;
+        }
+    }
+    1.0
+}
+
 /// Detect if a search query has local intent (seeking nearby/nearby results).
 /// Returns `true` if the query contains signals like "near me", "nearby", etc.
 fn has_local_intent(query: &str) -> bool {
@@ -5484,6 +5569,9 @@ fn merge_local_and_web(
 ) -> Vec<MergedResult> {
     let mut merged: Vec<MergedResult> = Vec::new();
     let mut url_to_idx: HashMap<String, usize> = HashMap::new();
+    // Explicit query location? (user named a place) — gates the cross-location
+    // mismatch penalty so IP-derived geo never penalises different-city pages.
+    let geo_is_explicit = detect_explicit_location(query).is_some();
 
     // Helper: normalize URL for dedup matching
     let normalize = |url: &str| -> String {
@@ -6670,7 +6758,13 @@ fn merge_local_and_web(
             }
         };
 
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult;
+        let cross_loc_mult = if geo_is_explicit {
+            cross_location_mismatch_mult(&r.title, &r.content, geo_location)
+        } else {
+            1.0
+        };
+
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult;
         // Capture this result's relevance for the post-loop adaptive-floor pass.
         relevance_vec.push(relevance);
     }
