@@ -427,6 +427,20 @@ struct MergedResult {
 
 fn default_f32_one() -> f32 { 1.0 }
 
+/// D4 (2026-08-18T1340Z round): identify the upstream engine that produced a
+/// merged result so per-engine trust can be gated. Local-only results report
+/// "local"; web/merged results report their non-local, non-instance upstream
+/// engine label (e.g. "bing", "brave"). Pure structural inspection of `sources`
+/// — no query/domain literals, so it generalises to any upstream.
+fn primary_engine(r: &MergedResult) -> String {
+    for s in &r.sources {
+        if s != "local" && !s.starts_with("instance_") {
+            return s.clone();
+        }
+    }
+    r.sources.first().cloned().unwrap_or_else(|| "local".to_string())
+}
+
 #[derive(Serialize, Clone, Debug)]
 struct DeepResult {
     result_type: String,
@@ -5906,6 +5920,66 @@ fn merge_local_and_web(
         .filter(|w| !is_weak_anchor_word(&w.to_lowercase()))
         .collect();
 
+    // ── D4 (2026-08-18T1340Z round): per-engine upstream-quality trust ──
+    // The fresh-date hard window must fail-OPEN when upstream returns no dates
+    // (otherwise a fresh query collapses to 0 results). But that fail-open lets a
+    // DATE-BLIND upstream engine — one that returned ZERO date-bearing results
+    // while OTHER engines returned dated ones — keep its junk. That junk still
+    // carries a high RRF position + domain authority, so the ranking trusts it
+    // even though it is visibly off-topic for a "recent … this budget season"
+    // query. We derive a per-engine trust multiplier purely from each engine's
+    // OWN date-signal behaviour on THIS query: an engine that returned ≥1 dated
+    // result when the query is fresh+dated earns full trust; an engine that
+    // returned NONE while others did is treated as low-trust (its fresh-intent
+    // results get crushed). No engine names, no per-query literals — only the
+    // structural signal "did this engine surface any dated result for this fresh
+    // query". General & self-adapting across upstreams and time.
+    // COLD-CASE GUARD: only populated when some engine returned a date. If NO
+    // engine had any dated result (every upstream is date-blind), the map stays
+    // empty and every result keeps trust 1.0 — there is no corroboration signal
+    // to single one engine out, so we must not crush blindly. Local results are
+    // exempt (kept at 1.0) — they are not "upstream engines" and the local-index
+    // quality gates already handle them.
+    let engine_trust: std::collections::HashMap<String, f32> = {
+        let mut m = std::collections::HashMap::new();
+        if intent == "fresh" {
+            let mut per_engine_dated: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut any_engine_dated = false;
+            for r in &merged {
+                let eng = primary_engine(r);
+                if eng == "local" {
+                    continue; // local not an upstream engine for trust purposes
+                }
+                if resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some() {
+                    *per_engine_dated.entry(eng).or_insert(0) += 1;
+                    any_engine_dated = true;
+                }
+            }
+            if any_engine_dated {
+                let mut web_engines: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for r in &merged {
+                    let eng = primary_engine(r);
+                    if eng != "local" {
+                        web_engines.insert(eng);
+                    }
+                }
+                for eng in web_engines {
+                    let dated = per_engine_dated.get(&eng).copied().unwrap_or(0);
+                    if dated == 0 {
+                        m.insert(eng.clone(), 0.15);
+                        tracing::info!(
+                            "D4 ENGINE TRUST: upstream '{}' returned 0 dated results on a fresh+dated query while others did — trust=0.15 (crush)",
+                            eng
+                        );
+                    } else {
+                        m.insert(eng.clone(), 1.0);
+                    }
+                }
+            }
+        }
+        m
+    };
+
     // ── Comparison-query compared-entity extraction (D3 fix) ──
     // For "compare X and Y" / "X vs Y" queries, the SPECIFIC compared entities
     // (brand+model tokens like "brezza"/"venue") are what make a result on-topic.
@@ -6431,6 +6505,63 @@ fn merge_local_and_web(
             intent_boost = 0.0;
         }
 
+        // ── D4 (2026-08-18T1340Z round): per-engine upstream-quality trust ──
+        // A fresh+dated query whose date window failed OPEN (no dates upstream →
+        // can't hard-drop) can still carry DATE-BLIND upstream junk that trusts
+        // its way to the top via RRF position + authority. We lower the trust of
+        // results whose upstream engine returned ZERO dated results while OTHER
+        // engines returned dated ones for this same query (see engine_trust map
+        // above). Trust is derived, not hardcoded: full for engines that surfaced
+        // dates, crushed (×0.12) for the corroborated date-blind engine. Local
+        // results and non-fresh intents are untouched (trust stays 1.0). This is
+        // the "lower trust for the low-quality upstream" half of the D4 fix.
+        let engine_trust_mult: f32 = if intent == "fresh" && !engine_trust.is_empty() {
+            let eng = primary_engine(r);
+            *engine_trust.get(&eng).unwrap_or(&1.0f32)
+        } else {
+            1.0
+        };
+
+        // ── D4 (2026-08-18T1340Z round): stronger fresh-intent off-topic crush ──
+        // The off_topic_struct gate above only fires when the result shares NO
+        // distinctive query term at all. For a fresh+dated query where the date
+        // window failed open, a date-blind upstream can return results that DO
+        // borrow one generic query word (so off_topic_struct misses them) yet are
+        // still clearly junk — no distinctive TOPIC term AND no date signal. We
+        // add a fresh-intent-specific crush: when the query is fresh AND the
+        // result shares no distinctive topic term AND carries no date, treat it
+        // as off-topic and starve freshness + intent_boost (and dampen relevance),
+        // so the dated, topic-bearing results from the good upstream win. This is
+        // the "stronger off-topic crush for fresh intent" half of the D4 fix.
+        // Keyed on (no distinctive topic term) + (no date signal) so it never
+        // touches a result that is dated or that names the topic — general, no
+        // query/domain literals.
+        let mut d4_off_topic = false;
+        if intent == "fresh" && !strong_distinctive_terms.is_empty() {
+            let has_distinctive = strong_distinctive_terms.iter().any(|t| {
+                let tl = t.to_lowercase();
+                title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
+            });
+            let has_date = resolve_item_date(
+                r.published_date.as_deref(),
+                &r.url,
+                &r.title,
+                &r.content,
+            ).is_some();
+            if !has_distinctive && !has_date {
+                d4_off_topic = true;
+            }
+        }
+        if d4_off_topic {
+            freshness = 0.0;
+            intent_boost = 0.0;
+            relevance *= 0.12;
+            tracing::info!(
+                "D4 FRESH OFF-TOPIC CRUSH x0.12: '{}' shares no distinctive topic term and has no date signal (fresh intent, date window failed open)",
+                r.url.chars().take(60).collect::<String>()
+            );
+        }
+
         // ── Fresh-intent news-portal demotion (this round, #16/#22) ──
         // For FRESH intent, upstream often returns ONLY the bare homepage or top-level
         // section of a major news portal (cnn.com/, bbc.com/news/world, foxnews.com/)
@@ -6914,7 +7045,7 @@ fn merge_local_and_web(
             1.0
         };
 
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult;
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult;
         // Capture this result's relevance for the post-loop adaptive-floor pass.
         relevance_vec.push(relevance);
     }
@@ -13253,6 +13384,80 @@ mod hardcoding_ruling_tests {
             vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
         assert_eq!(out.len(), 1, "adult result kept when query is explicitly adult");
+    }
+
+    // D4 (2026-08-18T1340Z round): a fresh+dated query where one upstream engine
+    // returned ONLY date-less off-topic junk while a SIBLING engine returned dated
+    // results must crush the date-blind engine's junk below the dated, on-topic
+    // result. This is the per-engine trust half of the D4 fix — no engine names in
+    // the ranking code, only each engine's own date-signal behaviour on the query.
+    fn web_res_dated(url: &str, title: &str, content: &str, engine: &str, date: Option<&str>) -> SearxResult {
+        SearxResult {
+            title: title.to_string(),
+            url: url.to_string(),
+            content: content.to_string(),
+            engine: engine.to_string(),
+            score: 1.0,
+            sources: vec![engine.to_string()],
+            published_date: date.map(|s| s.to_string()),
+            price: None,
+            currency: None,
+        }
+    }
+
+    #[test]
+    fn d4_dateblind_upstream_crushed_below_dated_sibling() {
+        let q = "recent changes to the indian income tax slabs announced this budget season";
+        // bing: date-blind junk (no date, no distinctive topic term) — the D4 defect.
+        let bing_junk = web_res_dated(
+            "https://www.bing.com/Recent - Design Inspiration",
+            "Recent - Design Inspiration",
+            "random inspiration gallery",
+            "bing",
+            None,
+        );
+        // brave: the genuine dated, on-topic result.
+        let brave_good = web_res_dated(
+            "https://www.livemint.com/income-tax-slabs-budget-2026-changes",
+            "Income Tax Slabs Budget 2026: changes announced this budget season",
+            "the indian income tax slabs changed in the budget announced this season",
+            "brave",
+            Some("2026-02-01"),
+        );
+        let web = vec![bing_junk, brave_good];
+        let out = merge_local_and_web(
+            vec![], web, q, "fresh", &cst(), None, None, &empty_sem(),
+        );
+        assert_eq!(out.len(), 2, "both results must survive (no hard date-drop on fresh query)");
+        // The dated, on-topic brave result must outrank the date-blind bing junk.
+        let brave = out.iter().find(|r| r.url.contains("livemint")).expect("brave result present");
+        let bing = out.iter().find(|r| r.url.contains("bing.com")).expect("bing result present");
+        assert!(
+            brave.score > bing.score,
+            "dated on-topic result (score={}) must outrank date-blind junk (score={})",
+            brave.score, bing.score
+        );
+    }
+
+    #[test]
+    fn d4_trust_only_when_sibling_has_dates() {
+        // Cold case: EVERY engine is date-blind. No corroboration signal, so NO
+        // engine must be crushed blindly — trust stays 1.0 for all. This guards
+        // against the fix itself regressing ordinary fresh queries where upstream
+        // simply returns no dates.
+        let q = "latest vegan thanksgiving recipes 2026";
+        let web = vec![
+            web_res_dated("https://a.example.com/v1", "Vegan Thanksgiving Recipes", "recipes", "bing", None),
+            web_res_dated("https://b.example.com/v2", "More Vegan Thanksgiving", "recipes", "brave", None),
+        ];
+        let out = merge_local_and_web(
+            vec![], web, q, "fresh", &cst(), None, None, &empty_sem(),
+        );
+        assert_eq!(out.len(), 2, "both survive");
+        // Neither should have been trust-crushed (every engine date-blind → map empty).
+        for r in &out {
+            assert!(r.score > 0.5, "date-blind-only query must not crush results, got {}", r.score);
+        }
     }
 }
 
