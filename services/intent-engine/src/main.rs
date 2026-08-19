@@ -257,6 +257,8 @@ fn normalize_spoken_numbers(query: &str) -> String {
         ("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50),
         ("sixty", 60), ("seventy", 70), ("eighty", 80), ("ninety", 90),
     ];
+    let price_markers = ["under", "below", "less", "over", "more", "max", "min"];
+    let currency_words = ["dollars", "dollar", "rupees", "rupee", "euros", "euro", "pounds", "pound", "yen", "won", "usd", "inr", "eur", "gbp", "jpy", "krw"];
     let tokens: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
     let mut out: Vec<String> = Vec::with_capacity(tokens.len());
     let mut i = 0;
@@ -278,40 +280,41 @@ fn normalize_spoken_numbers(query: &str) -> String {
                 run.push(t.clone());
                 j += 1;
             }
+            // Check if this number run is adjacent to a price context
+            let prev_is_price_marker = i > 0 && price_markers.iter().any(|m| tokens[i - 1].contains(m));
+            let next_is_currency = j < tokens.len() && currency_words.iter().any(|c| tokens[j].contains(c));
+            let is_price_context = prev_is_price_marker || next_is_currency;
+
             let mut total: i64 = 0;
             let mut current: i64 = 0;
             let mut has_any = false;
-            let mut saw_scale = false;
             for w in &run {
                 if *w == "hundred" {
                     if current == 0 { current = 1; }
-                    total += current * 100;
-                    current = 0;
-                    saw_scale = true;
+                    current *= 100;
+                    has_any = true;
                 } else if *w == "thousand" {
                     if current == 0 { current = 1; }
                     total += current * 1000;
                     current = 0;
-                    saw_scale = true;
+                    has_any = true;
                 } else {
                     let v = units.iter().find(|(w2, _)| w2 == w).map(|(_, v)| *v).unwrap_or(0);
-                    if v >= 10 && v <= 90 && v % 10 == 0 {
-                        current += v as i64;
-                    } else {
-                        if v < 10 { current += v as i64; }
-                        else { current += v as i64; }
-                    }
+                    current += v as i64;
                     has_any = true;
                 }
             }
             let value = if total == 0 && current == 0 { 0 } else { total + current };
-            if has_any {
+            if has_any && is_price_context {
                 out.push(value.to_string());
                 i = j;
                 continue;
             } else {
-                out.push(tok.clone());
-                i += 1;
+                // Not a price context or no number parsed - preserve original tokens
+                for t in &run {
+                    out.push(t.clone());
+                }
+                i = j;
                 continue;
             }
         }

@@ -978,42 +978,24 @@ mod tests {
     fn goal_terms_retains_short_technical_terms() {
         // Finding 1 regression: short technical terms like "AI" and "Go" must be
         // retained in objectives/deliverables even though they're <3 chars.
-        let goal = "Build an AI app";
-        let goal_lower = goal.to_lowercase();
-        let goal_terms: Vec<String> = goal_lower
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| {
-                let tl = t.trim();
-                let short_tech_terms = ["ai", "ml", "go", "c", "r", "ui", "ux", "io", "ar", "vr"];
-                (tl.len() >= 3 || short_tech_terms.contains(&tl))
-                    && !["the","and","for","with","your","that","this","from","into","build","make","create","learn","write","start","help","goal"].contains(&tl)
-            })
-            .map(|t| t.to_string())
-            .collect();
+        let goal1 = "Build an AI app";
+        let (_title1, _desc1, objs1, dels1, _ctype1) = phase_content(0, 3, goal1, &[]);
+        let phase1_text = format!("{} {}", objs1.join(" "), dels1.join(" ")).to_lowercase();
 
-        assert!(goal_terms.contains(&"ai".to_string()),
-            "short technical term 'AI' must be retained, got: {:?}", goal_terms);
-        assert!(goal_terms.contains(&"app".to_string()),
-            "'app' must be retained, got: {:?}", goal_terms);
+        assert!(phase1_text.contains("ai"),
+            "short technical term 'ai' must be retained in phase content, got objectives: {:?}, deliverables: {:?}", objs1, dels1);
+        assert!(phase1_text.contains("app"),
+            "'app' must be retained in phase content, got objectives: {:?}, deliverables: {:?}", objs1, dels1);
 
         // Verify "Go" is also retained
         let goal2 = "Learn Go programming";
-        let goal2_lower = goal2.to_lowercase();
-        let goal2_terms: Vec<String> = goal2_lower
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| {
-                let tl = t.trim();
-                let short_tech_terms = ["ai", "ml", "go", "c", "r", "ui", "ux", "io", "ar", "vr"];
-                (tl.len() >= 3 || short_tech_terms.contains(&tl))
-                    && !["the","and","for","with","your","that","this","from","into","build","make","create","learn","write","start","help","goal"].contains(&tl)
-            })
-            .map(|t| t.to_string())
-            .collect();
+        let (_title2, _desc2, objs2, dels2, _ctype2) = phase_content(0, 3, goal2, &[]);
+        let phase2_text = format!("{} {}", objs2.join(" "), dels2.join(" ")).to_lowercase();
 
-        assert!(goal2_terms.contains(&"go".to_string()),
-            "short technical term 'Go' must be retained, got: {:?}", goal2_terms);
-        assert!(goal2_terms.contains(&"programming".to_string()),
-            "'programming' must be retained, got: {:?}", goal2_terms);
+        assert!(phase2_text.contains("go"),
+            "short technical term 'go' must be retained in phase content, got objectives: {:?}, deliverables: {:?}", objs2, dels2);
+        assert!(phase2_text.contains("programming"),
+            "'programming' must be retained in phase content, got objectives: {:?}, deliverables: {:?}", objs2, dels2);
     }
 
     #[test]

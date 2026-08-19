@@ -165,8 +165,14 @@ def test_quick_roadmap_phase_count(session):
 
 def test_leaderboard_is_list(session):
     """#3 + #6 GET /goals/leaderboard -> 200 AND response is a LIST (JSON array)."""
-    # Ensure at least one goal exists so the board is non-empty.
-    _create_goal(session)
+    # Ensure at least one goal with a roadmap exists so the board is non-empty
+    # and the leaderboard contains a populated entry.
+    r = session.post(
+        f"{BASE}/goals/quick",
+        json={"goal": "build a rust CLI tool for the leaderboard test"},
+        timeout=60,
+    )
+    assert r.status_code == 200, f"POST /goals/quick -> {r.status_code}"
     time.sleep(1)  # let the store persist
     r = session.get(f"{BASE}/goals/leaderboard", timeout=10)
     assert r.status_code == 200, f"GET /goals/leaderboard -> {r.status_code}"

@@ -909,7 +909,15 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
         "research", "study", "report", "headline", "headlines", "article", "post",
         "developments", "advances", "this week", "this month", "this year", "published",
     ];
-    let has_news_term = news_terms.iter().any(|t| q_has_word(q_lower, t) || q_lower.contains(t));
+    let has_news_term = news_terms.iter().any(|t| {
+        if t.contains(' ') {
+            // Multi-word phrase: use substring matching
+            q_lower.contains(t)
+        } else {
+            // Single word: use whole-word matching only
+            q_has_word(q_lower, t)
+        }
+    });
     if q_has_word(q_lower, "recent") || q_has_word(q_lower, "latest") {
         // "recent"/"latest" are almost always temporal on their own ("latest news",
         // "recent breakthroughs", "latest movies"). Keep them as recency signals.
@@ -2212,7 +2220,11 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         }
         
         if is_neg {
-            if !clean_p.is_empty() && clean_p.split_whitespace().count() <= 2 {
+            if clean_p.split_whitespace().count() <= 4
+                && !clean_p.is_empty()
+                && !is_exclusion_grammar_noise(&clean_p)
+                && !is_subjective_quality_term(&clean_p)
+            {
                 if !negative.contains(&clean_p) {
                     negative.push(clean_p);
                 }
@@ -2452,11 +2464,20 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
         "mile", "miles", "mi", "meter", "meters", "metre", "metres",
         "foot", "feet", "ft", "yard", "yards", "yd",
     ];
+    static DISTANCE_REGEXES: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    let distance_res = DISTANCE_REGEXES.get_or_init(|| {
+        distance_units.iter().map(|u| {
+            regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(u))).unwrap()
+        }).collect()
+    });
     let is_distance_bound = |rest_after_num: &str| -> bool {
-        distance_units.iter().any(|u| {
-            let pat = format!(r"(?i)(?:^|[^a-z])\s*{}\b", regex::escape(u));
-            regex::Regex::new(&pat).map(|re| re.is_match(rest_after_num)).unwrap_or(false)
-        })
+        // Skip leading number tokens (the rest may start with the number itself)
+        let after_number = rest_after_num.trim_start()
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == ',' || c == '.');
+        // Only check the first one or two tokens after the numeric value
+        let tokens: Vec<&str> = after_number.split_whitespace().take(2).collect();
+        let check_text = tokens.join(" ");
+        distance_res.iter().any(|re| re.is_match(&check_text))
     };
 
     // Pattern A: upper-marker then number (+ optional currency word)
@@ -4268,23 +4289,74 @@ fn query_is_contrastive(q_orig: &str) -> bool {
 fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<String>) {
     let q_lower = q_orig.to_lowercase();
     let words: Vec<&str> = q_lower.split_whitespace().collect();
+
+    // First pass: identify which word indices are inside negation clauses
+    let neg_markers = ["not", "no", "without", "except", "excluding", "minus"];
+    let stopwords_for_subject = [
+        "not", "no", "without", "except", "excluding", "minus", "other",
+        "rather", "instead", "than", "to", "of", "a", "an", "the", "from",
+        "in", "on", "at", "for", "with", "by", "about", "any", "some",
+        "using", "having", "is", "are", "was", "were", "be", "been",
+        "being", "do", "does", "did", "have", "has", "had", "and", "or"
+    ];
+    let mut in_negation_clause = vec![false; words.len()];
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        let mut is_neg = neg_markers.contains(&w) || w.starts_with('-');
+        let mut skip_marker_len = 1;
+        if i + 1 < words.len() {
+            if (w == "other" || w == "rather") && words[i + 1] == "than" {
+                is_neg = true;
+                skip_marker_len = 2;
+            } else if w == "alternative" && words[i + 1] == "to" {
+                is_neg = true;
+                skip_marker_len = 2;
+            } else if w == "instead" && words[i + 1] == "of" {
+                is_neg = true;
+                skip_marker_len = 2;
+            }
+        }
+        if is_neg {
+            // Mark the negation marker and following words as part of negation clause
+            for j in i..(i + skip_marker_len).min(words.len()) {
+                in_negation_clause[j] = true;
+            }
+            // Mark following content words until we hit another marker or stop
+            let mut j = i + skip_marker_len;
+            while j < words.len() {
+                let wj = words[j];
+                if neg_markers.contains(&wj) || wj.starts_with('-') {
+                    break;
+                }
+                in_negation_clause[j] = true;
+                // Stop at obvious clause boundaries
+                if wj == "and" || wj == "or" {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+
     // Subject terms = every content word in the query that is NOT a negation
-    // marker and NOT a low-signal stopword. When building a compound exclusion we
-    // stop the current target (and finalise it) as soon as one of these subject
-    // terms reappears — that word belongs to the main query topic, not to the
-    // thing being excluded (e.g. "...without django or flask python web frameworks"
-    // must not swallow "python web frameworks" into the `flask` exclusion).
+    // marker and NOT a low-signal stopword and NOT inside a negation clause.
+    // When building a compound exclusion we stop the current target (and finalise it)
+    // as soon as one of these subject terms reappears — that word belongs to the main
+    // query topic, not to the thing being excluded (e.g. "...without django or flask
+    // python web frameworks" must not swallow "python web frameworks" into the `flask`
+    // exclusion).
     let subject_terms: std::collections::HashSet<&str> = words
         .iter()
-        .copied()
-        .filter(|w| {
-            !["not", "no", "without", "except", "excluding", "minus", "other",
-              "rather", "instead", "than", "to", "of", "a", "an", "the", "from",
-              "in", "on", "at", "for", "with", "by", "about", "any", "some",
-              "using", "having", "is", "are", "was", "were", "be", "been",
-              "being", "do", "does", "did", "have", "has", "had", "and", "or"]
-                .contains(w)
+        .enumerate()
+        .filter(|(idx, w)| {
+            !in_negation_clause[*idx] && !stopwords_for_subject.contains(w)
         })
+        .map(|(_, w)| *w)
         .collect();
     let mut terms: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
@@ -7130,10 +7202,12 @@ fn merge_local_and_web(
                     || q_lc_cap.contains("watch")
                     || q_lc_cap.contains("tutorial")
                     || q_lc_cap.contains("animation");
-                if !video_intent {
+                if !video_intent && best_non_video > 0.0 {
                     // Relative cap: a video must never outrank the best non-video
                     // result for a non-video query. best_non_video is computed from the
                     // post-calibration scores before any video was capped this pass.
+                    // Skip capping when no non-video result exists (best_non_video == 0.0)
+                    // so an all-video result set does not flatten to 0.05.
                     let video_cap = (best_non_video * 0.85).max(0.05);
                     if r.score > video_cap {
                         tracing::info!(
