@@ -1465,6 +1465,35 @@ const LOCATION_GAZETTEER: &[(&str, &str)] = &[
     ("bhopal", "IN"), ("patna", "IN"), ("surat", "IN"), ("vadodara", "IN"), ("rajkot", "IN"),
     ("coimbatore", "IN"), ("kochi", "IN"), ("thiruvananthapuram", "IN"), ("visakhapatnam", "IN"),
     ("vijayawada", "IN"), ("mysore", "IN"), ("mangalore", "IN"), ("goa", "IN"), ("singapore", "SG"),
+    // Additional Indian cities so the cross-location gates (soft multiplier + hard local
+    // drop) recognize them as known places. Pure reference data; extends the seed to close
+    // the geo-pollution gap for "restaurants in <city>" where <city> was not yet listed.
+    // SEED, not logic — no per-query hardcoding.
+    ("trichy", "IN"), ("tiruchirappalli", "IN"), ("madurai", "IN"), ("salem", "IN"),
+    ("tirunelveli", "IN"), ("erode", "IN"), ("thoothukudi", "IN"), ("thanjavur", "IN"),
+    ("nashik", "IN"), ("aurangabad", "IN"), ("gwalior", "IN"),
+    ("bhubaneswar", "IN"), ("ranchi", "IN"), ("raipur", "IN"), ("jodhpur", "IN"),
+    ("udaipur", "IN"), ("chandigarh", "IN"), ("amritsar", "IN"), ("ludhiana", "IN"),
+    ("allahabad", "IN"), ("prayagraj", "IN"), ("varanasi", "IN"), ("agra", "IN"),
+    ("dehradun", "IN"), ("jammu", "IN"), ("hubli", "IN"), ("dharwad", "IN"),
+    ("guntur", "IN"), ("nellore", "IN"), ("kurnool", "IN"), ("rajahmundry", "IN"),
+    ("trivandrum", "IN"),
+    // More international cities
+    ("paris", "FR"), ("lyon", "FR"), ("marseille", "FR"), ("munich", "DE"),
+    ("hamburg", "DE"), ("cologne", "DE"), ("frankfurt", "DE"), ("milan", "IT"),
+    ("naples", "IT"), ("turin", "IT"), ("barcelona", "ES"), ("valencia", "ES"),
+    ("seville", "ES"), ("lisbon", "PT"), ("porto", "PT"), ("vienna", "AT"),
+    ("zurich", "CH"), ("geneva", "CH"), ("brussels", "BE"), ("antwerp", "BE"),
+    ("osaka", "JP"), ("kyoto", "JP"), ("busan", "KR"), ("dallas", "US"),
+    ("houston", "US"), ("miami", "US"), ("atlanta", "US"), ("denver", "US"),
+    ("washington", "US"), ("philadelphia", "US"), ("las vegas", "US"),
+    ("manchester", "GB"), ("birmingham", "GB"), ("glasgow", "GB"), ("edinburgh", "GB"),
+    ("brisbane", "AU"), ("perth", "AU"), ("adelaide", "AU"),
+    ("dublin", "IE"), ("stockholm", "SE"), ("nairobi", "KE"),
+    ("accra", "GH"), ("addis ababa", "ET"), ("manila", "PH"), ("cebu", "PH"),
+    ("hanoi", "VN"), ("ho chi minh", "VN"), ("yangon", "MM"), ("phnom penh", "KH"),
+    ("kuala lumpur", "MY"), ("penang", "MY"), ("johannesburg", "ZA"), ("durban", "ZA"),
+    ("ibadan", "NG"), ("kano", "NG"), ("casablanca", "MA"),
     ("sydney", "AU"), ("melbourne", "AU"), ("auckland", "NZ"),
     ("new york", "US"), ("san francisco", "US"), ("los angeles", "US"),
     ("chicago", "US"), ("seattle", "US"), ("boston", "US"), ("austin", "US"),
@@ -7224,6 +7253,57 @@ fn merge_local_and_web(
         let removed = before - merged.len();
         if removed > 0 {
             tracing::info!("OFF_TOPIC_LOCAL_DROP: removed {}/{} local result(s) with zero distinctive-term overlap", removed, before);
+        }
+    }
+
+    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
+    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
+    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
+    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
+    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
+    // because the local base score is large, so other-city pages still floated into
+    // positions 3-5. We hard-drop local results that name a different gazetteer place
+    // and do NOT name the requested city/country.
+    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
+    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
+    // that NAME the requested place are kept. No query/domain literals.
+    if geo_is_explicit {
+        let before = merged.len();
+        merged.retain(|r| {
+            if !r.is_local {
+                return true;
+            }
+            let tl = r.title.to_lowercase();
+            let cl = r.content.to_lowercase();
+            let ul = r.url.to_lowercase();
+            let text = format!("{} {} {}", tl, cl, ul);
+            // On-topic for the requested location → keep.
+            let req_city = geo_location.and_then(|g| g.city.as_deref());
+            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
+            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
+                || req_country.map_or(false, |c| whole_word_contains(&text, c));
+            if mentions_req {
+                return true;
+            }
+            // Mention of a different known place → drop this local page.
+            let same_country_ok = req_city.is_none();
+            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
+            for (name, cc) in LOCATION_GAZETTEER.iter() {
+                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
+                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
+                if same_country_ok {
+                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
+                }
+                if name.len() < 3 { continue; }
+                if whole_word_contains(&text, name) {
+                    return false;
+                }
+            }
+            true
+        });
+        let removed = before - merged.len();
+        if removed > 0 {
+            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
         }
     }
 
