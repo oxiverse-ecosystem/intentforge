@@ -423,6 +423,13 @@ struct MergedResult {
     /// to demote low-signal crawled pages. Defaults to 1.0 for web results.
     #[serde(default = "default_f32_one")]
     quality: f32,
+    /// D4 (2026-08-18T1340Z round): the per-engine trust multiplier applied to
+    /// this result during the web merge. Stored (read-only, debug/observability)
+    /// so tests and operators can SEE whether a result was trust-crushed. 1.0 means
+    /// no crush; <1.0 means D4 crushed this engine's results (a dated sibling existed
+    /// and this engine only returned date-blind junk). Defaults to 1.0.
+    #[serde(default = "default_f32_one")]
+    engine_trust_mult: f32,
 }
 
 fn default_f32_one() -> f32 { 1.0 }
@@ -5759,6 +5766,7 @@ fn merge_local_and_web(
             price: r.price.map(|p| p.to_string()),
             currency: r.currency,
             quality: r.quality,
+            engine_trust_mult: 1.0,
         };
         url_to_idx.insert(norm, merged.len());
         merged.push(entry);
@@ -5813,6 +5821,7 @@ fn merge_local_and_web(
                 price: r.price.clone(),
                 currency: r.currency.clone(),
                 quality: 1.0,
+                engine_trust_mult: 1.0,
             };
             url_to_idx.insert(norm, merged.len());
             merged.push(entry);
@@ -7268,6 +7277,9 @@ fn merge_local_and_web(
         };
 
         r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult;
+        // Capture the D4 per-engine trust multiplier on the result so tests/operators
+        // can observe whether this result was trust-crushed (see engine_trust_mult field).
+        r.engine_trust_mult = engine_trust_mult;
         // Capture this result's relevance for the post-loop adaptive-floor pass.
         relevance_vec.push(relevance);
     }
@@ -13017,6 +13029,7 @@ async fn handle_search_fast(
                         price: r.price.map(|p| p.to_string()),
                         currency: r.currency,
                         quality: r.quality,
+                        engine_trust_mult: 1.0,
                     }).collect::<Vec<_>>()
                 }
                 None => vec![]
@@ -13730,9 +13743,18 @@ mod hardcoding_ruling_tests {
             vec![], web, q, "fresh", &cst(), None, None, &empty_sem(),
         );
         assert_eq!(out.len(), 2, "both survive");
-        // Neither should have been trust-crushed (every engine date-blind → map empty).
+        // COLD-CASE GUARD (the real property this test defends): when EVERY upstream
+        // engine is date-blind, the D4 per-engine trust map stays EMPTY, so no result
+        // is trust-crushed — `engine_trust_mult` must be exactly 1.0 for every result.
+        // (The final `score` is confounded by calibrate_scores, which can floor a
+        // lower-scored result to 0.05 regardless of trust — so we assert the trust
+        // multiplier directly, which is the observable the D4 logic actually controls.)
         for r in &out {
-            assert!(r.score > 0.5, "date-blind-only query must not crush results, got {}", r.score);
+            assert_eq!(
+                r.engine_trust_mult, 1.0,
+                "date-blind-only query must not trust-crush any engine (got {})",
+                r.engine_trust_mult
+            );
         }
     }
 }
