@@ -11338,15 +11338,18 @@ async fn handle_search(
         //     week" → 8/9 dropped, 1 survives = 11%). A near-empty result set is
         //     the same user-facing failure as a zero one: relevant, date-less
         //     results get discarded in favour of a single stale-but-dated item.
-        //     Fail-open when the surviving fraction is below a general 25% floor
-        //     AND the surviving count is too small to be useful (< 3). This is
-        //     keyed on survival ratio, not on any query/window, so it stays general.
+        //     Fail-open when the surviving fraction is at or below a general 25%
+        //     floor AND the surviving count is too small to be useful (< 3). The
+        //     <= (not <) boundary matters: a query whose results are exactly 25%
+        //     dated-and-in-window (e.g. ISRO "latest news" → 1 of 4 survive = 0.25)
+        //     is still a pathologically crushed set and must fail open. Keyed on
+        //     survival ratio, not on any query/window, so it stays general.
         let survivor_fraction = if pre_filter_count > 0 {
             survivors_after_window as f32 / pre_filter_count as f32
         } else {
             1.0
         };
-        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.25;
+        let fraction_too_low = survivors_after_window < 3 && survivor_fraction <= 0.25;
         if survivors_after_window == 0 || fraction_too_low {
             tracing::info!(
                 "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
