@@ -3969,7 +3969,15 @@ fn cross_location_mismatch_mult(
             continue; // skip 2-letter codes (us/uk) to avoid false hits
         }
         if whole_word_contains(&text, name) {
-            return 0.4;
+            // 2026-08-19 round: 0.4 -> 0.12. The old dampening was too weak — for a
+            // sparse upstream an authoritative other-city page (e.g. Bing
+            // "vegetarian restaurants in Ahmedabad" for a "visakhapatnam" query)
+            // kept a 0.4x-of-a-large-base score above the correct on-topic results,
+            // so geo pollution sat in positions 3-6. 0.12x crushes the mismatched
+            // page well below the requested-city results while keeping it present
+            // (fail-soft). Pages that NAME the requested city are exempted earlier
+            // (mentions_req), so inclusive lists stay untouched. General.
+            return 0.12;
         }
     }
     1.0
