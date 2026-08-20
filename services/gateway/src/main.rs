@@ -7087,9 +7087,8 @@ fn merge_local_and_web(
             let is_dict_domain_or_path = url_lower.contains("merriam-webster.com")
                 || url_lower.contains("dictionary.cambridge.org")
                 || url_lower.contains("wiktionary.org")
-                || url_lower.contains("dictionary.com")
+                || url_lower.contains("dictionary")
                 || url_lower.contains("vocabulary.com")
-                || url_lower.contains("thefreedictionary.com")
                 || url_lower.contains("wordnik.com")
                 || url_lower.contains("/dictionary/")
                 || url_lower.contains("/define/")
@@ -7113,8 +7112,7 @@ fn merge_local_and_web(
                 || (title_lower.contains("definition") && (title_lower.contains("meaning") || title_lower.contains("dictionary")))
                 || title_lower.contains("english dictionary")
                 || title_lower.contains("english thesaurus")
-                || title_lower.contains("collins")
-                || title_lower.contains("dictionary.com")
+                || title_lower.contains("dictionary")
                 // Title ends with a known dictionary brand (e.g. "| Cambridge
                 // Dictionary", "| Oxford Learner's Dictionaries") — a brand-named
                 // reference page, not a human article.
