@@ -1,0 +1,5 @@
+# IntentForge API schema regression tests
+# Run:  pytest tests/test_api_schema.py tests/test_goals_api_schema.py
+# These hit the running dev gateway (http://localhost:4000 by default).
+requests>=2.31
+pytest>=7.0
