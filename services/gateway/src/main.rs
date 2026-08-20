@@ -1637,14 +1637,14 @@ fn detect_preposition_location(query: &str) -> Option<geoloc::GeoLocation> {
                     break;
                 }
                 // Stop if we hit another location preposition start.
-                if tok == "in" || tok == "near" || tok == "at" || tok == "from"
-                    || tok == "around" || tok == "to" {
+                if *tok == "in" || *tok == "near" || *tok == "at" || *tok == "from"
+                    || *tok == "around" || *tok == "to" {
                     break;
                 }
                 let orig = orig_tokens.iter()
                     .find(|o| o.to_lowercase() == *tok)
                     .copied()
-                    .unwrap_or(tok);
+                    .unwrap_or(*tok);
                 let is_capitalized = orig.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
                 let is_gazetteer = LOCATION_GAZETTEER.iter().any(|(n, _)| *n == *tok);
                 let is_suffix = place_suffixes.contains(tok);
@@ -1666,7 +1666,7 @@ fn detect_preposition_location(query: &str) -> Option<geoloc::GeoLocation> {
             // Infer country only when the place is itself a gazetteer entry.
             let (cc, cname) = LOCATION_GAZETTEER.iter()
                 .find(|(n, _)| *n == city)
-                .map(|(_, cc)| (*cc, Some(country_name_for(*cc).to_string())))
+                .map(|(_, cc)| (Some(*cc), Some(country_name_for(*cc).to_string())))
                 .unwrap_or((None, None));
             return Some(geoloc::GeoLocation {
                 country_code: cc.map(|s| s.to_string()),
