@@ -294,15 +294,34 @@ impl SymSpellIndex {
         // but by ensuring such real words are PRESENT in dictionary.rs (so correct()
         // returns None at the exact-match stage). That keeps the >=2 guard intact and
         // preserves legitimate distance-1 typo fixes like pythn->python.
-        let best_dist = self.compute_edit_distance(word, best);
-        if best_dist >= 2
-            && !self.exact_map.contains_key(&word.to_lowercase())
-            && !self.is_known_misspelling(word)
-        {
-            let collapsed_input = Self::collapse_doubles(word);
-            let collapsed_best = Self::collapse_doubles(&best);
-            if collapsed_input != collapsed_best {
-                return None;
+        // EXTENDED ABSENT-WORD GUARD (skoda->soda brand-corruption bug, 2026-08-20).
+        // A word ABSENT from the dictionary must never be distance-corrected into a
+        // different word UNLESS it is:
+        //   (a) a known-misspelling seed (explicitly seeded to be corrected, e.g.
+        //       "programing"->"programming"), or
+        //   (b) a genuine single-edit typo of a real word — its character-bigram
+        //       profile is markedly UNNATURAL vs the candidate (perplexity ratio>=1.4).
+        // Genuine typos (pythn->python, housr->house, pthon->python, ngnix->nginx)
+        // contain unusual bigrams so they pass; real absent words/brands
+        // (skoda->soda, yawn->yarn) have natural bigrams so they are blocked.
+        // NO per-query literals — purely the existing bigram perplexity model plus
+        // the known-misspelling seed list. General, signal-driven, future-proof.
+        let absent = !self.exact_map.contains_key(&word.to_lowercase())
+            && !self.is_known_misspelling(word);
+        if absent && best_dist >= 1 && best_dist <= 2 {
+            if best_dist >= 2 {
+                // Original >=2 guard: allow the doubled-letter typo exception
+                // (embaras->embarrass etc.) via collapse_doubles equivalence.
+                let collapsed_input = Self::collapse_doubles(word);
+                let collapsed_best = Self::collapse_doubles(&best);
+                if collapsed_input != collapsed_best {
+                    return None;
+                }
+            } else {
+                // best_dist == 1: block unless the input is a genuine typo signature.
+                if !self.is_genuine_dist1_typo(word, &best) {
+                    return None;
+                }
             }
         }
 
@@ -351,6 +370,25 @@ impl SymSpellIndex {
         let ratio = if cand_perp > 0.0 { input_perp / cand_perp } else { 1.0 };
         let genuine_typo_signature = input_perp > natural_threshold && ratio >= 1.4;
         !genuine_typo_signature
+    }
+
+    /// Core genuine-typo signal, shared by the distance-1 absent-word guard.
+    ///
+    /// Returns true when `word` is a GENUINE single-edit typo of `candidate`: the
+    /// input's character-bigram profile is measurably UNNATURAL (it carries a
+    /// phonotactic scar like "sr", "hn", "pt", "gn") AND materially worse than the
+    /// candidate (perplexity ratio >= 1.4). This is the same signal
+    /// `blocks_dist1_substitution` uses, but WITHOUT requiring a pure same-length
+    /// substitution — so it also accepts insertions/deletions/transpositions
+    /// (pythn->python, pthon->python, housr->house, ngnix->nginx). A real
+    /// absent word/brand with natural bigrams (skoda->soda, yawn->yarn) returns
+    /// false and is therefore blocked by the caller. No per-query literals.
+    fn is_genuine_dist1_typo(&self, word: &str, candidate: &str) -> bool {
+        let input_perp = self.char_bigram_model.perplexity(word);
+        let cand_perp = self.char_bigram_model.perplexity(candidate);
+        let natural_threshold = self.char_bigram_model.reference_perplexity;
+        let ratio = if cand_perp > 0.0 { input_perp / cand_perp } else { 1.0 };
+        input_perp > natural_threshold && ratio >= 1.4
     }
 
     /// Collapse each run of identical consecutive chars to a single char.
@@ -1242,5 +1280,36 @@ mod tests {
         let index = SymSpellIndex::build();
         let result = index.correct("housr");
         assert_eq!(result, Some("house".to_string()), "Should correct typo 'housr' to 'house'");
+    }
+
+    #[test]
+    fn test_skoda_not_corrected_to_soda() {
+        // 2026-08-20 regression: "skoda" (a real car brand ABSENT from the 15k dict)
+        // must NOT be distance-1 deleted into the dictionary word "soda". This is the
+        // same brand-corruption class as yawn->yarn/biryani->bryan: an absent real word
+        // silently rewritten, which collapses downstream results (e.g. a
+        // "compare honda city and skoda slavia" query returns ~1 result). The extended
+        // absent-word guard blocks it because "skoda" has natural bigrams (no typo scar).
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("skoda"), None, "skoda must NOT be corrected to soda");
+        let (corrected, changed) = correct_query(&index, "compare honda city and skoda slavia reliability");
+        assert!(!changed, "query with 'skoda' must not be spell-changed");
+        assert_eq!(corrected, "compare honda city and skoda slavia reliability");
+    }
+
+    #[test]
+    fn test_pythn_still_corrected_after_dist1_guard() {
+        // The extended absent-word guard (distance-1) must NOT regress genuine typos:
+        // "pythn" has the unusual bigram "thn" so it remains a genuine-typo signature.
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("pythn"), Some("python".to_string()));
+    }
+
+    #[test]
+    fn test_ngnix_still_corrected_after_dist1_guard() {
+        // Transposition typo of an absent word must still correct via the genuine-typo
+        // signature (ngnix has unusual bigrams gn/ng).
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("ngnix"), Some("nginx".to_string()));
     }
 }
