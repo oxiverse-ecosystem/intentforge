@@ -269,7 +269,14 @@ impl SymSpellIndex {
         // word ABSENT from the dictionary (e.g. "housr"→"house", where
         // "housr" is not a dictionary word), so they still pass this guard.
         if is_single_substitution(word_lower.as_str(), best.as_str()) {
-            let input_in_dict = self.exact_map.contains_key(&word_lower);
+            // A genuine typo is almost always an insertion/deletion/transposition
+            // of a word ABSENT from the dictionary, OR a known-misspelling SEED
+            // (e.g. "housr"->"house", where "housr" is a low-freq seed explicitly
+            // present to be corrected). Only block when the input is a REAL
+            // corpus word (not a known-misspelling seed) AND the candidate is a
+            // dictionary word — that is the vegan->vegas data-loss class.
+            let input_in_dict = self.exact_map.contains_key(&word_lower)
+                && !self.is_known_misspelling(word_lower.as_str());
             let cand_in_dict = self.exact_map.contains_key(&best.to_lowercase());
             if input_in_dict && cand_in_dict {
                 return None;
@@ -321,8 +328,18 @@ impl SymSpellIndex {
                     return None;
                 }
             } else {
-                // distance-1: block unconditionally for absent non-misspelling words.
-                return None;
+                // distance-1: block ONLY when the correction is NOT a genuine
+                // typo. An absent word with natural bigrams (skoda->soda,
+                // yawn->yarn, biryani->bryan, ramen->raven) is a real
+                // brand/term, not a typo -> block. A genuine single-edit typo
+                // (housr->house, pythn->python, pthon->python, ngnix->nginx)
+                // carries a phonotactic scar (unnatural bigram + perplexity
+                // ratio >= 1.4) -> allow the correction. Unconditional blocking
+                // here previously broke legitimate typos (regression:
+                // test_housr_corrected_to_house).
+                if !self.is_genuine_dist1_typo(word, &best) {
+                    return None;
+                }
             }
         }
 
@@ -378,18 +395,22 @@ impl SymSpellIndex {
     /// Returns true when `word` is a GENUINE single-edit typo of `candidate`: the
     /// input's character-bigram profile is measurably UNNATURAL (it carries a
     /// phonotactic scar like "sr", "hn", "pt", "gn") AND materially worse than the
-    /// candidate (perplexity ratio >= 1.4). This is the same signal
-    /// `blocks_dist1_substitution` uses, but WITHOUT requiring a pure same-length
-    /// substitution — so it also accepts insertions/deletions/transpositions
-    /// (pythn->python, pthon->python, housr->house, ngnix->nginx). A real
-    /// absent word/brand with natural bigrams (skoda->soda, yawn->yarn) returns
-    /// false and is therefore blocked by the caller. No per-query literals.
+    /// candidate. Crucially, the CANDIDATE must itself be a NATURAL English word
+    /// (its perplexity stays near the reference). This is what separates a real
+    /// typo (housr->house: input scarred, "house" is common English) from a
+    /// real-word swap (skoda->soda / yawn->yarn: BOTH words are absent from the
+    /// training corpus, so the candidate is ALSO unnatural and must be blocked).
+    /// No per-query literals.
     fn is_genuine_dist1_typo(&self, word: &str, candidate: &str) -> bool {
         let input_perp = self.char_bigram_model.perplexity(word);
         let cand_perp = self.char_bigram_model.perplexity(candidate);
         let natural_threshold = self.char_bigram_model.reference_perplexity;
         let ratio = if cand_perp > 0.0 { input_perp / cand_perp } else { 1.0 };
-        input_perp > natural_threshold && ratio >= 1.4
+        // Input must be unnatural AND candidate must be a natural word (within 50%
+        // of the reference perplexity) AND materially worse than the candidate.
+        input_perp > natural_threshold
+            && cand_perp <= natural_threshold * 1.5
+            && ratio >= 1.4
     }
 
     /// Collapse each run of identical consecutive chars to a single char.
