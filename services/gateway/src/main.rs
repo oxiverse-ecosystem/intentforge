@@ -1507,6 +1507,34 @@ const LOCATION_GAZETTEER: &[(&str, &str)] = &[
     ("toronto", "CA"), ("vancouver", "CA"), ("sao paulo", "BR"), ("mexico city", "MX"),
     ("dubai", "AE"), ("cairo", "EG"), ("bangkok", "TH"), ("jakarta", "ID"),
     ("cape town", "ZA"), ("lagos", "NG"),
+    // 2026-08-19T1628Z round: extend the SEED with common Indian hill/travel/
+    // region destinations that users query but that were missing. These are the
+    // exact class of place that triggered geo pollution (an off-topic other-city
+    // local page ranking #1 because the requested place was unseen by
+    // detect_explicit_location, so geo_is_explicit stayed false and no
+    // cross-location penalty fired). Pure reference data; no per-query literals.
+    // Also a few more global travel hubs for general coverage.
+    ("ladakh", "IN"), ("leh", "IN"), ("mcleod ganj", "IN"), ("mcleodganj", "IN"),
+    ("dharamshala", "IN"), ("srinagar", "IN"), ("shimla", "IN"), ("manali", "IN"),
+    ("spiti", "IN"), ("kashmir", "IN"), ("gulmarg", "IN"), ("sonamarg", "IN"),
+    ("gokarna", "IN"), ("hampi", "IN"), ("coorg", "IN"), ("madikeri", "IN"),
+    ("munnar", "IN"), ("ooty", "IN"), ("udhagamandalam", "IN"), ("kodaikanal", "IN"),
+    ("darjeeling", "IN"), ("rishikesh", "IN"), ("haridwar", "IN"),
+    ("pondicherry", "IN"), ("puducherry", "IN"), ("alleppey", "IN"), ("alappuzha", "IN"),
+    ("kumarakom", "IN"), ("thekkady", "IN"), ("wagamon", "IN"), ("vagamon", "IN"),
+    ("mahabalipuram", "IN"), ("thanjavur", "IN"), ("hampi", "IN"),
+    ("lonavala", "IN"), ("khandala", "IN"), ("mahabaleshwar", "IN"), ("panchgani", "IN"),
+    ("mount abu", "IN"), ("mountain", "IN"), ("gir", "IN"), ("diu", "IN"),
+    ("andaman", "IN"), ("nicobar", "IN"), ("havelock", "IN"), ("port blair", "IN"),
+    ("tawang", "IN"), ("ziro", "IN"), ("shillong", "IN"), ("cherrapunji", "IN"),
+    ("kaziranga", "IN"), ("guwahati", "IN"), ("gangtok", "IN"), ("pelling", "IN"),
+    ("kerala", "IN"), ("kashmir", "IN"), ("himachal", "IN"), ("uttarakhand", "IN"),
+    ("goa", "IN"), ("kanyakumari", "IN"), ("rameshwaram", "IN"), ("madurai", "IN"),
+    ("trivandrum", "IN"), ("thiruvananthapuram", "IN"), ("kochi", "IN"),
+    ("phuket", "TH"), ("bali", "ID"), ("krabi", "TH"), ("chiang mai", "TH"),
+    ("colombo", "LK"), ("kandy", "LK"), ("kathmandu", "NP"), ("pokhara", "NP"),
+    ("istanbul", "TR"), ("antalya", "TR"), ("cappadocia", "TR"),
+    ("lisbon", "PT"), ("porto", "PT"), ("reykjavik", "IS"), ("dubrovnik", "HR"),
 ];
 
 /// If the query explicitly names a location (via whole-word match against the
@@ -1537,14 +1565,114 @@ fn detect_explicit_location(query: &str) -> Option<geoloc::GeoLocation> {
         if matched {
             let country_name = Some(country_name_for(cc).to_string());
             return Some(geoloc::GeoLocation {
-                country_code: Some(cc.to_string()),
-                country_name,
+            country_code: Some(cc.to_string()),
+            country_name,
+            region: None,
+            city: if name_words.len() > 1 || is_city(name) {
+                Some(name.to_string())
+            } else {
+                None
+            },
+            postal_code: None,
+            latitude: None,
+            longitude: None,
+            time_zone: None,
+            });
+        }
+    }
+    // Fallback: a place named via a location-preposition phrase ("in ladakh",
+    // "near mcleod ganj", "trip to goa") that the static gazetteer does not list.
+    // General: no per-place literals; closes the geo-pollution gap for any named
+    // place. Returns None if no preposition-place pattern is found.
+    detect_preposition_location(query)
+}
+
+/// Extract an explicit place from a location-preposition phrase, for queries that
+/// name a place the static `LOCATION_GAZETTEER` does not yet list (e.g. "places in
+/// ladakh", "near mcleod ganj", "trip to goa"). This is the GENERAL catch-all that
+/// closes the geo-pollution gap without enumerating every possible place: when a
+/// query says "<prep> <Place>", we treat <Place> as the requested location so the
+/// cross-location penalty + hard local-drop fire (they compare against the
+/// gazetteer to crush OTHER named cities). No per-place literals.
+///
+/// Robustness (avoid false positives like "in september" / "at night"):
+///   • The candidate head token must be a PLACE-LIKE noun: either it is itself a
+///     gazetteer entry, or it is Capitalized in the ORIGINAL (case-preserving)
+///     query (proper-noun signal), or it is a known place-suffix word
+///     (hill/beach/valley/…). A lowercase common noun ("september", "night") is
+///     rejected.
+///   • We take up to 3 following tokens as the place phrase (handles "new york",
+///     "mcleod ganj"); stop at the next preposition/stopword.
+fn detect_preposition_location(query: &str) -> Option<geoloc::GeoLocation> {
+    let q_lower = query.to_lowercase();
+    let prepositions: &[&str] = &[
+        " in ", " near ", " at ", " around ", " from ", " visit ", " explore ",
+        " trip to ", " road trip in ", " road trip to ", " places in ",
+        " places near ", " things to do in ", " tourism in ", " tourism near ",
+        " holiday in ", " vacation in ", " stay in ", " travel to ", " drive to ",
+    ];
+    let place_suffixes: &[&str] = &[
+        "hill", "hills", "beach", "beaches", "valley", "island", "islands",
+        "mountain", "mountains", "lake", "lakes", "fort", "temple", "city",
+        "town", "village", "region", "district", "state", "country", "province",
+    ];
+    let orig_tokens: Vec<&str> = query.split_whitespace().collect();
+    for prep in prepositions {
+        if let Some(pos) = q_lower.find(prep) {
+            let after = &q_lower[pos + prep.len()..];
+            let after_tokens: Vec<&str> = after.split_whitespace().collect();
+            if after_tokens.is_empty() {
+                continue;
+            }
+            // Determine how many following tokens form the place name (<=3),
+            // stopping at the next preposition/stopword boundary.
+            let mut n = 0;
+            let mut phrase_parts: Vec<String> = Vec::new();
+            for tok in &after_tokens {
+                if n >= 3 {
+                    break;
+                }
+                if ["that", "which", "with", "and", "for", "to", "of", "the",
+                    "a", "an", "my", "our", "this", "these", "those"].contains(tok) {
+                    break;
+                }
+                // Stop if we hit another location preposition start.
+                if tok == "in" || tok == "near" || tok == "at" || tok == "from"
+                    || tok == "around" || tok == "to" {
+                    break;
+                }
+                let orig = orig_tokens.iter()
+                    .find(|o| o.to_lowercase() == *tok)
+                    .copied()
+                    .unwrap_or(tok);
+                let is_capitalized = orig.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+                let is_gazetteer = LOCATION_GAZETTEER.iter().any(|(n, _)| *n == *tok);
+                let is_suffix = place_suffixes.contains(tok);
+                // The FIRST token must be place-like; continuation tokens (2nd/3rd)
+                // are accepted if they continue a capitalized/gazetteer phrase.
+                if n == 0 && !(is_capitalized || is_gazetteer || is_suffix) {
+                    break;
+                }
+                if n > 0 && !(is_capitalized || is_gazetteer) {
+                    break;
+                }
+                phrase_parts.push(tok.to_string());
+                n += 1;
+            }
+            if phrase_parts.is_empty() {
+                continue;
+            }
+            let city = phrase_parts.join(" ");
+            // Infer country only when the place is itself a gazetteer entry.
+            let (cc, cname) = LOCATION_GAZETTEER.iter()
+                .find(|(n, _)| *n == city)
+                .map(|(_, cc)| (*cc, Some(country_name_for(*cc).to_string())))
+                .unwrap_or((None, None));
+            return Some(geoloc::GeoLocation {
+                country_code: cc.map(|s| s.to_string()),
+                country_name: cname,
                 region: None,
-                city: if name_words.len() > 1 || is_city(name) {
-                    Some(name.to_string())
-                } else {
-                    None
-                },
+                city: Some(city),
                 postal_code: None,
                 latitude: None,
                 longitude: None,
@@ -1554,8 +1682,6 @@ fn detect_explicit_location(query: &str) -> Option<geoloc::GeoLocation> {
     }
     None
 }
-
-/// True if the gazetteer name is a city (vs a country), used to decide whether
 /// to populate `city`. Derived from the city set; cheap linear scan.
 fn is_city(name: &str) -> bool {
     const CITIES: &[&str] = &[
@@ -4006,15 +4132,17 @@ fn cross_location_mismatch_mult(
             continue; // skip 2-letter codes (us/uk) to avoid false hits
         }
         if whole_word_contains(&text, name) {
-            // 2026-08-19 round: 0.4 -> 0.12. The old dampening was too weak — for a
-            // sparse upstream an authoritative other-city page (e.g. Bing
-            // "vegetarian restaurants in Ahmedabad" for a "visakhapatnam" query)
-            // kept a 0.4x-of-a-large-base score above the correct on-topic results,
-            // so geo pollution sat in positions 3-6. 0.12x crushes the mismatched
-            // page well below the requested-city results while keeping it present
-            // (fail-soft). Pages that NAME the requested city are exempted earlier
-            // (mentions_req), so inclusive lists stay untouched. General.
-            return 0.12;
+            // 2026-08-19 round: 0.4 -> 0.12. Then 2026-08-19T1628Z round: 0.12 -> 0.06.
+            // The 0.12x dampening was STILL too weak — for a "best vegetarian thali
+            // places in mysore" query the off-topic Bing page "60 Best Places to
+            // Visit in Hyderabad" (which names a different gazetteer city) kept a
+            // 0.12x-of-a-large-base score ABOVE the correct on-topic Mysore results,
+            // because authority + quality boosts lifted its base and calibrate_scores
+            // rescales the max raw score back up. 0.06x crushes the mismatched page
+            // below the requested-city results while keeping it present (fail-soft).
+            // Pages that NAME the requested city are exempted earlier (mentions_req),
+            // so inclusive lists stay untouched. General.
+            return 0.06;
         }
     }
     1.0
