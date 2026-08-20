@@ -295,33 +295,34 @@ impl SymSpellIndex {
         // returns None at the exact-match stage). That keeps the >=2 guard intact and
         // preserves legitimate distance-1 typo fixes like pythn->python.
         // EXTENDED ABSENT-WORD GUARD (skoda->soda brand-corruption bug, 2026-08-20).
-        // A word ABSENT from the dictionary must never be distance-corrected into a
-        // different word UNLESS it is:
-        //   (a) a known-misspelling seed (explicitly seeded to be corrected, e.g.
-        //       "programing"->"programming"), or
-        //   (b) a genuine single-edit typo of a real word — its character-bigram
-        //       profile is markedly UNNATURAL vs the candidate (perplexity ratio>=1.4).
-        // Genuine typos (pythn->python, housr->house, pthon->python, ngnix->nginx)
-        // contain unusual bigrams so they pass; real absent words/brands
-        // (skoda->soda, yawn->yarn) have natural bigrams so they are blocked.
-        // NO per-query literals — purely the existing bigram perplexity model plus
-        // the known-misspelling seed list. General, signal-driven, future-proof.
+        // A word ABSENT from the dictionary must NEVER be distance-corrected into a
+        // different word, at ANY edit distance, UNLESS it is an explicit known-misspelling
+        // seed (e.g. "programing"->"programming", "pythn"->"python"). This is the same
+        // principle the >=2 guard already enforces: an absent word is almost certainly a
+        // REAL term (brand / foreign / coined / name) the 15k dictionary lacks — not a
+        // typo. Examples that must be blocked: skoda->soda, yawn->yarn, biryani->bryan,
+        // ramen->raven. Genuine typos of absent words are handled by being SEEDED as
+        // low-frequency misspelling entries in dictionary.rs (see the seed list there),
+        // which flips is_known_misspelling() true and exempts them. No per-query literals,
+        // no bigram heuristics — purely the known-misspelling seed list. General and
+        // future-proof: any absent word the engine should correct simply gets a seed.
+        let best_dist = self.compute_edit_distance(word, best);
         let absent = !self.exact_map.contains_key(&word.to_lowercase())
             && !self.is_known_misspelling(word);
         if absent && best_dist >= 1 && best_dist <= 2 {
             if best_dist >= 2 {
-                // Original >=2 guard: allow the doubled-letter typo exception
-                // (embaras->embarrass etc.) via collapse_doubles equivalence.
+                // Allow the doubled-letter typo exception (embaras->embarrass etc.)
+                // via collapse_doubles equivalence — but only when the input is itself a
+                // known-misspelling seed (otherwise the absent-word guard above already
+                // returned None before reaching here).
                 let collapsed_input = Self::collapse_doubles(word);
                 let collapsed_best = Self::collapse_doubles(&best);
                 if collapsed_input != collapsed_best {
                     return None;
                 }
             } else {
-                // best_dist == 1: block unless the input is a genuine typo signature.
-                if !self.is_genuine_dist1_typo(word, &best) {
-                    return None;
-                }
+                // distance-1: block unconditionally for absent non-misspelling words.
+                return None;
             }
         }
 
@@ -1289,7 +1290,8 @@ mod tests {
         // same brand-corruption class as yawn->yarn/biryani->bryan: an absent real word
         // silently rewritten, which collapses downstream results (e.g. a
         // "compare honda city and skoda slavia" query returns ~1 result). The extended
-        // absent-word guard blocks it because "skoda" has natural bigrams (no typo scar).
+        // absent-word guard blocks it because "skoda" is absent and not a known-misspelling
+        // seed (so it's treated as a real term, not a typo).
         let index = SymSpellIndex::build();
         assert_eq!(index.correct("skoda"), None, "skoda must NOT be corrected to soda");
         let (corrected, changed) = correct_query(&index, "compare honda city and skoda slavia reliability");
@@ -1300,15 +1302,16 @@ mod tests {
     #[test]
     fn test_pythn_still_corrected_after_dist1_guard() {
         // The extended absent-word guard (distance-1) must NOT regress genuine typos:
-        // "pythn" has the unusual bigram "thn" so it remains a genuine-typo signature.
+        // "pythn" is seeded as a known-misspelling entry (freq 0.0010), so it is exempt
+        // from the absent-word block and still corrects to "python".
         let index = SymSpellIndex::build();
         assert_eq!(index.correct("pythn"), Some("python".to_string()));
     }
 
     #[test]
     fn test_ngnix_still_corrected_after_dist1_guard() {
-        // Transposition typo of an absent word must still correct via the genuine-typo
-        // signature (ngnix has unusual bigrams gn/ng).
+        // Transposition typo of an absent word must still correct: "ngnix" is seeded as
+        // a known-misspelling entry, exempt from the absent-word block.
         let index = SymSpellIndex::build();
         assert_eq!(index.correct("ngnix"), Some("nginx".to_string()));
     }
