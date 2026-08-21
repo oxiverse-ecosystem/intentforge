@@ -6307,7 +6307,25 @@ fn merge_local_and_web(
         // runs. Skipping (not just demoting) guarantees it can never outrank real
         // results regardless of how weak the rest of the set is. No per-query or
         // per-domain literals.
-        if clean::is_adult_explicit(&r.title.to_lowercase(), &r.url.to_lowercase()) {
+        //
+        // EXCEPTION (root-cause fix for regression on this round): an explicit-adult
+        // query MUST keep adult results — the prior unconditional drop regressed the
+        // pre-existing invariant "adult result kept when query is explicitly adult"
+        // (ruling_adult_kept_for_explicit_adult_query). The same intent exception the
+        // D4 ranking drop uses is applied here, so only BENIGN queries hard-drop.
+        let p13_q_lc = query.to_lowercase();
+        let p13_adult_intent = p13_q_lc.contains("porn")
+            || p13_q_lc.contains("xxx")
+            || p13_q_lc.contains("nsfw")
+            || p13_q_lc.contains("adult video")
+            || p13_q_lc.contains("adult film")
+            || p13_q_lc.contains("sex video")
+            || p13_q_lc.contains("pornhub")
+            || p13_q_lc.contains("xvideos")
+            || p13_q_lc.contains("onlyfans");
+        if !p13_adult_intent
+            && clean::is_adult_explicit(&r.title.to_lowercase(), &r.url.to_lowercase())
+        {
             tracing::info!(
                 "P13 ADULT CONTENT DROP: '{}' ({}) flagged explicit — removed from merged set",
                 r.title.chars().take(50).collect::<String>(), r.url.chars().take(50).collect::<String>()
