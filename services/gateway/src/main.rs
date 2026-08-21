@@ -12609,9 +12609,41 @@ let mut results = match tokio::task::spawn_blocking(move || {
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     }
     // Hard filter on all constraints (file types, sites, date bounds, phrases, and negatives) post-merge:
+    let pre_hard = results.clone();
+    let had_negative_exclusion = !intent.structured_constraints.negative.is_empty();
     results.retain(|r| {
         !should_filter_by_constraints(&r.title, &r.content, &r.url, r.published_date.as_deref(), &intent.structured_constraints)
     });
+    // FAIL-OPEN for negative constraints (mirrors the junk-filter fail-open at ~12642:
+    // "never let a gate collapse a non-empty result set to ZERO"). A misclassified NL
+    // negation — a symptom/state verb inside a problem description ("my washing machine
+    // ... does not spin", "the door does not latch") that the intent engine tagged as an
+    // Exclusion role — must never be permitted to collapse a non-empty, genuinely-topical
+    // set to ZERO. An empty SERP for a real query is the worst failure mode (reads as
+    // "nothing exists"). When the negative hard-drop would empty the set, we keep the
+    // results and softly down-rank the ones the predicate would have dropped, so the user
+    // still receives the best available pages instead of a blank page.
+    // General: keyed on "would-empty", no query/domain bias, no per-query literals. Genuine
+    // topical exclusions ("python web framework not django") are unaffected — their candidate
+    // sets never empty, so the normal hard-drop still applies. This is the single safe net
+    // for ANY spurious-exclusion class (symptom verbs, mis-tagged engine entities), not a
+    // workaround tuned to one query.
+    if had_negative_exclusion && !pre_hard.is_empty() && results.is_empty() {
+        tracing::warn!(
+            "NEGATION FAIL-OPEN: all {} results dropped by negative constraint(s) {:?}; keeping set with soft down-rank instead of empty",
+            pre_hard.len(), intent.structured_constraints.negative
+        );
+        let mut restored = pre_hard;
+        for r in restored.iter_mut() {
+            if should_filter_by_constraints(&r.title, &r.content, &r.url, r.published_date.as_deref(), &intent.structured_constraints) {
+                // Demote (do not delete) the negative-matching results: they sink below
+                // genuine topical content but remain visible if nothing better exists.
+                r.score *= 0.25;
+            }
+        }
+        restored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results = restored;
+    }
 
     // Soft boost for intitle:/inurl:/intext: (enforced upstream, never hard-drop).
     if !intent.structured_constraints.intitle.is_empty()
