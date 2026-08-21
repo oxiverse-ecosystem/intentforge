@@ -8511,7 +8511,7 @@ async fn handle_images(
     };
 
     let searx1_fut = async {
-        match fetch_text_budgeted(state.http_client.clone(), searx_url.clone(), 4000).await {
+        match fetch_text_budgeted(state.http_client.clone(), searx_url.clone(), 6000).await {
             Some(raw) => parse_images(raw),
             None => { tracing::warn!("SearXNG1 image timed out/failed — empty"); vec![] }
         }
@@ -8522,7 +8522,7 @@ async fn handle_images(
             Some(u) => u,
             None => return vec![],
         };
-        match fetch_text_budgeted(state.http_client.clone(), url.clone(), 4000).await {
+        match fetch_text_budgeted(state.http_client.clone(), url.clone(), 6000).await {
             Some(raw) => parse_images(raw),
             None => { tracing::warn!("SearXNG2 image timed out/failed — empty"); vec![] }
         }
