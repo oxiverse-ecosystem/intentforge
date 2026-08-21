@@ -1894,6 +1894,12 @@ pub(crate) const WORD_FREQUENCIES: &[(&str, f64)] = &[
     ("becky", 0.0011), ("lesbo", 0.0010), ("farrell", 0.0010), ("elders", 0.0010), ("interpreters", 0.0010), ("frameworks", 0.0010), ("supporter", 0.0010), ("recieve", 0.0010),
     ("acheive", 0.0010), ("definately", 0.0010), ("seperate", 0.0010), ("occured", 0.0010), ("calender", 0.0010), ("neccessary", 0.0010), ("embarass", 0.0010), ("goverment", 0.0010),
     ("enviorment", 0.0010), ("recieving", 0.0010), ("acheiving", 0.0010), ("begginer", 0.0010), ("begginers", 0.0010), ("alternitiv", 0.0010), ("programing", 0.0010), ("programed", 0.0010),
-    ("framwork", 0.0010), ("languge", 0.0010), ("libary", 0.0010), ("libaries", 0.0010), ("deploymint", 0.0010), ("deply", 0.0010), ("depoly", 0.0010), ("perfomance", 0.0010),
+    ("framwork", 0.0010), ("languge", 0.0010), ("langauge", 0.0010), ("libary", 0.0010), ("libaries", 0.0010), ("deploymint", 0.0010), ("deply", 0.0010), ("depoly", 0.0010), ("perfomance", 0.0010),
+    // Single-char typos of absent words that the spell corrector must still fix.
+    // Seeded (low freq) so is_known_misspelling() is true and the absent-word guard
+    // (which blocks brand-corruption like skoda->soda, yawn->yarn at distance-1) exempts
+    // them. Without seeds the guard would block these too.
+    ("pythn", 0.0010), ("pthon", 0.0010), ("housr", 0.0010), ("ngnix", 0.0010),
     ("perfom", 0.0010), ("editer", 0.0010), ("begginners", 0.0010), ("orcale", 0.0010), ("agular", 0.0010), ("pypeline", 0.0010), ("surprize", 0.0010),
+    ("tranfer", 0.0010), ("bluetooh", 0.0010),
 ];
