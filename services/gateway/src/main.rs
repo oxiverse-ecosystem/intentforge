@@ -2456,6 +2456,23 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
                 "inr", "rs", "rs.", "euros", "euro", "eur", "pounds", "pound",
                 "gbp", "yen", "jpy", "won", "krw", "cents", "cent", "paise", "paisa"];
             if currency_words.contains(&pl.as_str()) { continue; }
+            // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
+            // extraction (e.g. "under 15000" / "below 2000" can leave the digits
+            // in `positive` as "+15000"). A purely-numeric positive carries no
+            // retrievable lexical meaning and only spuriously boosts pages that
+            // echo the number — "Tablets Under 15000" outranking actual
+            // "smartphones under 15000" for the latter query, because the token
+            // 15000 matched the tablet page's title but not the phone page's.
+            // The budget is ALREADY captured in `price_lt`/`price_max` and
+            // enforced by the shopping/price path, so removing the number from
+            // `positive` loses no signal. Signal-driven: ANY all-digit token
+            // (with optional thousands separators / decimal point) is dropped
+            // regardless of value — no per-query literals, no tuned thresholds.
+            // Years are already captured as date constraints, so dropping a bare
+            // year from `positive` is likewise safe.
+            if pl.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') {
+                continue;
+            }
             // D4 (2026-08-17): if this term was already captured as a NEGATIVE
             // constraint (e.g. the intent engine emits both `+chinese` and `-chinese`
             // for "not from chinese brands"), it is a contradiction to also keep it as
