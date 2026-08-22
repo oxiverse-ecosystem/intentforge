@@ -12344,7 +12344,10 @@ mod spellcheck_endpoint_tests {
                 q, negs
             );
             // The brand head must be the captured exclusion (lowercased).
-            let brand = q.rsplit_whitespace().next().unwrap();
+            // NOTE: &str has no rsplit_whitespace in the std prelude used here;
+            // split_whitespace yields the same last token for these single-brand
+            // queries (the brand is the final whitespace-delimited token).
+            let brand = q.split_whitespace().last().unwrap();
             assert!(
                 negs.iter().any(|n| n == brand),
                 "'{}' must be excluded for query '{}', got {:?}",
