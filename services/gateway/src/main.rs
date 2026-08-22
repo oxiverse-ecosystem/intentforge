@@ -3825,6 +3825,88 @@ fn is_manner_phrase(compound: &str) -> bool {
     false
 }
 
+/// D3 (brand/source negation): a compound is a real exclusion when the user tied
+/// it to an explicit negation + a SOURCE preposition in the original query
+/// ("not from sony", "not by nike", "not made by samsung", "not manufactured by
+/// lg"). This is structurally equivalent to the COUNTRY_DEMONYMS / P9 negated-
+/// country acceptance: no brand literals, no tuned thresholds — only the
+/// (negation marker) + (source-preposition) + (entity) pattern, detected purely
+/// from the token stream. It will NOT fire for manner/attribute objects
+/// ("without soap", "recipes not spicy") because those carry no source
+/// preposition, so it cannot re-introduce the c4317bc over-reach (any object of
+/// `without`/`not` = exclusion). Only a brand/source the user scoped with a
+/// *source cue* is honored as a real exclusion.
+///
+/// `compound` is the extracted negation target (e.g. "sony"); `q_orig` is the
+/// original query. We test whether `compound` (or its leading head) appears
+/// immediately after a negation marker (optional article) + a source preposition.
+fn is_negated_source_entity(q_orig: &str, compound: &str) -> bool {
+    let lc = q_orig.to_lowercase();
+    let comp = compound.to_lowercase();
+    if comp.is_empty() {
+        return false;
+    }
+    // Source prepositions that, when following a negation marker, signal a
+    // brand/source the user wants excluded. Structural vocabulary only.
+    let source_preps = ["from", "by", "made by", "manufactured by", "built by", "sold by", "produced by"];
+    // Negation markers that can introduce a source-scoped exclusion.
+    let neg_markers = ["not", "no", "without", "except", "excluding", "minus"];
+
+    // Build a windowed scan over the query tokens.
+    let toks: Vec<&str> = lc.split_whitespace().collect();
+    let mut i = 0;
+    while i < toks.len() {
+        if neg_markers.contains(&toks[i]) {
+            // Optional article between the negation and the source preposition.
+            let mut j = i + 1;
+            while j < toks.len() && ["a", "an", "the", "any", "some"].contains(&toks[j]) {
+                j += 1;
+            }
+            // Match a source preposition (single or two-word).
+            let prep: Option<String> = if j < toks.len() {
+                let two = if j + 1 < toks.len() {
+                    Some(format!("{} {}", toks[j], toks[j + 1]))
+                } else {
+                    None
+                };
+                if let Some(t) = two {
+                    if source_preps.contains(&t.as_str()) {
+                        Some(t)
+                    } else if source_preps.contains(&toks[j]) {
+                        Some(toks[j].to_string())
+                    } else {
+                        None
+                    }
+                } else if source_preps.contains(&toks[j]) {
+                    Some(toks[j].to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(p) = prep {
+                // Tokens after the preposition are the source/brand; the compound
+                // must match the head of that tail.
+                let after = j + p.split_whitespace().count();
+                let tail: Vec<&str> = toks[after..].to_vec();
+                if !tail.is_empty() {
+                    let tail_head = tail[0];
+                    // Compound may be "brand" or "brand series" — the head must match.
+                    if tail_head == comp
+                        || comp.starts_with(tail_head)
+                        || tail_head.starts_with(&comp)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// A negated compound is a real search EXCLUSION (not a manner qualifier) when at
 /// least one holds:
 ///  - (a) the compound names a recognized entity (protected brand/tech term — a
@@ -3882,6 +3964,17 @@ fn is_real_exclusion(
     // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
     // (e.g. "javascript not java not typescript" → java, typescript).
     if query_is_contrastive {
+        return true;
+    }
+    // D3 (brand/source negation): "not from sony", "not by nike", "not made by
+    // samsung" — the user explicitly named a brand/source to EXCLUDE, scoped by a
+    // source preposition. This is the structural analogue of the COUNTRY_DEMONYMS
+    // / P9 negated-country acceptance: no brand literals, just the negation +
+    // source-preposition pattern. It does NOT fire for manner/attribute objects
+    // ("without soap", "recipes not spicy") which lack a source preposition, so
+    // it cannot re-introduce the c4317bc over-reach (any object of `without` =
+    // exclusion). Only a brand/source the user tied to a *source cue* is honored.
+    if is_negated_source_entity(q_orig, compound) {
         return true;
     }
     // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
@@ -10123,6 +10216,20 @@ async fn handle_search(
     // price bound so normal relevance/authority ranking proceeds, and report the
     // gap via `ignored_constraints`. The bound still bites when real prices are
     // present (e.g. price-comparison pages). Generic; no merchant/domain bias.
+    // D3 (price bound reporting): snapshot the user's stated price bound BEFORE
+    // the fail-open clearing so we can restore it into the RESPONSE's
+    // structured_constraints. The fail-open must only disable price *ranking*
+    // (so a bound with no priced snippets doesn't demote/hard-drop every
+    // result); it must NOT delete the user's stated constraint from the
+    // reported `structured_constraints` (that made `price_lt` come back `None`
+    // while `applied_constraints` still said `price:<200` — a self-contradictory
+    // response). Restored just before serialization below.
+    let price_bound_snapshot = (
+        intent.structured_constraints.price_min,
+        intent.structured_constraints.price_max,
+        intent.structured_constraints.price_lt,
+        intent.structured_constraints.price_gt,
+    );
     if (intent.structured_constraints.price_min.is_some()
         || intent.structured_constraints.price_max.is_some()
         || intent.structured_constraints.price_lt.is_some()
@@ -10130,7 +10237,7 @@ async fn handle_search(
         && priced_result_count == 0
     {
         tracing::info!(
-            "PRICE FAIL-OPEN: {} web results but 0 carried a detectable price — clearing price bound (remains ranking-only boost/skip)",
+            "PRICE FAIL-OPEN: {} web results but 0 carried a detectable price — clearing price bound for RANKING only (bound preserved in reported structured_constraints)",
             pre_filter_count
         );
         intent.structured_constraints.price_min = None;
@@ -10956,6 +11063,43 @@ let mut results = match tokio::task::spawn_blocking(move || {
     let mut paginated_results = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
 
     // ─── Constraint transparency (applied / ignored / warnings) ───
+    // D3 (price bound reporting): re-apply the user's stated price bound into the
+    // RESPONSE's structured_constraints. The fail-open below only disables price
+    // *ranking* (so a bound with no priced snippets couldn't demote/drop every
+    // result); the bound must still appear in the reported `structured_constraints`
+    // (and thus `applied_constraints`) so the response is self-consistent. Without
+    // this, `price_lt` came back `None` while `applied_constraints` said
+    // `price:<200`. We only restore fields the user actually stated (snapshot was
+    // taken before clearing), and only when ranking left them None. This MUTATES
+    // `intent.structured_constraints`, so it runs before the `let sc = &...`
+    // borrow just below.
+    {
+        let (snap_min, snap_max, snap_lt, snap_gt) = price_bound_snapshot;
+        if snap_lt.is_some() && intent.structured_constraints.price_lt.is_none() {
+            intent.structured_constraints.price_lt = snap_lt;
+            if intent.structured_constraints.price_max.is_none() {
+                intent.structured_constraints.price_max = snap_lt;
+            }
+        }
+        if snap_gt.is_some() && intent.structured_constraints.price_gt.is_none() {
+            intent.structured_constraints.price_gt = snap_gt;
+            if intent.structured_constraints.price_min.is_none() {
+                intent.structured_constraints.price_min = snap_gt;
+            }
+        }
+        if snap_min.is_some() && intent.structured_constraints.price_min.is_none() {
+            intent.structured_constraints.price_min = snap_min;
+        }
+        if snap_max.is_some() && intent.structured_constraints.price_max.is_none() {
+            intent.structured_constraints.price_max = snap_max;
+        }
+        if price_bound_snapshot != (None, None, None, None) && priced_result_count == 0 {
+            let note = "price — constraint parsed and reported, but no returned result snippet carried a detectable price, so ranking used relevance/authority only (no hard narrowing)".to_string();
+            if !ignored.contains(&note) {
+                ignored.push(note);
+            }
+        }
+    }
     let sc = &intent.structured_constraints;
     let mut applied: Vec<String> = Vec::new();
     // NOTE: `ignored` was declared up-front (near the constraint-normalization /
@@ -12176,5 +12320,60 @@ mod spellcheck_endpoint_tests {
         assert_eq!(res["changed"].as_bool(), Some(false));
         assert!(res["corrections"].as_array().unwrap().is_empty());
         assert_eq!(res["corrected"].as_str(), Some("go rust"));
+    }
+
+    #[test]
+    fn d3_brand_source_negation_routed_to_negative() {
+        // D3 regression (t_1c27d98e): a brand/source the user scoped with an
+        // explicit negation + source preposition ("not from sony", "not by nike",
+        // "not made by samsung") must become a real exclusion, even WITHOUT
+        // contrastive framing (which a plain "not X" lacks). Before the fix,
+        // "not from sony" left sony as a POSITIVE term (the negation was silent).
+        // No brand literals: the helper keys only on the (negation) + (source
+        // preposition) + (entity) token pattern.
+        for q in [
+            "wireless earbuds not from sony",
+            "running shoes not by nike",
+            "smartphone not made by samsung",
+            "laptop not manufactured by lenovo",
+        ] {
+            let negs = extract_query_negative_terms(q);
+            assert!(
+                !negs.is_empty(),
+                "source-scoped negation '{}' must produce an exclusion, got {:?}",
+                q, negs
+            );
+            // The brand head must be the captured exclusion (lowercased).
+            let brand = q.rsplit_whitespace().next().unwrap();
+            assert!(
+                negs.iter().any(|n| n == brand),
+                "'{}' must be excluded for query '{}', got {:?}",
+                brand, q, negs
+            );
+        }
+        // Sanity: manner/attribute objects with NO source preposition must stay
+        // out (this is what prevents the c4317bc over-reach from returning).
+        assert!(
+            extract_query_negative_terms("recipes not spicy").is_empty(),
+            "'not spicy' (attribute, no source prep) must NOT be an exclusion"
+        );
+        assert!(
+            extract_query_negative_terms("how to clean a skillet without soap").is_empty(),
+            "'without soap' (manner, no source prep) must NOT be an exclusion"
+        );
+    }
+
+    #[test]
+    fn d3_price_bound_preserved_in_structured_constraints() {
+        // D3 regression (t_1c27d98e): `price:<N` / `price:>N` must populate
+        // structured_constraints.price_lt / price_gt (the P3 ranking-side filter
+        // can never fire otherwise, and the response reported price_lt=None while
+        // applied_constraints claimed price:<200 — self-contradictory).
+        // Pure extraction test (no gateway needed): gateway_extracted carries the
+        // bound straight from parse_price_range.
+        let c = extract_gateway_constraints("wireless earbuds price:<200");
+        assert_eq!(c.price_lt, Some(200.0), "price:<200 must set price_lt==200.0: {:?}", c);
+        let c2 = extract_gateway_constraints("monitor price:>500");
+        assert_eq!(c2.price_gt, Some(500.0), "price:>500 must set price_gt==500.0: {:?}", c2);
     }
 }
