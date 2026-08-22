@@ -4108,6 +4108,15 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                 "make", "made", "eating", "eat", "ate", "drinking", "drink", "drank",
                 "doing", "do", "did", "going", "go", "applying", "apply", "wearing",
                 "wear", "wore", "installing", "install", "running", "run",
+                // Source-creation verbs that introduce a brand via a source
+                // preposition ("not manufactured by lenovo", "not produced by acme",
+                // "not built by dell", "not sold by amazon", "not created by nike").
+                // These are the action, not the excluded entity; skip them (like
+                // the other trailer verbs) so the scanner lands on the brand.
+                "manufactured", "manufacture", "manufacturing", "produced",
+                "produce", "producing", "built", "build", "building", "sold",
+                "sell", "selling", "created", "create", "creating", "assembled",
+                "assemble", "assembling", "made",
             ];
             if j < words.len() && trailer_verbs.contains(&words[j]) {
                 let mut k = j + 1;
