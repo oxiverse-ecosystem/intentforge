@@ -4108,6 +4108,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                 "make", "made", "eating", "eat", "ate", "drinking", "drink", "drank",
                 "doing", "do", "did", "going", "go", "applying", "apply", "wearing",
                 "wear", "wore", "installing", "install", "running", "run",
+                "manufactured", "manufacture", "built", "sold", "produced",
             ];
             if j < words.len() && trailer_verbs.contains(&words[j]) {
                 let mut k = j + 1;
