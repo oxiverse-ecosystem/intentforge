@@ -1262,24 +1262,23 @@ Retrieves the goal status and full roadmap (if answers have been submitted).
 
 Returns all goals sorted by score (descending). Max 50 entries.
 
-**Response** `200 OK`
+**Response** `200 OK` — a bare JSON **ARRAY** (not a wrapper object) of goal objects:
 
 ```json
-{
-  "entries": [
-    {
-      "goal_id": "goal_0001",
-      "goal": "build a full-stack web app...",
-      "user_name": "Anonymous",
-      "score": 0,
-      "completed_phases": 0,
-      "total_phases": 4,
-      "created_at": "2026-07-29T12:00:00Z"
-    }
-  ],
-  "total_entries": 1
-}
+[
+  {
+    "goal_id": "goal_0001",
+    "goal": "build a full-stack web app...",
+    "user_name": "Anonymous",
+    "score": 0,
+    "completed_phases": 0,
+    "total_phases": 4,
+    "created_at": "2026-07-29T12:00:00Z"
+  }
+]
 ```
+
+> Note: the response is the list of entries directly. There is no `{"entries": [...], "total_entries": N}` wrapper — `len(response)` gives the entry count and each element is a goal object.
 
 ---
 
