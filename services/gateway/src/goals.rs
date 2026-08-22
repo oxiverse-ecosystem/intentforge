@@ -1098,10 +1098,10 @@ pub async fn handle_leaderboard(
 ) -> Response {
     let store = state.goals_state.lock();
     let entries = store.leaderboard(50);
-    (StatusCode::OK, Json(serde_json::json!({
-        "entries": entries,
-        "total_entries": entries.len()
-    }))).into_response()
+    // Returns a bare JSON ARRAY (Vec<LeaderboardEntry>) per the audit's schema
+    // assertion: the leaderboard response MUST be a list (iterable) of goal objects,
+    // not a dict wrapper. (Formerly returned `{"entries":[...],"total_entries":N}`.)
+    (StatusCode::OK, Json(entries)).into_response()
 }
 
 /// POST /goals/quick — one-shot goal to full roadmap (no questions)
