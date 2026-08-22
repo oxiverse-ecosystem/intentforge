@@ -247,7 +247,7 @@ IntentForge includes a **Goals** feature that turns a long-term goal into a pers
 - **Phase IDs are 1-indexed.** `POST /goals/:id/progress` with `{"phase_id":0}` returns `400 invalid_phase` (`"Phase 0 does not exist"`). Use the `id` from each roadmap phase.
 - Completing a phase via `/progress` or `/phases/:id/complete` sets `completed_phases` and adds **+100** to `score` (observed: 1 completed phase → `score:100`).
 - Questions are `0-indexed` in the **answers** body (`question_id:0..n`) but phases are `1-indexed` in the **roadmap** — a common source of confusion; the `invalid_phase` 400 is the tell.
-- Goals are stored **in-memory** (non-persistent across gateway restarts). `GET /goals/leaderboard` returns `{"entries":[...],"total_entries":N}`.
+- Goals are stored **in-memory** (non-persistent across gateway restarts). `GET /goals/leaderboard` returns a bare JSON **array** of goal objects (each with goal_id/goal/user_name/score/completed_phases/total_phases/created_at) — `len(response)` gives the count.
 - Error codes: `400 empty_goal` (goal < 3 chars), `400 invalid_phase`, `404 not_found` (unknown goal id), `422 invalid_payload` (bad JSON).
 
 See **[API_REFERENCE.md → Goals API](API_REFERENCE.md#goals-api)** for the full request/response schemas and domain-specific question banks.
