@@ -122,6 +122,7 @@ pub struct Roadmap {
     pub title: String,
     pub overview: String,
     pub phases: Vec<Phase>,
+    pub total_phases: usize,
     pub total_duration_weeks: u32,
     pub total_buffer_days: u32,
 }
@@ -516,6 +517,7 @@ fn generate_roadmap(goal: &str, answers: &[UserAnswer], resources: &[Resource]) 
             total_weeks, hours_val, num_phases,
         ),
         phases,
+        total_phases: num_phases,
         total_duration_weeks: total_weeks,
         total_buffer_days: total_buffer,
     }
@@ -1223,5 +1225,38 @@ pub async fn handle_update_progress(
             "error": "not_found",
             "message": format!("Goal '{}' not found or roadmap not generated", goal_id)
         }))).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression test for D1: roadmap.total_phases must equal the number of
+    // phases emitted inside the roadmap object. The API contract (API_REFERENCE.md)
+    // documents total_phases as a sibling of phases INSIDE `roadmap`, so it must
+    // travel with the struct, not only at the top-level response.
+    #[test]
+    fn generate_roadmap_total_phases_matches_phase_count() {
+        let goals = [
+            "Learn Rust by building a web server",
+            "Write a novel in one year",
+            "Train for a marathon in 6 months",
+            "Launch a startup in 12 months",
+        ];
+        let answers: Vec<UserAnswer> = vec![];
+        let resources: Vec<Resource> = vec![];
+
+        for goal in goals {
+            let roadmap = generate_roadmap(goal, &answers, &resources);
+            assert_eq!(
+                roadmap.total_phases,
+                roadmap.phases.len(),
+                "roadmap.total_phases ({}) != len(phases) ({}) for goal: {}",
+                roadmap.total_phases,
+                roadmap.phases.len(),
+                goal
+            );
+        }
     }
 }
