@@ -1973,6 +1973,11 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
     let mut price_gt = c.price_gt;
 
     // 1. Process negative constraints first (filtering and stripping +- or - prefixes)
+    // Engine-subjective-exclusion fix: drop junk Exclusions the intent engine (BERT
+    // Exclusion role) or gateway extractor may emit for subjective-quality adjectives or
+    // grammar-noise function words (e.g. "is genuinely fun" → exclusion `genuinely`;
+    // "and also have parking" → exclusion `also`). These invert the user's intent and
+    // penalize relevant pages. General, data-driven gates (no per-query literals).
     for n in &c.negative {
         let mut clean_n = n.trim().to_lowercase();
         if clean_n.starts_with('-') {
@@ -1982,6 +1987,9 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             clean_n = clean_n.strip_prefix('+').unwrap().trim().to_string();
         }
         if clean_n.split_whitespace().count() <= 2 && !clean_n.is_empty() {
+            if is_subjective_quality_term(&clean_n) || is_exclusion_grammar_noise(&clean_n) {
+                continue;
+            }
             if !negative.contains(&clean_n) {
                 negative.push(clean_n);
             }
@@ -3676,6 +3684,88 @@ const MANNER_VERBS: &[&str] = &[
     "costing", "need", "needing", "want", "wanting", "show", "showing", "tell",
     "telling",
 ];
+
+/// Subjective / quality / sentiment adjectives that describe the user's PREFERENCE
+/// for a result, not a TOPIC they want excluded. The intent engine (BERT-based
+/// Exclusion role) and gateway extractor can lift these as `Exclusion` entities when
+/// they appear in a negated or "and is <adj>" framing (e.g. "is genuinely fun" →
+/// exclusion `genuinely`; "and also have parking" → exclusion `also`). Treating
+/// "fun"/"good"/"genuinely" as a hard search exclusion inverts the user's intent and
+/// penalizes every relevant page, so these are dropped at the single `sanitize_constraints`
+/// chokepoint (mirrors the MANNER_VERBS data-driven pattern — structural vocabulary, no
+/// per-query literals). This is the engine-subjective-exclusion fix the QA round prescribes.
+const SUBJECTIVE_QUALITY_TERMS: &[&str] = &[
+    // core subjective graders
+    "good", "bad", "better", "best", "worst", "great", "excellent", "poor",
+    "nice", "fine", "okay", "ok", "decent", "awesome", "amazing", "terrible",
+    "fantastic", "wonderful", "horrible", "lovely", "pleasant", "superb",
+    // intensity / emphasis markers that are NOT topics ("too spicy", "genuinely fun")
+    "too", "very", "really", "truly", "genuinely", "actually", "quite", "rather",
+    "fairly", "pretty", "somewhat", "highly", "extremely", "super", "so", "just",
+    // quality / manner adjectives
+    "fun", "funny", "easy", "simple", "hard", "difficult", "clean", "messy",
+    "safe", "unsafe", "secure", "fast", "slow", "cheap", "expensive", "free",
+    "premium", "basic", "advanced", "modern", "old", "new", "fresh", "spicy",
+    "mild", "sweet", "bitter", "healthy", "unhealthy", "light", "heavy", "quiet",
+    "loud", "comfortable", "comfortabl", "convenient", "reliable", "trustworthy",
+    "popular", "recommended", "preferred", "ideal", "perfect", "beautiful", "ugly",
+    // conjunctions / filler that the extractor can mistake for an exclusion object
+    "also", "even", "still", "yet", "though", "however", "moreover", "besides",
+    "additionally", "furthermore", "plus",
+];
+
+/// Auxiliary-verb / function-word grammar NOISE that the engine may emit as an
+/// `Exclusion` role entity but which is never a real exclusion target
+/// (e.g. the P9 "have" / "from" grammar-noise class). Covers single-token function
+/// words that slipped past the extractor's stopword lists. Structural vocabulary,
+/// data-driven — never a per-query literal.
+const EXCLUSION_GRAMMAR_NOISE: &[&str] = &[
+    "have", "has", "had", "having", "from", "with", "without", "about", "into",
+    "onto", "upon", "over", "under", "before", "after", "than", "that", "which",
+    "this", "these", "those", "what", "when", "where", "who", "why", "how",
+    "their", "them", "they", "our", "your", "his", "her", "its", "the", "a", "an",
+    "and", "or", "but", "not", "no", "any", "some", "all", "each", "every",
+];
+
+/// True if `term` is a subjective-quality/sentiment adjective or a grammar-noise
+/// function word that must NOT become a hard search exclusion. Structural signals only
+/// (see SUBJECTIVE_QUALITY_TERMS / EXCLUSION_GRAMMAR_NOISE) — no per-query tuning.
+fn is_exclusion_grammar_noise(term: &str) -> bool {
+    let lc = term.trim().to_lowercase();
+    if lc.is_empty() {
+        return true;
+    }
+    if EXCLUSION_GRAMMAR_NOISE.contains(&lc.as_str()) {
+        return true;
+    }
+    // Multi-word subjective phrases ("genuinely fun") → drop the whole compound.
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    if tokens.iter().any(|t| SUBJECTIVE_QUALITY_TERMS.contains(t)) {
+        return true;
+    }
+    false
+}
+
+/// True if `term` is a subjective-quality/sentiment adjective the user wants in a
+/// result, not excluded from it. Mirrors `is_manner_phrase` (structural MANNER_VERBS
+/// vocabulary, not per-query literals). Drops junk engine Exclusions like `genuinely`.
+fn is_subjective_quality_term(term: &str) -> bool {
+    let lc = term.trim().to_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
+    // Whole-term match (e.g. "genuinely", "also", "fun", "spicy").
+    if SUBJECTIVE_QUALITY_TERMS.contains(&lc.as_str()) {
+        return true;
+    }
+    // Multi-word compound: if EVERY token is a subjective/quality term (no real topic
+    // noun), it is a preference description, not an exclusion.
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    if tokens.len() > 1 && !tokens.is_empty() {
+        return tokens.iter().all(|t| SUBJECTIVE_QUALITY_TERMS.contains(t));
+    }
+    false
+}
 
 /// Tokens that must never be surfaced as a "declined exclusion" in
 /// `ignored_constraints`. These are grammar/prepositions ("in", "about", "of",
