@@ -6219,6 +6219,30 @@ fn merge_local_and_web(
         // relevance >= 0.05, so for them this clamp is unchanged (no regression). Never
         // zeroed (0.005 floor) so calibrate_scores' floor logic still holds.
         let relevance_mult = relevance.clamp(0.005, 1.0);
+        // LOCAL partial-match crush (round 2026-08-24): local-index results that only
+        // PARTIALLY match the query — a few scattered tokens, often a brand collision
+        // like "Honda City" for "electric cars in city traffic", or a wrapper-phrase
+        // match like "explain like i'm five" for a blockchain query — arrive with a
+        // high indexer RRF base. After the relevance fold AND the per-query
+        // calibrate_scores rescale (which forces the max raw score onto 1.0), they
+        // float ABOVE genuinely on-topic web results that have higher relevance but a
+        // lower upstream RRF base, landing confidently at #1. Keyed on the SAME
+        // distinctive-term coverage (`overlap`) the rest of the ranker uses (not the
+        // post-BERT relevance, which a brand-collision page can inflate via cosine
+        // similarity): a local page covering < 50% of the query's distinctive terms is
+        // a partial / brand-collision match and is smoothly crushed (squared, floored
+        // so it stays present, not deleted). Genuinely on-topic local pages (coverage
+        // >= 0.5) keep full weight — no query/term/domain literals, future-proof.
+        let local_rel_factor = if r.is_local {
+            if overlap >= 0.5f32 {
+                1.0f32
+            } else {
+                let c = overlap.max(0.02f32);
+                c * c // squared: low-coverage local collapses hard
+            }
+        } else {
+            1.0f32
+        };
         // Video-suppression (non-/videos /search): Invidious videos enter the web merge
         // with score=0.0 and published_date=None, so they inherit r.score=1.0 and
         // freshness=1.0, which lets a generic youtube tutorial outrank a relevant
@@ -6244,7 +6268,7 @@ fn merge_local_and_web(
         } else {
             1.0
         };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult;
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * local_rel_factor * video_mult;
         // Capture this result's relevance for the post-loop adaptive-floor pass.
         relevance_vec.push(relevance);
     }
