@@ -1208,9 +1208,35 @@ fn detect_query_language(q_lower: &str) -> Option<String> {
 fn extract_conjunctive_terms(text: &str, max_words: usize) -> Vec<String> {
     // Stop words/connectors that terminate the negated chain, except "or" — handled
     // alongside "and" so exclusion lists like "without X or Y" are captured cleanly.
-    let stop_at = [" but ", " for ", " with ", " that ", " which ",
-                   " not ", " without ", " except ", " excluding ", " other than ",
-                   ".", ",", ";", "?", "!", " site:", " after:", " before:", " -"];
+    // RESUME_PREDICATES (2026-08-21 fix): main-clause verbs that resume the actual
+    // query after a negated clause. Without these, a negation like "no calculus
+    // background learn probability and statistics for data science" keeps scanning
+    // past the resume verb and treats the main query's "probability AND statistics"
+    // conjunction as an exclusion LIST → "statistics" is wrongly emitted as a
+    // negative. The user wants to LEARN statistics, not exclude it, so the spurious
+    // exclusion hard-drops every relevant page and collapses the result set to zero.
+    // These are open-class resume predicates (not per-query literals): a negated
+    // clause ("no X") is almost always immediately followed by the verb that resumes
+    // the user's real intent ("learn", "build", "find"...), never by another
+    // exclusion target. General + signal-driven; no query-specific strings.
+    let resume_predicates = [
+        " learn ", " build ", " make ", " find ", " get ", " create ", " start ",
+        " use ", " know ", " understand ", " help ", " want ", " need ", " cook ",
+        " fix ", " write ", " play ", " watch ", " read ", " buy ", " grow ",
+        " plan ", " design ", " setup ", " set up ", " install ", " deploy ",
+        " configure ", " show ", " explain ", " tell ", " give ", " compare ",
+        " choose ", " pick ", " discover ", " explore ", " study ", " practice ",
+    ];
+    let mut stop_at: Vec<&str> = vec![
+        " but ", " for ", " with ", " that ", " which ",
+        " not ", " without ", " except ", " excluding ", " other than ",
+        ".", ",", ";", "?", "!", " site:", " after:", " before:", " -",
+    ];
+    for p in resume_predicates.iter() {
+        if !stop_at.contains(p) {
+            stop_at.push(p);
+        }
+    }
     // Find the end of the negated phrase.
     let end = stop_at.iter()
         .filter_map(|s| text.to_lowercase().find(s))
@@ -2785,6 +2811,27 @@ async fn analyze_query(
             confidence = confidence.max(0.9);
         }
     }
+    // "better than" / "worse than" / "faster than" ⇒ explicit comparison between
+    // two entities, not a generic informational query. The linear probe
+    // frequently misranks these (e.g. "is the steam deck better than the rog
+    // ally for playing indie games" → informational @0.28) because the probe
+    // over-weights the surrounding topic tokens. A "X better/worse/faster/...
+    // than Y" framing is an unambiguous comparison signal. General lexical
+    // override, mirrors the 'vs'/'or' comparison rule above.
+    let comparison_than_markers = [
+        " better than ", " worse than ", " faster than ", " slower than ",
+        " cheaper than ", " more reliable than ", " more durable than ",
+        " lighter than ", " heavier than ", " bigger than ", " smaller than ",
+        " stronger than ", " weaker than ", " safer than ", " quieter than ",
+        " louder than ", " cooler than ", " hotter than ", " is better than ",
+        " are better than ", " which is better than ", " which are better than ",
+    ];
+    let has_better_than = comparison_than_markers.iter().any(|m| ql.contains(m));
+    if has_better_than && intent != "comparison" {
+        tracing::info!("Lexical override: 'better/worse/faster than' marker ⇒ comparison (was {})", intent);
+        intent = "comparison".to_string();
+        confidence = confidence.max(0.9);
+    }
     // "how to" / "how do i" / "how can i" / "how do you" ⇒ how-to.
     // Raise confidence so it isn't misranked behind informational/navigational.
     let howto_markers = ["how to ", "how do i ", "how do you ", "how can i ",
@@ -2996,4 +3043,34 @@ async fn embed_batch(
         embeddings.push(vec);
     }
     Json(EmbedBatchResponse { embeddings })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression test for the 2026-08-21 negation-over-extraction fix.
+    // "no calculus background learn probability and statistics for data science"
+    // must NOT pull "statistics" (a term the user wants to LEARN) into the
+    // negative set. The resume verb "learn" must terminate the negated clause
+    // so only "calculus" is excluded. Before the fix, "statistics" leaked in
+    // via the main query's "probability AND statistics" conjunction and
+    // collapsed the result set to zero.
+    #[test]
+    fn negation_stops_at_resume_predicate_not_main_query() {
+        // extract_constraints mirrors the gateway's negative extraction.
+        let c = extract_constraints("how can someone with no calculus background learn probability and statistics for data science");
+        assert!(c.negative.contains(&"calculus".to_string()), "calculus should be a negative: {:?}", c.negative);
+        assert!(!c.negative.contains(&"statistics".to_string()), "'statistics' must NOT be a negative (user wants to learn it): {:?}", c.negative);
+        // The wanted topic must survive as a positive requirement.
+        assert!(c.positive.iter().any(|p| p.contains("statistics")), "statistics must remain positive: {:?}", c.positive);
+    }
+
+    // A genuine multi-term exclusion list must still be captured fully.
+    #[test]
+    fn multi_term_exclusion_list_still_captured() {
+        let c = extract_constraints("python web frameworks without django or flask");
+        assert!(c.negative.contains(&"django".to_string()), "django should be excluded: {:?}", c.negative);
+        assert!(c.negative.contains(&"flask".to_string()), "flask should be excluded: {:?}", c.negative);
+    }
 }

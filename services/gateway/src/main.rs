@@ -7755,6 +7755,17 @@ fn merge_local_and_web(
             r.score *= 0.01;
         }
 
+        // P2d (round-2026-08-20T1935Z): collapse the indexer BM25 for off-topic locals
+        // HERE (same scope as `base`), because the earlier `r.score *= 0.01` in the noise-
+        // gate block above does NOT propagate to this read under the borrow structure. The
+        // body-incidental subject mention (e.g. "airtable" in a Slack-Alternatives page)
+        // gave it a large r.score that dominates weights.rrf; crushing it here lets the
+        // on-topic web page win after calibrate_scores. General: keyed on the P2d flag
+        // (local page names none of the query's title-anchored subject terms).
+        if p2d_offtopic {
+            r.score *= 0.01;
+        }
+
         let base = (weights.rrf * r.score)
             + (weights.semantic * semantic)
             + (weights.intent * intent_boost)
@@ -8434,6 +8445,72 @@ fn merge_local_and_web(
         }
     }
 
+    // ── P13 (round-2026-08-20T1935Z): drop adult/NSFW results flagged upstream ──
+    // The per-result loop (line ~6302) sets r.score = -1.0 and continues for any
+    // result whose title/URL matches clean::is_adult_explicit() — a query-agnostic
+    // lexical detector. Here we physically remove those sentinels so they never
+    // reach the response. Hard-drop (not demote) because a family-safe engine must
+    // never surface explicit content regardless of how weak the rest of the set is.
+    {
+        let before = merged.len();
+        merged.retain(|r| r.score >= 0.0);
+        let removed = before - merged.len();
+        if removed > 0 {
+            tracing::info!("P13 ADULT DROP: removed {} explicit result(s) from merged set", removed);
+        }
+    }
+
+    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
+    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
+    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
+    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
+    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
+    // because the local base score is large, so other-city pages still floated into
+    // positions 3-5. We hard-drop local results that name a different gazetteer place
+    // and do NOT name the requested city/country.
+    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
+    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
+    // that NAME the requested place are kept. No query/domain literals.
+    if geo_is_explicit {
+        let before = merged.len();
+        merged.retain(|r| {
+            if !r.is_local {
+                return true;
+            }
+            let tl = r.title.to_lowercase();
+            let cl = r.content.to_lowercase();
+            let ul = r.url.to_lowercase();
+            let text = format!("{} {} {}", tl, cl, ul);
+            // On-topic for the requested location → keep.
+            let req_city = geo_location.and_then(|g| g.city.as_deref());
+            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
+            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
+                || req_country.map_or(false, |c| whole_word_contains(&text, c));
+            if mentions_req {
+                return true;
+            }
+            // Mention of a different known place → drop this local page.
+            let same_country_ok = req_city.is_none();
+            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
+            for (name, cc) in LOCATION_GAZETTEER.iter() {
+                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
+                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
+                if same_country_ok {
+                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
+                }
+                if name.len() < 3 { continue; }
+                if whole_word_contains(&text, name) {
+                    return false;
+                }
+            }
+            true
+        });
+        let removed = before - merged.len();
+        if removed > 0 {
+            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
+        }
+    }
+
     // ── Adult-content hard-drop for non-adult queries (this round, D4) ──
     // Privacy-first search must not surface pornographic/NSFW results for ordinary
     // queries. The web fan-out (SearXNG-via-VPN) returned XNXX adult forums for an
@@ -8833,6 +8910,16 @@ fn merge_local_and_web(
             })
             .map(|t| t.score)
             .fold(f32::INFINITY, f32::min);
+
+        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
+        // Used by the P8 video cap (b0): a video must never outrank the best genuine
+        // text result for a non-video query, in any calibration regime (see comment
+        // at (b0)). Computed over post-calibration scores so it reflects the final
+        // text ranking.
+        let best_non_video = merged.iter()
+            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
+            .map(|r| r.score)
+            .fold(0.0f32, f32::max);
 
         // Best non-video score AFTER calibration but BEFORE this pass caps any video.
         // Used by the P8 video cap (b0): a video must never outrank the best genuine
@@ -12404,11 +12491,44 @@ async fn handle_search(
             "temperature in", "humidity in",
         ];
         let has_weather_prediction = weather_prediction_signals.iter().any(|s| q_lower.contains(*s));
+        // WEATHER-AS-SUBJECT (2026-08-21 fix for P11-class false trigger): a bare
+        // "weather" word anywhere must NOT force fresh — queries like "daily
+        // skincare routine for oily skin in humid weather" mention weather only as
+        // a modifier of a non-weather topic and must stay informational (evergreen
+        // advice, not news). Weather is the genuine subject only when it leads the
+        // query or appears in a subject-phrase ("weather in X", "X weather",
+        // "weather today/forecast/report/update", "this week's weather"). Structural
+        // phrases, no city/region literals. This closes the residue of P11 (substring
+        // intent triggers) without re-narrowing to only prediction signals.
+        // A bare "<word> weather" / "weather" as the FINAL token only counts as the
+        // subject when the WHOLE query is short (e.g. "delhi weather", "london
+        // forecast" — 2-4 tokens about weather). A modifier inside a long non-weather
+        // query like "...oily skin in humid weather" (13 tokens) is NOT the topic and
+        // must not force fresh.
+        let weather_is_subject = q_lower.starts_with("weather")
+            || q_lower.starts_with("forecast")
+            || q_lower.contains("weather in ")
+            || q_lower.contains("weather for ")
+            || q_lower.contains("weather today")
+            || q_lower.contains("weather tomorrow")
+            || q_lower.contains("weather report")
+            || q_lower.contains("weather update")
+            || q_lower.contains("current weather")
+            || q_lower.contains("live weather")
+            || q_lower.contains("this week's weather")
+            || q_lower.contains("weather near")
+            || {
+                let n_tok = q_lower.split_whitespace().count();
+                n_tok <= 4 && {
+                    let last = q_lower.split_whitespace().last().unwrap_or("");
+                    last == "weather" || last == "forecast"
+                }
+            };
         let is_howto_query = q_lower.starts_with("how to") || q_lower.starts_with("how do")
             || q_lower.starts_with("how can") || q_lower.contains("how to")
             || q_lower.contains("fix ") || q_lower.contains("repair") || q_lower.contains("won't start")
             || q_lower.contains("wont start") || q_lower.contains("leaking") || q_lower.contains("not cooling");
-        if has_weather_signal && (has_weather_prediction || q_has_word(&q_lower, "weather") || q_has_word(&q_lower, "forecast"))
+        if has_weather_signal && (has_weather_prediction || weather_is_subject)
             && !is_howto_query
             && intent.intent != "fresh" && intent.intent != "local"
         {
