@@ -56,39 +56,65 @@ def _create_goal(s, goal_text="learn rust for systems programming in 6 months"):
     assert "goal_id" in body and body["goal_id"], "no goal_id in create response"
     questions = body.get("questions", [])
     assert isinstance(questions, list) and len(questions) > 0, "questions[] empty"
-    return body["goal_id"]
+    return body["goal_id"], questions
 
 
 def test_create_goal_schema(session):
     """#4 POST /goals -> 200, goal_id present, questions[] non-empty."""
-    goal_id = _create_goal(session)
+    goal_id, _ = _create_goal(session)
     assert isinstance(goal_id, str) and goal_id.startswith("goal_")
 
 
 def test_get_goal_schema(session):
     """#5 GET /goals/{id} -> 200, status present."""
-    goal_id = _create_goal(session)
+    goal_id, _ = _create_goal(session)
     r = session.get(f"{BASE}/goals/{goal_id}", timeout=10)
     assert r.status_code == 200, f"GET /goals/{goal_id} -> {r.status_code}"
     body = r.json()
     assert "status" in body, "GET /goals/{id} missing 'status'"
 
 
+def _real_answers(questions):
+    """Build REAL structured answers from the questions emitted by POST /goals.
+
+    Picks the first option of each question (falling back to the question text
+    itself when a question has no options, e.g. free-text questions) so the
+    gateway's generate_roadmap() consumes genuine user structure instead of a
+    degenerate "yes"-to-everything payload. A degenerate payload previously
+    embedded the literal answer into the roadmap text (e.g. "yes hours/week")
+    while the phase-count invariant still held, so the regression was masked.
+
+    NOTE: questions come from the POST /goals response — GET /goals/{id} does
+    NOT return the questions array, so re-fetching it from GET would yield an
+    empty list and silently degrade back to the "yes"/empty path.
+    """
+    answers = []
+    for q in questions:
+        if "id" not in q:
+            continue
+        opts = q.get("options") or []
+        ans = opts[0] if opts else (q.get("question") or "x")
+        answers.append({"question_id": q["id"], "answer": ans})
+    return answers
+
+
 def test_submit_answers_roadmap_phase_count(session):
-    """#1 POST /goals/{id}/answers -> 200 AND total_phases == len(phases)."""
-    goal_id = _create_goal(session)
-    # Pull the generated questions so we can answer them.
-    get_r = session.get(f"{BASE}/goals/{goal_id}", timeout=10)
-    assert get_r.status_code == 200
-    questions = get_r.json().get("questions", [])
-    answers = [
-        {"question_id": q["id"], "answer": "yes"}
-        for q in questions
-        if "id" in q
-    ]
-    if not answers:
-        # Some flows answer inline; fall back to a minimal numeric payload.
-        answers = [{"question_id": 1, "answer": "yes"}]
+    """#1 POST /goals/{id}/answers -> 200 AND total_phases == len(phases).
+
+    Hardened (round 2026-08-18T0937Z): submits REAL structured answers (first
+    option of each generated question) so the roadmap generation path is
+    exercised with genuine user state, then guards the roadmap is
+    NON-DEGENERATE — not merely count-correct. A degenerate "yes"-to-everything
+    payload previously embedded the literal answer into the roadmap text (e.g.
+    "yes hours/week") while the phase-count invariant still held, masking the
+    regression. The single generate_roadmap() path emits a tailored
+    "Your Personalized Roadmap: <goal>" title (never a "Plan & Begin" wrapper)
+    and curates >=1 objective / deliverable / resource per phase, so these
+    guards catch a real regression in that path.
+    """
+    goal_id, questions = _create_goal(session)
+    answers = _real_answers(questions)
+    assert answers, "no structured answers built from generated questions"
 
     r = session.post(
         f"{BASE}/goals/{goal_id}/answers", json={"answers": answers}, timeout=60
@@ -98,10 +124,45 @@ def test_submit_answers_roadmap_phase_count(session):
     roadmap = body.get("roadmap", {})
     phases = roadmap.get("phases", [])
     total_phases = roadmap.get("total_phases")
+
+    # Hard invariant (existing): count must be internally consistent.
     assert isinstance(total_phases, int), "roadmap.total_phases missing/not int"
     assert total_phases == len(phases), (
         f"roadmap.total_phases ({total_phases}) != len(phases) ({len(phases)})"
     )
+
+    # Non-degenerate guards: the roadmap must reflect REAL submitted state,
+    # not a placeholder that merely preserved the count invariant.
+    title = roadmap.get("title", "")
+    assert title, "roadmap.title missing/empty"
+    assert "Roadmap" in title, f"roadmap.title should contain 'Roadmap': {title!r}"
+    # The degenerate placeholder wraps the raw goal as a phase-style title;
+    # the real (single) generate_roadmap path emits a tailored title with no
+    # "Plan & Begin" wrapper.
+    assert "Plan & Begin" not in title, (
+        f"roadmap.title looks like a degenerate placeholder: {title!r}"
+    )
+
+    overview = roadmap.get("overview", "")
+    assert overview, "roadmap.overview missing/empty"
+    # Exact degenerate string the old "yes"-payload produced (hours answer was
+    # literally "yes"). Real answers yield a different hours value.
+    assert overview != "A 12-week journey (yes hours/week) across 4 phases.", (
+        f"roadmap.overview is the degenerate placeholder: {overview!r}"
+    )
+
+    # Every phase must carry >=1 objective, deliverable, and resource. The real
+    # path always curates these; a regression collapsing them must be caught.
+    for p in phases:
+        assert len(p.get("objectives", [])) >= 1, (
+            f"phase {p.get('id')} has <1 objectives: {p}"
+        )
+        assert len(p.get("deliverables", [])) >= 1, (
+            f"phase {p.get('id')} has <1 deliverables: {p}"
+        )
+        assert len(p.get("resources", [])) >= 1, (
+            f"phase {p.get('id')} has <1 resources: {p}"
+        )
 
 
 def test_quick_roadmap_phase_count(session):

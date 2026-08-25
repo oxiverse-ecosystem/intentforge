@@ -247,10 +247,6 @@ fn parse_price_range(s: &str) -> Option<(Option<f32>, Option<f32>)> {
 /// Handles 0-99 directly and any magnitude via "X hundred/thousand [Y]" and
 /// "X thousand Y hundred [Z]" compositions (e.g. "two hundred fifty" -> "250",
 /// "one thousand two hundred" -> "1200", "nineteen" -> "19").
-///
-/// Only rewrites number-word runs when adjacent to a price marker or currency
-/// word, preserving original text elsewhere (so "nineteen eighty four" remains
-/// unchanged unless it appears in a price context).
 fn normalize_spoken_numbers(query: &str) -> String {
     let units: &[(&str, u32)] = &[
         ("zero", 0), ("ten", 10), ("eleven", 11), ("twelve", 12),
@@ -261,20 +257,9 @@ fn normalize_spoken_numbers(query: &str) -> String {
         ("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50),
         ("sixty", 60), ("seventy", 70), ("eighty", 80), ("ninety", 90),
     ];
-    let price_markers = [
-        "under", "below", "less", "cheaper", "max", "maximum", "over", "more",
-        "above", "minimum", "budget", "within", "around", "about", "price",
-    ];
-    let currency_words = [
-        "dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.",
-        "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw",
-        "$", "£", "€", "¥",
-    ];
-
     let tokens: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
     let mut out: Vec<String> = Vec::with_capacity(tokens.len());
     let mut i = 0;
-
     while i < tokens.len() {
         let tok = &tokens[i];
         if tok == "hundred" || tok == "thousand" {
@@ -284,14 +269,6 @@ fn normalize_spoken_numbers(query: &str) -> String {
         }
         let is_unit = units.iter().any(|(w, _)| w == tok);
         if is_unit {
-            // Check if adjacent to a price marker or currency word
-            let prev_is_price_context = if i > 0 {
-                let prev = &tokens[i - 1];
-                price_markers.contains(&prev.as_str()) || currency_words.contains(&prev.as_str())
-            } else {
-                false
-            };
-
             let mut j = i;
             let mut run: Vec<String> = Vec::new();
             while j < tokens.len() {
@@ -301,53 +278,42 @@ fn normalize_spoken_numbers(query: &str) -> String {
                 run.push(t.clone());
                 j += 1;
             }
-
-            // Check if followed by currency word
-            let next_is_price_context = if j < tokens.len() {
-                currency_words.contains(&tokens[j].as_str())
-            } else {
-                false
-            };
-
-            let in_price_context = prev_is_price_context || next_is_price_context;
-
-            if in_price_context {
-                let mut total: i64 = 0;
-                let mut current: i64 = 0;
-                let mut has_any = false;
-                for w in &run {
-                    if *w == "hundred" {
-                        if current == 0 { current = 1; }
-                        total += current * 100;
-                        current = 0;
-                    } else if *w == "thousand" {
-                        if current == 0 { current = 1; }
-                        total += current * 1000;
-                        current = 0;
+            let mut total: i64 = 0;
+            let mut current: i64 = 0;
+            let mut has_any = false;
+            let mut saw_scale = false;
+            for w in &run {
+                if *w == "hundred" {
+                    if current == 0 { current = 1; }
+                    total += current * 100;
+                    current = 0;
+                    saw_scale = true;
+                } else if *w == "thousand" {
+                    if current == 0 { current = 1; }
+                    total += current * 1000;
+                    current = 0;
+                    saw_scale = true;
+                } else {
+                    let v = units.iter().find(|(w2, _)| w2 == w).map(|(_, v)| *v).unwrap_or(0);
+                    if v >= 10 && v <= 90 && v % 10 == 0 {
+                        current += v as i64;
                     } else {
-                        let v = units.iter().find(|(w2, _)| w2 == w).map(|(_, v)| *v).unwrap_or(0);
-                        if v >= 10 && v <= 90 && v % 10 == 0 {
-                            current += v as i64;
-                        } else {
-                            current += v as i64;
-                        }
-                        has_any = true;
+                        if v < 10 { current += v as i64; }
+                        else { current += v as i64; }
                     }
-                }
-                let value = if total == 0 && current == 0 { 0 } else { total + current };
-                if has_any {
-                    out.push(value.to_string());
-                    i = j;
-                    continue;
+                    has_any = true;
                 }
             }
-
-            // Not in price context or not parseable; emit original tokens
-            for token in &run {
-                out.push(token.clone());
+            let value = if total == 0 && current == 0 { 0 } else { total + current };
+            if has_any {
+                out.push(value.to_string());
+                i = j;
+                continue;
+            } else {
+                out.push(tok.clone());
+                i += 1;
+                continue;
             }
-            i = j;
-            continue;
         }
         out.push(tok.clone());
         i += 1;
@@ -662,12 +628,17 @@ fn extract_constraints(query: &str) -> Constraints {
     for marker in &negative_start_markers {
         if q_lower.starts_with(marker) {
             let remaining = &q[marker.len()..];
-            // Preserve phrases if possible for negatives.
-            // Phase 5: negatives use max_words=1 (head-noun only) so
-            // "without prior experience" → "prior" not "prior experience".
-            let term = extract_negation_term(remaining);
-            if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
-                negative.push(term);
+            // Split the negated clause on " and "/" or " so a list like
+            // "without react or angular" yields BOTH exclusions. Using
+            // extract_conjunctive_terms (not the single-object
+            // extract_negation_term) is what makes "without A or B" / "without
+            // A and B" collect every operand. Negatives use max_words=1
+            // (head-noun only) so "without prior experience" → "prior" not
+            // "prior experience". General + signal-driven; no per-query literals.
+            for term in extract_conjunctive_terms(remaining, 1) {
+                if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
+                    negative.push(term);
+                }
             }
             break; // only one start marker can match
         }
@@ -700,14 +671,17 @@ fn extract_constraints(query: &str) -> Constraints {
                     }
                 }
                 let remaining = &q[after_marker..];
-                // Extract the negation OBJECT from the WHOLE clause at once
-                // (skips leading light verbs like "owned by"), rather than
-                // splitting into individual words first — splitting loses the
-                // multi-word object ("big advertising company" collapsed to the
-                // bare first word "controlled").
-                let term = extract_negation_term(remaining);
-                if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
-                    negative.push(term);
+                // Split the negated clause on " and "/" or " so a list like
+                // "without react or angular" yields BOTH exclusions. Using
+                // extract_conjunctive_terms (not the single-object
+                // extract_negation_term) is what makes "without A or B" /
+                // "without A and B" / "not X or Y" collect every operand.
+                // Negatives use max_words=1 (head-noun only). General +
+                // signal-driven; no per-query literals.
+                for term in extract_conjunctive_terms(remaining, 1) {
+                    if !term.is_empty() && term.len() > 1 && !is_generic_negatable(&term) {
+                        negative.push(term);
+                    }
                 }
             }
             search_from = after_marker;
