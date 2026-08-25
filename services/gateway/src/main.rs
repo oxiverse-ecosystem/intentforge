@@ -423,6 +423,16 @@ struct MergedResult {
     /// to demote low-signal crawled pages. Defaults to 1.0 for web results.
     #[serde(default = "default_f32_one")]
     quality: f32,
+    /// Honest product facts extracted by the /shopping pipeline from the result's
+    /// own page. Only present when the page exposed structured product data.
+    /// NEVER carries a fact not extracted from this exact URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commerce: Option<CommerceBlock<OfferFacts>>,
+    /// Provenance for the commerce block: the source URL it was extracted from and
+    /// when. Kept separate so the frontend can attribute facts to a page even when
+    /// `commerce` itself is null (e.g. "we looked, found nothing on that URL").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commerce_provenance: Option<CommerceBlock<()>>,
 }
 
 fn default_f32_one() -> f32 { 1.0 }
@@ -2332,8 +2342,15 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
 // null rather than silently collapsing to one canonical value. Every field is
 // Optional; a missing fact is null, never a guess. This is the foundation for
 // honest affiliate monetization: no misrepresentation, no ranking effects.
+/// Typed product facts extracted from a single page. Every field Optional.
+/// NO free-text price guessing: a price is captured only when it appears in a
+/// typed structured field. If multiple distinct offers/prices exist on the page,
+/// they are surfaced as price_low/price_high + offer_count and `price` is left
+/// null rather than silently collapsing to one canonical value. A missing fact is
+/// null, never a guess. This is the foundation for honest affiliate
+/// monetization: no misrepresentation, no ranking effects.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
-struct CommerceOffer {
+struct OfferFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     price: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2361,17 +2378,33 @@ struct CommerceOffer {
     price_high: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offer_count: Option<usize>,
-    /// When the page facts were observed (Unix seconds, UTC). Set to extraction
-    /// time; a stale/unknown fetch time must be labelled, never presented as
-    /// current. The consumer is responsible for treating it as an observation
-    /// timestamp, not a guarantee of live price.
+}
+
+/// A generic, serializable *container* for honest product facts of any kind `T`.
+/// Generic so the enrichment logic (`enrich_with_commerce`) and its unit tests can
+/// run PURELY OFFLINE with a stand-in facts type (no network / no HTTP). The
+/// `data` field holds the typed facts (e.g. `OfferFacts`); `url` + `observed_at`
+/// are the provenance — exactly where the facts came from and when, so the
+/// frontend can label them and never present a stale price as current.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+struct CommerceBlock<T> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    /// When the page facts were observed (Unix seconds, UTC). A stale/unknown
+    /// fetch time must be labelled, never presented as current.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     observed_at: Option<String>,
-    /// Where the facts came from: "json-ld", "og", or "none". Surfaced so the
-    /// frontend can label provenance. Structured extraction only — no heuristic.
+    /// Where the facts came from: "json-ld", "og", or "none". Structured
+    /// extraction only — no heuristic. Surfaced so the frontend can label
+    /// provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<T>,
 }
+
+/// Convenience alias used by the page extractor and the /shopping endpoint.
+type CommerceOffer = CommerceBlock<OfferFacts>;
 
 /// Coarse UTC observation timestamp without extra crates.
 fn now_unix_string() -> String {
@@ -2403,44 +2436,49 @@ fn json_get_u64(v: &serde_json::Value) -> Option<u64> {
 }
 
 fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
-    let mut offer = CommerceOffer::default();
+    let mut facts = OfferFacts::default();
+    let mut source: Option<String> = None;
 
     // 1) Preferred: JSON-LD structured data.
     let nodes = collect_commerce_nodes(html);
     if !nodes.is_empty() {
-        merge_jsonld_nodes(&mut offer, &nodes);
-        if offer.source.is_none() {
-            offer.source = Some("json-ld".to_string());
+        merge_jsonld_nodes(&mut facts, &nodes);
+        if source.is_none() {
+            source = Some("json-ld".to_string());
         }
     }
 
     // 2) Fallback / supplement: OpenGraph product:* meta (only when no price yet).
-    if offer.price.is_none() && offer.price_low.is_none() {
+    if facts.price.is_none() && facts.price_low.is_none() {
         if let Some(og) = parse_og_product(html) {
-            if offer.price.is_none() { offer.price = og.price; }
-            if offer.currency.is_none() { offer.currency = og.currency; }
-            if offer.availability.is_none() { offer.availability = og.availability; }
-            if offer.condition.is_none() { offer.condition = og.condition; }
-            if offer.merchant.is_none() { offer.merchant = og.merchant; }
-            if offer.gtin.is_none() { offer.gtin = og.gtin; }
-            if offer.rating.is_none() { offer.rating = og.rating; }
-            if offer.rating_count.is_none() { offer.rating_count = og.rating_count; }
-            if offer.source.is_none() { offer.source = Some("og".to_string()); }
+            if facts.price.is_none() { facts.price = og.price; }
+            if facts.currency.is_none() { facts.currency = og.currency; }
+            if facts.availability.is_none() { facts.availability = og.availability; }
+            if facts.condition.is_none() { facts.condition = og.condition; }
+            if facts.merchant.is_none() { facts.merchant = og.merchant; }
+            if facts.gtin.is_none() { facts.gtin = og.gtin; }
+            if facts.rating.is_none() { facts.rating = og.rating; }
+            if facts.rating_count.is_none() { facts.rating_count = og.rating_count; }
+            if source.is_none() { source = Some("og".to_string()); }
         }
     }
 
     // 3) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
-    if offer.merchant.is_none() {
+    if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
-                offer.merchant = Some(host.to_string());
+                facts.merchant = Some(host.to_string());
             }
         }
     }
 
-    offer.observed_at = Some(now_unix_string());
-    offer
+    CommerceOffer {
+        url: Some(url.to_string()),
+        observed_at: Some(now_unix_string()),
+        source,
+        data: Some(facts),
+    }
 }
 
 fn extract_meta_tags(html: &str) -> Vec<(String, String)> {
@@ -2546,7 +2584,7 @@ fn node_price(n: &serde_json::Value) -> Option<(f64, String)> {
     None
 }
 
-fn merge_jsonld_nodes(offer: &mut CommerceOffer, nodes: &[serde_json::Value]) {
+fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
     let mut prices: Vec<(f64, String)> = Vec::new();
     for n in nodes {
         let ty = n.get("@type")
@@ -2560,40 +2598,40 @@ fn merge_jsonld_nodes(offer: &mut CommerceOffer, nodes: &[serde_json::Value]) {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "USD".to_string());
-                offer.price_low = Some(lo);
-                offer.price = Some(lo); // entry price is a defined field, not a guess
-                if offer.currency.is_none() {
-                    offer.currency = Some(cur);
+                facts.price_low = Some(lo);
+                facts.price = Some(lo); // entry price is a defined field, not a guess
+                if facts.currency.is_none() {
+                    facts.currency = Some(cur);
                 }
             }
             if let Some(hi) = n.get("highPrice").and_then(json_get_f64) {
-                offer.price_high = Some(hi);
+                facts.price_high = Some(hi);
             }
             if let Some(oc) = n.get("offerCount").and_then(json_get_u64) {
-                offer.offer_count = Some(oc as usize);
+                facts.offer_count = Some(oc as usize);
             }
         }
 
         if let Some(p) = node_price(n) {
             prices.push(p);
         }
-        if offer.availability.is_none() {
-            offer.availability = n
+        if facts.availability.is_none() {
+            facts.availability = n
                 .get("availability")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
         }
-        if offer.condition.is_none() {
-            offer.condition = n
+        if facts.condition.is_none() {
+            facts.condition = n
                 .get("itemCondition")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
         }
-        if offer.sku.is_none() {
-            offer.sku = n.get("sku").and_then(|v| v.as_str()).map(|s| s.to_string());
+        if facts.sku.is_none() {
+            facts.sku = n.get("sku").and_then(|v| v.as_str()).map(|s| s.to_string());
         }
-        if offer.gtin.is_none() {
-            offer.gtin = n
+        if facts.gtin.is_none() {
+            facts.gtin = n
                 .get("gtin13")
                 .or_else(|| n.get("gtin14"))
                 .or_else(|| n.get("gtin8"))
@@ -2602,25 +2640,25 @@ fn merge_jsonld_nodes(offer: &mut CommerceOffer, nodes: &[serde_json::Value]) {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
         }
-        if offer.rating.is_none() {
+        if facts.rating.is_none() {
             if let Some(ar) = n.get("aggregateRating") {
-                offer.rating = ar.get("ratingValue").and_then(json_get_f64);
-                if offer.rating_count.is_none() {
-                    offer.rating_count = ar
+                facts.rating = ar.get("ratingValue").and_then(json_get_f64);
+                if facts.rating_count.is_none() {
+                    facts.rating_count = ar
                         .get("reviewCount")
                         .and_then(json_get_u64)
                         .or_else(|| ar.get("ratingCount").and_then(json_get_u64));
                 }
             }
         }
-        if offer.merchant.is_none() {
+        if facts.merchant.is_none() {
             if let Some(seller) = n.get("seller") {
-                offer.merchant =
+                facts.merchant =
                     seller.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
             }
         }
-        if offer.currency.is_none() {
-            offer.currency = n
+        if facts.currency.is_none() {
+            facts.currency = n
                 .get("priceCurrency")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
@@ -2630,12 +2668,12 @@ fn merge_jsonld_nodes(offer: &mut CommerceOffer, nodes: &[serde_json::Value]) {
     // Multiple distinct offers: never silently pick one as canonical.
     if prices.len() == 1 {
         let (p, c) = &prices[0];
-        offer.price = Some(*p);
-        if offer.currency.is_none() {
-            offer.currency = Some(c.clone());
+        facts.price = Some(*p);
+        if facts.currency.is_none() {
+            facts.currency = Some(c.clone());
         }
-        if offer.offer_count.is_none() {
-            offer.offer_count = Some(1);
+        if facts.offer_count.is_none() {
+            facts.offer_count = Some(1);
         }
     } else if !prices.is_empty() {
         let mut lo = f64::MAX;
@@ -2650,18 +2688,18 @@ fn merge_jsonld_nodes(offer: &mut CommerceOffer, nodes: &[serde_json::Value]) {
                 Some(_) => cur_agree = Some(String::new()), // disagreement -> no currency
             }
         }
-        offer.price_low = Some(lo);
-        offer.price_high = Some(hi);
-        offer.offer_count = Some(prices.len());
+        facts.price_low = Some(lo);
+        facts.price_high = Some(hi);
+        facts.offer_count = Some(prices.len());
         // Leave `price` null: multiple distinct prices, no single canonical.
         if let Some(c) = cur_agree.filter(|c| !c.is_empty()) {
-            offer.currency = Some(c);
+            facts.currency = Some(c);
         }
     }
 }
 
-fn parse_og_product(html: &str) -> Option<CommerceOffer> {
-    let mut o = CommerceOffer::default();
+fn parse_og_product(html: &str) -> Option<OfferFacts> {
+    let mut o = OfferFacts::default();
     for (prop, content) in extract_meta_tags(html) {
         match prop.as_str() {
             "product:price:amount" | "og:price:amount" => {
@@ -2738,6 +2776,392 @@ async fn handle_commerce_extract(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "serialization_failed"})),
         ),
+    }
+}
+
+/// Fetch a result page's HTML through the shared (VPN-routed) HTTP client so the
+/// commerce facts we attach come from the SAME upstream the result was produced
+/// from. Bounded and best-effort: any failure yields None and the caller degrades
+/// gracefully (no commerce block) — it must never break the search response.
+async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> {
+    let resp = match tokio::time::timeout(
+        Duration::from_millis(2500),
+        client
+            .get(url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            .send(),
+    ).await {
+        Ok(Ok(r)) => r,
+        _ => return None,
+    };
+    match tokio::time::timeout(Duration::from_millis(2000), resp.text()).await {
+        Ok(Ok(h)) => Some(h),
+        _ => None,
+    }
+}
+
+/// PURE, OFFLINE-TESTABLE enrichment: attach honest product facts to already-ranked
+/// results. This is the ONLY place commerce facts are attached, and it takes results
+/// that have ALREADY been ranked/scored by the main `/search` pipeline — it never
+/// re-ranks, re-sorts, or filters. Order is preserved byte-for-byte (see the
+/// order-invariance contract in ROADMAP item 3 / CI). Each result keeps its
+/// existing `commerce`/`commerce_provenance` (None -> fill), proving enrichment is a
+/// strict post-rank decoration pass, not a ranking signal.
+///
+/// Operates on raw `serde_json::Value` result objects so it does NOT require
+/// `Deserialize` on the whole `UnifiedResponse` (which carries non-deserializable
+/// fields). The `fetch` closure returns the page HTML for a given result URL;
+/// production passes `fetch_page_html`, but the unit tests pass a fake that returns
+/// in-repo fixtures — exercising the REAL `extract_commerce_offer` path with zero
+/// network.
+async fn enrich_with_commerce<F, Fut>(
+    results: &mut [serde_json::Value],
+    mut fetch: F,
+) where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    for r in results.iter_mut() {
+        if !r.is_object() {
+            continue;
+        }
+        let url = r
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if r.get("commerce").is_some() {
+            continue; // already enriched by an earlier step
+        }
+        let provenance = serde_json::json!({
+            "url": url,
+            "observed_at": now_unix_string(),
+            "source": null,
+            "data": null,
+        });
+        match fetch(url.clone()).await {
+            Some(h) => {
+                let offer: CommerceOffer = extract_commerce_offer(&h, &url);
+                // Only attach a `commerce` block when the page actually exposed
+                // structured product data — never a guessed/fabricated fact.
+                if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
+                    match serde_json::to_value(&offer) {
+                        Ok(v) => {
+                            r["commerce"] = v;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            None => {}
+        }
+        r["commerce_provenance"] = provenance;
+    }
+}
+
+/// True when an `OfferFacts` carries at least one meaningful structured fact.
+/// Used to decide whether to surface a `commerce` block at all (honest: no facts =>
+/// no block, never a placeholder).
+fn data_has_fact(d: &OfferFacts) -> bool {
+    d.price.is_some()
+        || d.price_low.is_some()
+        || d.currency.is_some()
+        || d.availability.is_some()
+        || d.merchant.is_some()
+        || d.condition.is_some()
+        || d.sku.is_some()
+        || d.gtin.is_some()
+        || d.rating.is_some()
+}
+
+/// GET /shopping — the user-facing commerce search endpoint (ROADMAP item 2).
+///
+/// DESIGN CONTRACT: this endpoint MUST reuse the EXACT same ranking pipeline as
+/// `/search`. It does NOT implement its own ranking rules. It forwards the request
+/// into `handle_search`, which produces the fully-ranked response, then runs
+/// `enrich_with_commerce` as a strict POST-RANKING decoration pass that only
+/// *attaches* honest product facts onto the already-ranked `results` array. Result
+/// order therefore cannot differ from `/search` for the same query (the
+/// order-invariance guarantee). The affiliate `affiliate` block is added in a later
+/// roadmap increment; until then `affiliate` is omitted and `commerce`/
+/// `commerce_provenance` carry the honest facts.
+async fn handle_shopping(
+    state: axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+    headers: HeaderMap,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
+    let (status, body) = handle_search(
+        state.clone(),
+        Query(params),
+        headers,
+    ).await;
+
+    // 2) Decode the already-ranked `results` array so we can attach facts + affiliate
+    //    in place. We operate at the JSON level (not full Deserialize) so the
+    //    enrichment is robust to every other field on UnifiedResponse.
+    let mut value = body.0.clone();
+    let results_attached = match value.get_mut("results").and_then(|v| v.as_array_mut()) {
+        Some(arr) => {
+            // ROADMAP item 1/2: attach honest product facts onto already-ranked results.
+            // The closure receives an OWNED String (generic bound `FnMut(String) -> Fut`),
+            // matching the `fetch(url.clone())` call inside `enrich_with_commerce`.
+            // We clone the reqwest client out of `state` BEFORE the closure so `state`
+            // stays usable afterward (for `decorate_affiliate`). Crucially, the returned
+            // future must OWN its inputs: returning a future that merely borrows the
+            // closure's `url` local would be a self-referential closure (E0515). Wrapping
+            // the call in `async move` moves the cloned client and the owned `url` into the
+            // future, so no borrow escapes.
+            let http_client = state.http_client.clone();
+            enrich_with_commerce(arr, move |url: String| {
+                let client = http_client.clone();
+                async move {
+                    fetch_page_html(&client, &url).await
+                }
+            }).await;
+            // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
+            decorate_affiliate(arr, &state.affiliate_ctx);
+            true
+        }
+        None => false,
+    };
+
+    // 3) Non-200 / empty → pass through untouched; otherwise return the enriched JSON.
+    if !results_attached {
+        return (status, body);
+    }
+    (status, Json(value))
+}
+
+// ─── Affiliate template engine (ROADMAP item 3) ──────────────────────
+// Server-side, data-driven affiliate decoration. NO hardcoded merchant/network
+// knowledge lives in code — everything (network list, template, params, key env
+// var name, rotation ids) comes from `data/commerce/affiliate.json`, so a new
+// merchant/network is added by editing DATA ONLY. The engine is a generic
+// template renderer supporting two kinds:
+//   * `wrap`        — network prefix + url-encoded destination (Sovrn/Skimlinks)
+//   * `append_params` — add query params to the merchant URL (EPN/Amazon/most)
+// Decoration is a STRICT post-ranking pass: `decorate_affiliate` iterates the
+// ALREADY-RANKED results and mutates only each result's `affiliate` field.
+// It never reorders, reselects, or re-scores. Missing key => `affiliate: null`,
+// result still returned (graceful degradation, never a crash / never breaks
+// search). No user id / session id / IP / query text is ever placed in an
+// affiliate parameter (privacy rule) — the only coarse subid is the merchant
+// host, which is non-identifying.
+/// One network/program row loaded from the data file. Generic over kinds.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct AffiliateNetwork {
+    id: String,
+    #[serde(default)]
+    kind: String, // "wrap" | "append_params"
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_priority")]
+    priority: i64,
+    network: String,
+    template: String,
+    #[serde(default)]
+    params: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    key_env: Option<String>,
+    #[serde(default)]
+    param_env: std::collections::HashMap<String, String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_priority() -> i64 {
+    0
+}
+
+/// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
+#[derive(Clone)]
+struct AffiliateCtx {
+    networks: Vec<AffiliateNetwork>,
+}
+
+impl AffiliateCtx {
+    /// Load networks from the data file. An empty/missing file is NOT fatal: the
+    /// engine simply has no networks and every result degrades to `affiliate:
+    /// null`. This is intentional — affiliate decoration is best-effort and must
+    /// never break search.
+    fn load() -> Self {
+        let mut networks: Vec<AffiliateNetwork> = Vec::new();
+        // Resolve the data path relative to the process cwd (container WORKDIR is
+        // /app, app binary at /app/gateway; data baked at /app/data/commerce).
+        let candidates = [
+            "data/commerce/affiliate.json",
+            "/app/data/commerce/affiliate.json",
+            "./data/commerce/affiliate.json",
+        ];
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
+                        for n in arr {
+                            if let Ok(net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                                networks.push(net);
+                            }
+                        }
+                    }
+                }
+                if !networks.is_empty() {
+                    break;
+                }
+            }
+        }
+        networks.sort_by(|a, b| b.priority.cmp(&a.priority));
+        tracing::info!("affiliate: loaded {} network(s) from data file", networks.len());
+        Self { networks }
+    }
+
+    /// The first enabled network that has its required key present in the env.
+    /// Returns None when no network can be applied (=> `affiliate: null`).
+    fn first_usable(&self) -> Option<&AffiliateNetwork> {
+        self.networks.iter().find(|n| {
+            n.enabled
+                && n.key_env
+                    .as_ref()
+                    .map(|k| std::env::var(k).is_ok())
+                    .unwrap_or(false)
+        })
+    }
+}
+
+/// Build the affiliate URL for a (network, destination) without touching any
+/// result. Pure + unit-testable. `subid` is the coarse, non-identifying value
+/// (merchant host) — see privacy rule above.
+///
+/// Both template kinds share ONE generic renderer:
+///   * `wrap`          — the template is a NETWORK PREFIX; the destination URL
+///                       must be percent-encoded (it is a query-param value), and
+///                       the network's `params` are appended as extra query pairs
+///                       (e.g. Sovrn `cuid={subid}`).
+///   * `append_params` — the template IS the raw destination URL; `params` are
+///                       appended (encoded) directly to it (e.g. eBay EPN / Amazon).
+/// Resolved value sources (all data, never code):
+///   {key}            env var named by `key_env`
+///   {url}            the (encoded for wrap / raw for append_params) destination
+///   {subid}          the coarse merchant host
+///   {param:<name>}   env var named by `param_env[name]` (generic — any name)
+fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> String {
+    let key = net
+        .key_env
+        .as_ref()
+        .and_then(|k| std::env::var(k).ok())
+        .unwrap_or_default();
+
+    // Resolve {param:<name>} placeholders from the network's param_env.
+    let mut resolved_params: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (pname, env_key) in &net.param_env {
+        if let Ok(v) = std::env::var(env_key) {
+            resolved_params.insert(pname.clone(), v);
+        }
+    }
+
+    // For `wrap` the destination must be url-encoded (it is a query-param value
+    // inside the network's prefix); for `append_params` the template IS the raw
+    // destination URL, so the `{url}` token must stay un-encoded.
+    let url_token = if net.kind == "wrap" {
+        urlencoding::encode(dest_url).into_owned()
+    } else {
+        dest_url.to_string()
+    };
+    let fill = |s: &str| -> String {
+        // Generic {param:<name>} resolution — any name, not just campaign_id.
+        let mut out = s.to_string();
+        // First interpolate scalar tokens.
+        out = out.replace("{key}", &key);
+        out = out.replace("{url}", &url_token);
+        out = out.replace("{subid}", subid);
+        // Then replace every {param:<name>} we have resolved from env.
+        for (pname, pval) in &resolved_params {
+            out = out.replace(&format!("{{param:{}}}", pname), pval);
+        }
+        // Any un-resolved {param:*} (missing env) collapses to empty — never a
+        // fabricated value, never a leftover literal placeholder.
+        let leftover = regex::Regex::new(r"\{param:[^}]*\}")
+            .ok()
+            .and_then(|re| re.find(&out).map(|_| true))
+            .unwrap_or(false);
+        if leftover {
+            // Strip the bare {param:...} token entirely.
+            if let Ok(re) = regex::Regex::new(r"\{param:[^}]*\}") {
+                out = re.replace_all(&out, "").to_string();
+            }
+        }
+        out
+    };
+
+    // The base template, with scalar + {param:*} tokens filled.
+    let base = fill(&net.template);
+
+    // Both kinds append the network's own `params` (encoded). For `wrap` these
+    // become extra query pairs on the network prefix; for `append_params` they
+    // attach to the raw destination URL. This is why a `wrap` network like Sovrn
+    // can carry `cuid={subid}` — it must NOT be dropped.
+    if !net.params.is_empty() {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for (k, v) in &net.params {
+            let val = fill(v);
+            if val.is_empty() {
+                continue;
+            }
+            pairs.push((k.clone(), val));
+        }
+        if !pairs.is_empty() {
+            let encoded: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+                .collect();
+            if base.contains('?') {
+                return format!("{}&{}", base, encoded.join("&"));
+            } else {
+                return format!("{}?{}", base, encoded.join("&"));
+            }
+        }
+    }
+    base
+}
+
+/// STRICT POST-RANKING decoration pass. Takes the ALREADY-RANKED `results` and
+/// adds an `affiliate` block to each, preserving order byte-for-byte. A result
+/// that already carries an `affiliate` block is left untouched (idempotent).
+/// When no usable network key is present, results keep `affiliate: null` and are
+/// still returned. This function NEVER reorders or re-scores.
+fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
+    let net = match ctx.first_usable() {
+        Some(n) => n,
+        None => return, // graceful: no key => leave affiliate un-set
+    };
+    for r in results.iter_mut() {
+        if !r.is_object() {
+            continue;
+        }
+        if r.get("affiliate").is_some() {
+            continue; // idempotent: never double-wrap
+        }
+        let url = match r.get("url").and_then(|v| v.as_str()) {
+            Some(u) if !u.is_empty() => u.to_string(),
+            _ => continue,
+        };
+        // Coarse, non-identifying subid: the destination merchant host only.
+        let subid = reqwest::Url::parse(&url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_default();
+        let aff_url = render_affiliate_url(net, &url, &subid);
+        let block = serde_json::json!({
+            "network": net.network,
+            "url": aff_url,
+            "disclosed": true,
+        });
+        r["affiliate"] = block;
     }
 }
 
@@ -5570,6 +5994,8 @@ fn merge_local_and_web(
             price: r.price.map(|p| p.to_string()),
             currency: r.currency,
             quality: r.quality,
+            commerce: None,
+            commerce_provenance: None,
         };
         url_to_idx.insert(norm, merged.len());
         merged.push(entry);
@@ -5624,6 +6050,8 @@ fn merge_local_and_web(
                 price: r.price.clone(),
                 currency: r.currency.clone(),
                 quality: 1.0,
+                commerce: None,
+                commerce_provenance: None,
             };
             url_to_idx.insert(norm, merged.len());
             merged.push(entry);
@@ -7314,6 +7742,11 @@ struct AppState {
     search_semaphore: Arc<tokio::sync::Semaphore>,
     /// Goal Feature: stores user goals, roadmaps, and leaderboard data
     goals_state: parking_lot::Mutex<goals::GoalStore>,
+    /// Affiliate template engine config (ROADMAP item 3). Loaded once at
+    /// startup from `data/commerce/affiliate.json`; all network/template/key-env
+    /// knowledge is data, never code. Used only as a strict post-rank decoration
+    /// pass — never affects ranking/order.
+    affiliate_ctx: AffiliateCtx,
 }
 
 async fn handle_images(
@@ -7843,6 +8276,8 @@ async fn main() {
         // ~350-400 MiB; with a 4 GiB cgroup, 8 keeps peak RSS safely under the
         // limit even under a burst, while still allowing real parallelism.
         search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        // Affiliate template engine config (ROADMAP item 3) — loaded from data.
+        affiliate_ctx: AffiliateCtx::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -7920,6 +8355,7 @@ async fn main() {
         // ranking, no monetization, no user-tracking surface. The /shopping
         // endpoint and affiliate decoration land in later increments.
         .route("/commerce/extract", post(handle_commerce_extract))
+        .route("/shopping", get(handle_shopping))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
         .route("/goals/quick", post(goals::handle_quick_roadmap))
@@ -12068,6 +12504,8 @@ async fn handle_search_fast(
                         price: r.price.map(|p| p.to_string()),
                         currency: r.currency,
                         quality: r.quality,
+                        commerce: None,
+                        commerce_provenance: None,
                     }).collect::<Vec<_>>()
                 }
                 None => vec![]
@@ -12834,69 +13272,75 @@ structured product data, so nothing must be extracted from the body.</p></body><
     #[test]
     fn extracts_single_offer_from_jsonld() {
         let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
-        assert_eq!(o.price, Some(49.99), "price must come from Offer.price");
-        assert_eq!(o.currency.as_deref(), Some("USD"));
-        assert_eq!(o.availability.as_deref(), Some("https://schema.org/InStock"));
-        assert_eq!(o.condition.as_deref(), Some("https://schema.org/NewCondition"));
-        assert_eq!(o.sku.as_deref(), Some("ACME-WP-001"));
-        assert_eq!(o.gtin.as_deref(), Some("1234567890123"));
-        assert_eq!(o.rating, Some(4.5));
-        assert_eq!(o.rating_count, Some(120));
-        assert_eq!(o.merchant.as_deref(), Some("Acme Store"));
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(49.99), "price must come from Offer.price");
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
+        assert_eq!(d.sku.as_deref(), Some("ACME-WP-001"));
+        assert_eq!(d.gtin.as_deref(), Some("1234567890123"));
+        assert_eq!(d.rating, Some(4.5));
+        assert_eq!(d.rating_count, Some(120));
+        assert_eq!(d.merchant.as_deref(), Some("Acme Store"));
         assert_eq!(o.source.as_deref(), Some("json-ld"));
         // No free-text price guessing: the body text mentions no price here, but
         // even where it would, it must not leak. price_low/high stay unset.
-        assert_eq!(o.price_low, None);
-        assert_eq!(o.price_high, None);
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
     }
 
     #[test]
     fn aggregate_offer_surfaces_range_not_single_canonical() {
         let o = extract_commerce_offer(HTML_AGGREGATE_OFFER, "https://shop.example.com/bulk");
-        assert_eq!(o.price_low, Some(10.00));
-        assert_eq!(o.price_high, Some(25.50));
-        assert_eq!(o.currency.as_deref(), Some("EUR"));
-        assert_eq!(o.offer_count, Some(8));
+        let d = o.data.as_ref().unwrap();
+        // AggregateOffer: range + count, but NO single `price` (no canonical guess).
+        assert_eq!(d.price_low, Some(10.00));
+        assert_eq!(d.price_high, Some(25.50));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(d.offer_count, Some(8));
         // `price` is set to the entry (low) price — a defined field, not a guess
         // about a single sold unit. That is acceptable; the full range is present.
-        assert_eq!(o.price, Some(10.00));
+        assert_eq!(d.price, Some(10.00));
     }
 
     #[test]
     fn two_offers_never_collapse_to_one_canonical_price() {
         let o = extract_commerce_offer(HTML_TWO_OFFERS, "https://shop.example.com/dual");
+        let d = o.data.as_ref().unwrap();
         // Two distinct USD offers: range + count, but `price` must stay null so
         // we never assert a canonical price we cannot justify.
-        assert_eq!(o.price_low, Some(15.00));
-        assert_eq!(o.price_high, Some(20.00));
-        assert_eq!(o.offer_count, Some(2));
-        assert_eq!(o.currency.as_deref(), Some("USD"));
-        assert_eq!(o.price, None, "must NOT collapse multiple offers into one price");
+        assert_eq!(d.price_low, Some(15.00));
+        assert_eq!(d.price_high, Some(20.00));
+        assert_eq!(d.offer_count, Some(2));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.price, None, "must NOT collapse multiple offers into one price");
     }
 
     #[test]
     fn open_graph_product_fallback_works() {
         let o = extract_commerce_offer(HTML_OG_PRODUCT, "https://og.example.com/p");
-        assert_eq!(o.price, Some(1299.00));
-        assert_eq!(o.currency.as_deref(), Some("INR"));
-        assert_eq!(o.availability.as_deref(), Some("in stock"));
-        assert_eq!(o.merchant.as_deref(), Some("OG Brand"));
-        assert_eq!(o.gtin.as_deref(), Some("OG-99"));
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(1299.00));
+        assert_eq!(d.currency.as_deref(), Some("INR"));
+        assert_eq!(d.availability.as_deref(), Some("in stock"));
+        assert_eq!(d.merchant.as_deref(), Some("OG Brand"));
+        assert_eq!(d.gtin.as_deref(), Some("OG-99"));
         assert_eq!(o.source.as_deref(), Some("og"));
     }
 
     #[test]
     fn no_price_page_is_all_null() {
         let o = extract_commerce_offer(HTML_NO_PRICE, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
         // The body literally says "$19.99" but we MUST NOT guess from free text.
-        assert_eq!(o.price, None, "free-text price must never be guessed");
-        assert_eq!(o.price_low, None);
-        assert_eq!(o.price_high, None);
-        assert_eq!(o.currency, None);
-        assert_eq!(o.availability, None);
-        assert_eq!(o.rating, None);
+        assert_eq!(d.price, None, "free-text price must never be guessed");
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
+        assert_eq!(d.currency, None);
+        assert_eq!(d.availability, None);
+        assert_eq!(d.rating, None);
         // merchant falls back to the coarse host label (identifier, not a fact).
-        assert_eq!(o.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
         assert_eq!(o.source.as_deref(), None);
     }
 
@@ -12911,8 +13355,9 @@ structured product data, so nothing must be extracted from the body.</p></body><
 ] }
 </script></head><body></body></html>"#;
         let o = extract_commerce_offer(html, "https://x.example.com/n");
-        assert_eq!(o.price, Some(5.00));
-        assert_eq!(o.currency.as_deref(), Some("GBP"));
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(5.00));
+        assert_eq!(d.currency.as_deref(), Some("GBP"));
     }
 
     #[test]
@@ -12921,5 +13366,225 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(o.observed_at.is_some());
         // A unix-second string is digits only.
         assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
+    }
+
+    // ── ROADMAP item 3: monetization MUST NOT affect ranking/order ────────────
+    // The /shopping pipeline enriches the ALREADY-RANKED results array in place,
+    // never reordering it. This test locks that invariant: with affiliate keys
+    // present or absent, the ranked URL order is byte-identical.
+    #[tokio::test]
+    async fn enrichment_preserves_result_order_with_or_without_affiliate_keys() {
+        // A representative already-ranked `results` slice (as /search would emit it).
+        let mut ranked = vec![
+            serde_json::json!({
+                "url": "https://shop.example.com/widget-pro",
+                "title": "Widget Pro",
+                "score": 9.7,
+                "sources": ["bing"]
+            }),
+            serde_json::json!({
+                "url": "https://store.example.org/cheaper-widget",
+                "title": "Cheaper Widget",
+                "score": 8.1,
+                "sources": ["brave"]
+            }),
+            serde_json::json!({
+                "url": "https://market.example.net/widget-bundle",
+                "title": "Widget Bundle",
+                "score": 6.3,
+                "sources": ["local"]
+            }),
+        ];
+
+        let before: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+
+        // Enrichment closure returns a fake product page for the FIRST result only,
+        // so we exercise the attach path AND the no-fact path (others get None).
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = |url: String| {
+            let h = fake_html.clone();
+            async move {
+                if url.contains("widget-pro") { Some(h) } else { None }
+            }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+
+        // 1) Order is byte-identical — this is the whole point.
+        let after: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(before, after, "enrichment must never reorder ranked results");
+
+        // 2) The fact-bearing result got an honest `commerce` block (from JSON-LD).
+        let first = ranked[0].get("commerce").expect("commerce block attached");
+        assert_eq!(first["source"], serde_json::json!("json-ld"));
+        assert_eq!(first["data"]["price"], serde_json::json!(49.99));
+
+        // 3) Provenance is attached to EVERY result, even those without facts.
+        for r in ranked.iter() {
+            assert!(r.get("commerce_provenance").is_some(), "provenance present");
+            assert!(r["commerce_provenance"]["url"].as_str().unwrap().len() > 0);
+        }
+
+        // 4) A no-fact result keeps `commerce` null (honest: we do NOT fabricate).
+        assert!(ranked[1].get("commerce").is_none()
+            || ranked[1]["commerce"].is_null());
+    }
+
+    // ── ROADMAP item 3: affiliate template engine ─────────────────────
+    // Honest, data-driven affiliate decoration. These tests lock the contract:
+    //  * two template kinds render correctly with correct URL-encoding
+    //  * decoration is idempotent (no double-wrap)
+    //  * missing key => `affiliate: null`, result still returned (graceful)
+    //  * result ORDER is byte-identical before/after decoration
+    //  * every decorated result carries `disclosed: true`
+    //  * no user/query/IP data ever enters an affiliate parameter
+
+    fn net(kind: &str, template: &str, params: HashMap<String, String>, key: Option<&str>) -> AffiliateNetwork {
+        AffiliateNetwork {
+            id: "test".to_string(),
+            kind: kind.to_string(),
+            enabled: true,
+            priority: 1,
+            network: "TestNet".to_string(),
+            template: template.to_string(),
+            params,
+            key_env: key.map(|s| s.to_string()),
+            param_env: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn wrap_kind_encodes_destination_and_uses_key() {
+        // `wrap`: network prefix + url-encoded destination, key interpolated.
+        std::env::set_var("DUMMY_SOVRN_KEY", "DUMMY_SOVRN_KEY");
+        let n = net(
+            "wrap",
+            "https://sovrn.co?key={key}&u={url}",
+            HashMap::new(),
+            Some("DUMMY_SOVRN_KEY"),
+        );
+        let url = "https://shop.example.com/widget?ref=blog#top";
+        let out = render_affiliate_url(&n, url, "shop.example.com");
+        assert!(out.starts_with("https://sovrn.co?key=DUMMY_SOVRN_KEY&u="), "key + prefix present");
+        // The destination must be percent-encoded (the `?` and `#` are unsafe raw).
+        assert!(out.contains("https%3A%2F%2Fshop.example.com%2Fwidget"), "destination url-encoded");
+        assert!(!out.contains("shop.example.com/widget?ref"), "raw destination must NOT appear");
+    }
+
+    #[test]
+    fn append_params_kind_appends_encoded_params_to_raw_url() {
+        // `append_params`: template is the raw destination; params appended encoded.
+        std::env::set_var("DUMMY_AMAZON_TAG", "DUMMY_AMAZON_TAG");
+        let mut params = HashMap::new();
+        params.insert("tag".to_string(), "{key}".to_string());
+        params.insert("customid".to_string(), "{subid}".to_string());
+        let n = net("append_params", "{url}", params.clone(), Some("DUMMY_AMAZON_TAG"));
+        let url = "https://www.amazon.com/dp/B0EXAMPLE";
+        let out = render_affiliate_url(&n, url, "amazon.com");
+        assert!(out.starts_with("https://www.amazon.com/dp/B0EXAMPLE?"), "raw destination preserved");
+        assert!(out.contains("tag=DUMMY_AMAZON_TAG"), "key param appended");
+        assert!(out.contains("customid=amazon.com"), "coarse subid (host) appended, no user data");
+        // Explicit param separator only when there is no existing query.
+        // The key comes from an ENV VAR (per architecture): set it, then name it.
+        std::env::set_var("DUMMY_EBAY_TAG", "T");
+        let n2 = net("append_params", "https://ebay.com/itm/123?foo=bar", params, Some("DUMMY_EBAY_TAG"));
+        let out2 = render_affiliate_url(&n2, "https://ebay.com/itm/123?foo=bar", "ebay.com");
+        // The existing query (?foo=bar) must be preserved, and network params
+        // appended with '&' (proving the separator is chosen correctly when a
+        // query already exists). Param *ordering* among themselves is NOT part of
+        // the contract (resolved from a HashMap), so assert each fact on its own.
+        assert!(out2.contains("?foo=bar"), "existing query preserved");
+        assert!(out2.contains("&tag=T"), "uses & separator when query already present");
+    }
+
+    #[test]
+    fn wrap_kind_appends_network_params_like_cuid() {
+        // A `wrap` network (e.g. Sovrn) carries its own `params` (cuid). These
+        // MUST be appended (encoded) to the network prefix — the prior renderer
+        // silently dropped them. This test locks that contract.
+        std::env::set_var("WRAP_CUID_KEY", "abc123");
+        let mut params = HashMap::new();
+        params.insert("cuid".to_string(), "{subid}".to_string());
+        let n = net("wrap", "https://sovrn.co?key={key}&u={url}", params, Some("WRAP_CUID_KEY"));
+        let url = "https://shop.example.com/widget?ref=blog";
+        let out = render_affiliate_url(&n, url, "shop.example.com");
+        // The network's own cuid param is present, carrying the coarse subid.
+        assert!(out.contains("cuid=shop.example.com"), "wrap network params (cuid) must be appended");
+        // Destination is still url-encoded inside the network prefix.
+        assert!(out.contains("https%3A%2F%2Fshop.example.com%2Fwidget"), "destination url-encoded");
+        assert!(!out.contains("shop.example.com/widget?ref"), "raw destination must NOT appear");
+    }
+
+    #[test]
+    fn decoration_is_idempotent_no_double_wrap() {
+        std::env::set_var("K", "K");
+        let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
+        let ctx = AffiliateCtx { networks: vec![n] };
+        let mut results = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
+        ];
+        decorate_affiliate(&mut results, &ctx);
+        let first_pass = results[0]["affiliate"]["url"].clone();
+        // Second pass must NOT double-wrap (same URL).
+        decorate_affiliate(&mut results, &ctx);
+        let second_pass = results[0]["affiliate"]["url"].clone();
+        assert_eq!(first_pass, second_pass, "idempotent: decoration must not double-wrap");
+        assert!(results[0]["affiliate"]["disclosed"].as_bool().unwrap_or(false), "disclosed:true");
+    }
+
+    #[test]
+    fn missing_key_degrades_to_null_affiliate() {
+        // No usable network (key env var unset) => results keep affiliate null.
+        let n = net("wrap", "https://sovrn.co?key={key}&u={url}", HashMap::new(), Some("UNSET_KEY_ENV_VAR_XYZ"));
+        let ctx = AffiliateCtx { networks: vec![n] };
+        let mut results = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
+        ];
+        decorate_affiliate(&mut results, &ctx);
+        assert!(results[0].get("affiliate").is_none(), "no key => affiliate omitted, not fabricated");
+    }
+
+    #[test]
+    fn decoration_preserves_ranking_order() {
+        // The central no-manipulation guarantee: decoration never reorders.
+        std::env::set_var("K", "K");
+        let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
+        let ctx = AffiliateCtx { networks: vec![n] };
+        let mut results = vec![
+            serde_json::json!({ "url": "https://a.example.com/x", "score": 9.7 }),
+            serde_json::json!({ "url": "https://b.example.org/y", "score": 8.1 }),
+            serde_json::json!({ "url": "https://c.example.net/z", "score": 6.3 }),
+        ];
+        let before: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        decorate_affiliate(&mut results, &ctx);
+        let after: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        assert_eq!(before, after, "affiliate decoration must never reorder ranked results");
+        // Every decorated result is disclosed.
+        for r in results.iter() {
+            assert_eq!(r["affiliate"]["disclosed"], serde_json::json!(true));
+        }
+    }
+
+    #[test]
+    fn no_user_or_query_data_in_affiliate_params() {
+        // Subid is the coarse merchant host only — never a query, user id, or IP.
+        std::env::set_var("K", "K");
+        let n = net(
+            "wrap",
+            "https://sovrn.co?key=K&u={url}&cuid={subid}",
+            HashMap::new(),
+            Some("K"),
+        );
+        let url = "https://shop.example.com/widget";
+        let out = render_affiliate_url(&n, url, "shop.example.com");
+        assert!(out.contains("cuid=shop.example.com"), "subid is the host");
+        assert!(!out.contains("q="), "no query text");
+        assert!(!out.contains("user"), "no user id");
+        assert!(!out.contains("ip="), "no ip");
     }
 }

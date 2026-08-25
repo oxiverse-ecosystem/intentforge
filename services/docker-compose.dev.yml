@@ -279,10 +279,15 @@ services:
       - SEARXNG2_URL=http://tor2:8081
       - CRAWLER_URL=http://localhost:5001
       - INDEXER_URL=http://localhost:6000
+      # Affiliate network keys (ROADMAP item 3). Absent => /shopping degrades to
+      # `affiliate: null` (graceful). Set a value here only to exercise the path
+      # locally; NEVER commit real keys. Production keys come from the runtime env.
+      - SOVRN_COMMERCE_KEY=dummy-test-key-do-not-use
     volumes:
       - ./shared-signals:/tmp/vpn-signals
       - ./shared-signals/resolv-gateway.conf:/etc/resolv.conf:ro
       - ../data/geolite2:/var/lib/geolite2:ro
+      - ./gateway/data/commerce:/app/data/commerce:ro
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
