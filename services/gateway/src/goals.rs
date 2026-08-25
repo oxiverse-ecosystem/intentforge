@@ -1182,10 +1182,12 @@ pub async fn handle_leaderboard(
 ) -> Response {
     let store = state.goals_state.lock();
     let entries = store.leaderboard(50);
-    (StatusCode::OK, Json(serde_json::json!({
-        "entries": entries,
-        "total_entries": entries.len()
-    }))).into_response()
+    // Returns a BARE JSON ARRAY of leaderboard entries (score-descending, max 50).
+    // `total_entries` is intentionally dropped — it is trivially derivable client-side
+    // as the array length, and a bare list is the consistent shape for a collection
+    // endpoint. The CI schema test (tests/goals_api_schema.py::test_goals_leaderboard_is_list)
+    // and the standing audit brief both encode this list contract.
+    (StatusCode::OK, Json(entries)).into_response()
 }
 
 /// POST /goals/quick — one-shot goal to full roadmap (no questions)

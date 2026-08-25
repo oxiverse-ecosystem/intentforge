@@ -1384,21 +1384,22 @@ Returns all goals sorted by score (descending). Max 50 entries.
 **Response** `200 OK`
 
 ```json
-{
-  "entries": [
-    {
-      "goal_id": "goal_0001",
-      "goal": "build a full-stack web app...",
-      "user_name": "Anonymous",
-      "score": 0,
-      "completed_phases": 0,
-      "total_phases": 4,
-      "created_at": "2026-07-29T12:00:00Z"
-    }
-  ],
-  "total_entries": 1
-}
+[
+  {
+    "goal_id": "goal_0003",
+    "goal": "learn rust programming language",
+    "user_name": "Anonymous",
+    "score": 0,
+    "completed_phases": 0,
+    "total_phases": 4,
+    "created_at": "2026-08-25T07:44:57Z"
+  }
+]
 ```
+
+The response is a **bare JSON array** (NOT an `{"entries":[...],"total_entries":N}` wrapper). The
+above is an actual live response captured after `POST /goals` → `POST /goals/:id/answers` generated
+a roadmap. The entry count is `len(array)`. Max 50 entries, sorted by `score` descending.
 
 ---
 
