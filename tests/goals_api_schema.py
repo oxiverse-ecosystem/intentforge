@@ -376,6 +376,85 @@ def test_price_lt_parsed():
     )
 
 
+# --------------------------------------------------------------------------- #
+# D3 (NL negation) — per-lead-in regression net
+# --------------------------------------------------------------------------- #
+# Every supported spoken negation lead-in must route its target entity into
+# `negative` AND keep it OUT of `positive`. A future refactor that drops a
+# lead-in (or starts re-injecting the brand as a positive term) fails the
+# matching case here. The lead-in table is data-driven in the gateway (no
+# per-brand literals); here we assert behaviour, not implementation.
+_NEGATION_LEADIN_CASES = [
+    ("not from", "sony"),
+    ("except", "apple"),
+    ("except for", "apple"),
+    ("excluding", "apple"),
+    ("without", "windows"),
+    ("other than", "java"),
+    ("anything but", "bose"),
+    ("alternative to", "sony"),
+    ("besides", "apple"),
+    ("no", "sony"),
+]
+
+
+def _negation_probe(q):
+    _assert_gateway_up()
+    status, data = _get_json("/search", {"q": q})
+    assert status == 200, f"/search returned {status} for q={q!r}"
+    sc = data.get("structured_constraints") or {}
+    return (
+        sc.get("negative", []),
+        sc.get("positive", []),
+        sc.get("price_lt"),
+        sc,
+    )
+
+
+def test_negation_leadins_route_to_negative():
+    """Each supported NL-negation lead-in excludes its brand from positive.
+
+    Regression net for t_265d86d2: a refactor that drops any lead-in (or starts
+    re-injecting the excluded brand as a positive term) fails its case here.
+    """
+    for lead, brand in _NEGATION_LEADIN_CASES:
+        q = f"wireless earbuds {lead} {brand}"
+        negative, positive, _lt, sc = _negation_probe(q)
+        assert brand in negative, (
+            f"lead-in {lead!r}: '{brand}' not in negative for q={q!r} ({sc!r})"
+        )
+        assert brand not in positive, (
+            f"lead-in {lead!r}: '{brand}' leaked into positive for q={q!r} ({sc!r})"
+        )
+
+
+def test_negation_multiterm_entity():
+    """Multi-word exclusion 'not from bose soundlink' keeps both tokens in
+    negative and out of positive (entity/noun-phrase survival, not one token)."""
+    negative, positive, _lt, sc = _negation_probe(
+        "headphones not from bose soundlink"
+    )
+    assert "bose soundlink" in negative, (
+        f"multi-word exclusion not captured: {sc!r}"
+    )
+    assert "bose" not in positive and "soundlink" not in positive, (
+        f"multi-word exclusion tokens leaked into positive: {sc!r}"
+    )
+
+
+def test_negation_full_suite_with_price():
+    """Full shopping query shape: '... not from sony under $200 ...' →
+    negative contains sony AND price_lt == 200.0 (negation + price coexist)."""
+    q = (
+        "best noise cancelling headphones not from sony under $200 "
+        "for travel with good battery life"
+    )
+    negative, positive, price_lt, sc = _negation_probe(q)
+    assert "sony" in negative, f"sony not excluded in full query: {sc!r}"
+    assert "sony" not in positive, f"sony leaked into positive: {sc!r}"
+    assert price_lt == 200.0, f"price_lt not 200.0 in full query: {sc!r}"
+
+
 if __name__ == "__main__":
     # Minimal runner for environments without pytest installed.
     import sys
@@ -396,6 +475,9 @@ if __name__ == "__main__":
         ("test_goals_leaderboard_is_list", test_goals_leaderboard_is_list),
         ("test_goals_quick_roadmap_invariant", test_goals_quick_roadmap_invariant),
         ("test_negation_not_from_sony", test_negation_not_from_sony),
+        ("test_negation_leadins_route_to_negative", test_negation_leadins_route_to_negative),
+        ("test_negation_multiterm_entity", test_negation_multiterm_entity),
+        ("test_negation_full_suite_with_price", test_negation_full_suite_with_price),
         ("test_price_lt_parsed", test_price_lt_parsed),
     ]
     failed = []

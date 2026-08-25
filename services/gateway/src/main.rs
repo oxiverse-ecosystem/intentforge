@@ -5009,7 +5009,93 @@ fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
     extract_query_negative_terms_with_dropped(q_orig).0
 }
 
-/// If the query has local intent, expand it with the user's city/region context.
+/// Extract EXPLICIT natural-language negation directives from a query and return
+/// the excluded entity/entities. Lead-ins are a data-driven table (not a per-brand
+/// list); the entity is whatever token(s) follow. The intent engine may misclassify
+/// these as positive constraints, so the gateway surfaces them directly.
+///
+/// Supported lead-ins: "not from X", "except X", "except for X", "excluding X",
+/// "without X", "other than X", "anything but X", "alternative to X", "besides X",
+/// "no X". A new lead-in is added here as data only — no per-query literals, no
+/// compiled-in brand list (hardcoding doctrine).
+///
+/// Manner qualifiers ("without soap") are deliberately NOT produced here: "soap" is
+/// not a content entity following a negation lead-in in a way that names a product
+/// to exclude; but more importantly, this extractor is only consulted for the
+/// explicit-negation SURVIVAL path, and manner suppression is handled separately by
+/// `is_real_exclusion` for the heuristic path. Single generic words after "no"/"without"
+/// that are not protected entities still pass through as explicit directives because
+/// the user said "not X" — that is unambiguous intent (unlike the heuristic
+/// `extract_query_negative_terms` path, which must be conservative to avoid collapsing
+/// result sets on manner phrases).
+fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
+    let leads: &[&str] = &[
+        r"(?i)\bnot\s+from\b",
+        r"(?i)\bexcept\s+for\b",
+        r"(?i)\bexcept\b",
+        r"(?i)\bexcluding\b",
+        r"(?i)\bwithout\b",
+        r"(?i)\bother\s+than\b",
+        r"(?i)\banything\s+but\b",
+        r"(?i)\balternative\s+to\b",
+        r"(?i)\bbesides\b",
+        r"(?i)\bno\b",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    let lower = q_orig.to_lowercase();
+    for lead in leads {
+        if let Ok(re) = regex::Regex::new(lead) {
+            let mut search = 0;
+            while let Some(m) = re.find(&lower[search..]) {
+                let after = search + m.end();
+                let tail = &lower[after..];
+                let words: Vec<&str> = tail.split_whitespace().collect();
+                let mut idx = 0;
+                // Skip leading function words (from, a, the, …) right after lead-in.
+                while idx < words.len() {
+                    let wc: String = words[idx].chars().filter(|c| c.is_alphanumeric()).collect();
+                    if wc.is_empty() || NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        idx += 1;
+                        continue;
+                    }
+                    break;
+                }
+                // Greedily collect the entity, stopping at a price op / new lead-in /
+                // trailing stopword once we already have a head.
+                let mut ent: Vec<String> = Vec::new();
+                while idx < words.len() && ent.len() < 5 {
+                    let w = words[idx];
+                    let wc: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                    if wc.is_empty() {
+                        break;
+                    }
+                    if wc.starts_with("price:") || wc == "under" || wc == "over" || wc == "below"
+                        || wc == "above" || wc == "less" || wc == "more" || wc == "max"
+                        || wc == "min" || wc == "$" || wc.parse::<f64>().is_ok()
+                    {
+                        break; // a fresh price constraint starts here
+                    }
+                    if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break; // trailing stopword ends the entity
+                    }
+                    ent.push(wc);
+                    idx += 1;
+                }
+                if !ent.is_empty() {
+                    let entity = ent.join(" ");
+                    if !out.contains(&entity) {
+                        out.push(entity);
+                    }
+                }
+                search = after;
+                if search >= lower.len() {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
 fn localize_query(query: &str, geo: &geoloc::GeoLocation) -> Option<String> {
     if !has_local_intent(query) {
         return None;
@@ -11449,13 +11535,58 @@ async fn handle_search(
             raw_neg.push(qt.clone());
         }
     }
+    // Explicit NL-negation directives ("not from X", "excluding X", "without X",
+    // "other than X", "anything but X", "alternative to X", "besides X") are
+    // unambiguous user intent and are collected by `normalize_nl_operators` as
+    // `-X` operators. They survive the heuristic `is_real_exclusion` gate (which
+    // exists to suppress manner qualifiers like "without soap" and generic nouns).
+    // Routing them here as a separate set means a brand the protected-term list
+    // does not know (e.g. "sony", "bose") is still excluded, while manner phrases
+    // never reach this path. This is data-driven via the lead-in table, not a
+    // per-brand allow-list.
+    let explicit_neg: Vec<String> = extract_explicit_negation_terms(&q_orig);
+    for en in &explicit_neg {
+        if !raw_neg.contains(en) {
+            raw_neg.push(en.clone());
+        }
+    }
     let mut gated_neg_dedup: Vec<String> = Vec::new();
+    let mut explicit_survivors: Vec<String> = Vec::new();
     for n in raw_neg.clone() {
+        if explicit_neg.iter().any(|e| e == &n) {
+            // Unambiguous directive: always keep, never re-inject as positive.
+            if !explicit_survivors.contains(&n) {
+                explicit_survivors.push(n.clone());
+            }
+            continue;
+        }
         if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
             gated_neg_dedup.push(n);
         }
     }
+    gated_neg_dedup.extend(explicit_survivors.clone());
     intent.structured_constraints.negative = gated_neg_dedup.clone();
+
+    // Explicit NL-negation directives must NOT also appear as POSITIVE terms.
+    // The intent engine sees the excluded brand/entity as a salient token and
+    // classifies it as a positive constraint, so if we only add it to `negative`
+    // the API would report the brand as BOTH excluded and requested — the exact
+    // inversion bug this task fixes (e.g. "not from sony" → positive:[…,'sony',…]
+    // and negative:[]). Remove any positive entry that matches an explicit
+    // negation entity (whole-phrase form OR individual token). Multi-word entities
+    // ("not from bose soundlink") are removed token-by-token. This is derived from
+    // the same data-driven `explicit_neg` set, so no per-query literals leak in.
+    if !explicit_neg.is_empty() {
+        let explicit_neg_tokens: std::collections::HashSet<String> = explicit_neg
+            .iter()
+            .flat_map(|e| e.split_whitespace().map(|t| t.to_lowercase()).collect::<Vec<_>>())
+            .collect();
+        intent.structured_constraints.positive.retain(|p| {
+            let pl = p.to_lowercase();
+            !explicit_neg_tokens.contains(&pl)
+                && !explicit_neg.iter().any(|e| e.to_lowercase() == pl)
+        });
+    }
 
     // D3 transparency: surface genuine (non-manner) candidate exclusions that the
     // gate declined, so they are not silently dropped. Two sources: (1) intent-engine
@@ -11475,6 +11606,11 @@ async fn handle_search(
     }
     let mut ignored_vec: Vec<String> = Vec::new();
     for n in declined {
+        // Explicit NL-negation directives are honored (survive the gate above as
+        // `gated_neg_dedup`), so they must NOT be surfaced as "exclusion not applied".
+        if explicit_neg.iter().any(|e| e == &n) {
+            continue;
+        }
         if is_manner_phrase(&n) || is_manner_frame(&q_orig, &n) {
             continue;
         }
@@ -12217,6 +12353,19 @@ fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
 /// (mirror of the intent engine's helper) so the engine query and the gateway's
 /// own constraint parsing honour spoken forms: "under $500" -> price:<500,
 /// "in url:github" -> inurl:github, "on site:reddit" -> site:reddit.
+/// Stopwords that terminate an exclusion entity during NL negation scanning
+/// (used by both `normalize_nl_operators` and the gateway `-term` scan). Generic
+/// structural vocabulary, not per-query brand literals (hardcoding doctrine).
+const NL_NEG_STOPWORDS: &[&str] = &[
+    "under", "over", "above", "below", "less", "more", "max", "min", "price",
+    "except", "excluding", "without", "besides", "other", "than", "not", "no",
+    "with", "for", "and", "or", "the", "a", "an", "of", "to", "in", "on", "at",
+    "by", "about", "that", "which", "who", "what", "when", "where", "why", "how",
+    "is", "are", "was", "were", "be", "been", "being", "has", "have", "had",
+    "do", "does", "did", "will", "would", "should", "can", "could",
+    "your", "you", "our", "we", "they", "it", "its", "their", "from", "but",
+];
+
 fn normalize_nl_operators(query: &str) -> String {
     let mut out = query.to_string();
     for (re_src, replacement) in [
@@ -12242,6 +12391,153 @@ fn normalize_nl_operators(query: &str) -> String {
         if let Ok(re) = regex::Regex::new(re_src) {
             out = re.replace_all(&out, replacement).to_string();
         }
+    }
+
+    // ── NEGATION family (spoken "not from X" → explicit `-X` exclusion) ──
+    // Data-driven lead-ins; the excluded entity is whatever token(s) follow,
+    // never a compiled-in brand list. A new lead-in is added here as data only.
+    // Each entry: (lead_in_regex, min_entity_words_to_consume).
+    let neg_leadins: &[(&str, usize)] = &[
+        (r"(?i)\bnot\s+from\b", 1),
+        (r"(?i)\bexcept\b", 1),
+        (r"(?i)\bexcept\s+for\b", 1),
+        (r"(?i)\bexcluding\b", 1),
+        (r"(?i)\bwithout\b", 1),
+        (r"(?i)\bother\s+than\b", 1),
+        (r"(?i)\banything\s+but\b", 1),
+        (r"(?i)\balternative\s+to\b", 1),
+        (r"(?i)\bbesides\b", 1),
+        (r"(?i)\bno\b", 1),
+    ];
+    // De-dupe: a token may only be consumed as an exclusion once per query.
+    let mut consumed: Vec<String> = Vec::new();
+    for (lead_re, min_words) in neg_leadins {
+        if let Ok(re) = regex::Regex::new(lead_re) {
+            let mut search_start = 0;
+            while let Some(m) = re.find(&out[search_start..]) {
+                let abs_start = search_start + m.start();
+                let after = search_start + m.end();
+                // Collect the entity: skip leading stopwords, then greedily take
+                // content words until a stopword / new negation lead-in / number
+                // that starts a fresh constraint (e.g. "under $200").
+                let rest = &out[after..];
+                let rest_words: Vec<&str> = rest.split_whitespace().collect();
+                let mut ent: Vec<String> = Vec::new();
+                let mut idx = 0;
+                // Skip filler prepositions ("from", "a", "the", ...) right after lead-in.
+                while idx < rest_words.len() {
+                    let w = rest_words[idx];
+                    let wc: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                    if wc.is_empty() || NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        // but a price/dollar token after the entity should not be
+                        // swallowed into the brand (handled by min_words gate below)
+                        idx += 1;
+                        continue;
+                    }
+                    break;
+                }
+                // Greedily absorb the entity token(s).
+                while idx < rest_words.len() && ent.len() < *min_words + 4 {
+                    let w = rest_words[idx];
+                    let wc: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                    if wc.is_empty() {
+                        break;
+                    }
+                    // Stop at a new constraint operator / negation lead-in.
+                    if wc.starts_with("price:") || wc == "under" || wc == "over" || wc == "below"
+                        || wc == "above" || wc == "less" || wc == "more" || wc == "max"
+                        || wc == "min" || wc == "$" || wc.parse::<f64>().is_ok()
+                    {
+                        break;
+                    }
+                    if NL_NEG_STOPWORDS.contains(&wc.as_str()) && !ent.is_empty() {
+                        break; // stopword after we already have a head = end of entity
+                    }
+                    if ent.len() >= *min_words && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break;
+                    }
+                    ent.push(wc);
+                    idx += 1;
+                }
+                if ent.len() >= *min_words {
+                    let entity = ent.join(" ");
+                    if !consumed.contains(&entity) {
+                        consumed.push(entity.clone());
+                    }
+                }
+                search_start = after; // allow overlapping scans by moving past lead-in
+                if search_start >= out.len() {
+                    break;
+                }
+            }
+        }
+    }
+    // Rewrite the query: drop the lead-in + entity phrase and re-append `-entity`
+    // so the canonical `-term` path (already handled downstream) picks it up and
+    // routes it to structured_constraints.negative without re-injecting it as a
+    // positive term.
+    if !consumed.is_empty() {
+        let mut rebuilt = String::new();
+        let mut cursor = 0usize;
+        // Walk the original out, removing each matched "lead-in entity" span.
+        let lower = out.to_lowercase();
+        let mut to_skip_ranges: Vec<(usize, usize)> = Vec::new();
+        for entity in &consumed {
+            // Re-find the lead-in + entity in the (lowercased) string to compute
+            // the byte span to drop.
+            for (lead_re, _min) in neg_leadins {
+                if let Ok(re) = regex::Regex::new(lead_re) {
+                    if let Some(m) = re.find(&lower[cursor..]) {
+                        let span_start = cursor + m.start();
+                        let mut pos = cursor + m.end();
+                        // consume stopwords + entity words
+                        let tail = &lower[pos..];
+                        let tw: Vec<&str> = tail.split_whitespace().collect();
+                        let mut eaten = 0usize;
+                        let mut ei = 0usize;
+                        while ei < tw.len() {
+                            let wc: String = tw[ei].chars().filter(|c| c.is_alphanumeric()).collect();
+                            if wc.is_empty() || NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                                eaten += tw[ei].len() + 1;
+                                ei += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        let ent_words: Vec<&str> = entity.split_whitespace().collect();
+                        for _ in 0..ent_words.len() {
+                            if ei < tw.len() {
+                                eaten += tw[ei].len() + 1;
+                                ei += 1;
+                            }
+                        }
+                        let span_end = pos + eaten;
+                        to_skip_ranges.push((span_start, span_end));
+                        cursor = span_end;
+                    }
+                }
+            }
+        }
+        to_skip_ranges.sort_by_key(|r| r.0);
+        for (s, e) in to_skip_ranges {
+            if s > cursor {
+                rebuilt.push_str(&out[cursor..s]);
+            }
+            cursor = e;
+        }
+        if cursor < out.len() {
+            rebuilt.push_str(&out[cursor..]);
+        }
+        let neg_suffix: Vec<String> = consumed
+            .iter()
+            .map(|e| format!("-{}", e))
+            .collect();
+        let mut rebuilt = rebuilt.split_whitespace().collect::<Vec<&str>>().join(" ");
+        if !rebuilt.is_empty() {
+            rebuilt.push(' ');
+        }
+        rebuilt.push_str(&neg_suffix.join(" "));
+        out = rebuilt;
     }
     out
 }
