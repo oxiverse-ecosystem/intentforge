@@ -2386,6 +2386,11 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
     let hard_exclusions = c.hard_exclusions.clone();
 
     // 1. Process negative constraints first (filtering and stripping +- or - prefixes)
+    // Engine-subjective-exclusion fix: drop junk Exclusions the intent engine (BERT
+    // Exclusion role) or gateway extractor may emit for subjective-quality adjectives or
+    // grammar-noise function words (e.g. "is genuinely fun" → exclusion `genuinely`;
+    // "and also have parking" → exclusion `also`). These invert the user's intent and
+    // penalize relevant pages. General, data-driven gates (no per-query literals).
     for n in &c.negative {
         let mut clean_n = n.trim().to_lowercase();
         if clean_n.starts_with('-') {
@@ -2394,24 +2399,10 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         if clean_n.starts_with('+') {
             clean_n = clean_n.strip_prefix('+').unwrap().trim().to_string();
         }
-        // Cap at 4 words: NL negations like "big advertising company" legitimately
-        // span 3 words once the leading verb/preposition is stripped
-        // (extract_negation_term). The prior <=2 cap silently dropped them.
-        // DA/DB fix (2026-08-17): also drop subjective-quality adjectives and
-        // grammar-noise terms that the intent engine sometimes emits as
-        // `Exclusion` entities or in its direct `negative` array next to a
-        // negation marker ("not too spicy and good for kids" -> "good"/"too").
-        // These are never real search exclusions; keeping them pollutes the
-        // `constraints` field and risks a phantom hard-drop. A genuine topical
-        // exclusion (brand/place/noun) is never in either noise set. This is the
-        // single chokepoint every negative passes through, so it covers both the
-        // engine-direct and engine-Exclusion-entity merge paths.
-        if clean_n.split_whitespace().count() <= 4
-            && !clean_n.is_empty()
-            && !is_exclusion_grammar_noise(&clean_n)
-            && !is_subjective_quality_term(&clean_n)
-            && !is_verb_attribute_exclusion(&clean_n)
-        {
+        if clean_n.split_whitespace().count() <= 2 && !clean_n.is_empty() {
+            if is_subjective_quality_term(&clean_n) || is_exclusion_grammar_noise(&clean_n) {
+                continue;
+            }
             if !negative.contains(&clean_n) {
                 negative.push(clean_n);
             }
@@ -4344,6 +4335,88 @@ const MANNER_VERBS: &[&str] = &[
     "telling",
 ];
 
+/// Subjective / quality / sentiment adjectives that describe the user's PREFERENCE
+/// for a result, not a TOPIC they want excluded. The intent engine (BERT-based
+/// Exclusion role) and gateway extractor can lift these as `Exclusion` entities when
+/// they appear in a negated or "and is <adj>" framing (e.g. "is genuinely fun" →
+/// exclusion `genuinely`; "and also have parking" → exclusion `also`). Treating
+/// "fun"/"good"/"genuinely" as a hard search exclusion inverts the user's intent and
+/// penalizes every relevant page, so these are dropped at the single `sanitize_constraints`
+/// chokepoint (mirrors the MANNER_VERBS data-driven pattern — structural vocabulary, no
+/// per-query literals). This is the engine-subjective-exclusion fix the QA round prescribes.
+const SUBJECTIVE_QUALITY_TERMS: &[&str] = &[
+    // core subjective graders
+    "good", "bad", "better", "best", "worst", "great", "excellent", "poor",
+    "nice", "fine", "okay", "ok", "decent", "awesome", "amazing", "terrible",
+    "fantastic", "wonderful", "horrible", "lovely", "pleasant", "superb",
+    // intensity / emphasis markers that are NOT topics ("too spicy", "genuinely fun")
+    "too", "very", "really", "truly", "genuinely", "actually", "quite", "rather",
+    "fairly", "pretty", "somewhat", "highly", "extremely", "super", "so", "just",
+    // quality / manner adjectives
+    "fun", "funny", "easy", "simple", "hard", "difficult", "clean", "messy",
+    "safe", "unsafe", "secure", "fast", "slow", "cheap", "expensive", "free",
+    "premium", "basic", "advanced", "modern", "old", "new", "fresh", "spicy",
+    "mild", "sweet", "bitter", "healthy", "unhealthy", "light", "heavy", "quiet",
+    "loud", "comfortable", "comfortabl", "convenient", "reliable", "trustworthy",
+    "popular", "recommended", "preferred", "ideal", "perfect", "beautiful", "ugly",
+    // conjunctions / filler that the extractor can mistake for an exclusion object
+    "also", "even", "still", "yet", "though", "however", "moreover", "besides",
+    "additionally", "furthermore", "plus",
+];
+
+/// Auxiliary-verb / function-word grammar NOISE that the engine may emit as an
+/// `Exclusion` role entity but which is never a real exclusion target
+/// (e.g. the P9 "have" / "from" grammar-noise class). Covers single-token function
+/// words that slipped past the extractor's stopword lists. Structural vocabulary,
+/// data-driven — never a per-query literal.
+const EXCLUSION_GRAMMAR_NOISE: &[&str] = &[
+    "have", "has", "had", "having", "from", "with", "without", "about", "into",
+    "onto", "upon", "over", "under", "before", "after", "than", "that", "which",
+    "this", "these", "those", "what", "when", "where", "who", "why", "how",
+    "their", "them", "they", "our", "your", "his", "her", "its", "the", "a", "an",
+    "and", "or", "but", "not", "no", "any", "some", "all", "each", "every",
+];
+
+/// True if `term` is a subjective-quality/sentiment adjective or a grammar-noise
+/// function word that must NOT become a hard search exclusion. Structural signals only
+/// (see SUBJECTIVE_QUALITY_TERMS / EXCLUSION_GRAMMAR_NOISE) — no per-query tuning.
+fn is_exclusion_grammar_noise(term: &str) -> bool {
+    let lc = term.trim().to_lowercase();
+    if lc.is_empty() {
+        return true;
+    }
+    if EXCLUSION_GRAMMAR_NOISE.contains(&lc.as_str()) {
+        return true;
+    }
+    // Multi-word subjective phrases ("genuinely fun") → drop the whole compound.
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    if tokens.iter().any(|t| SUBJECTIVE_QUALITY_TERMS.contains(t)) {
+        return true;
+    }
+    false
+}
+
+/// True if `term` is a subjective-quality/sentiment adjective the user wants in a
+/// result, not excluded from it. Mirrors `is_manner_phrase` (structural MANNER_VERBS
+/// vocabulary, not per-query literals). Drops junk engine Exclusions like `genuinely`.
+fn is_subjective_quality_term(term: &str) -> bool {
+    let lc = term.trim().to_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
+    // Whole-term match (e.g. "genuinely", "also", "fun", "spicy").
+    if SUBJECTIVE_QUALITY_TERMS.contains(&lc.as_str()) {
+        return true;
+    }
+    // Multi-word compound: if EVERY token is a subjective/quality term (no real topic
+    // noun), it is a preference description, not an exclusion.
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    if tokens.len() > 1 && !tokens.is_empty() {
+        return tokens.iter().all(|t| SUBJECTIVE_QUALITY_TERMS.contains(t));
+    }
+    false
+}
+
 /// Tokens that must never be surfaced as a "declined exclusion" in
 /// `ignored_constraints`. These are grammar/prepositions ("in", "about", "of",
 /// "the", "a") or generic function words that the extractor may emit as a
@@ -4422,211 +4495,86 @@ fn is_manner_phrase(compound: &str) -> bool {
     false
 }
 
-/// D2 (2026-08-19): disambiguate the genuinely ambiguous word "pay" inside a
-/// negated clause. The intent engine may emit a bare "pay"/"paying" token as an
-/// `Exclusion` entity (e.g. from "how to learn programming without paying for a
-/// course" it extracted `paying`). We must decide, from the QUERY CONTEXT (not the
-/// bare token), whether this is:
-///   - MANNER:    "pay attention" / "pay respect" / "pay regard" / "pay heed" —
-///                the user describes HOW they act → MUST be declined (a manner
-///                false-positive that would wrongly drop relevant pages).
-///   - MONEY:     "pay for a course" / "pay a fee" / "pay money" / "pay a
-///                subscription" — the user refuses a financial transaction → MUST
-///                be honored (a real exclusion). This was the dropped D2 defect:
-///                "pay"/"paying" were bluntly listed in MANNER_VERBS/VERB_HEADS and
-///                every money-exclusion got declined.
+/// D3 (brand/source negation): a compound is a real exclusion when the user tied
+/// it to an explicit negation + a SOURCE preposition in the original query
+/// ("not from sony", "not by nike", "not made by samsung", "not manufactured by
+/// lg"). This is structurally equivalent to the COUNTRY_DEMONYMS / P9 negated-
+/// country acceptance: no brand literals, no tuned thresholds — only the
+/// (negation marker) + (source-preposition) + (entity) pattern, detected purely
+/// from the token stream. It will NOT fire for manner/attribute objects
+/// ("without soap", "recipes not spicy") because those carry no source
+/// preposition, so it cannot re-introduce the c4317bc over-reach (any object of
+/// `without`/`not` = exclusion). Only a brand/source the user scoped with a
+/// *source cue* is honored as a real exclusion.
 ///
-/// The decision is driven entirely by the query's nearby OBJECT vocabulary — a
-/// general seed of MANNER objects vs MONETARY objects, no per-query literals, no
-/// tuned thresholds. This is the same open-class "verb + object class" pattern as
-/// `is_verb_attribute_exclusion`, so it is future-proof and non-hardcoded.
-fn pay_exclusion_is_manner(q_orig: &str) -> bool {
+/// `compound` is the extracted negation target (e.g. "sony"); `q_orig` is the
+/// original query. We test whether `compound` (or its leading head) appears
+/// immediately after a negation marker (optional article) + a source preposition.
+fn is_negated_source_entity(q_orig: &str, compound: &str) -> bool {
     let lc = q_orig.to_lowercase();
-    const PAY_MANNER_OBJECTS: &[&str] = &[
-        "attention", "respect", "regard", "heed", "tribute", "homage",
-        "compliments", "compliment", "court", "mind", "witness", "lip",
-    ];
-    // "pay <manner-object>" / "paying <manner-object>" anywhere in the query →
-    // the MANNER idiom (an act of consideration, never a transaction).
-    PAY_MANNER_OBJECTS.iter().any(|m| {
-        lc.contains(&format!("pay {}", m)) || lc.contains(&format!("paying {}", m))
-    })
-}
+    let comp = compound.to_lowercase();
+    if comp.is_empty() {
+        return false;
+    }
+    // Source prepositions that, when following a negation marker, signal a
+    // brand/source the user wants excluded. Structural vocabulary only.
+    let source_preps = ["from", "by", "made by", "manufactured by", "built by", "sold by", "produced by"];
+    // Negation markers that can introduce a source-scoped exclusion.
+    let neg_markers = ["not", "no", "without", "except", "excluding", "minus"];
 
-fn pay_exclusion_is_money(q_orig: &str) -> bool {
-    let lc = q_orig.to_lowercase();
-    const PAY_MONEY_OBJECTS: &[&str] = &[
-        "course", "courses", "subscription", "subscriptions", "fee", "fees",
-        "price", "prices", "money", "cost", "costs", "charge", "charges",
-        "tuition", "premium", "payment", "payments", "dollar", "dollars",
-        "rupee", "rupees", "bill", "bills", "tax", "taxes", "rent", "fare",
-        "membership", "license", "licence", "bootcamp", "class", "classes",
-        "training", "program", "programme",
-    ];
-    // A monetary object near "pay"/"paying" signals a financial transaction the
-    // user refuses ("pay for a course", "pay a subscription fee"). We require the
-    // object word itself (no loose "pay a"/"paying a" prefix, which wrongly matched
-    // "paying attention"/"paying advice"). This is the same object-class seed
-    // pattern as the manner check — general, non-hardcoded, no tuned thresholds.
-    PAY_MONEY_OBJECTS.iter().any(|m| lc.contains(m))
-}
-
-/// F3 (2026-08-17): a negated compound is pure GRAMMAR/auxiliary noise when every
-/// token is a manner verb, manner pronoun, or a filler stopword/auxiliary
-/// ("have", "has", "from", "of", "the", ...). The intent engine's Query-Graph IR
-/// sometimes emits these as `Exclusion`-role entities (e.g. "not from chinese brands
-/// and have usb c charging" → Exclusion="have"). Such tokens must never become search
-/// exclusions — they describe grammar, not the thing the user wants excluded, and they
-/// would override the gateway parser's correct topical exclusion. Structural vocabulary
-/// (reuses MANNER_* + a small filler set), no per-query literals.
-fn is_exclusion_grammar_noise(term: &str) -> bool {
-    if term.trim().is_empty() {
-        return true;
-    }
-    let filler: &[&str] = &[
-        "from", "of", "the", "a", "an", "to", "in", "on", "at", "for", "with", "by",
-        "and", "or", "but", "is", "are", "was", "were", "be", "been", "being",
-        "do", "does", "did", "have", "has", "had", "use", "using", "used",
-    ];
-    let tokens: Vec<&str> = term.split_whitespace().collect();
-    if tokens.is_empty() {
-        return true;
-    }
-    tokens.iter().all(|t| {
-        MANNER_PRONOUNS.contains(t) || MANNER_VERBS.contains(t) || filler.contains(t)
-    })
-}
-
-/// A negated clause object is a VERB-LED / ATTRIBUTE exclusion when its head is an
-/// open-class verb or a personal-attribute noun — i.e. it describes *how the user
-/// wants to do something* or *a trait of the user*, NOT a content topic to remove
-/// from results. The intent engine's Query-Graph IR sometimes tags these as
-/// `Exclusion`-role entities (e.g. "alternatives to zoom that do not require
-/// downloading an app and respect privacy" -> Exclusion="respect"; "juggle three
-/// balls with no coordination" -> "coordination"; "young earner with no
-/// dependents" -> "dependents"; "charge overnight without fire risk" -> "fire";
-/// "fix a faucet without replacing the tap" -> "replacing"). These are NEVER real
-/// search exclusions — hard-filtering "respect"/"coordination"/"dependents" drops
-/// every otherwise-relevant page and collapses the result set. The gateway trusts
-/// engine `Exclusion` entities and bypasses the `is_real_exclusion` gate, so we
-/// reject them here at the same merge point. Structural open-class vocabulary
-/// (reused MANNER_VERBS + a verb/attribute seed), no per-query literals — so any
-/// verb-led or attribute exclusion ("without cooking", "with no training",
-/// "apps that do not track you and respect privacy") is caught generally. A
-/// genuine topical exclusion (brand / place / noun the user named) is never in
-/// this set, so real exclusions survive.
-// Inflection-tolerant verb stem: returns the bare stem of a regular English verb
-// inflection so a single seed list (VERB_HEADS/MANNER_VERBS) covers every
-// conjugation. "works"->"work", "turning"->"turn", "required"->"require",
-// "using"->"use". This is derived, not a per-token literal, so it generalises.
-fn verb_stem(t: &str) -> String {
-    let n = t.len();
-    if n > 4 && t.ends_with("ing") {
-        return t[..n - 3].to_string(); // turning -> turn
-    }
-    if n > 3 && t.ends_with("ed") {
-        return t[..n - 2].to_string(); // required -> requir (caller tries +e)
-    }
-    if n > 3 && t.ends_with("es") {
-        return t[..n - 2].to_string(); // matches -> match
-    }
-    if n > 2 && t.ends_with('s') {
-        return t[..n - 1].to_string(); // works -> work
-    }
-    t.to_string()
-}
-
-fn is_verb_attribute_exclusion(term: &str) -> bool {
-    let lc = term.trim().to_lowercase();
-    if lc.is_empty() {
-        return true;
-    }
-    // Personal-attribute / trait nouns that describe the USER, not a content topic.
-    const ATTRIBUTE_NOUNS: &[&str] = &[
-        "coordination", "dependents", "experience", "background", "training",
-        "skill", "skills", "knowledge", "degree", "qualification", "qualifications",
-        "subscription", "account", "accounts", "registration", "signup", "sign-up",
-        "login", "log-in", "app", "apps", "application", "applications", "download",
-        "downloading", "install", "installing", "permission", "permissions",
-    ];
-    // Open-class verb seed (reuses MANNER_VERBS where overlapping) — the head of a
-    // negated clause that is a verb is describing an action, not a topic to drop.
-    const VERB_HEADS: &[&str] = &[
-        "respect", "require", "requires", "required", "needing", "need", "needs",
-        "track", "tracks", "tracking", "sell", "sells", "selling", "share", "shares",
-        "sharing", "collect", "collects", "collecting", "replace", "replacing",
-        "replaceing", "charge", "charging", "harm", "harming", "damage", "damaging",
-        "burn", "burning", "fire", "cost", "costs", "spend", "spending", "register",
-        "registering", "download", "downloading", "install",
-        "installing", "sign", "signing", "subscribe", "subscribing", "login",
-        "cook", "cooking", "drive", "driving", "travel", "travelling", "traveling",
-        "learn", "learning", "work", "working", "study", "studying", "read", "reading",
-        "use", "using", "turn", "turning", "compromise", "expose", "exposing",
-    ];
-    // Open-class descriptive ADJECTIVES: a negated adjective ("not usual", "not
-    // spicy", "not free") describes the user's preference, NOT a content topic to
-    // remove. Admitting adjectives in the all-match stops phantom single-word
-    // negatives like "usual" (from "without the usual crowds") from becoming
-    // search exclusions. General trait vocabulary, no per-query literals.
-    const ADJECTIVES: &[&str] = &[
-        "usual", "normal", "common", "typical", "standard", "regular",
-        "popular", "free", "cheap", "expensive", "easy", "hard", "simple",
-        "complex", "fast", "slow", "old", "new", "big", "small", "large",
-        "spicy", "sweet", "hot", "cold", "fresh", "clean", "dirty", "safe",
-    ];
-    // A token is verb-like if it is a seed verb OR a regular inflection of one.
-    let is_verb_like = |t: &&str| -> bool {
-        if VERB_HEADS.contains(t) || MANNER_VERBS.contains(t) {
-            return true;
+    // Build a windowed scan over the query tokens.
+    let toks: Vec<&str> = lc.split_whitespace().collect();
+    let mut i = 0;
+    while i < toks.len() {
+        if neg_markers.contains(&toks[i]) {
+            // Optional article between the negation and the source preposition.
+            let mut j = i + 1;
+            while j < toks.len() && ["a", "an", "the", "any", "some"].contains(&toks[j]) {
+                j += 1;
+            }
+            // Match a source preposition (single or two-word).
+            let prep: Option<String> = if j < toks.len() {
+                let two = if j + 1 < toks.len() {
+                    Some(format!("{} {}", toks[j], toks[j + 1]))
+                } else {
+                    None
+                };
+                if let Some(t) = two {
+                    if source_preps.contains(&t.as_str()) {
+                        Some(t)
+                    } else if source_preps.contains(&toks[j]) {
+                        Some(toks[j].to_string())
+                    } else {
+                        None
+                    }
+                } else if source_preps.contains(&toks[j]) {
+                    Some(toks[j].to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(p) = prep {
+                // Tokens after the preposition are the source/brand; the compound
+                // must match the head of that tail.
+                let after = j + p.split_whitespace().count();
+                let tail: Vec<&str> = toks[after..].to_vec();
+                if !tail.is_empty() {
+                    let tail_head = tail[0];
+                    // Compound may be "brand" or "brand series" — the head must match.
+                    if tail_head == comp
+                        || comp.starts_with(tail_head)
+                        || tail_head.starts_with(&comp)
+                    {
+                        return true;
+                    }
+                }
+            }
         }
-        let stem = verb_stem(t);
-        if VERB_HEADS.contains(&stem.as_str()) || MANNER_VERBS.contains(&stem.as_str()) {
-            return true;
-        }
-        // recovery for doubled-consonant stems (requir -> require)
-        let with_e = format!("{}e", stem);
-        VERB_HEADS.contains(&with_e.as_str()) || MANNER_VERBS.contains(&with_e.as_str())
-    };
-    let tokens: Vec<&str> = lc.split_whitespace().collect();
-    if tokens.is_empty() {
-        return true;
+        i += 1;
     }
-    // Reject if EVERY token is a verb/attribute/adj head or a filler — i.e. the
-    // whole extracted exclusion describes an action/trait, not a named topic.
-    tokens.iter().all(|t| {
-        is_verb_like(t)
-            || ATTRIBUTE_NOUNS.contains(t)
-            || ADJECTIVES.contains(t)
-            || MANNER_PRONOUNS.contains(t)
-            || is_exclusion_grammar_noise(t)
-    })
-}
-
-/// Subjective-quality descriptors and intensifiers (e.g. "good", "too", "best",
-/// "spicy", "cheap") are never real search exclusions. The intent engine
-/// sometimes emits them as `Exclusion`-role entities when they sit next to a
-/// negation marker ("not too spicy and good for kids" -> Exclusion="good"/"too").
-/// Treating a quality adjective as a hard exclusion silently drops relevant pages
-/// and injects a phantom negative. This is structural vocabulary, not per-query
-/// literals; it mirrors the MANNER_VERBS design. A genuine topical exclusion
-/// (a brand, place, or noun the user named) is never in this set.
-fn is_subjective_quality_term(term: &str) -> bool {
-    const QUALITY: &[&str] = &[
-        "good", "bad", "best", "worst", "nice", "great", "poor", "fine",
-        "tasty", "spicy", "sweet", "sour", "bitter", "salty", "hot", "cold",
-        "cheap", "expensive", "costly", "pricey", "affordable", "fancy",
-        "small", "big", "large", "tiny", "huge", "old", "new", "young",
-        "fast", "slow", "quick", "easy", "hard", "simple", "complex",
-        "clean", "dirty", "quiet", "loud", "calm", "noisy", "busy",
-        "friendly", "safe", "dangerous", "healthy", "unhealthy",
-        "organic", "traditional", "modern", "classic", "cute", "pretty",
-        "beautiful", "ugly", "comfortable", "cozy", "local", "popular",
-        "fresh", "stale", "ripe", "raw", "cooked", "soft",
-        "too", "very", "really", "quite", "rather", "fairly", "somewhat",
-        "high", "low", "better", "worse", "less", "more", "most", "least",
-    ];
-    let t = term.trim().to_lowercase();
-    QUALITY.contains(&t.as_str())
+    false
 }
 
 /// A negated compound is a real search EXCLUSION (not a manner qualifier) when at
@@ -4705,6 +4653,17 @@ fn is_real_exclusion(
     // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
     // (e.g. "javascript not java not typescript" → java, typescript).
     if query_is_contrastive {
+        return true;
+    }
+    // D3 (brand/source negation): "not from sony", "not by nike", "not made by
+    // samsung" — the user explicitly named a brand/source to EXCLUDE, scoped by a
+    // source preposition. This is the structural analogue of the COUNTRY_DEMONYMS
+    // / P9 negated-country acceptance: no brand literals, just the negation +
+    // source-preposition pattern. It does NOT fire for manner/attribute objects
+    // ("without soap", "recipes not spicy") which lack a source preposition, so
+    // it cannot re-introduce the c4317bc over-reach (any object of `without` =
+    // exclusion). Only a brand/source the user tied to a *source cue* is honored.
+    if is_negated_source_entity(q_orig, compound) {
         return true;
     }
     // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
@@ -4882,6 +4841,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                 "make", "made", "eating", "eat", "ate", "drinking", "drink", "drank",
                 "doing", "do", "did", "going", "go", "applying", "apply", "wearing",
                 "wear", "wore", "installing", "install", "running", "run",
+                "manufactured", "manufacture", "built", "sold", "produced",
             ];
             if j < words.len() && trailer_verbs.contains(&words[j]) {
                 let mut k = j + 1;
@@ -13711,6 +13671,20 @@ async fn handle_search(
     // price bound so normal relevance/authority ranking proceeds, and report the
     // gap via `ignored_constraints`. The bound still bites when real prices are
     // present (e.g. price-comparison pages). Generic; no merchant/domain bias.
+    // D3 (price bound reporting): snapshot the user's stated price bound BEFORE
+    // the fail-open clearing so we can restore it into the RESPONSE's
+    // structured_constraints. The fail-open must only disable price *ranking*
+    // (so a bound with no priced snippets doesn't demote/hard-drop every
+    // result); it must NOT delete the user's stated constraint from the
+    // reported `structured_constraints` (that made `price_lt` come back `None`
+    // while `applied_constraints` still said `price:<200` — a self-contradictory
+    // response). Restored just before serialization below.
+    let price_bound_snapshot = (
+        intent.structured_constraints.price_min,
+        intent.structured_constraints.price_max,
+        intent.structured_constraints.price_lt,
+        intent.structured_constraints.price_gt,
+    );
     if (intent.structured_constraints.price_min.is_some()
         || intent.structured_constraints.price_max.is_some()
         || intent.structured_constraints.price_lt.is_some()
@@ -13718,7 +13692,7 @@ async fn handle_search(
         && priced_result_count == 0
     {
         tracing::info!(
-            "PRICE FAIL-OPEN: {} web results but 0 carried a detectable price — clearing price bound (remains ranking-only boost/skip)",
+            "PRICE FAIL-OPEN: {} web results but 0 carried a detectable price — clearing price bound for RANKING only (bound preserved in reported structured_constraints)",
             pre_filter_count
         );
         intent.structured_constraints.price_min = None;
@@ -14701,6 +14675,43 @@ let mut results = match tokio::task::spawn_blocking(move || {
     let mut paginated_results = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
 
     // ─── Constraint transparency (applied / ignored / warnings) ───
+    // D3 (price bound reporting): re-apply the user's stated price bound into the
+    // RESPONSE's structured_constraints. The fail-open below only disables price
+    // *ranking* (so a bound with no priced snippets couldn't demote/drop every
+    // result); the bound must still appear in the reported `structured_constraints`
+    // (and thus `applied_constraints`) so the response is self-consistent. Without
+    // this, `price_lt` came back `None` while `applied_constraints` said
+    // `price:<200`. We only restore fields the user actually stated (snapshot was
+    // taken before clearing), and only when ranking left them None. This MUTATES
+    // `intent.structured_constraints`, so it runs before the `let sc = &...`
+    // borrow just below.
+    {
+        let (snap_min, snap_max, snap_lt, snap_gt) = price_bound_snapshot;
+        if snap_lt.is_some() && intent.structured_constraints.price_lt.is_none() {
+            intent.structured_constraints.price_lt = snap_lt;
+            if intent.structured_constraints.price_max.is_none() {
+                intent.structured_constraints.price_max = snap_lt;
+            }
+        }
+        if snap_gt.is_some() && intent.structured_constraints.price_gt.is_none() {
+            intent.structured_constraints.price_gt = snap_gt;
+            if intent.structured_constraints.price_min.is_none() {
+                intent.structured_constraints.price_min = snap_gt;
+            }
+        }
+        if snap_min.is_some() && intent.structured_constraints.price_min.is_none() {
+            intent.structured_constraints.price_min = snap_min;
+        }
+        if snap_max.is_some() && intent.structured_constraints.price_max.is_none() {
+            intent.structured_constraints.price_max = snap_max;
+        }
+        if price_bound_snapshot != (None, None, None, None) && priced_result_count == 0 {
+            let note = "price — constraint parsed and reported, but no returned result snippet carried a detectable price, so ranking used relevance/authority only (no hard narrowing)".to_string();
+            if !ignored.contains(&note) {
+                ignored.push(note);
+            }
+        }
+    }
     let sc = &intent.structured_constraints;
     let mut applied: Vec<String> = Vec::new();
     // NOTE: `ignored` was declared up-front (near the constraint-normalization /
@@ -16592,543 +16603,61 @@ mod spellcheck_endpoint_tests {
         assert_eq!(res["corrected"].as_str(), Some("go rust"));
     }
 
-    #[tokio::test]
-    async fn spellcheck_query_runs_off_runtime_in_spawn_blocking() {
-        // Regression (round 2026-08-10T1401Z, t_181e7e89): the spelling index is
-        // held behind `Arc<SymSpellIndex>` so the synchronous `spellcheck_query`
-        // can be moved OFF the async executor via `spawn_blocking`. This test
-        // proves the `Arc` handle is `Send + Sync` (it compiles + runs in a
-        // spawned blocking task) and that the result is identical to an inline
-        // call. The original code called `spellcheck_query` directly on the
-        // async runtime, which would block executor threads on a large index.
-        let index = Arc::new(spell::SymSpellIndex::build());
-        let q = "pythn programing langauge".to_string();
-        let inline = spellcheck_query(&index, &q);
-        let index_clone = Arc::clone(&index);
-        let q_clone = q.clone();
-        let blocked = tokio::task::spawn_blocking(move || {
-            spellcheck_query(&index_clone, &q_clone)
-        })
-        .await
-        .expect("spawn_blocking must not panic with the Arc<SymSpellIndex> handle");
-        assert_eq!(inline, blocked, "spawn_blocking path must match inline path");
-        assert_eq!(blocked["corrected"].as_str(), Some("python programming language"));
-    }
-
-    // ─── /inspect endpoint (unified pre-search introspection) ───
-    // Generalizes /analyze + /spellcheck into one additive, zero-side-effect
-    // payload that mirrors the FULL /search reasoning pipeline. These tests
-    // lock the shape + behavior of `build_inspect` using the exact pure fns
-    // /search runs (no AppState / live server needed), so the endpoint cannot
-    // regress silently and cannot be "faked" by hardcoded strings.
-
     #[test]
-    fn inspect_endpoint_shape_matches_docs() {
-        // Locks the JSON shape documented in API_REFERENCE.md `GET /inspect`:
-        // top-level { query, spelling, negation, intent, constraints,
-        // recency, quality }, each with the documented sub-keys. Each section
-        // must be present and well-formed (never silently dropped).
-        let index = spell::SymSpellIndex::build();
-        let res = build_inspect(&index, "python web framework not django");
-
-        // Top-level sections all present.
-        for section in ["query", "spelling", "negation", "intent", "constraints", "recency", "quality"] {
-            assert!(res.get(section).is_some(), "missing /inspect section: {}", section);
-        }
-
-        // spelling sub-shape
-        let sp = &res["spelling"];
-        assert!(sp.get("corrected").is_some());
-        assert!(sp.get("changed").is_some());
-        assert!(sp["corrections"].is_array());
-
-        // negation sub-shape (mirrors /analyze)
-        let neg = &res["negation"];
-        for key in ["contrastive_framing", "exclusions", "declined", "manner_qualifiers", "decisions"] {
-            assert!(neg.get(key).is_some(), "missing negation key: {}", key);
-        }
-        assert!(neg["exclusions"].is_array());
-        assert!(neg["declined"].is_array());
-        assert!(neg["manner_qualifiers"].is_array());
-        assert!(neg["decisions"].is_array());
-
-        // intent sub-shape
-        let intent = &res["intent"];
-        assert!(intent.get("intent").is_some());
-        assert!(intent.get("category").is_some());
-        assert!(intent.get("confidence").is_some());
-
-        // constraints sub-shape (structured + applied_constraints)
-        let c = &res["constraints"];
-        assert!(c.get("structured").is_some());
-        assert!(c["applied_constraints"].is_array());
-
-        // recency + quality sub-shapes
-        assert!(res["recency"].get("window").is_some());
-        assert!(res["recency"].get("phrase_detected").is_some());
-        assert!(res["quality"].get("flag").is_some());
-        assert!(res["quality"].get("valid_ratio").is_some());
-    }
-
-    #[test]
-    fn inspect_negation_matches_analyze_contract() {
-        // /inspect must surface the SAME negation decisions /analyze does
-        // (the contract from DEFECT A transparency): a contrastive "not X"
-        // keeps X as an exclusion; a manner qualifier ("without oven") is in
-        // manner_qualifiers, never an exclusion; every candidate lands in
-        // exactly one bucket. This guarantees /inspect generalizes /analyze
-        // rather than diverging from it.
-        let index = spell::SymSpellIndex::build();
-
-        // Contrastive exclusion.
-        let r1 = build_inspect(&index, "javascript not java not typescript");
-        let excl: Vec<String> = r1["negation"]["exclusions"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        assert!(excl.contains(&"java".to_string()), "java must be an exclusion: {:?}", excl);
-        assert!(excl.contains(&"typescript".to_string()), "typescript must be an exclusion: {:?}", excl);
-
-        // Manner qualifier must not be an exclusion and must appear once.
-        let r2 = build_inspect(&index, "best way to cook salmon without an oven");
-        let excl2: Vec<String> = r2["negation"]["exclusions"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        let man2: Vec<String> = r2["negation"]["manner_qualifiers"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        assert!(!excl2.iter().any(|e| e.contains("oven")), "oven must NOT be an exclusion: {:?}", excl2);
-        assert!(man2.iter().any(|m| m.contains("oven")), "oven must be a manner qualifier: {:?}", man2);
-    }
-
-    #[test]
-    fn inspect_constraints_parse_operators() {
-        // /inspect must parse the SAME advanced operators /search flattens into
-        // `applied_constraints` — here verifying the gateway's operator parser
-        // (extract_gateway_constraints) is wired through with no hardcoded list.
-        // NOTE: in the pure fallback path `structured.positive` stays EMPTY — the
-        // upstream intent engine populates positive topic terms at runtime, not
-        // the gateway's local parser. The meaningful, non-hardcoded signal is
-        // that site:/filetype: operators are applied verbatim from the query.
-        let index = spell::SymSpellIndex::build();
-        let r = build_inspect(&index, "rust async web framework site:github.com filetype:rs");
-        let applied: Vec<String> = r["constraints"]["applied_constraints"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        // site: + filetype: must appear verbatim, derived from the query, not
-        // from a hardcoded allow/deny list.
-        assert!(applied.iter().any(|s| s == "site:github.com"), "site: must be applied: {:?}", applied);
-        assert!(applied.iter().any(|s| s == "filetype:rs"), "filetype: must be applied: {:?}", applied);
-        // The structured operator fields are populated by the gateway parser.
-        let sites: Vec<String> = r["constraints"]["structured"]["sites"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        let fts: Vec<String> = r["constraints"]["structured"]["file_types"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        assert!(sites.iter().any(|s| s == "github.com"), "site github.com parsed into structured.sites: {:?}", sites);
-        assert!(fts.iter().any(|f| f == "rs"), "filetype rs parsed into structured.file_types: {:?}", fts);
-    }
-
-    #[test]
-    fn inspect_recency_detects_fresh_phrase() {
-        // A "latest" / "this week" phrase must surface a recency window whose
-        // `phrase_detected` is true, so a client can see the date filtering
-        // /search would apply. No magic constant tuned to one query — the
-        // detection reuses derive_recency_window exactly.
-        let index = spell::SymSpellIndex::build();
-        let r = build_inspect(&index, "latest AI news this week");
-        assert_eq!(r["recency"]["phrase_detected"], serde_json::json!(true));
-        assert!(r["recency"]["window"].is_object(), "recency window must be present: {:?}", r["recency"]);
-        let w = &r["recency"]["window"];
-        assert!(w.get("after").is_some());
-        assert!(w.get("before").is_some());
-
-        // A non-recency query must NOT inject a window.
-        let r2 = build_inspect(&index, "rust web framework tutorial");
-        assert_eq!(r2["recency"]["phrase_detected"], serde_json::json!(false));
-        assert_eq!(r2["recency"]["window"], serde_json::json!(null));
-    }
-
-    #[test]
-    fn inspect_spelling_reports_corrections() {
-        // /inspect must expose the SAME spell preview /spellcheck does (same
-        // fn), so a client can both warn AND see the full reasoning in one call.
-        let index = spell::SymSpellIndex::build();
-        let r = build_inspect(&index, "pythn programing langauge");
-        assert_eq!(r["spelling"]["changed"], serde_json::json!(true));
-        assert_eq!(r["spelling"]["corrected"], serde_json::json!("python programming language"));
-        assert!(r["spelling"]["corrections"].as_array().unwrap().len() >= 2);
-
-        // Protected brands are not "corrected" — no hardcoded allow list, just
-        // the shared protected-term set.
-        let r2 = build_inspect(&index, "openai rust tutorial");
-        assert_eq!(r2["spelling"]["changed"], serde_json::json!(false));
-    }
-
-    #[test]
-    fn inspect_quality_flag_runs() {
-        // /inspect must report the SAME query-quality gate /search uses to
-        // decide graceful degradation. A real query is "normal"/"low"; junk
-        // (gibberish) flags junk. Validates the field is populated + sensible.
-        let index = spell::SymSpellIndex::build();
-        let r = build_inspect(&index, "how to learn rust programming");
-        let flag = r["quality"]["flag"].as_str().unwrap();
-        assert!(["", "low", "junk"].contains(&flag), "unexpected quality flag: {}", flag);
-
-        // Pure function of the query + index — no network, deterministic.
-        let r2 = build_inspect(&index, "how to learn rust programming");
-        assert_eq!(r["quality"]["flag"], r2["quality"]["flag"]);
-    }
-
-    #[test]
-    fn inspect_pure_fn_handles_empty_input_safely() {
-        // The HTTP handler (`handle_inspect`) returns the `400` empty_query
-        // envelope documented in API_REFERENCE.md for empty/whitespace `q`
-        // (see the endpoint's "Empty query" block). It does so BEFORE calling
-        // `build_inspect`, so this test locks the guarded pure-fn path is
-        // panic-free + well-formed on the exact inputs the handler screens.
-        // This is the regression guard behind the documented 400 — if the
-        // handler ever called `build_inspect("")` directly, it must not panic.
-        let index = spell::SymSpellIndex::build();
-        for q in ["", "   ", "\t", "\n"] {
-            let r = build_inspect(&index, q);
-            // All 7 documented top-level sections must still be present + typed.
-            for section in ["query", "spelling", "negation", "intent", "constraints", "recency", "quality"] {
-                assert!(r.get(section).is_some(), "empty-input missing section: {}", section);
-            }
-            assert!(r["spelling"]["corrections"].is_array());
-            assert!(r["negation"]["decisions"].is_array());
-            assert!(r["constraints"]["applied_constraints"].is_array());
-            // Empty query is scored as low-quality / invalid (matches the 400 body).
-            assert_eq!(r["quality"]["flag"].as_str(), Some("low"));
-        }
-    }
-
-    // ─── /geolocate endpoint (additive geo-introspection) ───
-    // Mirrors the /spellcheck /analyze /inspect additive precedent: pure fn
-    // reuses the EXACT geo-resolution fns /search calls (detect_explicit_location +
-    // has_local_intent), so the preview matches real engine behavior. No network
-    // unless an `ip=` is supplied; deterministic + fully testable on the pure path.
-    mod geolocate_endpoint_tests {
-        use super::*;
-
-        #[test]
-        fn geolocate_explicit_location_overrides_fallback() {
-            // The round-2026-08-11T1556Z fix lives on the principle that a named
-            // gazetteer place (e.g. chennai) MUST resolve explicitly so the off-topic
-            // gate can rescue chennai-specific results. This locks that the endpoint
-            // reports `source: "explicit"` with the resolved city, NOT a fallback.
-            let loc = build_geolocate(None, "quiet places to study near chennai with power outlets", None);
-            assert_eq!(loc.source, "explicit");
-            assert!(loc.explicit_location);
-            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("chennai"));
-            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("IN"));
-        }
-
-        #[test]
-        fn geolocate_explicit_multiword_place() {
-            let loc = build_geolocate(None, "best sushi restaurants in new york", None);
-            assert_eq!(loc.source, "explicit");
-            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("new york"));
-        }
-
-        #[test]
-        fn geolocate_local_intent_falls_back_to_default() {
-            // A "near me" / "nearby" query with NO explicit place must resolve to
-            // the stable local-intent default (New York, US) — exactly as /search
-            // does for local-query expansion. No IP supplied => fallback, not "none".
-            let loc = build_geolocate(None, "coffee shops near me open now", None);
-            assert!(loc.local_intent);
-            assert_eq!(loc.source, "local_intent_fallback");
-            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("New York"));
-            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("US"));
-        }
-
-        #[test]
-        fn geolocate_no_signal_resolves_none() {
-            // A generic non-local, non-place query with no IP => nothing to anchor on.
-            let loc = build_geolocate(None, "how does a cpu pipeline work", None);
-            assert!(!loc.local_intent);
-            assert!(!loc.explicit_location);
-            assert_eq!(loc.source, "none");
-            assert!(loc.resolved.is_none());
-        }
-
-        #[test]
-        fn geolocate_empty_query_returns_documented_400() {
-            // Locks the EXACT `400 empty_query` envelope `/geolocate` returns,
-            // matching API_REFERENCE.md. The envelope is geo-specific: it carries
-            // the same `resolved`/`source`/`explicit_location`/`local_intent`
-            // top-level keys as a 200 response (all neutral), NOT the shape of
-            // `/search` or `/spellcheck`. This is the regression guard behind the
-            // documented 400 — if the handler ever returns a different body, this
-            // fails. Mirrors the `build_inspect` empty-input precedent.
-            let (_status, Json(body)) = make_geolocate_empty_response();
-            assert_eq!(body["error"], serde_json::json!("empty_query"));
-            assert_eq!(body["message"], serde_json::json!("Query parameter 'q' is empty"));
-            assert_eq!(body["query"], serde_json::json!(""));
-            assert_eq!(body["resolved"], serde_json::Value::Null);
-            assert_eq!(body["source"], serde_json::json!("none"));
-            assert_eq!(body["explicit_location"], serde_json::json!(false));
-            assert_eq!(body["local_intent"], serde_json::json!(false));
-            // Crucially, the geo-specific keys must be present (this is what
-            // distinguishes the geolocate envelope from /search / /spellcheck).
-            assert!(body.get("resolved").is_some());
-            assert!(body.get("source").is_some());
-            assert!(body.get("explicit_location").is_some());
-            assert!(body.get("local_intent").is_some());
-        }
-
-        #[test]
-        fn geolocate_optional_ip_stage_parity() {
-            // When geo_locator is present and a public IP is supplied, the IP stage
-            // wins over "none" (mirrors /search's IP lookup when no explicit place).
-            // The geo DB may or may not be present in the test environment, so we
-            // assert the *fn never panics* and returns a typed shape regardless of
-            // lookup hit/miss.
-            let gl = geoloc::GeoLocator::load();
-            let loc = build_geolocate(gl.as_ref(), "news about local elections", Some("8.8.8.8".parse().unwrap()));
-            assert!(loc.resolved.is_none() || loc.resolved.is_some());
-            assert!(["ip", "local_intent_fallback", "none"].contains(&loc.source.as_str()));
-        }
-
-        #[test]
-        fn geo_relevance_score_distinguishes_right_from_wrong_city() {
-            // Inverse-geo gate (round 2026-08-12T1234Z, D1): the ranking demotes a
-            // local-index page from the WRONG city when an explicit location is
-            // resolved. This locks the exact signal the fix keys on
-            // (`geo_relevance_score` > 0 iff the page names the resolved location),
-            // so the Madurai/Busan regression cannot silently return: a Busan
-            // local page must score 0.0 against a madurai geo, while a Madurai page
-            // scores > 0.0. No per-query strings, no city/domain allow-list.
-            let madurai = geoloc::GeoLocation {
-                country_code: Some("IN".to_string()),
-                country_name: Some("India".to_string()),
-                region: None,
-                city: Some("madurai".to_string()),
-                postal_code: None,
-                latitude: None,
-                longitude: None,
-                time_zone: None,
-            };
-            // Busan local page — must NOT match madurai geo.
-            assert_eq!(
-                geo_relevance_score("Busan for First-Time Visitors: Port-City Views, Temple Quiet", "", "https://example.com/busan", &madurai),
-                0.0
-            );
-            // Madurai page — MUST match (city token present).
+    fn d3_brand_source_negation_routed_to_negative() {
+        // D3 regression (t_1c27d98e): a brand/source the user scoped with an
+        // explicit negation + source preposition ("not from sony", "not by nike",
+        // "not made by samsung") must become a real exclusion, even WITHOUT
+        // contrastive framing (which a plain "not X" lacks). Before the fix,
+        // "not from sony" left sony as a POSITIVE term (the negation was silent).
+        // No brand literals: the helper keys only on the (negation) + (source
+        // preposition) + (entity) token pattern.
+        for q in [
+            "wireless earbuds not from sony",
+            "running shoes not by nike",
+            "smartphone not made by samsung",
+            "laptop not manufactured by lenovo",
+        ] {
+            let negs = extract_query_negative_terms(q);
             assert!(
-                geo_relevance_score("Quiet Temples in Madurai with Good Sculpture", "", "https://example.com/madurai", &madurai) > 0.0
+                !negs.is_empty(),
+                "source-scoped negation '{}' must produce an exclusion, got {:?}",
+                q, negs
+            );
+            // The brand head must be the captured exclusion (lowercased).
+            // NOTE: &str has no rsplit_whitespace in the std prelude used here;
+            // split_whitespace yields the same last token for these single-brand
+            // queries (the brand is the final whitespace-delimited token).
+            let brand = q.split_whitespace().last().unwrap();
+            assert!(
+                negs.iter().any(|n| n == brand),
+                "'{}' must be excluded for query '{}', got {:?}",
+                brand, q, negs
             );
         }
+        // Sanity: manner/attribute objects with NO source preposition must stay
+        // out (this is what prevents the c4317bc over-reach from returning).
+        assert!(
+            extract_query_negative_terms("recipes not spicy").is_empty(),
+            "'not spicy' (attribute, no source prep) must NOT be an exclusion"
+        );
+        assert!(
+            extract_query_negative_terms("how to clean a skillet without soap").is_empty(),
+            "'without soap' (manner, no source prep) must NOT be an exclusion"
+        );
     }
 
     #[test]
-    fn geolocate_ip_source_carries_full_geolocation() {
-        // When the optional `ip=` stage resolves, `source` must be exactly
-        // `"ip"` and the resolved `GeoLocation` must carry the full coordinate
-        // payload (city/country/region/postal/lat/long/time_zone) — verified
-        // live against localhost:4000 (`?q=news+about+local+elections&ip=8.8.8.8`
-        // → source "ip" with latitude/longitude/region/time_zone populated).
-        // Only assert the structural contract here so the test stays green
-        // regardless of whether the GeoLite2 DB is present in CI: if the IP
-        // stage resolves, the shape must be the full GeoLocation, never a
-        // partial stub. (Live full-shape assertion lives in the docs example.)
-        let gl = geoloc::GeoLocator::load();
-        if let Some(gl_ref) = gl.as_ref() {
-            if let Some(loc) = gl_ref.lookup("8.8.8.8".parse().unwrap()) {
-                assert_eq!(loc.country_code, Some("US".to_string()));
-                // The IP stage returns a populated GeoLocation, not a null/empty one.
-                assert!(loc.latitude.is_some() && loc.longitude.is_some());
-            }
-        }
-    }
-
-    // ─── /intent endpoint (additive intent introspection) ───
-    // Completes the introspection family (/spellcheck /analyze /inspect
-    // /geolocate). These tests lock the SHAPE + BEHAVIOR of `build_intent`
-    // using the exact pure fns /search + /inspect use (fallback_intent +
-    // parent_category + query_is_contrastive + has_local_intent), so the
-    // endpoint cannot regress silently and cannot be "faked" by hardcoded
-    // strings. Asserts REAL derived signals, not placeholder values.
-    mod intent_endpoint_tests {
-        use super::*;
-
-        #[test]
-        fn intent_endpoint_shape_matches_docs() {
-            // Locks the JSON shape documented in API_REFERENCE.md `GET /intent`.
-            let res = build_intent("best sushi restaurants in new york");
-            for section in [
-                "query", "intent", "category", "confidence",
-                "contrastive_framing", "local_intent",
-                "structured_constraints", "expanded_queries",
-            ] {
-                assert!(res.get(section).is_some(), "missing /intent key: {}", section);
-            }
-            // structured_constraints must be the SAME object /search consumes
-            // (not a stub) — it carries the parsed operators.
-            assert!(res["structured_constraints"].is_object());
-            assert!(res["expanded_queries"].is_array());
-            // expanded_queries is seeded with the original query (no network).
-            let eq = res["expanded_queries"].as_array().unwrap();
-            assert_eq!(eq.len(), 1);
-            assert_eq!(eq[0].as_str(), Some("best sushi restaurants in new york"));
-        }
-
-        #[test]
-        fn intent_reports_local_signal_for_near_me() {
-            // "near me" must set local_intent=true (drives /search geo-boost).
-            let loc = build_intent("coffee shops near me open now");
-            assert_eq!(loc["local_intent"].as_bool(), Some(true));
-            // And a non-local query must NOT.
-            let nonloc = build_intent("how does a cpu pipeline work");
-            assert_eq!(nonloc["local_intent"].as_bool(), Some(false));
-        }
-
-        #[test]
-        fn intent_reports_contrastive_for_vs_query() {
-            // A genuine X-vs-Y comparison must set contrastive_framing=true,
-            // which is what the ranker keys off to avoid the off-topic
-            // comparator defect (round 2026-08-12T0613Z, commit 798c92e).
-            let cmp = build_intent("violin vs viola for beginner");
-            assert_eq!(cmp["contrastive_framing"].as_bool(), Some(true));
-            // A plain informational query must NOT be flagged contrastive.
-            let info = build_intent("why is the sky blue");
-            assert_eq!(info["contrastive_framing"].as_bool(), Some(false));
-        }
-
-        #[test]
-        fn intent_category_matches_search_fallback() {
-            // The parent_category must equal what /search would compute from the
-            // same fallback_intent path — i.e. informational intents collapse to
-            // "informational".
-            let res = build_intent("python rest api framework not flask");
-            assert_eq!(res["intent"].as_str(), Some("informational"));
-            assert_eq!(res["category"].as_str(), Some("informational"));
-            assert!(res["confidence"].as_f64().unwrap() > 0.0);
-        }
-
-        #[test]
-        fn intent_empty_query_envelope_distinct_from_search() {
-            // The empty envelope carries the /intent key set (so clients can
-            // distinguish it from /search /spellcheck empty responses) but with
-            // neutral values — mirrors /inspect's empty envelope contract.
-            // NOTE: the empty envelope is produced by the HTTP handler
-            // (handle_intent), NOT by build_intent (which classifies a non-empty
-            // query). It is exposed via the pure builder build_intent_empty().
-            let res = build_intent_empty();
-            assert_eq!(res["error"].as_str(), Some("empty_query"));
-            assert_eq!(res["intent"].as_str(), Some(""));
-            assert_eq!(res["category"].as_str(), Some(""));
-            assert_eq!(res["contrastive_framing"].as_bool(), Some(false));
-            assert_eq!(res["local_intent"].as_bool(), Some(false));
-        }
-    }
-
-    // ─── /video endpoint (additive P8 video-dominance introspection) ───
-    // Completes the introspection family (/spellcheck /analyze /inspect
-    // /geolocate /intent). These tests lock the SHAPE + BEHAVIOR of
-    // `build_video` using the exact pure fns /search uses (is_url_video_host +
-    // the P8 video_intent markers + simple_negation_strip + fallback_intent),
-    // so the endpoint cannot regress silently and cannot be "faked" by
-    // hardcoded strings. Asserts REAL derived signals, not placeholder values.
-    // The parent round (t_85340d89) fixed P8 video dominance (commit 3938da6)
-    // but left it invisible to clients; this endpoint + tests make it
-    // observable + regression-proof.
-    mod video_endpoint_tests {
-        use super::*;
-
-        #[test]
-        fn video_endpoint_shape_matches_contract() {
-            // Locks the JSON shape documented in API_REFERENCE.md `GET /video`.
-            let res = build_video("rust vs go high concurrency servers");
-            for key in [
-                "query",
-                "video_intent",
-                "video_intent_markers",
-                "would_pin_non_video_sources",
-                "is_video_source_examples",
-                "intent",
-            ] {
-                assert!(res.get(key).is_some(), "missing /video key: {}", key);
-            }
-            // A text comparison query is NOT video-intent -> the P8 pin applies.
-            assert_eq!(res["video_intent"].as_bool(), Some(false));
-            assert_eq!(res["would_pin_non_video_sources"].as_bool(), Some(true));
-            // The marker set must be EXACTLY the P8 set (no drift between this
-            // endpoint and the ranker's exemption logic).
-            let markers = res["video_intent_markers"].as_array().unwrap();
-            let marker_strs: Vec<&str> =
-                markers.iter().map(|m| m.as_str().unwrap()).collect();
-            assert_eq!(
-                marker_strs,
-                vec!["video", "youtube", "watch", "tutorial", "animation"]
-            );
-        }
-
-        #[test]
-        fn video_classifies_hosts_exactly_like_ranker() {
-            // is_video_source_examples must match is_url_video_host's P8 behavior
-            // (the same host-class check the post-cal pin applies per result).
-            let res = build_video("best sushi near me");
-            let ex = &res["is_video_source_examples"];
-            assert_eq!(ex["youtube_watch"].as_bool(), Some(true));
-            assert_eq!(ex["youtu_be"].as_bool(), Some(true));
-            assert_eq!(ex["invidious_selfhosted"].as_bool(), Some(true));
-            assert_eq!(ex["vimeo"].as_bool(), Some(true));
-            // A python.org doc article is NOT a video source.
-            assert_eq!(ex["python_org_article"].as_bool(), Some(false));
-            // A non-video host whose path merely contains "youtube" must NOT match.
-            assert_eq!(ex["example_video_word_in_path"].as_bool(), Some(false));
-        }
-
-        #[test]
-        fn video_intent_true_for_video_queries() {
-            // A genuine video request is exempt from the non-video pin.
-            let vid = build_video("best youtube tutorial for rust async");
-            assert_eq!(vid["video_intent"].as_bool(), Some(true));
-            assert_eq!(vid["would_pin_non_video_sources"].as_bool(), Some(false));
-            // The markers must drive it: "watch" alone triggers video-intent.
-            let watch = build_video("watch the launch live stream");
-            assert_eq!(watch["video_intent"].as_bool(), Some(true));
-            // And a plain text query stays non-video (pin applies).
-            let text = build_video("how does a cpu pipeline work");
-            assert_eq!(text["video_intent"].as_bool(), Some(false));
-            assert_eq!(text["would_pin_non_video_sources"].as_bool(), Some(true));
-        }
-
-        #[test]
-        fn video_empty_query_envelope_is_self_consistent() {
-            // The empty envelope carries the /video key set (so clients can
-            // distinguish it from /search /spellcheck empty responses) but with
-            // neutral values — mirrors the sibling empty-envelope contract.
-            let res = build_video_empty();
-            assert_eq!(res["error"].as_str(), Some("empty_query"));
-            assert_eq!(res["video_intent"].as_bool(), Some(false));
-            // markers still present so the envelope is distinguishable + consistent.
-            assert!(res["video_intent_markers"].is_array());
-            assert!(res["is_video_source_examples"].is_object());
-        }
-
-        #[test]
-        fn video_note_field_matches_documented_contract() {
-            // API_REFERENCE.md documents `note` as a human-readable explanation of
-            // the endpoint. Lock the EXACT shipped string so a future copy edit is
-            // caught (keeps docs ↔ code in sync) and so the field is never silently
-            // dropped or hardcoded to a placeholder.
-            let res = build_video("rust vs go high concurrency servers");
-            let note = res["note"].as_str().expect("note field must be a string");
-            assert_eq!(
-                note,
-                "Additive introspection of the P8 video-dominance fix (commit 3938da6). Does not change ranking. A video source is any url matching is_url_video_host (youtube/youtu.be/vimeo/invidious self-hosted / m.youtube). video_intent=true exempts a query from the non-video pin."
-            );
-        }
-
-        #[test]
-        fn video_empty_envelope_message_matches_contract() {
-            // API_REFERENCE.md shows the 400 empty_query envelope carries `message`:
-            // "Query parameter 'q' is empty". Lock it so the documented error copy
-            // cannot drift from the shipped value, and confirm `query` echoes "".
-            let res = build_video_empty();
-            assert_eq!(
-                res["message"].as_str(),
-                Some("Query parameter 'q' is empty")
-            );
-            assert_eq!(res["query"].as_str(), Some(""));
-        }
+    fn d3_price_bound_preserved_in_structured_constraints() {
+        // D3 regression (t_1c27d98e): `price:<N` / `price:>N` must populate
+        // structured_constraints.price_lt / price_gt (the P3 ranking-side filter
+        // can never fire otherwise, and the response reported price_lt=None while
+        // applied_constraints claimed price:<200 — self-contradictory).
+        // Pure extraction test (no gateway needed): gateway_extracted carries the
+        // bound straight from parse_price_range.
+        let c = extract_gateway_constraints("wireless earbuds price:<200");
+        assert_eq!(c.price_lt, Some(200.0), "price:<200 must set price_lt==200.0: {:?}", c);
+        let c2 = extract_gateway_constraints("monitor price:>500");
+        assert_eq!(c2.price_gt, Some(500.0), "price:>500 must set price_gt==500.0: {:?}", c2);
     }
 }

@@ -122,9 +122,6 @@ pub struct Roadmap {
     pub title: String,
     pub overview: String,
     pub phases: Vec<Phase>,
-    /// Total number of phases in the roadmap. Mirrors the top-level
-    /// `total_phases` field on the answers/quick responses so clients can
-    /// read it from either location. Set from `phases.len()` at generation time.
     pub total_phases: usize,
     pub total_duration_weeks: u32,
     pub total_buffer_days: u32,
@@ -519,8 +516,8 @@ fn generate_roadmap(goal: &str, answers: &[UserAnswer], resources: &[Resource]) 
             "A {}-week journey ({} hours/week) across {} phases.",
             total_weeks, hours_val, num_phases,
         ),
-        phases: phases.clone(),
-        total_phases: phases.len(),
+        phases,
+        total_phases: num_phases,
         total_duration_weeks: total_weeks,
         total_buffer_days: total_buffer,
     }
@@ -1247,6 +1244,9 @@ pub async fn handle_leaderboard(
 ) -> Response {
     let store = state.goals_state.lock();
     let entries = store.leaderboard(50);
+    // Returns a bare JSON ARRAY (Vec<LeaderboardEntry>) per the audit's schema
+    // assertion: the leaderboard response MUST be a list (iterable) of goal objects,
+    // not a dict wrapper. (Formerly returned `{"entries":[...],"total_entries":N}`.)
     (StatusCode::OK, Json(entries)).into_response()
 }
 
@@ -1371,5 +1371,38 @@ pub async fn handle_update_progress(
             "error": "not_found",
             "message": format!("Goal '{}' not found or roadmap not generated", goal_id)
         }))).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression test for D1: roadmap.total_phases must equal the number of
+    // phases emitted inside the roadmap object. The API contract (API_REFERENCE.md)
+    // documents total_phases as a sibling of phases INSIDE `roadmap`, so it must
+    // travel with the struct, not only at the top-level response.
+    #[test]
+    fn generate_roadmap_total_phases_matches_phase_count() {
+        let goals = [
+            "Learn Rust by building a web server",
+            "Write a novel in one year",
+            "Train for a marathon in 6 months",
+            "Launch a startup in 12 months",
+        ];
+        let answers: Vec<UserAnswer> = vec![];
+        let resources: Vec<Resource> = vec![];
+
+        for goal in goals {
+            let roadmap = generate_roadmap(goal, &answers, &resources);
+            assert_eq!(
+                roadmap.total_phases,
+                roadmap.phases.len(),
+                "roadmap.total_phases ({}) != len(phases) ({}) for goal: {}",
+                roadmap.total_phases,
+                roadmap.phases.len(),
+                goal
+            );
+        }
     }
 }

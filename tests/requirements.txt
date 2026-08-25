@@ -1,0 +1,3 @@
+# API schema regression suite (tests/goals_api_schema.py)
+# No heavy deps — only pytest. urllib is stdlib.
+pytest>=8
