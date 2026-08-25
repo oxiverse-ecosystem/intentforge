@@ -5968,6 +5968,14 @@ fn merge_local_and_web(
     let mut merged: Vec<MergedResult> = Vec::new();
     let mut url_to_idx: HashMap<String, usize> = HashMap::new();
 
+    // How many of the merged web results actually carry a detectable price. The
+    // price-aware ranking block below only demotes price-less results when at
+    // least one priced result is present (fail-open): when NO result carries a
+    // price, demoting every price-less result collapses a valid product query to
+    // zero results, so the bound stays ranking-only. Computed here from `web`
+    // so it stays in scope for the per-result loop.
+    let priced_result_count = web.iter().filter(|r| r.get_price().is_some()).count();
+
     // Helper: normalize URL for dedup matching
     let normalize = |url: &str| -> String {
         let lower = url.to_lowercase();
@@ -6632,7 +6640,19 @@ fn merge_local_and_web(
                     relevance *= 1.10;
                 }
             } else if !price_signal {
-                relevance *= 0.45;
+                // Fail-open: only demote price-less results when at least one merged
+                // result actually carries a detectable price. When NO result has a
+                // price (the normal web-snippet case), demoting every price-less
+                // result would collapse a valid product query to zero results — so
+                // the bound stays ranking-only and the gap is reported via
+                // `ignored_constraints`. This replaces the old PRICE FAIL-OPEN branch
+                // that MUTATED `structured_constraints` (deleting the user's stated
+                // price bound), which misrepresented the query to downstream
+                // consumers (notably commerce/shopping). Extraction truth is now
+                // preserved regardless of upstream price availability.
+                if priced_result_count > 0 {
+                    relevance *= 0.45;
+                }
             }
         }
 
@@ -11044,32 +11064,19 @@ async fn handle_search(
         }
     }
 
-    // PRICE fail-open (mirrors the date fail-open above, P3-class): a price
-    // constraint (`price:<60000`, `price_max`, etc.) can only meaningfully
-    // narrow results when at least one merged web result actually carries a
-    // detectable price. Web/local snippets almost never do, so when
-    // `priced_result_count == 0` the P3 ranking block would demote EVERY result
-    // (×0.45, no detectable price signal) and the hard filter would drop the
-    // single surviving item — collapsing a valid product query ("best budget
-    // mirrorless camera under 60000 rupees") to 0 results. Fail open: clear the
-    // price bound so normal relevance/authority ranking proceeds, and report the
-    // gap via `ignored_constraints`. The bound still bites when real prices are
-    // present (e.g. price-comparison pages). Generic; no merchant/domain bias.
-    if (intent.structured_constraints.price_min.is_some()
-        || intent.structured_constraints.price_max.is_some()
-        || intent.structured_constraints.price_lt.is_some()
-        || intent.structured_constraints.price_gt.is_some())
-        && priced_result_count == 0
-    {
-        tracing::info!(
-            "PRICE FAIL-OPEN: {} web results but 0 carried a detectable price — clearing price bound (remains ranking-only boost/skip)",
-            pre_filter_count
-        );
-        intent.structured_constraints.price_min = None;
-        intent.structured_constraints.price_max = None;
-        intent.structured_constraints.price_lt = None;
-        intent.structured_constraints.price_gt = None;
-    }
+    // PRICE fail-open behaviour — DO NOT mutate `structured_constraints` here.
+    // `structured_constraints` is EXTRACTION TRUTH: it reports what the user
+    // asked for, and is consumed downstream (notably the commerce/shopping
+    // path). Clearing the bound when no upstream result carried a price was a
+    // MISREPRESENTATION of the query (the user DID say `price:<200`), and made
+    // `test_price_lt_parsed` flake per cache/upstream state. The actual
+    // fail-open now lives in the ranking layer (`merge_local_and_web`): the P3
+    // block at ~6606 only demotes price-less results when `priced_result_count
+    // > 0`, so a price-less result set survives (fail-open) instead of
+    // collapsing to zero. The unenforced bound is honestly reported via
+    // `ignored_constraints` (see the block near the constraint-transparency
+    // section, which checks the still-present bound + `priced_result_count`).
+    // Nothing to clear here.
 
     // --- Hard filter: remove web results that violate negative constraints ---
     // Uses a graduated penalty approach instead of a single threshold:
@@ -11935,8 +11942,23 @@ let mut results = match tokio::task::spawn_blocking(move || {
     }
     if (sc.price_min.is_some() || sc.price_max.is_some()
         || sc.price_lt.is_some() || sc.price_gt.is_some()) && priced_result_count == 0 {
+        // Name the unenforced bound explicitly so the response is honest:
+        // "you asked for this, we could not enforce it (no priced results)".
+        let bound_label = if let Some(v) = sc.price_lt {
+            format!("price:<{}", v)
+        } else if let Some(v) = sc.price_gt {
+            format!("price:>{}", v)
+        } else if let (Some(lo), Some(hi)) = (sc.price_min, sc.price_max) {
+            format!("price:{}-{}", lo, hi)
+        } else if let Some(lo) = sc.price_min {
+            format!("price:{}..", lo)
+        } else if let Some(hi) = sc.price_max {
+            format!("price:..{}", hi)
+        } else {
+            "price".to_string()
+        };
         ignored.push(
-            "price — no returned result snippet carried a detectable price, so no results could be narrowed".to_string(),
+            format!("{} — no returned result carried a detectable price, so no results could be narrowed", bound_label),
         );
     }
     if !sc.related.is_empty() {
