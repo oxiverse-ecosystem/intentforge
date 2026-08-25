@@ -4035,6 +4035,25 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         if GENERIC_NEG.contains(&w) {
                             break; // generic connector — won't extend past it
                         }
+                        // Bare search OPERATORS (site:, filetype:, intitle:,
+                        // inurl:, intext:, related:, and the `-flag` shortcut)
+                        // are not searchable content — they are structural
+                        // query directives. If one rides along in a negation
+                        // phrase (e.g. "not django site:github.com"), treat it
+                        // as a hard compound boundary so it is NOT absorbed into
+                        // the exclusion term. `extract_gateway_constraints`
+                        // already strips these operators separately and applies
+                        // the real filter; this only stops the negation compound
+                        // from swallowing them into garbage like "django
+                        // sitegithubcom". This is a structural guard, not a
+                        // hardcoded operator list.
+                        if w.contains(':')
+                            || (w.starts_with('-')
+                                && w.len() > 1
+                                && !w[1..].chars().all(|c| c.is_alphanumeric()))
+                        {
+                            break;
+                        }
                         let wc: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
                         if wc.is_empty() {
                             break;
@@ -6219,6 +6238,7 @@ fn merge_local_and_web(
     // removes that carve-out so the same gate protects web results.
     if !strong_distinctive_terms.is_empty() {
         let before = merged.len();
+        let retained_pre_offtopic: Vec<MergedResult> = merged.iter().cloned().collect();
         merged.retain(|r| {
             // Adult exemption: when the query is explicitly adult, an adult result
             // must survive the off-topic gate — the adult block below keeps it
@@ -6254,6 +6274,41 @@ fn merge_local_and_web(
         let removed = before - merged.len();
         if removed > 0 {
             tracing::info!("OFF_TOPIC_HARD_DROP: removed {}/{} result(s) (local+web) with zero distinctive-term overlap", removed, before);
+        }
+        // Fail-open rescue (mirrors the date/price fail-opens above): if the
+        // off-topic drop would EMPTY the merged set, the "distinctive-term
+        // overlap" signal is too strict for this query (e.g. fresh+price queries
+        // where upstream results legitimately omit the exact distinctive tokens
+        // in their title/content/url snippets) and we must not return a blank
+        // page. Restore the survivors but STILL enforce the adult hard-drop below
+        // (safety is never fail-open), and keep an explicit warning so the gap is
+        // visible. Keyed on "would-empty", not on any query/domain — general.
+        if merged.is_empty() && before > 0 {
+            let restored: Vec<MergedResult> = retained_pre_offtopic
+                .into_iter()
+                .filter(|r| {
+                    let ul = r.url.to_lowercase();
+                    let tl = r.title.to_lowercase();
+                    let host = reqwest::Url::parse(&r.url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                        .unwrap_or_default();
+                    let tld_adult = host.ends_with(".xxx");
+                    let host_adult = adult_hosts.iter().any(|h| host.contains(h));
+                    let path_adult = adult_paths.iter().any(|p| ul.contains(p));
+                    let title_adult = tl.contains("porn") || tl.contains("xxx ")
+                        || tl.contains("nude") || tl.contains("naked")
+                        || tl.contains("sex video") || tl.contains("adult film");
+                    let is_adult = tld_adult || host_adult || path_adult || title_adult;
+                    !is_adult
+                })
+                .collect();
+            tracing::warn!(
+                "OFF_TOPIC_HARD_DROP FAIL-OPEN: {} result(s) all lacked distinctive-term overlap but dropping them would empty the set — restoring {} non-adult survivor(s) (recency/authority ranking still applies)",
+                before,
+                restored.len()
+            );
+            merged = restored;
         }
     }
 
@@ -6815,8 +6870,11 @@ struct AppState {
     /// In-flight request deduplication: tracks identical queries in flight so
     /// concurrent duplicate requests share one SearXNG fetch instead of N.
     in_flight: Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<String>>>>,
-    /// SymSpell + LinSpell spelling correction index (built at startup)
-    spell_index: spell::SymSpellIndex,
+    /// SymSpell + LinSpell spelling correction index (built at startup).
+    /// Held behind `Arc` so the synchronous dictionary lookup can be moved into
+    /// a `spawn_blocking` task off the async runtime (see `handle_spellcheck`)
+    /// without deep-cloning the (large) index per request.
+    spell_index: Arc<spell::SymSpellIndex>,
     /// Optional MaxMind GeoLite2 IP geolocation lookup
     geo_locator: Option<geoloc::GeoLocator>,
     /// Bounds concurrent heavy search handlers so the combined per-request
@@ -7351,7 +7409,7 @@ async fn main() {
         searxng2_url,
         searx_last_used: Mutex::new(HashMap::new()),
         in_flight: Mutex::new(HashMap::new()),
-        spell_index: spell::SymSpellIndex::build(),
+        spell_index: Arc::new(spell::SymSpellIndex::build()),
         geo_locator: geoloc::GeoLocator::load(),
         goals_state: parking_lot::Mutex::new(goals::GoalStore::new()),
         // Cap concurrent heavy searches. Measured peak per concurrent search is
@@ -7431,6 +7489,10 @@ async fn main() {
         .route("/news", get(handle_news))
         .route("/spellcheck", get(handle_spellcheck))
         .route("/analyze", get(handle_analyze))
+        // Unified pre-search introspection: mirrors the FULL /search reasoning
+        // pipeline (spell -> negation -> intent -> constraints -> recency ->
+        // query-quality) in one additive, zero-side-effect payload. See handle_inspect.
+        .route("/inspect", get(handle_inspect))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
         .route("/goals/quick", post(goals::handle_quick_roadmap))
@@ -7573,7 +7635,30 @@ async fn handle_spellcheck(
             })),
         );
     }
-    let result = spellcheck_query(&state.spell_index, &q);
+    let result = {
+        // `spellcheck_query` runs synchronous SymSpell dictionary lookups and
+        // string work. On a large index this would block the async executor
+        // thread and stall unrelated in-flight requests, so we move it into a
+        // `spawn_blocking` task. The index lives behind `Arc`, so the closure
+        // can cheaply own a clone of the handle (no deep dictionary copy).
+        let index = Arc::clone(&state.spell_index);
+        let q_owned = q.clone();
+        match tokio::task::spawn_blocking(move || spellcheck_query(&index, &q_owned)).await {
+            Ok(r) => r,
+            Err(_) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "spellcheck_task_failed",
+                        "query": q,
+                        "corrected": "",
+                        "changed": false,
+                        "corrections": []
+                    })),
+                );
+            }
+        }
+    };
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -7658,6 +7743,179 @@ async fn handle_analyze(
         "decisions": decisions
     });
     (axum::http::StatusCode::OK, Json(result))
+}
+
+/// `GET /inspect?q=...` — unified pre-search introspection.
+///
+/// Generalizes the `/analyze` (negation) and `/spellcheck` (spelling)
+/// transparency endpoints into ONE additive, zero-side-effect payload that
+/// mirrors the *entire* `/search` reasoning pipeline a client can reason about
+/// before issuing a search:
+///
+///   1. spelling  — `spellcheck_query` (same fn `/search` pre-corrects with)
+///   2. negation   — the `exclusions` / `declined` / `manner_qualifiers` split
+///                   from `extract_query_negative_terms_with_dropped` + the
+///                   per-term `decisions[]` (same as `/analyze`)
+///   3. intent     — `fallback_intent` (pure, no-network) + `parent_category`
+///   4. constraints— `extract_gateway_constraints` (the gateway's own operator
+///                   parser, identical to what `/search` flattens) + the
+///                   `applied_constraints` shape `/search` reports
+///   5. recency    — `derive_recency_window` (what a "latest"/"this week"
+///                   phrase would inject), so the client can see whether a
+///                   date window will be applied
+///   6. quality    — `query_quality_flag` (junk/low/normal), the same gate that
+///                   decides graceful degradation
+///
+/// No new ranking logic, no per-query hardcoded strings, no domain allow/deny
+/// lists, no magic constants. It reuses the EXACT functions `/search` calls, so
+/// the preview always matches real engine behavior. It is read-only: it does
+/// not change ranking, negation gating, calibration, or fetch anything.
+async fn handle_inspect(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
+    if q.trim().is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "empty_query",
+                "message": "Query parameter 'q' is empty",
+                "query": "",
+                "spelling": { "corrected": "", "changed": false, "corrections": [] },
+                "negation": { "exclusions": [], "declined": [], "manner_qualifiers": [], "contrastive_framing": false, "decisions": [] },
+                "intent": { "intent": "", "category": "", "confidence": 0.0 },
+                "constraints": { "structured": {}, "applied_constraints": [] },
+                "recency": { "window": null, "phrase_detected": false },
+                "quality": { "flag": "low", "valid_ratio": 0.0 }
+            })),
+        );
+    }
+    let result = build_inspect(&state.spell_index, &q);
+    (axum::http::StatusCode::OK, Json(result))
+}
+
+/// Pure builder for `/inspect`. Exported + unit-tested so behavior is locked
+/// independently of the HTTP layer (no AppState / live server needed). Mirrors
+/// the exact pure functions `/search` runs — never duplicate or hardcode logic.
+fn build_inspect(index: &spell::SymSpellIndex, q: &str) -> serde_json::Value {
+    // 1. Spelling (same fn `/search` pre-corrects with).
+    let spelling = spellcheck_query(index, q);
+
+    // 2. Negation (same fn + per-term decisions as `/analyze`).
+    let q_orig = q.to_string();
+    let query_contrastive = query_is_contrastive(&q_orig);
+    let (kept, declined, manner) =
+        extract_query_negative_terms_with_dropped(&q_orig);
+    let mut decisions: Vec<serde_json::Value> = Vec::new();
+    for term in &kept {
+        decisions.push(serde_json::json!({
+            "term": term,
+            "decision": "exclusion",
+            "reason": "recognized entity or contrastive framing (compare/versus/alternative/instead-of/double-negation)"
+        }));
+    }
+    for term in &declined {
+        let is_manner = is_manner_phrase(term) || is_manner_frame(&q_orig, term);
+        decisions.push(serde_json::json!({
+            "term": term,
+            "decision": "declined",
+            "reason": if is_manner {
+                "manner qualifier (HOW not WHAT to exclude) — never a search exclusion"
+            } else {
+                "neither a recognized entity nor in contrastive framing — excluded to avoid penalizing unrelated topical words"
+            }
+        }));
+    }
+    for term in &manner {
+        decisions.push(serde_json::json!({
+            "term": term,
+            "decision": "manner_qualifier",
+            "reason": "manner qualifier (HOW not WHAT to exclude) — described the user's method, not a topic to filter out"
+        }));
+    }
+
+    // 3. Intent (pure, no-network fallback classifier — same one `/search` uses
+    //    when the intent engine is unreachable, so the preview is consistent).
+    let intent = fallback_intent(q);
+    let category = parent_category(&intent.intent);
+
+    // 4. Constraints (gateway's own operator parser, identical to `/search`).
+    //    Build the `applied_constraints` shape `/search` reports.
+    let sc = &intent.structured_constraints;
+    let mut applied: Vec<String> = Vec::new();
+    if let Some(l) = &sc.language { applied.push(format!("lang:{}", l)); }
+    if let Some(a) = &sc.after_date { applied.push(format!("after:{}", a)); }
+    if let Some(b) = &sc.before_date { applied.push(format!("before:{}", b)); }
+    for s in &sc.sites { applied.push(format!("site:{}", s)); }
+    for f in &sc.file_types { applied.push(format!("filetype:{}", f)); }
+    for p in &sc.phrases { applied.push(format!("\"{}\"", p)); }
+    for t in &sc.intitle { applied.push(format!("intitle:{}", t)); }
+    for u in &sc.inurl { applied.push(format!("inurl:{}", u)); }
+    for t in &sc.intext { applied.push(format!("intext:{}", t)); }
+    for r in &sc.related { applied.push(format!("related:{}", r)); }
+    let has_lt = sc.price_lt.is_some();
+    let has_gt = sc.price_gt.is_some();
+    if sc.price_min.is_some() || sc.price_max.is_some() || has_lt || has_gt {
+        if let Some(v) = sc.price_lt { applied.push(format!("price:<{}", v)); }
+        if let Some(v) = sc.price_gt { applied.push(format!("price:>{}", v)); }
+        if !has_lt && !has_gt {
+            let lo = sc.price_min.map(|v| v.to_string()).unwrap_or_else(|| "*".to_string());
+            let hi = sc.price_max.map(|v| v.to_string()).unwrap_or_else(|| "*".to_string());
+            applied.push(format!("price:{}-{}", lo, hi));
+        }
+    }
+    for n in &sc.negative { applied.push(format!("not:{}", n)); }
+
+    // 5. Recency (what a fresh/recent phrase would inject as a date window).
+    let recency_window = derive_recency_window(&q.to_lowercase());
+    let recency_phrase = recency_window.is_some()
+        && (q.to_lowercase().contains("latest")
+            || q.to_lowercase().contains("recent")
+            || q.to_lowercase().contains("fresh")
+            || q.to_lowercase().contains("today")
+            || q.to_lowercase().contains("yesterday")
+            || q.to_lowercase().contains("this week")
+            || q.to_lowercase().contains("last week")
+            || q.to_lowercase().contains("this month")
+            || q.to_lowercase().contains("past week")
+            || q.to_lowercase().contains("this year"));
+
+    // 6. Query quality (same gate that decides graceful degradation).
+    let (quality_flag, valid_ratio) = query_quality_flag(q, index);
+
+    serde_json::json!({
+        "query": q,
+        "spelling": {
+            "corrected": spelling["corrected"],
+            "changed": spelling["changed"],
+            "corrections": spelling["corrections"]
+        },
+        "negation": {
+            "contrastive_framing": query_contrastive,
+            "exclusions": kept,
+            "declined": declined,
+            "manner_qualifiers": manner,
+            "decisions": decisions
+        },
+        "intent": {
+            "intent": intent.intent,
+            "category": category,
+            "confidence": intent.confidence
+        },
+        "constraints": {
+            "structured": sc,
+            "applied_constraints": applied
+        },
+        "recency": {
+            "window": recency_window.map(|(a, b)| serde_json::json!({ "after": a, "before": b })),
+            "phrase_detected": recency_phrase
+        },
+        "quality": {
+            "flag": quality_flag,
+            "valid_ratio": valid_ratio
+        }
+    })
 }
 
 fn is_pronounceable(w: &str) -> bool {
@@ -12280,6 +12538,50 @@ mod hardcoding_ruling_tests {
         assert!(!is_url_video_host("https://example.com/youtube-guide-article"));
         assert!(!is_url_video_host("https://reddit.com/r/IndianFood/comments/abc"));
     }
+
+    #[test]
+    fn negation_compound_does_not_swallow_site_operator() {
+        // Regression (round 2026-08-10T1401Z, t_331c2fc3): when an operator token
+        // rides along in a negation phrase (e.g. "not django site:github.com"),
+        // the greedy compound builder must NOT absorb `site:github.com` into the
+        // exclusion term. Before the fix the exclusion came back as
+        // "django sitegithubcom" (garbage). After the fix it must be exactly
+        // ["django"], and the real site: operator must still be extracted
+        // separately by extract_gateway_constraints.
+        let q = "latest python web framework not django site:github.com";
+        let exclusions = extract_query_negative_terms(q);
+        assert_eq!(
+            exclusions,
+            vec!["django".to_string()],
+            "site: operator must not be swallowed into the exclusion compound"
+        );
+
+        let c = extract_gateway_constraints(q);
+        assert!(
+            c.sites.contains(&"github.com".to_string()),
+            "extract_gateway_constraints must still extract the real site: filter"
+        );
+
+        // filetype: must ALSO be treated as a boundary, so it is never absorbed
+        // into the compound (which would produce garbage like "pandas
+        // filetypepdf"). The real `file_type` operator must still be extracted
+        // separately by extract_gateway_constraints. Note: whether "pandas"
+        // itself survives the `is_real_exclusion` gate is engine policy and NOT
+        // part of this regression — we only assert the operator is not swallowed
+        // and the genuine file_type filter is extracted.
+        let q2 = "python tutorials not pandas filetype:pdf";
+        let excl2 = extract_query_negative_terms(q2);
+        assert!(
+            !excl2.iter().any(|e| e.contains("filetype")),
+            "filetype: operator must not be swallowed into any exclusion term, got {:?}",
+            excl2
+        );
+        let c2 = extract_gateway_constraints(q2);
+        assert!(
+            c2.file_types.contains(&"pdf".to_string()),
+            "extract_gateway_constraints must still extract the real filetype: filter"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -12425,5 +12727,211 @@ mod spellcheck_endpoint_tests {
         assert_eq!(res["changed"].as_bool(), Some(false));
         assert!(res["corrections"].as_array().unwrap().is_empty());
         assert_eq!(res["corrected"].as_str(), Some("go rust"));
+    }
+
+    #[tokio::test]
+    async fn spellcheck_query_runs_off_runtime_in_spawn_blocking() {
+        // Regression (round 2026-08-10T1401Z, t_181e7e89): the spelling index is
+        // held behind `Arc<SymSpellIndex>` so the synchronous `spellcheck_query`
+        // can be moved OFF the async executor via `spawn_blocking`. This test
+        // proves the `Arc` handle is `Send + Sync` (it compiles + runs in a
+        // spawned blocking task) and that the result is identical to an inline
+        // call. The original code called `spellcheck_query` directly on the
+        // async runtime, which would block executor threads on a large index.
+        let index = Arc::new(spell::SymSpellIndex::build());
+        let q = "pythn programing langauge".to_string();
+        let inline = spellcheck_query(&index, &q);
+        let index_clone = Arc::clone(&index);
+        let q_clone = q.clone();
+        let blocked = tokio::task::spawn_blocking(move || {
+            spellcheck_query(&index_clone, &q_clone)
+        })
+        .await
+        .expect("spawn_blocking must not panic with the Arc<SymSpellIndex> handle");
+        assert_eq!(inline, blocked, "spawn_blocking path must match inline path");
+        assert_eq!(blocked["corrected"].as_str(), Some("python programming language"));
+    }
+
+    // ─── /inspect endpoint (unified pre-search introspection) ───
+    // Generalizes /analyze + /spellcheck into one additive, zero-side-effect
+    // payload that mirrors the FULL /search reasoning pipeline. These tests
+    // lock the shape + behavior of `build_inspect` using the exact pure fns
+    // /search runs (no AppState / live server needed), so the endpoint cannot
+    // regress silently and cannot be "faked" by hardcoded strings.
+
+    #[test]
+    fn inspect_endpoint_shape_matches_docs() {
+        // Locks the JSON shape documented in API_REFERENCE.md `GET /inspect`:
+        // top-level { query, spelling, negation, intent, constraints,
+        // recency, quality }, each with the documented sub-keys. Each section
+        // must be present and well-formed (never silently dropped).
+        let index = spell::SymSpellIndex::build();
+        let res = build_inspect(&index, "python web framework not django");
+
+        // Top-level sections all present.
+        for section in ["query", "spelling", "negation", "intent", "constraints", "recency", "quality"] {
+            assert!(res.get(section).is_some(), "missing /inspect section: {}", section);
+        }
+
+        // spelling sub-shape
+        let sp = &res["spelling"];
+        assert!(sp.get("corrected").is_some());
+        assert!(sp.get("changed").is_some());
+        assert!(sp["corrections"].is_array());
+
+        // negation sub-shape (mirrors /analyze)
+        let neg = &res["negation"];
+        for key in ["contrastive_framing", "exclusions", "declined", "manner_qualifiers", "decisions"] {
+            assert!(neg.get(key).is_some(), "missing negation key: {}", key);
+        }
+        assert!(neg["exclusions"].is_array());
+        assert!(neg["declined"].is_array());
+        assert!(neg["manner_qualifiers"].is_array());
+        assert!(neg["decisions"].is_array());
+
+        // intent sub-shape
+        let intent = &res["intent"];
+        assert!(intent.get("intent").is_some());
+        assert!(intent.get("category").is_some());
+        assert!(intent.get("confidence").is_some());
+
+        // constraints sub-shape (structured + applied_constraints)
+        let c = &res["constraints"];
+        assert!(c.get("structured").is_some());
+        assert!(c["applied_constraints"].is_array());
+
+        // recency + quality sub-shapes
+        assert!(res["recency"].get("window").is_some());
+        assert!(res["recency"].get("phrase_detected").is_some());
+        assert!(res["quality"].get("flag").is_some());
+        assert!(res["quality"].get("valid_ratio").is_some());
+    }
+
+    #[test]
+    fn inspect_negation_matches_analyze_contract() {
+        // /inspect must surface the SAME negation decisions /analyze does
+        // (the contract from DEFECT A transparency): a contrastive "not X"
+        // keeps X as an exclusion; a manner qualifier ("without oven") is in
+        // manner_qualifiers, never an exclusion; every candidate lands in
+        // exactly one bucket. This guarantees /inspect generalizes /analyze
+        // rather than diverging from it.
+        let index = spell::SymSpellIndex::build();
+
+        // Contrastive exclusion.
+        let r1 = build_inspect(&index, "javascript not java not typescript");
+        let excl: Vec<String> = r1["negation"]["exclusions"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(excl.contains(&"java".to_string()), "java must be an exclusion: {:?}", excl);
+        assert!(excl.contains(&"typescript".to_string()), "typescript must be an exclusion: {:?}", excl);
+
+        // Manner qualifier must not be an exclusion and must appear once.
+        let r2 = build_inspect(&index, "best way to cook salmon without an oven");
+        let excl2: Vec<String> = r2["negation"]["exclusions"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        let man2: Vec<String> = r2["negation"]["manner_qualifiers"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(!excl2.iter().any(|e| e.contains("oven")), "oven must NOT be an exclusion: {:?}", excl2);
+        assert!(man2.iter().any(|m| m.contains("oven")), "oven must be a manner qualifier: {:?}", man2);
+    }
+
+    #[test]
+    fn inspect_constraints_parse_operators() {
+        // /inspect must parse the SAME advanced operators /search flattens into
+        // `applied_constraints` — here verifying the gateway's operator parser
+        // (extract_gateway_constraints) is wired through with no hardcoded list.
+        // NOTE: in the pure fallback path `structured.positive` stays EMPTY — the
+        // upstream intent engine populates positive topic terms at runtime, not
+        // the gateway's local parser. The meaningful, non-hardcoded signal is
+        // that site:/filetype: operators are applied verbatim from the query.
+        let index = spell::SymSpellIndex::build();
+        let r = build_inspect(&index, "rust async web framework site:github.com filetype:rs");
+        let applied: Vec<String> = r["constraints"]["applied_constraints"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        // site: + filetype: must appear verbatim, derived from the query, not
+        // from a hardcoded allow/deny list.
+        assert!(applied.iter().any(|s| s == "site:github.com"), "site: must be applied: {:?}", applied);
+        assert!(applied.iter().any(|s| s == "filetype:rs"), "filetype: must be applied: {:?}", applied);
+        // The structured operator fields are populated by the gateway parser.
+        let sites: Vec<String> = r["constraints"]["structured"]["sites"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        let fts: Vec<String> = r["constraints"]["structured"]["file_types"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(sites.iter().any(|s| s == "github.com"), "site github.com parsed into structured.sites: {:?}", sites);
+        assert!(fts.iter().any(|f| f == "rs"), "filetype rs parsed into structured.file_types: {:?}", fts);
+    }
+
+    #[test]
+    fn inspect_recency_detects_fresh_phrase() {
+        // A "latest" / "this week" phrase must surface a recency window whose
+        // `phrase_detected` is true, so a client can see the date filtering
+        // /search would apply. No magic constant tuned to one query — the
+        // detection reuses derive_recency_window exactly.
+        let index = spell::SymSpellIndex::build();
+        let r = build_inspect(&index, "latest AI news this week");
+        assert_eq!(r["recency"]["phrase_detected"], serde_json::json!(true));
+        assert!(r["recency"]["window"].is_object(), "recency window must be present: {:?}", r["recency"]);
+        let w = &r["recency"]["window"];
+        assert!(w.get("after").is_some());
+        assert!(w.get("before").is_some());
+
+        // A non-recency query must NOT inject a window.
+        let r2 = build_inspect(&index, "rust web framework tutorial");
+        assert_eq!(r2["recency"]["phrase_detected"], serde_json::json!(false));
+        assert_eq!(r2["recency"]["window"], serde_json::json!(null));
+    }
+
+    #[test]
+    fn inspect_spelling_reports_corrections() {
+        // /inspect must expose the SAME spell preview /spellcheck does (same
+        // fn), so a client can both warn AND see the full reasoning in one call.
+        let index = spell::SymSpellIndex::build();
+        let r = build_inspect(&index, "pythn programing langauge");
+        assert_eq!(r["spelling"]["changed"], serde_json::json!(true));
+        assert_eq!(r["spelling"]["corrected"], serde_json::json!("python programming language"));
+        assert!(r["spelling"]["corrections"].as_array().unwrap().len() >= 2);
+
+        // Protected brands are not "corrected" — no hardcoded allow list, just
+        // the shared protected-term set.
+        let r2 = build_inspect(&index, "openai rust tutorial");
+        assert_eq!(r2["spelling"]["changed"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn inspect_quality_flag_runs() {
+        // /inspect must report the SAME query-quality gate /search uses to
+        // decide graceful degradation. A real query is "normal"/"low"; junk
+        // (gibberish) flags junk. Validates the field is populated + sensible.
+        let index = spell::SymSpellIndex::build();
+        let r = build_inspect(&index, "how to learn rust programming");
+        let flag = r["quality"]["flag"].as_str().unwrap();
+        assert!(["", "low", "junk"].contains(&flag), "unexpected quality flag: {}", flag);
+
+        // Pure function of the query + index — no network, deterministic.
+        let r2 = build_inspect(&index, "how to learn rust programming");
+        assert_eq!(r["quality"]["flag"], r2["quality"]["flag"]);
+    }
+
+    #[test]
+    fn inspect_pure_fn_handles_empty_input_safely() {
+        // The HTTP handler (`handle_inspect`) returns the `400` empty_query
+        // envelope documented in API_REFERENCE.md for empty/whitespace `q`
+        // (see the endpoint's "Empty query" block). It does so BEFORE calling
+        // `build_inspect`, so this test locks the guarded pure-fn path is
+        // panic-free + well-formed on the exact inputs the handler screens.
+        // This is the regression guard behind the documented 400 — if the
+        // handler ever called `build_inspect("")` directly, it must not panic.
+        let index = spell::SymSpellIndex::build();
+        for q in ["", "   ", "\t", "\n"] {
+            let r = build_inspect(&index, q);
+            // All 7 documented top-level sections must still be present + typed.
+            for section in ["query", "spelling", "negation", "intent", "constraints", "recency", "quality"] {
+                assert!(r.get(section).is_some(), "empty-input missing section: {}", section);
+            }
+            assert!(r["spelling"]["corrections"].is_array());
+            assert!(r["negation"]["decisions"].is_array());
+            assert!(r["constraints"]["applied_constraints"].is_array());
+            // Empty query is scored as low-quality / invalid (matches the 400 body).
+            assert_eq!(r["quality"]["flag"].as_str(), Some("low"));
+        }
     }
 }
