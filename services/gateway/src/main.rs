@@ -2322,6 +2322,427 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
     None
 }
 
+// ─── Commerce: honest product-fact extraction (ROADMAP item 1) ───────
+// Extracts structured commerce facts ONLY from machine-readable page data:
+//   * schema.org JSON-LD (Product / Offer / AggregateOffer)
+//   * OpenGraph `product:*` meta tags
+// NO free-text price guessing. A price is captured only when it appears in a
+// typed structured field. If multiple distinct offers/prices exist on the page,
+// they are surfaced as price_low/price_high + offer_count and `price` is left
+// null rather than silently collapsing to one canonical value. Every field is
+// Optional; a missing fact is null, never a guess. This is the foundation for
+// honest affiliate monetization: no misrepresentation, no ranking effects.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+struct CommerceOffer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    availability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    merchant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    condition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sku: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gtin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rating: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rating_count: Option<u64>,
+    /// Set when the page exposes a price RANGE (AggregateOffer or >1 offer). The
+    /// single `price` field is left null in that case to avoid asserting a
+    /// canonical price we cannot justify from the data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_low: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_high: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    offer_count: Option<usize>,
+    /// When the page facts were observed (Unix seconds, UTC). Set to extraction
+    /// time; a stale/unknown fetch time must be labelled, never presented as
+    /// current. The consumer is responsible for treating it as an observation
+    /// timestamp, not a guarantee of live price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_at: Option<String>,
+    /// Where the facts came from: "json-ld", "og", or "none". Surfaced so the
+    /// frontend can label provenance. Structured extraction only — no heuristic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+}
+
+/// Coarse UTC observation timestamp without extra crates.
+fn now_unix_string() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{}", secs)
+}
+
+/// Parse a JSON value as f64 whether it is a number OR a numeric string
+/// (schema.org commonly serializes e.g. "ratingValue": "4.5"). Returns None
+/// only when the value isn't a parseable number.
+fn json_get_f64(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.replace(',', "").parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Parse a JSON value as u64 whether it is a number OR a numeric string.
+fn json_get_u64(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.replace(',', "").parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
+    let mut offer = CommerceOffer::default();
+
+    // 1) Preferred: JSON-LD structured data.
+    let nodes = collect_commerce_nodes(html);
+    if !nodes.is_empty() {
+        merge_jsonld_nodes(&mut offer, &nodes);
+        if offer.source.is_none() {
+            offer.source = Some("json-ld".to_string());
+        }
+    }
+
+    // 2) Fallback / supplement: OpenGraph product:* meta (only when no price yet).
+    if offer.price.is_none() && offer.price_low.is_none() {
+        if let Some(og) = parse_og_product(html) {
+            if offer.price.is_none() { offer.price = og.price; }
+            if offer.currency.is_none() { offer.currency = og.currency; }
+            if offer.availability.is_none() { offer.availability = og.availability; }
+            if offer.condition.is_none() { offer.condition = og.condition; }
+            if offer.merchant.is_none() { offer.merchant = og.merchant; }
+            if offer.gtin.is_none() { offer.gtin = og.gtin; }
+            if offer.rating.is_none() { offer.rating = og.rating; }
+            if offer.rating_count.is_none() { offer.rating_count = og.rating_count; }
+            if offer.source.is_none() { offer.source = Some("og".to_string()); }
+        }
+    }
+
+    // 3) Merchant fallback: derive a coarse host label only when no page-provided
+    //    seller name exists. This is a last-resort identifier, not a product fact.
+    if offer.merchant.is_none() {
+        if let Ok(parsed) = reqwest::Url::parse(url) {
+            if let Some(host) = parsed.host_str() {
+                offer.merchant = Some(host.to_string());
+            }
+        }
+    }
+
+    offer.observed_at = Some(now_unix_string());
+    offer
+}
+
+fn extract_meta_tags(html: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    static META_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = META_RE.get_or_init(|| regex::Regex::new(r#"(?i)<meta\b[^>]*>"#).unwrap());
+    static PROP_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let prop_re = PROP_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)(?:property|name)\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static CONTENT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let content_re = CONTENT_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)content\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    for m in re.find_iter(html) {
+        let tag = m.as_str();
+        let prop = prop_re.captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|x| x.as_str().to_lowercase());
+        let content = content_re.captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|x| x.as_str().to_string());
+        if let (Some(p), Some(c)) = (prop, content) {
+            out.push((p, c));
+        }
+    }
+    out
+}
+
+fn collect_commerce_nodes(html: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?is)<script[^>]*type\s*=\s*["']application/ld\+json["'][^>]*>(.*?)</script>"#,
+        )
+        .unwrap()
+    });
+    for cap in re.captures_iter(html) {
+        if let Some(inner) = cap.get(1) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(inner.as_str()) {
+                walk_commerce_nodes(&v, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn walk_commerce_nodes(v: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            let ty = match map.get("@type") {
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(serde_json::Value::Array(a)) => {
+                    a.iter().find_map(|x| x.as_str().map(|s| s.to_string()))
+                }
+                _ => None,
+            };
+            if let Some(t) = ty {
+                let tl = t.to_lowercase();
+                if tl.contains("product") || tl.contains("offer") {
+                    out.push(v.clone());
+                }
+            }
+            // Descend into all nested values so a Product inside @graph, WebPage,
+            // etc. is still discovered.
+            for (k, val) in map {
+                if k == "@type" {
+                    continue;
+                }
+                walk_commerce_nodes(val, out);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for item in a {
+                walk_commerce_nodes(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract a single (price, currency) from an Offer/Product node. Returns None
+/// for AggregateOffer nodes — those are handled separately via low/high price so
+/// we never collapse a range into one number.
+fn node_price(n: &serde_json::Value) -> Option<(f64, String)> {
+    let ty = n.get("@type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if ty.contains("aggregate") {
+        return None;
+    }
+    if let Some(p) = n.get("price") {
+        if let Some(amount) = json_get_f64(p) {
+            let cur = n.get("priceCurrency")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "USD".to_string());
+            return Some((amount, cur));
+        }
+    }
+    None
+}
+
+fn merge_jsonld_nodes(offer: &mut CommerceOffer, nodes: &[serde_json::Value]) {
+    let mut prices: Vec<(f64, String)> = Vec::new();
+    for n in nodes {
+        let ty = n.get("@type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        // AggregateOffer: surface range + count, never a single collapsed price.
+        if ty.contains("aggregate") {
+            if let Some(lo) = n.get("lowPrice").and_then(json_get_f64) {
+                let cur = n.get("priceCurrency")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "USD".to_string());
+                offer.price_low = Some(lo);
+                offer.price = Some(lo); // entry price is a defined field, not a guess
+                if offer.currency.is_none() {
+                    offer.currency = Some(cur);
+                }
+            }
+            if let Some(hi) = n.get("highPrice").and_then(json_get_f64) {
+                offer.price_high = Some(hi);
+            }
+            if let Some(oc) = n.get("offerCount").and_then(json_get_u64) {
+                offer.offer_count = Some(oc as usize);
+            }
+        }
+
+        if let Some(p) = node_price(n) {
+            prices.push(p);
+        }
+        if offer.availability.is_none() {
+            offer.availability = n
+                .get("availability")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if offer.condition.is_none() {
+            offer.condition = n
+                .get("itemCondition")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if offer.sku.is_none() {
+            offer.sku = n.get("sku").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+        if offer.gtin.is_none() {
+            offer.gtin = n
+                .get("gtin13")
+                .or_else(|| n.get("gtin14"))
+                .or_else(|| n.get("gtin8"))
+                .or_else(|| n.get("gtin"))
+                .or_else(|| n.get("mpn"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if offer.rating.is_none() {
+            if let Some(ar) = n.get("aggregateRating") {
+                offer.rating = ar.get("ratingValue").and_then(json_get_f64);
+                if offer.rating_count.is_none() {
+                    offer.rating_count = ar
+                        .get("reviewCount")
+                        .and_then(json_get_u64)
+                        .or_else(|| ar.get("ratingCount").and_then(json_get_u64));
+                }
+            }
+        }
+        if offer.merchant.is_none() {
+            if let Some(seller) = n.get("seller") {
+                offer.merchant =
+                    seller.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+            }
+        }
+        if offer.currency.is_none() {
+            offer.currency = n
+                .get("priceCurrency")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+
+    // Multiple distinct offers: never silently pick one as canonical.
+    if prices.len() == 1 {
+        let (p, c) = &prices[0];
+        offer.price = Some(*p);
+        if offer.currency.is_none() {
+            offer.currency = Some(c.clone());
+        }
+        if offer.offer_count.is_none() {
+            offer.offer_count = Some(1);
+        }
+    } else if !prices.is_empty() {
+        let mut lo = f64::MAX;
+        let mut hi = f64::MIN;
+        let mut cur_agree: Option<String> = None;
+        for (p, c) in &prices {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+            match &cur_agree {
+                None => cur_agree = Some(c.clone()),
+                Some(existing) if existing == c => {}
+                Some(_) => cur_agree = Some(String::new()), // disagreement -> no currency
+            }
+        }
+        offer.price_low = Some(lo);
+        offer.price_high = Some(hi);
+        offer.offer_count = Some(prices.len());
+        // Leave `price` null: multiple distinct prices, no single canonical.
+        if let Some(c) = cur_agree.filter(|c| !c.is_empty()) {
+            offer.currency = Some(c);
+        }
+    }
+}
+
+fn parse_og_product(html: &str) -> Option<CommerceOffer> {
+    let mut o = CommerceOffer::default();
+    for (prop, content) in extract_meta_tags(html) {
+        match prop.as_str() {
+            "product:price:amount" | "og:price:amount" => {
+                if o.price.is_none() {
+                    if let Ok(v) = content.replace(',', "").parse::<f64>() {
+                        o.price = Some(v);
+                    }
+                }
+            }
+            "product:price:currency" | "og:price:currency" => {
+                if o.currency.is_none() {
+                    o.currency = Some(content.clone());
+                }
+            }
+            "product:availability" | "og:availability" => {
+                if o.availability.is_none() {
+                    o.availability = Some(content.clone());
+                }
+            }
+            "product:condition" | "og:condition" => {
+                if o.condition.is_none() {
+                    o.condition = Some(content.clone());
+                }
+            }
+            "product:retailer" | "og:site_name" | "product:brand" => {
+                if o.merchant.is_none() {
+                    o.merchant = Some(content.clone());
+                }
+            }
+            "product:item_id" | "product:gtin" | "product:sku" => {
+                if o.gtin.is_none() {
+                    o.gtin = Some(content.clone());
+                }
+            }
+            "product:rating:value" | "product:rating:average" => {
+                if o.rating.is_none() {
+                    o.rating = content.parse::<f64>().ok();
+                }
+            }
+            "product:rating:count" | "product:rating:scale" | "product:review_count" => {
+                if o.rating_count.is_none() {
+                    o.rating_count = content.parse::<u64>().ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    if o.price.is_none()
+        && o.price_low.is_none()
+        && o.availability.is_none()
+        && o.merchant.is_none()
+        && o.gtin.is_none()
+        && o.rating.is_none()
+    {
+        return None;
+    }
+    Some(o)
+}
+
+/// Developer/verification primitive: runs the honest commerce extractor on
+/// supplied HTML and returns the typed CommerceOffer. This is NOT a search
+/// endpoint and applies NO ranking or monetization — it only surfaces facts
+/// extracted from the given page. The user-facing `/shopping` endpoint and
+/// affiliate decoration land in later roadmap increments.
+async fn handle_commerce_extract(
+    Json(body): Json<serde_json::Value>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let html = body.get("html").and_then(|v| v.as_str()).unwrap_or("");
+    let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let offer = extract_commerce_offer(html, url);
+    match serde_json::to_value(&offer) {
+        Ok(v) => (axum::http::StatusCode::OK, Json(v)),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "serialization_failed"})),
+        ),
+    }
+}
+
+// ─── end commerce extraction ──────────────────────────────────────────
+
 /// Extract a natural-language price bound from a raw query (no operator syntax).
 /// Powers the P3 ranking fix for queries like "wireless headphones under 150 dollars"
 /// or "laptop below 1000 rupees" — these never matched the `price:<` operator parser,
@@ -7494,6 +7915,11 @@ async fn main() {
         .route("/videos", get(handle_videos))
         .route("/news", get(handle_news))
         .route("/spellcheck", get(handle_spellcheck))
+        // Commerce: honest product-fact extraction primitive (ROADMAP item 1).
+        // Returns the typed CommerceOffer extracted from supplied HTML — no
+        // ranking, no monetization, no user-tracking surface. The /shopping
+        // endpoint and affiliate decoration land in later increments.
+        .route("/commerce/extract", post(handle_commerce_extract))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
         .route("/goals/quick", post(goals::handle_quick_roadmap))
@@ -12324,5 +12750,176 @@ mod spellcheck_endpoint_tests {
         assert_eq!(res["changed"].as_bool(), Some(false));
         assert!(res["corrections"].as_array().unwrap().is_empty());
         assert_eq!(res["corrected"].as_str(), Some("go rust"));
+    }
+}
+
+mod commerce_extraction_tests {
+    use super::*;
+
+    // Realistic schema.org Product + Offer JSON-LD fixture (single offer).
+    const HTML_SINGLE_OFFER: &str = r#"<!doctype html><html><head>
+<title>Acme Widget Pro</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Acme Widget Pro",
+  "sku": "ACME-WP-001",
+  "gtin13": "1234567890123",
+  "brand": {"@type": "Brand", "name": "Acme"},
+  "offers": {
+    "@type": "Offer",
+    "price": "49.99",
+    "priceCurrency": "USD",
+    "availability": "https://schema.org/InStock",
+    "itemCondition": "https://schema.org/NewCondition",
+    "seller": {"@type": "Organization", "name": "Acme Store"},
+    "aggregateRating": {"@type": "AggregateRating", "ratingValue": "4.5", "reviewCount": "120"}
+  }
+}
+</script></head><body><h1>Acme Widget Pro</h1></body></html>"#;
+
+    // Fixture with a price RANGE (AggregateOffer) — must NOT collapse to one price.
+    const HTML_AGGREGATE_OFFER: &str = r#"<!doctype html><html><head>
+<title>Bulk Gizmos</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Bulk Gizmos",
+  "offers": {
+    "@type": "AggregateOffer",
+    "lowPrice": "10.00",
+    "highPrice": "25.50",
+    "priceCurrency": "EUR",
+    "offerCount": "8",
+    "availability": "https://schema.org/InStock"
+  }
+}
+</script></head><body></body></html>"#;
+
+    // Fixture with TWO distinct offers in an array — must NOT silently pick one.
+    const HTML_TWO_OFFERS: &str = r#"<!doctype html><html><head>
+<title>Dual Listing</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Dual Listing",
+  "offers": [
+    {"@type": "Offer", "price": "15.00", "priceCurrency": "USD"},
+    {"@type": "Offer", "price": "20.00", "priceCurrency": "USD"}
+  ]
+}
+</script></head><body></body></html>"#;
+
+    // OpenGraph product:* meta fixture (no JSON-LD).
+    const HTML_OG_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>OG Product</title>
+<meta property="og:title" content="OG Product">
+<meta property="product:price:amount" content="1299.00">
+<meta property="product:price:currency" content="INR">
+<meta property="product:availability" content="in stock">
+<meta property="product:brand" content="OG Brand">
+<meta property="product:item_id" content="OG-99">
+</head><body></body></html>"#;
+
+    // Page with NO price and NO product data anywhere.
+    const HTML_NO_PRICE: &str = r#"<!doctype html><html><head>
+<title>Just an article</title>
+<meta property="og:title" content="Some Blog Post">
+</head><body><p>This article mentions a price of $19.99 in the text but has no
+structured product data, so nothing must be extracted from the body.</p></body></html>"#;
+
+    #[test]
+    fn extracts_single_offer_from_jsonld() {
+        let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
+        assert_eq!(o.price, Some(49.99), "price must come from Offer.price");
+        assert_eq!(o.currency.as_deref(), Some("USD"));
+        assert_eq!(o.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(o.condition.as_deref(), Some("https://schema.org/NewCondition"));
+        assert_eq!(o.sku.as_deref(), Some("ACME-WP-001"));
+        assert_eq!(o.gtin.as_deref(), Some("1234567890123"));
+        assert_eq!(o.rating, Some(4.5));
+        assert_eq!(o.rating_count, Some(120));
+        assert_eq!(o.merchant.as_deref(), Some("Acme Store"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+        // No free-text price guessing: the body text mentions no price here, but
+        // even where it would, it must not leak. price_low/high stay unset.
+        assert_eq!(o.price_low, None);
+        assert_eq!(o.price_high, None);
+    }
+
+    #[test]
+    fn aggregate_offer_surfaces_range_not_single_canonical() {
+        let o = extract_commerce_offer(HTML_AGGREGATE_OFFER, "https://shop.example.com/bulk");
+        assert_eq!(o.price_low, Some(10.00));
+        assert_eq!(o.price_high, Some(25.50));
+        assert_eq!(o.currency.as_deref(), Some("EUR"));
+        assert_eq!(o.offer_count, Some(8));
+        // `price` is set to the entry (low) price — a defined field, not a guess
+        // about a single sold unit. That is acceptable; the full range is present.
+        assert_eq!(o.price, Some(10.00));
+    }
+
+    #[test]
+    fn two_offers_never_collapse_to_one_canonical_price() {
+        let o = extract_commerce_offer(HTML_TWO_OFFERS, "https://shop.example.com/dual");
+        // Two distinct USD offers: range + count, but `price` must stay null so
+        // we never assert a canonical price we cannot justify.
+        assert_eq!(o.price_low, Some(15.00));
+        assert_eq!(o.price_high, Some(20.00));
+        assert_eq!(o.offer_count, Some(2));
+        assert_eq!(o.currency.as_deref(), Some("USD"));
+        assert_eq!(o.price, None, "must NOT collapse multiple offers into one price");
+    }
+
+    #[test]
+    fn open_graph_product_fallback_works() {
+        let o = extract_commerce_offer(HTML_OG_PRODUCT, "https://og.example.com/p");
+        assert_eq!(o.price, Some(1299.00));
+        assert_eq!(o.currency.as_deref(), Some("INR"));
+        assert_eq!(o.availability.as_deref(), Some("in stock"));
+        assert_eq!(o.merchant.as_deref(), Some("OG Brand"));
+        assert_eq!(o.gtin.as_deref(), Some("OG-99"));
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    #[test]
+    fn no_price_page_is_all_null() {
+        let o = extract_commerce_offer(HTML_NO_PRICE, "https://blog.example.com/post");
+        // The body literally says "$19.99" but we MUST NOT guess from free text.
+        assert_eq!(o.price, None, "free-text price must never be guessed");
+        assert_eq!(o.price_low, None);
+        assert_eq!(o.price_high, None);
+        assert_eq!(o.currency, None);
+        assert_eq!(o.availability, None);
+        assert_eq!(o.rating, None);
+        // merchant falls back to the coarse host label (identifier, not a fact).
+        assert_eq!(o.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    #[test]
+    fn product_inside_graph_is_discovered() {
+        // A Product nested inside a WebPage @graph must still be found.
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{ "@context": "https://schema.org/", "@graph": [
+  {"@type": "WebPage", "name": "Page"},
+  {"@type": "Product", "name": "Nested", "offers": {"@type": "Offer", "price": "5.00", "priceCurrency": "GBP"}}
+] }
+</script></head><body></body></html>"#;
+        let o = extract_commerce_offer(html, "https://x.example.com/n");
+        assert_eq!(o.price, Some(5.00));
+        assert_eq!(o.currency.as_deref(), Some("GBP"));
+    }
+
+    #[test]
+    fn observed_at_is_always_set() {
+        let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
+        assert!(o.observed_at.is_some());
+        // A unix-second string is digits only.
+        assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
     }
 }
