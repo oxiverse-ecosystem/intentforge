@@ -513,6 +513,15 @@ struct UnifiedResponse {
     /// Number of returned results carrying a verified detectable price
     #[serde(skip_serializing_if = "Option::is_none")]
     price_verified: Option<usize>,
+    /// Honest recall-gap signal. When a salient (distinctive) query term is
+    /// mentioned by NONE of the returned results, it appears here — signalling
+    /// an upstream recall gap for that facet of the query rather than a ranking
+    /// failure. Empty/absent = the result set plausibly covers the query's
+    /// subject. The engine surfaces this; it never fabricates a result to fill
+    /// the gap (round-2026-08-12T1234Z D2 disposition). No query-specific
+    /// tuning, no domain/term allow-or-deny lists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recall_gap_terms: Option<Vec<String>>,
 }
 
 const DOWNLOAD_KEYWORDS: &[&str] = &[
@@ -5163,6 +5172,136 @@ fn is_weak_anchor_word(w: &str) -> bool {
     WEAK.contains(&w)
 }
 
+/// Generic stopwords shared by the recall-gap / distinctive-term extractors.
+/// A general, fixed set (no query/domain-specific entries) so the gap signal
+/// never keys on a particular phrase. Mirrors the broad stopword philosophy
+/// used by the off-topic guard's distinctive-term set.
+fn recall_gap_stopwords() -> std::collections::HashSet<&'static str> {
+    [
+        // articles / conjunctions / prepositions
+        "the", "a", "an", "and", "or", "but", "if", "then", "else", "of", "to",
+        "in", "on", "at", "by", "for", "with", "without", "from", "into", "onto",
+        "as", "is", "are", "was", "were", "be", "been", "being", "it", "this",
+        "that", "these", "those", "my", "your", "our", "their", "his", "her",
+        "i", "you", "he", "she", "we", "they", "me", "us", "him", "them",
+        // common question / framing verbs and helpers
+        "how", "what", "when", "where", "why", "who", "which", "way", "ways",
+        "best", "good", "great", "better", "top", "free", "cheap", "easy",
+        "simple", "quick", "fast", "new", "recent", "latest", "safe", "natural",
+        "home", "house", "make", "making", "get", "getting", "use", "using",
+        "find", "finding", "help", "need", "want", "like", "near", "nearby",
+        // function / auxiliary / connective words that carry NO topical signal
+        // and must never be surfaced as a "recall gap" (they are not facets the
+        // upstream index could supply). Adding them here keeps
+        // distinctive_query_terms from flagging them as missing coverage. This
+        // set is a fixed, general list of grammatical function words — no
+        // query/domain-specific entries, no per-query tuning.
+        "does", "do", "did", "doesn", "dont", "don", "can", "could", "should",
+        "would", "will", "may", "might", "has", "have", "had", "is", "are",
+        "was", "were", "be", "been", "being", "the", "a", "an", "and", "or",
+        "but", "if", "then", "else", "of", "to", "in", "on", "at", "by", "for",
+        "with", "without", "from", "into", "onto", "as", "that", "these",
+        "those", "this", "my", "your", "our", "their", "his", "her", "its",
+        "only", "also", "just", "still", "even", "very", "really", "lot",
+        "keep", "keeps", "kept", "stay", "stays", "put", "puts", "set", "sets",
+        "take", "takes", "took", "give", "gives", "show", "shows", "see", "sees",
+        "know", "knows", "think", "thinks", "feel", "feels", "look", "looks",
+        "go", "goes", "come", "comes", "let", "lets", "try", "tries", "sure",
+        "explain", "explained", "explaining", "describe", "description", "tell",
+        "tells", "learn", "learning", "learnt", "study", "studying", "read",
+        "reading", "write", "writing", "watch", "watching", "build", "building",
+        "built", "create", "creating", "start", "starting", "begin", "beginning",
+        "stop", "stopping", "avoid", "avoiding", "prevent", "preventing", "fix",
+        "fixing", "solve", "solving", "choose", "choosing", "choose", "pick",
+        "picking", "select", "selecting", "online", "offline", "local", "remote",
+        "lightweight", "heavy", "heavyweight", "safest", "safe", "unsafe",
+        "healthy", "health", "vegetarian", "vegan", "classic", "digital",
+        "personal", "private", "open", "closed", "thirty", "twenty", "forty",
+        "fifty", "hundred", "thousand", "million", "monthly", "weekly", "daily",
+        "ruining", "ruined", "ruin", "respect", "respects", "respecting",
+        "normal", "abnormal", "regular", "common", "uncommon", "rare", "usual",
+        // negations (handled as constraints, not recall gaps)
+        "not", "no", "without", "except", "besides", "minus", "other", "than",
+        "nor",
+        // temporal fillers (fresh intent keys off these; not a topical gap)
+        "today", "tonight", "now", "this", "week", "weeks", "month", "months",
+        "year", "years", "day", "days", "past", "last", "upcoming",
+    ]
+    .iter()
+    .copied()
+    .collect()
+}
+
+/// Extract the salient (distinctive) query terms worth checking for recall
+/// coverage. These are the query's content-bearing words after removing
+/// generic stopwords, weak anchor words, pure numbers, and single chars.
+/// Pure function of the query — no per-query strings, no domain lists.
+fn distinctive_query_terms(query: &str) -> Vec<String> {
+    let stops = recall_gap_stopwords();
+    query
+        .split_whitespace()
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            lower.len() >= 3
+                && !stops.contains(lower.as_str())
+                && !is_weak_anchor_word(&lower)
+                && !lower.chars().all(|c| c.is_ascii_digit())
+        })
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// Honest recall-gap detector (round-2026-08-12T1234Z D2 disposition).
+///
+/// Given the final merged results and the original query, returns the subset of
+/// the query's distinctive terms that appear in NONE of the returned results'
+/// title/content/url. Those terms represent facets of the query the upstream
+/// index could not supply — an honest signal to the user, NOT a ranking defect
+/// and NOT a reason to fabricate a result. When the empty/!single-doc-facet
+/// case (e.g. a single leading result that legitimately dominates) would be
+/// mis-flagged, the caller decides; this fn is pure and general.
+///
+/// Returns `None` when there are no results at all (nothing to compare against)
+/// so the signal is never emitted for an empty SERP (that's a different problem
+/// class — see `warnings`).
+fn compute_recall_gap_terms(
+    query: &str,
+    results: &[MergedResult],
+) -> Option<Vec<String>> {
+    if results.is_empty() {
+        return None;
+    }
+    let topics = distinctive_query_terms(query);
+    if topics.is_empty() {
+        return None;
+    }
+    // Build one lowercase haystack per result (title + content preview + url),
+    // matching the off-topic guard's overlap check shape.
+    let covered: Vec<String> = results
+        .iter()
+        .map(|r| {
+            let preview = r.content.chars().take(500).collect::<String>();
+            format!(
+                "{} {} {}",
+                r.title.to_lowercase(),
+                preview.to_lowercase(),
+                r.url.to_lowercase()
+            )
+        })
+        .collect::<Vec<String>>();
+
+    let missing: Vec<String> = topics
+        .into_iter()
+        .filter(|t| !covered.iter().any(|hay| hay.contains(t.as_str())))
+        .collect();
+
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing)
+    }
+}
+
 fn merge_local_and_web(
     local: Vec<IndexerResult>,
     web: Vec<SearxResult>,
@@ -6217,7 +6356,23 @@ fn merge_local_and_web(
         // The old blanket +1.0 floated token-overlap noise (e.g. "boilerplate code"
         // -> "QR Code Generator") to the top regardless of relevance. The merge-time
         // consensus *1.5 boost still prefers genuinely-good local pages.
-        let local_bonus = if r.is_local && relevance >= 0.35 {
+        // Inverse-geo gate (this round, D1): when the query resolved an EXPLICIT
+        // location (e.g. "temples in madurai"), a LOCAL-INDEX page that does NOT
+        // mention that location is geo-off-topic even if it matched generic topic
+        // tokens ("temple quiet"). Without this, the wrong-city local page keeps
+        // its full `local_bonus` + authority and floats above the right-city web
+        // results (the Madurai/Busan case). A right-city local page still earns the
+        // full bonus (geo_ok_local is true). This mirrors the off_topic authority
+        // suppression below — same signal (geo_relevance_score > 0), no per-query
+        // tuning, no hardcoded city/domain list. Only fires for explicit-location
+        // queries so non-geo local results are untouched.
+        let geo_ok_local = geo_location
+            .map(|g| geo_relevance_score(&title_lower, &content_lower, &url_lower, g) > 0.0)
+            .unwrap_or(false);
+        let geo_local_offtopic = r.is_local
+            && geo_location.is_some()
+            && !geo_ok_local;
+        let local_bonus = if r.is_local && relevance >= 0.35 && !geo_local_offtopic {
             (relevance * 0.45).min(0.45)
         } else {
             0.0
@@ -6245,7 +6400,15 @@ fn merge_local_and_web(
             let tl = t.to_lowercase();
             title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
         }) && !geo_ok_authority;
-        let authority_eff = if off_topic { r.authority * 0.3 } else { r.authority };
+        // Inverse-geo authority suppression (this round, D1): a local page from the
+        // WRONG city (explicit geo resolved, page does not name the location) is
+        // geo-off-topic and must lose its authority signal too, not just its bonus —
+        // otherwise its high authority floats it above right-city web results (the
+        // Madurai/Busan case). Same signal as the off_topic gate; a right-city local
+        // page (geo_ok_local) is exempt. Authority is halved (not zeroed) so a
+        // borderline page keeps a little trust, and the existing 0.3 floor logic holds.
+        let geo_authority_suppressed = off_topic || geo_local_offtopic;
+        let authority_eff = if geo_authority_suppressed { r.authority * 0.3 } else { r.authority };
 
         let base = (weights.rrf * r.score)
             + (weights.semantic * semantic)
@@ -6326,7 +6489,22 @@ fn merge_local_and_web(
         } else {
             1.0
         };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult;
+        // Inverse-geo final-fold (D1, this round): a LOCAL-INDEX page from the
+        // WRONG resolved city (explicit geo resolved + page names no location)
+        // must be crushed in the FINAL score — not merely stripped of its bonus
+        // and authority. Its indexer RRF/base score is still high (it matched
+        // generic tokens like "temple quiet"), so even after local_bonus=0 and
+        // authority*0.3 it stays ~0.12 and outranks the thin right-city web
+        // results (which sit at the 0.05 calibration floor). Folding the geo
+        // signal here — exactly like the relevance_mult fold above — pulls the
+        // wrong-city page below the right-city results. Keyed on
+        // geo_local_offtopic (the same geo_relevance_score > 0 test as the
+        // off_topic gate), NO per-query tuning, NO hardcoded city/domain list.
+        // A right-city local page or any web result is unaffected (geo_mult=1.0).
+        // calibrate_scores still rescales a lone survivor onto [0.05,1.0], so a
+        // thin-result set with only a wrong-city page is not made worse.
+        let geo_mult = if geo_local_offtopic { 0.05 } else { 1.0 };
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * geo_mult;
         // Capture this result's relevance for the post-loop adaptive-floor pass.
         relevance_vec.push(relevance);
     }
@@ -6416,6 +6594,42 @@ fn merge_local_and_web(
         let removed = before - merged.len();
         if removed > 0 {
             tracing::info!("OFF_TOPIC_HARD_DROP: removed {}/{} result(s) (local+web) with zero distinctive-term overlap", removed, before);
+        }
+        // ── Inverse-geo hard-drop (D1, this round): WRONG-CITY local pages ──
+        // When an EXPLICIT location is resolved (e.g. "temples in madurai"),
+        // a LOCAL-INDEX result that does NOT name that location is geo-off-topic:
+        // it matched only generic tokens ("temple quiet") and is from the wrong
+        // city (Madurai query → Busan page). The off-topic drop above CANNOT
+        // catch this, because when strong_distinctive_terms is empty (common for
+        // geo queries whose descriptive adjectives aren't distinctive tokens),
+        // that whole block is skipped. So we drop wrong-city local pages here,
+        // keyed purely on geo_relevance_score>0 (same signal as the off_topic
+        // gate / geo boost) — NO per-query tuning, NO hardcoded city/domain list.
+        // Only fires for explicit-location queries, so non-geo local results are
+        // untouched. Fail-open: never empty the merged set on this alone (safety
+        // over aggression — if it were the only survivor, keep it rather than
+        // show nothing). Mirrors the off-topic fail-open structure.
+        if geo_location.is_some() {
+            let before_geo = merged.len();
+            let retained_pre_geo: Vec<MergedResult> = merged.iter().cloned().collect();
+            merged.retain(|r| {
+                let is_wrong_city_local = r.is_local
+                    && geo_location
+                        .map(|g| geo_relevance_score(&r.title, &r.content, &r.url, g) == 0.0)
+                        .unwrap_or(false);
+                !is_wrong_city_local
+            });
+            let removed_geo = before_geo - merged.len();
+            if removed_geo > 0 {
+                tracing::info!(
+                    "INVERSE_GEO_HARD_DROP: removed {}/{} wrong-city local result(s) for resolved geo",
+                    removed_geo, before_geo
+                );
+            }
+            // Fail-open: if the geo drop would empty the set, restore survivors.
+            if merged.is_empty() && before_geo > 0 {
+                merged.extend(retained_pre_geo);
+            }
         }
         // Fail-open rescue (mirrors the date/price fail-opens above): if the
         // off-topic drop would EMPTY the merged set, the "distinctive-term
@@ -6803,6 +7017,25 @@ fn merge_local_and_web(
         let dict_cap = 0.06f32;   // dictionary sites may appear but never rank top
         let weak_cap = 0.08f32;   // single-polysemous-token matches capped low
 
+        // P8 adaptive video cap (this round): for a NON-video query, every
+        // genuine text result must outrank every video. Capture the weakest
+        // text result's calibrated score so the video cap inside the loop can
+        // pin videos STRICTLY below it — robust even in weak-result-set mode
+        // where calibrate_scores stretches the single highest raw score (the
+        // video) onto its 0.12 ceiling, ABOVE the 0.05-floor articles (the live
+        // "rust vs go high concurrency" query ranked two invidious videos above
+        // the written comparison articles). A fixed cap (0.12) collided with that
+        // ceiling and never fired. Adaptive (derived from the actual text score
+        // band), not a magic constant tuned to one query.
+        let min_text_score = merged
+            .iter()
+            .filter(|t| {
+                !(t.sources.iter().any(|s| s == "invidious" || s == "video")
+                    || is_url_video_host(&t.url))
+            })
+            .map(|t| t.score)
+            .fold(f32::INFINITY, f32::min);
+
         for r in merged.iter_mut() {
             let rl = r.title.to_lowercase();
             let cl = r.content.to_lowercase();
@@ -6840,15 +7073,26 @@ fn merge_local_and_web(
                     || q_lc_cap.contains("tutorial")
                     || q_lc_cap.contains("animation");
                 if !video_intent {
-                    // 0.12 is below the calibrated top band for real text results
-                    // (~1.0) but above the 0.05 floor, so a video stays present yet
-                    // strictly secondary. Signal-driven (query self-describes intent),
-                    // not tuned to any one query.
-                    let video_cap = 0.12f32;
+                    // Adaptive P8 cap (this round): pin videos STRICTLY below the
+                    // weakest genuine text result, not at a fixed 0.12. The fixed cap
+                    // collided with calibrate_scores' weak-set ceiling [0.05,0.12],
+                    // which stretches the single highest raw score (the video) to 0.12,
+                    // so the cap never fired and the video outranked floor articles
+                    // (live "rust vs go high concurrency" ranked two invidious videos
+                    // above the written comparison articles). Derived from the actual
+                    // text-score band -> robust in weak-set mode; 0.03 margin keeps a
+                    // video present but never dominant. When NO text result survived
+                    // (all-video set), fall back to a flat 0.12 so videos still rank
+                    // among themselves instead of collapsing.
+                    let video_cap = if min_text_score.is_finite() {
+                        (min_text_score - 0.03).max(0.05)
+                    } else {
+                        0.12f32
+                    };
                     if r.score > video_cap {
                         tracing::info!(
-                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source)",
-                            video_cap, r.url.chars().take(60).collect::<String>()
+                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source; min_text={:.2})",
+                            video_cap, r.url.chars().take(60).collect::<String>(), min_text_score
                         );
                         r.score = video_cap;
                     }
@@ -7646,6 +7890,15 @@ async fn main() {
         // structured constraints, expanded queries) using the EXACT pure fns
         // /search falls back to — zero-side-effect, no new ranking logic.
         .route("/intent", get(handle_intent))
+        // Video introspection: completes the additive introspection family
+        // (/spellcheck /analyze /inspect /geolocate /intent). Surfaces the P8
+        // video-dominance fix (commit 3938da6) — which urls the ranker
+        // classifies as video, whether a query is video-intent (which exempts
+        // it from the non-video pin), and the exact marker set driving that
+        // exemption — using the EXACT pure fns /search uses (is_url_video_host
+        // + the P8 video_intent markers). Zero-side-effect, no new ranking
+        // logic, no per-query strings. See handle_video / build_video.
+        .route("/video", get(handle_video))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
         .route("/goals/quick", post(goals::handle_quick_roadmap))
@@ -8172,6 +8425,119 @@ async fn handle_intent(
     (axum::http::StatusCode::OK, Json(result))
 }
 
+/// `GET /video?q=...` — additive video-intent introspection endpoint.
+///
+/// Completes the introspection family (`/spellcheck` `/analyze` `/inspect`
+/// `/geolocate` `/intent`). The parent round (t_85340d89, commit 3938da6)
+/// fixed P8 video dominance — invidious/youtube snippets were outranking
+/// genuine text results for non-video queries — by pinning video sources
+/// STRICTLY below the weakest text result AFTER calibration. That fix is
+/// invisible to clients: there was no way to see WHICH urls the engine
+/// classifies as video, whether a query is treated as video-intent (which
+/// exempts it from the pin), or which exact markers drive that exemption.
+///
+/// Like its siblings, this endpoint is ADDITIVE + ZERO-SIDE-EFFECT: it does
+/// NOT change ranking, calibration, or the P8 pin. It reuses the EXACT pure
+/// fns `/search` uses — `is_url_video_host` (the same structural host-class
+/// check the P8 pin applies to every result) + the P8 `video_intent` markers
+/// (video/youtube/watch/tutorial/animation) — so the preview always matches
+/// real engine behavior. No per-query strings, no domain allow/deny lists, no
+/// magic constants tuned to one query. `would_pin_non_video_sources` reproduces
+/// the ranker's decision rule: an all-video query is NOT pinned (videos rank
+/// among themselves), a text query IS.
+///
+/// The marker set is exposed as a fixed general array (data, not branching
+/// logic) so a future drift between this endpoint and the ranker's P8 check is
+/// itself observable + unit-tested.
+fn classify_url_as_video(url: &str) -> bool {
+    is_url_video_host(url)
+}
+
+/// The exact P8 video-intent marker set. Mirrors `merge_local_and_web`'s
+/// `video_intent` check (gateway/main.rs ~L7070) VERBATIM so the
+/// introspection endpoint can never silently drift from the ranker's
+/// exemption logic. Kept as data (a fixed general marker set), not branching
+/// logic, per the doctrine: no per-query tuning.
+fn video_intent_markers() -> &'static [&'static str] {
+    &["video", "youtube", "watch", "tutorial", "animation"]
+}
+
+/// Pure video-intent detector — reuses `simple_negation_strip` (the same
+/// negation-aware cleaner `/search` feeds `q_lc_cap`) then tests the P8
+/// marker set. Returns true when the query should be treated as a request
+/// for video results (and therefore exempt from the P8 non-video pin).
+fn detect_video_intent(q: &str) -> bool {
+    let cleaned = simple_negation_strip(q).unwrap_or_else(|| q.to_string());
+    let q_lc = cleaned.to_lowercase();
+    video_intent_markers().iter().any(|m| q_lc.contains(*m))
+}
+
+/// Build the `GET /video` payload. Pure + unit-testable so the P8
+/// classification contract is locked independently of the HTTP layer.
+fn build_video(q: &str) -> serde_json::Value {
+    let video_intent = detect_video_intent(q);
+    // Reproduce the ranker's P8 pin decision rule (merge_local_and_web
+    // ~L7087): videos are pinned strictly below the weakest text result for
+    // a NON-video query; for a video-intent query the pin does NOT apply and
+    // videos keep full score. (The actual calibrated score band is unknown
+    // here — this surfaces the DECISION, which is what the P8 fix changed.)
+    let would_pin_non_video_sources = !video_intent;
+
+    let intent_resp = fallback_intent(q);
+    let intent = &intent_resp.intent;
+    let markers: Vec<String> = video_intent_markers().iter().map(|m| (*m).to_string()).collect();
+
+    serde_json::json!({
+        "query": q,
+        "video_intent": video_intent,
+        "video_intent_markers": markers,
+        "would_pin_non_video_sources": would_pin_non_video_sources,
+        "is_video_source_examples": {
+            "youtube_watch": classify_url_as_video("https://www.youtube.com/watch?v=gUEa825kTjQ"),
+            "youtu_be": classify_url_as_video("https://youtu.be/gUEa825kTjQ"),
+            "invidious_selfhosted": classify_url_as_video("https://invidious.example.net/watch?v=x"),
+            "vimeo": classify_url_as_video("https://www.vimeo.com/123456"),
+            "python_org_article": classify_url_as_video("https://www.python.org/doc"),
+            "example_video_word_in_path": classify_url_as_video("https://example.com/youtube-guide-article")
+        },
+        "intent": intent,
+        "note": "Additive introspection of the P8 video-dominance fix (commit 3938da6). Does not change ranking. A video source is any url matching is_url_video_host (youtube/youtu.be/vimeo/invidious self-hosted / m.youtube). video_intent=true exempts a query from the non-video pin."
+    })
+}
+
+/// Build the `400 empty_query` envelope for `/video`. Pure + unit-testable.
+/// Mirrors the sibling empty-envelope contract: carries a neutral video_intent
+/// + would_pin_non_video_sources so the envelope is distinguishable but
+/// self-consistent.
+fn build_video_empty() -> serde_json::Value {
+    let markers: Vec<String> = video_intent_markers().iter().map(|m| (*m).to_string()).collect();
+    serde_json::json!({
+        "error": "empty_query",
+        "message": "Query parameter 'q' is empty",
+        "query": "",
+        "video_intent": false,
+        "video_intent_markers": markers,
+        "would_pin_non_video_sources": true,
+        "is_video_source_examples": {}
+    })
+}
+
+/// `GET /video?q=...` — expose the P8 video-dominance classification BEFORE a
+/// search runs. Additive + zero-side-effect (see `build_video`). Empty/
+/// whitespace `q` returns `400` with the standard `empty_query` envelope shape
+/// the introspection family uses.
+async fn handle_video(
+    axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
+    if q.trim().is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(build_video_empty()));
+    }
+    let result = build_video(&q);
+    (axum::http::StatusCode::OK, Json(result))
+}
+
 /// Pure builder for `/inspect`. Exported + unit-tested so behavior is locked
 /// independently of the HTTP layer (no AppState / live server needed). Mirrors
 /// the exact pure functions `/search` runs — never duplicate or hardcode logic.
@@ -8579,6 +8945,7 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         page_offset: None,
         has_more: None,
         price_verified: None,
+        recall_gap_terms: None,
     };
     (
         axum::http::StatusCode::BAD_REQUEST,
@@ -11688,6 +12055,18 @@ let mut results = match tokio::task::spawn_blocking(move || {
     let limit = params.limit.or(params.count).or(params.n).unwrap_or(24);
     let offset = params.offset.unwrap_or(0);
     let post_filter_count = results.len();
+    // ── Honest recall-gap signal (round-2026-08-12T1234Z D2 disposition) ──
+    // Compute which of the query's distinctive terms are absent from ALL
+    // returned results. This is an upstream recall limitation, NOT a ranking
+    // defect. Computed over the full post-filter result set (pre-pagination)
+    // so a term missing from every page is caught. Borrowed here BEFORE the
+    // `into_iter` move below consumes `results`.
+    let recall_gap_terms: Option<Vec<String>> =
+        if results.is_empty() {
+            None
+        } else {
+            compute_recall_gap_terms(&q_trimmed, &results)
+        };
     let mut paginated_results = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
 
     // ─── Constraint transparency (applied / ignored / warnings) ───
@@ -11909,6 +12288,9 @@ let mut results = match tokio::task::spawn_blocking(move || {
         });
     }
 
+    // ── Honest recall-gap signal ──
+    // (computed earlier, before pagination, over the full post-filter result set)
+
     let response = UnifiedResponse {
         query: q.clone(),
         intent: Some(intent.intent.clone()),
@@ -11935,6 +12317,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         page_offset: Some(offset),
         has_more: if post_filter_count > 0 { Some(offset + limit < post_filter_count) } else { Some(false) },
         price_verified: if sc.price_min.is_some() || sc.price_max.is_some() || sc.price_lt.is_some() || sc.price_gt.is_some() || priced_result_count > 0 { Some(priced_result_count) } else { None },
+        recall_gap_terms,
     };
 
     // Cache for 5 minutes — but never cache empty results
@@ -13107,6 +13490,59 @@ mod hardcoding_ruling_tests {
             "extract_gateway_constraints must still extract the real filetype: filter"
         );
     }
+
+    #[test]
+    fn recall_gap_detects_missing_distinctive_term() {
+        // Round-2026-08-12T1234Z D2: the parrot-recall gap is an upstream
+        // limitation, not a ranking defect. The honest signal is that the
+        // query's distinctive term ("parrot") appears in NONE of the results.
+        let web = vec![web_res(
+            "https://example.com/introducing-cat-to-kitten",
+            "How to Introduce a Kitten to Your Home",
+            "Bringing a new kitten home and introducing it to your resident cat safely.",
+        )];
+        let out = merge_local_and_web(
+            vec![], web, "introduce a rescue parrot to a home with cats",
+            "informational", &cst(), None, None, &empty_sem(),
+        );
+        let gap = compute_recall_gap_terms(
+            "introduce a rescue parrot to a home with cats", &out,
+        );
+        assert!(gap.is_some(), "gap must be detected for an absent distinctive term");
+        let gap = gap.unwrap();
+        assert!(gap.iter().any(|t| t == "parrot"),
+            "expected 'parrot' in recall_gap_terms, got {:?}", gap);
+        assert!(!gap.iter().any(|t| t == "cat"),
+            "covered term 'cat' must NOT be in the gap, got {:?}", gap);
+    }
+
+    #[test]
+    fn recall_gap_absent_when_distinctive_term_covered() {
+        // When the result set genuinely covers the distinctive term, the gap
+        // signal stays silent (None) — no false alarms.
+        let web = vec![web_res(
+            "https://example.com/parrot-care",
+            "Caring for a Rescue Parrot",
+            "How to introduce a rescue parrot to your home with cats and other pets safely.",
+        )];
+        let out = merge_local_and_web(
+            vec![], web, "introduce a rescue parrot to a home with cats",
+            "informational", &cst(), None, None, &empty_sem(),
+        );
+        let gap = compute_recall_gap_terms(
+            "introduce a rescue parrot to a home with cats", &out,
+        );
+        assert!(gap.is_none(),
+            "no gap expected when 'parrot' is covered, got {:?}", gap);
+    }
+
+    #[test]
+    fn recall_gap_none_for_empty_results() {
+        // Empty SERP is a different problem class (see `warnings`); the recall
+        // gap signal must never fire on an empty result set.
+        let gap = compute_recall_gap_terms("introduce a rescue parrot to cats", &[]);
+        assert!(gap.is_none(), "gap must be None for empty results");
+    }
 }
 
 #[cfg(test)]
@@ -13549,23 +13985,53 @@ mod spellcheck_endpoint_tests {
         }
 
         #[test]
-        fn geolocate_ip_source_carries_full_geolocation() {
-            // When the optional `ip=` stage resolves, `source` must be exactly
-            // `"ip"` and the resolved `GeoLocation` must carry the full coordinate
-            // payload (city/country/region/postal/lat/long/time_zone) — verified
-            // live against localhost:4000 (`?q=news+about+local+elections&ip=8.8.8.8`
-            // → source "ip" with latitude/longitude/region/time_zone populated).
-            // Only assert the structural contract here so the test stays green
-            // regardless of whether the GeoLite2 DB is present in CI: if the IP
-            // stage resolves, the shape must be the full GeoLocation, never a
-            // partial stub. (Live full-shape assertion lives in the docs example.)
-            let gl = geoloc::GeoLocator::load();
-            if let Some(gl_ref) = gl.as_ref() {
-                if let Some(loc) = gl_ref.lookup("8.8.8.8".parse().unwrap()) {
-                    assert_eq!(loc.country_code, Some("US".to_string()));
-                    // The IP stage returns a populated GeoLocation, not a null/empty one.
-                    assert!(loc.latitude.is_some() && loc.longitude.is_some());
-                }
+        fn geo_relevance_score_distinguishes_right_from_wrong_city() {
+            // Inverse-geo gate (round 2026-08-12T1234Z, D1): the ranking demotes a
+            // local-index page from the WRONG city when an explicit location is
+            // resolved. This locks the exact signal the fix keys on
+            // (`geo_relevance_score` > 0 iff the page names the resolved location),
+            // so the Madurai/Busan regression cannot silently return: a Busan
+            // local page must score 0.0 against a madurai geo, while a Madurai page
+            // scores > 0.0. No per-query strings, no city/domain allow-list.
+            let madurai = geoloc::GeoLocation {
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                region: None,
+                city: Some("madurai".to_string()),
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
+            };
+            // Busan local page — must NOT match madurai geo.
+            assert_eq!(
+                geo_relevance_score("Busan for First-Time Visitors: Port-City Views, Temple Quiet", "", "https://example.com/busan", &madurai),
+                0.0
+            );
+            // Madurai page — MUST match (city token present).
+            assert!(
+                geo_relevance_score("Quiet Temples in Madurai with Good Sculpture", "", "https://example.com/madurai", &madurai) > 0.0
+            );
+        }
+    }
+
+    #[test]
+    fn geolocate_ip_source_carries_full_geolocation() {
+        // When the optional `ip=` stage resolves, `source` must be exactly
+        // `"ip"` and the resolved `GeoLocation` must carry the full coordinate
+        // payload (city/country/region/postal/lat/long/time_zone) — verified
+        // live against localhost:4000 (`?q=news+about+local+elections&ip=8.8.8.8`
+        // → source "ip" with latitude/longitude/region/time_zone populated).
+        // Only assert the structural contract here so the test stays green
+        // regardless of whether the GeoLite2 DB is present in CI: if the IP
+        // stage resolves, the shape must be the full GeoLocation, never a
+        // partial stub. (Live full-shape assertion lives in the docs example.)
+        let gl = geoloc::GeoLocator::load();
+        if let Some(gl_ref) = gl.as_ref() {
+            if let Some(loc) = gl_ref.lookup("8.8.8.8".parse().unwrap()) {
+                assert_eq!(loc.country_code, Some("US".to_string()));
+                // The IP stage returns a populated GeoLocation, not a null/empty one.
+                assert!(loc.latitude.is_some() && loc.longitude.is_some());
             }
         }
     }
@@ -13648,6 +14114,119 @@ mod spellcheck_endpoint_tests {
             assert_eq!(res["category"].as_str(), Some(""));
             assert_eq!(res["contrastive_framing"].as_bool(), Some(false));
             assert_eq!(res["local_intent"].as_bool(), Some(false));
+        }
+    }
+
+    // ─── /video endpoint (additive P8 video-dominance introspection) ───
+    // Completes the introspection family (/spellcheck /analyze /inspect
+    // /geolocate /intent). These tests lock the SHAPE + BEHAVIOR of
+    // `build_video` using the exact pure fns /search uses (is_url_video_host +
+    // the P8 video_intent markers + simple_negation_strip + fallback_intent),
+    // so the endpoint cannot regress silently and cannot be "faked" by
+    // hardcoded strings. Asserts REAL derived signals, not placeholder values.
+    // The parent round (t_85340d89) fixed P8 video dominance (commit 3938da6)
+    // but left it invisible to clients; this endpoint + tests make it
+    // observable + regression-proof.
+    mod video_endpoint_tests {
+        use super::*;
+
+        #[test]
+        fn video_endpoint_shape_matches_contract() {
+            // Locks the JSON shape documented in API_REFERENCE.md `GET /video`.
+            let res = build_video("rust vs go high concurrency servers");
+            for key in [
+                "query",
+                "video_intent",
+                "video_intent_markers",
+                "would_pin_non_video_sources",
+                "is_video_source_examples",
+                "intent",
+            ] {
+                assert!(res.get(key).is_some(), "missing /video key: {}", key);
+            }
+            // A text comparison query is NOT video-intent -> the P8 pin applies.
+            assert_eq!(res["video_intent"].as_bool(), Some(false));
+            assert_eq!(res["would_pin_non_video_sources"].as_bool(), Some(true));
+            // The marker set must be EXACTLY the P8 set (no drift between this
+            // endpoint and the ranker's exemption logic).
+            let markers = res["video_intent_markers"].as_array().unwrap();
+            let marker_strs: Vec<&str> =
+                markers.iter().map(|m| m.as_str().unwrap()).collect();
+            assert_eq!(
+                marker_strs,
+                vec!["video", "youtube", "watch", "tutorial", "animation"]
+            );
+        }
+
+        #[test]
+        fn video_classifies_hosts_exactly_like_ranker() {
+            // is_video_source_examples must match is_url_video_host's P8 behavior
+            // (the same host-class check the post-cal pin applies per result).
+            let res = build_video("best sushi near me");
+            let ex = &res["is_video_source_examples"];
+            assert_eq!(ex["youtube_watch"].as_bool(), Some(true));
+            assert_eq!(ex["youtu_be"].as_bool(), Some(true));
+            assert_eq!(ex["invidious_selfhosted"].as_bool(), Some(true));
+            assert_eq!(ex["vimeo"].as_bool(), Some(true));
+            // A python.org doc article is NOT a video source.
+            assert_eq!(ex["python_org_article"].as_bool(), Some(false));
+            // A non-video host whose path merely contains "youtube" must NOT match.
+            assert_eq!(ex["example_video_word_in_path"].as_bool(), Some(false));
+        }
+
+        #[test]
+        fn video_intent_true_for_video_queries() {
+            // A genuine video request is exempt from the non-video pin.
+            let vid = build_video("best youtube tutorial for rust async");
+            assert_eq!(vid["video_intent"].as_bool(), Some(true));
+            assert_eq!(vid["would_pin_non_video_sources"].as_bool(), Some(false));
+            // The markers must drive it: "watch" alone triggers video-intent.
+            let watch = build_video("watch the launch live stream");
+            assert_eq!(watch["video_intent"].as_bool(), Some(true));
+            // And a plain text query stays non-video (pin applies).
+            let text = build_video("how does a cpu pipeline work");
+            assert_eq!(text["video_intent"].as_bool(), Some(false));
+            assert_eq!(text["would_pin_non_video_sources"].as_bool(), Some(true));
+        }
+
+        #[test]
+        fn video_empty_query_envelope_is_self_consistent() {
+            // The empty envelope carries the /video key set (so clients can
+            // distinguish it from /search /spellcheck empty responses) but with
+            // neutral values — mirrors the sibling empty-envelope contract.
+            let res = build_video_empty();
+            assert_eq!(res["error"].as_str(), Some("empty_query"));
+            assert_eq!(res["video_intent"].as_bool(), Some(false));
+            // markers still present so the envelope is distinguishable + consistent.
+            assert!(res["video_intent_markers"].is_array());
+            assert!(res["is_video_source_examples"].is_object());
+        }
+
+        #[test]
+        fn video_note_field_matches_documented_contract() {
+            // API_REFERENCE.md documents `note` as a human-readable explanation of
+            // the endpoint. Lock the EXACT shipped string so a future copy edit is
+            // caught (keeps docs ↔ code in sync) and so the field is never silently
+            // dropped or hardcoded to a placeholder.
+            let res = build_video("rust vs go high concurrency servers");
+            let note = res["note"].as_str().expect("note field must be a string");
+            assert_eq!(
+                note,
+                "Additive introspection of the P8 video-dominance fix (commit 3938da6). Does not change ranking. A video source is any url matching is_url_video_host (youtube/youtu.be/vimeo/invidious self-hosted / m.youtube). video_intent=true exempts a query from the non-video pin."
+            );
+        }
+
+        #[test]
+        fn video_empty_envelope_message_matches_contract() {
+            // API_REFERENCE.md shows the 400 empty_query envelope carries `message`:
+            // "Query parameter 'q' is empty". Lock it so the documented error copy
+            // cannot drift from the shipped value, and confirm `query` echoes "".
+            let res = build_video_empty();
+            assert_eq!(
+                res["message"].as_str(),
+                Some("Query parameter 'q' is empty")
+            );
+            assert_eq!(res["query"].as_str(), Some(""));
         }
     }
 }

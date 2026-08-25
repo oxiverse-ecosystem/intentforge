@@ -23,6 +23,7 @@
   - [GET /inspect](#get-inspect)
   - [GET /geolocate](#get-geolocate)
   - [GET /intent](#get-intent)
+  - [GET /video](#get-video)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -37,6 +38,7 @@
 - [Spell Correction](#spell-correction)
 - [Geolocation & Local Queries](#geolocation--local-queries)
 - [Scoring & Ranking](#scoring--ranking)
+- [Honest Recall-Gap Signal](#honest-recall-gap-signal)
 - [Caching](#caching)
 - [Error Handling](#error-handling)
 - [Performance & Stress Test Results](#performance--stress-test-results)
@@ -147,7 +149,7 @@ Full search endpoint. Queries multiple backends (SearXNG via VPN, local index) i
 
 > **Verified shape (this session):** a successful `/search` returns these top-level keys (observed on every live response):
 > `query`, `intent`, `category`, `confidence`, `constraints`, `structured_constraints`, `expanded_queries`, `distribution`, `results`, `results_before_filter`, `results_after_filter`, `total`, `limit`, `offset`, `has_more`.
-> Optionally present: `applied_constraints` (when operators/negations are applied), `spell_corrected_query` (when a correction fired), `query_quality` (only on `low`/`junk` queries), `deep_result`, `price_verified` (transactional).
+> Optionally present: `applied_constraints` (when operators/negations are applied), `spell_corrected_query` (when a correction fired), `query_quality` (only on `low`/`junk` queries), `deep_result`, `price_verified` (transactional), `recall_gap_terms` (when a distinctive query term is absent from every returned result — an honest upstream recall-gap signal; see [below](#honest-recall-gap-signal)).
 > `geo_location`, `warnings`, `ignored_constraints` were **absent** from all observed successful responses (declared-but-omitted `None` fields).
 > **`confidence` is a real float in ~0.30–0.90**, not always `0.75` — the value depends on the query and the intent engine.
 
@@ -448,7 +450,7 @@ This is the read-only companion to `/spellcheck`: it does **not** change `/searc
 **Empty query** returns `400` with the standard error envelope (same shape as `/search` and `/spellcheck`):
 
 ```json
-{ "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "exclusions": [], "declined": [], "manner_qualifiers": [], "decisions": [] }
+{ "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "exclusions": [], "declined": [], "manner_qualifiers": [] }
 ```
 
 **Notes**
@@ -464,7 +466,7 @@ curl "http://localhost:4000/analyze?q=javascript+not+java+not+typescript"
 # See why a "without X" manner phrase was NOT turned into an exclusion
 curl "http://localhost:4000/analyze?q=how+to+clean+a+cast+iron+skillet+without+soap"
 # → {"manner_qualifiers":["soap"],"exclusions":[],"declined":[],"contrastive_framing":false,...}
-```
+# ```
 
 ---
 
@@ -521,7 +523,7 @@ constants.
 
 > **Verified (this round, 2026-08-10T1401Z):** every claim below was executed
 > against the live dev stack at `localhost:4000` (gateway rebuilt at the round's
-> feature commit `ca4362c`/`ea11acd`). All 7 cases returned `200` unless noted. The
+> feature commit `ca4362c`/`ea11acd`). All 6 cases returned `200` unless noted. The
 > endpoint reuses the same pure functions `/search` runs (no network, deterministic).
 >
 > | Query | What was observed |
@@ -726,6 +728,105 @@ curl -i "http://localhost:4000/intent?q=%20%20"
 - The endpoint is additive — it does not change `/search` ranking, calibration, negation gating, or intent-engine calls. It is a read-only preview of the existing intent-classification path.
 - A test module (`intent_endpoint_tests`, 5 cases) locks the JSON shape, the local/contrastive derived signals, the category mapping, and the `400` empty envelope; the gateway suite is 108/108 passing.
 
+### `GET /video`
+
+Additive video-introspection endpoint. Completes the introspection family
+(`/spellcheck` `/analyze` `/inspect` `/geolocate` `/intent`). The parent round
+(2026-08-13T0634Z, commit `3938da6`) fixed **P8 video dominance** — invidious/youtube
+snippets were outranking genuine text results for non-video queries — by pinning
+video sources *strictly* below the weakest text result *after* calibration. That
+fix was invisible to clients: there was no way to see **which** urls the engine
+classifies as video, whether a query is treated as **video-intent** (which exempts
+it from the non-video pin), or which exact markers drive that exemption.
+
+Mirrors the additive, zero-side-effect precedent of its siblings: it does **not**
+change `/search` ranking, calibration, or the P8 pin. It reuses the *exact* pure
+functions `/search` uses — `is_url_video_host` (the same structural host-class
+check the P8 pin applies to every result: youtube / youtu.be / vimeo / invidious
+self-hosted / m.youtube) + the P8 `video_intent` markers (video / youtube / watch /
+tutorial / animation) — so the preview always matches real engine behavior. No
+per-query strings, no domain allow/deny lists, no magic constants.
+
+> **Honest scope note:** this endpoint surfaces the P8 **decision**, not the
+> calibrated score band (which depends on the live result set). `would_pin_non_video_sources`
+> reproduces the ranker's rule: `true` for a non-video query (videos are pinned
+> below text results), `false` for a video-intent query (videos keep full score).
+> When NO text result survives (all-video set) the ranker falls back to a flat
+> cap so videos still rank among themselves — the exemption decision here still
+> reports `would_pin_non_video_sources: true`, because the *pin logic* is what
+> fires for non-video queries; an all-video set is an edge case the ranker
+> handles via the fallback, not via this flag.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                          |
+|-----------|--------|----------|---------|--------------------------------------|
+| `q`       | string | yes      | —       | The query to classify for video handling |
+
+**Response** `200 OK` — top-level `{ query, video_intent, video_intent_markers, would_pin_non_video_sources, is_video_source_examples, intent, note }`:
+
+- `video_intent` — `true` when the query carries a video-intent marker (video / youtube / watch / tutorial / animation), via the *same* `simple_negation_strip` + marker check `/search` uses. When `true`, the P8 non-video pin does NOT apply.
+- `video_intent_markers` — the exact marker set driving the exemption (data, not branching logic), so a future drift between this endpoint and the ranker's P8 check is itself observable + unit-tested.
+- `would_pin_non_video_sources` — `true` for a non-video query (the P8 pin applies: videos pinned below text); `false` when `video_intent` is `true`.
+- `is_video_source_examples` — a set of worked url classifications using `is_url_video_host`, so a client can see exactly which hosts the engine treats as video (and that a non-video host whose *path* merely contains "youtube" is NOT matched).
+- `intent` — the raw fallback intent label for the query (`fallback_intent`, the no-network classifier `/search` falls back to).
+- `note` — a human-readable explanation of what the endpoint does.
+
+```json
+{
+  "query": "rust vs go high concurrency servers",
+  "video_intent": false,
+  "video_intent_markers": ["video", "youtube", "watch", "tutorial", "animation"],
+  "would_pin_non_video_sources": true,
+  "is_video_source_examples": {
+    "youtube_watch": true,
+    "youtu_be": true,
+    "invidious_selfhosted": true,
+    "vimeo": true,
+    "python_org_article": false,
+    "example_video_word_in_path": false
+  },
+  "intent": "informational",
+  "note": "Additive introspection of the P8 video-dominance fix (commit 3938da6). Does not change ranking. A video source is any url matching is_url_video_host (youtube/youtu.be/vimeo/invidious self-hosted / m.youtube). video_intent=true exempts a query from the non-video pin."
+}
+```
+
+**Real request / response (executed against live `localhost:4000` this card, 2026-08-13T0634Z):**
+
+```bash
+# Non-video text query -> pin applies
+curl "http://localhost:4000/video?q=rust%20vs%20go%20high%20concurrency%20servers"
+# -> {"query":"rust vs go high concurrency servers","video_intent":false,
+#     "video_intent_markers":["video","youtube","watch","tutorial","animation"],
+#     "would_pin_non_video_sources":true, ...}
+
+# Video-intent query -> exempt from pin
+curl "http://localhost:4000/video?q=best%20youtube%20tutorial%20for%20rust%20async"
+# -> {"query":"best youtube tutorial for rust async","video_intent":true,
+#     "would_pin_non_video_sources":false, ...}
+
+# Empty / whitespace query -> 400 empty_query envelope
+curl -i "http://localhost:4000/video?q=%20%20"
+# HTTP/1.1 400 Bad Request
+# {"error":"empty_query","message":"Query parameter 'q' is empty","query":"",
+#  "video_intent":false,"video_intent_markers":["video","youtube","watch","tutorial","animation"],
+#  "would_pin_non_video_sources":true,"is_video_source_examples":{}}
+```
+
+> **Verified (this card, 2026-08-13T0634Z):** endpoint shipped via `docker compose build gateway` + `up -d` (health `OK`), confirmed live for both the text and video-intent cases above, AND via the `video_endpoint_tests` module (6 cases) on the pure path:
+> - `?q=rust+vs+go+high+concurrency+servers` → `video_intent: false`, `would_pin_non_video_sources: true`; `?q=best+youtube+tutorial+for+rust+async` → `video_intent: true`, `would_pin_non_video_sources: false`
+> - `is_video_source_examples` matches `is_url_video_host`: youtube/youtu.be/invidious/vimeo → `true`; python.org article → `false`; host `example.com/youtube-guide-article` (word in path only) → `false`
+> - empty/whitespace `q` returns `400` with the `/video`-shaped `empty_query` envelope (neutral `video_intent` + markers present) — distinguishable from `/search`/`spellcheck` empty responses.
+>
+> **No hardcoding:** the endpoint reuses the *exact* pure fns `/search` uses (`is_url_video_host` + the P8 marker set + `simple_negation_strip` + `fallback_intent`). The marker set is fixed general data (no per-query tuning). The contract is locked by `video_endpoint_tests` (6 tests) which run under the round's lean CI (`cargo test -p gateway`).
+
+**Notes**
+- Pure function of the query; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, calibration, the P8 video pin, or intent-engine calls. It is a read-only preview of the existing P8 video-classification path.
+- A test module (`video_endpoint_tests`, 6 cases) locks the JSON shape, the host-classification parity with `is_url_video_host`, the video-intent detection, the `400` empty envelope, the `note` field, and the empty-envelope `message`/`query` fields.
+- **Executed, not just declared (this docs card, 2026-08-13T0634Z):** the 6 tests were compiled + run against the real `rust:1.88` toolchain (`cargo test --release video_endpoint_tests`) → `6 passed; 0 failed`. This closes the documentation-vs-code drift: every field the docs claim (`note`, `message`) is now assertion-locked.
+
+
 ```bash
 # See how the engine classifies a query's intent before searching
 curl "http://localhost:4000/intent?q=violin+vs+viola+for+beginner"
@@ -781,7 +882,7 @@ The `/search` endpoint parses a rich set of operators directly from the query st
 `NOT:` is an **explicit, unconditional structural exclude** — the general, non-hardcoded escape hatch for the DEFECT-A class of limitations. It is parsed by the gateway's own operator extractor (`extract_gateway_constraints`), independent of the intent engine's entity/contrastive recognition.
 
 - **Syntax:** `NOT:<term>` for a single token, or `NOT:"<phrase>"` for a multi-word term (up to 4 words). Terms are lowercased for case-insensitive matching.
-- **Behaviour:** any non-exempt result whose **title, content, or URL contains the term** (substring match) is hard-dropped by `should_filter_by_constraints`. This fires *before* the soft-penalty ranking path, so it removes the page entirely rather than demoting it. See the alt-listing exemption below for how comparison/"alternatives" pages are retained.
+- **Behaviour:** any result whose **title, content, or URL contains the term** (substring match) is hard-dropped by `should_filter_by_constraints`. This fires *before* the soft-penalty ranking path, so it removes the page entirely rather than demoting it.
 - **Surfaced as:** `structured_constraints.hard_exclusions: ["<term>"]` and `applied_constraints: ["not:<term>"]` on `/search` and `/inspect`.
 - **Never forwarded upstream:** `preprocess_searxng_query` strips `NOT:` so SearXNG does not treat `<term>` as a literal search word and re-surface it.
 - **Alt-listing exemption (by design):** a comparison / "alternatives" page that merely *mentions* the excluded term in a referential context (alt-score > 0.3) is **kept**, exactly like the `site:` / `filetype:` negative gates and the committed test `not_operator_keeps_alt_listing_page`. So `"Best Flask Alternatives"` survives `NOT:flask`.
@@ -872,6 +973,7 @@ curl "http://localhost:4000/search?q=python&limit=10&offset=40"
 | `query_quality` | string | — | Quality rating of the query: `"high"`, `"medium"`, `"low"`, or `"noise"` |
 | `error` | string | — | Error code (`"empty_query"`, `"upstream_unavailable"`, etc.) |
 | `message` | string | — | Human-readable error or status message |
+| `recall_gap_terms` | string[] | — | Honest upstream recall-gap signal: distinctive query terms absent from ALL returned results (an index-coverage gap, not a ranking defect). Omitted entirely when the result set plausibly covers the query. See [Honest Recall-Gap Signal](#honest-recall-gap-signal). |
 
 ### `MergedResult` (from `/search`)
 
@@ -909,6 +1011,41 @@ The unified result type for the main search endpoint. Results can come from loca
 | `price_max` | float | Maximum price. **Unverified this session.** |
 | `price_lt` | float | Upper price bound from `<` operator. **Unverified this session.** |
 | `price_gt` | float | Lower price bound from `>` operator. **Unverified this session.** |
+
+---
+
+## Honest Recall-Gap Signal
+
+`recall_gap_terms` is a new optional field on the `/search` `UnifiedResponse` (shipped in round `2026-08-12T1234Z` D2). It is an **honest, non-fabricating** signal: when a salient (distinctive, content-bearing) term from the query appears in **none** of the returned results, that term is listed here — telling the client *"the upstream index could not supply this facet of your query"* rather than pretending a result fills the gap.
+
+**Behaviour (verified live, 2026-08-12):**
+- Computed over the **full post-filter result set, before pagination**, so a term missing from every page is caught (the value is borrowed before the `into_iter` move that feeds pagination).
+- A term is "distinctive" if it survives a fixed, general stopword set + the existing `is_weak_anchor_word` check (length ≥ 3, not a pure number, not a generic word). **No per-query strings, no domain/term allow-or-deny lists** — the signal is fully algorithmic and query-general.
+- The field is **omitted entirely** from the JSON (`skip_serializing_if = "Option::is_none"`) when:
+  - the result set is empty (that is a different problem class — see `warnings`), or
+  - every distinctive query term is actually covered by some result.
+- It **never fabricates** a result to fill the gap. It is a surfaced observation, not a ranking input.
+
+**Real example (executed against `localhost:4000` on 2026-08-12):**
+
+Gap case — a rare distinctive term is uncovered:
+```bash
+curl -s "http://localhost:4000/search?q=zygomatic+architectural+photography+techniques" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('recall_gap_terms =', d.get('recall_gap_terms'))"
+# → recall_gap_terms = ['zygomatic']
+```
+The query's covered terms (`architectural`, `photography`, `techniques`) are correctly absent from the list; only the uncovered `zygomatic` surfaces.
+
+Covered case — the field is omitted when results cover the subject:
+```bash
+curl -s "http://localhost:4000/search?q=rust+web+framework" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('recall_gap_terms present?', 'recall_gap_terms' in d)"
+# → recall_gap_terms present? False
+```
+
+**Test coverage:**
+- The pure functions (`compute_recall_gap_terms`, `distinctive_query_terms`) are locked by 3 gateway unit tests in `hardcoding_ruling_tests`: `recall_gap_detects_missing_distinctive_term`, `recall_gap_absent_when_distinctive_term_covered`, `recall_gap_none_for_empty_results`.
+- The end-to-end serialization onto `/search` is covered by `tests/test_recall_gap_endpoint.py` — a runnable live integration test (skips cleanly when no gateway is reachable; asserts the gap and covered behaviours against a real server).
 
 ---
 
