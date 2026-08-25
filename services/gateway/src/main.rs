@@ -6440,103 +6440,6 @@ fn merge_local_and_web(
         .collect();
     let query_entity_count = comparison_entities.len();
 
-    // ── D4 (2026-08-18T1340Z round): per-engine upstream-quality trust ──
-    // The fresh-date hard window must fail-OPEN when upstream returns no dates
-    // (otherwise a fresh query collapses to 0 results). But that fail-open lets a
-    // DATE-BLIND upstream engine — one that returned ZERO date-bearing results
-    // while OTHER engines returned dated ones — keep its junk. That junk still
-    // carries a high RRF position + domain authority, so the ranking trusts it
-    // even though it is visibly off-topic for a "recent … this budget season"
-    // query. We derive a per-engine trust multiplier purely from each engine's
-    // OWN date-signal behaviour on THIS query: an engine that returned ≥1 dated
-    // result when the query is fresh+dated earns full trust; an engine that
-    // returned NONE while others did is treated as low-trust (its fresh-intent
-    // results get crushed). No engine names, no per-query literals — only the
-    // structural signal "did this engine surface any dated result for this fresh
-    // query". General & self-adapting across upstreams and time.
-    // COLD-CASE GUARD: only populated when some engine returned a date. If NO
-    // engine had any dated result (every upstream is date-blind), the map stays
-    // empty and every result keeps trust 1.0 — there is no corroboration signal
-    // to single one engine out, so we must not crush blindly. Local results are
-    // exempt (kept at 1.0) — they are not "upstream engines" and the local-index
-    // quality gates already handle them.
-    let engine_trust: std::collections::HashMap<String, f32> = {
-        let mut m = std::collections::HashMap::new();
-        if intent == "fresh" {
-            let mut per_engine_dated: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-            let mut any_engine_dated = false;
-            for r in &merged {
-                let eng = primary_engine(r);
-                if eng == "local" {
-                    continue; // local not an upstream engine for trust purposes
-                }
-                if resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some() {
-                    *per_engine_dated.entry(eng).or_insert(0) += 1;
-                    any_engine_dated = true;
-                }
-            }
-            if any_engine_dated {
-                let mut web_engines: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for r in &merged {
-                    let eng = primary_engine(r);
-                    if eng != "local" {
-                        web_engines.insert(eng);
-                    }
-                }
-                for eng in web_engines {
-                    let dated = per_engine_dated.get(&eng).copied().unwrap_or(0);
-                    if dated == 0 {
-                        m.insert(eng.clone(), 0.15);
-                        tracing::info!(
-                            "D4 ENGINE TRUST: upstream '{}' returned 0 dated results on a fresh+dated query while others did — trust=0.15 (crush)",
-                            eng
-                        );
-                    } else {
-                        m.insert(eng.clone(), 1.0);
-                    }
-                }
-            }
-        }
-        m
-    };
-
-    // ── Comparison-query compared-entity extraction (D3 fix) ──
-    // For "compare X and Y" / "X vs Y" queries, the SPECIFIC compared entities
-    // (brand+model tokens like "brezza"/"venue") are what make a result on-topic.
-    // Generic attribute words ("mileage"/"petrol"/"range") and comparison-structure
-    // words ("compare"/"vs"/"between"/"and") are NOT entities. A local page that
-    // names NONE of the compared entities is off-topic crawl noise — e.g. a "Honda
-    // City Mileage" page floating above the actual Brezza/Venue results for a
-    // "Brezza vs Venue" query — and must not earn the local_bonus or keep a high
-    // relevance. Extraction is purely derived from the query's own distinctive terms
-    // minus attribute/structure vocab: no per-brand/per-entity tuning, so it
-    // generalises to any comparison ("swift vs nexon", "city vs amaze", ...).
-    let comparison_query = q_words.iter().any(|w| {
-        let l = w.to_lowercase();
-        l == "compare" || l == "comparison" || l == "versus" || l == "vs" || l == "v"
-            || l == "between" || (l == "and" && q_words.len() >= 5) || l == "or"
-    });
-    let comparison_structure_words: &[&str] = &[
-        "compare", "comparison", "versus", "vs", "v", "between", "and", "or", "the",
-        "a", "an", "of", "to", "in", "on", "for", "with", "that", "this", "these",
-        "those", "real", "world", "which", "has", "have", "better", "best", "top",
-        "than", "then",
-    ];
-    let comparison_attribute_terms: &[&str] = &[
-        "mileage", "range", "price", "cost", "specs", "spec", "specification", "boot",
-        "space", "power", "torque", "engine", "fuel", "petrol", "diesel", "electric",
-        "automatic", "manual", "variant", "feature", "features", "performance",
-        "efficiency", "kmpl", "review", "reviews", "launch", "model", "models", "year",
-    ];
-    let comparison_entities: Vec<String> = strong_distinctive_terms
-        .iter()
-        .map(|t| t.to_lowercase())
-        .filter(|tl| !comparison_structure_words.contains(&tl.as_str()))
-        .filter(|tl| !comparison_attribute_terms.contains(&tl.as_str()))
-        .filter(|tl| !is_weak_anchor_word(tl))
-        .collect();
-    let query_entity_count = comparison_entities.len();
-
     let core_topic_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
             let lower = w.to_lowercase();
@@ -7830,6 +7733,17 @@ fn merge_local_and_web(
             r.score *= 0.01;
         }
 
+        // P2d (round-2026-08-20T1935Z): collapse the indexer BM25 for off-topic locals
+        // HERE (same scope as `base`), because the earlier `r.score *= 0.01` in the noise-
+        // gate block above does NOT propagate to this read under the borrow structure. The
+        // body-incidental subject mention (e.g. "airtable" in a Slack-Alternatives page)
+        // gave it a large r.score that dominates weights.rrf; crushing it here lets the
+        // on-topic web page win after calibrate_scores. General: keyed on the P2d flag
+        // (local page names none of the query's title-anchored subject terms).
+        if p2d_offtopic {
+            r.score *= 0.01;
+        }
+
         let base = (weights.rrf * r.score)
             + (weights.semantic * semantic)
             + (weights.intent * intent_boost)
@@ -8257,6 +8171,72 @@ fn merge_local_and_web(
         let removed = before - merged.len();
         if removed > 0 {
             tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
+        }
+    }
+
+    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
+    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
+    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
+    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
+    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
+    // because the local base score is large, so other-city pages still floated into
+    // positions 3-5. We hard-drop local results that name a different gazetteer place
+    // and do NOT name the requested city/country.
+    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
+    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
+    // that NAME the requested place are kept. No query/domain literals.
+    if geo_is_explicit {
+        let before = merged.len();
+        merged.retain(|r| {
+            if !r.is_local {
+                return true;
+            }
+            let tl = r.title.to_lowercase();
+            let cl = r.content.to_lowercase();
+            let ul = r.url.to_lowercase();
+            let text = format!("{} {} {}", tl, cl, ul);
+            // On-topic for the requested location → keep.
+            let req_city = geo_location.and_then(|g| g.city.as_deref());
+            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
+            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
+                || req_country.map_or(false, |c| whole_word_contains(&text, c));
+            if mentions_req {
+                return true;
+            }
+            // Mention of a different known place → drop this local page.
+            let same_country_ok = req_city.is_none();
+            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
+            for (name, cc) in LOCATION_GAZETTEER.iter() {
+                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
+                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
+                if same_country_ok {
+                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
+                }
+                if name.len() < 3 { continue; }
+                if whole_word_contains(&text, name) {
+                    return false;
+                }
+            }
+            true
+        });
+        let removed = before - merged.len();
+        if removed > 0 {
+            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
+        }
+    }
+
+    // ── P13 (round-2026-08-20T1935Z): drop adult/NSFW results flagged upstream ──
+    // The per-result loop (line ~6302) sets r.score = -1.0 and continues for any
+    // result whose title/URL matches clean::is_adult_explicit() — a query-agnostic
+    // lexical detector. Here we physically remove those sentinels so they never
+    // reach the response. Hard-drop (not demote) because a family-safe engine must
+    // never surface explicit content regardless of how weak the rest of the set is.
+    {
+        let before = merged.len();
+        merged.retain(|r| r.score >= 0.0);
+        let removed = before - merged.len();
+        if removed > 0 {
+            tracing::info!("P13 ADULT DROP: removed {} explicit result(s) from merged set", removed);
         }
     }
 
@@ -8827,6 +8807,16 @@ fn merge_local_and_web(
             .map(|r| r.score)
             .fold(0.0f32, f32::max);
 
+        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
+        // Used by the P8 video cap (b0): a video must never outrank the best genuine
+        // text result for a non-video query, in any calibration regime (see comment
+        // at (b0)). Computed over post-calibration scores so it reflects the final
+        // text ranking.
+        let best_non_video = merged.iter()
+            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
+            .map(|r| r.score)
+            .fold(0.0f32, f32::max);
+
         for r in merged.iter_mut() {
             let rl = r.title.to_lowercase();
             let cl = r.content.to_lowercase();
@@ -9240,7 +9230,7 @@ async fn handle_images(
     };
 
     let searx1_fut = async {
-        match fetch_text_budgeted(state.http_client.clone(), searx_url.clone(), 4000).await {
+        match fetch_text_budgeted(state.http_client.clone(), searx_url.clone(), 6000).await {
             Some(raw) => parse_images(raw),
             None => { tracing::warn!("SearXNG1 image timed out/failed — empty"); vec![] }
         }
@@ -9251,7 +9241,7 @@ async fn handle_images(
             Some(u) => u,
             None => return vec![],
         };
-        match fetch_text_budgeted(state.http_client.clone(), url.clone(), 4000).await {
+        match fetch_text_budgeted(state.http_client.clone(), url.clone(), 6000).await {
             Some(raw) => parse_images(raw),
             None => { tracing::warn!("SearXNG2 image timed out/failed — empty"); vec![] }
         }
@@ -11706,14 +11696,22 @@ async fn handle_search(
             }
         }
 
-        // Retry policy. For site:-constrained queries an upstream_unavailable is
-        // almost always a transient double-failure of the two INDEPENDENT egress
-        // paths (gluetun-VPN + Tor2) — a short backoff + one re-fire recovers it.
-        // Budgets are sized so the WHOLE request stays under 5s:
-        //   attempt1 = 2600ms, backoff 250ms, attempt2 = 1800ms  => worst ~4650ms.
-        // Non-site queries keep the original single-shot 5.5s budget (no extra
-        // upstream load, no behaviour change).
-        let max_attempts: usize = if has_site { 2 } else { 1 };
+        // Retry policy. An upstream_unavailable for ANY query (site:-constrained OR
+        // plain NL) is almost always a transient double-failure of the two
+        // INDEPENDENT egress paths (gluetun-VPN + Tor2) — a short backoff + one
+        // re-fire recovers it. The 2026-08-21 round proved this on plain NL: 4/30
+        // fresh queries hit upstream_unavailable on attempt 1, and ALL 4 returned
+        // real results (4/4/2/19) on an immediate retry. The previous code only
+        // retried site:-constrained queries (max_attempts = 1 for plain NL), so the
+        // re-fire path was dead code for the common case — plain NL queries
+        // surfaced upstream_unavailable even though a retry would have recovered.
+        // We now retry once for EVERY query when no usable result was found on
+        // attempt 1. A successful attempt 1 breaks early (has_usable is true), so
+        // there is ZERO added latency for queries that already have results — the
+        // retry only costs time on the queries that would otherwise return empty.
+        //   attempt1 = 10s budget (non-site) / 4500ms (site); backoff 150ms;
+        //   attempt2 = 10s (non-site, force re-probe) / 15s (site, cold-tor2).
+        let max_attempts: usize = 2;
         let attempt_budget_ms = |attempt: usize| -> u64 {
             if has_site {
                 // attempt1 gives the gluetun instance a fair shot (instance1
@@ -11822,7 +11820,7 @@ async fn handle_search(
                 out_results = results;
                 if attempt > 1 {
                     tracing::info!(
-                        "SearXNG retry recovered results on attempt {} (site:-constrained query)",
+                        "SearXNG retry recovered results on attempt {} (transient upstream failure)",
                         attempt
                     );
                 }
@@ -11833,6 +11831,11 @@ async fn handle_search(
                 if has_site {
                     tracing::warn!(
                         "SearXNG site:-constrained query empty after {} attempt(s) -- will signal upstream_unavailable",
+                        attempt
+                    );
+                } else {
+                    tracing::warn!(
+                        "SearXNG query empty after {} attempt(s) -- will signal upstream_unavailable",
                         attempt
                     );
                 }
