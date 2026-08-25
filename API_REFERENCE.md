@@ -21,6 +21,7 @@
   - [GET /spellcheck](#get-spellcheck)
   - [GET /analyze](#get-analyze)
   - [GET /inspect](#get-inspect)
+  - [GET /geolocate](#get-geolocate)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -387,7 +388,7 @@ Spelling-correction preview. Exposes the engine's in-process SymSpell + LinSpell
 }
 ```
 
-> **Verified (this round, 2026-08-09):** a typo string returns `changed: true` with a `correction` per changed token. Protected brands/tech terms (`openai`, `rust`, `kubernetes`, …) are never "corrected" — `"openai rust tutorial"` returns `changed: false` and an empty `corrections` array. URL tokens, code tokens (`.` `/` `@` `#` `$` or containing a digit), and very short words (< 4 characters, counted by Unicode character count not UTF-8 byte length) are skipped by the corrector and **omitted entirely from the `corrections` array** — the endpoint only lists tokens it actually proposed fixing, so the client never flags skipped tokens as typos. They are still preserved verbatim in the whole-query `corrected` string. The `corrected` string matches what `/search` runs for the same query (verified 2026-08-09: `/spellcheck?q=pythn+programing+langauge` → `corrected: "python programming language"`, and `/search?q=pythn+programing+langauge` returns `"query":"python programming language"`). Example: `/spellcheck?q=pythn+kubernetes.io` returns `changed:true` with `corrections` containing **only** `pythn→python` (the `kubernetes.io` URL token is skipped and absent from `corrections`, but retained in `corrected`).
+> **Verified (this round, 2026-08-09):** a typo string returns `changed: true` with a `correction` per changed token. Protected brands/tech terms (`openai`, `rust`, `kubernetes`, …) are never "corrected" — `"openai rust tutorial"` returns `changed: false` and an empty `corrections` array. URL tokens, code tokens (`.` `/` `@` `#` `$` or containing a digit), and very short words (< 4 chars) are skipped by the corrector and **omitted entirely from the `corrections` array** — the endpoint only lists tokens it actually proposed fixing, so the client never flags skipped tokens as typos. They are still preserved verbatim in the whole-query `corrected` string. The `corrected` string matches what `/search` runs for the same query (verified 2026-08-09: `/spellcheck?q=pythn+programing+langauge` → `corrected: "python programming language"`, and `/search?q=pythn+programing+langauge` returns `"query":"python programming language"`). Example: `/spellcheck?q=pythn+kubernetes.io` returns `changed:true` with `corrections` containing **only** `pythn→python` (the `kubernetes.io` URL token is skipped and absent from `corrections`, but retained in `corrected`).
 
 **Empty query** returns `400` with the standard error envelope (same shape as `/search`):
 
@@ -443,7 +444,7 @@ This is the read-only companion to `/spellcheck`: it does **not** change `/searc
 
 > **Verified (this round, 2026-08-10):** all examples below were executed against the live dev stack at `localhost:4000` (gateway rebuilt at commit `c31cea0`). Contrastive `not X` → `exclusions` with `contrastive_framing: true` (e.g. `javascript not java not typescript` → `["java","typescript"]`). A manner phrase `without soap` → `manner_qualifiers` with empty `exclusions`/`declined` (`how to clean a cast iron skillet without soap after cooking eggs` → `["soap"]`). A generic `not spicy` with no contrastive framing → `declined` (`best spicy ramen not spicy` → `["spicy"]`). The DEFECT A trigger `best way to cook salmon without an oven` → `manner_qualifiers: ["oven"]` — the root cause is now *visible* instead of silent. The transparency invariant holds: every negation candidate appears in exactly one bucket.
 
-**Empty query** returns `400` with an error envelope containing the negation-specific fields:
+**Empty query** returns `400` with the standard error envelope (same shape as `/search` and `/spellcheck`):
 
 ```json
 { "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "exclusions": [], "declined": [], "manner_qualifiers": [] }
@@ -473,7 +474,7 @@ Unified pre-search introspection. Generalizes the `/analyze` (negation) and
 zero-side-effect payload that mirrors the *entire* `/search` reasoning pipeline
 a client can inspect **before** issuing a search:
 
-1. **spelling** — uses `spell::correct_query` (the same underlying correction function `/search` uses) and wraps it in `spellcheck_query` to produce the detailed response shape with per-token `corrections[]`.
+1. **spelling** — same `spellcheck_query` fn `/search` pre-corrects with.
 2. **negation** — the `exclusions` / `declined` / `manner_qualifiers` split + per-term `decisions[]` (identical to `/analyze`).
 3. **intent** — the pure no-network fallback classifier (`fallback_intent`) + coarse `category`.
 4. **constraints** — the gateway's own operator parser (`extract_gateway_constraints`) + the `applied_constraints` shape `/search` reports.
@@ -519,7 +520,7 @@ constants.
 
 > **Verified (this round, 2026-08-10T1401Z):** every claim below was executed
 > against the live dev stack at `localhost:4000` (gateway rebuilt at the round's
-> feature commit `ca4362c`/`ea11acd`). All 7 cases returned `200` unless noted. The
+> feature commit `ca4362c`/`ea11acd`). All 6 cases returned `200` unless noted. The
 > endpoint reuses the same pure functions `/search` runs (no network, deterministic).
 >
 > | Query | What was observed |
@@ -554,6 +555,82 @@ curl "http://localhost:4000/inspect?q=python+web+framework+not+django"
 # A fresh-phrase query: see the recency window /search would apply
 curl "http://localhost:4000/inspect?q=latest+ai+news+this+week"
 # → {"recency":{"window":{"after":"...","before":"..."},"phrase_detected":true},...}
+```
+
+---
+
+### `GET /geolocate`
+
+Additive geo-introspection endpoint. Mirrors the `/spellcheck` `/analyze` `/inspect`
+precedent: it does **not** change `/search` ranking, geo-boost, or calibration. It
+reuses the *exact* location-resolution functions `/search` calls
+(`detect_explicit_location` + `has_local_intent`) so a client can see — **before**
+issuing a search — which location the engine will anchor on, and *why*. No network
+is performed unless an optional `ip=` param is supplied; the gazetteer + local-intent
+path is pure and fast.
+
+This endpoint makes the round-2026-08-11T1556Z geo fix *legible*: a query that names
+a gazetteer place (e.g. `quiet places to study near chennai`) now resolves explicitly,
+and a client can confirm the resolved location matches the one `/search` will use to
+rescue location-specific results from the off-topic gate.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                                  |
+|-----------|--------|----------|---------|----------------------------------------------|
+| `q`       | string | yes      | —       | The query/phrase to resolve a location for   |
+| `ip`      | string | no       | —       | Optional client IP to reproduce `/search`'s IP-geolocation stage for parity (unparseable/missing disables that stage) |
+
+**Response** `200 OK` — top-level `{ query, resolved, source, explicit_location, local_intent }`:
+
+- `resolved` — the resolved `geoloc::GeoLocation` (serialized struct: `country_code`, `country_name`, `region`, `city`, `postal_code`, `latitude`, `longitude`, `time_zone`), or `null` when no location can be inferred. The `source: "explicit"` branch (query named a gazetteer place) returns this struct with **`latitude`/`longitude`/`postal_code`/`region`/`time_zone` set to `null`** (the gazetteer knows the city/country but not coordinates). The `source: "local_intent_fallback"` and `source: "ip"` branches return the **full** struct, including `latitude`, `longitude`, `postal_code`, `region`, and `time_zone` (verified live — see examples).
+- `source` — one of: `"explicit"` (query named a gazetteer place → overrides IP geo), `"local_intent_fallback"` (no explicit place but "near me"/"nearby" intent → stable New York, US default), `"ip"` (only when `ip=` supplied and the geo DB resolved it), or `"none"` (no signal).
+- `explicit_location` — `true` when `source == "explicit"`.
+- `local_intent` — `true` when the query carries local-intent signals ("near me", "nearby", "around me", …).
+
+```json
+{
+  "query": "quiet places to study near chennai with power outlets and free wifi",
+  "resolved": {
+    "city": "chennai",
+    "country_code": "IN",
+    "country_name": "India",
+    "latitude": null,
+    "longitude": null,
+    "postal_code": null,
+    "region": null,
+    "time_zone": null
+  },
+  "source": "explicit",
+  "explicit_location": true,
+  "local_intent": true
+}
+```
+
+> **Verified (this round, 2026-08-11):** all four `source` branches + the `400` empty-query path confirmed live against `localhost:4000`:
+> - `?q=quiet+places+to+study+near+chennai...` → `source: "explicit"`, `city: "chennai"`, `country_code: "IN"` (coordinates null)
+> - `?q=best+sushi+restaurants+in+new+york` → `source: "explicit"`, `city: "new york"`, `country_code: "US"`
+> - `?q=coffee+shops+near+me+open+now` → `source: "local_intent_fallback"`, `city: "New York"`, `country_code: "US"`, `latitude: 40.7128`, `longitude: -74.006`, `region: "New York"`, `postal_code: "10001"`, `time_zone: "America/New_York"`
+> - `?q=how+does+a+cpu+pipeline+work` → `source: "none"`, `resolved: null`
+> - `?q=news+about+local+elections&ip=8.8.8.8` → `source: "ip"`, `country_code: "US"`, `latitude: 37.751`, `longitude: -97.822`, `time_zone: "America/Chicago"`
+>
+> Empty/whitespace `q` returns `400` with a **geo-specific** `empty_query` envelope (the `resolved`/`source`/`explicit_location`/`local_intent` keys, all neutral — NOT the shape of `/search` or `/spellcheck`). Verified live: `GET /geolocate?q=` → `HTTP 400` with body:
+> ```json
+> {"error":"empty_query","message":"Query parameter 'q' is empty","query":"","resolved":null,"source":"none","explicit_location":false,"local_intent":false}
+> ```
+
+**Notes**
+- Pure function of the query (+ optional `ip`) over the loaded gazetteer; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, geo-boost, negation gating, or calibration. It is a read-only preview of the existing location-resolution path.
+- A test module (`geolocate_endpoint_tests`, 7 cases) locks the `source`-routing behavior, the exact `400` envelope, and the `ip`-stage contract; the gateway suite is 103/103 passing.
+
+```bash
+# See how the engine would localize a query before searching
+curl "http://localhost:4000/geolocate?q=quiet+places+to+study+near+chennai"
+# → {"query":"...","resolved":{"city":"chennai",...},"source":"explicit","explicit_location":true,"local_intent":true}
+
+# Reproduce the IP-geolocation stage with a public IP for parity
+curl "http://localhost:4000/geolocate?q=news+about+local+elections&ip=8.8.8.8"
 ```
 
 ---

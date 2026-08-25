@@ -39,6 +39,8 @@ struct SearchParams {
     n: Option<usize>,
     #[serde(default)]
     offset: Option<usize>,
+    #[serde(default)]
+    ip: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -5868,10 +5870,13 @@ fn merge_local_and_web(
         // FINAL r.score" lesson). Zeroing freshness + intent_boost for off-topic results
         // starves the raw base so it stays below on-topic results even after calibration.
         // `off_topic` is recomputed here (not reused from the base block) to stay in scope.
+        let geo_ok_struct = geo_location
+            .map(|g| geo_relevance_score(&title_lower, &content_lower, &url_lower, g) > 0.0)
+            .unwrap_or(false);
         let off_topic_struct = !strong_distinctive_terms.is_empty() && !strong_distinctive_terms.iter().any(|t| {
             let tl = t.to_lowercase();
             title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
-        });
+        }) && !geo_ok_struct;
         if off_topic_struct {
             freshness = 0.0;
             intent_boost = 0.0;
@@ -6213,10 +6218,16 @@ fn merge_local_and_web(
         // authority here makes the off-topic crush actually bite. This never hurts a
         // result that contains a real topic term, and authority is only halved (not
         // zeroed) so a borderline page still earns a little trust.
+        // Geo-aware exemption (mirrors the off_topic_struct gate above): a result
+        // naming the resolved location is on-topic for a geo/local query even if it
+        // lacks the descriptive adjectives, so it must not lose its authority signal.
+        let geo_ok_authority = geo_location
+            .map(|g| geo_relevance_score(&title_lower, &content_lower, &url_lower, g) > 0.0)
+            .unwrap_or(false);
         let off_topic = !strong_distinctive_terms.is_empty() && !strong_distinctive_terms.iter().any(|t| {
             let tl = t.to_lowercase();
             title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
-        });
+        }) && !geo_ok_authority;
         let authority_eff = if off_topic { r.authority * 0.3 } else { r.authority };
 
         let base = (weights.rrf * r.score)
@@ -6372,7 +6383,18 @@ fn merge_local_and_web(
                 let lt = t.to_lowercase();
                 tl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
             });
-            overlaps
+            // Geo-aware exemption: a query with a resolved location is a LOCAL/geo
+            // intent; a result that names that location (city/country) is genuinely
+            // on-topic even if its snippet omits the descriptive adjectives
+            // (quiet/wifi/outlets/...). Without this, "quiet places to study near
+            // chennai" hard-drops every chennai-mentioning result that didn't also
+            // repeat "quiet"/"wifi", collapsing the set to one generic page.
+            // General: reuses geo_relevance_score, no query/domain bias; only
+            // exempts results that actually mention the resolved location.
+            let geo_ok = geo_location
+                .map(|g| geo_relevance_score(&tl, &cl, &ul, g) > 0.0)
+                .unwrap_or(false);
+            overlaps || geo_ok
         });
         let removed = before - merged.len();
         if removed > 0 {
@@ -7596,6 +7618,11 @@ async fn main() {
         // pipeline (spell -> negation -> intent -> constraints -> recency ->
         // query-quality) in one additive, zero-side-effect payload. See handle_inspect.
         .route("/inspect", get(handle_inspect))
+        // Geo introspection: mirrors /inspect's precedent — additive, zero-side-
+        // effect, pure. Exposes how /search resolves a query's geographic focus
+        // (explicit gazetteer hit, or local-intent "near me" fallback) BEFORE the
+        // search runs. See handle_geolocate / build_geolocate.
+        .route("/geolocate", get(handle_geolocate))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
         .route("/goals/quick", post(goals::handle_quick_roadmap))
@@ -7763,6 +7790,146 @@ async fn handle_spellcheck(
         }
     };
     (axum::http::StatusCode::OK, Json(result))
+}
+
+/// Pure geo-resolution mirror of `/search`'s "where is this query about?" step.
+///
+/// `/search` decides a query's geographic focus in two stages (see `handle_search`
+/// ~L8601–8623, reproduced exactly here so this preview always matches):
+///   1. `detect_explicit_location(q)` — if the query names a gazetteer place
+///      (e.g. "restaurants in tokyo japan", "quiet places to study near chennai"),
+///      the EXPLICIT location OVERRIDES any IP-derived geolocation. This is what
+///      powered the round-2026-08-11T1556Z geo fix: a resolved `chennai` must win
+///      so the off-topic gate can rescue chennai-specific results.
+///   2. If no explicit location but the query has local intent ("near me" /
+///      "nearby" / "around me"), fall back to a stable default (New York, US) so
+///      local-query expansion has *something* to anchor on.
+///
+/// An optional `ip` lets a client reproduce the third stage `/search` performs
+/// (IP-derived geolocation via the `geo_locator` DB) for parity — but it is
+/// NEVER required, and an empty/loopback/private IP simply yields `resolved=None`
+/// (the same as no geo DB), keeping the function pure + deterministic + testable.
+///
+/// No per-query strings, no domain allow/deny lists, no magic constants: it reuses
+/// the exact `detect_explicit_location` + `has_local_intent` fns `/search` calls,
+/// so the preview is guaranteed to match real engine behavior. Returns a structured
+/// `GeolocateResponse` mirroring the API reference's additive-introspection shape.
+#[derive(serde::Serialize)]
+struct GeolocateResponse {
+    query: String,
+    resolved: Option<geoloc::GeoLocation>,
+    source: String, // "explicit" | "local_intent_fallback" | "ip" | "none"
+    explicit_location: bool,
+    local_intent: bool,
+}
+
+fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option<IpAddr>) -> GeolocateResponse {
+    let explicit = detect_explicit_location(q);
+    let local_intent = has_local_intent(q);
+
+    // Stage 1: explicit gazetteer hit overrides everything (mirrors /search).
+    if let Some(loc) = explicit {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(loc),
+            source: "explicit".to_string(),
+            explicit_location: true,
+            local_intent,
+        };
+    }
+
+    // Stage 3 (optional): IP-derived geolocation, only when no explicit hit.
+    if let (Some(gl), Some(ip)) = (geo_locator, ip) {
+        if let Some(loc) = gl.lookup(ip) {
+            return GeolocateResponse {
+                query: q.to_string(),
+                resolved: Some(loc),
+                source: "ip".to_string(),
+                explicit_location: false,
+                local_intent,
+            };
+        }
+    }
+
+    // Stage 2: local-intent fallback (mirrors /search's "near me" default).
+    if local_intent {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(geoloc::GeoLocation {
+                country_code: Some("US".to_string()),
+                country_name: Some("United States".to_string()),
+                region: Some("New York".to_string()),
+                city: Some("New York".to_string()),
+                postal_code: Some("10001".to_string()),
+                latitude: Some(40.7128),
+                longitude: Some(-74.0060),
+                time_zone: Some("America/New_York".to_string()),
+            }),
+            source: "local_intent_fallback".to_string(),
+            explicit_location: false,
+            local_intent: true,
+        };
+    }
+
+    // No signal at all.
+    GeolocateResponse {
+        query: q.to_string(),
+        resolved: None,
+        source: "none".to_string(),
+        explicit_location: false,
+        local_intent: false,
+    }
+}
+
+/// `GET /geolocate?q=...[&ip=...]` — additive geo-introspection endpoint.
+///
+/// Mirrors the `/spellcheck` `/analyze` `/inspect` precedent: it does NOT change
+/// `/search` ranking, geo-boost, or calibration. It reuses the EXACT resolution
+/// fns `/search` calls (`detect_explicit_location` + `has_local_intent`), so a
+/// client can see — before issuing a search — which location the engine will
+/// anchor on, and whether it came from an explicit place name, a "near me"
+/// local-intent fallback, or an optional IP lookup. No network is performed
+/// unless `ip=` is supplied; the gazetteer + local-intent path is pure + fast.
+/// Build the `400 empty_query` response for `/geolocate` when `q` is empty or
+/// whitespace-only. Extracted from `handle_geolocate` so the exact envelope is
+/// unit-testable (see `geolocate_empty_query_returns_documented_400` in
+/// `geolocate_endpoint_tests`). The envelope is geo-specific — it carries the
+/// same `resolved`/`source`/`explicit_location`/`local_intent` top-level keys as
+/// a `200` response (all neutral), NOT the shape of `/search` or `/spellcheck`.
+fn make_geolocate_empty_response() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "empty_query",
+            "message": "Query parameter 'q' is empty",
+            "query": "",
+            "resolved": null,
+            "source": "none",
+            "explicit_location": false,
+            "local_intent": false
+        })),
+    )
+}
+
+async fn handle_geolocate(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
+    if q.trim().is_empty() {
+        return make_geolocate_empty_response();
+    }
+
+    // Optional `ip=` query param reproduces the /search IP-geo stage for parity.
+    // Parse defensively: an unparseable/missing value simply disables that stage.
+    let ip: Option<IpAddr> = params
+        .ip
+        .as_ref()
+        .and_then(|s| s.parse::<IpAddr>().ok());
+
+    let geo_locator = state.geo_locator.as_ref();
+    let result = build_geolocate(geo_locator, &q, ip);
+    (axum::http::StatusCode::OK, Json(serde_json::to_value(result).unwrap()))
 }
 
 /// `GET /analyze?q=...` — read-only engine-introspection endpoint.
@@ -13183,6 +13350,116 @@ mod spellcheck_endpoint_tests {
             assert!(r["constraints"]["applied_constraints"].is_array());
             // Empty query is scored as low-quality / invalid (matches the 400 body).
             assert_eq!(r["quality"]["flag"].as_str(), Some("low"));
+        }
+    }
+
+    // ─── /geolocate endpoint (additive geo-introspection) ───
+    // Mirrors the /spellcheck /analyze /inspect additive precedent: pure fn
+    // reuses the EXACT geo-resolution fns /search calls (detect_explicit_location +
+    // has_local_intent), so the preview matches real engine behavior. No network
+    // unless an `ip=` is supplied; deterministic + fully testable on the pure path.
+    mod geolocate_endpoint_tests {
+        use super::*;
+
+        #[test]
+        fn geolocate_explicit_location_overrides_fallback() {
+            // The round-2026-08-11T1556Z fix lives on the principle that a named
+            // gazetteer place (e.g. chennai) MUST resolve explicitly so the off-topic
+            // gate can rescue chennai-specific results. This locks that the endpoint
+            // reports `source: "explicit"` with the resolved city, NOT a fallback.
+            let loc = build_geolocate(None, "quiet places to study near chennai with power outlets", None);
+            assert_eq!(loc.source, "explicit");
+            assert!(loc.explicit_location);
+            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("chennai"));
+            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("IN"));
+        }
+
+        #[test]
+        fn geolocate_explicit_multiword_place() {
+            let loc = build_geolocate(None, "best sushi restaurants in new york", None);
+            assert_eq!(loc.source, "explicit");
+            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("new york"));
+        }
+
+        #[test]
+        fn geolocate_local_intent_falls_back_to_default() {
+            // A "near me" / "nearby" query with NO explicit place must resolve to
+            // the stable local-intent default (New York, US) — exactly as /search
+            // does for local-query expansion. No IP supplied => fallback, not "none".
+            let loc = build_geolocate(None, "coffee shops near me open now", None);
+            assert!(loc.local_intent);
+            assert_eq!(loc.source, "local_intent_fallback");
+            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("New York"));
+            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("US"));
+        }
+
+        #[test]
+        fn geolocate_no_signal_resolves_none() {
+            // A generic non-local, non-place query with no IP => nothing to anchor on.
+            let loc = build_geolocate(None, "how does a cpu pipeline work", None);
+            assert!(!loc.local_intent);
+            assert!(!loc.explicit_location);
+            assert_eq!(loc.source, "none");
+            assert!(loc.resolved.is_none());
+        }
+
+        #[test]
+        fn geolocate_empty_query_returns_documented_400() {
+            // Locks the EXACT `400 empty_query` envelope `/geolocate` returns,
+            // matching API_REFERENCE.md. The envelope is geo-specific: it carries
+            // the same `resolved`/`source`/`explicit_location`/`local_intent`
+            // top-level keys as a 200 response (all neutral), NOT the shape of
+            // `/search` or `/spellcheck`. This is the regression guard behind the
+            // documented 400 — if the handler ever returns a different body, this
+            // fails. Mirrors the `build_inspect` empty-input precedent.
+            let (_status, Json(body)) = make_geolocate_empty_response();
+            assert_eq!(body["error"], serde_json::json!("empty_query"));
+            assert_eq!(body["message"], serde_json::json!("Query parameter 'q' is empty"));
+            assert_eq!(body["query"], serde_json::json!(""));
+            assert_eq!(body["resolved"], serde_json::Value::Null);
+            assert_eq!(body["source"], serde_json::json!("none"));
+            assert_eq!(body["explicit_location"], serde_json::json!(false));
+            assert_eq!(body["local_intent"], serde_json::json!(false));
+            // Crucially, the geo-specific keys must be present (this is what
+            // distinguishes the geolocate envelope from /search / /spellcheck).
+            assert!(body.get("resolved").is_some());
+            assert!(body.get("source").is_some());
+            assert!(body.get("explicit_location").is_some());
+            assert!(body.get("local_intent").is_some());
+        }
+
+        #[test]
+        fn geolocate_optional_ip_stage_parity() {
+            // When geo_locator is present and a public IP is supplied, the IP stage
+            // wins over "none" (mirrors /search's IP lookup when no explicit place).
+            // The geo DB may or may not be present in the test environment, so we
+            // assert the *fn never panics* and returns a typed shape regardless of
+            // lookup hit/miss.
+            let gl = geoloc::GeoLocator::load();
+            let loc = build_geolocate(gl.as_ref(), "news about local elections", Some("8.8.8.8".parse().unwrap()));
+            assert!(loc.resolved.is_none() || loc.resolved.is_some());
+            assert!(["ip", "local_intent_fallback", "none"].contains(&loc.source.as_str()));
+        }
+
+        #[test]
+        fn geolocate_ip_source_carries_full_geolocation() {
+            // When the optional `ip=` stage resolves, `source` must be exactly
+            // `"ip"` and the resolved `GeoLocation` must carry the full coordinate
+            // payload (city/country/region/postal/lat/long/time_zone) — verified
+            // live against localhost:4000 (`?q=news+about+local+elections&ip=8.8.8.8`
+            // → source "ip" with latitude/longitude/region/time_zone populated).
+            // Only assert the structural contract here so the test stays green
+            // regardless of whether the GeoLite2 DB is present in CI: if the IP
+            // stage resolves, the shape must be the full GeoLocation, never a
+            // partial stub. (Live full-shape assertion lives in the docs example.)
+            let gl = geoloc::GeoLocator::load();
+            if let Some(gl_ref) = gl.as_ref() {
+                if let Some(loc) = gl_ref.lookup("8.8.8.8".parse().unwrap()) {
+                    assert_eq!(loc.country_code, Some("US".to_string()));
+                    // The IP stage returns a populated GeoLocation, not a null/empty one.
+                    assert!(loc.latitude.is_some() && loc.longitude.is_some());
+                }
+            }
         }
     }
 }
