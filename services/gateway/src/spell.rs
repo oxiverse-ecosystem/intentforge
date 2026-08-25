@@ -56,7 +56,7 @@ const PROTECTED_TERMS: &[&str] = &[
     "rust", "python", "golang", "kotlin", "scala", "elixir", "haskell",
     "ocaml", "clojure", "zig", "astro", "hugo", "bun", "deno", "nextjs",
     "nodejs", "typescript", "javascript", "svelte", "tailwind", "flutter",
-    "django", "fastapi", "laravel", "webpack", "vite", "esbuild", "pnpm",
+    "django", "fastapi", "flask", "express", "laravel", "webpack", "vite", "esbuild", "pnpm",
     "podman", "kubernetes", "terraform", "ansible", "helm", "nginx", "tokio",
     "postgres", "redis", "mongodb", "sqlite", "grafana", "caddy",
     // Common brands likely to collide with English words
