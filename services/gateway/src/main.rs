@@ -9359,6 +9359,39 @@ async fn handle_search(
         }
     }
 
+    // DEFECT C fix (initial fan-out injection): for contrastive negative queries
+    // ("alternative to uber", "instead of photoshop"), the per-excluded-term alt
+    // queries are the ONLY way to retrieve entity-specific alternatives. The retry
+    // fan-out that normally fires them is gated behind a 4.5s end-to-end deadline
+    // and is frequently SKIPPED on cold runs (upstream fan-out already consumed the
+    // budget), so the alt-specific results never reach the merge and the result set
+    // collapses to generic listicles with zero uber-specific pages. Inject the same
+    // alt queries into the INITIAL fan-out (which is never deadline-gated) so they
+    // always fire. query_is_contrastive detects "alternative to"/"instead of"/
+    // "other than" framing; we only act when a negative constraint was extracted,
+    // which mirrors the retry-stage guard and keeps ordinary queries untouched.
+    if !constraints.negative.is_empty() && query_is_contrastive(&q) {
+        let mut alt_variants: Vec<String> = Vec::new();
+        for neg in &constraints.negative {
+            let n = neg.trim();
+            if n.is_empty() { continue; }
+            alt_variants.push(format!("alternative to {}", n));
+            alt_variants.push(format!("{} alternatives", n));
+            if alt_variants.len() >= 6 { break; }
+        }
+        for (i, base_url) in searx_base_urls.iter().enumerate() {
+            let key = format!("searxng{}", i);
+            for v in &alt_variants {
+                let clean_v = preprocess_searxng_query(v);
+                let clean_q_outer = preprocess_searxng_query(&q);
+                if !clean_v.is_empty() && clean_v != clean_q_outer {
+                    searx_urls.push(searxng_url(base_url, &clean_v, geo_location.as_ref(), lang));
+                    searx_instance_keys.push(key.clone());
+                }
+            }
+        }
+    }
+
     let invidious_url = format!("http://invidious:3000/api/v1/search?q={}", q_encoded);
 
     let indexer_q = if let Some(ref stripped) = stripped_override {
@@ -10071,6 +10104,48 @@ async fn handle_search(
         tracing::info!("ONLY NEGATIVE: {} web results — keeping for constraint scoring", before);
     }
 
+    // ─── Contract enforcement: supported-intent normalization ───
+    // The intent-engine is a black box that may emit an intent outside the
+    // documented 8-class API contract (e.g. a trained "chitchat" class). The
+    // public contract guarantees exactly {navigational, informational, technical,
+    // how-to, comparison, fresh, transactional, local}. Any other label is
+    // remapped to the highest-probability SUPPORTED class from the distribution so
+    // the contract holds and downstream ranking/overrides operate on a known
+    // label. Without this, an unsupported intent silently bypasses every
+    // override gate (which all check `intent.intent != "<known>"`) and leaks to
+    // the API as a phantom class with no freshness/half-life semantics.
+    {
+        const SUPPORTED: &[&str] = &[
+            "navigational", "informational", "technical", "how-to",
+            "comparison", "fresh", "transactional", "local",
+        ];
+        if !SUPPORTED.contains(&intent.intent.as_str()) {
+            let best = SUPPORTED.iter()
+                .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            match best {
+                Some((lbl, prob)) => {
+                    tracing::warn!(
+                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' — remapping to '{}' (top supported class)",
+                        intent.intent, q, lbl
+                    );
+                    intent.intent = (*lbl).to_string();
+                    // Use the distribution probability for the selected supported class
+                    // rather than the original unsupported-class confidence.
+                    intent.confidence = prob;
+                }
+                None => {
+                    tracing::warn!(
+                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' with no supported distribution entry — falling back to informational",
+                        intent.intent, q
+                    );
+                    intent.intent = "informational".to_string();
+                    intent.confidence = 0.35;
+                }
+            }
+        }
+    }
+
     // ─── Rule-based intent overrides for known misclassification patterns ───
     // Fire when the linear probe has low confidence (<0.30) — the model is guessing,
     // so pattern-based heuristics beat random chance.
@@ -10260,7 +10335,32 @@ async fn handle_search(
             "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
         ];
         let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
-        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" {
+        // Do NOT clobber a decisive action/decision intent (comparison,
+        // transactional, how-to, technical, navigational) to fresh. A weather word
+        // like "rain" legitimately appears inside gear/commercial/how-to queries
+        // ("backpacking tent in the rain", "fix laptop fan after rain") and must not
+        // re-rank them by news-recency. Weather override only applies to
+        // informational/chitchat-style queries; genuine weather queries are still
+        // caught by the "today"/"forecast" temporal signals in other overrides.
+        let weather_skip_intents = ["comparison", "transactional", "how-to", "technical", "navigational"];
+        let weather_should_skip = weather_skip_intents.contains(&intent.intent.as_str());
+        // Also skip when the query itself carries decisive product / recommendation /
+        // instructional framing. A weather word inside such a query does NOT make it a
+        // weather query: "best lightweight tent for backpacking in the rain",
+        // "hiking boots that work in snow" are gear/how-to questions the engine may
+        // classify as `informational` (low confidence) -- which the 5-intent skip list
+        // above does not catch, so the weather override would wrongly re-rank them by
+        // news-recency. Genuine weather queries ("weather forecast today rain") carry
+        // none of these markers and still force `fresh` below.
+        let has_decisive_framing = [
+            "best ", "top ", "vs ", " review", "reviews", " for camping", " for backpacking",
+            " for hiking", "how to", "how do i", "buy ", "compare", "alternatives",
+            "which ", "cheapest", " vs. ", "best-",
+        ]
+        .iter()
+        .any(|m| q_lower.contains(m));
+        let weather_should_skip = weather_should_skip || has_decisive_framing;
+        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" && !weather_should_skip {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
                 q, intent.intent, intent.confidence
@@ -10370,30 +10470,52 @@ async fn handle_search(
     } else { None };
     // Generate alternative-seeking variations so the retry actually fetches
     // pages like alternatives-listing articles instead of the excluded tools' official pages.
-    // The stripped_query already excludes negated content terms via simple_negation_strip,
-    // so "browser not chrome not edge" becomes "browser". From there we generate multiple
-    // alternative-seeking variations of the core topic plus per-excluded-term queries.
-    let alt_queries: Vec<String> = if let Some(ref s_q) = stripped_query {
-        let mut alts = Vec::new();
-        alts.push(format!("{} alternatives", s_q));
-        alts.push(format!("{} comparison", s_q));
-        for neg in &intent.structured_constraints.negative {
-            alts.push(format!("alternative to {}", neg));
-            if alts.len() >= 6 { break; }
-        }
-        alts.push(format!("best {} 2026", s_q));
-        alts.push(format!("top {} 2026", s_q));
-        alts
-    } else {
-        Vec::new()
-    };
+    // The stripped_query excludes negated content terms via simple_negation_strip,
+    // so "browser not chrome not edge" becomes "browser" and we generate topic-anchored
+    // variants ("browser alternatives", "browser comparison") plus per-excluded-term
+    // "alternative to {neg}" queries.
+    //
+    // DEFECT C fix (real root cause): for purely-contrastive queries where the ENTIRE
+    // query is the contrastive frame + a single excluded term ("alternative to uber",
+    // "instead of photoshop"), simple_negation_strip returns None (no retained positive
+    // topic) — but the excluded entity IS the alt anchor. We therefore ALWAYS seed
+    // per-excluded-term alt queries ("alternative to {neg}", "{neg} alternatives",
+    // "best {neg} 2026") so the gateway fetches uber-specific alternatives
+    // (alternativeto.net/uber, rideshare roundups) instead of collapsing to generic
+    // "alternative to" listicles that mention the excluded term only referentially.
+    // Previously this block was guarded by `if let Some(s_q)` and was skipped entirely
+    // for purely-contrastive queries, leaving DEFECT C unfixed. The 3-gate alt-score
+    // alignment the audit prescribed was already shipped in 5c25d5d, so this query
+    // expansion path is the genuine remaining gap.
+    let mut alt_queries: Vec<String> = Vec::new();
+    if let Some(ref s_q) = stripped_query {
+        alt_queries.push(format!("{} alternatives", s_q));
+        alt_queries.push(format!("{} comparison", s_q));
+    }
+    for neg in &intent.structured_constraints.negative {
+        let n = neg.trim();
+        if n.is_empty() { continue; }
+        alt_queries.push(format!("alternative to {}", n));
+        alt_queries.push(format!("{} alternatives", n));
+        alt_queries.push(format!("best {} 2026", n));
+        if alt_queries.len() >= 9 { break; }
+    }
+    if let Some(ref s_q) = stripped_query {
+        alt_queries.push(format!("best {} 2026", s_q));
+        alt_queries.push(format!("top {} 2026", s_q));
+    }
     let expanded_queries = if let Some(ref s_q) = stripped_query {
         let mut eq = vec![s_q.clone()];
         eq.extend(alt_queries);
         eq.extend(expanded_queries);
         eq
     } else {
-        expanded_queries
+        // No retained topic (purely-contrastive, e.g. "alternative to uber").
+        // Seed the upstream fetch with the per-excluded-term alt queries above so we
+        // don't fall back to generic "alternative to" listicles with no uber-specific page.
+        let mut eq = alt_queries.clone();
+        eq.extend(expanded_queries);
+        eq
     };
     // Location-aware query expansion: use semantic "local" intent from the engine
     // (BERT-based classifier), falling back to keyword detection when confidence is low.
@@ -10610,8 +10732,24 @@ async fn handle_search(
     let expected_min = if only_negative { 5 } else if expanded_queries.len() > 1 { 15 } else { 10 };
     let needs_more_results = total_results < expected_min || (only_negative && searx_base_urls.len() > 1);
 
+    // DEFECT C fix (real root cause): for contrastive negative queries
+    // ("alternative to uber", "instead of photoshop"), the per-excluded-term alt
+    // queries ("alternative to uber", "uber alternatives", "best uber 2026") are the
+    // ONLY way to retrieve uber-specific alternatives. The initial fan-out only sends
+    // the (spell-corrected) raw query, which returns generic "alternative to X"
+    // listicles + off-topic junk that ALREADY fill the result quota — so the
+    // count-gated retry below would skip the genuinely useful alt queries and the
+    // result set would contain zero uber-specific pages. Force the retry fan-out
+    // for contrastive negatives regardless of how many initial results we have, so
+    // the alt-specific upstream fetches always happen. Guarded by
+    // `intent.structured_constraints.negative` being non-empty AND the query carrying
+    // contrastive framing (likewise detected for the exclusion gate upstream) to avoid
+    // disturbing ordinary queries.
+    let has_contrastive_negatives = !intent.structured_constraints.negative.is_empty()
+        && query_is_contrastive(&q);
+
     // Count-based retry (no relevance needed yet — fires before Invidious/news/image)
-    if needs_more_results && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
+    if (needs_more_results || has_contrastive_negatives) && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
         let mut retry_futs = Vec::new();
         let retry_timeout = Duration::from_secs(4); // shorter than initial 5s
         let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 6 } else { 3 };
@@ -10668,10 +10806,18 @@ async fn handle_search(
         if !retry_futs.is_empty() {
             let elapsed = search_start.elapsed();
             let limit = Duration::from_millis(4500); // 4.5s overall target limit (handler budget is 5.5s)
-            if elapsed >= limit {
+            // Allow contrastive-negative retries to bypass the elapsed-time skip (they
+            // are critical for "alternative to X" queries and get a bounded 1s budget),
+            // but still enforce the deadline for ordinary count-based retries.
+            if elapsed >= limit && !has_contrastive_negatives {
                 tracing::warn!("Retry skipped: elapsed time ({:?}) already exceeds target deadline ({:?})", elapsed, limit);
             } else {
-                let retry_budget = limit - elapsed;
+                let retry_budget = if elapsed >= limit {
+                    // Contrastive-negative bypass: grant a bounded 1s budget
+                    Duration::from_secs(1)
+                } else {
+                    limit - elapsed
+                };
                 tracing::info!(
                     "PARALLEL RETRY: {} results < {} expected, firing {} retry variation(s) with budget {:?}",
                     total_results, expected_min, retry_futs.len(), retry_budget
@@ -11866,6 +12012,16 @@ let mut results = match tokio::task::spawn_blocking(move || {
     if !intent.structured_constraints.negative.is_empty() && !results.is_empty() {
         let neg_refs: Vec<&str> = intent.structured_constraints.negative
             .iter().map(|s| s.as_str()).collect();
+        // DEFECT C ranking fix: for contrastive-negative queries ("alternative to uber",
+        // "instead of photoshop") the genuinely useful results are the alt-listing pages
+        // that MENTION the excluded entity (alternativeto.net/uber, "Best Uber Alternatives").
+        // The generic "alternative to X" listicles (which mention the excluded TERM only
+        // referentially, e.g. "Alternative to Fitbit") are off-target noise. The original
+        // rule boosted clean-title (no-excluded-term) results, which pushed the
+        // entity-specific uber pages BELOW the generic listicles. Invert the boost for
+        // contrastive framings: entity-mentioning alt pages get the +0.03 nudge and the
+        // generic listicles do not. Non-contrastive negatives keep the original behavior.
+        let contrastive = query_is_contrastive(&q);
         for r in results.iter_mut() {
             let title_lower = r.title.to_lowercase();
             let has_neg_in_title = neg_refs.iter().any(|n| {
@@ -11882,10 +12038,17 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     title_lower.contains(&joined)
                 }
             });
+            let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
             // Boost clean results by a small differential nudge (+0.03) so they
             // outrank alt pages WITHOUT collapsing the whole cluster to 1.0.
             // (Phase 0: replaced the old uniform ×1.25.)
-            if !has_neg_in_title {
+            if contrastive {
+                // Entity-specific alt pages (mention excluded term AND are alt listings)
+                // are the answer — boost them, not the generic listicles.
+                if has_neg_in_title && alt_score > 0.3 {
+                    r.score += 0.03;
+                }
+            } else if !has_neg_in_title {
                 r.score += 0.03;
             }
         }
