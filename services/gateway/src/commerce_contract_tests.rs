@@ -304,3 +304,191 @@ fn contract_missing_key_degrades_without_leak_or_crash() {
         "no affiliate urls emitted when key is absent"
     );
 }
+
+/// Pure helper used by the order-invariance test: the ranked URL list is the
+/// ORDER of the `url` field exactly as ranking produced it. Affiliate decoration
+/// MUST leave this byte-identical. We read `url` (not `affiliate.url`) on
+/// purpose — that is the field the ranking pipeline owns and the one a future
+/// manipulation would try to change.
+fn collect_ranked_urls(payload: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(arr) = payload.get("results").and_then(|v| v.as_array()) {
+        for r in arr {
+            if let Some(u) = r.get("url").and_then(|v| v.as_str()) {
+                out.push(u.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// ╔════════════════════════════════════════════════════════════════════════╗
+/// ║ MANDATORY ORDER-INVARIANCE TEST — THE BUSINESS THESIS.                  ║
+/// ║                                                                          ║
+/// ║ Likhith's entire commerce idea: "affiliate links instead of ads, with NO ║
+/// ║ search manipulation." The ONLY machine-checkable proof of that claim is  ║
+/// ║ this ORDER-INVARIANCE test: for the same already-ranked results, the     ║
+/// ║ ranked URL list (order + URLs + count) must be byte-identical whether    ║
+/// ║ affiliate decoration is ENABLED or DISABLED. Without it a future change   ║
+/// ║ could quietly let an affiliated merchant rank higher and the loop could   ║
+/// ║ not prove the promise. The audit brief (oxiverse-qa-cycle.sh) requires    ║
+/// ║ this; this test IS that requirement, made permanent in CI.                ║
+/// ╚════════════════════════════════════════════════════════════════════════╝
+///
+/// DESIGN: `decorate_affiliate` is already a STRICT post-ranking pass (it is
+/// called in `handle_shopping` only AFTER `handle_search` fixes the ranked
+/// order, and it only writes each result's `affiliate` field — never `url`,
+/// never order). The test below compares the pre-decoration order against the
+/// post-decoration order and they MUST match by construction. No refactor was
+/// needed; this test locks the invariant so it cannot regress.
+///
+/// ENABLED run: a network whose shape is IDENTICAL to the production Sovrn row
+/// in data/commerce/affiliate.json (kind=`wrap`, same template, `cuid={subid}`);
+/// its `key_env` is presented with a dummy-but-present value so the REAL
+/// decoration code path executes. DISABLED run: an empty network set (no key =>
+/// `first_usable()` returns None => `affiliate` omitted, results returned
+/// untouched) — exactly the "keys unset" behaviour. Both runs feed the SAME
+/// ranked input; the ranked `url` order must not move.
+///
+/// The test is GENERAL: it asserts on the ranked URL list, not on any
+/// query-specific string, so it holds for ANY shopping query, not just the
+/// example. The representative payload is just a fixture exercising the real
+/// `decorate_affiliate` pass.
+#[test]
+fn test_affiliate_decoration_does_not_change_ranking() {
+    // Representative already-ranked results for a shopping query shape
+    // ("buy wireless earbuds under 200" — triggers shopping intent downstream).
+    let ranked_input = representative_shopping_payload("buy wireless earbuds under 200");
+
+    // ── ENABLED run ──────────────────────────────────────────────────────────
+    // Mirror production's Sovrn network (real `wrap` template + cuid={subid});
+    // enable it by presenting its key env var with a dummy-but-present value so
+    // the decoration code path actually runs.
+    std::env::set_var("SOVRN_COMMERCE_KEY", "DUMMY_ENABLED");
+    let enabled_net = contract_net(
+        "wrap",
+        "https://sovrn.co?key={key}&u={url}",
+        {
+            let mut p = HashMap::new();
+            p.insert("cuid".to_string(), "{subid}".to_string());
+            p
+        },
+        Some("SOVRN_COMMERCE_KEY"),
+    );
+    let enabled_ctx = AffiliateCtx { networks: vec![enabled_net] };
+    let mut enabled_payload = ranked_input.clone();
+    if let Some(arr) = enabled_payload
+        .get_mut("results")
+        .and_then(|v| v.as_array_mut())
+    {
+        decorate_affiliate(arr, &enabled_ctx);
+    }
+    let enabled_ranked = collect_ranked_urls(&enabled_payload);
+    let enabled_aff = collect_affiliate_urls(&enabled_payload);
+
+    // ── DISABLED run ─────────────────────────────────────────────────────────
+    // No networks at all => first_usable() returns None => affiliate omitted,
+    // results returned untouched. This IS the "keys unset" behaviour.
+    let disabled_ctx = AffiliateCtx { networks: vec![] };
+    let mut disabled_payload = ranked_input.clone();
+    if let Some(arr) = disabled_payload
+        .get_mut("results")
+        .and_then(|v| v.as_array_mut())
+    {
+        decorate_affiliate(arr, &disabled_ctx);
+    }
+    let disabled_ranked = collect_ranked_urls(&disabled_payload);
+    let disabled_aff = collect_affiliate_urls(&disabled_payload);
+
+    // Non-vacuous guard: the ENABLED run must actually decorate, and the
+    // DISABLED run must not — otherwise the two runs would trivially match and
+    // the test would "pass" while proving nothing.
+    assert!(
+        !enabled_aff.is_empty(),
+        "ENABLED run must actually decorate (affiliate urls present); else the test is vacuous"
+    );
+    assert!(
+        disabled_aff.is_empty(),
+        "DISABLED run must NOT decorate (affiliate urls absent)"
+    );
+
+    // THE CONTRACT: ranked URL order is byte-identical with or without
+    // decoration. If they differ, affiliate monetization changed ranking.
+    if enabled_ranked != disabled_ranked {
+        eprintln!("ORDER-INVARIANCE VIOLATION — affiliate monetization changed ranking:");
+        eprintln!("  ENABLED  ranked urls (count={}):", enabled_ranked.len());
+        for (i, u) in enabled_ranked.iter().enumerate() {
+            eprintln!("    [{}] {}", i, u);
+        }
+        eprintln!("  DISABLED ranked urls (count={}):", disabled_ranked.len());
+        for (i, u) in disabled_ranked.iter().enumerate() {
+            eprintln!("    [{}] {}", i, u);
+        }
+    }
+    assert_eq!(
+        enabled_ranked, disabled_ranked,
+        "affiliate decoration MUST NOT change the ranked URL order (count, URLs, or sequence)"
+    );
+}
+
+/// NON-VACUOUS CONTROL: proves the order-invariance test above would CATCH a
+/// real manipulation. Decoration must write only the `affiliate` field and
+/// leave `url` (the ranking-owned field) byte-identical. If a future change
+/// incorrectly folded URL wrapping into `url` (the classic "monetization affects
+/// ranking" bug), the ranked URL list would change and the contract test would
+/// FAIL. This test locks that field-level distinction so the invariant is
+/// enforced structurally, not just asserted.
+#[test]
+fn test_affiliate_decoration_writes_affiliate_field_not_url() {
+    std::env::set_var("SOVRN_COMMERCE_KEY", "DUMMY_ENABLED");
+    let net = contract_net(
+        "wrap",
+        "https://sovrn.co?key={key}&u={url}",
+        {
+            let mut p = HashMap::new();
+            p.insert("cuid".to_string(), "{subid}".to_string());
+            p
+        },
+        Some("SOVRN_COMMERCE_KEY"),
+    );
+    let ctx = AffiliateCtx { networks: vec![net] };
+
+    let raw = representative_shopping_payload("buy wireless earbuds under 200");
+    let before_urls: Vec<String> = raw["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["url"].as_str().unwrap().to_string())
+        .collect();
+
+    let mut payload = raw.clone();
+    if let Some(arr) = payload.get_mut("results").and_then(|v| v.as_array_mut()) {
+        decorate_affiliate(arr, &ctx);
+    }
+    let after_urls: Vec<String> = payload["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["url"].as_str().unwrap().to_string())
+        .collect();
+
+    // The `url` field is NEVER touched by decoration => ranked order intact.
+    assert_eq!(
+        before_urls, after_urls,
+        "decorate_affiliate must NOT mutate the `url` field (ranking-owned)"
+    );
+    // Whereas the `affiliate` field IS added (decoration happened).
+    let aff = collect_affiliate_urls(&payload);
+    assert_eq!(
+        aff.len(),
+        before_urls.len(),
+        "every ranked result gained an affiliate block"
+    );
+    // And the decorated (affiliate) urls are OBVIOUSLY different strings from the
+    // ranked (raw) urls, so a future change that folded wrapping into `url` would
+    // be caught by the order-invariance test above.
+    assert_ne!(
+        aff, after_urls,
+        "decoration targets `affiliate`, not `url`; if these were equal, wrapping leaked into ranking"
+    );
+}
