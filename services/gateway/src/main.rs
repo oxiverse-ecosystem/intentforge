@@ -444,6 +444,14 @@ struct MergedResult {
     /// and this engine only returned date-blind junk). Defaults to 1.0.
     #[serde(default = "default_f32_one")]
     engine_trust_mult: f32,
+    /// Score-calibration cap applied during the web merge: when this result's
+    /// raw score exceeded a per-bucket cap (dict/video/weak), its score was
+    /// clamped to `post_cal_cap` and the original surplus discarded. Stored
+    /// (read-only, debug/observability) so tests/operators can SEE that a result
+    /// was calibration-clamped. `None` means no cap was applied. General: set by
+    /// the existing per-engine calibration logic, never a per-query literal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_cal_cap: Option<f32>,
 }
 
 fn default_f32_one() -> f32 { 1.0 }
@@ -4375,7 +4383,139 @@ const EXCLUSION_GRAMMAR_NOISE: &[&str] = &[
     "this", "these", "those", "what", "when", "where", "who", "why", "how",
     "their", "them", "they", "our", "your", "his", "her", "its", "the", "a", "an",
     "and", "or", "but", "not", "no", "any", "some", "all", "each", "every",
+    // Prepositions / function words that the intent engine may emit as a
+    // standalone `Exclusion` entity or inside an auxiliary+filler compound
+    // (e.g. "have of", "from the", "with a", "in on"). None of these are ever a
+    // real content exclusion, so they belong in the grammar-noise class. This
+    // makes the multi-word compound check (every token a function word → noise)
+    // correctly reject "have of" and friends. Pure structural vocabulary — no
+    // per-query literals; genuine topical exclusions (e.g. "chinese", "django")
+    // contain a real noun and are never matched here.
+    "of", "to", "in", "on", "at", "for", "by", "as", "off", "per",
 ];
+
+/// Inflection-tolerant verb stem: returns the bare stem of a regular English verb
+/// inflection so a single seed list (VERB_HEADS/MANNER_VERBS) covers every
+/// conjugation. "works"->"work", "turning"->"turn", "required"->"require",
+/// "using"->"use". Derived, not a per-token literal, so it generalises.
+fn verb_stem(t: &str) -> String {
+    let n = t.len();
+    if n > 4 && t.ends_with("ing") {
+        return t[..n - 3].to_string(); // turning -> turn
+    }
+    if n > 3 && t.ends_with("ed") {
+        return t[..n - 2].to_string(); // required -> requir (caller tries +e)
+    }
+    if n > 3 && t.ends_with("es") {
+        return t[..n - 2].to_string(); // matches -> match
+    }
+    if n > 2 && t.ends_with('s') {
+        return t[..n - 1].to_string(); // works -> work
+    }
+    t.to_string()
+}
+
+/// A negated clause object is a VERB-LED / ATTRIBUTE exclusion when its head is an
+/// open-class verb or a personal-attribute noun — i.e. it describes *how the user
+/// wants to do something* or *a trait of the user*, NOT a content topic to remove
+/// from results. Structural open-class vocabulary (reused MANNER_VERBS + a
+/// verb/attribute seed), no per-query literals — so any verb-led or attribute
+/// exclusion is caught generally. A genuine topical exclusion (brand / place /
+/// noun the user named) is never in this set, so real exclusions survive.
+fn is_verb_attribute_exclusion(term: &str) -> bool {
+    let lc = term.trim().to_lowercase();
+    if lc.is_empty() {
+        return true;
+    }
+    // Personal-attribute / trait nouns that describe the USER, not a content topic.
+    const ATTRIBUTE_NOUNS: &[&str] = &[
+        "coordination", "dependents", "experience", "background", "training",
+        "skill", "skills", "knowledge", "degree", "qualification", "qualifications",
+        "subscription", "account", "accounts", "registration", "signup", "sign-up",
+        "login", "log-in", "app", "apps", "application", "applications", "download",
+        "downloading", "install", "installing", "permission", "permissions",
+    ];
+    // Open-class verb seed (reuses MANNER_VERBS where overlapping).
+    const VERB_HEADS: &[&str] = &[
+        "respect", "require", "requires", "required", "needing", "need", "needs",
+        "track", "tracks", "tracking", "sell", "sells", "selling", "share", "shares",
+        "sharing", "collect", "collects", "collecting", "replace", "replacing",
+        "replaceing", "charge", "charging", "harm", "harming", "damage", "damaging",
+        "burn", "burning", "fire", "cost", "costs", "spend", "spending", "register",
+        "registering", "download", "downloading", "install",
+        "installing", "sign", "signing", "subscribe", "subscribing", "login",
+        "cook", "cooking", "drive", "driving", "travel", "travelling", "traveling",
+        "learn", "learning", "work", "working", "study", "studying", "read", "reading",
+        "use", "using", "turn", "turning", "compromise", "expose", "exposing",
+    ];
+    // Open-class descriptive ADJECTIVES: a negated adjective describes the user's
+    // preference, NOT a content topic to remove.
+    const ADJECTIVES: &[&str] = &[
+        "usual", "normal", "common", "typical", "standard", "regular",
+        "popular", "free", "cheap", "expensive", "easy", "hard", "simple",
+        "complex", "fast", "slow", "old", "new", "big", "small", "large",
+        "spicy", "sweet", "hot", "cold", "fresh", "clean", "dirty", "safe",
+    ];
+    // A token is verb-like if it is a seed verb OR a regular inflection of one.
+    let is_verb_like = |t: &&str| -> bool {
+        if VERB_HEADS.contains(t) || MANNER_VERBS.contains(t) {
+            return true;
+        }
+        let stem = verb_stem(t);
+        if VERB_HEADS.contains(&stem.as_str()) || MANNER_VERBS.contains(&stem.as_str()) {
+            return true;
+        }
+        // recovery for doubled-consonant stems (requir -> require)
+        let with_e = format!("{}e", stem);
+        VERB_HEADS.contains(&with_e.as_str()) || MANNER_VERBS.contains(&with_e.as_str())
+    };
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    if tokens.is_empty() {
+        return true;
+    }
+    // Reject if EVERY token is a verb/attribute/adj head or a filler — i.e. the
+    // whole extracted exclusion describes an action/trait, not a named topic.
+    tokens.iter().all(|t| {
+        is_verb_like(t)
+            || ATTRIBUTE_NOUNS.contains(t)
+            || ADJECTIVES.contains(t)
+            || MANNER_PRONOUNS.contains(t)
+            || is_exclusion_grammar_noise(t)
+    })
+}
+
+/// `pay`/`paying` is ambiguous. "pay attention"/"pay respect" is a MANNER idiom
+/// (an act of consideration, never a transaction) and must NOT be treated as a
+/// real money exclusion. "pay for a course"/"pay a subscription fee" is a genuine
+/// financial transaction the user refuses → MUST be honored. Decided entirely by
+/// the query's nearby OBJECT vocabulary (MANNER vs MONETARY object seeds, no
+/// per-query literals, no tuned thresholds) — future-proof and non-hardcoded.
+fn pay_exclusion_is_manner(q_orig: &str) -> bool {
+    let lc = q_orig.to_lowercase();
+    const PAY_MANNER_OBJECTS: &[&str] = &[
+        "attention", "respect", "regard", "heed", "tribute", "homage",
+        "compliments", "compliment", "court", "mind", "witness", "lip",
+    ];
+    PAY_MANNER_OBJECTS.iter().any(|m| {
+        lc.contains(&format!("pay {}", m)) || lc.contains(&format!("paying {}", m))
+    })
+}
+
+fn pay_exclusion_is_money(q_orig: &str) -> bool {
+    let lc = q_orig.to_lowercase();
+    const PAY_MONEY_OBJECTS: &[&str] = &[
+        "course", "courses", "subscription", "subscriptions", "fee", "fees",
+        "price", "prices", "money", "cost", "costs", "charge", "charges",
+        "tuition", "premium", "payment", "payments", "dollar", "dollars",
+        "rupee", "rupees", "bill", "bills", "tax", "taxes", "rent", "fare",
+        "membership", "license", "licence", "bootcamp", "class", "classes",
+        "training", "program", "programme",
+    ];
+    // Require the object word itself (no loose "pay a"/"paying a" prefix, which
+    // wrongly matched "paying attention"/"paying advice"). Same object-class seed
+    // pattern as the manner check — general, non-hardcoded, no tuned thresholds.
+    PAY_MONEY_OBJECTS.iter().any(|m| lc.contains(m))
+}
 
 /// True if `term` is a subjective-quality/sentiment adjective or a grammar-noise
 /// function word that must NOT become a hard search exclusion. Structural signals only
@@ -4386,6 +4526,16 @@ fn is_exclusion_grammar_noise(term: &str) -> bool {
         return true;
     }
     if EXCLUSION_GRAMMAR_NOISE.contains(&lc.as_str()) {
+        return true;
+    }
+    // Multi-word auxiliary/filler compounds (e.g. "have of", "from the",
+    // "with a") that the engine may emit as a single Exclusion role entity are
+    // pure grammar noise too: reject the compound when EVERY token is a known
+    // grammar-noise word. General structural vocabulary (EXCLUSION_GRAMMAR_NOISE),
+    // no per-query literals; a genuine multi-word topic exclusion (e.g.
+    // "south korea") contains a real noun token and is correctly NOT rejected.
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    if tokens.len() > 1 && tokens.iter().all(|t| EXCLUSION_GRAMMAR_NOISE.contains(t)) {
         return true;
     }
     // Multi-word subjective phrases ("genuinely fun") → drop the whole compound.
@@ -4918,7 +5068,8 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                     // or flask".)
                     let mut record_and_reset = |compound: &mut Vec<String>,
                                                 terms: &mut Vec<String>,
-                                                dropped: &mut Vec<String>| {
+                                                dropped: &mut Vec<String>,
+                                                manner: &mut Vec<String>| {
                         if compound.is_empty() {
                             return;
                         }
@@ -4927,12 +5078,20 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                             && !terms.contains(&joined)
                         {
                             terms.push(joined);
-                        } else if !is_manner_phrase(&joined)
-                            && !is_manner_frame(q_orig, &joined)
+                        } else if is_manner_phrase(&joined)
+                            || is_manner_frame(q_orig, &joined)
                         {
-                            if !dropped.contains(&joined) {
-                                dropped.push(joined);
+                            // Manner qualifier (HOW-not-WHAT exclusion, e.g.
+                            // "without soap", "with no music background"): surface it
+                            // separately for engine-introspection transparency and
+                            // NEVER treat it as a search exclusion or a declined
+                            // attribute. General: structural MANNER_VERBS/MANNER_PRONOUNS
+                            // vocabulary, no per-query literals.
+                            if !manner.contains(&joined) {
+                                manner.push(joined);
                             }
+                        } else if !dropped.contains(&joined) {
+                            dropped.push(joined);
                         }
                         compound.clear();
                     };
@@ -4946,14 +5105,14 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         // stop consuming — e.g. "not django site:github.com" → "django"
                         // only (previously emitted the phantom "django sitegithubcom").
                         if is_operator_word(w) {
-                            record_and_reset(&mut compound, &mut terms, &mut dropped);
+                            record_and_reset(&mut compound, &mut terms, &mut dropped, &mut manner);
                             break;
                         }
                         // List connectors between exclusion targets: the current
                         // target is finalised, then we start collecting the next.
                         let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
                         if bare == "or" || bare == "and" {
-                            record_and_reset(&mut compound, &mut terms, &mut dropped);
+                            record_and_reset(&mut compound, &mut terms, &mut dropped, &mut manner);
                             k += 1;
                             continue;
                         }
@@ -4994,7 +5153,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         // This prevents "without django or flask" from swallowing
                         // "flask python web frameworks" as one giant (gated-out) phrase.
                         if !compound.is_empty() && subject_terms.contains(&wc.as_str()) {
-                            record_and_reset(&mut compound, &mut terms, &mut dropped);
+                            record_and_reset(&mut compound, &mut terms, &mut dropped, &mut manner);
                             break;
                         }
                         // A trailing comma on the word (e.g. "django,") also
@@ -5002,12 +5161,12 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         let trailing_sep = w != wc && (w.ends_with(',') || w.ends_with(';'));
                         compound.push(wc);
                         if trailing_sep {
-                            record_and_reset(&mut compound, &mut terms, &mut dropped);
+                            record_and_reset(&mut compound, &mut terms, &mut dropped, &mut manner);
                         }
                         k += 1;
                     }
                     // Finalise the last (or only) target.
-                    record_and_reset(&mut compound, &mut terms, &mut dropped);
+                    record_and_reset(&mut compound, &mut terms, &mut dropped, &mut manner);
                     // Advance past every word we consumed (first_clean at j plus all
                     // extensions) so the outer loop doesn't re-scan them. `k` already
                     // points at the first word we did NOT consume (or words.len()).
@@ -5960,6 +6119,116 @@ fn renormalize_distribution(distribution: &mut std::collections::HashMap<String,
 /// anchor on "source"/"privacy"/"search"/"engine", not the ultra-common "open",
 /// so pages matching only "open" (OpenAI, Open Library) get correctly crushed
 /// as off-topic instead of surviving the guard.
+/// Stopwords for recall-gap term extraction: grammatical function words,
+/// question/framing verbs, negations, and temporal fillers that carry NO topical
+/// signal and must never be surfaced as a "recall gap" (they are not facets the
+/// upstream index could supply). Fixed, general list — no query/domain literals.
+fn recall_gap_stopwords() -> std::collections::HashSet<&'static str> {
+    [
+        "the", "a", "an", "and", "or", "but", "if", "then", "else", "of", "to",
+        "in", "on", "at", "by", "for", "with", "without", "from", "into", "onto",
+        "as", "is", "are", "was", "were", "be", "been", "being", "it", "this",
+        "that", "these", "those", "my", "your", "our", "their", "his", "her",
+        "i", "you", "he", "she", "we", "they", "me", "us", "him", "them",
+        "how", "what", "when", "where", "why", "who", "which", "way", "ways",
+        "best", "good", "great", "better", "top", "free", "cheap", "easy",
+        "simple", "quick", "fast", "new", "recent", "latest", "safe", "natural",
+        "home", "house", "make", "making", "get", "getting", "use", "using",
+        "find", "finding", "help", "need", "want", "like", "near", "nearby",
+        "does", "do", "did", "doesn", "dont", "don", "can", "could", "should",
+        "would", "will", "may", "might", "has", "have", "had",
+        "only", "also", "just", "still", "even", "very", "really", "lot",
+        "keep", "keeps", "kept", "stay", "stays", "put", "puts", "set", "sets",
+        "take", "takes", "took", "give", "gives", "show", "shows", "see", "sees",
+        "know", "knows", "think", "thinks", "feel", "feels", "look", "looks",
+        "go", "goes", "come", "comes", "let", "lets", "try", "tries", "sure",
+        "explain", "explained", "explaining", "describe", "description", "tell",
+        "tells", "learn", "learning", "learnt", "study", "studying", "read",
+        "reading", "write", "writing", "watch", "watching", "build", "building",
+        "built", "create", "creating", "start", "starting", "begin", "beginning",
+        "stop", "stopping", "avoid", "avoiding", "prevent", "preventing", "fix",
+        "fixing", "solve", "solving", "choose", "choosing", "pick",
+        "picking", "select", "selecting", "online", "offline", "local", "remote",
+        "lightweight", "heavy", "heavyweight", "safest", "unsafe",
+        "healthy", "health", "vegetarian", "vegan", "classic", "digital",
+        "personal", "private", "open", "closed", "thirty", "twenty", "forty",
+        "fifty", "hundred", "thousand", "million", "monthly", "weekly", "daily",
+        "ruining", "ruined", "ruin", "respect", "respects", "respecting",
+        "normal", "abnormal", "regular", "common", "uncommon", "rare", "usual",
+        "not", "no", "without", "except", "besides", "minus", "other", "than",
+        "nor",
+        "today", "tonight", "now", "this", "week", "weeks", "month", "months",
+        "year", "years", "day", "days", "past", "last", "upcoming",
+    ]
+    .iter()
+    .copied()
+    .collect()
+}
+
+/// Extract the salient (distinctive) query terms worth checking for recall
+/// coverage. Content-bearing words after removing generic stopwords, weak anchor
+/// words, pure numbers, and single chars. Pure function of the query — no
+/// per-query strings, no domain lists.
+fn distinctive_query_terms(query: &str) -> Vec<String> {
+    let stops = recall_gap_stopwords();
+    query
+        .split_whitespace()
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            lower.len() >= 3
+                && !stops.contains(lower.as_str())
+                && !is_weak_anchor_word(&lower)
+                && !lower.chars().all(|c| c.is_ascii_digit())
+        })
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// Honest recall-gap detector (round-2026-08-12T1234Z D2 disposition).
+///
+/// Given the final merged results and the original query, returns the subset of
+/// the query's distinctive terms that appear in NONE of the returned results'
+/// title/content/url. Those terms represent facets of the query the upstream
+/// index could not supply — an honest signal to the user, NOT a ranking defect
+/// and NOT a reason to fabricate a result. Returns `None` when there are no
+/// results at all (nothing to compare against) so the signal is never emitted for
+/// an empty SERP. Pure and general.
+fn compute_recall_gap_terms(
+    query: &str,
+    results: &[MergedResult],
+) -> Option<Vec<String>> {
+    if results.is_empty() {
+        return None;
+    }
+    let topics = distinctive_query_terms(query);
+    if topics.is_empty() {
+        return None;
+    }
+    let covered: Vec<String> = results
+        .iter()
+        .map(|r| {
+            let preview = r.content.chars().take(500).collect::<String>();
+            format!(
+                "{} {} {}",
+                r.title.to_lowercase(),
+                preview.to_lowercase(),
+                r.url.to_lowercase()
+            )
+        })
+        .collect::<Vec<String>>();
+
+    let missing: Vec<String> = topics
+        .into_iter()
+        .filter(|t| !covered.iter().any(|hay| hay.contains(t.as_str())))
+        .collect();
+
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing)
+    }
+}
+
 fn is_weak_anchor_word(w: &str) -> bool {
     const WEAK: &[&str] = &[
         "open", "source", "most", "best", "top", "free", "good", "great", "common",
@@ -6060,6 +6329,7 @@ fn merge_local_and_web(
             currency: r.currency,
             quality: r.quality,
             engine_trust_mult: 1.0,
+            post_cal_cap: None,
         };
         url_to_idx.insert(norm, merged.len());
         merged.push(entry);
@@ -6115,6 +6385,7 @@ fn merge_local_and_web(
                 currency: r.currency.clone(),
                 quality: 1.0,
                 engine_trust_mult: 1.0,
+                post_cal_cap: None,
             };
             url_to_idx.insert(norm, merged.len());
             merged.push(entry);
@@ -7713,13 +7984,20 @@ fn merge_local_and_web(
             let tl = t.to_lowercase();
             title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
         }) && !geo_ok_authority;
-        // Inverse-geo authority suppression (this round, D1): a local page from the
+        // Inverse-geo authority suppression (D1): a local page from the
         // WRONG city (explicit geo resolved, page does not name the location) is
         // geo-off-topic and must lose its authority signal too, not just its bonus —
         // otherwise its high authority floats it above right-city web results (the
         // Madurai/Busan case). Same signal as the off_topic gate; a right-city local
         // page (geo_ok_local) is exempt. Authority is halved (not zeroed) so a
         // borderline page keeps a little trust, and the existing 0.3 floor logic holds.
+        // Mirrors the local_bonus geo gate below: a local page is geo-off-topic only
+        // when an explicit geo was resolved AND the page does not name that location
+        // (geo_relevance_score == 0). No hardcoded city/domain lists; signal-driven.
+        let geo_ok_local = geo_location
+            .map(|g| geo_relevance_score(&title_lower, &content_lower, &url_lower, g) > 0.0)
+            .unwrap_or(false);
+        let geo_local_offtopic = r.is_local && geo_location.is_some() && !geo_ok_local;
         let geo_authority_suppressed = off_topic || geo_local_offtopic;
         let authority_eff = if geo_authority_suppressed { r.authority * 0.3 } else { r.authority };
 
@@ -7946,7 +8224,28 @@ fn merge_local_and_web(
     if !strong_distinctive_terms.is_empty() {
         let before = merged.len();
         let retained_pre_offtopic: Vec<MergedResult> = merged.iter().cloned().collect();
+        // D4 (fresh-intent) exemption for the off-topic HARD-DROP: when the query is
+        // `fresh` and at least one OTHER merged web result carries a parseable date
+        // (i.e. a sibling upstream engine returned dated, on-topic results), a
+        // date-blind result that lacks distinctive-term overlap must NOT be hard
+        // dropped. The whole point of the D4 per-engine trust design is to CRUSH such
+        // date-blind junk (×0.15 trust + ×0.12 fresh-off-topic relevance) so the
+        // dated sibling outranks it — but it must still SURVIVE, never be removed.
+        // Hard-dropping it here would reintroduce the 0-result collapse D4 exists to
+        // prevent and contradict the `d4_dateblind_upstream_crushed_below_dated_sibling`
+        // contract ("both results must survive"). Keyed on (fresh intent + a dated
+        // sibling), never on any query/domain literal, so it stays general.
+        let fresh_has_dated_sibling = intent == "fresh"
+            && merged.iter().any(|r| {
+                r.sources.iter().any(|s| s != "local")
+                    && resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
+            });
         merged.retain(|r| {
+            if fresh_has_dated_sibling {
+                // Keep date-blind junk so the engine-trust crush demotes it in-place
+                // instead of removing it. Topic-bearing / dated results also pass.
+                return true;
+            }
             // Adult exemption: when the query is explicitly adult, an adult result
             // must survive the off-topic gate — the adult block below keeps it
             // intentionally. Without this, the web off-topic drop would remove the
@@ -14966,6 +15265,10 @@ let mut results = match tokio::task::spawn_blocking(move || {
         page_limit: Some(limit),
         page_offset: Some(offset),
         has_more: if post_filter_count > 0 { Some(offset + limit < post_filter_count) } else { Some(false) },
+        // Honest recall-gap signal: which distinctive query terms are absent from
+        // ALL returned results (upstream coverage limitation, not a ranking defect).
+        // Computed at 14677 and threaded through here. None when empty/!computed.
+        recall_gap_terms,
         // FIX-B: gate price_verified on transactional intent AND a REAL price bound.
         // The old condition also fired on `priced_result_count > 0` — any web result
         // merely mentioning a price, regardless of intent — which emitted a spurious
@@ -15493,6 +15796,7 @@ async fn handle_search_fast(
                         currency: r.currency,
                         quality: r.quality,
                         engine_trust_mult: 1.0,
+                        post_cal_cap: None,
                     }).collect::<Vec<_>>()
                 }
                 None => vec![]
@@ -15713,7 +16017,7 @@ mod constraint_fix_tests {
             "rust web server without actix site:reddit.com",
             "learn spanish not duolingo site:reddit.com",
         ] {
-            let (kept, dropped) = extract_query_negative_terms_with_dropped(q);
+            let (kept, dropped, _manner) = extract_query_negative_terms_with_dropped(q);
             let joined = kept.join(" ");
             assert!(
                 !kept.iter().any(|t| t.contains("site")),
@@ -15729,7 +16033,7 @@ mod constraint_fix_tests {
             );
         }
         // Exact assertion for the canonical repro.
-        let (kept, _dropped) =
+        let (kept, _dropped, _manner) =
             extract_query_negative_terms_with_dropped("python web framework not django site:github.com");
         assert_eq!(kept, vec!["django".to_string()], "D3: 'not django site:github.com' → ['django'] only");
     }
