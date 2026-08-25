@@ -387,7 +387,7 @@ Spelling-correction preview. Exposes the engine's in-process SymSpell + LinSpell
 }
 ```
 
-> **Verified (this round, 2026-08-09):** a typo string returns `changed: true` with a `correction` per changed token. Protected brands/tech terms (`openai`, `rust`, `kubernetes`, …) are never "corrected" — `"openai rust tutorial"` returns `changed: false` and an empty `corrections` array. URL tokens, code tokens (`.` `/` `@` `#` `$` or containing a digit), and very short words (< 4 chars) are skipped by the corrector and **omitted entirely from the `corrections` array** — the endpoint only lists tokens it actually proposed fixing, so the client never flags skipped tokens as typos. They are still preserved verbatim in the whole-query `corrected` string. The `corrected` string matches what `/search` runs for the same query (verified 2026-08-09: `/spellcheck?q=pythn+programing+langauge` → `corrected: "python programming language"`, and `/search?q=pythn+programing+langauge` returns `"query":"python programming language"`). Example: `/spellcheck?q=pythn+kubernetes.io` returns `changed:true` with `corrections` containing **only** `pythn→python` (the `kubernetes.io` URL token is skipped and absent from `corrections`, but retained in `corrected`).
+> **Verified (this round, 2026-08-09):** a typo string returns `changed: true` with a `correction` per changed token. Protected brands/tech terms (`openai`, `rust`, `kubernetes`, …) are never "corrected" — `"openai rust tutorial"` returns `changed: false` and an empty `corrections` array. URL tokens, code tokens (`.` `/` `@` `#` `$` or containing a digit), and very short words (< 4 characters, counted by Unicode character count not UTF-8 byte length) are skipped by the corrector and **omitted entirely from the `corrections` array** — the endpoint only lists tokens it actually proposed fixing, so the client never flags skipped tokens as typos. They are still preserved verbatim in the whole-query `corrected` string. The `corrected` string matches what `/search` runs for the same query (verified 2026-08-09: `/spellcheck?q=pythn+programing+langauge` → `corrected: "python programming language"`, and `/search?q=pythn+programing+langauge` returns `"query":"python programming language"`). Example: `/spellcheck?q=pythn+kubernetes.io` returns `changed:true` with `corrections` containing **only** `pythn→python` (the `kubernetes.io` URL token is skipped and absent from `corrections`, but retained in `corrected`).
 
 **Empty query** returns `400` with the standard error envelope (same shape as `/search`):
 
@@ -443,7 +443,7 @@ This is the read-only companion to `/spellcheck`: it does **not** change `/searc
 
 > **Verified (this round, 2026-08-10):** all examples below were executed against the live dev stack at `localhost:4000` (gateway rebuilt at commit `c31cea0`). Contrastive `not X` → `exclusions` with `contrastive_framing: true` (e.g. `javascript not java not typescript` → `["java","typescript"]`). A manner phrase `without soap` → `manner_qualifiers` with empty `exclusions`/`declined` (`how to clean a cast iron skillet without soap after cooking eggs` → `["soap"]`). A generic `not spicy` with no contrastive framing → `declined` (`best spicy ramen not spicy` → `["spicy"]`). The DEFECT A trigger `best way to cook salmon without an oven` → `manner_qualifiers: ["oven"]` — the root cause is now *visible* instead of silent. The transparency invariant holds: every negation candidate appears in exactly one bucket.
 
-**Empty query** returns `400` with the standard error envelope (same shape as `/search` and `/spellcheck`):
+**Empty query** returns `400` with an error envelope containing the negation-specific fields:
 
 ```json
 { "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "exclusions": [], "declined": [], "manner_qualifiers": [] }
@@ -473,7 +473,7 @@ Unified pre-search introspection. Generalizes the `/analyze` (negation) and
 zero-side-effect payload that mirrors the *entire* `/search` reasoning pipeline
 a client can inspect **before** issuing a search:
 
-1. **spelling** — same `spellcheck_query` fn `/search` pre-corrects with.
+1. **spelling** — uses `spell::correct_query` (the same underlying correction function `/search` uses) and wraps it in `spellcheck_query` to produce the detailed response shape with per-token `corrections[]`.
 2. **negation** — the `exclusions` / `declined` / `manner_qualifiers` split + per-term `decisions[]` (identical to `/analyze`).
 3. **intent** — the pure no-network fallback classifier (`fallback_intent`) + coarse `category`.
 4. **constraints** — the gateway's own operator parser (`extract_gateway_constraints`) + the `applied_constraints` shape `/search` reports.
@@ -519,7 +519,7 @@ constants.
 
 > **Verified (this round, 2026-08-10T1401Z):** every claim below was executed
 > against the live dev stack at `localhost:4000` (gateway rebuilt at the round's
-> feature commit `ca4362c`/`ea11acd`). All 6 cases returned `200` unless noted. The
+> feature commit `ca4362c`/`ea11acd`). All 7 cases returned `200` unless noted. The
 > endpoint reuses the same pure functions `/search` runs (no network, deterministic).
 >
 > | Query | What was observed |
@@ -590,10 +590,38 @@ The `/search` endpoint parses a rich set of operators directly from the query st
 | `price_max:` | `price_max:100` | Maximum price | `price_max: 100.0` |
 | `lang:` | `lang:en` | Language filter (ISO code). Auto-applied as `lang:en` for English queries even without explicit use. | `language: "en"` |
 | `related:` | `related:python.org` | Find related pages | `related: ["python.org"]` |
+| `NOT:` | `python web framework NOT:flask` | **Hard-exclude** any result mentioning the term (single token, or quote a phrase: `NOT:"visual studio code"`). Unlike the natural-language `not X` (a soft penalty gated on entity/contrastive recognition that *declines* unrecognized terms like `flask`), `NOT:` is an **unconditional structural exclude** — any result whose title/content/url contains the term is dropped. General escape hatch for the DEFECT-A class; surfaced in `applied_constraints` as `not:<term>`. | `hard_exclusions: ["flask"]` |
 
 > **Verification status (this session, 2026-08-05):** the following operators were exercised live and confirmed to populate `structured_constraints` + `applied_constraints`: `site:` (block 32), `filetype:` (block 33), `intitle:` (block 34), `inurl:` (block 35), `after:` (block 36), and the natural-language negation `not X` (block 12 → `negative:["django"]`, `applied_constraints:["not:django"]`). The `fresh`/`today` intent auto-produced `after_date`+`before_date` = today (block 9). The **`price:` / `price_min:` / `price_max:`** operators and `lang:` / `intext:` / `related:` were **NOT exercised this session** — treat their extraction as unverified. 
 
 **Multiple operators** can be combined: `site:arxiv.org site:wikipedia.org quantum computing` → both sites are applied (observed).
+
+### The `NOT:` hard-exclusion operator (verified live 2026-08-11)
+
+`NOT:` is an **explicit, unconditional structural exclude** — the general, non-hardcoded escape hatch for the DEFECT-A class of limitations. It is parsed by the gateway's own operator extractor (`extract_gateway_constraints`), independent of the intent engine's entity/contrastive recognition.
+
+- **Syntax:** `NOT:<term>` for a single token, or `NOT:"<phrase>"` for a multi-word term (up to 4 words). Terms are lowercased for case-insensitive matching.
+- **Behaviour:** any result whose **title, content, or URL contains the term** (substring match) is hard-dropped by `should_filter_by_constraints`. This fires *before* the soft-penalty ranking path, so it removes the page entirely rather than demoting it.
+- **Surfaced as:** `structured_constraints.hard_exclusions: ["<term>"]` and `applied_constraints: ["not:<term>"]` on `/search` and `/inspect`.
+- **Never forwarded upstream:** `preprocess_searxng_query` strips `NOT:` so SearXNG does not treat `<term>` as a literal search word and re-surface it.
+- **Alt-listing exemption (by design):** a comparison / "alternatives" page that merely *mentions* the excluded term in a referential context (alt-score > 0.3) is **kept**, exactly like the `site:` / `filetype:` negative gates and the committed test `not_operator_keeps_alt_listing_page`. So `"Best Flask Alternatives"` survives `NOT:flask`.
+- **Contrast with bare `not X`:** the natural-language `not X` is a *soft* topical penalty gated on entity/contrastive recognition (`is_real_exclusion`) — an unrecognized tech term like `flask` is *declined*, leaving flask pages in the results (the DEFECT-A limitation). `NOT:flask` always excludes it. Use `NOT:` when you know a term is off-topic and don't want to rely on entity recognition.
+
+**Verified live example** (gateway rebuilt at commit `c3ee023` + the `/search` integration fix from this round; `localhost:4000`, cold cache):
+
+```bash
+curl "http://localhost:4000/search?q=python%20web%20framework%20NOT:flask"
+# → 200; top-level:
+#   "query": "python web framework NOT:flask"
+#   "applied_constraints": ["not:flask"]
+#   "structured_constraints": { ... "hard_exclusions": ["flask"], "negative": [], ... }
+#   "results": [ ... ]   # non-exempt pages whose title/url mention "flask" are dropped;
+#                        # comparison pages that only reference flask (e.g.
+#                        # "Which Is the Best Python Web Framework: Django, Flask, or FastAPI?")
+#                        # are retained by the alt-listing exemption above
+```
+
+> **Honest note on the original feature commit:** commit `c3ee023` added the `NOT:` parser, the hard-drop gate, the upstream-strip, and the `/inspect` + `applied_constraints` reporting code, but the `/search` path never copied `gateway_extracted.hard_exclusions` into the merged `structured_constraints`. As a result `/inspect` reported `hard_exclusions: ["flask"]` while `/search` silently dropped the operator (`applied_constraints: null`, flask pages retained) — the feature's "verified cold" claim was only true at the unit/`/inspect` level, not in integrated `/search`. A follow-up fix (this round) copies `hard_exclusions` into the merged constraints so `/search` now hard-drops and reports `NOT:` as documented above. The regression test `not_operator_reported_in_inspect_applied_constraints` locks the reporting contract.
 
 **Natural language date ranges** are automatically converted:
 - `"past 7 days"`, `"last week"`, `"this month"` → `after:YYYY-MM-DD before:YYYY-MM-DD`
