@@ -42,28 +42,39 @@ jobs:
         working-directory: services/gateway
         run: cargo test --locked
 
+  # --------------------------------------------------------------------------- #
+  # API schema regression — a REAL gate, never a green-wash.
+  #
+  # WHY REQUIRE=1 (the fix for the green-wash that hid three shipped defects):
+  #   The suite asserts the documented JSON contracts for EVERY endpoint in
+  #   API_REFERENCE.md. It needs a RUNNING gateway. On a bare runner there is no
+  #   IntentForge stack, so the old config set INTENTFORGE_REQUIRE_GATEWAY="0",
+  #   which made the suite pytest.skip() the entire run — a totally broken API
+  #   contract still reported a GREEN check (verified: `5 skipped in 0.11s`).
+  #   That is exactly how price-fail-open, "not from sony"→positive, and the
+  #   /goals/leaderboard shape mismatch rode a green master.
+  #
+  #   The suite now FAILS LOUD (red) when the gateway is unreachable or its
+  #   /health is not "OK". A broken contract can NEVER yield a green check.
+  #
+  # HOW THE STACK GETS UP (the merge gate):
+  #   * If the repo provides ProtonVPN creds as secrets, this job brings the
+  #     stack up via docker compose and runs the real guard against it.
+  #   * WITHOUT creds (the public CI case), the stack cannot run here, so the
+  #     job FAILS LOUDLY by design. This is intentional and documented: the
+  #     authoritative schema gate is the local oxiverse-qa loop, which DOES
+  #     bring the full stack up and sets INTENTFORGE_REQUIRE_GATEWAY=1 before
+  #     running this same suite. Do NOT "fix" the red by lowering REQUIRE back
+  #     to "0" — that reintroduces the green-wash. Instead, run the QA loop
+  #     (or supply VPN secrets) before merging.
+  #
+  # Collectability note: the suite is tests/test_goals_api_schema.py (test_
+  # prefix) and is run by DIRECTORY (`pytest tests/`), never by naming a file,
+  # so all 20 assertions are actually collected.
+  # --------------------------------------------------------------------------- #
   schema-regression:
     name: API schema regression (live gateway contract)
     runs-on: ubuntu-latest
-    # This job asserts the documented JSON contracts for EVERY endpoint in
-    # API_REFERENCE.md (incl. the Goals API). It needs a RUNNING gateway.
-    #
-    # IMPORTANT: a bare runner has no IntentForge stack, so the suite is designed
-    # to SKIP cleanly there (no green-washing of a real failure). To make it a
-    # real guard, bring the stack up (docker compose) and set
-    # INTENTFORGE_REQUIRE_GATEWAY=1 so an unreachable/contract-drifted gateway
-    # FAILS the run. The QA loop already does this locally/where the stack runs.
-    #
-    # Example (when the stack is brought up in this job):
-    #   - name: Bring up IntentForge stack
-    #     run: (cd services && docker compose -f docker-compose.dev.yml up -d gateway indexer ...)
-    #   - name: Wait for gateway health
-    #     run: for i in $(seq 1 30); do curl -sf localhost:4000/health && break; sleep 5; done
-    #   - name: Run schema regression (must fail if gateway missing)
-    #     env:
-    #       INTENTFORGE_BASE: http://localhost:4000
-    #       INTENTFORGE_REQUIRE_GATEWAY: "1"
-    #     run: pytest tests/goals_api_schema.py -v
     steps:
       - uses: actions/checkout@v4
 
@@ -75,10 +86,27 @@ jobs:
       - name: Install pytest
         run: pip install -r tests/requirements.txt
 
-      - name: Run API schema regression
+      - name: Bring up IntentForge stack (requires VPN creds as repo secrets)
+        # Only attempt the stack when ProtonVPN creds are supplied. Without them
+        # the upstream search path cannot run and the job fails loud below.
+        if: ${{ secrets.PROTONVPN_USER != '' }}
         env:
-          # Default: skip cleanly if no gateway (bare runner). The QA loop and
-          # any job that brings the stack up should set this to "1".
-          INTENTFORGE_REQUIRE_GATEWAY: "0"
+          PROTONVPN_USER: ${{ secrets.PROTONVPN_USER }}
+          PROTONVPN_PASSWORD: ${{ secrets.PROTONVPN_PASSWORD }}
+        working-directory: services
+        run: |
+          docker compose -f docker-compose.dev.yml up -d gateway indexer searxng searxng2
+          for i in $(seq 1 60); do
+            if curl -fsS localhost:4000/health; then
+              echo "gateway healthy"; break
+            fi
+            sleep 5
+          done
+
+      - name: Run API schema regression (FAIL LOUD if gateway down)
+        env:
+          # REQUIRE=1 → an unreachable/drifted gateway turns the run RED,
+          # never green. This is the real regression guard.
+          INTENTFORGE_REQUIRE_GATEWAY: "1"
           INTENTFORGE_BASE: http://localhost:4000
-        run: pytest tests/goals_api_schema.py -v
+        run: pytest tests/ -v
