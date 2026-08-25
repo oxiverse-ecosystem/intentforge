@@ -2499,6 +2499,23 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
                 "inr", "rs", "rs.", "euros", "euro", "eur", "pounds", "pound",
                 "gbp", "yen", "jpy", "won", "krw", "cents", "cent", "paise", "paisa"];
             if currency_words.contains(&pl.as_str()) { continue; }
+            // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
+            // extraction (e.g. "under 15000" / "below 2000" can leave the digits
+            // in `positive` as "+15000"). A purely-numeric positive carries no
+            // retrievable lexical meaning and only spuriously boosts pages that
+            // echo the number — "Tablets Under 15000" outranking actual
+            // "smartphones under 15000" for the latter query, because the token
+            // 15000 matched the tablet page's title but not the phone page's.
+            // The budget is ALREADY captured in `price_lt`/`price_max` and
+            // enforced by the shopping/price path, so removing the number from
+            // `positive` loses no signal. Signal-driven: ANY all-digit token
+            // (with optional thousands separators / decimal point) is dropped
+            // regardless of value — no per-query literals, no tuned thresholds.
+            // Years are already captured as date constraints, so dropping a bare
+            // year from `positive` is likewise safe.
+            if pl.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') {
+                continue;
+            }
             // D4 (2026-08-17): if this term was already captured as a NEGATIVE
             // constraint (e.g. the intent engine emits both `+chinese` and `-chinese`
             // for "not from chinese brands"), it is a contradiction to also keep it as
@@ -7766,6 +7783,17 @@ fn merge_local_and_web(
             r.score *= 0.01;
         }
 
+        // P2d (round-2026-08-20T1935Z): collapse the indexer BM25 for off-topic locals
+        // HERE (same scope as `base`), because the earlier `r.score *= 0.01` in the noise-
+        // gate block above does NOT propagate to this read under the borrow structure. The
+        // body-incidental subject mention (e.g. "airtable" in a Slack-Alternatives page)
+        // gave it a large r.score that dominates weights.rrf; crushing it here lets the
+        // on-topic web page win after calibrate_scores. General: keyed on the P2d flag
+        // (local page names none of the query's title-anchored subject terms).
+        if p2d_offtopic {
+            r.score *= 0.01;
+        }
+
         let base = (weights.rrf * r.score)
             + (weights.semantic * semantic)
             + (weights.intent * intent_boost)
@@ -8511,6 +8539,72 @@ fn merge_local_and_web(
         }
     }
 
+    // ── P13 (round-2026-08-20T1935Z): drop adult/NSFW results flagged upstream ──
+    // The per-result loop (line ~6302) sets r.score = -1.0 and continues for any
+    // result whose title/URL matches clean::is_adult_explicit() — a query-agnostic
+    // lexical detector. Here we physically remove those sentinels so they never
+    // reach the response. Hard-drop (not demote) because a family-safe engine must
+    // never surface explicit content regardless of how weak the rest of the set is.
+    {
+        let before = merged.len();
+        merged.retain(|r| r.score >= 0.0);
+        let removed = before - merged.len();
+        if removed > 0 {
+            tracing::info!("P13 ADULT DROP: removed {} explicit result(s) from merged set", removed);
+        }
+    }
+
+    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
+    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
+    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
+    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
+    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
+    // because the local base score is large, so other-city pages still floated into
+    // positions 3-5. We hard-drop local results that name a different gazetteer place
+    // and do NOT name the requested city/country.
+    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
+    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
+    // that NAME the requested place are kept. No query/domain literals.
+    if geo_is_explicit {
+        let before = merged.len();
+        merged.retain(|r| {
+            if !r.is_local {
+                return true;
+            }
+            let tl = r.title.to_lowercase();
+            let cl = r.content.to_lowercase();
+            let ul = r.url.to_lowercase();
+            let text = format!("{} {} {}", tl, cl, ul);
+            // On-topic for the requested location → keep.
+            let req_city = geo_location.and_then(|g| g.city.as_deref());
+            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
+            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
+                || req_country.map_or(false, |c| whole_word_contains(&text, c));
+            if mentions_req {
+                return true;
+            }
+            // Mention of a different known place → drop this local page.
+            let same_country_ok = req_city.is_none();
+            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
+            for (name, cc) in LOCATION_GAZETTEER.iter() {
+                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
+                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
+                if same_country_ok {
+                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
+                }
+                if name.len() < 3 { continue; }
+                if whole_word_contains(&text, name) {
+                    return false;
+                }
+            }
+            true
+        });
+        let removed = before - merged.len();
+        if removed > 0 {
+            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
+        }
+    }
+
     // ── Adult-content hard-drop for non-adult queries (this round, D4) ──
     // Privacy-first search must not surface pornographic/NSFW results for ordinary
     // queries. The web fan-out (SearXNG-via-VPN) returned XNXX adult forums for an
@@ -8910,6 +9004,16 @@ fn merge_local_and_web(
             })
             .map(|t| t.score)
             .fold(f32::INFINITY, f32::min);
+
+        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
+        // Used by the P8 video cap (b0): a video must never outrank the best genuine
+        // text result for a non-video query, in any calibration regime (see comment
+        // at (b0)). Computed over post-calibration scores so it reflects the final
+        // text ranking.
+        let best_non_video = merged.iter()
+            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
+            .map(|r| r.score)
+            .fold(0.0f32, f32::max);
 
         // Best non-video score AFTER calibration but BEFORE this pass caps any video.
         // Used by the P8 video cap (b0): a video must never outrank the best genuine
