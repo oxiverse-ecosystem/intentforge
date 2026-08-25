@@ -1770,8 +1770,6 @@ Returns all goals sorted by score (descending). Max 50 entries.
 
 **Response** `200 OK` — a bare JSON **ARRAY** (not a wrapper object) of goal objects:
 
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
 ```json
 [
   {
