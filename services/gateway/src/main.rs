@@ -1631,6 +1631,76 @@ fn is_comparison_or_alternative_query(constraints: &Constraints) -> bool {
     false
 }
 
+/// Detect whether an EXCLUDED term (a negative constraint like "medication")
+/// appears in a NEGATING context within a result — i.e. the page is
+/// *fulfilling* the user's exclusion rather than violating it. For
+/// "lower blood pressure WITHOUT medication" the most relevant pages literally
+/// say "without medication" / "no pills" / "free of drugs". Penalising them
+/// (the old behaviour) collapses recall and can surface the opposite of intent
+/// (a pill page ranking #1 for "sleep without pills"). When the excluded term is
+/// framed negatively, the result should be BOOSTED, not crushed.
+///
+/// General, signal-driven: keyed on a small closed set of English negation
+/// markers + the excluded term's own tokens, no per-query/domain strings.
+fn term_in_negating_context(term_lower: &str, text_lower: &str) -> bool {
+    let term_tokens: Vec<&str> = term_lower
+        .split_whitespace()
+        .filter(|t| t.len() >= 2)
+        .collect();
+    if term_tokens.is_empty() {
+        return false;
+    }
+    // Negation markers that, when appearing shortly BEFORE the excluded term,
+    // signal the page is about avoiding it.
+    // Single-word markers
+    let single_word_markers: &[&str] = &[
+        "without", "no", "not", "never", "avoid", "avoiding",
+        "zero", "minus", "absent", "non",
+    ];
+    // Multi-word markers represented as token sequences
+    let multi_word_markers: &[&[&str]] = &[
+        &["with", "no"],
+        &["free", "of"],
+        &["free", "from"],
+        &["instead", "of"],
+        &["rather", "than"],
+    ];
+    let words: Vec<&str> = text_lower.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()).collect();
+    for (i, w) in words.iter().enumerate() {
+        let is_term_token = term_tokens.iter().any(|t| {
+            let tl = t.trim_end_matches('s'); // loose plural match
+            w == t || w == &tl || (w.len() > t.len() && w.starts_with(t) && (w.len() - t.len()) as f32 / t.len() as f32 <= 0.5)
+        });
+        if !is_term_token {
+            continue;
+        }
+        // Look back up to 3 tokens for a negation marker.
+        let start = i.saturating_sub(3);
+        let preceding_window = &words[start..i];
+
+        // Check single-word markers with exact token equality (no prefix matching)
+        for &prev in preceding_window {
+            if single_word_markers.contains(&prev) {
+                return true;
+            }
+        }
+
+        // Check multi-word markers as token sequences
+        for multi_marker in multi_word_markers {
+            if preceding_window.len() >= multi_marker.len() {
+                // Scan all possible positions in the window
+                for window_start in 0..=(preceding_window.len() - multi_marker.len()) {
+                    let window_slice = &preceding_window[window_start..window_start + multi_marker.len()];
+                    if window_slice == *multi_marker {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn constraint_score(
     title: &str,
     content: &str,
@@ -1703,7 +1773,14 @@ fn constraint_score(
     // pre-merge hard-drop gate uses the same pure alt_score>0.3 exemption, so all
     // gates must agree to avoid re-drops.
     let is_alt_page = alt_score > 0.3;
-    let mut any_negative_matched = false;
+    // Stricter gate for the title-dominance hard-drop below: a WEAK alt signal
+    // alone (e.g. a "best "/"top " listicle title with no comparison/alternative
+    // wording and no supporting URL/content evidence) must not exempt a page
+    // whose title is otherwise dominated by the excluded term from the hard
+    // drop — only genuine comparison/alternative pages (strong title signal,
+    // or corroborated by URL/content) should be exempt from that check.
+    let is_strong_alt_page = alt_score > 0.5;
+    let mut any_unresolved_violation = false;
     let mut hit_count = 0u32;
 
     for neg in &expanded_negatives {
@@ -1744,33 +1821,63 @@ fn constraint_score(
 
         if title_or_url_matched {
             hit_count += 1;
-            any_negative_matched = true;
-            if !is_alt_page {
+            // NEGATION-CONTEXT BOOST (this round): when the excluded term
+            // appears in a NEGATING context ("without medication", "no pills",
+            // "free of drugs"), the page is FULFILLING the user's exclusion,
+            // so it is MORE relevant — not less. The old code penalised these
+            // pages (×0.02), which collapsed recall for "X without Y" queries
+            // and could surface the opposite of intent (a pill page at #1 for
+            // "sleep without pills"). Boost instead of crush. This applies
+            // regardless of is_alt_page: a title like "natural alternatives
+            // instead of pills" is still fulfilling the exclusion even though
+            // it also reads as an alternative-listing page.
+            let neg_ctx_title = term_in_negating_context(neg_lower.as_str(), &title_lower);
+            let neg_ctx_content = term_in_negating_context(neg_lower.as_str(), &content.to_lowercase());
+            if neg_ctx_title || neg_ctx_content {
+                let boost = 1.18;
+                tracing::info!("CONSTRAINT NEG-CTX BOOST: '{}' in '{}' → boost={:.2} (excluding term framed negatively)",
+                    neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                    boost);
+                score *= boost;
+            } else if !is_alt_page {
                 let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
                 tracing::info!("CONSTRAINT HIT (TITLE/URL): '{}' in '{}' → penalty={:.4} (non-alt)",
                     neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
                     penalty);
                 score *= penalty;
+            } else {
+                any_unresolved_violation = true;
             }
         } else if content_matched {
             hit_count += 1;
-            any_negative_matched = true;
-            if !is_alt_page {
+            let neg_ctx_content = term_in_negating_context(neg_lower.as_str(), &content.to_lowercase());
+            if neg_ctx_content {
+                let boost = 1.15;
+                tracing::info!("CONSTRAINT NEG-CTX BOOST (content): '{}' in '{}' → boost={:.2}",
+                    neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                    boost);
+                score *= boost;
+            } else if !is_alt_page {
                 let penalty = (0.25 + (neg_count - 1.0) * 0.05).clamp(0.25, 0.50);
                 tracing::info!("CONSTRAINT HIT (CONTENT): '{}' in '{}' → penalty={:.4} (non-alt)",
                     neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
                     penalty);
                 score *= penalty;
+            } else {
+                any_unresolved_violation = true;
             }
         } else {
             tracing::info!("CONSTRAINT MISS: '{}' not in '{}'", neg, &text_lower[..text_lower.char_indices().nth(60).map(|(i,_)| i).unwrap_or(text_lower.len())]);
         }
     }
 
-    if any_negative_matched && is_alt_page {
+    if any_unresolved_violation {
         // Alt pages get one single flat penalty regardless of how many excluded
         // terms they mention. This prevents "Django vs FastAPI vs Flask: Which to
         // Choose" (which mentions all 3) from getting compounded 0.175^3 = 0.005.
+        // Only terms that were NOT already resolved via the negation-context
+        // boost above count as violations here — a boosted term is fulfilling
+        // the exclusion, not violating it, so it must not also be penalized.
         // The alt_score measures how strongly this page is an alternative listing
         // (comparison vs titles, URL patterns, content patterns).
         // High alt_score → barely penalized: alt_score=0.7 → 0.175 single hit
@@ -1801,9 +1908,16 @@ fn constraint_score(
     // them. Rule: a NON-alt page is dropped only when its TITLE is dominated by
     // the excluded term(s): ≥50% of its non-stopword title tokens are an
     // excluded term (or a sub-brand of it, e.g. "pycharm" ∈ "pycharm-community").
+    // Finding 3: exclude negative-term occurrences when they appear in negating
+    // context (e.g., "Sleep without pills" should NOT be hard-dropped because
+    // "without pills" is FULFILLING the exclusion, not violating it).
     // Incidental mentions inside body/comparison pages are left to the soft
     // penalty above. Fail-closed: if we can't prove dominance, we keep it.
-    if !is_alt_page && !expanded_negatives.is_empty() {
+    // Uses the STRICT alt-page gate: a weak listicle signal alone (e.g. "Best
+    // sleeping pills" — no comparison/alternative wording, no URL/content
+    // corroboration) must not exempt a title genuinely dominated by the
+    // excluded term from this hard drop.
+    if !is_strong_alt_page && !expanded_negatives.is_empty() {
         const STOP: &[&str] = &[
             "the", "a", "an", "and", "or", "for", "of", "in", "on", "to", "with",
             "vs", "versus", "best", "top", "review", "reviews", "guide", "guides",
@@ -1815,6 +1929,12 @@ fn constraint_score(
             .filter(|t| t.len() >= 2 && !STOP.contains(&t.as_str()))
             .collect();
         if !title_tokens.is_empty() {
+            // Check if any of the expanded negatives appear in negating context
+            // in the title. If they do, they're RELEVANT (not violations).
+            let negatives_in_negating_context: Vec<&String> = expanded_negatives.iter()
+                .filter(|neg| term_in_negating_context(&neg.to_lowercase(), &title_lower))
+                .collect();
+
             let dominated = title_tokens.iter().filter(|tok| {
                 expanded_negatives.iter().any(|neg| {
                     if neg.is_empty() { return false; }
@@ -1822,10 +1942,13 @@ fn constraint_score(
                     // Exact word, or the token is a sub-brand/compound of the
                     // excluded term (n ⊂ tok, covering "pycharm-community",
                     // "macbook-pro", "nodejs"-style collisions handled by len gap).
-                    tok.as_str() == n.as_str()
+                    let is_match = tok.as_str() == n.as_str()
                         || (tok.len() > n.len()
                             && tok.starts_with(&n)
-                            && (tok.len() - n.len()) as f32 / n.len() as f32 <= 0.6)
+                            && (tok.len() - n.len()) as f32 / n.len() as f32 <= 0.6);
+
+                    // Exclude this match if the term is in negating context
+                    is_match && !negatives_in_negating_context.contains(&neg)
                 })
             }).count();
             let dom_frac = dominated as f32 / title_tokens.len() as f32;
@@ -1976,7 +2099,11 @@ fn constraint_score(
         }
     }
 
-    score.clamp(0.0, 1.0)
+    // Upper bound raised from 1.0 so the negation-context boost above (a
+    // result that FULFILLS an "X without Y" exclusion) can actually surface
+    // as a score above the neutral 1.0 baseline instead of being clipped back
+    // down to parity with non-boosted results.
+    score.clamp(0.0, 2.0)
 }
 
 /// Parsed price constraint. `min`/`max` describe an explicit range (`price:10-100`);
@@ -13333,6 +13460,41 @@ mod constraint_fix_tests {
         assert!(!query_is_contrastive("how to clean a cast iron skillet without soap after cooking eggs"));
     }
 
+    #[test]
+    fn negation_context_no_prefix_false_positives() {
+        // Finding 2 regression: prefix matching on negation markers causes false
+        // positives (e.g., "nonlinear" starting with "no" incorrectly triggers
+        // negation context). Multi-word markers like "free of" and "instead of"
+        // should be matched as token sequences, and single-word markers should use
+        // exact token equality only.
+
+        // "nonlinear" should NOT match the "no" marker
+        assert!(!term_in_negating_context("medication", "nonlinear medication dynamics"),
+            "'nonlinear' must not match 'no' marker");
+
+        // "notable" should NOT match the "not" marker
+        assert!(!term_in_negating_context("pills", "notable pills research"),
+            "'notable' must not match 'not' marker");
+
+        // But genuine negation markers should still work
+        assert!(term_in_negating_context("medication", "no medication needed"),
+            "'no medication' should match");
+        assert!(term_in_negating_context("pills", "without pills"),
+            "'without pills' should match");
+
+        // Multi-word markers should work as token sequences
+        assert!(term_in_negating_context("sugar", "free of sugar"),
+            "'free of sugar' should match multi-word marker");
+        assert!(term_in_negating_context("meat", "instead of meat"),
+            "'instead of meat' should match multi-word marker");
+        assert!(term_in_negating_context("coffee", "rather than coffee"),
+            "'rather than coffee' should match multi-word marker");
+
+        // But partial matches should NOT trigger
+        assert!(!term_in_negating_context("sugar", "free sugar available"),
+            "'free' alone without 'of' should not match");
+    }
+
 
     #[test]
     fn pure_negation_scores_match_down() {
@@ -13341,6 +13503,51 @@ mod constraint_fix_tests {
         c.negative = vec!["trump".to_string()];
         let score = constraint_score("Trump speech", "https://x.com/trump", "trump said things", &c);
         assert!(score < 0.05, "trump-mentioning result should score near-zero for -trump");
+    }
+
+    #[test]
+    fn title_dominance_excludes_negating_context() {
+        // Finding 3 regression: title-dominance check should exclude negative-term
+        // occurrences when they appear in negating context. "Sleep without pills"
+        // should NOT be hard-dropped because "without pills" is FULFILLING the
+        // exclusion (the page is about avoiding pills), not violating it.
+        let mut c = cst();
+        c.negative = vec!["pills".to_string()];
+
+        // "Sleep without pills" should receive a BOOST (not a hard-drop)
+        let score = constraint_score(
+            "Sleep without pills",
+            "https://example.com/sleep",
+            "Natural sleep techniques without pills or medication",
+            &c
+        );
+        assert!(score > 0.0,
+            "'Sleep without pills' should not be hard-dropped (score > 0), got: {}", score);
+        // Should be boosted above 1.0 due to negating context
+        assert!(score > 1.0,
+            "'Sleep without pills' should be boosted (score > 1.0), got: {}", score);
+
+        // But "Best sleeping pills" should be hard-dropped (title dominated, no negating context)
+        let score2 = constraint_score(
+            "Best sleeping pills",
+            "https://example.com/pills",
+            "Top rated sleeping pills for insomnia",
+            &c
+        );
+        assert_eq!(score2, 0.0,
+            "'Best sleeping pills' should be hard-dropped (score = 0), got: {}", score2);
+
+        // "Natural alternatives instead of pills" should also be boosted (not hard-dropped)
+        let score3 = constraint_score(
+            "Natural alternatives instead of pills",
+            "https://example.com/alt",
+            "Try these natural alternatives instead of pills",
+            &c
+        );
+        assert!(score3 > 0.0,
+            "'instead of pills' should not be hard-dropped, got: {}", score3);
+        assert!(score3 > 1.0,
+            "'instead of pills' should be boosted, got: {}", score3);
     }
 
     #[test]
