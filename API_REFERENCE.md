@@ -1768,7 +1768,7 @@ Retrieves the goal status and full roadmap (if answers have been submitted).
 
 Returns all goals sorted by score (descending). Max 50 entries.
 
-**Response** `200 OK`
+**Response** `200 OK` — a bare JSON **ARRAY** (not a wrapper object) of goal objects:
 
 Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
 
@@ -1785,6 +1785,8 @@ Returns a JSON array (list) of goal leaderboard entries, sorted by score (descen
   }
 ]
 ```
+
+> Note: the response is the list of entries directly. There is no `{"entries": [...], "total_entries": N}` wrapper — `len(response)` gives the entry count and each element is a goal object.
 
 ---
 
