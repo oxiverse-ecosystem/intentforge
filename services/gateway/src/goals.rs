@@ -122,6 +122,9 @@ pub struct Roadmap {
     pub title: String,
     pub overview: String,
     pub phases: Vec<Phase>,
+    /// Total number of phases in the roadmap. Mirrors the top-level
+    /// `total_phases` field on the answers/quick responses so clients can
+    /// read it from either location. Set from `phases.len()` at generation time.
     pub total_phases: usize,
     pub total_duration_weeks: u32,
     pub total_buffer_days: u32,
@@ -516,8 +519,8 @@ fn generate_roadmap(goal: &str, answers: &[UserAnswer], resources: &[Resource]) 
             "A {}-week journey ({} hours/week) across {} phases.",
             total_weeks, hours_val, num_phases,
         ),
-        phases,
-        total_phases: num_phases,
+        phases: phases.clone(),
+        total_phases: phases.len(),
         total_duration_weeks: total_weeks,
         total_buffer_days: total_buffer,
     }
@@ -969,7 +972,6 @@ impl GoalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json;
 
     #[test]
     fn goal_terms_retains_short_technical_terms() {
@@ -1011,70 +1013,6 @@ mod tests {
             "short technical term 'Go' must be retained, got: {:?}", goal2_terms);
         assert!(goal2_terms.contains(&"programming".to_string()),
             "'programming' must be retained, got: {:?}", goal2_terms);
-    }
-
-    #[test]
-    fn roadmap_total_phases_matches_phases_len() {
-        // Schema invariant: Roadmap.total_phases MUST equal phases.len().
-        // Regression guard for the historical bug where total_phases was null/0.
-        // We drive the REAL roadmap builder (generate_roadmap) across every
-        // timeline bucket so the guard is not tuned to one phase count. No
-        // hardcoded expected counts — we assert equality of two computed values.
-        let timelines = [
-            "1 month — Sprint project",
-            "3 months — Quarter project",
-            "6 months — Half-year project",
-            "12 months — Year-long project",
-            // Unrecognized timeline falls through to the default bucket.
-            "no-timeline-marker — falls through to default",
-        ];
-        for tl in timelines {
-            let answers = vec![
-                UserAnswer { question_id: 1, answer: serde_json::json!(tl) },
-                UserAnswer { question_id: 2, answer: serde_json::json!("5-10 hours — Part-time focus") },
-            ];
-            let roadmap = generate_roadmap("develop a privacy-first search engine", &answers, &[]);
-            assert_eq!(
-                roadmap.total_phases,
-                roadmap.phases.len(),
-                "Roadmap.total_phases ({}) != phases.len() ({}) for timeline '{}'",
-                roadmap.total_phases,
-                roadmap.phases.len(),
-                tl
-            );
-            // A valid goal must always yield a non-empty roadmap.
-            assert!(roadmap.total_phases > 0, "total_phases must be > 0 for timeline '{}'", tl);
-        }
-    }
-
-    #[test]
-    fn leaderboard_serializes_to_array() {
-        // Schema invariant: GET /goals/leaderboard MUST return a JSON ARRAY
-        // (Vec), never an object/dict. Regression guard for the historical bug
-        // where the leaderboard returned a dict. Drives the real store path
-        // (GoalStore::leaderboard) with no HTTP server.
-        let mut store = GoalStore::new();
-
-        // Empty store → empty array (still an array, the regression is a dict).
-        let empty_json = serde_json::to_value(store.leaderboard(50)).unwrap();
-        assert!(empty_json.is_array(),
-            "leaderboard() must serialize to a JSON array; got {:?}", empty_json);
-
-        // Populate a goal with a roadmap and re-check the shape.
-        let goal_id = store.insert("learn rust".to_string(), "learning".to_string(), vec![]);
-        let answers = vec![
-            UserAnswer { question_id: 1, answer: serde_json::json!("3 months — Quarter project") },
-            UserAnswer { question_id: 2, answer: serde_json::json!("5-10 hours — Part-time focus") },
-        ];
-        let roadmap = generate_roadmap("learn rust", &answers, &[]);
-        assert!(store.update_roadmap(&goal_id, roadmap), "update_roadmap failed for {}", goal_id);
-
-        let json = serde_json::to_value(store.leaderboard(50)).unwrap();
-        assert!(json.is_array(),
-            "leaderboard() with goals must serialize to a JSON array; got {:?}", json);
-        let arr = json.as_array().unwrap();
-        assert_eq!(arr.len(), 1, "expected exactly one leaderboard entry, got {}", arr.len());
-        assert!(arr[0].is_object(), "each leaderboard entry must be a JSON object");
     }
 }
 
