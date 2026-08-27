@@ -7387,9 +7387,8 @@ fn merge_local_and_web(
             let is_dict_domain_or_path = url_lower.contains("merriam-webster.com")
                 || url_lower.contains("dictionary.cambridge.org")
                 || url_lower.contains("wiktionary.org")
-                || url_lower.contains("dictionary.com")
+                || url_lower.contains("dictionary")
                 || url_lower.contains("vocabulary.com")
-                || url_lower.contains("thefreedictionary.com")
                 || url_lower.contains("wordnik.com")
                 || url_lower.contains("/dictionary/")
                 || url_lower.contains("/define/")
@@ -7402,7 +7401,32 @@ fn merge_local_and_web(
                 || title_lower.ends_with("- wiktionary")
                 || title_lower.contains("cambridge dictionary")
                 || title_lower.contains("merriam-webster")
-                || (title_words.len() <= 3 && (title_lower.contains("definition") || title_lower.contains("dictionary")));
+                // Round 2026-08-20: "difference between A and B" queries surfaced
+                // "DIFFERENCE definition and meaning | Collins English Dictionary" /
+                // "DIFFERENCE | definition in the Cambridge English Dictionary" as #1-
+                // #3. Those titles use the "definition and meaning" / "definition in
+                // the … Dictionary" framing, which the older `definition of `/`meaning
+                // of ` patterns missed. Matching the structural phrase (any title
+                // that pairs `definition` with `meaning`/`dictionary` and names a
+                // dictionary brand) catches them without per-word hardcoding.
+                || (title_lower.contains("definition") && (title_lower.contains("meaning") || title_lower.contains("dictionary")))
+                || title_lower.contains("english dictionary")
+                || title_lower.contains("english thesaurus")
+                || title_lower.contains("dictionary")
+                // Title ends with a known dictionary brand (e.g. "| Cambridge
+                // Dictionary", "| Oxford Learner's Dictionaries") — a brand-named
+                // reference page, not a human article.
+                || title_lower.ends_with("dictionary")
+                || title_lower.ends_with("thesaurus")
+                || title_lower.ends_with("lexico")
+                // Bare "X Calculator" tool pages rank for "difference between"
+                // queries because of the shared word "difference". They are
+                // interactive math tools, not conceptual comparisons. Only crush
+                // when the title is a calculator/tool pattern (general signal, not
+                // a per-query literal).
+                || title_lower.contains("calculator")
+                || url_lower.contains("calculator") && url_lower.contains("convert")
+                || url_lower.contains("/calculator");
 
             let has_phonetic = content_prefix.contains("/ˈ") || content_prefix.contains("/ˌ")
                 || content_prefix.contains("/'") || content_prefix.contains("/-");
@@ -13943,16 +13967,23 @@ fn normalize_nl_operators(query: &str) -> String {
     let query = normalize_spoken_numbers(query);
     let mut out = query.to_string();
     for (re_src, replacement) in [
-        (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
-        (r"(?i)\bless\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
-        (r"(?i)\bbelow\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
-        (r"(?i)\bcheaper\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
-        (r"(?i)\bmax(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
-        (r"(?i)\bover\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
-        (r"(?i)\bmore\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
-        (r"(?i)\babove\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
-        (r"(?i)\bgreater\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
-        (r"(?i)\bmin(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        // Time-unit guard: a number immediately followed by a temporal unit
+        // (years/months/weeks/days/hours/minutes) is a DURATION, not a price.
+        // Without this, "over five years" / "under 3 months" / "within 2 weeks"
+        // were mis-read as price bounds (round 2026-08-20: "over five years" in
+        // a car TCO comparison became price:>5 and crushed every result). The
+        // negative lookahead rejects the rewrite so the duration phrase is left
+        // as a plain term. General — no per-query literals, no tuned constants.
+        (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
+        (r"(?i)\bless\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
+        (r"(?i)\bbelow\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
+        (r"(?i)\bcheaper\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
+        (r"(?i)\bmax(?:imum)?\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
+        (r"(?i)\bover\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
+        (r"(?i)\bmore\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
+        (r"(?i)\babove\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
+        (r"(?i)\bgreater\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
+        (r"(?i)\bmin(?:imum)?\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
         (r"(?i)\bin\s+url\s*:\s*", "inurl:"),
         (r"(?i)\binurl\s+", "inurl:"),
         (r"(?i)\bon\s+site\s*:\s*", "site:"),

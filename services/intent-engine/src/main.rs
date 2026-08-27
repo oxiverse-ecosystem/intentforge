@@ -337,19 +337,24 @@ fn normalize_nl_operators(query: &str) -> String {
     let query = normalize_spoken_numbers(query);
     let mut out = query.to_string();
 
-    // Price: upper-bound forms.
+    // Price: upper-bound forms. All price markers carry a time-unit negative
+    // lookahead so a number followed by a temporal unit (years/months/weeks/
+    // days/hours/minutes) is treated as a DURATION, not a price. Without this
+    // guard, "over five years" (spoken -> "over 5") became price:>5 and silently
+    // crushed every result for a car TCO comparison query (IntentForge round
+    // 2026-08-20). Mirror of the gateway's fix in normalize_nl_operators.
     for (re_src, replacement) in [
-        (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
-        (r"(?i)\bless\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
-        (r"(?i)\bbelow\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
-        (r"(?i)\bcheaper\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
-        (r"(?i)\bmax(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
+        (r"(?i)\bless\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
+        (r"(?i)\bbelow\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
+        (r"(?i)\bcheaper\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
+        (r"(?i)\bmax(?:imum)?\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
         // Price: lower-bound forms.
-        (r"(?i)\bover\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
-        (r"(?i)\bmore\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
-        (r"(?i)\babove\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
-        (r"(?i)\bgreater\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
-        (r"(?i)\bmin(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bover\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
+        (r"(?i)\bmore\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
+        (r"(?i)\babove\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
+        (r"(?i)\bgreater\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
+        (r"(?i)\bmin(?:imum)?\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
         // Operator spacing: "in url:github" / "inurl github" -> "inurl:github"
         (r"(?i)\bin\s+url\s*:\s*", "inurl:"),
         (r"(?i)\binurl\s+", "inurl:"),
