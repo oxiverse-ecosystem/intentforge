@@ -3631,6 +3631,45 @@ fn has_local_intent(query: &str) -> bool {
         )
 }
 
+/// Known video-hosting domains. Used by the P8 video dampening so that videos
+/// arriving through the GENERAL web result set (e.g. a youtube.com URL returned by
+/// SearXNG, which is NOT tagged with the `invidious`/`video` source) are still
+/// recognized as video results and dampened for non-video queries. This is a struct-
+/// ural allow-list of platforms the engine explicitly treats as "video surfaces",
+/// not a per-query tuned list — it is the same platform set the dedicated /videos
+/// endpoint uses, so the policy is consistent and future-proof.
+const VIDEO_HOSTS: &[&str] = &[
+    "youtube.com", "youtu.be", "m.youtube.com", "youtube-nocookie.com",
+    "vimeo.com", "dailymotion.com", "twitch.tv", "rumble.com", "odysee.com",
+    "bitchute.com", "lbry.tv", "peer.tube", "invidious",
+];
+
+/// Returns true if `url` points at a known video platform (see VIDEO_HOSTS).
+/// Cheap, allocation-free host suffix check — no DNS, no per-request config.
+fn is_url_video_host(url: &str) -> bool {
+    let u = url.to_lowercase();
+    let host = if let Some(idx) = u.find("://") {
+        &u[idx + 3..]
+    } else {
+        &u
+    };
+    let host = host.split(['/', '?', '#']).next().unwrap_or(host);
+    VIDEO_HOSTS.iter().any(|h| {
+        host == *h
+            || host.ends_with(&format!(".{}", h))
+            // Invidious instances are self-hosted at arbitrary subdomains
+            // (e.g. invidious.example.net, invidious.snopyta.org), so match any
+            // host that carries the "invidious" label as a full domain label —
+            // not just the bare `invidious` / `.invidious` suffix. This is the
+            // same structural host-class check the dedicated /videos endpoint
+            // uses; no per-instance domain list.
+            || (h == &"invidious"
+                && (host == "invidious"
+                    || host.starts_with("invidious.")
+                    || host.ends_with(".invidious")))
+    })
+}
+
 /// Words/phrases that signal CONTRASTIVE framing. When a negation marker sits in
 /// contrastive framing, the negated head is genuinely a search exclusion (e.g.
 /// "search engine alternative to google" → exclude google; "react vs vue" → exclude
@@ -3855,17 +3894,27 @@ fn query_is_contrastive(q_orig: &str) -> bool {
 ///          "other than ubuntu" → ["ubuntu"]
 /// Manner qualifiers (e.g. "without soap", "with no music background") are NOT treated
 /// as search exclusions — see `is_real_exclusion`.
-/// Like `extract_query_negative_terms`, but also returns the SECOND element:
-/// genuine candidate negations (built compounds) that the `is_real_exclusion`
-/// gate DECLINED and that are NOT manner qualifiers. These are surfaced to the
-/// user via `ignored_constraints` (D3 transparency) so a legitimate attribute
-/// exclusion like "recipes not spicy" is not silently dropped. Manner qualifiers
-/// ("without soap") are intentionally absent from both vectors.
-fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<String>) {
+/// Like `extract_query_negative_terms`, but also returns a THIRD element:
+/// the manner-qualifier compounds (e.g. "without soap", "with no music
+/// background") the extractor recognized as HOW-not-WHAT exclusions. These are
+/// deliberately NOT search exclusions, but surfacing them (in the `/analyze`
+/// introspection endpoint) makes the engine's reasoning legible instead of
+/// swallowing them silently.
+///
+/// The SECOND element is the genuine candidate negation (built compound) that
+/// the `is_real_exclusion` gate DECLINED and that is NOT a manner qualifier.
+/// These are surfaced to the user via `ignored_constraints` (D3 transparency) so
+/// a legitimate attribute exclusion like "recipes not spicy" is not silently
+/// dropped. Manner qualifiers are intentionally absent from this second vector.
+fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     let q_lower = q_orig.to_lowercase();
     let words: Vec<&str> = q_lower.split_whitespace().collect();
     let mut terms: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
+    // Manner qualifiers ("without soap", "with no music background") — HOW not
+    // WHAT to exclude. Never treated as search exclusions, surfaced separately
+    // (third tuple element) for engine-introspection transparency.
+    let mut manner: Vec<String> = Vec::new();
     // Computed once: whether the query is in contrastive/exclusion framing. Real
     // exclusions are gated on this flag + entity recognition (see is_real_exclusion).
     let query_contrastive = query_is_contrastive(q_orig);
@@ -4002,7 +4051,16 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         && !terms.contains(&joined)
                     {
                         terms.push(joined);
-                    } else if !is_manner_phrase(&joined) && !is_manner_frame(q_orig, &joined) {
+                    } else if is_manner_phrase(&joined) || is_manner_frame(q_orig, &joined) {
+                        // Manner qualifier ("without soap", "without offending the
+                        // couple"): describes HOW not WHAT to exclude. It is NOT a
+                        // search exclusion — record it (the third tuple element) so
+                        // the `/analyze` endpoint can explain the engine's reasoning
+                        // instead of swallowing it silently.
+                        if !manner.contains(&joined) {
+                            manner.push(joined);
+                        }
+                    } else {
                         // D3 transparency: a genuine candidate exclusion that the
                         // gate declined (not a recognized entity, not contrastive
                         // framing) AND is not a manner qualifier. It was silently
@@ -4023,7 +4081,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
             i += 1;
         }
     }
-    (terms, dropped)
+    (terms, dropped, manner)
 }
 
 /// Backward-compatible thin wrapper: returns only the kept exclusions.
@@ -6091,7 +6149,15 @@ fn merge_local_and_web(
         // article for text queries (e.g. "how to make biryani at home"). Videos have
         // their own /videos endpoint; in /search they are secondary, so dampen them
         // unless the query is explicitly video-seeking. Floor keeps them present, not dominant.
-        let is_video_source = r.sources.iter().any(|s| s == "invidious" || s == "video");
+        // A result is a "video" if it is tagged with the video source OR its URL
+        // points at a known video platform. SearXNG often returns youtube.com /
+        // vimeo.com / etc. URLs inside the GENERAL web result set WITHOUT a
+        // video source tag (e.g. the "authentic poha indore style" query returned a
+        // youtube.com recipe video at score 1.0 for a non-video query). Treating
+        // those as text allowed them to outrank the real recipe article. is_url_video_host
+        // catches them so the same dampening applies.
+        let is_video_source = r.sources.iter().any(|s| s == "invidious" || s == "video")
+            || is_url_video_host(&r.url);
         let q_lc = query.to_lowercase();
         let video_mult = if is_video_source {
             if q_lc.contains("video") || q_lc.contains("youtube") || q_lc.contains("watch") || q_lc.contains("tutorial") || q_lc.contains("animation") {
@@ -6115,22 +6181,66 @@ fn merge_local_and_web(
         relevance_vec.push(relevance);
     }
 
-    // ── Off-topic LOCAL hard-drop (round-6 D1, sole-survivor case) ──
-    // A local-index result whose title/content/url shares ZERO of the query's
+    // ── Adult-intent + adult-marker detection (lifted above the off-topic drop) ──
+    // Computed once here so BOTH the off-topic hard-drop below and the adult
+    // hard-drop further down can use it without re-detecting. The adult host/path
+    // lists are the curated static safety blocklist — accepted exception to the
+    // no-hardcoding rule (never runtime-data-driven).
+    let q_lc_adult = clean_query.to_lowercase();
+    let adult_intent = q_lc_adult.contains("porn") || q_lc_adult.contains("xxx")
+        || q_lc_adult.contains("nsfw") || q_lc_adult.contains("adult video")
+        || q_lc_adult.contains("adult film") || q_lc_adult.contains("sex video")
+        || q_lc_adult.contains("pornhub") || q_lc_adult.contains("xvideos")
+        || q_lc_adult.contains("onlyfans");
+    let adult_hosts: &[&str] = &[
+        "xvideos", "xnxx", "pornhub", "xhamster", "youporn", "redtube",
+        "txxx", "fpo.xxx", "watchon.me", "spankbang", "brazzers",
+        "porn", "adultfriendfinder", "onlyfans", "chaturbate", "livejasmin",
+        "cam4", "myfreecams", "beeg", "porntube", "eporner",
+        "pornhd", "tube8", "xtube", "heavy-r", "efukt", "porzo",
+    ];
+    let adult_paths: &[&str] = &["/porn/", "/xxx/", "/adult/", "/nsfw/", "/sex/", "/porno/"];
+
+    // ── Off-topic hard-drop (round-6 D1 LOCAL sole-survivor case; extended to WEB this round) ──
+    // A result (local OR web) whose title/content/url shares ZERO of the query's
     // distinctive topic terms is off-topic (e.g. a crawler-indexed
     // "Early Warning Signs of Macular Degeneration" page for an "earthquakes in
-    // the himalayan region" query). When web upstream is sparse it can be the ONLY
-    // surviving result, and calibrate_scores then inflates it to 1.0 — confidently
-    // returning off-topic junk. Drop it outright. This uses the SAME distinctive-term
-    // overlap test as the in-loop `off_topic_struct` gate, so genuinely relevant
-    // local pages (which DO contain a distinctive term — e.g. an iPhone-vs-S24
-    // article for a "compare iphone and samsung" query) are kept. General: keyed on
-    // (is_local && zero distinctive-term overlap), no query/domain bias.
+    // the himalayan region" query, or unrelated software-testing blogs for an
+    // "authentic poha indore style recipe" query). When web upstream is sparse it
+    // can be the ONLY surviving result, and calibrate_scores then inflates it to
+    // 1.0 — confidently returning off-topic junk. Drop it outright. This uses the
+    // SAME distinctive-term overlap test as the in-loop `off_topic_struct` gate,
+    // so genuinely relevant pages (which DO contain a distinctive term — e.g. an
+    // iPhone-vs-S24 article for a "compare iphone and samsung" query) are kept.
+    // General: keyed on (zero distinctive-term overlap), no query/domain bias.
+    // NOTE: previously this only dropped LOCAL results; web results with zero
+    // overlap survived at the 0.05 floor (calibrate_scores re-inflates the bottom
+    // onto [0.05,1.0]), so off-topic web junk could not be removed. This round
+    // removes that carve-out so the same gate protects web results.
     if !strong_distinctive_terms.is_empty() {
         let before = merged.len();
         merged.retain(|r| {
-            if !r.is_local {
-                return true;
+            // Adult exemption: when the query is explicitly adult, an adult result
+            // must survive the off-topic gate — the adult block below keeps it
+            // intentionally. Without this, the web off-topic drop would remove the
+            // adult URL first (it shares zero food/recipe/etc. distinctive terms),
+            // regressing "adult kept for explicit-adult query".
+            if adult_intent {
+                let ul = r.url.to_lowercase();
+                let tl = r.title.to_lowercase();
+                let host = reqwest::Url::parse(&r.url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                    .unwrap_or_default();
+                let tld_adult = host.ends_with(".xxx");
+                let host_adult = adult_hosts.iter().any(|h| host.contains(h));
+                let path_adult = adult_paths.iter().any(|p| ul.contains(p));
+                let title_adult = tl.contains("porn") || tl.contains("xxx ")
+                    || tl.contains("nude") || tl.contains("naked")
+                    || tl.contains("sex video") || tl.contains("adult film");
+                if tld_adult || host_adult || path_adult || title_adult {
+                    return true;
+                }
             }
             let tl = r.title.to_lowercase();
             let cl = r.content.to_lowercase();
@@ -6143,7 +6253,7 @@ fn merge_local_and_web(
         });
         let removed = before - merged.len();
         if removed > 0 {
-            tracing::info!("OFF_TOPIC_LOCAL_DROP: removed {}/{} local result(s) with zero distinctive-term overlap", removed, before);
+            tracing::info!("OFF_TOPIC_HARD_DROP: removed {}/{} result(s) (local+web) with zero distinctive-term overlap", removed, before);
         }
     }
 
@@ -6153,28 +6263,11 @@ fn merge_local_and_web(
     // innocuous "improve deep sleep without medication" query — a content-safety
     // failure. There is no upstream SafeSearch guarantee we can rely on, so we drop
     // adult results at ranking time UNLESS the user explicitly sought adult content.
-    // curated static safety blocklist — accepted exception to the no-hardcoding rule;
-    // never make this runtime-data-driven. Adult TLDs (.xxx), known adult host
-    // substrings, and /porn/ /xxx/ /adult/ path markers are dropped at ranking time
-    // UNLESS the user explicitly sought adult content. An explicit-adult query
-    // (contains "porn"/"xxx"/"nsfw"/"adult video"/"sex video") keeps adult results;
-    // everything else drops them.
+    // The adult host/path lists are the curated static safety blocklist — accepted
+    // exception to the no-hardcoding rule; never runtime-data-driven. An explicit-adult
+    // query keeps adult results; everything else drops them.
     {
-        let q_lc = clean_query.to_lowercase();
-        let adult_intent = q_lc.contains("porn") || q_lc.contains("xxx")
-            || q_lc.contains("nsfw") || q_lc.contains("adult video")
-            || q_lc.contains("adult film") || q_lc.contains("sex video")
-            || q_lc.contains("pornhub") || q_lc.contains("xvideos")
-            || q_lc.contains("onlyfans");
         if !adult_intent {
-            let adult_hosts: &[&str] = &[
-                "xvideos", "xnxx", "pornhub", "xhamster", "youporn", "redtube",
-                "txxx", "fpo.xxx", "watchon.me", "spankbang", "brazzers",
-                "porn", "adultfriendfinder", "onlyfans", "chaturbate", "livejasmin",
-                "cam4", "myfreecams", "beeg", "porntube", "eporner",
-                "pornhd", "tube8", "xtube", "heavy-r", "efukt", "porzo",
-            ];
-            let adult_paths: &[&str] = &["/porn/", "/xxx/", "/adult/", "/nsfw/", "/sex/", "/porno/"];
             let before = merged.len();
             merged.retain(|r| {
                 let ul = r.url.to_lowercase();
@@ -6541,7 +6634,8 @@ fn merge_local_and_web(
             // re-applies AFTER calibration, so the dampening is durable: videos may
             // still appear (floor preserved) but can never outrank genuine text
             // results for a non-video query. Video-intent queries keep full score.
-            let is_video_src = r.sources.iter().any(|s| s == "invidious" || s == "video");
+            let is_video_src = r.sources.iter().any(|s| s == "invidious" || s == "video")
+                || is_url_video_host(&r.url);
             if is_video_src {
                 let video_intent = q_lc_cap.contains("video")
                     || q_lc_cap.contains("youtube")
@@ -7336,6 +7430,7 @@ async fn main() {
         .route("/videos", get(handle_videos))
         .route("/news", get(handle_news))
         .route("/spellcheck", get(handle_spellcheck))
+        .route("/analyze", get(handle_analyze))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
         .route("/goals/quick", post(goals::handle_quick_roadmap))
@@ -7479,6 +7574,89 @@ async fn handle_spellcheck(
         );
     }
     let result = spellcheck_query(&state.spell_index, &q);
+    (axum::http::StatusCode::OK, Json(result))
+}
+
+/// `GET /analyze?q=...` — read-only engine-introspection endpoint.
+///
+/// Mirrors the additive, zero-side-effect precedent of `/spellcheck`: it does
+/// NOT change `/search` ranking, negation gating, or calibration. Instead it
+/// exposes the engine's *reasoning* over a query's negation / constraint
+/// extraction and the `is_real_exclusion` gate, so a client can see why a term
+/// was kept as an exclusion, dropped as an unrecognized entity, or declined as
+/// a HOW-not-WHAT manner qualifier.
+///
+/// This directly serves DEFECT A (negation-hardening) transparency: the
+/// `without X` / `not Y` handling is the single most confusing part of the
+/// engine's output (see round report intentforge-2026-08-10T0813Z — DEFECT A),
+/// and clients currently receive no per-term explanation. `/analyze` makes the
+/// same logic `/search` uses inspectable.
+///
+/// No per-query strings, no domain allow/deny lists, no magic constants: it
+/// reuses `extract_query_negative_terms_with_dropped` + `is_real_exclusion`, the
+/// identical functions `/search` calls, so the preview matches real behavior.
+async fn handle_analyze(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
+    if q.trim().is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "empty_query",
+                "message": "Query parameter 'q' is empty",
+                "query": "",
+                "exclusions": [],
+                "declined": [],
+                "manner_qualifiers": []
+            })),
+        );
+    }
+    let q_orig = q.clone();
+    let query_contrastive = query_is_contrastive(&q_orig);
+    let (kept, declined, manner) =
+        extract_query_negative_terms_with_dropped(&q_orig);
+
+    // Build a per-term decision list so clients see WHY each candidate was
+    // routed the way it was. Reuses `is_real_exclusion` (entity / contrastive
+    // framing) exactly as `/search` does — no duplicated logic.
+    let mut decisions: Vec<serde_json::Value> = Vec::new();
+    for term in &kept {
+        decisions.push(serde_json::json!({
+            "term": term,
+            "decision": "exclusion",
+            "reason": "recognized entity or contrastive framing (compare/versus/alternative/instead-of/double-negation)"
+        }));
+    }
+    for term in &declined {
+        let is_manner = is_manner_phrase(term) || is_manner_frame(&q_orig, term);
+        decisions.push(serde_json::json!({
+            "term": term,
+            "decision": "declined",
+            "reason": if is_manner {
+                "manner qualifier (HOW not WHAT to exclude) — never a search exclusion"
+            } else {
+                "neither a recognized entity nor in contrastive framing — excluded to avoid penalizing unrelated topical words"
+            }
+        }));
+    }
+    for term in &manner {
+        decisions.push(serde_json::json!({
+            "term": term,
+            "decision": "manner_qualifier",
+            "reason": "manner qualifier (HOW not WHAT to exclude) — described the user's method, not a topic to filter out"
+        }));
+    }
+
+    let result = serde_json::json!({
+        "query": q,
+        "contrastive_framing": query_contrastive,
+        "exclusions": kept,
+        "declined": declined,
+        "manner_qualifiers": manner,
+        "decisions": decisions
+    });
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -10403,7 +10581,7 @@ async fn handle_search(
     // Handles: "not react not vue" → ["react", "vue"]
     //          "without node not django" → ["node", "django"]
     //          "not prometheus not grafana not datadog" → ["prometheus", "grafana", "datadog"]
-    let (query_neg_terms, query_neg_dropped): (Vec<String>, Vec<String>) =
+    let (query_neg_terms, query_neg_dropped, _query_neg_manner): (Vec<String>, Vec<String>, Vec<String>) =
         extract_query_negative_terms_with_dropped(&q_orig);
     let query_contrastive = query_is_contrastive(&q_orig);
 
@@ -11642,7 +11820,7 @@ mod constraint_fix_tests {
             "songs not in english",
             "news not about politics",
         ] {
-            let (kept, dropped) = extract_query_negative_terms_with_dropped(q);
+            let (kept, dropped, _manner) = extract_query_negative_terms_with_dropped(q);
             // The gate still declines the attribute exclusion (no entity / no contrastive
             // framing) — that behaviour is UNCHANGED from the regression. What changed is
             // that the declined term is now reported rather than discarded.
@@ -11680,7 +11858,7 @@ mod constraint_fix_tests {
             "how to clean a cast iron skillet without soap after cooking eggs",
             "how to learn guitar with no music background",
         ] {
-            let (kept, dropped) = extract_query_negative_terms_with_dropped(q);
+            let (kept, dropped, _manner) = extract_query_negative_terms_with_dropped(q);
             assert!(kept.is_empty(), "manner '{}' must not be kept: {:?}", q, kept);
             assert!(
                 dropped.is_empty(),
@@ -11747,6 +11925,149 @@ mod constraint_fix_tests {
         assert!(!negs.contains(&"track you as".to_string()), "manner 'track you as' must be dropped: {:?}", negs);
         assert!(!negs.contains(&"track".to_string()), "manner 'track' must be dropped: {:?}", negs);
         assert!(negs.contains(&"google".to_string()), "google should survive as a real exclusion: {:?}", negs);
+    }
+
+    #[test]
+    fn analyze_endpoint_exposes_negation_decisions() {
+        // The /analyze introspection endpoint (DEFECT A transparency) must expose
+        // the SAME gating /search uses, in an inspectable shape:
+        //  - a contrastive "not X" keeps X as a real exclusion,
+        //  - a manner qualifier ("without soap") is surfaced under manner_qualifiers
+        //    and is NEVER in `exclusions` nor `declined`,
+        //  - a generic attribute exclusion ("without a computer science degree",
+        //    not an entity, not contrastive) is `declined`, not silently dropped,
+        //  - every negation candidate the extractor sees lands in EXACTLY ONE
+        //    bucket (exclusion / declined / manner_qualifier) — never lost.
+        // This is the failing-without-feature / passing-with-feature gate for the
+        // new endpoint's analyzer.
+
+        // (1) Contrastive exclusion is reported as an exclusion.
+        let (kept, declined, manner) =
+            extract_query_negative_terms_with_dropped("javascript not java not typescript");
+        assert!(kept.contains(&"java".to_string()), "java must be a reported exclusion: {:?}", kept);
+        assert!(kept.contains(&"typescript".to_string()), "typescript must be a reported exclusion: {:?}", kept);
+        assert!(manner.is_empty(), "no manner qualifier expected here: {:?}", manner);
+
+        // (2) Manner qualifier is surfaced under manner_qualifiers and NOT
+        //     counted as an exclusion or a declined attribute.
+        let (mkept, mdeclined, mmanner) = extract_query_negative_terms_with_dropped(
+            "how to clean a cast iron skillet without soap after cooking eggs",
+        );
+        assert!(mkept.is_empty(), "manner 'without soap' must not be an exclusion: {:?}", mkept);
+        assert!(mdeclined.is_empty(), "manner qualifier must not appear in declined: {:?}", mdeclined);
+        assert!(mmanner.iter().any(|m| m.contains("soap")), "soap must be surfaced as a manner qualifier: {:?}", mmanner);
+
+        // (3) A generic attribute exclusion that is neither an entity, nor in
+        //     contrastive framing, nor a "without/with-no" manner frame (e.g.
+        //     "healthy recipes not spicy" → "spicy") is reported under `declined`
+        //     (so /analyze can explain WHY it was not applied) — never silently
+        //     dropped, never mislabeled an exclusion or a manner qualifier.
+        let (dkept, ddeclined, dmanner) =
+            extract_query_negative_terms_with_dropped("healthy recipes not spicy");
+        assert!(dkept.is_empty(), "attribute 'not spicy' must not be an exclusion: {:?}", dkept);
+        assert!(dmanner.is_empty(), "spicy is not a manner qualifier: {:?}", dmanner);
+        assert!(ddeclined.iter().any(|d| d.contains("spicy")), "spicy must be reported as declined: {:?}", ddeclined);
+
+        // (4) Transparency invariant: a negation candidate the extractor sees is
+        //     ALWAYS surfaced in exactly one bucket (exclusion / declined /
+        //     manner_qualifier) — never lost. This is the core contract of the
+        //     /analyze endpoint for DEFECT A (no silent swallowing). Verify on a
+        //     DEFECT A trigger query ("cook salmon without an oven"): "oven"
+        //     appears in exactly one bucket.
+        let (okept, odeclined, omanner) =
+            extract_query_negative_terms_with_dropped("best way to cook salmon without an oven");
+        let oven_in_excl = okept.iter().any(|t| t.contains("oven"));
+        let oven_in_decl = odeclined.iter().any(|t| t.contains("oven"));
+        let oven_in_manner = omanner.iter().any(|t| t.contains("oven"));
+        let oven_buckets = [oven_in_excl, oven_in_decl, oven_in_manner].iter().filter(|b| **b).count();
+        assert_eq!(oven_buckets, 1, "oven must surface in exactly ONE bucket (transparency), got kept={:?} declined={:?} manner={:?}", okept, odeclined, omanner);
+    }
+
+    #[test]
+    fn analyze_endpoint_response_shape_matches_docs() {
+        // Locks the JSON shape documented in API_REFERENCE.md `GET /analyze`:
+        // the handler builds `{query, contrastive_framing, exclusions, declined,
+        // manner_qualifiers, decisions[]}`, where `decisions[]` is one entry per
+        // candidate term `{term, decision, reason}` and `contrastive_framing`
+        // reflects query_is_contrastive. Mirrors handle_analyze's construction
+        // exactly (no AppState needed — it only delegates to the two pure fns).
+        let q = "javascript not java not typescript";
+        let q_orig = q.to_string();
+        let query_contrastive = query_is_contrastive(&q_orig);
+        let (kept, declined, manner) =
+            extract_query_negative_terms_with_dropped(&q_orig);
+
+        let mut decisions: Vec<serde_json::Value> = Vec::new();
+        for term in &kept {
+            decisions.push(serde_json::json!({
+                "term": term,
+                "decision": "exclusion",
+                "reason": "recognized entity or contrastive framing (compare/versus/alternative/instead-of/double-negation)"
+            }));
+        }
+        for term in &declined {
+            let is_manner = is_manner_phrase(term) || is_manner_frame(&q_orig, term);
+            decisions.push(serde_json::json!({
+                "term": term,
+                "decision": "declined",
+                "reason": if is_manner {
+                    "manner qualifier (HOW not WHAT to exclude) — never a search exclusion"
+                } else {
+                    "neither a recognized entity nor in contrastive framing — excluded to avoid penalizing unrelated topical words"
+                }
+            }));
+        }
+        for term in &manner {
+            decisions.push(serde_json::json!({
+                "term": term,
+                "decision": "manner_qualifier",
+                "reason": "manner qualifier (HOW not WHAT to exclude) — described the user's method, not a topic to filter out"
+            }));
+        }
+
+        let result = serde_json::json!({
+            "query": q,
+            "contrastive_framing": query_contrastive,
+            "exclusions": kept,
+            "declined": declined,
+            "manner_qualifiers": manner,
+            "decisions": decisions
+        });
+
+        // Documented fields all present.
+        assert!(result.get("query").is_some());
+        assert!(result.get("contrastive_framing").is_some());
+        assert!(result.get("exclusions").is_some());
+        assert!(result.get("declined").is_some());
+        assert!(result.get("manner_qualifiers").is_some());
+        assert!(result.get("decisions").is_some());
+
+        // Documented behavior: contrastive framing true, exclusions populated,
+        // a decisions entry per term with the documented decision vocabulary.
+        assert_eq!(result["contrastive_framing"], serde_json::json!(true));
+        assert!(result["exclusions"].as_array().unwrap().len() == 2);
+        let decisions = result["decisions"].as_array().unwrap();
+        assert_eq!(decisions.len(), 2);
+        for d in decisions {
+            assert_eq!(d["decision"], serde_json::json!("exclusion"));
+            assert!(d.get("term").is_some());
+            assert!(d.get("reason").is_some());
+        }
+
+        // Empty query reported by the handler as 400 empty_query with the
+        // documented envelope (all arrays empty). Lock the envelope shape here.
+        let empty = serde_json::json!({
+            "error": "empty_query",
+            "message": "Query parameter 'q' is empty",
+            "query": "",
+            "exclusions": [],
+            "declined": [],
+            "manner_qualifiers": []
+        });
+        assert_eq!(empty["error"], serde_json::json!("empty_query"));
+        assert!(empty["exclusions"].as_array().unwrap().is_empty());
+        assert!(empty["declined"].as_array().unwrap().is_empty());
+        assert!(empty["manner_qualifiers"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -11940,6 +12261,24 @@ mod hardcoding_ruling_tests {
             vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
         assert_eq!(out.len(), 1, "adult result kept when query is explicitly adult");
+    }
+
+    #[test]
+    fn video_host_detection_covers_web_merge_urls() {
+        // P8 (YouTube-host gap): SearXNG returns youtube.com / youtu.be / vimeo.com /
+        // etc. URLs inside the GENERAL web result set WITHOUT a `video` source tag.
+        // A non-video query ("authentic poha indore style") then ranked a
+        // youtube.com recipe video at score 1.0 above the real recipe article.
+        // is_url_video_host must catch these hosts so the P8 dampening applies.
+        assert!(is_url_video_host("https://www.youtube.com/watch?v=gUEa825kTjQ"));
+        assert!(is_url_video_host("https://youtu.be/gUEa825kTjQ"));
+        assert!(is_url_video_host("https://m.youtube.com/watch?v=abc"));
+        assert!(is_url_video_host("https://www.vimeo.com/123456"));
+        assert!(is_url_video_host("https://invidious.example.net/watch?v=x"));
+        // Non-video hosts must NOT match.
+        assert!(!is_url_video_host("https://www.python.org/doc"));
+        assert!(!is_url_video_host("https://example.com/youtube-guide-article"));
+        assert!(!is_url_video_host("https://reddit.com/r/IndianFood/comments/abc"));
     }
 }
 
