@@ -11958,11 +11958,44 @@ async fn handle_search(
             "temperature in", "humidity in",
         ];
         let has_weather_prediction = weather_prediction_signals.iter().any(|s| q_lower.contains(*s));
+        // WEATHER-AS-SUBJECT (2026-08-21 fix for P11-class false trigger): a bare
+        // "weather" word anywhere must NOT force fresh — queries like "daily
+        // skincare routine for oily skin in humid weather" mention weather only as
+        // a modifier of a non-weather topic and must stay informational (evergreen
+        // advice, not news). Weather is the genuine subject only when it leads the
+        // query or appears in a subject-phrase ("weather in X", "X weather",
+        // "weather today/forecast/report/update", "this week's weather"). Structural
+        // phrases, no city/region literals. This closes the residue of P11 (substring
+        // intent triggers) without re-narrowing to only prediction signals.
+        // A bare "<word> weather" / "weather" as the FINAL token only counts as the
+        // subject when the WHOLE query is short (e.g. "delhi weather", "london
+        // forecast" — 2-4 tokens about weather). A modifier inside a long non-weather
+        // query like "...oily skin in humid weather" (13 tokens) is NOT the topic and
+        // must not force fresh.
+        let weather_is_subject = q_lower.starts_with("weather")
+            || q_lower.starts_with("forecast")
+            || q_lower.contains("weather in ")
+            || q_lower.contains("weather for ")
+            || q_lower.contains("weather today")
+            || q_lower.contains("weather tomorrow")
+            || q_lower.contains("weather report")
+            || q_lower.contains("weather update")
+            || q_lower.contains("current weather")
+            || q_lower.contains("live weather")
+            || q_lower.contains("this week's weather")
+            || q_lower.contains("weather near")
+            || {
+                let n_tok = q_lower.split_whitespace().count();
+                n_tok <= 4 && {
+                    let last = q_lower.split_whitespace().last().unwrap_or("");
+                    last == "weather" || last == "forecast"
+                }
+            };
         let is_howto_query = q_lower.starts_with("how to") || q_lower.starts_with("how do")
             || q_lower.starts_with("how can") || q_lower.contains("how to")
             || q_lower.contains("fix ") || q_lower.contains("repair") || q_lower.contains("won't start")
             || q_lower.contains("wont start") || q_lower.contains("leaking") || q_lower.contains("not cooling");
-        if has_weather_signal && (has_weather_prediction || q_has_word(&q_lower, "weather") || q_has_word(&q_lower, "forecast"))
+        if has_weather_signal && (has_weather_prediction || weather_is_subject)
             && !is_howto_query
             && intent.intent != "fresh" && intent.intent != "local"
         {
