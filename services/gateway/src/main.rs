@@ -9145,8 +9145,6 @@ async fn handle_news(
     (axum::http::StatusCode::OK, Json(response))
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-
 /// Generic stopwords shared by the recall-gap / distinctive-term extractors.
 /// A general, fixed set (no query/domain-specific entries) so the gap signal
 /// never keys on a particular phrase. Mirrors the broad stopword philosophy
@@ -9249,7 +9247,7 @@ fn compute_recall_gap_terms(
     }
 }
 
-
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     tracing_subscriber::fmt::init();
 
