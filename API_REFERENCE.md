@@ -391,7 +391,7 @@ Spelling-correction preview. Exposes the engine's in-process SymSpell + LinSpell
 }
 ```
 
-> **Verified (this round, 2026-08-09):** a typo string returns `changed: true` with a `correction` per changed token. Protected brands/tech terms (`openai`, `rust`, `kubernetes`, …) are never "corrected" — `"openai rust tutorial"` returns `changed: false` and an empty `corrections` array. URL tokens, code tokens (`.` `/` `@` `#` `$` or containing a digit), and very short words (< 4 chars) are skipped by the corrector and **omitted entirely from the `corrections` array** — the endpoint only lists tokens it actually proposed fixing, so the client never flags skipped tokens as typos. They are still preserved verbatim in the whole-query `corrected` string. The `corrected` string matches what `/search` runs for the same query (verified 2026-08-09: `/spellcheck?q=pythn+programing+langauge` → `corrected: "python programming language"`, and `/search?q=pythn+programing+langauge` returns `"query":"python programming language"`). Example: `/spellcheck?q=pythn+kubernetes.io` returns `changed:true` with `corrections` containing **only** `pythn→python` (the `kubernetes.io` URL token is skipped and absent from `corrections`, but retained in `corrected`).
+> **Verified (this round, 2026-08-09):** a typo string returns `changed: true` with a `correction` per changed token. Protected brands/tech terms (`openai`, `rust`, `kubernetes`, …) are never "corrected" — `"openai rust tutorial"` returns `changed: false` and an empty `corrections` array. URL tokens, code tokens (`.` `/` `@` `#` `$` or containing a digit), and very short words (< 4 characters, counted by Unicode character count not UTF-8 byte length) are skipped by the corrector and **omitted entirely from the `corrections` array** — the endpoint only lists tokens it actually proposed fixing, so the client never flags skipped tokens as typos. They are still preserved verbatim in the whole-query `corrected` string. The `corrected` string matches what `/search` runs for the same query (verified 2026-08-09: `/spellcheck?q=pythn+programing+langauge` → `corrected: "python programming language"`, and `/search?q=pythn+programing+langauge` returns `"query":"python programming language"`). Example: `/spellcheck?q=pythn+kubernetes.io` returns `changed:true` with `corrections` containing **only** `pythn→python` (the `kubernetes.io` URL token is skipped and absent from `corrections`, but retained in `corrected`).
 
 **Empty query** returns `400` with the standard error envelope (same shape as `/search`):
 
@@ -447,7 +447,7 @@ This is the read-only companion to `/spellcheck`: it does **not** change `/searc
 
 > **Verified (this round, 2026-08-10):** all examples below were executed against the live dev stack at `localhost:4000` (gateway rebuilt at commit `c31cea0`). Contrastive `not X` → `exclusions` with `contrastive_framing: true` (e.g. `javascript not java not typescript` → `["java","typescript"]`). A manner phrase `without soap` → `manner_qualifiers` with empty `exclusions`/`declined` (`how to clean a cast iron skillet without soap after cooking eggs` → `["soap"]`). A generic `not spicy` with no contrastive framing → `declined` (`best spicy ramen not spicy` → `["spicy"]`). The DEFECT A trigger `best way to cook salmon without an oven` → `manner_qualifiers: ["oven"]` — the root cause is now *visible* instead of silent. The transparency invariant holds: every negation candidate appears in exactly one bucket.
 
-**Empty query** returns `400` with the standard error envelope (same shape as `/search` and `/spellcheck`):
+**Empty query** returns `400` with an error envelope containing the negation-specific fields:
 
 ```json
 { "error": "empty_query", "message": "Query parameter 'q' is empty", "query": "", "exclusions": [], "declined": [], "manner_qualifiers": [] }
@@ -477,7 +477,7 @@ Unified pre-search introspection. Generalizes the `/analyze` (negation) and
 zero-side-effect payload that mirrors the *entire* `/search` reasoning pipeline
 a client can inspect **before** issuing a search:
 
-1. **spelling** — same `spellcheck_query` fn `/search` pre-corrects with.
+1. **spelling** — uses `spell::correct_query` (the same underlying correction function `/search` uses) and wraps it in `spellcheck_query` to produce the detailed response shape with per-token `corrections[]`.
 2. **negation** — the `exclusions` / `declined` / `manner_qualifiers` split + per-term `decisions[]` (identical to `/analyze`).
 3. **intent** — the pure no-network fallback classifier (`fallback_intent`) + coarse `category`.
 4. **constraints** — the gateway's own operator parser (`extract_gateway_constraints`) + the `applied_constraints` shape `/search` reports.
@@ -523,7 +523,7 @@ constants.
 
 > **Verified (this round, 2026-08-10T1401Z):** every claim below was executed
 > against the live dev stack at `localhost:4000` (gateway rebuilt at the round's
-> feature commit `ca4362c`/`ea11acd`). All 6 cases returned `200` unless noted. The
+> feature commit `ca4362c`/`ea11acd`). All 7 cases returned `200` unless noted. The
 > endpoint reuses the same pure functions `/search` runs (no network, deterministic).
 >
 > | Query | What was observed |
