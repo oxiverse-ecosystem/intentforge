@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [master, main, 'auto/round-**']
 
+# A new push to the same ref cancels the previous, still-running run. Under the
+# autonomous QA loop this repo is pushed to many times per day; cancelling
+# superseded runs avoids burning Actions compute + network egress on stale work.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -19,6 +26,13 @@ jobs:
     # the pure ranking/cleaning/spell-correction logic that actually regresses.
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Defense-in-depth: never pull Git-LFS objects in CI. This repo has no
+          # LFS-tracked files today, but if a future commit re-tracks one, a deep
+          # checkout would silently re-serve it and burn the LFS bandwidth quota.
+          # A shallow clone also cuts per-run checkout egress + wall-clock.
+          lfs: false
+          fetch-depth: 1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -42,43 +56,8 @@ jobs:
         working-directory: services/gateway
         run: cargo test --locked
 
-  schema-regression:
-    name: API schema regression (live gateway contract)
-    runs-on: ubuntu-latest
-    # This job asserts the documented JSON contracts for EVERY endpoint in
-    # API_REFERENCE.md (incl. the Goals API). It needs a RUNNING gateway.
-    #
-    # IMPORTANT: a bare runner has no IntentForge stack, so the suite is designed
-    # to SKIP cleanly there (no green-washing of a real failure). To make it a
-    # real guard, bring the stack up (docker compose) and set
-    # INTENTFORGE_REQUIRE_GATEWAY=1 so an unreachable/contract-drifted gateway
-    # FAILS the run. The QA loop already does this locally/where the stack runs.
-    #
-    # Example (when the stack is brought up in this job):
-    #   - name: Bring up IntentForge stack
-    #     run: (cd services && docker compose -f docker-compose.dev.yml up -d gateway indexer ...)
-    #   - name: Wait for gateway health
-    #     run: for i in $(seq 1 30); do curl -sf localhost:4000/health && break; sleep 5; done
-    #   - name: Run schema regression (must fail if gateway missing)
-    #     env:
-    #       INTENTFORGE_BASE: http://localhost:4000
-    #       INTENTFORGE_REQUIRE_GATEWAY: "1"
-    #     run: pytest tests/goals_api_schema.py -v
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install pytest
-        run: pip install -r tests/requirements.txt
-
-      - name: Run API schema regression
-        env:
-          # Default: skip cleanly if no gateway (bare runner). The QA loop and
-          # any job that brings the stack up should set this to "1".
-          INTENTFORGE_REQUIRE_GATEWAY: "0"
-          INTENTFORGE_BASE: http://localhost:4000
-        run: pytest tests/goals_api_schema.py -v
+  # NOTE: API schema regression (live-gateway contract) is owned by
+  # .github/workflows/goals-api-schema.yml, which runs the SAME suites
+  # (tests/goals_api_schema.py + tests/test_api_schema.py) and is driven by the
+  # QA loop. Running it again here would be duplicate compute + egress on every
+  # push, so it is intentionally not duplicated in this file.
