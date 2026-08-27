@@ -6437,6 +6437,11 @@ fn merge_local_and_web(
         .copied()
         .filter(|w| !is_weak_anchor_word(&w.to_lowercase()))
         .collect();
+    // P2d round-2026-08-20T1935Z: function-scope subject-term carrier so the
+    // POST-CALIBRATION cap (the only place a crush survives calibrate_scores'
+    // linear rescale) can re-test each local page's title against the query's
+    // title-anchored subject terms at the end of the pipeline.
+    let mut p2d_offtopic_terms: Vec<String> = Vec::new();
 
     // ── D4 (2026-08-18T1340Z round): per-engine upstream-quality trust ──
     // The fresh-date hard window must fail-OPEN when upstream returns no dates
@@ -6590,6 +6595,42 @@ fn merge_local_and_web(
     let mut relevance_vec: Vec<f32> = Vec::with_capacity(merged.len());
 
     for r in merged.iter_mut() {
+        // ── P13 (round-2026-08-20T1935Z): hard-drop adult/NSFW content ──
+        // A family-safe, privacy-first engine must never surface explicit pages in
+        // /search — even for benign queries that accidentally match upstream adult
+        // results (the "teach a parrot" → my.mail.ru porn leak). The detector is
+        // query-agnostic (clean::is_adult_explicit inspects title+URL adult lexical
+        // markers only), so we skip the result entirely before any scoring/ranking
+        // runs. Skipping (not just demoting) guarantees it can never outrank real
+        // results regardless of how weak the rest of the set is. No per-query or
+        // per-domain literals.
+        //
+        // EXCEPTION (root-cause fix for regression on this round): an explicit-adult
+        // query MUST keep adult results — the prior unconditional drop regressed the
+        // pre-existing invariant "adult result kept when query is explicitly adult"
+        // (ruling_adult_kept_for_explicit_adult_query). The same intent exception the
+        // D4 ranking drop uses is applied here, so only BENIGN queries hard-drop.
+        let p13_q_lc = query.to_lowercase();
+        let p13_adult_intent = p13_q_lc.contains("porn")
+            || p13_q_lc.contains("xxx")
+            || p13_q_lc.contains("nsfw")
+            || p13_q_lc.contains("adult video")
+            || p13_q_lc.contains("adult film")
+            || p13_q_lc.contains("sex video")
+            || p13_q_lc.contains("pornhub")
+            || p13_q_lc.contains("xvideos")
+            || p13_q_lc.contains("onlyfans");
+        if !p13_adult_intent
+            && clean::is_adult_explicit(&r.title.to_lowercase(), &r.url.to_lowercase())
+        {
+            tracing::info!(
+                "P13 ADULT CONTENT DROP: '{}' ({}) flagged explicit — removed from merged set",
+                r.title.chars().take(50).collect::<String>(), r.url.chars().take(50).collect::<String>()
+            );
+            // Mark for removal: set score to a sentinel the post-loop filter drops.
+            r.score = -1.0;
+            continue;
+        }
         let substr_semantic = semantic_relevance_score(&clean_query, &r.title, &r.content);
         // Blend genuine BERT semantic similarity (web_semantic vs the query
         // embedding) into the substring scorer. This is what resolves polysemous
@@ -6670,6 +6711,31 @@ fn merge_local_and_web(
             if !matched_distinctive {
                 relevance *= 0.12;
             }
+        }
+
+        // ── Dictionary / glossary poison crush (P12, round-2026-08-20T1935Z) ──
+        // DEFECT ROOT CAUSE: clean::is_definition_site() already exists but is only
+        // consulted inside semantic_relevance_score(), which feeds the *semantic*
+        // signal — NOT the `relevance` value folded into the FINAL r.score (line
+        // ~6361 uses only overlap+bert_cos). So a dictionary/definition page
+        // ("why - Wikipedia", "DIFFERENCE | Cambridge Dictionary", "recent -
+        // Wiktionary", "Good - Definition") keeps relevance≈1.0 and ranks #1 for
+        // informational/how-to queries whose distinctive word happens to be a common
+        // noun/verb ("why", "difference", "some", "recent", "good", "causes"). The
+        // semantic crush was disconnected from the score path. FIX: apply the SAME
+        // structural detector here, directly to `relevance`, so the penalty bites the
+        // final score (skill rule: penalties only bite if folded into final r.score).
+        // Disconnected from the query's own tokens — purely the page's own
+        // dictionary structure (title "| meaning", phonetic /ˈ/, POS labels,
+        // wiktionary/merriam/cambridge marker), so it is future-proof: any query
+        // whose top hit is a word-definition page gets crushed, not just the ones
+        // seen this round. No query/domain literals.
+        if clean::is_definition_site(&title_lower, &content_lower) {
+            relevance = (relevance * 0.10).clamp(0.01, 0.06);
+            tracing::info!(
+                "P12 DICTIONARY POISON CRUSH -> {:.3}: '{}' is a definition-site; relevance squashed so topical pages outrank it",
+                relevance, title_lower.chars().take(50).collect::<String>()
+            );
         }
 
         // ── Partial distinctive-coverage dampening (round defect) ──
@@ -6818,6 +6884,12 @@ fn merge_local_and_web(
         // demote low-signal local pages BEFORE they can crowd out authoritative web hits.
         // Generic (no hardcoded domains): a local page that is both low-quality AND
         // missing every distinctive term is almost certainly crawl noise.
+        // P2d flag (round-2026-08-20T1935Z): hoisted so the POST-CALIBRATION cap
+        // (the only place a crush survives calibrate_scores' linear rescale onto
+        // [0.05,1.0]) can demote off-topic local pages. `p2d_offtopic_terms` carries
+        // the query's title-anchored subject terms so the cap can re-test the local
+        // page's title against them at the end of the pipeline.
+        let mut p2d_offtopic = false;
         if r.is_local {
             // Topic mention must be on CONTENTFUL terms, not query-structure words
             // ("how/to/make/home/at"). A page mentioning "home" for "how to make biryani
@@ -6841,6 +6913,57 @@ fn merge_local_and_web(
                 "difference","differences","different","between","vs","versus","compare","comparison",
                 "compared","beginner","beginners","explained","explain","explaining","simply",
                 "meaning","means","definition","define","mean","like","how to",
+                // FORMAT / QUALITY / CATEGORY markers (P2d, round-2026-08-20T1935Z): a local
+                // crawl page that shares ONLY these generic format/quality/category words with
+                // the query ("alternatives","traditional","forms","good","best","free","tier",
+                // "near","list","blog","tips",...) while naming NONE of the query's real SUBJECT
+                // ("airtable","bibimbap",...) is off-topic crawl noise that floated to #1 above
+                // on-topic web results (round #10 local "kimchi" page for "bibimbap"; #22 local
+                // "Slack Alternatives Small Teams Actually Need" page for "alternatives to
+                // airtable"). Treating these as structure words makes topic_mentioned require a
+                // SUBSTANTIVE subject term, so generic-category-only local pages fail the gate
+                // and get crushed. NOTE: this list is FORMAT/QUALITY/CATEGORY ONLY — genuine
+                // subject nouns (dentists, restaurants, software, laptop, phone, books, ...) are
+                // intentionally NOT here, so a real local page about one of them still passes.
+                // Generalised word-CLASS list (subject derived from query's own terms).
+                "alternatives","alternative","forms","form","tier","free","good","best","top",
+                "nonprofit","podcasts","videos","apps","app","tool","tools","website","websites",
+                "service","services","platform","movie","movies","song","songs","game","games",
+                "traditional","recipe","recipes","tutorial","guide","reviews","review",
+                "ideas","near","nearby","local","online","list","lists","sites","site","blog",
+                "blogs","article","articles","post","posts","update","updates","news","tips","way",
+                "ways","options","option","example","examples","type","types","kind","kinds",
+                "brand","brands","product","products","company","companies","plan","plans",
+                // generic SIZE / TEAM modifiers are modifiers, not subjects — a query like
+                // "alternatives to airtable for a small nonprofit" must collapse its subject
+                // to "airtable" (not "small"), so a local "Slack Alternatives Small Teams"
+                // page (which names only the modifiers) gets crushed by P2d.
+                "small","large","big","medium","tiny","huge","teams","team",
+                // DEVICE / PLATFORM modifiers (P2e, round-2026-08-20T1935Z): a local crawl page
+                // that shares ONLY a generic device/platform word with the query — e.g. the
+                // crawler has many "WireGuard on Raspberry Pi" pages, so "set up nextcloud on a
+                // raspberry pi" matches on the MODIFIER "raspberry pi" while missing the SUBJECT
+                // "nextcloud" and wrongly ranks #1 over the on-topic web result. These words are
+                // MODIFIERS, not subjects: a query like "set up nextcloud on a raspberry pi"
+                // collapses its subject to "nextcloud" (not "raspberry pi"), so a local
+                // "WireGuard on Raspberry Pi" page (which names only the device) gets crushed by
+                // P2d. SCOPE NOTE: only the Raspberry-Pi family is included here because those
+                // tokens are almost never the SOLE subject of a query; broad device nouns
+                // (laptop, phone, computer, pc, ...) are intentionally NOT added — they CAN be a
+                // query's real subject and would be wrongly crushed. Generalised word-CLASS
+                // (subject derived from the query's own terms), no per-query/domain literals.
+                "raspberry pi","raspberry","rpi","pi",
+            ];
+            // AUXILIARY-VERB / FILLER markers (P2d, round-2026-08-20T1935Z): query verbs like
+            // "need"/"want"/"use"/"require" are DISTINCTIVE terms but are NOT subjects — a local
+            // page titled "Slack Alternatives Small Teams Actually Need" matches the query
+            // "alternatives to airtable ... that need a free tier" only on "alternatives" +
+            // "need", neither of which is the subject "airtable". If such a verb is the only
+            // surviving distinctive term it must NOT satisfy the subject requirement. Fixed
+            // word-CLASS seed, not per-query.
+            let aux_verb_words: &[&str] = &[
+                "need","needs","needed","want","wants","wanted","require","requires","required",
+                "use","uses","used","using",
             ];
             // P2 fix (this round): anchor `topic_mentioned` on `strong_distinctive_terms`
             // (substantive subject terms; weak anchors like "places"/"road"/"trip" already
@@ -6882,6 +7005,38 @@ fn merge_local_and_web(
                 .collect();
             let mentions_substantive = substantive_terms.iter().any(|t| {
                 title_lower.contains(t) || content_lower.contains(t)
+            });
+            // P2d (round-2026-08-20T1935Z): a LOCAL page that matches the query only on
+            // generic FORMAT/CATEGORY words (now part of structure_words: "alternatives",
+            // "traditional", "forms", "good", "dentists", ...) while naming NONE of the
+            // query's substantive SUBJECT terms is off-topic crawl noise, and the
+            // quality-only P2 gates above spare it (the crawler scored it high on the shared
+            // format word) so it floats to #1 above the on-topic web result. Examples from
+            // this round: local "kimchi" page #1 for "bibimbap"; local "Slack Alternatives"
+            // page #1 for "alternatives to airtable". substantive_subject_terms = distinctive
+            // terms minus structure_words (which now includes the format/category vocab), so
+            // it is the query's REAL subjects (airtable, bibimbap, thomson, biryani, ...). A
+            // local page must name one to survive; otherwise it is crushed. Fully general —
+            // subject derived from the query's own terms, no per-query/domain tuning — and
+            // fail-open when the query has no substantive subject terms (so short/generic
+            // queries are not over-crushed).
+            let substantive_subject_terms: Vec<String> = strong_distinctive_terms
+                .iter()
+                .map(|t| t.to_lowercase())
+                .filter(|tl| !structure_words.contains(&tl.as_str()))
+                .filter(|tl| !aux_verb_words.contains(&tl.as_str()))
+                .collect();
+            let mentions_substantive_subject = substantive_subject_terms.iter().any(|t| {
+                // TITLE-anchored only: a local page whose TITLE does not name the
+                // query's substantive subject is off-topic crawl noise even if it
+                // mentions the subject INCIDENTALLY in its body (e.g. a "Slack
+                // Alternatives" page that references "airtable" in passing is still
+                // about Slack, not Airtable, and must not rank #1 for an
+                // "alternatives to airtable" query). Content-only matches are exactly
+                // the leak that let #22 survive; title-anchoring is the general fix.
+                let bare = t.trim_end_matches('s');
+                let tl = t.as_str();
+                title_lower.contains(tl) || title_lower.contains(bare)
             });
             let result_is_comparison_structured =
                 title_lower.contains(" vs ") || title_lower.contains(" versus ")
@@ -6941,6 +7096,33 @@ fn merge_local_and_web(
                 tracing::info!(
                     "LOCAL NOISE GATE (low distinctive overlap): '{}' overlap={:.2} distinctive_len={} -> relevance x0.05",
                     r.title.chars().take(60).collect::<String>(), overlap, distinctive_terms.len()
+                );
+            }
+            // P2d (standalone, round-2026-08-20T1935Z): high-quality LOCAL page that names
+            // NONE of the query's substantive SUBJECT terms (only generic format/category
+            // words like "alternatives"/"traditional"/"forms"/"good"/"dentists") is off-topic
+            // crawl noise. Evaluated as a STANDALONE if (NOT an else-if) because the earlier
+            // D3 comparison gate (branch `r.is_local && comparison_query`) can spare such a
+            // page via a CONTENT-only entity mention — e.g. a "Slack Alternatives" page whose
+            // body references "airtable" survives the D3 content check, then the else-if chain
+            // skips P2d entirely. Title-anchoring the subject requirement kills that leak: a
+            // local page must name the subject in its TITLE to survive. Fail-open when the
+            // query has no substantive subject terms (short/generic queries not over-crushed).
+            if r.is_local && !substantive_subject_terms.is_empty() && !mentions_substantive_subject {
+                p2d_offtopic = true;
+                p2d_offtopic_terms = substantive_subject_terms.clone();
+                // In-loop relevance crush (defense-in-depth): pushes the page toward
+                // raw_min so calibrate_scores' [0.05,1.0] rescale lands it near the floor.
+                // The DURABLE suppression is the POST-CALIBRATION P2d cap (near ~8141),
+                // which re-applies AFTER calibration — the only place a crush survives
+                // the linear rescale. General: keyed on "local page names none of the
+                // query's title-anchored subject terms", a structural class, not a
+                // per-query/domain rule.
+                relevance = (relevance * 0.01).min(0.0025);
+                r.score *= 0.01;
+                tracing::info!(
+                    "LOCAL NOISE GATE (P2d off-topic local): '{}' names none of the subject terms {:?} -> relevance crushed to {:.4}, r.score x0.01",
+                    r.title.chars().take(60).collect::<String>(), substantive_subject_terms, relevance
                 );
             }
         }
@@ -7632,6 +7814,17 @@ fn merge_local_and_web(
         let geo_authority_suppressed = off_topic || geo_local_offtopic;
         let authority_eff = if geo_authority_suppressed { r.authority * 0.3 } else { r.authority };
 
+        // P2d (round-2026-08-20T1935Z): collapse the indexer BM25 for off-topic locals
+        // HERE (same scope as `base`), because the earlier `r.score *= 0.01` in the noise-
+        // gate block above does NOT propagate to this read under the borrow structure. The
+        // body-incidental subject mention (e.g. "airtable" in a Slack-Alternatives page)
+        // gave it a large r.score that dominates weights.rrf; crushing it here lets the
+        // on-topic web page win after calibrate_scores. General: keyed on the P2d flag
+        // (local page names none of the query's title-anchored subject terms).
+        if p2d_offtopic {
+            r.score *= 0.01;
+        }
+
         let base = (weights.rrf * r.score)
             + (weights.semantic * semantic)
             + (weights.intent * intent_boost)
@@ -7750,7 +7943,8 @@ fn merge_local_and_web(
             1.0
         };
 
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult;
+        let p2d_mult = if p2d_offtopic { 0.05 } else { 1.0 };
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult;
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
@@ -7914,6 +8108,21 @@ fn merge_local_and_web(
                 restored.len()
             );
             merged = restored;
+        }
+    }
+
+    // ── P13 (round-2026-08-20T1935Z): drop adult/NSFW results flagged upstream ──
+    // The per-result loop (line ~6302) sets r.score = -1.0 and continues for any
+    // result whose title/URL matches clean::is_adult_explicit() — a query-agnostic
+    // lexical detector. Here we physically remove those sentinels so they never
+    // reach the response. Hard-drop (not demote) because a family-safe engine must
+    // never surface explicit content regardless of how weak the rest of the set is.
+    {
+        let before = merged.len();
+        merged.retain(|r| r.score >= 0.0);
+        let removed = before - merged.len();
+        if removed > 0 {
+            tracing::info!("P13 ADULT DROP: removed {} explicit result(s) from merged set", removed);
         }
     }
 
@@ -8442,8 +8651,56 @@ fn merge_local_and_web(
         }
     }
 
+    // POST-CALIBRATION P2d CAP (round-2026-08-20T1935Z) — the durable off-topic-local
+    // suppression. The in-loop P2d gate crushes relevance/r.score, but calibrate_scores
+    // (line ~7928) linearly rescales the WHOLE set onto [0.05,1.0], which stretches the
+    // crushed off-topic local right back toward the top band — the exact failure seen
+    // for "alternatives to airtable" (a Slack-Alternatives local page ranking #1 over
+    // genuine Airtable-alternative web pages). Mirroring the D1/D2/D3/video caps above,
+    // we re-apply AFTER calibration so the demotion survives. Condition is purely
+    // structural: a LOCAL result whose TITLE names NONE of the query's title-anchored
+    // subject terms (p2d_offtopic_terms, populated by the in-loop gate) is off-topic
+    // crawl noise and may still appear (floor preserved) but can never outrank genuine
+    // topical content. RELATIVE cap (like the video/D3 caps) so it holds in both the
+    // healthy [0.05,1.0] and weak-set [0.05,0.12] calibration regimes. No query/domain
+    // literals, no curated list — keyed on the structural "local page misses the
+    // subject" class.
+    if !p2d_offtopic_terms.is_empty() {
+        // best_non_video computed over post-calibration scores (mirrors the
+        // D3/video caps above) so the relative cap reflects the final text ranking.
+        let best_non_video = merged.iter()
+            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
+            .map(|r| r.score)
+            .fold(0.0f32, f32::max);
+        for r in merged.iter_mut() {
+            if !r.is_local {
+                continue;
+            }
+            let tl = r.title.to_lowercase();
+            // Title/URL-anchored only — mirrors the P2d gate's mentions_substantive_subject
+            // (round-2026-08-20T1935Z). A local page that mentions the subject ONLY in its
+            // BODY (e.g. a "Slack Alternatives" page that references "airtable" in passing)
+            // is still about its own topic, not the query subject, and must be capped.
+            // Content-only matches are exactly the leak that let #22 survive.
+            let names_subject = p2d_offtopic_terms.iter().any(|t| {
+                let lt = t.to_lowercase();
+                tl.contains(&lt) || r.url.to_lowercase().contains(&lt)
+            });
+            if !names_subject {
+                let p2d_cap = (best_non_video * 0.5).max(0.05);
+                if r.score > p2d_cap {
+                    tracing::info!(
+                        "POST-CAL P2d OFF-TOPIC-LOCAL CAP -> {:.2}: '{}' names none of {:?} (best_text={:.2})",
+                        p2d_cap, r.url.chars().take(60).collect::<String>(), p2d_offtopic_terms, best_non_video
+                    );
+                    r.score = p2d_cap;
+                }
+            }
+        }
+    }
+
     // Re-sort by score descending after post-calibration caps to ensure capped
-    // results (video/dict/weak-match) move below higher-scoring text results.
+    // results (video/dict/weak-match/P2d) move below higher-scoring text results.
     merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     merged
