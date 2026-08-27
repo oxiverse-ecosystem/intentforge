@@ -6970,6 +6970,22 @@ fn merge_local_and_web(
                 // query's real subject and would be wrongly crushed. Generalised word-CLASS
                 // (subject derived from the query's own terms), no per-query/domain literals.
                 "raspberry pi","raspberry","rpi","pi",
+                // TEMPORAL / GENERIC-MODIFIER words (local-noise gate, this round 2026-08-22):
+                // days-of-week, parts-of-day, and generic time/availability modifiers are
+                // NON-DISCRIMINATING — thousands of unrelated pages contain "sunday", "morning",
+                // "weekend", "open", "early". A local crawl page that matches a query ONLY on
+                // such a token (e.g. Fox News "Sunday Morning Futures" ranking #1 for "weekend
+                // flower markets in thrissur that open early on sunday morning") is off-topic
+                // crawl noise, yet it survived the P2 gate because "sunday"/"morning"/"open"
+                // counted as a "subject" match in topic_mentioned/substantive_subject_terms.
+                // Excluding this word-CLASS from the subject test forces the local page to name a
+                // REAL topic noun (flower/market/thrissur) to survive. Queries whose genuine
+                // subject IS temporal (e.g. "what to do this weekend") simply have no
+                // substantive subject terms -> the gate fails open (nothing to miss). Pure
+                // word-CLASS seed, no per-query/domain tuning, future-proof.
+                "sunday","monday","tuesday","wednesday","thursday","friday","saturday",
+                "weekend","weekday","weekdays","morning","evening","afternoon","night","tonight",
+                "today","month","year","open","opened","close","closed","early","late",
             ];
             // AUXILIARY-VERB / FILLER markers (P2d, round-2026-08-20T1935Z): query verbs like
             // "need"/"want"/"use"/"require" are DISTINCTIVE terms but are NOT subjects — a local
@@ -8683,34 +8699,43 @@ fn merge_local_and_web(
     // literals, no curated list — keyed on the structural "local page misses the
     // subject" class.
     if !p2d_offtopic_terms.is_empty() {
-        // best_non_video computed over post-calibration scores (mirrors the
-        // D3/video caps above) so the relative cap reflects the final text ranking.
-        let best_non_video = merged.iter()
-            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
-        for r in merged.iter_mut() {
+        // A LOCAL page is "off-topic" for this query when its TITLE/URL names NONE of the
+        // query's subject terms (p2d_offtopic_terms, populated by the in-loop P2d gate).
+        let is_offtopic_local = |r: &MergedResult| -> bool {
             if !r.is_local {
-                continue;
+                return false;
             }
             let tl = r.title.to_lowercase();
-            // Title/URL-anchored only — mirrors the P2d gate's mentions_substantive_subject
-            // (round-2026-08-20T1935Z). A local page that mentions the subject ONLY in its
-            // BODY (e.g. a "Slack Alternatives" page that references "airtable" in passing)
-            // is still about its own topic, not the query subject, and must be capped.
-            // Content-only matches are exactly the leak that let #22 survive.
-            let names_subject = p2d_offtopic_terms.iter().any(|t| {
+            let ul = r.url.to_lowercase();
+            !p2d_offtopic_terms.iter().any(|t| {
                 let lt = t.to_lowercase();
-                tl.contains(&lt) || r.url.to_lowercase().contains(&lt)
-            });
-            if !names_subject {
-                let p2d_cap = (best_non_video * 0.5).max(0.05);
-                if r.score > p2d_cap {
-                    tracing::info!(
-                        "POST-CAL P2d OFF-TOPIC-LOCAL CAP -> {:.2}: '{}' names none of {:?} (best_text={:.2})",
-                        p2d_cap, r.url.chars().take(60).collect::<String>(), p2d_offtopic_terms, best_non_video
-                    );
-                    r.score = p2d_cap;
+                tl.contains(&lt) || ul.contains(&lt)
+            })
+        };
+        // CAP REFERENCE must be the best ON-TOPIC score — i.e. the max score among results
+        // that are NOT off-topic-local themselves. The previous reference (best_non_video)
+        // included the off-topic local page, so capping to 0.5*that left the off-topic local
+        // ABOVE the on-topic web pages (which calibrate to the ~0.05 floor) — e.g. Fox News
+        // "Sunday Morning Futures" stayed #1 for "weekend flower markets in thrissur ...".
+        // By excluding off-topic-local pages from the reference, the cap forces every
+        // off-topic local strictly BELOW the best genuine on-topic result (it may dip under
+        // the 0.05 calibration floor, which is correct — it should rank last, never first).
+        // Structural only: no query/domain literals, keyed on "local page misses the subject".
+        let cap_ref = merged.iter()
+            .filter(|r| !is_offtopic_local(r))
+            .map(|r| r.score)
+            .fold(0.0f32, f32::max);
+        if cap_ref > 0.0 {
+            for r in merged.iter_mut() {
+                if is_offtopic_local(r) {
+                    let p2d_cap = cap_ref * 0.6;
+                    if r.score > p2d_cap {
+                        tracing::info!(
+                            "POST-CAL P2d OFF-TOPIC-LOCAL CAP -> {:.3}: '{}' names none of {:?} (ontopic_ref={:.3})",
+                            p2d_cap, r.url.chars().take(60).collect::<String>(), p2d_offtopic_terms, cap_ref
+                        );
+                        r.score = p2d_cap;
+                    }
                 }
             }
         }
