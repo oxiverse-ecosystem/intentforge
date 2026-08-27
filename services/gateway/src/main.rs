@@ -9145,8 +9145,6 @@ async fn handle_news(
     (axum::http::StatusCode::OK, Json(response))
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-
 /// Generic stopwords shared by the recall-gap / distinctive-term extractors.
 /// A general, fixed set (no query/domain-specific entries) so the gap signal
 /// never keys on a particular phrase. Mirrors the broad stopword philosophy
@@ -9235,7 +9233,7 @@ fn compute_recall_gap_terms(
                 r.url.to_lowercase()
             )
         })
-        .collect::<Vec<String>>();
+        .collect();
 
     let missing: Vec<String> = topics
         .into_iter()
@@ -9250,6 +9248,7 @@ fn compute_recall_gap_terms(
 }
 
 
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     tracing_subscriber::fmt::init();
 
@@ -14855,7 +14854,7 @@ mod constraint_fix_tests {
             );
         }
         // Exact assertion for the canonical repro.
-        let (kept, _dropped) =
+        let (kept, _dropped, _manner) =
             extract_query_negative_terms_with_dropped("python web framework not django site:github.com");
         assert_eq!(kept, vec!["django".to_string()], "D3: 'not django site:github.com' → ['django'] only");
     }
