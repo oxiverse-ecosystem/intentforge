@@ -1901,4 +1901,5 @@ pub(crate) const WORD_FREQUENCIES: &[(&str, f64)] = &[
     // them. Without seeds the guard would block these too.
     ("pythn", 0.0010), ("pthon", 0.0010), ("housr", 0.0010), ("ngnix", 0.0010),
     ("perfom", 0.0010), ("editer", 0.0010), ("begginners", 0.0010), ("orcale", 0.0010), ("agular", 0.0010), ("pypeline", 0.0010), ("surprize", 0.0010),
+    ("tranfer", 0.0010), ("bluetooh", 0.0010),
 ];

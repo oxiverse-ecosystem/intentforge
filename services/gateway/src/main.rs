@@ -8946,7 +8946,7 @@ async fn handle_images(
     };
 
     let searx1_fut = async {
-        match fetch_text_budgeted(state.http_client.clone(), searx_url.clone(), 4000).await {
+        match fetch_text_budgeted(state.http_client.clone(), searx_url.clone(), 6000).await {
             Some(raw) => parse_images(raw),
             None => { tracing::warn!("SearXNG1 image timed out/failed — empty"); vec![] }
         }
@@ -8957,7 +8957,7 @@ async fn handle_images(
             Some(u) => u,
             None => return vec![],
         };
-        match fetch_text_budgeted(state.http_client.clone(), url.clone(), 4000).await {
+        match fetch_text_budgeted(state.http_client.clone(), url.clone(), 6000).await {
             Some(raw) => parse_images(raw),
             None => { tracing::warn!("SearXNG2 image timed out/failed — empty"); vec![] }
         }
@@ -11379,14 +11379,22 @@ async fn handle_search(
             }
         }
 
-        // Retry policy. For site:-constrained queries an upstream_unavailable is
-        // almost always a transient double-failure of the two INDEPENDENT egress
-        // paths (gluetun-VPN + Tor2) — a short backoff + one re-fire recovers it.
-        // Budgets are sized so the WHOLE request stays under 5s:
-        //   attempt1 = 2600ms, backoff 250ms, attempt2 = 1800ms  => worst ~4650ms.
-        // Non-site queries keep the original single-shot 5.5s budget (no extra
-        // upstream load, no behaviour change).
-        let max_attempts: usize = if has_site { 2 } else { 1 };
+        // Retry policy. An upstream_unavailable for ANY query (site:-constrained OR
+        // plain NL) is almost always a transient double-failure of the two
+        // INDEPENDENT egress paths (gluetun-VPN + Tor2) — a short backoff + one
+        // re-fire recovers it. The 2026-08-21 round proved this on plain NL: 4/30
+        // fresh queries hit upstream_unavailable on attempt 1, and ALL 4 returned
+        // real results (4/4/2/19) on an immediate retry. The previous code only
+        // retried site:-constrained queries (max_attempts = 1 for plain NL), so the
+        // re-fire path was dead code for the common case — plain NL queries
+        // surfaced upstream_unavailable even though a retry would have recovered.
+        // We now retry once for EVERY query when no usable result was found on
+        // attempt 1. A successful attempt 1 breaks early (has_usable is true), so
+        // there is ZERO added latency for queries that already have results — the
+        // retry only costs time on the queries that would otherwise return empty.
+        //   attempt1 = 10s budget (non-site) / 4500ms (site); backoff 150ms;
+        //   attempt2 = 10s (non-site, force re-probe) / 15s (site, cold-tor2).
+        let max_attempts: usize = 2;
         let attempt_budget_ms = |attempt: usize| -> u64 {
             if has_site {
                 // attempt1 gives the gluetun instance a fair shot (instance1
@@ -11495,7 +11503,7 @@ async fn handle_search(
                 out_results = results;
                 if attempt > 1 {
                     tracing::info!(
-                        "SearXNG retry recovered results on attempt {} (site:-constrained query)",
+                        "SearXNG retry recovered results on attempt {} (transient upstream failure)",
                         attempt
                     );
                 }
@@ -11506,6 +11514,11 @@ async fn handle_search(
                 if has_site {
                     tracing::warn!(
                         "SearXNG site:-constrained query empty after {} attempt(s) -- will signal upstream_unavailable",
+                        attempt
+                    );
+                } else {
+                    tracing::warn!(
+                        "SearXNG query empty after {} attempt(s) -- will signal upstream_unavailable",
                         attempt
                     );
                 }
