@@ -1297,7 +1297,7 @@ pub async fn handle_update_progress(
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_roadmap {
     use super::*;
 
     // Regression test for D1: roadmap.total_phases must equal the number of
