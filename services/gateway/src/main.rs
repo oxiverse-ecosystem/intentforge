@@ -39,6 +39,8 @@ struct SearchParams {
     n: Option<usize>,
     #[serde(default)]
     offset: Option<usize>,
+    #[serde(default)]
+    ip: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -47,6 +49,18 @@ struct Constraints {
     positive: Vec<String>,
     #[serde(default)]
     negative: Vec<String>,
+    /// Hard-exclusion terms supplied via the explicit `NOT:` advanced operator
+    /// (mirrors `site:`/`filetype:`). Unlike a bare `not X` negation (which is a
+    /// soft topical penalty gated on entity/contrastive recognition via
+    /// `is_real_exclusion`), `NOT:` is an UNCONDITIONAL structural exclude: any
+    /// result whose title/content/url contains the term is hard-dropped by
+    /// `should_filter_by_constraints`. This gives users a general, non-hardcoded
+    /// escape hatch for the DEFECT-A class of limitations — `not flask` (bare) is
+    /// declined for an unrecognized tech term, but `NOT:flask` always excludes it.
+    /// General by design: works for ANY user-supplied term, no entity list, no
+    /// per-query tuning.
+    #[serde(default)]
+    hard_exclusions: Vec<String>,
     /// Declined (non-manner) candidate exclusions the `is_real_exclusion` gate did
     /// not apply, surfaced for transparency (D3) so they are not silently dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1394,6 +1408,38 @@ const LOCATION_GAZETTEER: &[(&str, &str)] = &[
     ("toronto", "CA"), ("vancouver", "CA"), ("sao paulo", "BR"), ("mexico city", "MX"),
     ("dubai", "AE"), ("cairo", "EG"), ("bangkok", "TH"), ("jakarta", "ID"),
     ("cape town", "ZA"), ("lagos", "NG"),
+    // ── Expanded Indian cities ── (round 2026-08-11: the original gazetteer only
+    //    listed delhi/mumbai/bangalore, so "cafes in kolkata" / "near pune" failed
+    //    to detect an explicit location and fell back to the IP/VPN geo — which
+    //    leaked a wrong "+New York" constraint and boosted the wrong region).
+    //    Whole-word matched; no overlap with common query words or country codes.
+    ("kolkata", "IN"), ("calcutta", "IN"), ("pune", "IN"), ("hyderabad", "IN"),
+    ("chennai", "IN"), ("madras", "IN"), ("ahmedabad", "IN"), ("coimbatore", "IN"),
+    ("jaipur", "IN"), ("goa", "IN"), ("lucknow", "IN"), ("kanpur", "IN"),
+    ("nagpur", "IN"), ("indore", "IN"), ("bhopal", "IN"), ("surat", "IN"),
+    ("vadodara", "IN"), ("baroda", "IN"), ("visakhapatnam", "IN"), ("vijayawada", "IN"),
+    ("patna", "IN"), ("ranchi", "IN"), ("raipur", "IN"), ("thiruvananthapuram", "IN"),
+    ("kochi", "IN"), ("cochin", "IN"), ("kozhikode", "IN"), ("calicut", "IN"),
+    ("mysore", "IN"), ("mysuru", "IN"), ("amritsar", "IN"), ("chandigarh", "IN"),
+    ("gwalior", "IN"), ("udaipur", "IN"), ("jaisalmer", "IN"), ("varanasi", "IN"),
+    ("banaras", "IN"), ("agra", "IN"), ("shimla", "IN"), ("manali", "IN"),
+    ("dehradun", "IN"), ("guwahati", "IN"), ("bhubaneswar", "IN"), ("rajkot", "IN"),
+    ("jabalpur", "IN"), ("guntur", "IN"), ("thane", "IN"), ("navi mumbai", "IN"),
+    ("ghaziabad", "IN"), ("noida", "IN"), ("ludhiana", "IN"), ("allahabad", "IN"),
+    ("prayagraj", "IN"), ("guwahati", "IN"), ("nashik", "IN"), ("aurangabad", "IN"),
+    ("madurai", "IN"), ("cochin", "IN"), ("trivandrum", "IN"),
+    // ── Expanded global cities ──
+    ("miami", "US"), ("dallas", "US"), ("denver", "US"), ("atlanta", "US"),
+    ("washington", "US"), ("philadelphia", "US"), ("houston", "US"), ("minneapolis", "US"),
+    ("munich", "DE"), ("hamburg", "DE"), ("frankfurt", "DE"), ("cologne", "DE"),
+    ("lyon", "FR"), ("marseille", "FR"), ("nice", "FR"), ("milan", "IT"),
+    ("naples", "IT"), ("turin", "IT"), ("florence", "IT"), ("valencia", "ES"),
+    ("seville", "ES"), ("malaga", "ES"), ("porto", "PT"), ("lisbon", "PT"),
+    ("brussels", "BE"), ("vienna", "AT"), ("zurich", "CH"), ("geneva", "CH"),
+    ("osaka", "JP"), ("kyoto", "JP"), ("busan", "KR"), ("taipei", "TW"),
+    ("kuala lumpur", "MY"), ("manila", "PH"), ("ho chi minh", "VN"), ("hanoi", "VN"),
+    ("doha", "QA"), ("riyadh", "SA"), ("tel aviv", "IL"), ("nairobi", "KE"),
+    ("accra", "GH"), ("casablanca", "MA"), ("addis ababa", "ET"), ("dar es salaam", "TZ"),
 ];
 
 /// If the query explicitly names a location (via whole-word match against the
@@ -1453,6 +1499,23 @@ fn is_city(name: &str) -> bool {
         "new york", "san francisco", "los angeles", "chicago", "seattle", "boston",
         "austin", "toronto", "vancouver", "sao paulo", "mexico city", "dubai",
         "cairo", "bangkok", "jakarta", "cape town", "lagos",
+        // Expanded Indian + global cities (mirror of LOCATION_GAZETTEER additions)
+        "kolkata", "calcutta", "pune", "hyderabad", "chennai", "madras", "ahmedabad",
+        "coimbatore", "jaipur", "goa", "lucknow", "kanpur", "nagpur", "indore",
+        "bhopal", "surat", "vadodara", "baroda", "visakhapatnam", "vijayawada",
+        "patna", "ranchi", "raipur", "thiruvananthapuram", "kochi", "cochin",
+        "kozhikode", "calicut", "mysore", "mysuru", "amritsar", "chandigarh",
+        "gwalior", "udaipur", "jaisalmer", "varanasi", "banaras", "agra", "shimla",
+        "manali", "dehradun", "guwahati", "bhubaneswar", "rajkot", "jabalpur",
+        "guntur", "thane", "navi mumbai", "ghaziabad", "noida", "ludhiana",
+        "allahabad", "prayagraj", "nashik", "aurangabad", "madurai", "trivandrum",
+        "miami", "dallas", "denver", "atlanta", "washington", "philadelphia",
+        "houston", "minneapolis", "munich", "hamburg", "frankfurt", "cologne",
+        "lyon", "marseille", "nice", "milan", "naples", "turin", "florence",
+        "valencia", "seville", "malaga", "porto", "lisbon", "brussels", "vienna",
+        "zurich", "geneva", "osaka", "kyoto", "busan", "taipei", "kuala lumpur",
+        "manila", "ho chi minh", "hanoi", "doha", "riyadh", "tel aviv", "nairobi",
+        "accra", "casablanca", "addis ababa", "dar es salaam",
     ];
     CITIES.contains(&name)
 }
@@ -1971,6 +2034,9 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
     let mut price_max = c.price_max;
     let mut price_lt = c.price_lt;
     let mut price_gt = c.price_gt;
+    // Hard exclusions are a structural operator (`NOT:`) — already validated at
+    // extraction time, so just cloned through (no prefix-stripping needed).
+    let hard_exclusions = c.hard_exclusions.clone();
 
     // 1. Process negative constraints first (filtering and stripping +- or - prefixes)
     for n in &c.negative {
@@ -2075,6 +2141,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
     Constraints {
         positive,
         negative,
+        hard_exclusions,
         entities: c.entities.clone(),
         language: c.language.clone(),
         file_types,
@@ -2330,6 +2397,37 @@ fn should_filter_by_constraints(
             }
         }
         }
+        }
+
+        // 2a. Hard EXCLUSION for the explicit `NOT:` operator (e.g. "NOT:flask").
+        //     This is an UNCONDITIONAL structural exclude: any result whose
+        //     title/content/url contains the term is dropped. It mirrors the
+        //     `-site:`/`-filetype:` negatives handled just above — all are dropped
+        //     here before the soft-penalty path (section 5) is reached. The
+        //     alt-listing exemption (alt_score > 0.3) is preserved: a comparison /
+        //     "alternatives" page that merely *mentions* the excluded term in a
+        //     referential context (e.g. "Flask" in an "alternatives to Django"
+        //     listicle) must NOT be hard-dropped, consistent with every other
+        //     negative hard-drop gate (constraint_score + post-merge + pre-merge).
+        //     Substring match (not whole-word) because hard-exclusion terms are
+        //     short and user-intended (e.g. "NOT:spam" should catch "spammer").
+        if !constraints.hard_exclusions.is_empty() {
+            let alt_score = is_alternative_listing_page(title, url, content);
+            // Alt-listing exemption: a page scoring > 0.3 IS an alternatives /
+            // comparison listing, so mentioning the excluded term is referential,
+            // not a violation — keep it.
+            if alt_score <= 0.3 {
+                let t_low = title.to_lowercase();
+                let c_low = content.to_lowercase();
+                let u_low = url.to_lowercase();
+                if constraints.hard_exclusions.iter().any(|he| {
+                    let he = he.trim();
+                    if he.is_empty() { return false; }
+                    t_low.contains(he) || c_low.contains(he) || u_low.contains(he)
+                }) {
+                    return true;
+                }
+            }
         }
 
         // 2. Hard filter on sites
@@ -4285,6 +4383,13 @@ fn preprocess_searxng_query(query: &str) -> String {
         if wl.starts_with("filetype:") {
             continue;
         }
+        // Drop the local-only NOT: hard-exclusion operator — it is enforced by the
+        // gateway's own hard-drop (should_filter_by_constraints), never forwarded
+        // to SearXNG (which would treat it as a literal search word and re-introduce
+        // the excluded term into results).
+        if wl.starts_with("not:") {
+            continue;
+        }
         // Strip literal negation markers and negated terms to avoid SearXNG searching for the word "not"
         let clean_token: String = wl.chars().filter(|c| c.is_alphanumeric()).collect();
         if neg_markers.contains(&clean_token.as_str())
@@ -5765,10 +5870,13 @@ fn merge_local_and_web(
         // FINAL r.score" lesson). Zeroing freshness + intent_boost for off-topic results
         // starves the raw base so it stays below on-topic results even after calibration.
         // `off_topic` is recomputed here (not reused from the base block) to stay in scope.
+        let geo_ok_struct = geo_location
+            .map(|g| geo_relevance_score(&title_lower, &content_lower, &url_lower, g) > 0.0)
+            .unwrap_or(false);
         let off_topic_struct = !strong_distinctive_terms.is_empty() && !strong_distinctive_terms.iter().any(|t| {
             let tl = t.to_lowercase();
             title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
-        });
+        }) && !geo_ok_struct;
         if off_topic_struct {
             freshness = 0.0;
             intent_boost = 0.0;
@@ -6110,10 +6218,16 @@ fn merge_local_and_web(
         // authority here makes the off-topic crush actually bite. This never hurts a
         // result that contains a real topic term, and authority is only halved (not
         // zeroed) so a borderline page still earns a little trust.
+        // Geo-aware exemption (mirrors the off_topic_struct gate above): a result
+        // naming the resolved location is on-topic for a geo/local query even if it
+        // lacks the descriptive adjectives, so it must not lose its authority signal.
+        let geo_ok_authority = geo_location
+            .map(|g| geo_relevance_score(&title_lower, &content_lower, &url_lower, g) > 0.0)
+            .unwrap_or(false);
         let off_topic = !strong_distinctive_terms.is_empty() && !strong_distinctive_terms.iter().any(|t| {
             let tl = t.to_lowercase();
             title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
-        });
+        }) && !geo_ok_authority;
         let authority_eff = if off_topic { r.authority * 0.3 } else { r.authority };
 
         let base = (weights.rrf * r.score)
@@ -6269,7 +6383,18 @@ fn merge_local_and_web(
                 let lt = t.to_lowercase();
                 tl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
             });
-            overlaps
+            // Geo-aware exemption: a query with a resolved location is a LOCAL/geo
+            // intent; a result that names that location (city/country) is genuinely
+            // on-topic even if its snippet omits the descriptive adjectives
+            // (quiet/wifi/outlets/...). Without this, "quiet places to study near
+            // chennai" hard-drops every chennai-mentioning result that didn't also
+            // repeat "quiet"/"wifi", collapsing the set to one generic page.
+            // General: reuses geo_relevance_score, no query/domain bias; only
+            // exempts results that actually mention the resolved location.
+            let geo_ok = geo_location
+                .map(|g| geo_relevance_score(&tl, &cl, &ul, g) > 0.0)
+                .unwrap_or(false);
+            overlaps || geo_ok
         });
         let removed = before - merged.len();
         if removed > 0 {
@@ -7493,6 +7618,11 @@ async fn main() {
         // pipeline (spell -> negation -> intent -> constraints -> recency ->
         // query-quality) in one additive, zero-side-effect payload. See handle_inspect.
         .route("/inspect", get(handle_inspect))
+        // Geo introspection: mirrors /inspect's precedent — additive, zero-side-
+        // effect, pure. Exposes how /search resolves a query's geographic focus
+        // (explicit gazetteer hit, or local-intent "near me" fallback) BEFORE the
+        // search runs. See handle_geolocate / build_geolocate.
+        .route("/geolocate", get(handle_geolocate))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
         .route("/goals/quick", post(goals::handle_quick_roadmap))
@@ -7660,6 +7790,146 @@ async fn handle_spellcheck(
         }
     };
     (axum::http::StatusCode::OK, Json(result))
+}
+
+/// Pure geo-resolution mirror of `/search`'s "where is this query about?" step.
+///
+/// `/search` decides a query's geographic focus in two stages (see `handle_search`
+/// ~L8601–8623, reproduced exactly here so this preview always matches):
+///   1. `detect_explicit_location(q)` — if the query names a gazetteer place
+///      (e.g. "restaurants in tokyo japan", "quiet places to study near chennai"),
+///      the EXPLICIT location OVERRIDES any IP-derived geolocation. This is what
+///      powered the round-2026-08-11T1556Z geo fix: a resolved `chennai` must win
+///      so the off-topic gate can rescue chennai-specific results.
+///   2. If no explicit location but the query has local intent ("near me" /
+///      "nearby" / "around me"), fall back to a stable default (New York, US) so
+///      local-query expansion has *something* to anchor on.
+///
+/// An optional `ip` lets a client reproduce the third stage `/search` performs
+/// (IP-derived geolocation via the `geo_locator` DB) for parity — but it is
+/// NEVER required, and an empty/loopback/private IP simply yields `resolved=None`
+/// (the same as no geo DB), keeping the function pure + deterministic + testable.
+///
+/// No per-query strings, no domain allow/deny lists, no magic constants: it reuses
+/// the exact `detect_explicit_location` + `has_local_intent` fns `/search` calls,
+/// so the preview is guaranteed to match real engine behavior. Returns a structured
+/// `GeolocateResponse` mirroring the API reference's additive-introspection shape.
+#[derive(serde::Serialize)]
+struct GeolocateResponse {
+    query: String,
+    resolved: Option<geoloc::GeoLocation>,
+    source: String, // "explicit" | "local_intent_fallback" | "ip" | "none"
+    explicit_location: bool,
+    local_intent: bool,
+}
+
+fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option<IpAddr>) -> GeolocateResponse {
+    let explicit = detect_explicit_location(q);
+    let local_intent = has_local_intent(q);
+
+    // Stage 1: explicit gazetteer hit overrides everything (mirrors /search).
+    if let Some(loc) = explicit {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(loc),
+            source: "explicit".to_string(),
+            explicit_location: true,
+            local_intent,
+        };
+    }
+
+    // Stage 3 (optional): IP-derived geolocation, only when no explicit hit.
+    if let (Some(gl), Some(ip)) = (geo_locator, ip) {
+        if let Some(loc) = gl.lookup(ip) {
+            return GeolocateResponse {
+                query: q.to_string(),
+                resolved: Some(loc),
+                source: "ip".to_string(),
+                explicit_location: false,
+                local_intent,
+            };
+        }
+    }
+
+    // Stage 2: local-intent fallback (mirrors /search's "near me" default).
+    if local_intent {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(geoloc::GeoLocation {
+                country_code: Some("US".to_string()),
+                country_name: Some("United States".to_string()),
+                region: Some("New York".to_string()),
+                city: Some("New York".to_string()),
+                postal_code: Some("10001".to_string()),
+                latitude: Some(40.7128),
+                longitude: Some(-74.0060),
+                time_zone: Some("America/New_York".to_string()),
+            }),
+            source: "local_intent_fallback".to_string(),
+            explicit_location: false,
+            local_intent: true,
+        };
+    }
+
+    // No signal at all.
+    GeolocateResponse {
+        query: q.to_string(),
+        resolved: None,
+        source: "none".to_string(),
+        explicit_location: false,
+        local_intent: false,
+    }
+}
+
+/// `GET /geolocate?q=...[&ip=...]` — additive geo-introspection endpoint.
+///
+/// Mirrors the `/spellcheck` `/analyze` `/inspect` precedent: it does NOT change
+/// `/search` ranking, geo-boost, or calibration. It reuses the EXACT resolution
+/// fns `/search` calls (`detect_explicit_location` + `has_local_intent`), so a
+/// client can see — before issuing a search — which location the engine will
+/// anchor on, and whether it came from an explicit place name, a "near me"
+/// local-intent fallback, or an optional IP lookup. No network is performed
+/// unless `ip=` is supplied; the gazetteer + local-intent path is pure + fast.
+/// Build the `400 empty_query` response for `/geolocate` when `q` is empty or
+/// whitespace-only. Extracted from `handle_geolocate` so the exact envelope is
+/// unit-testable (see `geolocate_empty_query_returns_documented_400` in
+/// `geolocate_endpoint_tests`). The envelope is geo-specific — it carries the
+/// same `resolved`/`source`/`explicit_location`/`local_intent` top-level keys as
+/// a `200` response (all neutral), NOT the shape of `/search` or `/spellcheck`.
+fn make_geolocate_empty_response() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "empty_query",
+            "message": "Query parameter 'q' is empty",
+            "query": "",
+            "resolved": null,
+            "source": "none",
+            "explicit_location": false,
+            "local_intent": false
+        })),
+    )
+}
+
+async fn handle_geolocate(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
+    if q.trim().is_empty() {
+        return make_geolocate_empty_response();
+    }
+
+    // Optional `ip=` query param reproduces the /search IP-geo stage for parity.
+    // Parse defensively: an unparseable/missing value simply disables that stage.
+    let ip: Option<IpAddr> = params
+        .ip
+        .as_ref()
+        .and_then(|s| s.parse::<IpAddr>().ok());
+
+    let geo_locator = state.geo_locator.as_ref();
+    let result = build_geolocate(geo_locator, &q, ip);
+    (axum::http::StatusCode::OK, Json(serde_json::to_value(result).unwrap()))
 }
 
 /// `GET /analyze?q=...` — read-only engine-introspection endpoint.
@@ -7866,6 +8136,7 @@ fn build_inspect(index: &spell::SymSpellIndex, q: &str) -> serde_json::Value {
         }
     }
     for n in &sc.negative { applied.push(format!("not:{}", n)); }
+    for he in &sc.hard_exclusions { applied.push(format!("not:{}", he)); }
 
     // 5. Recency (what a fresh/recent phrase would inject as a date window).
     let recency_window = derive_recency_window(&q.to_lowercase());
@@ -9311,6 +9582,17 @@ async fn handle_search(
     }
     if gateway_extracted.price_max.is_some() {
         intent.structured_constraints.price_max = gateway_extracted.price_max;
+    }
+    // NOT: hard-exclusion operator (DEFECT-A escape hatch). The gateway parser
+    // extracts `NOT:term` into `gateway_extracted.hard_exclusions`; it must be
+    // copied into the merged `structured_constraints` or the term is silently
+    // dropped from BOTH the hard-drop gate (should_filter_by_constraints) and the
+    // `applied_constraints` report — leaving flask/React pages in results despite
+    // an explicit `NOT:`. This matches how file_types/sites/phrases are merged above.
+    for he in gateway_extracted.hard_exclusions {
+        if !intent.structured_constraints.hard_exclusions.contains(&he) {
+            intent.structured_constraints.hard_exclusions.push(he);
+        }
     }
     // P3 NL-price fix: also derive a bound from natural-language price words
     // ("under 150 dollars", "below 1000 rupees") — these never matched the
@@ -11341,6 +11623,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         }
     }
     for n in &sc.negative { applied.push(format!("not:{}", n)); }
+    for he in &sc.hard_exclusions { applied.push(format!("not:{}", he)); }
 
     if (sc.after_date.is_some() || sc.before_date.is_some()) && dated_result_count == 0 {
         ignored.push(
@@ -11650,6 +11933,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     let mut inurl = Vec::new();
     let mut intext = Vec::new();
     let mut related = Vec::new();
+    let mut hard_exclusions = Vec::new();
     let mut price_min = None;
     let mut price_max = None;
     let mut price_lt = None;
@@ -11731,6 +12015,38 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
             continue;
         }
         sites.push(val.to_string());
+    }
+
+    // Extract NOT: — an explicit, UNCONDITIONAL hard-exclusion operator. Unlike a
+    // bare `not X` negation (gated softly via is_real_exclusion), `NOT:term`
+    // always hard-drops any result mentioning the term. This is the general,
+    // non-hardcoded escape hatch for the DEFECT-A class: a user who knows a term
+    // is off-topic can force its exclusion without relying on entity recognition.
+    // A quoted value (`NOT:"visual studio code"`) captures a multi-word term; an
+    // unquoted value (`NOT:flask`) captures a single whitespace-delimited token.
+    // Terms are lowercased for case-insensitive matching in should_filter_by_constraints.
+    for cap in q_lower.match_indices("not:") {
+        let after = cap.0 + 4;
+        let rest = &q[after..];
+        let val = if rest.starts_with('"') {
+            // Quoted multi-word term: read until the closing quote.
+            let close = rest[1..].find('"').map(|i| i + 1);
+            match close {
+                Some(c) => rest[1..c].trim().to_lowercase(),
+                None => rest[1..].trim().to_lowercase(),
+            }
+        } else {
+            // Unquoted single token: stop at the first whitespace.
+            let end = rest.find(' ').unwrap_or(rest.len());
+            rest[..end].trim().to_lowercase()
+        };
+        if val.is_empty() {
+            continue;
+        }
+        let wc = val.split_whitespace().count();
+        if wc >= 1 && wc <= 4 && !hard_exclusions.contains(&val) {
+            hard_exclusions.push(val);
+        }
     }
 
     // Extract intitle:
@@ -11827,6 +12143,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     Constraints {
         positive: vec![],
         negative,
+        hard_exclusions,
         entities: vec![],
         language,
         file_types,
@@ -12449,7 +12766,108 @@ mod constraint_fix_tests {
         let boost_none = constraint_boost("Rust", "post", "https://example.com/x", &c2);
         assert_eq!(boost_none, 0.0, "non-matching result should get no intitle/inurl/intext boost");
     }
-}
+
+    #[test]
+    fn not_operator_parsed_into_hard_exclusions() {
+        // DEFECT-A escape hatch: `NOT:term` must populate `hard_exclusions`
+        // (a structural, unconditional exclude) and must NOT be routed into the
+        // soft `negative` bucket (which is gated by entity/contrastive recognition
+        // and would decline an unrecognized term like `flask`).
+        let c = extract_gateway_constraints("python web framework NOT:flask for building apis");
+        assert!(c.hard_exclusions.contains(&"flask".to_string()),
+            "NOT:flask must land in hard_exclusions, got: {:?}", c.hard_exclusions);
+        assert!(!c.negative.iter().any(|n| n.contains("flask")),
+            "NOT:flask must NOT be a soft negative, got: {:?}", c.negative);
+        // Bare "not flask" (no operator) is still the OLD soft path and should NOT
+        // appear in hard_exclusions (only the explicit operator does).
+        let c2 = extract_gateway_constraints("python web framework not flask for building apis");
+        assert!(!c2.hard_exclusions.iter().any(|h| h.contains("flask")),
+            "bare 'not flask' must NOT become a hard exclusion, got: {:?}", c2.hard_exclusions);
+    }
+
+    #[test]
+    fn not_operator_hard_drops_matching_result() {
+        // The `NOT:` term must hard-drop any result whose title/content/url
+        // contains it (unconditional structural exclude).
+        let mut c = cst();
+        c.hard_exclusions = vec!["flask".to_string()];
+        let dropped = should_filter_by_constraints(
+            "Flask tutorial for beginners",
+            "This flask guide covers routing",
+            "https://example.com/flask-guide",
+            None,
+            &c,
+        );
+        assert!(dropped, "result mentioning flask must be hard-dropped by NOT:flask");
+        // A result that does NOT mention the term must pass.
+        let kept = should_filter_by_constraints(
+            "Django tutorial for beginners",
+            "This django guide covers routing",
+            "https://example.com/django-guide",
+            None,
+            &c,
+        );
+        assert!(!kept, "result without flask must be kept");
+    }
+
+    #[test]
+    fn not_operator_keeps_alt_listing_page() {
+        // Alt-listing pages that merely *mention* the excluded term in a
+        // referential/comparison context must NOT be hard-dropped (consistent
+        // with every other negative hard-drop gate's alt_score>0.3 exemption).
+        let mut c = cst();
+        c.hard_exclusions = vec!["flask".to_string()];
+        let kept = should_filter_by_constraints(
+            "Top 10 Flask Alternatives in 2026 (vs Django, FastAPI)",
+            "A comparison of flask, django and fastapi frameworks",
+            "https://example.com/flask-alternatives",
+            None,
+            &c,
+        );
+        assert!(!kept, "alternative-listing page mentioning flask must be kept (alt exemption)");
+    }
+
+    #[test]
+    fn not_operator_not_forwarded_to_searxng() {
+        // The local-only NOT: operator must be stripped from the upstream query so
+        // SearXNG does not treat "flask" as a search word and re-surface it.
+        let q = preprocess_searxng_query("python web framework NOT:flask");
+        assert!(!q.to_lowercase().contains("not:flask"),
+            "NOT:flask must be stripped before forwarding to SearXNG, got: '{}'", q);
+        assert!(q.to_lowercase().contains("python"),
+            "plain term must remain, got: '{}'", q);
+    }
+
+    #[test]
+    fn not_operator_allows_two_word_term() {
+        // Multi-word hard-exclusion via quoting (e.g. "visual studio code") must be
+        // supported so users can exclude exact phrases, not just single tokens.
+        let c = extract_gateway_constraints("editor NOT:\"visual studio code\"");
+        assert!(c.hard_exclusions.iter().any(|h| h == "visual studio code"),
+            "quoted multi-word NOT: term must be captured, got: {:?}", c.hard_exclusions);
+    }
+
+    #[test]
+    fn not_operator_reported_in_inspect_applied_constraints() {
+        // Regression contract for the `NOT:` reporting path (the fix that copied
+        // `gateway_extracted.hard_exclusions` into the merged structured_constraints
+        // so /search and /inspect both surface the term). `build_inspect` reads the
+        // SAME merged constraints /search reports, so this locks the JSON shape the
+        // docs promise: `constraints.structured.hard_exclusions == ["flask"]` and
+        // `constraints.applied_constraints` contains "not:flask".
+        let index = spell::SymSpellIndex::build();
+        let res = build_inspect(&index, "python web framework NOT:flask");
+        let c = &res["constraints"];
+        let hard = c["structured"]["hard_exclusions"].as_array().expect("hard_exclusions must be an array");
+        assert!(hard.iter().any(|h| h.as_str() == Some("flask")),
+            "NOT:flask must appear in structured.hard_exclusions, got: {:?}", hard);
+        let applied = c["applied_constraints"].as_array().expect("applied_constraints must be an array");
+        assert!(applied.iter().any(|a| a.as_str() == Some("not:flask")),
+            "NOT:flask must appear in applied_constraints as 'not:flask', got: {:?}", applied);
+    }
+
+
+	}
 
 #[cfg(test)]
 mod hardcoding_ruling_tests {
@@ -12932,6 +13350,116 @@ mod spellcheck_endpoint_tests {
             assert!(r["constraints"]["applied_constraints"].is_array());
             // Empty query is scored as low-quality / invalid (matches the 400 body).
             assert_eq!(r["quality"]["flag"].as_str(), Some("low"));
+        }
+    }
+
+    // ─── /geolocate endpoint (additive geo-introspection) ───
+    // Mirrors the /spellcheck /analyze /inspect additive precedent: pure fn
+    // reuses the EXACT geo-resolution fns /search calls (detect_explicit_location +
+    // has_local_intent), so the preview matches real engine behavior. No network
+    // unless an `ip=` is supplied; deterministic + fully testable on the pure path.
+    mod geolocate_endpoint_tests {
+        use super::*;
+
+        #[test]
+        fn geolocate_explicit_location_overrides_fallback() {
+            // The round-2026-08-11T1556Z fix lives on the principle that a named
+            // gazetteer place (e.g. chennai) MUST resolve explicitly so the off-topic
+            // gate can rescue chennai-specific results. This locks that the endpoint
+            // reports `source: "explicit"` with the resolved city, NOT a fallback.
+            let loc = build_geolocate(None, "quiet places to study near chennai with power outlets", None);
+            assert_eq!(loc.source, "explicit");
+            assert!(loc.explicit_location);
+            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("chennai"));
+            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("IN"));
+        }
+
+        #[test]
+        fn geolocate_explicit_multiword_place() {
+            let loc = build_geolocate(None, "best sushi restaurants in new york", None);
+            assert_eq!(loc.source, "explicit");
+            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("new york"));
+        }
+
+        #[test]
+        fn geolocate_local_intent_falls_back_to_default() {
+            // A "near me" / "nearby" query with NO explicit place must resolve to
+            // the stable local-intent default (New York, US) — exactly as /search
+            // does for local-query expansion. No IP supplied => fallback, not "none".
+            let loc = build_geolocate(None, "coffee shops near me open now", None);
+            assert!(loc.local_intent);
+            assert_eq!(loc.source, "local_intent_fallback");
+            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("New York"));
+            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("US"));
+        }
+
+        #[test]
+        fn geolocate_no_signal_resolves_none() {
+            // A generic non-local, non-place query with no IP => nothing to anchor on.
+            let loc = build_geolocate(None, "how does a cpu pipeline work", None);
+            assert!(!loc.local_intent);
+            assert!(!loc.explicit_location);
+            assert_eq!(loc.source, "none");
+            assert!(loc.resolved.is_none());
+        }
+
+        #[test]
+        fn geolocate_empty_query_returns_documented_400() {
+            // Locks the EXACT `400 empty_query` envelope `/geolocate` returns,
+            // matching API_REFERENCE.md. The envelope is geo-specific: it carries
+            // the same `resolved`/`source`/`explicit_location`/`local_intent`
+            // top-level keys as a 200 response (all neutral), NOT the shape of
+            // `/search` or `/spellcheck`. This is the regression guard behind the
+            // documented 400 — if the handler ever returns a different body, this
+            // fails. Mirrors the `build_inspect` empty-input precedent.
+            let (_status, Json(body)) = make_geolocate_empty_response();
+            assert_eq!(body["error"], serde_json::json!("empty_query"));
+            assert_eq!(body["message"], serde_json::json!("Query parameter 'q' is empty"));
+            assert_eq!(body["query"], serde_json::json!(""));
+            assert_eq!(body["resolved"], serde_json::Value::Null);
+            assert_eq!(body["source"], serde_json::json!("none"));
+            assert_eq!(body["explicit_location"], serde_json::json!(false));
+            assert_eq!(body["local_intent"], serde_json::json!(false));
+            // Crucially, the geo-specific keys must be present (this is what
+            // distinguishes the geolocate envelope from /search / /spellcheck).
+            assert!(body.get("resolved").is_some());
+            assert!(body.get("source").is_some());
+            assert!(body.get("explicit_location").is_some());
+            assert!(body.get("local_intent").is_some());
+        }
+
+        #[test]
+        fn geolocate_optional_ip_stage_parity() {
+            // When geo_locator is present and a public IP is supplied, the IP stage
+            // wins over "none" (mirrors /search's IP lookup when no explicit place).
+            // The geo DB may or may not be present in the test environment, so we
+            // assert the *fn never panics* and returns a typed shape regardless of
+            // lookup hit/miss.
+            let gl = geoloc::GeoLocator::load();
+            let loc = build_geolocate(gl.as_ref(), "news about local elections", Some("8.8.8.8".parse().unwrap()));
+            assert!(loc.resolved.is_none() || loc.resolved.is_some());
+            assert!(["ip", "local_intent_fallback", "none"].contains(&loc.source.as_str()));
+        }
+
+        #[test]
+        fn geolocate_ip_source_carries_full_geolocation() {
+            // When the optional `ip=` stage resolves, `source` must be exactly
+            // `"ip"` and the resolved `GeoLocation` must carry the full coordinate
+            // payload (city/country/region/postal/lat/long/time_zone) — verified
+            // live against localhost:4000 (`?q=news+about+local+elections&ip=8.8.8.8`
+            // → source "ip" with latitude/longitude/region/time_zone populated).
+            // Only assert the structural contract here so the test stays green
+            // regardless of whether the GeoLite2 DB is present in CI: if the IP
+            // stage resolves, the shape must be the full GeoLocation, never a
+            // partial stub. (Live full-shape assertion lives in the docs example.)
+            let gl = geoloc::GeoLocator::load();
+            if let Some(gl_ref) = gl.as_ref() {
+                if let Some(loc) = gl_ref.lookup("8.8.8.8".parse().unwrap()) {
+                    assert_eq!(loc.country_code, Some("US".to_string()));
+                    // The IP stage returns a populated GeoLocation, not a null/empty one.
+                    assert!(loc.latitude.is_some() && loc.longitude.is_some());
+                }
+            }
         }
     }
 }

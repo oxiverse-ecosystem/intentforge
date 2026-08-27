@@ -21,6 +21,7 @@
   - [GET /spellcheck](#get-spellcheck)
   - [GET /analyze](#get-analyze)
   - [GET /inspect](#get-inspect)
+  - [GET /geolocate](#get-geolocate)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -558,6 +559,82 @@ curl "http://localhost:4000/inspect?q=latest+ai+news+this+week"
 
 ---
 
+### `GET /geolocate`
+
+Additive geo-introspection endpoint. Mirrors the `/spellcheck` `/analyze` `/inspect`
+precedent: it does **not** change `/search` ranking, geo-boost, or calibration. It
+reuses the *exact* location-resolution functions `/search` calls
+(`detect_explicit_location` + `has_local_intent`) so a client can see — **before**
+issuing a search — which location the engine will anchor on, and *why*. No network
+is performed unless an optional `ip=` param is supplied; the gazetteer + local-intent
+path is pure and fast.
+
+This endpoint makes the round-2026-08-11T1556Z geo fix *legible*: a query that names
+a gazetteer place (e.g. `quiet places to study near chennai`) now resolves explicitly,
+and a client can confirm the resolved location matches the one `/search` will use to
+rescue location-specific results from the off-topic gate.
+
+**Query Parameters**
+
+| Parameter | Type   | Required | Default | Description                                  |
+|-----------|--------|----------|---------|----------------------------------------------|
+| `q`       | string | yes      | —       | The query/phrase to resolve a location for   |
+| `ip`      | string | no       | —       | Optional client IP to reproduce `/search`'s IP-geolocation stage for parity (unparseable/missing disables that stage) |
+
+**Response** `200 OK` — top-level `{ query, resolved, source, explicit_location, local_intent }`:
+
+- `resolved` — the resolved `geoloc::GeoLocation` (serialized struct: `country_code`, `country_name`, `region`, `city`, `postal_code`, `latitude`, `longitude`, `time_zone`), or `null` when no location can be inferred. The `source: "explicit"` branch (query named a gazetteer place) returns this struct with **`latitude`/`longitude`/`postal_code`/`region`/`time_zone` set to `null`** (the gazetteer knows the city/country but not coordinates). The `source: "local_intent_fallback"` and `source: "ip"` branches return the **full** struct, including `latitude`, `longitude`, `postal_code`, `region`, and `time_zone` (verified live — see examples).
+- `source` — one of: `"explicit"` (query named a gazetteer place → overrides IP geo), `"local_intent_fallback"` (no explicit place but "near me"/"nearby" intent → stable New York, US default), `"ip"` (only when `ip=` supplied and the geo DB resolved it), or `"none"` (no signal).
+- `explicit_location` — `true` when `source == "explicit"`.
+- `local_intent` — `true` when the query carries local-intent signals ("near me", "nearby", "around me", …).
+
+```json
+{
+  "query": "quiet places to study near chennai with power outlets and free wifi",
+  "resolved": {
+    "city": "chennai",
+    "country_code": "IN",
+    "country_name": "India",
+    "latitude": null,
+    "longitude": null,
+    "postal_code": null,
+    "region": null,
+    "time_zone": null
+  },
+  "source": "explicit",
+  "explicit_location": true,
+  "local_intent": true
+}
+```
+
+> **Verified (this round, 2026-08-11):** all four `source` branches + the `400` empty-query path confirmed live against `localhost:4000`:
+> - `?q=quiet+places+to+study+near+chennai...` → `source: "explicit"`, `city: "chennai"`, `country_code: "IN"` (coordinates null)
+> - `?q=best+sushi+restaurants+in+new+york` → `source: "explicit"`, `city: "new york"`, `country_code: "US"`
+> - `?q=coffee+shops+near+me+open+now` → `source: "local_intent_fallback"`, `city: "New York"`, `country_code: "US"`, `latitude: 40.7128`, `longitude: -74.006`, `region: "New York"`, `postal_code: "10001"`, `time_zone: "America/New_York"`
+> - `?q=how+does+a+cpu+pipeline+work` → `source: "none"`, `resolved: null`
+> - `?q=news+about+local+elections&ip=8.8.8.8` → `source: "ip"`, `country_code: "US"`, `latitude: 37.751`, `longitude: -97.822`, `time_zone: "America/Chicago"`
+>
+> Empty/whitespace `q` returns `400` with a **geo-specific** `empty_query` envelope (the `resolved`/`source`/`explicit_location`/`local_intent` keys, all neutral — NOT the shape of `/search` or `/spellcheck`). Verified live: `GET /geolocate?q=` → `HTTP 400` with body:
+> ```json
+> {"error":"empty_query","message":"Query parameter 'q' is empty","query":"","resolved":null,"source":"none","explicit_location":false,"local_intent":false}
+> ```
+
+**Notes**
+- Pure function of the query (+ optional `ip`) over the loaded gazetteer; no per-query tuned constants, no domain allow/deny lists.
+- The endpoint is additive — it does not change `/search` ranking, geo-boost, negation gating, or calibration. It is a read-only preview of the existing location-resolution path.
+- A test module (`geolocate_endpoint_tests`, 7 cases) locks the `source`-routing behavior, the exact `400` envelope, and the `ip`-stage contract; the gateway suite is 103/103 passing.
+
+```bash
+# See how the engine would localize a query before searching
+curl "http://localhost:4000/geolocate?q=quiet+places+to+study+near+chennai"
+# → {"query":"...","resolved":{"city":"chennai",...},"source":"explicit","explicit_location":true,"local_intent":true}
+
+# Reproduce the IP-geolocation stage with a public IP for parity
+curl "http://localhost:4000/geolocate?q=news+about+local+elections&ip=8.8.8.8"
+```
+
+---
+
 ## Query Parameters
 
 All search endpoints accept the following standard parameters:
@@ -590,10 +667,38 @@ The `/search` endpoint parses a rich set of operators directly from the query st
 | `price_max:` | `price_max:100` | Maximum price | `price_max: 100.0` |
 | `lang:` | `lang:en` | Language filter (ISO code). Auto-applied as `lang:en` for English queries even without explicit use. | `language: "en"` |
 | `related:` | `related:python.org` | Find related pages | `related: ["python.org"]` |
+| `NOT:` | `python web framework NOT:flask` | **Hard-exclude** any result mentioning the term (single token, or quote a phrase: `NOT:"visual studio code"`). Unlike the natural-language `not X` (a soft penalty gated on entity/contrastive recognition that *declines* unrecognized terms like `flask`), `NOT:` is an **unconditional structural exclude** — any result whose title/content/url contains the term is dropped. General escape hatch for the DEFECT-A class; surfaced in `applied_constraints` as `not:<term>`. | `hard_exclusions: ["flask"]` |
 
 > **Verification status (this session, 2026-08-05):** the following operators were exercised live and confirmed to populate `structured_constraints` + `applied_constraints`: `site:` (block 32), `filetype:` (block 33), `intitle:` (block 34), `inurl:` (block 35), `after:` (block 36), and the natural-language negation `not X` (block 12 → `negative:["django"]`, `applied_constraints:["not:django"]`). The `fresh`/`today` intent auto-produced `after_date`+`before_date` = today (block 9). The **`price:` / `price_min:` / `price_max:`** operators and `lang:` / `intext:` / `related:` were **NOT exercised this session** — treat their extraction as unverified. 
 
 **Multiple operators** can be combined: `site:arxiv.org site:wikipedia.org quantum computing` → both sites are applied (observed).
+
+### The `NOT:` hard-exclusion operator (verified live 2026-08-11)
+
+`NOT:` is an **explicit, unconditional structural exclude** — the general, non-hardcoded escape hatch for the DEFECT-A class of limitations. It is parsed by the gateway's own operator extractor (`extract_gateway_constraints`), independent of the intent engine's entity/contrastive recognition.
+
+- **Syntax:** `NOT:<term>` for a single token, or `NOT:"<phrase>"` for a multi-word term (up to 4 words). Terms are lowercased for case-insensitive matching.
+- **Behaviour:** any result whose **title, content, or URL contains the term** (substring match) is hard-dropped by `should_filter_by_constraints`. This fires *before* the soft-penalty ranking path, so it removes the page entirely rather than demoting it.
+- **Surfaced as:** `structured_constraints.hard_exclusions: ["<term>"]` and `applied_constraints: ["not:<term>"]` on `/search` and `/inspect`.
+- **Never forwarded upstream:** `preprocess_searxng_query` strips `NOT:` so SearXNG does not treat `<term>` as a literal search word and re-surface it.
+- **Alt-listing exemption (by design):** a comparison / "alternatives" page that merely *mentions* the excluded term in a referential context (alt-score > 0.3) is **kept**, exactly like the `site:` / `filetype:` negative gates and the committed test `not_operator_keeps_alt_listing_page`. So `"Best Flask Alternatives"` survives `NOT:flask`.
+- **Contrast with bare `not X`:** the natural-language `not X` is a *soft* topical penalty gated on entity/contrastive recognition (`is_real_exclusion`) — an unrecognized tech term like `flask` is *declined*, leaving flask pages in the results (the DEFECT-A limitation). `NOT:flask` always excludes it. Use `NOT:` when you know a term is off-topic and don't want to rely on entity recognition.
+
+**Verified live example** (gateway rebuilt at commit `c3ee023` + the `/search` integration fix from this round; `localhost:4000`, cold cache):
+
+```bash
+curl "http://localhost:4000/search?q=python%20web%20framework%20NOT:flask"
+# → 200; top-level:
+#   "query": "python web framework NOT:flask"
+#   "applied_constraints": ["not:flask"]
+#   "structured_constraints": { ... "hard_exclusions": ["flask"], "negative": [], ... }
+#   "results": [ ... ]   # non-exempt pages whose title/url mention "flask" are dropped;
+#                        # comparison pages that only reference flask (e.g.
+#                        # "Which Is the Best Python Web Framework: Django, Flask, or FastAPI?")
+#                        # are retained by the alt-listing exemption above
+```
+
+> **Honest note on the original feature commit:** commit `c3ee023` added the `NOT:` parser, the hard-drop gate, the upstream-strip, and the `/inspect` + `applied_constraints` reporting code, but the `/search` path never copied `gateway_extracted.hard_exclusions` into the merged `structured_constraints`. As a result `/inspect` reported `hard_exclusions: ["flask"]` while `/search` silently dropped the operator (`applied_constraints: null`, flask pages retained) — the feature's "verified cold" claim was only true at the unit/`/inspect` level, not in integrated `/search`. A follow-up fix (this round) copies `hard_exclusions` into the merged constraints so `/search` now hard-drops and reports `NOT:` as documented above. The regression test `not_operator_reported_in_inspect_applied_constraints` locks the reporting contract.
 
 **Natural language date ranges** are automatically converted:
 - `"past 7 days"`, `"last week"`, `"this month"` → `after:YYYY-MM-DD before:YYYY-MM-DD`
