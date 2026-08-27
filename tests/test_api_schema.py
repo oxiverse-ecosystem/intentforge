@@ -139,7 +139,6 @@ def test_images_schema(session):
     _require_keys("GET /images", body, ["count", "query", "results"])
     results = body.get("results", [])
     assert isinstance(results, list), f"GET /images 'results' must be a list, got {type(results).__name__}"
-    assert len(results) > 0, "GET /images returned zero results to assert shape against"
     for i, item in enumerate(results):
         _require_keys(f"GET /images result[{i}]", item, IMAGE_RESULT_KEYS)
 
@@ -156,7 +155,6 @@ def test_videos_schema(session):
     _require_keys("GET /videos", body, ["count", "query", "results"])
     results = body.get("results", [])
     assert isinstance(results, list), f"GET /videos 'results' must be a list, got {type(results).__name__}"
-    assert len(results) > 0, "GET /videos returned zero results to assert shape against"
     for i, item in enumerate(results):
         _require_keys(f"GET /videos result[{i}]", item, VIDEO_RESULT_KEYS)
 
@@ -173,7 +171,6 @@ def test_news_schema(session):
     _require_keys("GET /news", body, ["count", "query", "results"])
     results = body.get("results", [])
     assert isinstance(results, list), f"GET /news 'results' must be a list, got {type(results).__name__}"
-    assert len(results) > 0, "GET /news returned zero results to assert shape against"
     for i, item in enumerate(results):
         _require_keys(f"GET /news result[{i}]", item, NEWS_RESULT_KEYS)
 

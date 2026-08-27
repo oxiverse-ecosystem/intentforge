@@ -1958,7 +1958,7 @@ curl -s -X POST "http://localhost:4000/goals/quick" \
 #### Leaderboard
 
 ```bash
-curl -s "http://localhost:4000/goals/leaderboard" | jq '.entries[] | {goal, total_phases}'
+curl -s "http://localhost:4000/goals/leaderboard" | jq '.[] | {goal, total_phases}'
 ```
 
 #### Extract phase resources (with jq)

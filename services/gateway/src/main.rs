@@ -991,14 +991,23 @@ fn freshness_score(url: &str, intent: &str, published_date: Option<&str>, title:
     let mut estimated_age_hours: f32 = 168.0; // default: 7 days (less aggressive decay)
     let mut parsed_ok = false;
 
-    // Resolve the best date we can from upstream published_date, a URL-embedded
-    // year, or a date written in the title/content text. The upstream `publishedDate`
-    // field is frequently None (SearXNG news backends rarely populate it), so ranking
-    // on it alone leaves recency blind — a "latest X this week" query then ranks
-    // evergreen/undated pages by pure relevance. Falling back to resolve_item_date()
-    // (which already drives the after:/before: hard-filter) lets the freshness score
-    // actually decay stale items and boost recent ones. Generic: no per-query tuning.
-    let resolved = resolve_item_date(published_date, url, title, content);
+    // Resolve the best date we can from upstream published_date or a date written
+    // in the title/content text. The upstream `publishedDate` field is frequently
+    // None (SearXNG news backends rarely populate it), so ranking on it alone leaves
+    // recency blind — a "latest X this week" query then ranks evergreen/undated
+    // pages by pure relevance. Falling back to resolve_item_date() (which already
+    // drives the after:/before: hard-filter) lets the freshness score actually decay
+    // stale items and boost recent ones. Generic: no per-query tuning.
+    //
+    // Only accept full dates (from published_date or extract_date_from_text); a bare
+    // URL year represented as January 1 is too imprecise to set parsed_ok or compute
+    // age. Let the existing URL-year heuristic below assign its 24-hour age instead.
+    let resolved = if let Some(pd) = published_date {
+        parse_date_to_comparable(pd)
+    } else {
+        let text = format!("{} {}", title, content);
+        extract_date_from_text(&text)
+    };
     if let Some((y, m, d)) = resolved {
         let (cur_y, cur_m, cur_d) = today_ymd();
         let cur_days = ymd_to_days(cur_y, cur_m, cur_d);
@@ -2678,16 +2687,20 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     // Without this guard, "within 300 kilometers" was mis-read as price:<300
     // and the spurious price bound dropped relevant results (round 2026-08-15).
     // General, unit-aware — no per-query literals.
+    // Inspect only the immediate token following the number, not the entire rest.
     let distance_units = [
         "km", "kms", "kilometer", "kilometers", "kilometre", "kilometres",
         "mile", "miles", "mi", "meter", "meters", "metre", "metres",
         "foot", "feet", "ft", "yard", "yards", "yd",
     ];
     let is_distance_bound = |rest_after_num: &str| -> bool {
-        distance_units.iter().any(|u| {
-            let pat = format!(r"(?i)(?:^|[^a-z])\s*{}\b", regex::escape(u));
-            regex::Regex::new(&pat).map(|re| re.is_match(rest_after_num)).unwrap_or(false)
-        })
+        // Extract the next token after optional whitespace
+        let next_token = rest_after_num.trim_start()
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("");
+        let next_token_lower = next_token.to_lowercase();
+        distance_units.iter().any(|u| next_token_lower == *u)
     };
 
     // Pattern A: upper-marker then number (+ optional currency word)
@@ -4733,18 +4746,33 @@ fn query_is_contrastive(q_orig: &str) -> bool {
 fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     let q_lower = q_orig.to_lowercase();
     let words: Vec<&str> = q_lower.split_whitespace().collect();
-    // Subject terms = every content word in the query that is NOT a negation
-    // marker and NOT a low-signal stopword. When building a compound exclusion we
-    // stop the current target (and finalise it) as soon as one of these subject
-    // terms reappears — that word belongs to the main query topic, not to the
-    // thing being excluded (e.g. "...without django or flask python web frameworks"
-    // must not swallow "python web frameworks" into the `flask` exclusion).
-    let subject_terms: std::collections::HashSet<&str> = words
+
+    // Find the position of the first negation marker to split subject vs. excluded terms.
+    let neg_markers_for_split = ["not", "no", "without", "except", "excluding", "minus"];
+    let first_neg_pos = words.iter().position(|w| {
+        neg_markers_for_split.contains(w) || w.starts_with('-')
+            || (*w == "other" && words.get(words.iter().position(|x| *x == *w).unwrap() + 1).map(|x| *x == "than").unwrap_or(false))
+            || (*w == "rather" && words.get(words.iter().position(|x| *x == *w).unwrap() + 1).map(|x| *x == "than").unwrap_or(false))
+            || (*w == "alternative" && words.get(words.iter().position(|x| *x == *w).unwrap() + 1).map(|x| *x == "to").unwrap_or(false))
+            || (*w == "instead" && words.get(words.iter().position(|x| *x == *w).unwrap() + 1).map(|x| *x == "of").unwrap_or(false))
+    });
+
+    // Subject terms = every non-stopword content word appearing BEFORE the first
+    // negation marker. When building a compound exclusion we stop the current
+    // target (and finalise it) as soon as one of these subject terms reappears —
+    // that word belongs to the main query topic, not to the thing being excluded
+    // (e.g. "...without django or flask python web frameworks" must not swallow
+    // "python web frameworks" into the `flask` exclusion).
+    let subject_words = if let Some(pos) = first_neg_pos {
+        &words[..pos]
+    } else {
+        &words[..]
+    };
+    let subject_terms: std::collections::HashSet<&str> = subject_words
         .iter()
         .copied()
         .filter(|w| {
-            !["not", "no", "without", "except", "excluding", "minus", "other",
-              "rather", "instead", "than", "to", "of", "a", "an", "the", "from",
+            !["to", "of", "a", "an", "the", "from",
               "in", "on", "at", "for", "with", "by", "about", "any", "some",
               "using", "having", "is", "are", "was", "were", "be", "been",
               "being", "do", "does", "did", "have", "has", "had", "and", "or"]
@@ -13902,6 +13930,10 @@ fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
 /// Handles 0-99 directly and any magnitude via "X hundred/thousand [Y]" and
 /// "X thousand Y hundred [Z]" compositions (e.g. "two hundred fifty" -> "250",
 /// "one thousand two hundred" -> "1200", "nineteen" -> "19").
+///
+/// Only rewrites number-word runs when adjacent to a price marker or currency
+/// word, preserving original text elsewhere (so "nineteen eighty four" remains
+/// unchanged unless it appears in a price context).
 fn normalize_spoken_numbers(query: &str) -> String {
     let units: &[(&str, u32)] = &[
         ("zero", 0), ("ten", 10), ("eleven", 11), ("twelve", 12),
@@ -13912,9 +13944,20 @@ fn normalize_spoken_numbers(query: &str) -> String {
         ("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50),
         ("sixty", 60), ("seventy", 70), ("eighty", 80), ("ninety", 90),
     ];
+    let price_markers = [
+        "under", "below", "less", "cheaper", "max", "maximum", "over", "more",
+        "above", "minimum", "budget", "within", "around", "about", "price",
+    ];
+    let currency_words = [
+        "dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.",
+        "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw",
+        "$", "£", "€", "¥",
+    ];
+
     let tokens: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
     let mut out: Vec<String> = Vec::with_capacity(tokens.len());
     let mut i = 0;
+
     while i < tokens.len() {
         let tok = &tokens[i];
         // Look for a "hundred" or "thousand" scalar clause ending on that word.
@@ -13925,6 +13968,14 @@ fn normalize_spoken_numbers(query: &str) -> String {
         }
         let is_unit = units.iter().any(|(w, _)| w == tok);
         if is_unit {
+            // Check if adjacent to a price marker or currency word
+            let prev_is_price_context = if i > 0 {
+                let prev = &tokens[i - 1];
+                price_markers.contains(&prev.as_str()) || currency_words.contains(&prev.as_str())
+            } else {
+                false
+            };
+
             // Gather the contiguous run of number words.
             let mut j = i;
             let mut run: Vec<String> = Vec::new();
@@ -13935,48 +13986,55 @@ fn normalize_spoken_numbers(query: &str) -> String {
                 run.push(t.clone());
                 j += 1;
             }
-            // Parse the composed value.
-            let mut total: i64 = 0;
-            let mut current: i64 = 0;
-            let mut has_any = false;
-            let mut saw_scale = false;
-            for w in &run {
-                if *w == "hundred" {
-                    if current == 0 { current = 1; }
-                    total += current * 100;
-                    current = 0;
-                    saw_scale = true;
-                } else if *w == "thousand" {
-                    if current == 0 { current = 1; }
-                    total += current * 1000;
-                    current = 0;
-                    saw_scale = true;
-                } else {
-                    let v = units.iter().find(|(w2, _)| w2 == w).map(|(_, v)| *v).unwrap_or(0);
-                    if v >= 10 && v <= 90 && v % 10 == 0 {
-                        // tens (twenty..ninety) add directly
-                        current += v as i64;
+
+            // Check if followed by currency word
+            let next_is_price_context = if j < tokens.len() {
+                currency_words.contains(&tokens[j].as_str())
+            } else {
+                false
+            };
+
+            let in_price_context = prev_is_price_context || next_is_price_context;
+
+            if in_price_context {
+                // Parse the composed value.
+                let mut total: i64 = 0;
+                let mut current: i64 = 0;
+                let mut has_any = false;
+                for w in &run {
+                    if *w == "hundred" {
+                        if current == 0 { current = 1; }
+                        total += current * 100;
+                        current = 0;
+                    } else if *w == "thousand" {
+                        if current == 0 { current = 1; }
+                        total += current * 1000;
+                        current = 0;
                     } else {
-                        if current > 0 && v < 10 && !saw_scale {
-                            // e.g. "twenty one" -> 21 (tens already in current)
+                        let v = units.iter().find(|(w2, _)| w2 == w).map(|(_, v)| *v).unwrap_or(0);
+                        if v >= 10 && v <= 90 && v % 10 == 0 {
+                            // tens (twenty..ninety) add directly
+                            current += v as i64;
+                        } else {
+                            current += v as i64;
                         }
-                        if v < 10 { current += v as i64; }
-                        else { current += v as i64; }
+                        has_any = true;
                     }
-                    has_any = true;
+                }
+                let value = if total == 0 && current == 0 { 0 } else { total + current };
+                if has_any {
+                    out.push(value.to_string());
+                    i = j;
+                    continue;
                 }
             }
-            let value = if total == 0 && current == 0 { 0 } else { total + current };
-            if has_any {
-                out.push(value.to_string());
-                i = j;
-                continue;
-            } else {
-                // Not a parseable number run; emit as-is.
-                out.push(tok.clone());
-                i += 1;
-                continue;
+
+            // Not in price context or not parseable; emit original tokens
+            for token in &run {
+                out.push(token.clone());
             }
+            i = j;
+            continue;
         }
         out.push(tok.clone());
         i += 1;
