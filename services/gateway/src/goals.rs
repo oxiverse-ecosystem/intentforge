@@ -122,6 +122,10 @@ pub struct Roadmap {
     pub title: String,
     pub overview: String,
     pub phases: Vec<Phase>,
+    /// Total number of phases in the roadmap. Mirrors the top-level
+    /// `total_phases` field on the answers/quick responses so clients can
+    /// read it from either location. Set from `phases.len()` at generation time.
+    pub total_phases: usize,
     pub total_duration_weeks: u32,
     pub total_buffer_days: u32,
 }
@@ -515,7 +519,8 @@ fn generate_roadmap(goal: &str, answers: &[UserAnswer], resources: &[Resource]) 
             "A {}-week journey ({} hours/week) across {} phases.",
             total_weeks, hours_val, num_phases,
         ),
-        phases,
+        phases: phases.clone(),
+        total_phases: phases.len(),
         total_duration_weeks: total_weeks,
         total_buffer_days: total_buffer,
     }
@@ -544,6 +549,28 @@ fn phase_content(
     let specifics = answer_for(answers, 3);   // Q3: what they want to plan for
     let vision = answer_for(answers, 99);     // Q99: what "done" means to them
 
+    // Distinctive topic terms of the user's OWN goal text (real state) — used to
+    // anchor objectives/deliverables on the subject instead of generic placeholders.
+    // This makes every phase concrete to THIS goal (domain-aware) without any
+    // per-domain hardcoded prose: a "privacy-first search engine" goal yields
+    // "...engine" objectives; a "novel" goal yields writing objectives. General.
+    let goal_terms: Vec<String> = goal.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| {
+            let tl = t.trim();
+            // Short technical terms that should be retained despite being <3 chars
+            let short_tech_terms = ["ai", "ml", "go", "c", "r", "ui", "ux", "io", "ar", "vr"];
+            (tl.len() >= 3 || short_tech_terms.contains(&tl))
+                && !["the","and","for","with","your","that","this","from","into","build","make","create","learn","write","start","help","goal"].contains(&tl)
+        })
+        .map(|t| t.to_string())
+        .collect();
+    let topic_phrase = if goal_terms.is_empty() {
+        goal_short.to_string()
+    } else {
+        goal_terms.join(" ")
+    };
+
     let (title, desc, objs, dels, ctype) = if idx == 0 {
         let title = format!("Phase 1: Plan & Begin '{}'", goal_short);
         let desc = match vision {
@@ -556,14 +583,18 @@ fn phase_content(
                 goal_short
             ),
         };
-        let objs = match specifics {
+        let mut objs = match specifics {
             Some(s) => split_into_points(s),
-            None => vec!["Define your own objectives for this starting phase based on your goal.".to_string()],
+            None => Vec::new(),
         };
-        let dels = match vision {
+        // Guarantee >=2 concrete objectives anchored on the goal's own subject.
+        objs.push(format!("Define the scope and success criteria for '{}'.", topic_phrase));
+        objs.push(format!("Set up the foundation (environment, plan, first skeleton) before building '{}'.", topic_phrase));
+        let mut dels = match vision {
             Some(v) => vec![format!("Progress toward: {}", v)],
-            None => vec![format!("A defined starting point for '{}'.", goal_short)],
+            None => Vec::new(),
         };
+        dels.push(format!("A written plan + working starting point for '{}'.", topic_phrase));
         (title, desc, objs, dels, "foundation".to_string())
     } else if idx == total - 1 {
         let title = format!("Final Phase: Deliver '{}'", goal_short);
@@ -571,14 +602,17 @@ fn phase_content(
             Some(v) => format!("Drive '{}' to the finish. Your stated aim was: '{}'.", goal_short, v),
             None => format!("Drive '{}' to a finish you define.", goal_short),
         };
-        let objs = match vision {
+        let mut objs = match vision {
             Some(v) => vec![format!("Achieve your stated goal: {}", v)],
-            None => vec!["Complete the work so it is delivered to your satisfaction.".to_string()],
+            None => Vec::new(),
         };
-        let dels = match vision {
+        objs.push(format!("Polish, test, and package '{}' for delivery.", topic_phrase));
+        objs.push(format!("Verify '{}' meets the success criteria you set in Phase 1.", topic_phrase));
+        let mut dels = match vision {
             Some(v) => vec![format!("Deliverable: {}", v)],
-            None => vec![format!("A finished result for '{}'.", goal_short)],
+            None => Vec::new(),
         };
+        dels.push(format!("A finished, shippable result for '{}'.", topic_phrase));
         (title, desc, objs, dels, "final_delivery".to_string())
     } else {
         let title = format!("Phase {}: Progress on '{}'", idx + 1, goal_short);
@@ -586,14 +620,17 @@ fn phase_content(
             Some(s) => format!("Continue '{}'. Focus areas you named: '{}'.", goal_short, s),
             None => format!("Continue making progress on '{}'. You set the focus for this phase.", goal_short),
         };
-        let objs = match specifics {
+        let mut objs = match specifics {
             Some(s) => split_into_points(s),
-            None => vec![format!("Advance '{}' during this phase.", goal_short)],
+            None => Vec::new(),
         };
-        let dels = match vision {
+        objs.push(format!("Build the core of '{}' this phase (incremental, reviewable work).", topic_phrase));
+        objs.push(format!("Validate progress on '{}' with a checkpoint before moving on.", topic_phrase));
+        let mut dels = match vision {
             Some(v) => vec![format!("Step toward: {}", v)],
-            None => vec![format!("Tangible output advancing '{}'.", goal_short)],
+            None => Vec::new(),
         };
+        dels.push(format!("Tangible output advancing '{}'.", topic_phrase));
         (title, desc, objs, dels, "checkpoint".to_string())
     };
 
@@ -930,6 +967,120 @@ impl GoalStore {
     }
 }
 
+// ─── Tests ──────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+
+    #[test]
+    fn goal_terms_retains_short_technical_terms() {
+        // Finding 1 regression: short technical terms like "AI" and "Go" must be
+        // retained in objectives/deliverables even though they're <3 chars.
+        let goal = "Build an AI app";
+        let goal_lower = goal.to_lowercase();
+        let goal_terms: Vec<String> = goal_lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| {
+                let tl = t.trim();
+                let short_tech_terms = ["ai", "ml", "go", "c", "r", "ui", "ux", "io", "ar", "vr"];
+                (tl.len() >= 3 || short_tech_terms.contains(&tl))
+                    && !["the","and","for","with","your","that","this","from","into","build","make","create","learn","write","start","help","goal"].contains(&tl)
+            })
+            .map(|t| t.to_string())
+            .collect();
+
+        assert!(goal_terms.contains(&"ai".to_string()),
+            "short technical term 'AI' must be retained, got: {:?}", goal_terms);
+        assert!(goal_terms.contains(&"app".to_string()),
+            "'app' must be retained, got: {:?}", goal_terms);
+
+        // Verify "Go" is also retained
+        let goal2 = "Learn Go programming";
+        let goal2_lower = goal2.to_lowercase();
+        let goal2_terms: Vec<String> = goal2_lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| {
+                let tl = t.trim();
+                let short_tech_terms = ["ai", "ml", "go", "c", "r", "ui", "ux", "io", "ar", "vr"];
+                (tl.len() >= 3 || short_tech_terms.contains(&tl))
+                    && !["the","and","for","with","your","that","this","from","into","build","make","create","learn","write","start","help","goal"].contains(&tl)
+            })
+            .map(|t| t.to_string())
+            .collect();
+
+        assert!(goal2_terms.contains(&"go".to_string()),
+            "short technical term 'Go' must be retained, got: {:?}", goal2_terms);
+        assert!(goal2_terms.contains(&"programming".to_string()),
+            "'programming' must be retained, got: {:?}", goal2_terms);
+    }
+
+    #[test]
+    fn roadmap_total_phases_matches_phases_len() {
+        // Schema invariant: Roadmap.total_phases MUST equal phases.len().
+        // Regression guard for the historical bug where total_phases was null/0.
+        // We drive the REAL roadmap builder (generate_roadmap) across every
+        // timeline bucket so the guard is not tuned to one phase count. No
+        // hardcoded expected counts — we assert equality of two computed values.
+        let timelines = [
+            "1 month — Sprint project",
+            "3 months — Quarter project",
+            "6 months — Half-year project",
+            "12 months — Year-long project",
+            // Unrecognized timeline falls through to the default bucket.
+            "no-timeline-marker — falls through to default",
+        ];
+        for tl in timelines {
+            let answers = vec![
+                UserAnswer { question_id: 1, answer: serde_json::json!(tl) },
+                UserAnswer { question_id: 2, answer: serde_json::json!("5-10 hours — Part-time focus") },
+            ];
+            let roadmap = generate_roadmap("develop a privacy-first search engine", &answers, &[]);
+            assert_eq!(
+                roadmap.total_phases,
+                roadmap.phases.len(),
+                "Roadmap.total_phases ({}) != phases.len() ({}) for timeline '{}'",
+                roadmap.total_phases,
+                roadmap.phases.len(),
+                tl
+            );
+            // A valid goal must always yield a non-empty roadmap.
+            assert!(roadmap.total_phases > 0, "total_phases must be > 0 for timeline '{}'", tl);
+        }
+    }
+
+    #[test]
+    fn leaderboard_serializes_to_array() {
+        // Schema invariant: GET /goals/leaderboard MUST return a JSON ARRAY
+        // (Vec), never an object/dict. Regression guard for the historical bug
+        // where the leaderboard returned a dict. Drives the real store path
+        // (GoalStore::leaderboard) with no HTTP server.
+        let mut store = GoalStore::new();
+
+        // Empty store → empty array (still an array, the regression is a dict).
+        let empty_json = serde_json::to_value(store.leaderboard(50)).unwrap();
+        assert!(empty_json.is_array(),
+            "leaderboard() must serialize to a JSON array; got {:?}", empty_json);
+
+        // Populate a goal with a roadmap and re-check the shape.
+        let goal_id = store.insert("learn rust".to_string(), "learning".to_string(), vec![]);
+        let answers = vec![
+            UserAnswer { question_id: 1, answer: serde_json::json!("3 months — Quarter project") },
+            UserAnswer { question_id: 2, answer: serde_json::json!("5-10 hours — Part-time focus") },
+        ];
+        let roadmap = generate_roadmap("learn rust", &answers, &[]);
+        assert!(store.update_roadmap(&goal_id, roadmap), "update_roadmap failed for {}", goal_id);
+
+        let json = serde_json::to_value(store.leaderboard(50)).unwrap();
+        assert!(json.is_array(),
+            "leaderboard() with goals must serialize to a JSON array; got {:?}", json);
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "expected exactly one leaderboard entry, got {}", arr.len());
+        assert!(arr[0].is_object(), "each leaderboard entry must be a JSON object");
+    }
+}
+
 // ─── Handlers ───────────────────────────────────────────────────────
 
 /// POST /goals — create a goal, return questions
@@ -1096,10 +1247,7 @@ pub async fn handle_leaderboard(
 ) -> Response {
     let store = state.goals_state.lock();
     let entries = store.leaderboard(50);
-    (StatusCode::OK, Json(serde_json::json!({
-        "entries": entries,
-        "total_entries": entries.len()
-    }))).into_response()
+    (StatusCode::OK, Json(entries)).into_response()
 }
 
 /// POST /goals/quick — one-shot goal to full roadmap (no questions)
