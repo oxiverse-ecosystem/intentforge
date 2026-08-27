@@ -9235,7 +9235,7 @@ fn compute_recall_gap_terms(
                 r.url.to_lowercase()
             )
         })
-        .collect::<Vec<String>>();
+        .collect::<std::collections::HashSet<String>>();
 
     let missing: Vec<String> = topics
         .into_iter()
@@ -14855,7 +14855,7 @@ mod constraint_fix_tests {
             );
         }
         // Exact assertion for the canonical repro.
-        let (kept, _dropped) =
+        let (kept, _dropped, _manner) =
             extract_query_negative_terms_with_dropped("python web framework not django site:github.com");
         assert_eq!(kept, vec!["django".to_string()], "D3: 'not django site:github.com' → ['django'] only");
     }
