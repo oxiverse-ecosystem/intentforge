@@ -4415,6 +4415,13 @@ fn is_exclusion_grammar_noise(term: &str) -> bool {
     if tokens.iter().any(|t| SUBJECTIVE_QUALITY_TERMS.contains(t)) {
         return true;
     }
+    // A compound made ENTIRELY of grammar-noise function words ("have of",
+    // "from with") is itself grammar noise — every token is in the noise set,
+    // so the phrase carries no topical/entity meaning. Structural (closed-class
+    // vocabulary), no per-query tuning.
+    if !tokens.is_empty() && tokens.iter().all(|t| EXCLUSION_GRAMMAR_NOISE.contains(t)) {
+        return true;
+    }
     false
 }
 
