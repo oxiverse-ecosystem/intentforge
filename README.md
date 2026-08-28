@@ -460,19 +460,25 @@ The gateway is exposed at `https://api.oxiverse.com` (configurable in `services/
 
 ## License
 
-IntentForge v2 — Private Search Engine
-Copyright © 2026 Likhith Sai Seemala (Oxiverse)
+IntentForge is licensed under the **Oxiverse Community License (OCL)**.
 
-Licensed under the **Oxiverse Community License (OCL) v1.0** — a source-available,
-non-commercial license with privacy-by-design as a non-negotiable baseline.
+The full, always-current license text — including the current version, the
+commercial-licensing terms (closed-source self-hosting and open-source self-hosting
+paths), and the privacy-by-design requirements — is published at:
 
-- Full text: see [LICENSE](LICENSE)
-- Non-Commercial community use is permitted (student projects, portfolios, research,
-  internal evaluation). Modifications to the core codebase must remain under OCL v1.0.
-- Commercial use (SaaS, paid products, hosted offerings) requires a separate written
-  Commercial License — inquire at licensor@oxiverse.com
-- Independently developed apps that merely consume the hosted API/platform are NOT
-  derivative works and may be licensed under your choice of OSI-approved license or OCL.
+    https://oxiverse.com/license
+
+That page is the single source of truth (it renders the canonical LICENSE directly), so
+read it there rather than relying on a copied snapshot.
+
+Quick summary:
+- Non-Commercial community use (student projects, portfolios, research, internal evaluation) is permitted.
+- Modifications to the core codebase must remain under OCL.
+- Commercial use — SaaS, paid products, hosted offerings, or closed-source self-hosting — requires a separate Commercial License from Oxiverse (inquire at likhith@oxiverse.com).
+- Independently developed apps that merely consume the hosted API/platform are NOT derivative works and may be licensed under your choice of OSI-approved license or OCL.
+- Privacy-by-Design is a non-negotiable baseline for all use.
+
+This repository does not embed its own copy of the license to avoid drift.
 
 ## Roadmap
 
