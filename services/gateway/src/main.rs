@@ -4396,7 +4396,7 @@ const EXCLUSION_GRAMMAR_NOISE: &[&str] = &[
     "onto", "upon", "over", "under", "before", "after", "than", "that", "which",
     "this", "these", "those", "what", "when", "where", "who", "why", "how",
     "their", "them", "they", "our", "your", "his", "her", "its", "the", "a", "an",
-    "and", "or", "but", "not", "no", "any", "some", "all", "each", "every",
+    "and", "or", "but", "not", "no", "any", "some", "all", "each", "every", "of",
 ];
 
 /// True if `term` is a subjective-quality/sentiment adjective or a grammar-noise
