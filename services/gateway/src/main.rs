@@ -1444,10 +1444,23 @@ fn negative_term_matches_token(term_clean: &str, token_clean: &str) -> bool {
     if term_clean.len() < 3 {
         return false;
     }
-    // Compound/inflection match: token must START with the term (suffix like
-    // "js", "lang", "rest") and the term must dominate the token length.
-    if token_clean.starts_with(term_clean) {
-        let ratio = term_clean.len() as f32 / token_clean.len() as f32;
+    // Compound/inflection match: one side must START with the other and the
+    // shorter must dominate the longer's length (ratio >= 0.75). This catches
+    // both directions of stem mismatch:
+    //   - term is a prefix of token:  "react" ⊂ "reactjs"   (0.71 borderline)
+    //   - token is a prefix of term:  "subscribe" ⊂ "subscription" (9/12=0.75)
+    // The latter is the common "without subscription" -> page says "subscribe"
+    // case: previously the penalty never fired because only term-prefix logic
+    // existed, so the excluded-term page survived in the top results.
+    // Requiring the SHORTER to dominate >= 0.75 avoids collapsing distinct words
+    // ("java" ⊂ "javascript" = 0.4 firmly rejected).
+    let (shorter, longer) = if term_clean.len() <= token_clean.len() {
+        (term_clean, token_clean)
+    } else {
+        (token_clean, term_clean)
+    };
+    if longer.starts_with(shorter) {
+        let ratio = shorter.len() as f32 / longer.len() as f32;
         return ratio >= 0.75;
     }
     false
@@ -2383,6 +2396,28 @@ fn parse_price_range(s: &str) -> Option<ParsedPrice> {
 }
 
 /// Hard-filter results violating constraints beyond redemption.
+// Non-topical query-function words that the constraint extractor leaks into the
+// `positive` set from natural-language question phrasing ("what", "who", "how",
+// "use", "best", "good", ...). These match nearly every page, so they drown the
+// real topical signal and let grammar/dictionary/orphan pages outrank genuinely
+// relevant results (e.g. "what won the world chess championship" -> "Won -
+// Wiktionary" because `won` collides with the leaked `who`/`what` tokens).
+// Dropping them is data-driven (a general English question-word list, no
+// per-query literals) and makes the positive coverage signal meaningful. Terms
+// that are themselves topical (e.g. "use" as in "how to use X", "good" as a
+// product-quality intent) are intentionally NOT in this list — only pure
+// query scaffolding that never discriminates a result.
+const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
+    "what", "who", "whom", "whose", "which", "when", "where", "why", "how",
+    "are", "is", "was", "were", "be", "been", "being", "do", "does", "did",
+    "have", "has", "had", "can", "could", "should", "would", "will", "shall",
+    "may", "might", "must", "the", "a", "an", "and", "or", "of", "to", "for",
+    "in", "on", "at", "by", "with", "from", "as", "that", "this", "these",
+    "those", "my", "your", "our", "their", "me", "you", "i", "we", "they",
+    "it", "its", "there", "here", "about", "into", "out", "up", "down",
+    "best", "good", "great", "top", "better", "vs", "versus",
+];
+
 fn sanitize_constraints(c: &Constraints) -> Constraints {
     let mut negative: Vec<String> = Vec::new();
     let mut positive: Vec<String> = Vec::new();
@@ -2508,6 +2543,12 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
                 "inr", "rs", "rs.", "euros", "euro", "eur", "pounds", "pound",
                 "gbp", "yen", "jpy", "won", "krw", "cents", "cent", "paise", "paisa"];
             if currency_words.contains(&pl.as_str()) { continue; }
+            // Drop non-topical query-function words leaked from NL phrasing
+            // (see NON_TOPICAL_QUERY_WORDS). They match every page and drown the
+            // real topical signal, so a relevant result cannot outrank grammar /
+            // dictionary / orphan pages. Signal-driven: a general English
+            // question-word list, no per-query literals, no tuned thresholds.
+            if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) { continue; }
             // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
             // extraction (e.g. "under 15000" / "below 2000" can leave the digits
             // in `positive` as "+15000"). A purely-numeric positive carries no
