@@ -1495,7 +1495,14 @@ result:
   result, so the frontend can label facts and never show a stale price as current.
 - `affiliate` — added by the post-rank affiliate engine (see below). When no
   network key is present in the environment, this field is omitted and the result is
-  still returned (graceful degradation).
+  still returned (graceful degradation). When a network with a configured bid floor /
+  fallback is used, the block also carries `bid_floor` (the configured floor, for
+  reporting) and `fallback` (the fallback URL), both `Optional` and **never**
+  influencing ranking — see *Bid-floor / fallback (item 6)* below.
+- `offer_comparisons` — a top-level array (sibling of `results`) of multi-merchant
+  offer groups for the same product, built **read-only** from already-attached
+  `commerce` blocks (matched by shared `gtin`/`sku`). See *Offer comparison (item 5)*
+  below. Absent when no product has ≥2 offers with a shared identifier.
 
 **Query parameters:** identical to `/search` (`q`, `count`, `fresh`, etc.). This
 endpoint has **no ranking rules of its own**.
@@ -1528,16 +1535,19 @@ Top result (truncated):
   "affiliate": {
     "disclosed": true,
     "network": "Sovrn Commerce",
-    "url": "https://sovrn.co?key=dummy-test-key-do-not-use&u=https%3A%2F%2Fpowersof10.com%2Fbest-wireless-earbuds-under-50%2F&cuid=powersof10.com"
+    "url": "https://sovrn.co?key=dummy-test-key-do-not-use&u=https%3A%2F%2Fpowersof10.com%2Fbest-wireless-earbuds-under-50%2F&cuid=powersof10.com&bf=0.10&fbu=https%3A%2F%2Fwww.example-merchant.com%2F",
+    "bid_floor": "0.10",
+    "fallback": "https://www.example-merchant.com/"
   }
-}
 ```
 
 > The `affiliate.url` above uses the dev `SOVRN_COMMERCE_KEY=dummy-test-key-do-not-use`
 > from `docker-compose.dev.yml`. Production keys come from the runtime environment.
 > The destination (`u=`) is percent-encoded; the `cuid` is the coarse merchant host
 > only — no user id, query text, session id, or IP is ever placed in an affiliate
-> parameter.
+> parameter. `bf` (bid floor) and `fbu` (fallback URL) are appended as query params
+> from the network's data-configured `bid_floor` / `fallback_url` fields and are for
+> reporting / fallback only — they never affect ranking.
 
 **No-manipulation guarantee (verified live):** the ranked URL order from
 `/shopping` is byte-identical to `/search` for the same query. This is locked in CI
@@ -1580,6 +1590,52 @@ editing data, never recompiling. Keys come from environment variables named by
 `key_env` (e.g. `SOVRN_COMMERCE_KEY`, `EBAY_EPN_CAMPAIGN_ID`, `AMAZON_ASSOCIATES_TAG`).
 Missing key ⇒ the result degrades to `affiliate: null`. See `STATE.md` under
 `.hermes-qa/commerce/` for the increment roadmap and current status.
+
+#### Bid-floor / fallback support (item 6, 2026-08-29)
+
+`AffiliateNetwork` (in `affiliate.json`) gained two **data-only** optional fields:
+`bid_floor` (Sovrn `bf` — a bid floor) and `fallback_url` (Sovrn `fbu` — the URL used
+if the floor isn't met). The generic renderer appends them as `bf=` / `fbu=` query
+params on the decorated URL and surfaces `bid_floor` / `fallback` in the `affiliate`
+block for operator reporting. **Neither influences ranking** — decoration runs strictly
+after the ranked order is fixed, so they cannot move a result. Adding `bf`/`fbu`
+support for a new network is a pure data edit (no recompile); the dev config already
+sets `bid_floor: "0.10"` on the Sovrn row.
+
+**Verified live** (`GET /shopping?q=sony%20wh-1000xm5%20headphones`, 6 results,
+decoration ON with the dev key):
+
+```
+affiliate sample keys: ['bid_floor', 'disclosed', 'fallback', 'network', 'url']
+bid_floor = 0.10   fallback = https://www.example-merchant.com/   disclosed = true
+```
+
+#### Offer comparison (item 5, 2026-08-29)
+
+`build_offer_comparisons()` is a **read-only, post-enrichment** view over the already
+attached `commerce` blocks. It groups results that share a `gtin` (preferred) or `sku`,
+orders each group's `MerchantOffer` entries by extracted price ascending, and flags
+`mixed_observation_times` when the grouped offers were observed at different times (so
+the frontend never presents a stale-vs-fresh spread as simultaneous). A group needs ≥2
+offers with a shared identifier — it **never** fabricates a comparison across unrelated
+products. Returned as the top-level `offer_comparisons` array on `/shopping`; absent
+when no product qualifies.
+
+**Verified by unit tests** (`item5_groups_by_gtin_sorts_by_price_and_flags_mixed_times`,
+`item5_no_comparison_without_shared_id`): a 2-offer shared-`gtin` product groups and
+sorts by price with `mixed_observation_times=true`; distinct `gtin`s never merge.
+
+#### Order-invariance is locked at every layer
+
+Three independent guards prove monetization never touches ranking:
+1. `enrichment_preserves_result_order_with_or_without_affiliate_keys` (decoration ON vs OFF → identical `url` order).
+2. `test_affiliate_decoration_does_not_change_ranking` (order-invariance contract in CI forever).
+3. `item6_bf_fbu_never_change_ranking` (the SAME guarantee, now WITH `bf`/`fbu` present).
+
+**Verified live** (2026-08-29, `sony wh-1000xm5 headphones`, 6 results):
+`ORDER IDENTICAL (shopping vs search): True` — the ranked URL list (order + URLs +
+count) is byte-identical whether affiliate decoration (now WITH `bf`/`fbu`) is ON
+(`/shopping`) or OFF (`/search`).
 
 ---
 
