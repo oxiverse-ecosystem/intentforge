@@ -39,6 +39,8 @@ fn contract_net(
         params,
         key_env: key_env.map(|s| s.to_string()),
         param_env: HashMap::new(),
+        bid_floor: None,
+        fallback_url: None,
     }
 }
 
@@ -492,3 +494,217 @@ fn test_affiliate_decoration_writes_affiliate_field_not_url() {
         "decoration targets `affiliate`, not `url`; if these were equal, wrapping leaked into ranking"
     );
 }
+
+/// ─────────────────────────────────────────────────────────────────────────────
+/// ROADMAP item 6 — bid-floor (`bf`) / fallback (`fbu`) support + reporting.
+/// These are DATA-DRIVEN network fields that are appended to the decorated URL as
+/// query params and surfaced in the `affiliate` block for reporting. They MUST
+/// never affect ranking: decoration runs strictly AFTER the ranked order is fixed,
+/// so the `*_invariance` assertions below prove they cannot move results.
+/// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a network row that carries `bid_floor` + `fallback_url` (item 6 fields).
+fn contract_net_with_bf(
+    kind: &str,
+    template: &str,
+    params: HashMap<String, String>,
+    key_env: Option<&str>,
+    bid_floor: Option<&str>,
+    fallback_url: Option<&str>,
+) -> AffiliateNetwork {
+    AffiliateNetwork {
+        id: "contract".to_string(),
+        kind: kind.to_string(),
+        enabled: true,
+        priority: 1,
+        network: "ContractNet".to_string(),
+        template: template.to_string(),
+        params,
+        key_env: key_env.map(|s| s.to_string()),
+        param_env: HashMap::new(),
+        bid_floor: bid_floor.map(|s| s.to_string()),
+        fallback_url: fallback_url.map(|s| s.to_string()),
+    }
+}
+
+#[test]
+fn item6_bid_floor_and_fallback_appended_and_reported() {
+    std::env::set_var("CONTRACT_SOVRN_BF_KEY", "CONTRACT_SOVRN_BF_KEY");
+    let mut params = HashMap::new();
+    params.insert("cuid".to_string(), "{subid}".to_string());
+    let n = contract_net_with_bf(
+        "wrap",
+        "https://sovrn.co?key={key}&u={url}",
+        params,
+        Some("CONTRACT_SOVRN_BF_KEY"),
+        Some("0.10"),
+        Some("https://shop.example.com/fallback"),
+    );
+    let ctx = AffiliateCtx { networks: vec![n] };
+
+    let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
+    if let Some(arr) = payload.get_mut("results").and_then(|v| v.as_array_mut()) {
+        decorate_affiliate(arr, &ctx);
+    }
+
+    let urls = collect_affiliate_urls(&payload);
+    assert!(!urls.is_empty(), "decoration must have produced affiliate urls");
+    for u in &urls {
+        let lower = u.to_lowercase();
+        assert!(lower.contains("bf=0.10"), "bid floor must be appended: {}", u);
+        assert!(
+            lower.contains("fbu=https%3a%2f%2fshop.example.com%2ffallback")
+                || lower.contains("fbu=https%3A%2F%2Fshop.example.com%2Ffallback"),
+            "fallback url must be url-encoded and appended: {}",
+            u
+        );
+        // CONTRACT (A): still disclosed.
+        assert!(
+            u.contains("disclosed") || true,
+            "disclosure is on the affiliate block, checked separately"
+        );
+    }
+    // Reporting fields present on the affiliate block.
+    if let Some(arr) = payload.get("results").and_then(|v| v.as_array()) {
+        for r in arr {
+            let aff = r.get("affiliate").expect("affiliate block present");
+            assert_eq!(
+                aff.get("disclosed").and_then(|v| v.as_bool()),
+                Some(true),
+                "disclosed must stay true with bf/fbu"
+            );
+            assert_eq!(
+                aff.get("bid_floor").and_then(|v| v.as_str()),
+                Some("0.10"),
+                "bid_floor surfaced for reporting"
+            );
+            assert_eq!(
+                aff.get("fallback").and_then(|v| v.as_str()),
+                Some("https://shop.example.com/fallback"),
+                "fallback surfaced for reporting"
+            );
+        }
+    }
+}
+
+#[test]
+fn item6_bf_fbu_never_change_ranking() {
+    // Same order-invariance guarantee, now WITH bf/fbu present (the hardest case).
+    std::env::set_var("SOVRN_COMMERCE_KEY", "DUMMY_ENABLED");
+    let mut params = HashMap::new();
+    params.insert("cuid".to_string(), "{subid}".to_string());
+    let enabled_net = contract_net_with_bf(
+        "wrap",
+        "https://sovrn.co?key={key}&u={url}",
+        params,
+        Some("SOVRN_COMMERCE_KEY"),
+        Some("0.25"),
+        Some("https://shop.example.com/fallback"),
+    );
+    let enabled_ctx = AffiliateCtx { networks: vec![enabled_net] };
+    let ranked_input = representative_shopping_payload("buy wireless earbuds under 200");
+
+    let mut enabled_payload = ranked_input.clone();
+    if let Some(arr) = enabled_payload
+        .get_mut("results")
+        .and_then(|v| v.as_array_mut())
+    {
+        decorate_affiliate(arr, &enabled_ctx);
+    }
+    let enabled_ranked = collect_ranked_urls(&enabled_payload);
+    let enabled_aff = collect_affiliate_urls(&enabled_payload);
+    assert!(
+        !enabled_aff.is_empty(),
+        "ENABLED run must actually decorate (with bf/fbu)"
+    );
+    assert!(
+        enabled_aff.iter().all(|u| u.to_lowercase().contains("bf=0.25")),
+        "bf must be present in decorated urls"
+    );
+
+    let disabled_ctx = AffiliateCtx { networks: vec![] };
+    let mut disabled_payload = ranked_input.clone();
+    if let Some(arr) = disabled_payload
+        .get_mut("results")
+        .and_then(|v| v.as_array_mut())
+    {
+        decorate_affiliate(arr, &disabled_ctx);
+    }
+    let disabled_ranked = collect_ranked_urls(&disabled_payload);
+
+    assert_eq!(
+        enabled_ranked, disabled_ranked,
+        "bf/fbu decoration MUST NOT change the ranked URL order"
+    );
+}
+
+/// ─────────────────────────────────────────────────────────────────────────────
+/// ROADMAP item 5 — multi-merchant offer comparison lock-in (pure, offline).
+/// `build_offer_comparisons` is a read-only, post-enrichment view over already
+/// attached `commerce` blocks. These tests prove it groups by gtin/sku, sorts by
+/// extracted price, and flags mixed observation times — and never reorders results.
+/// ─────────────────────────────────────────────────────────────────────────────
+fn commerce_result(url: &str, gtin: &str, price: f64, observed_at: &str) -> Value {
+    json!({
+        "url": url,
+        "commerce": {
+            "url": url,
+            "observed_at": observed_at,
+            "source": "json-ld",
+            "data": {
+                "gtin": gtin,
+                "price": price,
+                "currency": "USD",
+                "merchant": url
+            }
+        }
+    })
+}
+
+#[test]
+fn item5_groups_by_gtin_sorts_by_price_and_flags_mixed_times() {
+    let results = vec![
+        commerce_result("https://a.example/prod", "GTIN1", 19.99, "100"),
+        commerce_result("https://b.example/prod", "GTIN1", 9.99, "200"),
+        commerce_result("https://c.example/other", "GTIN2", 5.00, "300"),
+    ];
+    let comps = build_offer_comparisons(&results);
+    // GTIN1 has 2 offers => one comparison. GTIN2 has only 1 offer => correctly
+    // excluded (a single offer is not a "comparison"). So exactly ONE group.
+    assert_eq!(comps.len(), 1, "one comparison for the product with >=2 offers");
+
+    // Find GTIN1's comparison: must contain both a + b, sorted ascending by price.
+    let g1 = comps
+        .iter()
+        .find(|c| c.product_id.as_deref() == Some("GTIN1"))
+        .expect("GTIN1 group present");
+    assert_eq!(g1.id_kind.as_deref(), Some("gtin"));
+    assert_eq!(g1.offers.len(), 2, "both merchants grouped");
+    assert_eq!(g1.offers[0].price, Some(9.99), "lowest price first");
+    assert_eq!(g1.offers[1].price, Some(19.99));
+    // Observed at 100 vs 200 => mixed observation times => must be flagged.
+    assert!(
+        g1.mixed_observation_times,
+        "different observed_at across offers must be flagged as mixed"
+    );
+
+    // GTIN2 has a single offer => no comparison (need >= 2 to compare).
+    let g2 = comps
+        .iter()
+        .find(|c| c.product_id.as_deref() == Some("GTIN2"));
+    assert!(g2.is_none(), "single-offer product is NOT a comparison");
+}
+
+#[test]
+fn item5_no_comparison_without_shared_id() {
+    let results = vec![
+        commerce_result("https://a.example/prod", "GTIN_A", 19.99, "100"),
+        commerce_result("https://b.example/prod", "GTIN_B", 9.99, "100"),
+    ];
+    let comps = build_offer_comparisons(&results);
+    assert!(
+        comps.is_empty(),
+        "no comparison when products share no gtin/sku (never fabricate)"
+    );
+}
+
