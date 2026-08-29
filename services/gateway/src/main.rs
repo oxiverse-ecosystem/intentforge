@@ -3520,7 +3520,16 @@ struct AffiliateNetwork {
     #[serde(default)]
     key_env: Option<String>,
     #[serde(default)]
-    param_env: std::collections::HashMap<String, String>,
+    param_env: HashMap<String, String>,
+    /// Bid floor (Sovrn `bf`) appended as a query param on the decorated URL.
+    /// DATA-ONLY — never influences ranking (decoration is a strict post-ranking
+    /// pass). Surfaced in the `affiliate` block for reporting.
+    #[serde(default)]
+    bid_floor: Option<String>,
+    /// Fallback URL (Sovrn `fbu`) used if the bid floor isn't met. Appended
+    /// url-encoded as a query param. DATA-ONLY.
+    #[serde(default)]
+    fallback_url: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -3653,29 +3662,44 @@ fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> 
     // The base template, with scalar + {param:*} tokens filled.
     let base = fill(&net.template);
 
-    // Both kinds append the network's own `params` (encoded). For `wrap` these
-    // become extra query pairs on the network prefix; for `append_params` they
-    // attach to the raw destination URL. This is why a `wrap` network like Sovrn
-    // can carry `cuid={subid}` — it must NOT be dropped.
-    if !net.params.is_empty() {
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        for (k, v) in &net.params {
-            let val = fill(v);
-            if val.is_empty() {
-                continue;
-            }
-            pairs.push((k.clone(), val));
+    // Merge the network's own `params` plus the generic bid-floor / fallback
+    // fields (ROADMAP item 6) into one query-pair list. ALL THREE are
+    // DATA-DRIVEN — none is hardcoded here. `bf`/`fbu` are pure reporting/fallback
+    // signals that NEVER affect ranking: decoration runs strictly AFTER the ranked
+    // order is fixed (see `decorate_affiliate` + the order-invariance test), so
+    // nothing appended here can move a result's position.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (k, v) in &net.params {
+        let val = fill(v);
+        if val.is_empty() {
+            continue;
         }
-        if !pairs.is_empty() {
-            let encoded: Vec<String> = pairs
-                .iter()
-                .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
-                .collect();
-            if base.contains('?') {
-                return format!("{}&{}", base, encoded.join("&"));
-            } else {
-                return format!("{}?{}", base, encoded.join("&"));
-            }
+        pairs.push((k.clone(), val));
+    }
+    if let Some(bf) = &net.bid_floor {
+        let val = fill(bf);
+        if !val.is_empty() {
+            pairs.push(("bf".to_string(), val));
+        }
+    }
+    if let Some(fbu) = &net.fallback_url {
+        // fbu is itself a URL. We must NOT pre-encode it here: the final
+        // query-pair encoding step below encodes every value exactly once, so
+        // passing the raw URL avoids a double-encoding bug (raw => encoded once).
+        let val = fbu.clone();
+        if !val.is_empty() {
+            pairs.push(("fbu".to_string(), val));
+        }
+    }
+    if !pairs.is_empty() {
+        let encoded: Vec<String> = pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect();
+        if base.contains('?') {
+            return format!("{}&{}", base, encoded.join("&"));
+        } else {
+            return format!("{}?{}", base, encoded.join("&"));
         }
     }
     base
@@ -3708,12 +3732,24 @@ fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
             .and_then(|u| u.host_str().map(|h| h.to_string()))
             .unwrap_or_default();
         let aff_url = render_affiliate_url(net, &url, &subid);
-        let block = serde_json::json!({
-            "network": net.network,
-            "url": aff_url,
-            "disclosed": true,
-        });
-        r["affiliate"] = block;
+        // Reporting fields (ROADMAP item 6): surface the configured bid floor /
+        // fallback so operators can report on monetization. These are DATA-driven
+        // (from the network config) and are NEVER used for ranking. `disclosed`
+        // stays true so the frontend can label the result.
+        let mut block = serde_json::Map::new();
+        block.insert(
+            "network".to_string(),
+            serde_json::Value::String(net.network.clone()),
+        );
+        block.insert("url".to_string(), serde_json::Value::String(aff_url));
+        block.insert("disclosed".to_string(), serde_json::Value::Bool(true));
+        if let Some(bf) = &net.bid_floor {
+            block.insert("bid_floor".to_string(), serde_json::Value::String(bf.clone()));
+        }
+        if let Some(fbu) = &net.fallback_url {
+            block.insert("fallback".to_string(), serde_json::Value::String(fbu.clone()));
+        }
+        r["affiliate"] = serde_json::Value::Object(block);
     }
 }
 
@@ -17887,6 +17923,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
             params,
             key_env: key.map(|s| s.to_string()),
             param_env: HashMap::new(),
+            bid_floor: None,
+            fallback_url: None,
         }
     }
 

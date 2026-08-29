@@ -11,7 +11,9 @@
       "template": "https://sovrn.co?key={key}&u={url}",
       "params": { "cuid": "{subid}" },
       "key_env": "SOVRN_COMMERCE_KEY",
-      "param_env": {}
+      "param_env": {},
+      "bid_floor": "0.10",
+      "fallback_url": "https://www.example-merchant.com/"
     },
     {
       "id": "skimlinks",
