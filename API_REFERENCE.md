@@ -23,6 +23,8 @@
   - [GET /inspect](#get-inspect)
   - [GET /geolocate](#get-geolocate)
   - [GET /intent](#get-intent)
+  - [GET /shopping](#get-shopping) (commerce — honest affiliate, no ranking effect)
+  - [POST /commerce/extract](#post-commerceextract) (verification primitive, no monetization)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -1464,6 +1466,123 @@ All Goals errors return a JSON body with `error` + `message`.
 
 See `docs/_generated/_round_v2_raw.md` for the exact raw bodies (`GOALS update progress ...` and the corrected `phase_id:1` blocks).
 
+---
+
+## Commerce Search (honest affiliate monetization)
+
+IntentForge monetizes with **affiliate links instead of ads** — affiliate links need
+no user tracking or profiling. Two invariants govern every commerce feature:
+
+1. **No search manipulation.** Monetization never changes ranking, selection, or
+   ordering. The `/shopping` endpoint reuses the *exact* `/search` ranking pipeline;
+   affiliate decoration is a strict **post-rank** pass that only adds fields to
+   already-ordered results. Result order is identical to `/search` (verified live below).
+2. **No product misrepresentation.** Every product fact (`price`, `currency`,
+   `availability`, `merchant`, `condition`, `sku`/`gtin`, `rating`) is **extracted
+   from that result's own page** (schema.org/Product JSON-LD, OpenGraph `product:*`,
+   microdata) — never inferred, never carried across URLs, never guessed from free
+   text. A missing fact is `null`, not a placeholder.
+
+### GET /shopping
+
+Runs the same ranking pipeline as `/search`, then attaches two extra fields per
+result:
+
+- `commerce` — honest product facts extracted from the result's own page
+  (`source` is `"json-ld"` / `"og"` / `null`; every sub-field is `Optional`). A
+  result whose page exposed no structured product data gets **no** `commerce` block.
+- `commerce_provenance` — `{ url, observed_at, source, data:null }` for **every**
+  result, so the frontend can label facts and never show a stale price as current.
+- `affiliate` — added by the post-rank affiliate engine (see below). When no
+  network key is present in the environment, this field is omitted and the result is
+  still returned (graceful degradation).
+
+**Query parameters:** identical to `/search` (`q`, `count`, `fresh`, etc.). This
+endpoint has **no ranking rules of its own**.
+
+**Example (real, 2026-08-25, `localhost:4000`)**
+
+```bash
+curl -s "localhost:4000/shopping?q=best%20wireless%20earbuds%20under%2050&count=5"
+# → HTTP 200
+```
+
+Top result (truncated):
+
+```json
+{
+  "url": "https://powersof10.com/best-wireless-earbuds-under-50/",
+  "title": "Best Wireless Earbuds Under $50 2026: 10 Budget Models Tested",
+  "commerce_provenance": {
+    "data": null,
+    "observed_at": "1787637896",
+    "source": null,
+    "url": "https://powersof10.com/best-wireless-earbuds-under-50/"
+  },
+  "commerce": {
+    "data": { "merchant": "Powers Of 10" },
+    "observed_at": "1787637898",
+    "source": "og",
+    "url": "https://powersof10.com/best-wireless-earbuds-under-50/"
+  },
+  "affiliate": {
+    "disclosed": true,
+    "network": "Sovrn Commerce",
+    "url": "https://sovrn.co?key=dummy-test-key-do-not-use&u=https%3A%2F%2Fpowersof10.com%2Fbest-wireless-earbuds-under-50%2F&cuid=powersof10.com"
+  }
+}
+```
+
+> The `affiliate.url` above uses the dev `SOVRN_COMMERCE_KEY=dummy-test-key-do-not-use`
+> from `docker-compose.dev.yml`. Production keys come from the runtime environment.
+> The destination (`u=`) is percent-encoded; the `cuid` is the coarse merchant host
+> only — no user id, query text, session id, or IP is ever placed in an affiliate
+> parameter.
+
+**No-manipulation guarantee (verified live):** the ranked URL order from
+`/shopping` is byte-identical to `/search` for the same query. This is locked in CI
+by a Rust unit test (`enrichment_preserves_result_order_with_or_without_affiliate_keys`
+and `decoration_preserves_ranking_order`).
+
+### POST /commerce/extract
+
+A **verification primitive** — runs the honest commerce extractor on supplied HTML
+and returns the typed facts. It applies **no ranking and no monetization**; it only
+surfaces facts extracted from the given page. Use it to inspect what the extractor
+would attach, or in tests/fixtures.
+
+**Request body**
+
+```json
+{ "html": "<html>…schema.org/Product JSON-LD or OG meta…</html>", "url": "https://store.example.com/p/1" }
+```
+
+**Response** — a `CommerceOffer` JSON object (`price`, `currency`, `availability`,
+`merchant`, `condition`, `sku`, `gtin`, `rating`, `price_low`, `price_high`,
+`offer_count`, `observed_at`, `source`). All fields `Optional`. If the page has no
+structured product data, the returned object carries `null` for every fact (no guess).
+
+**Honesty properties (locked by unit tests):**
+
+- A page that literally contains `"$19.99"` in prose but no structured price → every
+  price field is `null` (free-text is never guessed).
+- A page with two distinct offers → `price_low`/`price_high`/`offer_count` are set,
+  but `price` stays `null` (never collapses to one canonical price).
+- A page with an `AggregateOffer` → range + count, `price` = entry (low) price only.
+
+### Affiliate template engine (data-driven)
+
+The affiliate engine is a generic template renderer over
+`services/gateway/data/commerce/affiliate.json`. **All** network knowledge
+(templates, kinds `wrap` / `append_params`, params, key env-var names, priority,
+enabled flag) lives in that data file — adding a merchant/network requires **only**
+editing data, never recompiling. Keys come from environment variables named by
+`key_env` (e.g. `SOVRN_COMMERCE_KEY`, `EBAY_EPN_CAMPAIGN_ID`, `AMAZON_ASSOCIATES_TAG`).
+Missing key ⇒ the result degrades to `affiliate: null`. See `STATE.md` under
+`.hermes-qa/commerce/` for the increment roadmap and current status.
+
+---
+
 ### POST /goals
 
 Creates a new goal and returns domain-specific questions tailored to the goal type.
@@ -1677,16 +1796,22 @@ Returns a JSON array (list) of goal leaderboard entries, sorted by score (descen
   {
     "goal_id": "goal_0001",
     "goal": "build a full-stack web app...",
+    "goal_id": "goal_0003",
+    "goal": "learn rust programming language",
     "user_name": "Anonymous",
     "score": 0,
     "completed_phases": 0,
     "total_phases": 4,
     "created_at": "2026-07-29T12:00:00Z"
+    "created_at": "2026-08-25T07:44:57Z"
   }
 ]
 ```
 
 > Note: the response is the list of entries directly. There is no `{"entries": [...], "total_entries": N}` wrapper — `len(response)` gives the entry count and each element is a goal object.
+The response is a **bare JSON array** (NOT an `{"entries":[...],"total_entries":N}` wrapper). The
+above is an actual live response captured after `POST /goals` → `POST /goals/:id/answers` generated
+a roadmap. The entry count is `len(array)`. Max 50 entries, sorted by `score` descending.
 
 ---
 

@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "note": "Runtime-loaded affiliate network config. Adding a merchant/network requires ONLY editing this file — no recompile. Keys/secrets come from ENVIRONMENT VARIABLES (see key_env / param_env), never hardcoded here. Two template kinds: 'wrap' (network prefix + url-encoded destination, e.g. Sovrn/Skimlinks) and 'append_params' (add query params to the merchant URL, e.g. eBay EPN / Amazon).",
+  "networks": [
+    {
+      "id": "sovrn",
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 100,
+      "network": "Sovrn Commerce",
+      "template": "https://sovrn.co?key={key}&u={url}",
+      "params": { "cuid": "{subid}" },
+      "key_env": "SOVRN_COMMERCE_KEY",
+      "param_env": {}
+    },
+    {
+      "id": "skimlinks",
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 90,
+      "network": "Skimlinks",
+      "template": "https://go.redirectingat.com/?xid={key}&url={url}",
+      "params": {},
+      "key_env": "SKIMLINKS_XID",
+      "param_env": {}
+    },
+    {
+      "id": "ebay_epn",
+      "kind": "append_params",
+      "enabled": true,
+      "priority": 80,
+      "network": "eBay Partner Network",
+      "template": "{url}",
+      "params": {
+        "mkevt": "1",
+        "mkcid": "1",
+        "mkrid": "{key}",
+        "campid": "{param:campaign_id}",
+        "toolid": "10001",
+        "customid": "{subid}"
+      },
+      "key_env": "EBAY_EPN_ROTATION_ID",
+      "param_env": { "campaign_id": "EBAY_EPN_CAMPAIGN_ID" }
+    },
+    {
+      "id": "amazon_associates",
+      "kind": "append_params",
+      "enabled": true,
+      "priority": 70,
+      "network": "Amazon Associates",
+      "template": "{url}",
+      "params": { "tag": "{key}" },
+      "key_env": "AMAZON_ASSOCIATES_TAG",
+      "param_env": {}
+    }
+  ]
+}
