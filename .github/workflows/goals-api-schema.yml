@@ -9,7 +9,7 @@ name: goals-api-schema-tests
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, 'auto/**']
   pull_request:
     branches: [master, main]
 
