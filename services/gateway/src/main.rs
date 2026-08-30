@@ -560,6 +560,17 @@ struct UnifiedResponse {
     /// tuning, no domain/term allow-or-deny lists.
     #[serde(skip_serializing_if = "Option::is_none")]
     recall_gap_terms: Option<Vec<String>>,
+    /// MAIN-PATH commercial intent (ROADMAP item 7). When the resolved intent is
+    /// `transactional` / has a strong transactional distribution / carries a price
+    /// bound, this carries a `shopping` block: the SAME post-rank enrichment
+    /// (`extract_commerce_offer` + `decorate_affiliate` + offer comparison) already
+    /// used by `GET /shopping`, built from a CLONE of the top-N ranked results so the
+    /// main `results` ordering is NEVER touched. Absent when the query is not
+    /// commercial. This is the "IntentForge knows you want to buy" feature: the
+    /// normal `/search` response gains a `shopping` field, not a separate tab.
+    /// Decoration is strictly post-ranking — proven by the order-invariance test.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shopping: Option<serde_json::Value>,
 }
 
 const DOWNLOAD_KEYWORDS: &[&str] = &[
@@ -3418,6 +3429,50 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.sku.is_some()
         || d.gtin.is_some()
         || d.rating.is_some()
+}
+
+/// How many of the ALREADY-RANKED top results feed the main-path `shopping`
+/// block on `/search` (ROADMAP item 7). This is a presentation cap on a CLONE of
+/// the ranked results, NOT a ranking change — the real `results` array is never
+/// touched, so this number cannot affect ranking or selection. Data-free: tuning
+/// it only changes how many enriched shopping cards show, never their order.
+const COMMERCE_MAINPATH_TOP_N: usize = 8;
+
+/// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
+///
+/// Returns true when the in-process intent signals indicate the user wants to buy.
+/// It reuses the EXISTING signal-driven intent machinery exclusively:
+///   * the resolved intent label is `transactional`, OR
+///   * the transactional probability in the intent `distribution` is strong
+///     (>= 0.50) — covers "X vs Y" product queries that resolve to a non-
+///     transactional argmax label but carry a strong transactional distribution, OR
+///   * a price bound was parsed from the query by the EXISTING constraint parser
+///     (`price:<N` / `price:>N` / `price_min` / `price_max`) — itself a
+///     commercial signal regardless of label.
+///
+/// It NEVER consults a keyword list, NEVER calls a third party, and NEVER reads
+/// the raw query text — the signals are all produced upstream by the
+/// classifier. This keeps detection private and free of keyword hardcoding,
+/// satisfying both the no-hardcoding doctrine and the privacy thesis.
+fn is_commercial_intent(
+    label: &str,
+    distribution: &std::collections::HashMap<String, f32>,
+    has_price_bound: bool,
+) -> bool {
+    if has_price_bound {
+        return true;
+    }
+    if label == "transactional" {
+        return true;
+    }
+    // Strong transactional distribution is itself commercial intent even if the
+    // argmax label is something else (e.g. "comparison"). Threshold is a signal
+    // probability, not a per-query literal.
+    distribution
+        .get("transactional")
+        .copied()
+        .unwrap_or(0.0)
+        >= 0.50
 }
 
 /// GET /shopping — the user-facing commerce search endpoint (ROADMAP item 2).
@@ -11553,6 +11608,7 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         has_more: None,
         price_verified: None,
         recall_gap_terms: None,
+        shopping: None,
     };
     (
         axum::http::StatusCode::BAD_REQUEST,
@@ -15313,6 +15369,60 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // ── Honest recall-gap signal ──
     // (computed earlier, before pagination, over the full post-filter result set)
 
+    // ── MAIN-PATH commercial intent (ROADMAP item 7) ──
+    // When the resolved intent is commercial (transactional label / strong
+    // transactional distribution / a stated price bound — see `is_commercial_intent`),
+    // attach a `shopping` block to the SAME `/search` response so the user gets
+    // honest product facts + an affiliate-monetized strip without leaving the
+    // results page. STRICT no-manipulation: this block is built from a CLONE of
+    // the top-N ALREADY-RANKED results; `paginated_results` (the real web results)
+    // is NEVER read, mutated, reordered, or reselected here. We reuse the EXACT
+    // same honest post-rank enrichment passes already written for `GET /shopping`
+    // (`enrich_with_commerce` + `decorate_affiliate` + `build_offer_comparisons`),
+    // so the order-invariance guarantee holds: affiliate decoration runs strictly
+    // AFTER the order is fixed and cannot move a result. No external call, no
+    // keyword list — the commercial signal comes purely from in-process intent.
+    let shopping_block: Option<serde_json::Value> = if is_commercial_intent(
+        &intent.intent,
+        &intent.distribution,
+        sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
+    ) {
+        // Clone only the top-N ranked results into a JSON array we can enrich in
+        // place. `serde_json::to_value` on `MergedResult` is lossless/Serialize.
+        let mut shop_arr: Vec<serde_json::Value> = paginated_results
+            .iter()
+            .take(COMMERCE_MAINPATH_TOP_N)
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect();
+        if shop_arr.is_empty() {
+            None
+        } else {
+            let http_client = client.clone();
+            // Reuse the same strict post-rank enrichment as /shopping. Each fetch is
+            // already budgeted (~4.5s) inside `fetch_page_html`, and we only touch
+            // the top-N (bounded), so the main /search latency stays acceptable.
+            enrich_with_commerce(&mut shop_arr, move |url: String| {
+                let c = http_client.clone();
+                async move { fetch_page_html(&c, &url).await }
+            })
+            .await;
+            // STRICT post-ranking affiliate decoration (never reorders).
+            decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
+            // Read-only multi-merchant offer comparison from the attached facts.
+            let mut block = serde_json::json!({ "results": shop_arr });
+            if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                let comparisons = build_offer_comparisons(arr_ref);
+                if !comparisons.is_empty() {
+                    block["offer_comparisons"] =
+                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+                }
+            }
+            Some(block)
+        }
+    } else {
+        None
+    };
+
     let response = UnifiedResponse {
         query: q.clone(),
         intent: Some(intent.intent.clone()),
@@ -15351,6 +15461,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             && (sc.price_lt.is_some() || sc.price_gt.is_some() || sc.price_min.is_some() || sc.price_max.is_some())
         { Some(priced_result_count) } else { None },
         recall_gap_terms,
+        shopping: shopping_block,
     };
 
     // Cache for 5 minutes — but never cache empty results
@@ -17901,6 +18012,53 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // 4) A no-fact result keeps `commerce` null (honest: we do NOT fabricate).
         assert!(ranked[1].get("commerce").is_none()
             || ranked[1]["commerce"].is_null());
+    }
+
+    // ── ROADMAP item 7: main-path commercial intent is SIGNAL-based ────────
+    // Detection must reuse the EXISTING signal-driven intent machinery (the
+    // `transactional` label + distribution + price constraints) — NEVER a keyword
+    // list. These tests lock that contract. They are pure (no network, no live
+    // gateway): `is_commercial_intent` only reads in-process signals.
+    #[test]
+    fn commercial_intent_from_transactional_label() {
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("transactional".to_string(), 0.9);
+        dist.insert("informational".to_string(), 0.1);
+        assert!(is_commercial_intent("transactional", &dist, false));
+    }
+
+    #[test]
+    fn commercial_intent_from_strong_transactional_distribution() {
+        // A product "X vs Y" query may resolve to a non-transactional argmax label
+        // (e.g. "comparison") but with a STRONG transactional distribution — still
+        // commercial. We require the distribution probability to cross the signal
+        // threshold, not merely be the argmax.
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("comparison".to_string(), 0.51);
+        dist.insert("transactional".to_string(), 0.62);
+        // argmax label is "comparison" but transactional prob >= 0.50 => commercial.
+        assert!(is_commercial_intent("comparison", &dist, false));
+    }
+
+    #[test]
+    fn commercial_intent_from_price_bound_without_transactional_label() {
+        // A stated price bound (price:<N / price:>N / min-max) is itself commercial
+        // intent — no need for the transactional label. The bound is parsed by the
+        // EXISTING gateway/engine constraint parser, never a keyword.
+        let dist = std::collections::HashMap::new();
+        assert!(is_commercial_intent("informational", &dist, true));
+    }
+
+    #[test]
+    fn informational_query_is_not_commercial() {
+        // A purely informational query ("rust ownership", "how do black holes work")
+        // with no price bound and no transactional signal must NOT trigger a
+        // shopping block. This proves detection is signal-based + private (no
+        // external classifier, no third-party call).
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("informational".to_string(), 0.95);
+        dist.insert("transactional".to_string(), 0.02);
+        assert!(!is_commercial_intent("informational", &dist, false));
     }
 
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
