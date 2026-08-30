@@ -74,7 +74,7 @@ earlier fix (t_fdab0124) held; the v2 round did not regress it.
   matches the live transcript and the earlier parent handoff.
 
 ### F5 (verified TRUE) — Goals leaderboard shape + in-memory storage
-`GET /goals/leaderboard` → `{"entries":[...],"total_entries":N}`. ✔ matches README line 250.
+`GET /goals/leaderboard` → bare JSON array `[{...}]` (max 50, score-descending). ✔ matches README line 250 and the live contract (`total_entries` wrapper dropped; count derivable as `len(array)`).
 
 ### F6 (verified TRUE) — README Goals section is backed by real observed behavior
 The two flows (quick, discovery), the 7-route endpoint table, and the behavior notes (1-indexed

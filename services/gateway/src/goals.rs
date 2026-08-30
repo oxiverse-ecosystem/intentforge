@@ -1169,6 +1169,11 @@ pub async fn handle_leaderboard(
     // Returns a bare JSON ARRAY (Vec<LeaderboardEntry>) per the audit's schema
     // assertion: the leaderboard response MUST be a list (iterable) of goal objects,
     // not a dict wrapper. (Formerly returned `{"entries":[...],"total_entries":N}`.)
+    // Returns a BARE JSON ARRAY of leaderboard entries (score-descending, max 50).
+    // `total_entries` is intentionally dropped — it is trivially derivable client-side
+    // as the array length, and a bare list is the consistent shape for a collection
+    // endpoint. The CI schema test (tests/goals_api_schema.py::test_goals_leaderboard_is_list)
+    // and the standing audit brief both encode this list contract.
     (StatusCode::OK, Json(entries)).into_response()
 }
 

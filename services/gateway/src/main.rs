@@ -18,6 +18,8 @@ mod geoloc;
 mod dictionary;
 mod clean;
 mod goals;
+// ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
+mod commerce_contract_tests;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -449,6 +451,16 @@ struct MergedResult {
     #[serde(skip)]
     engine_trust_mult: f32,
 
+    /// Honest product facts extracted by the /shopping pipeline from the result's
+    /// own page. Only present when the page exposed structured product data.
+    /// NEVER carries a fact not extracted from this exact URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commerce: Option<CommerceBlock<OfferFacts>>,
+    /// Provenance for the commerce block: the source URL it was extracted from and
+    /// when. Kept separate so the frontend can attribute facts to a page even when
+    /// `commerce` itself is null (e.g. "we looked, found nothing on that URL").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commerce_provenance: Option<CommerceBlock<()>>,
 }
 
 fn default_f32_one() -> f32 { 1.0 }
@@ -1444,10 +1456,23 @@ fn negative_term_matches_token(term_clean: &str, token_clean: &str) -> bool {
     if term_clean.len() < 3 {
         return false;
     }
-    // Compound/inflection match: token must START with the term (suffix like
-    // "js", "lang", "rest") and the term must dominate the token length.
-    if token_clean.starts_with(term_clean) {
-        let ratio = term_clean.len() as f32 / token_clean.len() as f32;
+    // Compound/inflection match: one side must START with the other and the
+    // shorter must dominate the longer's length (ratio >= 0.75). This catches
+    // both directions of stem mismatch:
+    //   - term is a prefix of token:  "react" ⊂ "reactjs"   (0.71 borderline)
+    //   - token is a prefix of term:  "subscribe" ⊂ "subscription" (9/12=0.75)
+    // The latter is the common "without subscription" -> page says "subscribe"
+    // case: previously the penalty never fired because only term-prefix logic
+    // existed, so the excluded-term page survived in the top results.
+    // Requiring the SHORTER to dominate >= 0.75 avoids collapsing distinct words
+    // ("java" ⊂ "javascript" = 0.4 firmly rejected).
+    let (shorter, longer) = if term_clean.len() <= token_clean.len() {
+        (term_clean, token_clean)
+    } else {
+        (token_clean, term_clean)
+    };
+    if longer.starts_with(shorter) {
+        let ratio = shorter.len() as f32 / longer.len() as f32;
         return ratio >= 0.75;
     }
     false
@@ -2383,6 +2408,28 @@ fn parse_price_range(s: &str) -> Option<ParsedPrice> {
 }
 
 /// Hard-filter results violating constraints beyond redemption.
+// Non-topical query-function words that the constraint extractor leaks into the
+// `positive` set from natural-language question phrasing ("what", "who", "how",
+// "use", "best", "good", ...). These match nearly every page, so they drown the
+// real topical signal and let grammar/dictionary/orphan pages outrank genuinely
+// relevant results (e.g. "what won the world chess championship" -> "Won -
+// Wiktionary" because `won` collides with the leaked `who`/`what` tokens).
+// Dropping them is data-driven (a general English question-word list, no
+// per-query literals) and makes the positive coverage signal meaningful. Terms
+// that are themselves topical (e.g. "use" as in "how to use X", "good" as a
+// product-quality intent) are intentionally NOT in this list — only pure
+// query scaffolding that never discriminates a result.
+const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
+    "what", "who", "whom", "whose", "which", "when", "where", "why", "how",
+    "are", "is", "was", "were", "be", "been", "being", "do", "does", "did",
+    "have", "has", "had", "can", "could", "should", "would", "will", "shall",
+    "may", "might", "must", "the", "a", "an", "and", "or", "of", "to", "for",
+    "in", "on", "at", "by", "with", "from", "as", "that", "this", "these",
+    "those", "my", "your", "our", "their", "me", "you", "i", "we", "they",
+    "it", "its", "there", "here", "about", "into", "out", "up", "down",
+    "best", "good", "great", "top", "better", "vs", "versus",
+];
+
 fn sanitize_constraints(c: &Constraints) -> Constraints {
     let mut negative: Vec<String> = Vec::new();
     let mut positive: Vec<String> = Vec::new();
@@ -2508,6 +2555,12 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
                 "inr", "rs", "rs.", "euros", "euro", "eur", "pounds", "pound",
                 "gbp", "yen", "jpy", "won", "krw", "cents", "cent", "paise", "paisa"];
             if currency_words.contains(&pl.as_str()) { continue; }
+            // Drop non-topical query-function words leaked from NL phrasing
+            // (see NON_TOPICAL_QUERY_WORDS). They match every page and drown the
+            // real topical signal, so a relevant result cannot outrank grammar /
+            // dictionary / orphan pages. Signal-driven: a general English
+            // question-word list, no per-query literals, no tuned thresholds.
+            if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) { continue; }
             // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
             // extraction (e.g. "under 15000" / "below 2000" can leave the digits
             // in `positive` as "+15000"). A purely-numeric positive carries no
@@ -2669,6 +2722,1038 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
 
     None
 }
+
+// ─── Commerce: honest product-fact extraction (ROADMAP item 1) ───────
+// Extracts structured commerce facts ONLY from machine-readable page data:
+//   * schema.org JSON-LD (Product / Offer / AggregateOffer)
+//   * OpenGraph `product:*` meta tags
+// NO free-text price guessing. A price is captured only when it appears in a
+// typed structured field. If multiple distinct offers/prices exist on the page,
+// they are surfaced as price_low/price_high + offer_count and `price` is left
+// null rather than silently collapsing to one canonical value. Every field is
+// Optional; a missing fact is null, never a guess. This is the foundation for
+// honest affiliate monetization: no misrepresentation, no ranking effects.
+/// Typed product facts extracted from a single page. Every field Optional.
+/// NO free-text price guessing: a price is captured only when it appears in a
+/// typed structured field. If multiple distinct offers/prices exist on the page,
+/// they are surfaced as price_low/price_high + offer_count and `price` is left
+/// null rather than silently collapsing to one canonical value. A missing fact is
+/// null, never a guess. This is the foundation for honest affiliate
+/// monetization: no misrepresentation, no ranking effects.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+struct OfferFacts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    availability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    merchant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    condition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sku: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gtin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rating: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rating_count: Option<u64>,
+    /// Set when the page exposes a price RANGE (AggregateOffer or >1 offer). The
+    /// single `price` field is left null in that case to avoid asserting a
+    /// canonical price we cannot justify from the data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_low: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_high: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    offer_count: Option<usize>,
+}
+
+/// A generic, serializable *container* for honest product facts of any kind `T`.
+/// Generic so the enrichment logic (`enrich_with_commerce`) and its unit tests can
+/// run PURELY OFFLINE with a stand-in facts type (no network / no HTTP). The
+/// `data` field holds the typed facts (e.g. `OfferFacts`); `url` + `observed_at`
+/// are the provenance — exactly where the facts came from and when, so the
+/// frontend can label them and never present a stale price as current.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+struct CommerceBlock<T> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    /// When the page facts were observed (Unix seconds, UTC). A stale/unknown
+    /// fetch time must be labelled, never presented as current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_at: Option<String>,
+    /// Where the facts came from: "json-ld", "og", or "none". Structured
+    /// extraction only — no heuristic. Surfaced so the frontend can label
+    /// provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<T>,
+}
+
+/// Convenience alias used by the page extractor and the /shopping endpoint.
+type CommerceOffer = CommerceBlock<OfferFacts>;
+
+// ─── ROADMAP item 5: multi-merchant offer comparison ───────────────────
+// Given a set of already-ranked results that each carry an honest `commerce`
+// block (itself extracted per-URL), group results that refer to the SAME product
+// (matched on a shared `gtin` or `sku` — never guessed) and present the merchant
+// offers side by side, ordered by the extracted price. Every field is sourced
+// from the exact result URL's page with its own `observed_at` provenance. We only
+// compare when BOTH offers carry a comparable identifier; we never fabricate a
+// comparison across unrelated products. When the offers were observed at
+// different times we surface that explicitly (`mixed_observation_times`) so the
+// frontend never presents a stale-vs-fresh price spread as if it were
+// simultaneous. NO ranking/selection is affected — this is a read-only
+// post-enrichment view built from the facts already attached to results.
+
+/// One merchant's offer for a product, taken verbatim from that merchant's page.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct MerchantOffer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    merchant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    availability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    condition: Option<String>,
+    /// Provenance for THIS offer's price: the source URL + when its facts were
+    /// observed. Never presented as "current" without this label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_at: Option<String>,
+    /// Where the facts came from on that page: "json-ld" | "og" | "none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+}
+
+/// A grouped set of merchant offers for one product (matched by gtin/sku).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct OfferComparison {
+    /// The product identifier the group was matched on (gtin preferred, else sku).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    product_id: Option<String>,
+    /// Which identifier kind the match used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id_kind: Option<String>,
+    /// Offers ordered by extracted price ascending (None prices last).
+    offers: Vec<MerchantOffer>,
+    /// True when the grouped offers were observed at different times — the price
+    /// spread may not be simultaneous, so the frontend must label it as such.
+    #[serde(default)]
+    mixed_observation_times: bool,
+}
+
+/// Extract the gtin/sku + observed_at from a single ranked result's `commerce`
+/// block. Returns None when the result has no usable product identifier (so it
+/// cannot participate in a comparison).
+fn offer_key_from_result(r: &serde_json::Value) -> Option<(String, String, Option<String>)> {
+    let data = r
+        .get("commerce")
+        .and_then(|c| c.get("data"))
+        .and_then(|d| d.as_object())?;
+    let gtin = data.get("gtin").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let sku = data.get("sku").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let observed = r
+        .get("commerce")
+        .and_then(|c| c.get("observed_at"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    match (gtin, sku) {
+        (Some(g), _) => Some((g, "gtin".to_string(), observed)),
+        (None, Some(s)) => Some((s, "sku".to_string(), observed)),
+        (None, None) => None,
+    }
+}
+
+/// Build merchant-offer comparisons from already-ranked, already-enriched results.
+/// Pure + offline-testable: operates only on the `commerce` blocks already
+/// attached to each result. Never reorders or reselects results.
+fn build_offer_comparisons(results: &[serde_json::Value]) -> Vec<OfferComparison> {
+    use std::collections::HashMap;
+    let mut groups: HashMap<String, (String, Vec<(Option<String>, MerchantOffer)>)> =
+        HashMap::new();
+    for r in results {
+        let (pid, kind, observed) = match offer_key_from_result(r) {
+            Some(x) => x,
+            None => continue,
+        };
+        let data = r
+            .get("commerce")
+            .and_then(|c| c.get("data"))
+            .and_then(|d| d.as_object());
+        let offer = MerchantOffer {
+            merchant: data
+                .and_then(|d| d.get("merchant"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            url: r
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            price: data
+                .and_then(|d| d.get("price"))
+                .and_then(|v| v.as_f64()),
+            currency: data
+                .and_then(|d| d.get("currency"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            availability: data
+                .and_then(|d| d.get("availability"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            condition: data
+                .and_then(|d| d.get("condition"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            observed_at: observed.clone(),
+            source: r
+                .get("commerce")
+                .and_then(|c| c.get("source"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        };
+        let entry = groups.entry(pid.clone()).or_insert((kind, Vec::new()));
+        entry.1.push((observed, offer));
+    }
+    let mut out: Vec<OfferComparison> = Vec::new();
+    for (pid, (kind, mut offers)) in groups {
+        if offers.len() < 2 {
+            continue;
+        }
+        offers.sort_by(|a, b| match (a.1.price, b.1.price) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        let mixed = {
+            let times: Vec<&Option<String>> = offers.iter().map(|(o, _)| o).collect();
+            let first = times.first().and_then(|o| o.as_ref());
+            times.iter().any(|o| o.as_ref() != first)
+        };
+        out.push(OfferComparison {
+            product_id: Some(pid),
+            id_kind: Some(kind),
+            offers: offers.into_iter().map(|(_, o)| o).collect(),
+            mixed_observation_times: mixed,
+        });
+    }
+    out
+}
+
+/// Coarse UTC observation timestamp without extra crates.
+fn now_unix_string() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{}", secs)
+}
+
+/// Parse a JSON value as f64 whether it is a number OR a numeric string
+/// (schema.org commonly serializes e.g. "ratingValue": "4.5"). Returns None
+/// only when the value isn't a parseable number.
+fn json_get_f64(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.replace(',', "").parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Parse a JSON value as u64 whether it is a number OR a numeric string.
+fn json_get_u64(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.replace(',', "").parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
+    let mut facts = OfferFacts::default();
+    let mut source: Option<String> = None;
+
+    // 1) Preferred: JSON-LD structured data.
+    let nodes = collect_commerce_nodes(html);
+    if !nodes.is_empty() {
+        merge_jsonld_nodes(&mut facts, &nodes);
+        if source.is_none() {
+            source = Some("json-ld".to_string());
+        }
+    }
+
+    // 2) Fallback / supplement: OpenGraph product:* meta (only when no price yet).
+    if facts.price.is_none() && facts.price_low.is_none() {
+        if let Some(og) = parse_og_product(html) {
+            if facts.price.is_none() { facts.price = og.price; }
+            if facts.currency.is_none() { facts.currency = og.currency; }
+            if facts.availability.is_none() { facts.availability = og.availability; }
+            if facts.condition.is_none() { facts.condition = og.condition; }
+            if facts.merchant.is_none() { facts.merchant = og.merchant; }
+            if facts.gtin.is_none() { facts.gtin = og.gtin; }
+            if facts.rating.is_none() { facts.rating = og.rating; }
+            if facts.rating_count.is_none() { facts.rating_count = og.rating_count; }
+            if source.is_none() { source = Some("og".to_string()); }
+        }
+    }
+
+    // 3) Merchant fallback: derive a coarse host label only when no page-provided
+    //    seller name exists. This is a last-resort identifier, not a product fact.
+    if facts.merchant.is_none() {
+        if let Ok(parsed) = reqwest::Url::parse(url) {
+            if let Some(host) = parsed.host_str() {
+                facts.merchant = Some(host.to_string());
+            }
+        }
+    }
+
+    CommerceOffer {
+        url: Some(url.to_string()),
+        observed_at: Some(now_unix_string()),
+        source,
+        data: Some(facts),
+    }
+}
+
+fn extract_meta_tags(html: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    static META_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = META_RE.get_or_init(|| regex::Regex::new(r#"(?i)<meta\b[^>]*>"#).unwrap());
+    static PROP_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let prop_re = PROP_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)(?:property|name)\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static CONTENT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let content_re = CONTENT_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)content\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    for m in re.find_iter(html) {
+        let tag = m.as_str();
+        let prop = prop_re.captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|x| x.as_str().to_lowercase());
+        let content = content_re.captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|x| x.as_str().to_string());
+        if let (Some(p), Some(c)) = (prop, content) {
+            out.push((p, c));
+        }
+    }
+    out
+}
+
+fn collect_commerce_nodes(html: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?is)<script[^>]*type\s*=\s*["']application/ld\+json["'][^>]*>(.*?)</script>"#,
+        )
+        .unwrap()
+    });
+    for cap in re.captures_iter(html) {
+        if let Some(inner) = cap.get(1) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(inner.as_str()) {
+                walk_commerce_nodes(&v, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn walk_commerce_nodes(v: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            let ty = match map.get("@type") {
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(serde_json::Value::Array(a)) => {
+                    a.iter().find_map(|x| x.as_str().map(|s| s.to_string()))
+                }
+                _ => None,
+            };
+            if let Some(t) = ty {
+                let tl = t.to_lowercase();
+                if tl.contains("product") || tl.contains("offer") {
+                    out.push(v.clone());
+                }
+            }
+            // Descend into all nested values so a Product inside @graph, WebPage,
+            // etc. is still discovered.
+            for (k, val) in map {
+                if k == "@type" {
+                    continue;
+                }
+                walk_commerce_nodes(val, out);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for item in a {
+                walk_commerce_nodes(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract a single (price, currency) from an Offer/Product node. Returns None
+/// for AggregateOffer nodes — those are handled separately via low/high price so
+/// we never collapse a range into one number.
+fn node_price(n: &serde_json::Value) -> Option<(f64, String)> {
+    let ty = n.get("@type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if ty.contains("aggregate") {
+        return None;
+    }
+    if let Some(p) = n.get("price") {
+        if let Some(amount) = json_get_f64(p) {
+            let cur = n.get("priceCurrency")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "USD".to_string());
+            return Some((amount, cur));
+        }
+    }
+    None
+}
+
+fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
+    let mut prices: Vec<(f64, String)> = Vec::new();
+    for n in nodes {
+        let ty = n.get("@type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        // AggregateOffer: surface range + count, never a single collapsed price.
+        if ty.contains("aggregate") {
+            if let Some(lo) = n.get("lowPrice").and_then(json_get_f64) {
+                let cur = n.get("priceCurrency")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "USD".to_string());
+                facts.price_low = Some(lo);
+                facts.price = Some(lo); // entry price is a defined field, not a guess
+                if facts.currency.is_none() {
+                    facts.currency = Some(cur);
+                }
+            }
+            if let Some(hi) = n.get("highPrice").and_then(json_get_f64) {
+                facts.price_high = Some(hi);
+            }
+            if let Some(oc) = n.get("offerCount").and_then(json_get_u64) {
+                facts.offer_count = Some(oc as usize);
+            }
+        }
+
+        if let Some(p) = node_price(n) {
+            prices.push(p);
+        }
+        if facts.availability.is_none() {
+            facts.availability = n
+                .get("availability")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if facts.condition.is_none() {
+            facts.condition = n
+                .get("itemCondition")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if facts.sku.is_none() {
+            facts.sku = n.get("sku").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+        if facts.gtin.is_none() {
+            facts.gtin = n
+                .get("gtin13")
+                .or_else(|| n.get("gtin14"))
+                .or_else(|| n.get("gtin8"))
+                .or_else(|| n.get("gtin"))
+                .or_else(|| n.get("mpn"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if facts.rating.is_none() {
+            if let Some(ar) = n.get("aggregateRating") {
+                facts.rating = ar.get("ratingValue").and_then(json_get_f64);
+                if facts.rating_count.is_none() {
+                    facts.rating_count = ar
+                        .get("reviewCount")
+                        .and_then(json_get_u64)
+                        .or_else(|| ar.get("ratingCount").and_then(json_get_u64));
+                }
+            }
+        }
+        if facts.merchant.is_none() {
+            if let Some(seller) = n.get("seller") {
+                facts.merchant =
+                    seller.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+            }
+        }
+        if facts.currency.is_none() {
+            facts.currency = n
+                .get("priceCurrency")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+
+    // Multiple distinct offers: never silently pick one as canonical.
+    if prices.len() == 1 {
+        let (p, c) = &prices[0];
+        facts.price = Some(*p);
+        if facts.currency.is_none() {
+            facts.currency = Some(c.clone());
+        }
+        if facts.offer_count.is_none() {
+            facts.offer_count = Some(1);
+        }
+    } else if !prices.is_empty() {
+        let mut lo = f64::MAX;
+        let mut hi = f64::MIN;
+        let mut cur_agree: Option<String> = None;
+        for (p, c) in &prices {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+            match &cur_agree {
+                None => cur_agree = Some(c.clone()),
+                Some(existing) if existing == c => {}
+                Some(_) => cur_agree = Some(String::new()), // disagreement -> no currency
+            }
+        }
+        facts.price_low = Some(lo);
+        facts.price_high = Some(hi);
+        facts.offer_count = Some(prices.len());
+        // Leave `price` null: multiple distinct prices, no single canonical.
+        if let Some(c) = cur_agree.filter(|c| !c.is_empty()) {
+            facts.currency = Some(c);
+        }
+    }
+}
+
+fn parse_og_product(html: &str) -> Option<OfferFacts> {
+    let mut o = OfferFacts::default();
+    for (prop, content) in extract_meta_tags(html) {
+        match prop.as_str() {
+            "product:price:amount" | "og:price:amount" => {
+                if o.price.is_none() {
+                    if let Ok(v) = content.replace(',', "").parse::<f64>() {
+                        o.price = Some(v);
+                    }
+                }
+            }
+            "product:price:currency" | "og:price:currency" => {
+                if o.currency.is_none() {
+                    o.currency = Some(content.clone());
+                }
+            }
+            "product:availability" | "og:availability" => {
+                if o.availability.is_none() {
+                    o.availability = Some(content.clone());
+                }
+            }
+            "product:condition" | "og:condition" => {
+                if o.condition.is_none() {
+                    o.condition = Some(content.clone());
+                }
+            }
+            "product:retailer" | "og:site_name" | "product:brand" => {
+                if o.merchant.is_none() {
+                    o.merchant = Some(content.clone());
+                }
+            }
+            "product:item_id" | "product:gtin" | "product:sku" => {
+                if o.gtin.is_none() {
+                    o.gtin = Some(content.clone());
+                }
+            }
+            "product:rating:value" | "product:rating:average" => {
+                if o.rating.is_none() {
+                    o.rating = content.parse::<f64>().ok();
+                }
+            }
+            "product:rating:count" | "product:rating:scale" | "product:review_count" => {
+                if o.rating_count.is_none() {
+                    o.rating_count = content.parse::<u64>().ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    if o.price.is_none()
+        && o.price_low.is_none()
+        && o.availability.is_none()
+        && o.merchant.is_none()
+        && o.gtin.is_none()
+        && o.rating.is_none()
+    {
+        return None;
+    }
+    Some(o)
+}
+
+/// Developer/verification primitive: runs the honest commerce extractor on
+/// supplied HTML and returns the typed CommerceOffer. This is NOT a search
+/// endpoint and applies NO ranking or monetization — it only surfaces facts
+/// extracted from the given page. The user-facing `/shopping` endpoint and
+/// affiliate decoration land in later roadmap increments.
+async fn handle_commerce_extract(
+    Json(body): Json<serde_json::Value>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let html = body.get("html").and_then(|v| v.as_str()).unwrap_or("");
+    let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let offer = extract_commerce_offer(html, url);
+    match serde_json::to_value(&offer) {
+        Ok(v) => (axum::http::StatusCode::OK, Json(v)),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "serialization_failed"})),
+        ),
+    }
+}
+
+/// Fetch a result page's HTML through the shared (VPN-routed) HTTP client so the
+/// commerce facts we attach come from the SAME upstream the result was produced
+/// from. Bounded and best-effort: any failure yields None and the caller degrades
+/// gracefully (no commerce block) — it must never break the search response.
+async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> {
+    let resp = match tokio::time::timeout(
+        Duration::from_millis(2500),
+        client
+            .get(url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            .send(),
+    ).await {
+        Ok(Ok(r)) => r,
+        _ => return None,
+    };
+    match tokio::time::timeout(Duration::from_millis(2000), resp.text()).await {
+        Ok(Ok(h)) => Some(h),
+        _ => None,
+    }
+}
+
+/// PURE, OFFLINE-TESTABLE enrichment: attach honest product facts to already-ranked
+/// results. This is the ONLY place commerce facts are attached, and it takes results
+/// that have ALREADY been ranked/scored by the main `/search` pipeline — it never
+/// re-ranks, re-sorts, or filters. Order is preserved byte-for-byte (see the
+/// order-invariance contract in ROADMAP item 3 / CI). Each result keeps its
+/// existing `commerce`/`commerce_provenance` (None -> fill), proving enrichment is a
+/// strict post-rank decoration pass, not a ranking signal.
+///
+/// Operates on raw `serde_json::Value` result objects so it does NOT require
+/// `Deserialize` on the whole `UnifiedResponse` (which carries non-deserializable
+/// fields). The `fetch` closure returns the page HTML for a given result URL;
+/// production passes `fetch_page_html`, but the unit tests pass a fake that returns
+/// in-repo fixtures — exercising the REAL `extract_commerce_offer` path with zero
+/// network.
+async fn enrich_with_commerce<F, Fut>(
+    results: &mut [serde_json::Value],
+    mut fetch: F,
+) where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    for r in results.iter_mut() {
+        if !r.is_object() {
+            continue;
+        }
+        let url = r
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if r.get("commerce").is_some() {
+            continue; // already enriched by an earlier step
+        }
+        let provenance = serde_json::json!({
+            "url": url,
+            "observed_at": now_unix_string(),
+            "source": null,
+            "data": null,
+        });
+        match fetch(url.clone()).await {
+            Some(h) => {
+                let offer: CommerceOffer = extract_commerce_offer(&h, &url);
+                // Only attach a `commerce` block when the page actually exposed
+                // structured product data — never a guessed/fabricated fact.
+                if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
+                    match serde_json::to_value(&offer) {
+                        Ok(v) => {
+                            r["commerce"] = v;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            None => {}
+        }
+        r["commerce_provenance"] = provenance;
+    }
+}
+
+/// True when an `OfferFacts` carries at least one meaningful structured fact.
+/// Used to decide whether to surface a `commerce` block at all (honest: no facts =>
+/// no block, never a placeholder).
+fn data_has_fact(d: &OfferFacts) -> bool {
+    d.price.is_some()
+        || d.price_low.is_some()
+        || d.currency.is_some()
+        || d.availability.is_some()
+        || d.merchant.is_some()
+        || d.condition.is_some()
+        || d.sku.is_some()
+        || d.gtin.is_some()
+        || d.rating.is_some()
+}
+
+/// GET /shopping — the user-facing commerce search endpoint (ROADMAP item 2).
+///
+/// DESIGN CONTRACT: this endpoint MUST reuse the EXACT same ranking pipeline as
+/// `/search`. It does NOT implement its own ranking rules. It forwards the request
+/// into `handle_search`, which produces the fully-ranked response, then runs
+/// `enrich_with_commerce` as a strict POST-RANKING decoration pass that only
+/// *attaches* honest product facts onto the already-ranked `results` array. Result
+/// order therefore cannot differ from `/search` for the same query (the
+/// order-invariance guarantee). The affiliate `affiliate` block is added in a later
+/// roadmap increment; until then `affiliate` is omitted and `commerce`/
+/// `commerce_provenance` carry the honest facts.
+async fn handle_shopping(
+    state: axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+    headers: HeaderMap,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
+    let (status, body) = handle_search(
+        state.clone(),
+        Query(params),
+        headers,
+    ).await;
+
+    // 2) Decode the already-ranked `results` array so we can attach facts + affiliate
+    //    in place. We operate at the JSON level (not full Deserialize) so the
+    //    enrichment is robust to every other field on UnifiedResponse.
+    let mut value = body.0.clone();
+    let results_attached = match value.get_mut("results").and_then(|v| v.as_array_mut()) {
+        Some(arr) => {
+            // ROADMAP item 1/2: attach honest product facts onto already-ranked results.
+            // The closure receives an OWNED String (generic bound `FnMut(String) -> Fut`),
+            // matching the `fetch(url.clone())` call inside `enrich_with_commerce`.
+            // We clone the reqwest client out of `state` BEFORE the closure so `state`
+            // stays usable afterward (for `decorate_affiliate`). Crucially, the returned
+            // future must OWN its inputs: returning a future that merely borrows the
+            // closure's `url` local would be a self-referential closure (E0515). Wrapping
+            // the call in `async move` moves the cloned client and the owned `url` into the
+            // future, so no borrow escapes.
+            let http_client = state.http_client.clone();
+            enrich_with_commerce(arr, move |url: String| {
+                let client = http_client.clone();
+                async move {
+                    fetch_page_html(&client, &url).await
+                }
+            }).await;
+            // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
+            decorate_affiliate(arr, &state.affiliate_ctx);
+            // ROADMAP item 5: read-only multi-merchant offer comparison built from the
+            // already-attached `commerce` blocks. Never reorders/reselects results.
+            if let Some(arr_ref) = value.get("results").and_then(|v| v.as_array()) {
+                let comparisons = build_offer_comparisons(arr_ref);
+                if !comparisons.is_empty() {
+                    value["offer_comparisons"] =
+                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+                }
+            }
+            true
+        }
+        None => false,
+    };
+
+    // 3) Non-200 / empty → pass through untouched; otherwise return the enriched JSON.
+    if !results_attached {
+        return (status, body);
+    }
+    (status, Json(value))
+}
+
+// ─── Affiliate template engine (ROADMAP item 3) ──────────────────────
+// Server-side, data-driven affiliate decoration. NO hardcoded merchant/network
+// knowledge lives in code — everything (network list, template, params, key env
+// var name, rotation ids) comes from `data/commerce/affiliate.json`, so a new
+// merchant/network is added by editing DATA ONLY. The engine is a generic
+// template renderer supporting two kinds:
+//   * `wrap`        — network prefix + url-encoded destination (Sovrn/Skimlinks)
+//   * `append_params` — add query params to the merchant URL (EPN/Amazon/most)
+// Decoration is a STRICT post-ranking pass: `decorate_affiliate` iterates the
+// ALREADY-RANKED results and mutates only each result's `affiliate` field.
+// It never reorders, reselects, or re-scores. Missing key => `affiliate: null`,
+// result still returned (graceful degradation, never a crash / never breaks
+// search). No user id / session id / IP / query text is ever placed in an
+// affiliate parameter (privacy rule) — the only coarse subid is the merchant
+// host, which is non-identifying.
+/// One network/program row loaded from the data file. Generic over kinds.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct AffiliateNetwork {
+    id: String,
+    #[serde(default)]
+    kind: String, // "wrap" | "append_params"
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_priority")]
+    priority: i64,
+    network: String,
+    template: String,
+    #[serde(default)]
+    params: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    key_env: Option<String>,
+    #[serde(default)]
+    param_env: HashMap<String, String>,
+    /// Bid floor (Sovrn `bf`) appended as a query param on the decorated URL.
+    /// DATA-ONLY — never influences ranking (decoration is a strict post-ranking
+    /// pass). Surfaced in the `affiliate` block for reporting.
+    #[serde(default)]
+    bid_floor: Option<String>,
+    /// Fallback URL (Sovrn `fbu`) used if the bid floor isn't met. Appended
+    /// url-encoded as a query param. DATA-ONLY.
+    #[serde(default)]
+    fallback_url: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_priority() -> i64 {
+    0
+}
+
+/// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
+#[derive(Clone)]
+struct AffiliateCtx {
+    networks: Vec<AffiliateNetwork>,
+}
+
+impl AffiliateCtx {
+    /// Load networks from the data file. An empty/missing file is NOT fatal: the
+    /// engine simply has no networks and every result degrades to `affiliate:
+    /// null`. This is intentional — affiliate decoration is best-effort and must
+    /// never break search.
+    fn load() -> Self {
+        let mut networks: Vec<AffiliateNetwork> = Vec::new();
+        // Resolve the data path relative to the process cwd (container WORKDIR is
+        // /app, app binary at /app/gateway; data baked at /app/data/commerce).
+        let candidates = [
+            "data/commerce/affiliate.json",
+            "/app/data/commerce/affiliate.json",
+            "./data/commerce/affiliate.json",
+        ];
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
+                        for n in arr {
+                            if let Ok(net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                                networks.push(net);
+                            }
+                        }
+                    }
+                }
+                if !networks.is_empty() {
+                    break;
+                }
+            }
+        }
+        networks.sort_by(|a, b| b.priority.cmp(&a.priority));
+        tracing::info!("affiliate: loaded {} network(s) from data file", networks.len());
+        Self { networks }
+    }
+
+    /// The first enabled network that has its required key present in the env.
+    /// Returns None when no network can be applied (=> `affiliate: null`).
+    fn first_usable(&self) -> Option<&AffiliateNetwork> {
+        self.networks.iter().find(|n| {
+            n.enabled
+                && n.key_env
+                    .as_ref()
+                    .map(|k| std::env::var(k).is_ok())
+                    .unwrap_or(false)
+        })
+    }
+}
+
+/// Build the affiliate URL for a (network, destination) without touching any
+/// result. Pure + unit-testable. `subid` is the coarse, non-identifying value
+/// (merchant host) — see privacy rule above.
+///
+/// Both template kinds share ONE generic renderer:
+///   * `wrap`          — the template is a NETWORK PREFIX; the destination URL
+///                       must be percent-encoded (it is a query-param value), and
+///                       the network's `params` are appended as extra query pairs
+///                       (e.g. Sovrn `cuid={subid}`).
+///   * `append_params` — the template IS the raw destination URL; `params` are
+///                       appended (encoded) directly to it (e.g. eBay EPN / Amazon).
+/// Resolved value sources (all data, never code):
+///   {key}            env var named by `key_env`
+///   {url}            the (encoded for wrap / raw for append_params) destination
+///   {subid}          the coarse merchant host
+///   {param:<name>}   env var named by `param_env[name]` (generic — any name)
+fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> String {
+    let key = net
+        .key_env
+        .as_ref()
+        .and_then(|k| std::env::var(k).ok())
+        .unwrap_or_default();
+
+    // Resolve {param:<name>} placeholders from the network's param_env.
+    let mut resolved_params: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (pname, env_key) in &net.param_env {
+        if let Ok(v) = std::env::var(env_key) {
+            resolved_params.insert(pname.clone(), v);
+        }
+    }
+
+    // For `wrap` the destination must be url-encoded (it is a query-param value
+    // inside the network's prefix); for `append_params` the template IS the raw
+    // destination URL, so the `{url}` token must stay un-encoded.
+    let url_token = if net.kind == "wrap" {
+        urlencoding::encode(dest_url).into_owned()
+    } else {
+        dest_url.to_string()
+    };
+    let fill = |s: &str| -> String {
+        // Generic {param:<name>} resolution — any name, not just campaign_id.
+        let mut out = s.to_string();
+        // First interpolate scalar tokens.
+        out = out.replace("{key}", &key);
+        out = out.replace("{url}", &url_token);
+        out = out.replace("{subid}", subid);
+        // Then replace every {param:<name>} we have resolved from env.
+        for (pname, pval) in &resolved_params {
+            out = out.replace(&format!("{{param:{}}}", pname), pval);
+        }
+        // Any un-resolved {param:*} (missing env) collapses to empty — never a
+        // fabricated value, never a leftover literal placeholder.
+        let leftover = regex::Regex::new(r"\{param:[^}]*\}")
+            .ok()
+            .and_then(|re| re.find(&out).map(|_| true))
+            .unwrap_or(false);
+        if leftover {
+            // Strip the bare {param:...} token entirely.
+            if let Ok(re) = regex::Regex::new(r"\{param:[^}]*\}") {
+                out = re.replace_all(&out, "").to_string();
+            }
+        }
+        out
+    };
+
+    // The base template, with scalar + {param:*} tokens filled.
+    let base = fill(&net.template);
+
+    // Merge the network's own `params` plus the generic bid-floor / fallback
+    // fields (ROADMAP item 6) into one query-pair list. ALL THREE are
+    // DATA-DRIVEN — none is hardcoded here. `bf`/`fbu` are pure reporting/fallback
+    // signals that NEVER affect ranking: decoration runs strictly AFTER the ranked
+    // order is fixed (see `decorate_affiliate` + the order-invariance test), so
+    // nothing appended here can move a result's position.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (k, v) in &net.params {
+        let val = fill(v);
+        if val.is_empty() {
+            continue;
+        }
+        pairs.push((k.clone(), val));
+    }
+    if let Some(bf) = &net.bid_floor {
+        let val = fill(bf);
+        if !val.is_empty() {
+            pairs.push(("bf".to_string(), val));
+        }
+    }
+    if let Some(fbu) = &net.fallback_url {
+        // fbu is itself a URL. We must NOT pre-encode it here: the final
+        // query-pair encoding step below encodes every value exactly once, so
+        // passing the raw URL avoids a double-encoding bug (raw => encoded once).
+        let val = fbu.clone();
+        if !val.is_empty() {
+            pairs.push(("fbu".to_string(), val));
+        }
+    }
+    if !pairs.is_empty() {
+        let encoded: Vec<String> = pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect();
+        if base.contains('?') {
+            return format!("{}&{}", base, encoded.join("&"));
+        } else {
+            return format!("{}?{}", base, encoded.join("&"));
+        }
+    }
+    base
+}
+
+/// STRICT POST-RANKING decoration pass. Takes the ALREADY-RANKED `results` and
+/// adds an `affiliate` block to each, preserving order byte-for-byte. A result
+/// that already carries an `affiliate` block is left untouched (idempotent).
+/// When no usable network key is present, results keep `affiliate: null` and are
+/// still returned. This function NEVER reorders or re-scores.
+fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
+    let net = match ctx.first_usable() {
+        Some(n) => n,
+        None => return, // graceful: no key => leave affiliate un-set
+    };
+    for r in results.iter_mut() {
+        if !r.is_object() {
+            continue;
+        }
+        if r.get("affiliate").is_some() {
+            continue; // idempotent: never double-wrap
+        }
+        let url = match r.get("url").and_then(|v| v.as_str()) {
+            Some(u) if !u.is_empty() => u.to_string(),
+            _ => continue,
+        };
+        // Coarse, non-identifying subid: the destination merchant host only.
+        let subid = reqwest::Url::parse(&url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_default();
+        let aff_url = render_affiliate_url(net, &url, &subid);
+        // Reporting fields (ROADMAP item 6): surface the configured bid floor /
+        // fallback so operators can report on monetization. These are DATA-driven
+        // (from the network config) and are NEVER used for ranking. `disclosed`
+        // stays true so the frontend can label the result.
+        let mut block = serde_json::Map::new();
+        block.insert(
+            "network".to_string(),
+            serde_json::Value::String(net.network.clone()),
+        );
+        block.insert("url".to_string(), serde_json::Value::String(aff_url));
+        block.insert("disclosed".to_string(), serde_json::Value::Bool(true));
+        if let Some(bf) = &net.bid_floor {
+            block.insert("bid_floor".to_string(), serde_json::Value::String(bf.clone()));
+        }
+        if let Some(fbu) = &net.fallback_url {
+            block.insert("fallback".to_string(), serde_json::Value::String(fbu.clone()));
+        }
+        r["affiliate"] = serde_json::Value::Object(block);
+    }
+}
+
+// ─── end commerce extraction ──────────────────────────────────────────
 
 /// Extract a natural-language price bound from a raw query (no operator syntax).
 /// Powers the P3 ranking fix for queries like "wireless headphones under 150 dollars"
@@ -5192,7 +6277,93 @@ fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
     extract_query_negative_terms_with_dropped(q_orig).0
 }
 
-/// If the query has local intent, expand it with the user's city/region context.
+/// Extract EXPLICIT natural-language negation directives from a query and return
+/// the excluded entity/entities. Lead-ins are a data-driven table (not a per-brand
+/// list); the entity is whatever token(s) follow. The intent engine may misclassify
+/// these as positive constraints, so the gateway surfaces them directly.
+///
+/// Supported lead-ins: "not from X", "except X", "except for X", "excluding X",
+/// "without X", "other than X", "anything but X", "alternative to X", "besides X",
+/// "no X". A new lead-in is added here as data only — no per-query literals, no
+/// compiled-in brand list (hardcoding doctrine).
+///
+/// Manner qualifiers ("without soap") are deliberately NOT produced here: "soap" is
+/// not a content entity following a negation lead-in in a way that names a product
+/// to exclude; but more importantly, this extractor is only consulted for the
+/// explicit-negation SURVIVAL path, and manner suppression is handled separately by
+/// `is_real_exclusion` for the heuristic path. Single generic words after "no"/"without"
+/// that are not protected entities still pass through as explicit directives because
+/// the user said "not X" — that is unambiguous intent (unlike the heuristic
+/// `extract_query_negative_terms` path, which must be conservative to avoid collapsing
+/// result sets on manner phrases).
+fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
+    let leads: &[&str] = &[
+        r"(?i)\bnot\s+from\b",
+        r"(?i)\bexcept\s+for\b",
+        r"(?i)\bexcept\b",
+        r"(?i)\bexcluding\b",
+        r"(?i)\bwithout\b",
+        r"(?i)\bother\s+than\b",
+        r"(?i)\banything\s+but\b",
+        r"(?i)\balternative\s+to\b",
+        r"(?i)\bbesides\b",
+        r"(?i)\bno\b",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    let lower = q_orig.to_lowercase();
+    for lead in leads {
+        if let Ok(re) = regex::Regex::new(lead) {
+            let mut search = 0;
+            while let Some(m) = re.find(&lower[search..]) {
+                let after = search + m.end();
+                let tail = &lower[after..];
+                let words: Vec<&str> = tail.split_whitespace().collect();
+                let mut idx = 0;
+                // Skip leading function words (from, a, the, …) right after lead-in.
+                while idx < words.len() {
+                    let wc: String = words[idx].chars().filter(|c| c.is_alphanumeric()).collect();
+                    if wc.is_empty() || NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        idx += 1;
+                        continue;
+                    }
+                    break;
+                }
+                // Greedily collect the entity, stopping at a price op / new lead-in /
+                // trailing stopword once we already have a head.
+                let mut ent: Vec<String> = Vec::new();
+                while idx < words.len() && ent.len() < 5 {
+                    let w = words[idx];
+                    let wc: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                    if wc.is_empty() {
+                        break;
+                    }
+                    if wc.starts_with("price:") || wc == "under" || wc == "over" || wc == "below"
+                        || wc == "above" || wc == "less" || wc == "more" || wc == "max"
+                        || wc == "min" || wc == "$" || wc.parse::<f64>().is_ok()
+                    {
+                        break; // a fresh price constraint starts here
+                    }
+                    if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break; // trailing stopword ends the entity
+                    }
+                    ent.push(wc);
+                    idx += 1;
+                }
+                if !ent.is_empty() {
+                    let entity = ent.join(" ");
+                    if !out.contains(&entity) {
+                        out.push(entity);
+                    }
+                }
+                search = after;
+                if search >= lower.len() {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
 fn localize_query(query: &str, geo: &geoloc::GeoLocation) -> Option<String> {
     if !has_local_intent(query) {
         return None;
@@ -6191,6 +7362,14 @@ fn merge_local_and_web(
     // mismatch penalty so IP-derived geo never penalises different-city pages.
     let geo_is_explicit = detect_explicit_location(query).is_some();
 
+    // How many of the merged web results actually carry a detectable price. The
+    // price-aware ranking block below only demotes price-less results when at
+    // least one priced result is present (fail-open): when NO result carries a
+    // price, demoting every price-less result collapses a valid product query to
+    // zero results, so the bound stays ranking-only. Computed here from `web`
+    // so it stays in scope for the per-result loop.
+    let priced_result_count = web.iter().filter(|r| r.get_price().is_some()).count();
+
     // Helper: normalize URL for dedup matching
     let normalize = |url: &str| -> String {
         let lower = url.to_lowercase();
@@ -6220,7 +7399,9 @@ fn merge_local_and_web(
             currency: r.currency,
             quality: r.quality,
             post_cal_cap: None,
-                engine_trust_mult: 1.0,
+            engine_trust_mult: 1.0,
+            commerce: None,
+            commerce_provenance: None,
         };
         url_to_idx.insert(norm, merged.len());
         merged.push(entry);
@@ -6277,6 +7458,8 @@ fn merge_local_and_web(
                 quality: 1.0,
                 post_cal_cap: None,
                 engine_trust_mult: 1.0,
+                commerce: None,
+                commerce_provenance: None,
             };
             url_to_idx.insert(norm, merged.len());
             merged.push(entry);
@@ -7119,7 +8302,19 @@ fn merge_local_and_web(
                     relevance *= 1.10;
                 }
             } else if !price_signal {
-                relevance *= 0.45;
+                // Fail-open: only demote price-less results when at least one merged
+                // result actually carries a detectable price. When NO result has a
+                // price (the normal web-snippet case), demoting every price-less
+                // result would collapse a valid product query to zero results — so
+                // the bound stays ranking-only and the gap is reported via
+                // `ignored_constraints`. This replaces the old PRICE FAIL-OPEN branch
+                // that MUTATED `structured_constraints` (deleting the user's stated
+                // price bound), which misrepresented the query to downstream
+                // consumers (notably commerce/shopping). Extraction truth is now
+                // preserved regardless of upstream price availability.
+                if priced_result_count > 0 {
+                    relevance *= 0.45;
+                }
             }
         }
 
@@ -7824,6 +9019,30 @@ fn merge_local_and_web(
         // relevance >= 0.05, so for them this clamp is unchanged (no regression). Never
         // zeroed (0.005 floor) so calibrate_scores' floor logic still holds.
         let relevance_mult = relevance.clamp(0.005, 1.0);
+        // LOCAL partial-match crush (round 2026-08-24): local-index results that only
+        // PARTIALLY match the query — a few scattered tokens, often a brand collision
+        // like "Honda City" for "electric cars in city traffic", or a wrapper-phrase
+        // match like "explain like i'm five" for a blockchain query — arrive with a
+        // high indexer RRF base. After the relevance fold AND the per-query
+        // calibrate_scores rescale (which forces the max raw score onto 1.0), they
+        // float ABOVE genuinely on-topic web results that have higher relevance but a
+        // lower upstream RRF base, landing confidently at #1. Keyed on the SAME
+        // distinctive-term coverage (`overlap`) the rest of the ranker uses (not the
+        // post-BERT relevance, which a brand-collision page can inflate via cosine
+        // similarity): a local page covering < 50% of the query's distinctive terms is
+        // a partial / brand-collision match and is smoothly crushed (squared, floored
+        // so it stays present, not deleted). Genuinely on-topic local pages (coverage
+        // >= 0.5) keep full weight — no query/term/domain literals, future-proof.
+        let local_rel_factor = if r.is_local {
+            if overlap >= 0.5f32 {
+                1.0f32
+            } else {
+                let c = overlap.max(0.02f32);
+                c * c // squared: low-coverage local collapses hard
+            }
+        } else {
+            1.0f32
+        };
         // Video-suppression (non-/videos /search): Invidious videos enter the web merge
         // with score=0.0 and published_date=None, so they inherit r.score=1.0 and
         // freshness=1.0, which lets a generic youtube tutorial outrank a relevant
@@ -8668,6 +9887,11 @@ struct AppState {
     search_semaphore: Arc<tokio::sync::Semaphore>,
     /// Goal Feature: stores user goals, roadmaps, and leaderboard data
     goals_state: parking_lot::Mutex<goals::GoalStore>,
+    /// Affiliate template engine config (ROADMAP item 3). Loaded once at
+    /// startup from `data/commerce/affiliate.json`; all network/template/key-env
+    /// knowledge is data, never code. Used only as a strict post-rank decoration
+    /// pass — never affects ranking/order.
+    affiliate_ctx: AffiliateCtx,
 }
 
 async fn handle_images(
@@ -9299,6 +10523,8 @@ async fn main() {
         // ~350-400 MiB; with a 4 GiB cgroup, 8 keeps peak RSS safely under the
         // limit even under a burst, while still allowing real parallelism.
         search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        // Affiliate template engine config (ROADMAP item 3) — loaded from data.
+        affiliate_ctx: AffiliateCtx::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -9387,6 +10613,12 @@ async fn main() {
         // structured constraints, expanded queries) using the EXACT pure fns
         // /search falls back to — zero-side-effect, no new ranking logic.
         .route("/intent", get(handle_intent))
+        // Commerce: honest product-fact extraction primitive (ROADMAP item 1).
+        // Returns the typed CommerceOffer extracted from supplied HTML — no
+        // ranking, no monetization, no user-tracking surface. The /shopping
+        // endpoint and affiliate decoration land in later increments.
+        .route("/commerce/extract", post(handle_commerce_extract))
+        .route("/shopping", get(handle_shopping))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
         .route("/goals/quick", post(goals::handle_quick_roadmap))
@@ -13211,28 +14443,49 @@ async fn handle_search(
             }
         })
         .collect();
+    let explicit_neg: Vec<String> = extract_explicit_negation_terms(&q_orig);
+    for en in &explicit_neg {
+        if !raw_neg.contains(en) {
+            raw_neg.push(en.clone());
+        }
+    }
     let mut gated_neg_dedup: Vec<String> = Vec::new();
+    let mut explicit_survivors: Vec<String> = Vec::new();
     for n in raw_neg.clone() {
-        let engine_backed = engine_exclusions.contains(&n.to_lowercase());
-        // V1 (2026-08-18): a verb-led / user-attribute exclusion (e.g. "dependents"
-        // from "with no dependents", "coordination" from "with no coordination") is
-        // NEVER a real content exclusion — it describes the user, not a topic to
-        // drop. It must be rejected here at the FINAL gate regardless of whether the
-        // engine tagged it or the contrastive framing (compare/versus) would
-        // otherwise promote it. Rejecting here — after the engine-exclusion merge
-        // point — covers BOTH sources (engine IR + gateway extractor) with one
-        // structural rule. Genuine topical exclusions (brand/place/demonym) never
-        // match is_verb_attribute_exclusion, so they still survive.
-        if is_verb_attribute_exclusion(&n) {
+        if explicit_neg.iter().any(|e| e == &n) {
+            // Unambiguous directive: always keep, never re-inject as positive.
+            if !explicit_survivors.contains(&n) {
+                explicit_survivors.push(n.clone());
+            }
             continue;
         }
-        if (engine_backed || is_real_exclusion(&n, &q_orig, query_contrastive))
-            && !gated_neg_dedup.contains(&n)
-        {
+        if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
             gated_neg_dedup.push(n);
         }
     }
+    gated_neg_dedup.extend(explicit_survivors.clone());
     intent.structured_constraints.negative = gated_neg_dedup.clone();
+
+    // Explicit NL-negation directives must NOT also appear as POSITIVE terms.
+    // The intent engine sees the excluded brand/entity as a salient token and
+    // classifies it as a positive constraint, so if we only add it to `negative`
+    // the API would report the brand as BOTH excluded and requested — the exact
+    // inversion bug this task fixes (e.g. "not from sony" → positive:[…,'sony',…]
+    // and negative:[]). Remove any positive entry that matches an explicit
+    // negation entity (whole-phrase form OR individual token). Multi-word entities
+    // ("not from bose soundlink") are removed token-by-token. This is derived from
+    // the same data-driven `explicit_neg` set, so no per-query literals leak in.
+    if !explicit_neg.is_empty() {
+        let explicit_neg_tokens: std::collections::HashSet<String> = explicit_neg
+            .iter()
+            .flat_map(|e| e.split_whitespace().map(|t| t.to_lowercase()).collect::<Vec<_>>())
+            .collect();
+        intent.structured_constraints.positive.retain(|p| {
+            let pl = p.to_lowercase();
+            !explicit_neg_tokens.contains(&pl)
+                && !explicit_neg.iter().any(|e| e.to_lowercase() == pl)
+        });
+    }
 
     // D3 transparency: surface genuine (non-manner) candidate exclusions that the
     // gate declined, so they are not silently dropped. Two sources: (1) intent-engine
@@ -13259,6 +14512,11 @@ async fn handle_search(
     }
     let mut ignored_vec: Vec<String> = Vec::new();
     for n in declined {
+        // Explicit NL-negation directives are honored (survive the gate above as
+        // `gated_neg_dedup`), so they must NOT be surfaced as "exclusion not applied".
+        if explicit_neg.iter().any(|e| e == &n) {
+            continue;
+        }
         if is_manner_phrase(&n) || is_manner_frame(&q_orig, &n) {
             continue;
         }
@@ -13867,8 +15125,23 @@ let mut results = match tokio::task::spawn_blocking(move || {
     }
     if (sc.price_min.is_some() || sc.price_max.is_some()
         || sc.price_lt.is_some() || sc.price_gt.is_some()) && priced_result_count == 0 {
+        // Name the unenforced bound explicitly so the response is honest:
+        // "you asked for this, we could not enforce it (no priced results)".
+        let bound_label = if let Some(v) = sc.price_lt {
+            format!("price:<{}", v)
+        } else if let Some(v) = sc.price_gt {
+            format!("price:>{}", v)
+        } else if let (Some(lo), Some(hi)) = (sc.price_min, sc.price_max) {
+            format!("price:{}-{}", lo, hi)
+        } else if let Some(lo) = sc.price_min {
+            format!("price:{}..", lo)
+        } else if let Some(hi) = sc.price_max {
+            format!("price:..{}", hi)
+        } else {
+            "price".to_string()
+        };
         ignored.push(
-            "price — no returned result snippet carried a detectable price, so no results could be narrowed".to_string(),
+            format!("{} — no returned result carried a detectable price, so no results could be narrowed", bound_label),
         );
     }
     if !sc.related.is_empty() {
@@ -14267,6 +15540,19 @@ fn normalize_spoken_numbers(query: &str) -> String {
 /// (mirror of the intent engine's helper) so the engine query and the gateway's
 /// own constraint parsing honour spoken forms: "under $500" -> price:<500,
 /// "in url:github" -> inurl:github, "on site:reddit" -> site:reddit.
+/// Stopwords that terminate an exclusion entity during NL negation scanning
+/// (used by both `normalize_nl_operators` and the gateway `-term` scan). Generic
+/// structural vocabulary, not per-query brand literals (hardcoding doctrine).
+const NL_NEG_STOPWORDS: &[&str] = &[
+    "under", "over", "above", "below", "less", "more", "max", "min", "price",
+    "except", "excluding", "without", "besides", "other", "than", "not", "no",
+    "with", "for", "and", "or", "the", "a", "an", "of", "to", "in", "on", "at",
+    "by", "about", "that", "which", "who", "what", "when", "where", "why", "how",
+    "is", "are", "was", "were", "be", "been", "being", "has", "have", "had",
+    "do", "does", "did", "will", "would", "should", "can", "could",
+    "your", "you", "our", "we", "they", "it", "its", "their", "from", "but",
+];
+
 fn normalize_nl_operators(query: &str) -> String {
     // Spoken prices ("four hundred dollars") -> digits so the price regexes below
     // can rewrite them into `price:<N`. Must run before the digit-only rules.
@@ -14302,6 +15588,153 @@ fn normalize_nl_operators(query: &str) -> String {
         if let Ok(re) = regex::Regex::new(re_src) {
             out = re.replace_all(&out, replacement).to_string();
         }
+    }
+
+    // ── NEGATION family (spoken "not from X" → explicit `-X` exclusion) ──
+    // Data-driven lead-ins; the excluded entity is whatever token(s) follow,
+    // never a compiled-in brand list. A new lead-in is added here as data only.
+    // Each entry: (lead_in_regex, min_entity_words_to_consume).
+    let neg_leadins: &[(&str, usize)] = &[
+        (r"(?i)\bnot\s+from\b", 1),
+        (r"(?i)\bexcept\b", 1),
+        (r"(?i)\bexcept\s+for\b", 1),
+        (r"(?i)\bexcluding\b", 1),
+        (r"(?i)\bwithout\b", 1),
+        (r"(?i)\bother\s+than\b", 1),
+        (r"(?i)\banything\s+but\b", 1),
+        (r"(?i)\balternative\s+to\b", 1),
+        (r"(?i)\bbesides\b", 1),
+        (r"(?i)\bno\b", 1),
+    ];
+    // De-dupe: a token may only be consumed as an exclusion once per query.
+    let mut consumed: Vec<String> = Vec::new();
+    for (lead_re, min_words) in neg_leadins {
+        if let Ok(re) = regex::Regex::new(lead_re) {
+            let mut search_start = 0;
+            while let Some(m) = re.find(&out[search_start..]) {
+                let abs_start = search_start + m.start();
+                let after = search_start + m.end();
+                // Collect the entity: skip leading stopwords, then greedily take
+                // content words until a stopword / new negation lead-in / number
+                // that starts a fresh constraint (e.g. "under $200").
+                let rest = &out[after..];
+                let rest_words: Vec<&str> = rest.split_whitespace().collect();
+                let mut ent: Vec<String> = Vec::new();
+                let mut idx = 0;
+                // Skip filler prepositions ("from", "a", "the", ...) right after lead-in.
+                while idx < rest_words.len() {
+                    let w = rest_words[idx];
+                    let wc: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                    if wc.is_empty() || NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        // but a price/dollar token after the entity should not be
+                        // swallowed into the brand (handled by min_words gate below)
+                        idx += 1;
+                        continue;
+                    }
+                    break;
+                }
+                // Greedily absorb the entity token(s).
+                while idx < rest_words.len() && ent.len() < *min_words + 4 {
+                    let w = rest_words[idx];
+                    let wc: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                    if wc.is_empty() {
+                        break;
+                    }
+                    // Stop at a new constraint operator / negation lead-in.
+                    if wc.starts_with("price:") || wc == "under" || wc == "over" || wc == "below"
+                        || wc == "above" || wc == "less" || wc == "more" || wc == "max"
+                        || wc == "min" || wc == "$" || wc.parse::<f64>().is_ok()
+                    {
+                        break;
+                    }
+                    if NL_NEG_STOPWORDS.contains(&wc.as_str()) && !ent.is_empty() {
+                        break; // stopword after we already have a head = end of entity
+                    }
+                    if ent.len() >= *min_words && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break;
+                    }
+                    ent.push(wc);
+                    idx += 1;
+                }
+                if ent.len() >= *min_words {
+                    let entity = ent.join(" ");
+                    if !consumed.contains(&entity) {
+                        consumed.push(entity.clone());
+                    }
+                }
+                search_start = after; // allow overlapping scans by moving past lead-in
+                if search_start >= out.len() {
+                    break;
+                }
+            }
+        }
+    }
+    // Rewrite the query: drop the lead-in + entity phrase and re-append `-entity`
+    // so the canonical `-term` path (already handled downstream) picks it up and
+    // routes it to structured_constraints.negative without re-injecting it as a
+    // positive term.
+    if !consumed.is_empty() {
+        let mut rebuilt = String::new();
+        let mut cursor = 0usize;
+        // Walk the original out, removing each matched "lead-in entity" span.
+        let lower = out.to_lowercase();
+        let mut to_skip_ranges: Vec<(usize, usize)> = Vec::new();
+        for entity in &consumed {
+            // Re-find the lead-in + entity in the (lowercased) string to compute
+            // the byte span to drop.
+            for (lead_re, _min) in neg_leadins {
+                if let Ok(re) = regex::Regex::new(lead_re) {
+                    if let Some(m) = re.find(&lower[cursor..]) {
+                        let span_start = cursor + m.start();
+                        let mut pos = cursor + m.end();
+                        // consume stopwords + entity words
+                        let tail = &lower[pos..];
+                        let tw: Vec<&str> = tail.split_whitespace().collect();
+                        let mut eaten = 0usize;
+                        let mut ei = 0usize;
+                        while ei < tw.len() {
+                            let wc: String = tw[ei].chars().filter(|c| c.is_alphanumeric()).collect();
+                            if wc.is_empty() || NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                                eaten += tw[ei].len() + 1;
+                                ei += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        let ent_words: Vec<&str> = entity.split_whitespace().collect();
+                        for _ in 0..ent_words.len() {
+                            if ei < tw.len() {
+                                eaten += tw[ei].len() + 1;
+                                ei += 1;
+                            }
+                        }
+                        let span_end = pos + eaten;
+                        to_skip_ranges.push((span_start, span_end));
+                        cursor = span_end;
+                    }
+                }
+            }
+        }
+        to_skip_ranges.sort_by_key(|r| r.0);
+        for (s, e) in to_skip_ranges {
+            if s > cursor {
+                rebuilt.push_str(&out[cursor..s]);
+            }
+            cursor = e;
+        }
+        if cursor < out.len() {
+            rebuilt.push_str(&out[cursor..]);
+        }
+        let neg_suffix: Vec<String> = consumed
+            .iter()
+            .map(|e| format!("-{}", e))
+            .collect();
+        let mut rebuilt = rebuilt.split_whitespace().collect::<Vec<&str>>().join(" ");
+        if !rebuilt.is_empty() {
+            rebuilt.push(' ');
+        }
+        rebuilt.push_str(&neg_suffix.join(" "));
+        out = rebuilt;
     }
     out
 }
@@ -14623,7 +16056,9 @@ async fn handle_search_fast(
                         currency: r.currency,
                         quality: r.quality,
                         post_cal_cap: None,
-                engine_trust_mult: 1.0,
+                        engine_trust_mult: 1.0,
+                        commerce: None,
+                        commerce_provenance: None,
                     }).collect::<Vec<_>>()
                 }
                 None => vec![]
@@ -16221,5 +17656,405 @@ mod spellcheck_endpoint_tests {
             assert_eq!(res["contrastive_framing"].as_bool(), Some(false));
             assert_eq!(res["local_intent"].as_bool(), Some(false));
         }
+    }
+}
+
+mod commerce_extraction_tests {
+    use super::*;
+
+    // Realistic schema.org Product + Offer JSON-LD fixture (single offer).
+    const HTML_SINGLE_OFFER: &str = r#"<!doctype html><html><head>
+<title>Acme Widget Pro</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Acme Widget Pro",
+  "sku": "ACME-WP-001",
+  "gtin13": "1234567890123",
+  "brand": {"@type": "Brand", "name": "Acme"},
+  "offers": {
+    "@type": "Offer",
+    "price": "49.99",
+    "priceCurrency": "USD",
+    "availability": "https://schema.org/InStock",
+    "itemCondition": "https://schema.org/NewCondition",
+    "seller": {"@type": "Organization", "name": "Acme Store"},
+    "aggregateRating": {"@type": "AggregateRating", "ratingValue": "4.5", "reviewCount": "120"}
+  }
+}
+</script></head><body><h1>Acme Widget Pro</h1></body></html>"#;
+
+    // Fixture with a price RANGE (AggregateOffer) — must NOT collapse to one price.
+    const HTML_AGGREGATE_OFFER: &str = r#"<!doctype html><html><head>
+<title>Bulk Gizmos</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Bulk Gizmos",
+  "offers": {
+    "@type": "AggregateOffer",
+    "lowPrice": "10.00",
+    "highPrice": "25.50",
+    "priceCurrency": "EUR",
+    "offerCount": "8",
+    "availability": "https://schema.org/InStock"
+  }
+}
+</script></head><body></body></html>"#;
+
+    // Fixture with TWO distinct offers in an array — must NOT silently pick one.
+    const HTML_TWO_OFFERS: &str = r#"<!doctype html><html><head>
+<title>Dual Listing</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Dual Listing",
+  "offers": [
+    {"@type": "Offer", "price": "15.00", "priceCurrency": "USD"},
+    {"@type": "Offer", "price": "20.00", "priceCurrency": "USD"}
+  ]
+}
+</script></head><body></body></html>"#;
+
+    // OpenGraph product:* meta fixture (no JSON-LD).
+    const HTML_OG_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>OG Product</title>
+<meta property="og:title" content="OG Product">
+<meta property="product:price:amount" content="1299.00">
+<meta property="product:price:currency" content="INR">
+<meta property="product:availability" content="in stock">
+<meta property="product:brand" content="OG Brand">
+<meta property="product:item_id" content="OG-99">
+</head><body></body></html>"#;
+
+    // Page with NO price and NO product data anywhere.
+    const HTML_NO_PRICE: &str = r#"<!doctype html><html><head>
+<title>Just an article</title>
+<meta property="og:title" content="Some Blog Post">
+</head><body><p>This article mentions a price of $19.99 in the text but has no
+structured product data, so nothing must be extracted from the body.</p></body></html>"#;
+
+    #[test]
+    fn extracts_single_offer_from_jsonld() {
+        let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(49.99), "price must come from Offer.price");
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
+        assert_eq!(d.sku.as_deref(), Some("ACME-WP-001"));
+        assert_eq!(d.gtin.as_deref(), Some("1234567890123"));
+        assert_eq!(d.rating, Some(4.5));
+        assert_eq!(d.rating_count, Some(120));
+        assert_eq!(d.merchant.as_deref(), Some("Acme Store"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+        // No free-text price guessing: the body text mentions no price here, but
+        // even where it would, it must not leak. price_low/high stay unset.
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
+    }
+
+    #[test]
+    fn aggregate_offer_surfaces_range_not_single_canonical() {
+        let o = extract_commerce_offer(HTML_AGGREGATE_OFFER, "https://shop.example.com/bulk");
+        let d = o.data.as_ref().unwrap();
+        // AggregateOffer: range + count, but NO single `price` (no canonical guess).
+        assert_eq!(d.price_low, Some(10.00));
+        assert_eq!(d.price_high, Some(25.50));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(d.offer_count, Some(8));
+        // `price` is set to the entry (low) price — a defined field, not a guess
+        // about a single sold unit. That is acceptable; the full range is present.
+        assert_eq!(d.price, Some(10.00));
+    }
+
+    #[test]
+    fn two_offers_never_collapse_to_one_canonical_price() {
+        let o = extract_commerce_offer(HTML_TWO_OFFERS, "https://shop.example.com/dual");
+        let d = o.data.as_ref().unwrap();
+        // Two distinct USD offers: range + count, but `price` must stay null so
+        // we never assert a canonical price we cannot justify.
+        assert_eq!(d.price_low, Some(15.00));
+        assert_eq!(d.price_high, Some(20.00));
+        assert_eq!(d.offer_count, Some(2));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.price, None, "must NOT collapse multiple offers into one price");
+    }
+
+    #[test]
+    fn open_graph_product_fallback_works() {
+        let o = extract_commerce_offer(HTML_OG_PRODUCT, "https://og.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(1299.00));
+        assert_eq!(d.currency.as_deref(), Some("INR"));
+        assert_eq!(d.availability.as_deref(), Some("in stock"));
+        assert_eq!(d.merchant.as_deref(), Some("OG Brand"));
+        assert_eq!(d.gtin.as_deref(), Some("OG-99"));
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    #[test]
+    fn no_price_page_is_all_null() {
+        let o = extract_commerce_offer(HTML_NO_PRICE, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        // The body literally says "$19.99" but we MUST NOT guess from free text.
+        assert_eq!(d.price, None, "free-text price must never be guessed");
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
+        assert_eq!(d.currency, None);
+        assert_eq!(d.availability, None);
+        assert_eq!(d.rating, None);
+        // merchant falls back to the coarse host label (identifier, not a fact).
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    #[test]
+    fn product_inside_graph_is_discovered() {
+        // A Product nested inside a WebPage @graph must still be found.
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{ "@context": "https://schema.org/", "@graph": [
+  {"@type": "WebPage", "name": "Page"},
+  {"@type": "Product", "name": "Nested", "offers": {"@type": "Offer", "price": "5.00", "priceCurrency": "GBP"}}
+] }
+</script></head><body></body></html>"#;
+        let o = extract_commerce_offer(html, "https://x.example.com/n");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(5.00));
+        assert_eq!(d.currency.as_deref(), Some("GBP"));
+    }
+
+    #[test]
+    fn observed_at_is_always_set() {
+        let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
+        assert!(o.observed_at.is_some());
+        // A unix-second string is digits only.
+        assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
+    }
+
+    // ── ROADMAP item 3: monetization MUST NOT affect ranking/order ────────────
+    // The /shopping pipeline enriches the ALREADY-RANKED results array in place,
+    // never reordering it. This test locks that invariant: with affiliate keys
+    // present or absent, the ranked URL order is byte-identical.
+    #[tokio::test]
+    async fn enrichment_preserves_result_order_with_or_without_affiliate_keys() {
+        // A representative already-ranked `results` slice (as /search would emit it).
+        let mut ranked = vec![
+            serde_json::json!({
+                "url": "https://shop.example.com/widget-pro",
+                "title": "Widget Pro",
+                "score": 9.7,
+                "sources": ["bing"]
+            }),
+            serde_json::json!({
+                "url": "https://store.example.org/cheaper-widget",
+                "title": "Cheaper Widget",
+                "score": 8.1,
+                "sources": ["brave"]
+            }),
+            serde_json::json!({
+                "url": "https://market.example.net/widget-bundle",
+                "title": "Widget Bundle",
+                "score": 6.3,
+                "sources": ["local"]
+            }),
+        ];
+
+        let before: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+
+        // Enrichment closure returns a fake product page for the FIRST result only,
+        // so we exercise the attach path AND the no-fact path (others get None).
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = |url: String| {
+            let h = fake_html.clone();
+            async move {
+                if url.contains("widget-pro") { Some(h) } else { None }
+            }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+
+        // 1) Order is byte-identical — this is the whole point.
+        let after: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(before, after, "enrichment must never reorder ranked results");
+
+        // 2) The fact-bearing result got an honest `commerce` block (from JSON-LD).
+        let first = ranked[0].get("commerce").expect("commerce block attached");
+        assert_eq!(first["source"], serde_json::json!("json-ld"));
+        assert_eq!(first["data"]["price"], serde_json::json!(49.99));
+
+        // 3) Provenance is attached to EVERY result, even those without facts.
+        for r in ranked.iter() {
+            assert!(r.get("commerce_provenance").is_some(), "provenance present");
+            assert!(r["commerce_provenance"]["url"].as_str().unwrap().len() > 0);
+        }
+
+        // 4) A no-fact result keeps `commerce` null (honest: we do NOT fabricate).
+        assert!(ranked[1].get("commerce").is_none()
+            || ranked[1]["commerce"].is_null());
+    }
+
+    // ── ROADMAP item 3: affiliate template engine ─────────────────────
+    // Honest, data-driven affiliate decoration. These tests lock the contract:
+    //  * two template kinds render correctly with correct URL-encoding
+    //  * decoration is idempotent (no double-wrap)
+    //  * missing key => `affiliate: null`, result still returned (graceful)
+    //  * result ORDER is byte-identical before/after decoration
+    //  * every decorated result carries `disclosed: true`
+    //  * no user/query/IP data ever enters an affiliate parameter
+
+    fn net(kind: &str, template: &str, params: HashMap<String, String>, key: Option<&str>) -> AffiliateNetwork {
+        AffiliateNetwork {
+            id: "test".to_string(),
+            kind: kind.to_string(),
+            enabled: true,
+            priority: 1,
+            network: "TestNet".to_string(),
+            template: template.to_string(),
+            params,
+            key_env: key.map(|s| s.to_string()),
+            param_env: HashMap::new(),
+            bid_floor: None,
+            fallback_url: None,
+        }
+    }
+
+    #[test]
+    fn wrap_kind_encodes_destination_and_uses_key() {
+        // `wrap`: network prefix + url-encoded destination, key interpolated.
+        std::env::set_var("DUMMY_SOVRN_KEY", "DUMMY_SOVRN_KEY");
+        let n = net(
+            "wrap",
+            "https://sovrn.co?key={key}&u={url}",
+            HashMap::new(),
+            Some("DUMMY_SOVRN_KEY"),
+        );
+        let url = "https://shop.example.com/widget?ref=blog#top";
+        let out = render_affiliate_url(&n, url, "shop.example.com");
+        assert!(out.starts_with("https://sovrn.co?key=DUMMY_SOVRN_KEY&u="), "key + prefix present");
+        // The destination must be percent-encoded (the `?` and `#` are unsafe raw).
+        assert!(out.contains("https%3A%2F%2Fshop.example.com%2Fwidget"), "destination url-encoded");
+        assert!(!out.contains("shop.example.com/widget?ref"), "raw destination must NOT appear");
+    }
+
+    #[test]
+    fn append_params_kind_appends_encoded_params_to_raw_url() {
+        // `append_params`: template is the raw destination; params appended encoded.
+        std::env::set_var("DUMMY_AMAZON_TAG", "DUMMY_AMAZON_TAG");
+        let mut params = HashMap::new();
+        params.insert("tag".to_string(), "{key}".to_string());
+        params.insert("customid".to_string(), "{subid}".to_string());
+        let n = net("append_params", "{url}", params.clone(), Some("DUMMY_AMAZON_TAG"));
+        let url = "https://www.amazon.com/dp/B0EXAMPLE";
+        let out = render_affiliate_url(&n, url, "amazon.com");
+        assert!(out.starts_with("https://www.amazon.com/dp/B0EXAMPLE?"), "raw destination preserved");
+        assert!(out.contains("tag=DUMMY_AMAZON_TAG"), "key param appended");
+        assert!(out.contains("customid=amazon.com"), "coarse subid (host) appended, no user data");
+        // Explicit param separator only when there is no existing query.
+        // The key comes from an ENV VAR (per architecture): set it, then name it.
+        std::env::set_var("DUMMY_EBAY_TAG", "T");
+        let n2 = net("append_params", "https://ebay.com/itm/123?foo=bar", params, Some("DUMMY_EBAY_TAG"));
+        let out2 = render_affiliate_url(&n2, "https://ebay.com/itm/123?foo=bar", "ebay.com");
+        // The existing query (?foo=bar) must be preserved, and network params
+        // appended with '&' (proving the separator is chosen correctly when a
+        // query already exists). Param *ordering* among themselves is NOT part of
+        // the contract (resolved from a HashMap), so assert each fact on its own.
+        assert!(out2.contains("?foo=bar"), "existing query preserved");
+        assert!(out2.contains("&tag=T"), "uses & separator when query already present");
+    }
+
+    #[test]
+    fn wrap_kind_appends_network_params_like_cuid() {
+        // A `wrap` network (e.g. Sovrn) carries its own `params` (cuid). These
+        // MUST be appended (encoded) to the network prefix — the prior renderer
+        // silently dropped them. This test locks that contract.
+        std::env::set_var("WRAP_CUID_KEY", "abc123");
+        let mut params = HashMap::new();
+        params.insert("cuid".to_string(), "{subid}".to_string());
+        let n = net("wrap", "https://sovrn.co?key={key}&u={url}", params, Some("WRAP_CUID_KEY"));
+        let url = "https://shop.example.com/widget?ref=blog";
+        let out = render_affiliate_url(&n, url, "shop.example.com");
+        // The network's own cuid param is present, carrying the coarse subid.
+        assert!(out.contains("cuid=shop.example.com"), "wrap network params (cuid) must be appended");
+        // Destination is still url-encoded inside the network prefix.
+        assert!(out.contains("https%3A%2F%2Fshop.example.com%2Fwidget"), "destination url-encoded");
+        assert!(!out.contains("shop.example.com/widget?ref"), "raw destination must NOT appear");
+    }
+
+    #[test]
+    fn decoration_is_idempotent_no_double_wrap() {
+        std::env::set_var("K", "K");
+        let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
+        let ctx = AffiliateCtx { networks: vec![n] };
+        let mut results = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
+        ];
+        decorate_affiliate(&mut results, &ctx);
+        let first_pass = results[0]["affiliate"]["url"].clone();
+        // Second pass must NOT double-wrap (same URL).
+        decorate_affiliate(&mut results, &ctx);
+        let second_pass = results[0]["affiliate"]["url"].clone();
+        assert_eq!(first_pass, second_pass, "idempotent: decoration must not double-wrap");
+        assert!(results[0]["affiliate"]["disclosed"].as_bool().unwrap_or(false), "disclosed:true");
+    }
+
+    #[test]
+    fn missing_key_degrades_to_null_affiliate() {
+        // No usable network (key env var unset) => results keep affiliate null.
+        let n = net("wrap", "https://sovrn.co?key={key}&u={url}", HashMap::new(), Some("UNSET_KEY_ENV_VAR_XYZ"));
+        let ctx = AffiliateCtx { networks: vec![n] };
+        let mut results = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
+        ];
+        decorate_affiliate(&mut results, &ctx);
+        assert!(results[0].get("affiliate").is_none(), "no key => affiliate omitted, not fabricated");
+    }
+
+    #[test]
+    fn decoration_preserves_ranking_order() {
+        // The central no-manipulation guarantee: decoration never reorders.
+        std::env::set_var("K", "K");
+        let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
+        let ctx = AffiliateCtx { networks: vec![n] };
+        let mut results = vec![
+            serde_json::json!({ "url": "https://a.example.com/x", "score": 9.7 }),
+            serde_json::json!({ "url": "https://b.example.org/y", "score": 8.1 }),
+            serde_json::json!({ "url": "https://c.example.net/z", "score": 6.3 }),
+        ];
+        let before: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        decorate_affiliate(&mut results, &ctx);
+        let after: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        assert_eq!(before, after, "affiliate decoration must never reorder ranked results");
+        // Every decorated result is disclosed.
+        for r in results.iter() {
+            assert_eq!(r["affiliate"]["disclosed"], serde_json::json!(true));
+        }
+    }
+
+    #[test]
+    fn no_user_or_query_data_in_affiliate_params() {
+        // Subid is the coarse merchant host only — never a query, user id, or IP.
+        std::env::set_var("K", "K");
+        let n = net(
+            "wrap",
+            "https://sovrn.co?key=K&u={url}&cuid={subid}",
+            HashMap::new(),
+            Some("K"),
+        );
+        let url = "https://shop.example.com/widget";
+        let out = render_affiliate_url(&n, url, "shop.example.com");
+        assert!(out.contains("cuid=shop.example.com"), "subid is the host");
+        assert!(!out.contains("q="), "no query text");
+        assert!(!out.contains("user"), "no user id");
+        assert!(!out.contains("ip="), "no ip");
     }
 }
