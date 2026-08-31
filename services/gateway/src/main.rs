@@ -2783,6 +2783,15 @@ struct OfferFacts {
     price_high: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offer_count: Option<usize>,
+    /// Product name from structured data (JSON-LD `name` / microdata `itemprop="name"` / OG `og:title`).
+    /// Only extracted from typed structured signals, never from free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// Sale end date from schema.org `priceValidUntil` (ISO 8601 date string).
+    /// Lets the frontend label a price as a limited-time offer. Only extracted
+    /// from structured data, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_valid_until: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3165,6 +3174,16 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
                     facts.merchant = Some(content);
                 }
             }
+            "name" => {
+                if facts.name.is_none() && !content.is_empty() {
+                    facts.name = Some(content);
+                }
+            }
+            "pricevaliduntil" => {
+                if facts.price_valid_until.is_none() && !content.is_empty() {
+                    facts.price_valid_until = Some(content);
+                }
+            }
             _ => {}
         }
     }
@@ -3515,6 +3534,24 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
         if facts.currency.is_none() {
             facts.currency = n
                 .get("priceCurrency")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        // ROADMAP item 1 (increment): extract product `name` and `priceValidUntil`
+        // from the SAME typed structured node. `name` is the product title (e.g.
+        // "Acme Widget Pro"); `priceValidUntil` is an ISO 8601 sale-end date that
+        // lets the frontend label a price as a limited-time offer. Both are
+        // optional and only set when the page actually exposes them — never
+        // guessed. The fields live on the Product/Offer node itself.
+        if facts.name.is_none() {
+            facts.name = n
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if facts.price_valid_until.is_none() {
+            facts.price_valid_until = n
+                .get("priceValidUntil")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
         }
@@ -18422,6 +18459,131 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(o.observed_at.is_some());
         // A unix-second string is digits only.
         assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn jsonld_extracts_product_name_and_sale_end_date() {
+        // ROADMAP item 1 (increment): the product `name` (e.g. "Acme Widget Pro")
+        // and the offer's `priceValidUntil` (ISO 8601 sale-end date) are extracted
+        // from the SAME typed structured node. Both must be present when the page
+        // exposes them and null when absent — never guessed from free text.
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Acme Widget Pro",
+  "offers": {
+    "@type": "Offer",
+    "price": "49.99",
+    "priceCurrency": "USD",
+    "priceValidUntil": "2026-12-31"
+  }
+}
+</script></head><body><h1>Acme Widget Pro</h1></body></html>"#;
+        let o = extract_commerce_offer(html, "https://store.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.name.as_deref(), Some("Acme Widget Pro"), "product name from JSON-LD");
+        assert_eq!(d.price_valid_until.as_deref(), Some("2026-12-31"), "sale end date from JSON-LD");
+        // Existing fields still extract correctly alongside new ones.
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+    }
+
+    #[test]
+    fn jsonld_missing_name_and_sale_date_stay_null() {
+        // A product page that exposes NO `name` and NO `priceValidUntil` must
+        // leave both null — we never guess them from any other field.
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "offers": {
+    "@type": "Offer",
+    "price": "9.99",
+    "priceCurrency": "USD"
+  }
+}
+</script></head><body><body></html>"#;
+        let o = extract_commerce_offer(html, "https://store.example.com/no-name");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.name, None, "no name in structured data => null");
+        assert_eq!(d.price_valid_until, None, "no priceValidUntil => null");
+        assert_eq!(d.price, Some(9.99));
+    }
+
+    #[test]
+    fn microdata_extracts_product_name_and_sale_end_date() {
+        // ROADMAP item 1 (increment): schema.org microdata `itemprop="name"` and
+        // `itemprop="priceValidUntil"` are extracted alongside the existing price/
+        // rating/sku fields. This exercises the parse_microdata path.
+        let html = r#"<!doctype html><html><head><title>Microdata Product</title></head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Microdata Widget</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">29.99</span>
+    <span itemprop="priceCurrency">EUR</span>
+    <time itemprop="priceValidUntil" datetime="2026-11-30">2026-11-30</time>
+  </div>
+</div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/md");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.name.as_deref(), Some("Microdata Widget"), "name from microdata");
+        assert_eq!(d.price_valid_until.as_deref(), Some("2026-11-30"), "sale end date from microdata");
+        assert_eq!(d.price, Some(29.99));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    #[test]
+    fn microdata_missing_name_and_sale_date_stay_null() {
+        // A microdata product page with NO `itemprop="name"` and NO
+        // `itemprop="priceValidUntil"` leaves both null.
+        let html = r#"<!doctype html><html><head></head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">14.99</span>
+  </div>
+</div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/md-no-name");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.name, None);
+        assert_eq!(d.price_valid_until, None);
+        assert_eq!(d.price, Some(14.99));
+    }
+
+    #[test]
+    fn name_and_sale_date_preserved_in_enrichment_order_invariance() {
+        // The mandatory order-invariance test must still pass after adding the
+        // new fields: enrichment with the new fields populated never reorders
+        // ranked results (the whole no-manipulation guarantee).
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://a.example.com/x", "score": 9.0 }),
+        ];
+        let fake_html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Widget",
+  "offers": {"@type": "Offer", "price": "10.00", "priceValidUntil": "2026-12-31"}
+}
+</script></head><body></body></html>"#;
+        let h = fake_html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        assert_eq!(r["url"], "https://a.example.com/x", "order preserved");
+        let c = r.get("commerce").expect("commerce block attached");
+        assert_eq!(c["data"]["name"], "Widget");
+        assert_eq!(c["data"]["price_valid_until"], "2026-12-31");
+        assert_eq!(c["data"]["price"], 10.00);
     }
 
     // ── ROADMAP item 3: monetization MUST NOT affect ranking/order ────────────
