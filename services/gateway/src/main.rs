@@ -3431,6 +3431,15 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.rating.is_some()
 }
 
+/// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
+/// page exposed structured product data, attached by `enrich_with_commerce`).
+/// Powers the main-path `shopping` gate: the strip is only surfaced when at
+/// least one top result actually has product facts — never an empty link-farm
+/// strip of bare affiliate links. Pure + offline-testable.
+fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
+    results.iter().any(|r| r.get("commerce").is_some())
+}
+
 /// How many of the ALREADY-RANKED top results feed the main-path `shopping`
 /// block on `/search` (ROADMAP item 7). This is a presentation cap on a CLONE of
 /// the ranked results, NOT a ranking change — the real `results` array is never
@@ -6282,11 +6291,18 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         k += 1;
                     }
                     let joined = compound.join(" ");
-                    // Gate: only keep the compound as a real exclusion when it is in
-                    // contrastive framing or names a recognized entity. Manner
-                    // qualifiers ("without soap", "with no music background") are
-                    // dropped so they don't penalize the user's own topical words.
-                    if is_real_exclusion(&joined, q_orig, query_contrastive)
+                    // GUARD (2026-08-31 round): never emit an EMPTY exclusion term.
+                    // A compound finalised via a list connector ("and"/"or") inside
+                    // the loop above is now empty; if we still ran the gate on it,
+                    // `is_real_exclusion("")` returns true for any contrastive query
+                    // (a query containing "no"/"without" is contrastive), pushing ""
+                    // as a negative. An empty `not:` substring-matches EVERY title
+                    // ("" is present everywhere), so the hard-drop would delete ALL
+                    // retrieved results and collapse the query to 0 hits — exactly
+                    // the catastrophic failure seen for "no dairy and no gelatin".
+                    // General + structural: an empty exclusion is never meaningful.
+                    if !joined.is_empty()
+                        && is_real_exclusion(&joined, q_orig, query_contrastive)
                         && !terms.contains(&joined)
                     {
                         terms.push(joined);
@@ -15408,16 +15424,30 @@ let mut results = match tokio::task::spawn_blocking(move || {
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
-            // Read-only multi-merchant offer comparison from the attached facts.
-            let mut block = serde_json::json!({ "results": shop_arr });
-            if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                let comparisons = build_offer_comparisons(arr_ref);
-                if !comparisons.is_empty() {
-                    block["offer_comparisons"] =
-                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+            // ROADMAP item 7 (refinement): only surface the main-path `shopping`
+            // strip when at least one of the top-N ranked results actually exposed
+            // structured product data (a `commerce` block). A commercial-intent
+            // query whose top results are articles/reviews/guides with no product
+            // schema would otherwise render an empty strip of cards carrying only
+            // affiliate links — a low-value, link-farm-like surface that invites
+            // misuse of the affiliate thesis. Gating on a REAL `commerce` block
+            // keeps the block honest: it appears only when we have product facts to
+            // show. Pure post-enrichment signal, no query-specific logic, and the
+            // `results` ordering is untouched either way (no-manipulation holds).
+            if !shop_arr.iter().any(|r| r.get("commerce").is_some()) {
+                None
+            } else {
+                // Read-only multi-merchant offer comparison from the attached facts.
+                let mut block = serde_json::json!({ "results": shop_arr });
+                if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                    let comparisons = build_offer_comparisons(arr_ref);
+                    if !comparisons.is_empty() {
+                        block["offer_comparisons"] =
+                            serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+                    }
                 }
+                Some(block)
             }
-            Some(block)
         }
     } else {
         None
@@ -16596,6 +16626,34 @@ mod constraint_fix_tests {
         let oven_in_manner = omanner.iter().any(|t| t.contains("oven"));
         let oven_buckets = [oven_in_excl, oven_in_decl, oven_in_manner].iter().filter(|b| **b).count();
         assert_eq!(oven_buckets, 1, "oven must surface in exactly ONE bucket (transparency), got kept={:?} declined={:?} manner={:?}", okept, odeclined, omanner);
+    }
+
+    #[test]
+    fn negation_never_emits_empty_exclusion_on_compound_no_and_no() {
+        // REGRESSION (round 2026-08-31T1132Z): a no X and no Y / without X or Y
+        // compound finalised via a list connector (and/or) inside the collection
+        // loop leaves an EMPTY trailing compound; the post-loop finalise must NOT
+        // push an empty string as an exclusion. An empty not: substring-matches
+        // EVERY title, hard-drops ALL retrieved results, and collapses the query
+        // to 0 hits. General defect (any no A and no B phrasing), not a fluke.
+        for q in [
+            "how do I make a vegan chocolate mousse that uses no dairy and no gelatin",
+            "recipes with no nuts and no dairy",
+            "shoes without laces or without velcro",
+        ] {
+            let (kept, _declined, _manner) = extract_query_negative_terms_with_dropped(q);
+            assert!(
+                !kept.iter().any(|t| t.trim().is_empty()),
+                "empty exclusion must never be emitted (collapses query to 0): q={:?} kept={:?}",
+                q, kept
+            );
+            let joined = kept.join(" ");
+            assert!(
+                joined.contains("dairy") && joined.contains("gelatin"),
+                "legitimate exclusions must survive: q={:?} kept={:?}",
+                q, kept
+            );
+        }
     }
 
     #[test]
@@ -18059,6 +18117,30 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("informational".to_string(), 0.95);
         dist.insert("transactional".to_string(), 0.02);
         assert!(!is_commercial_intent("informational", &dist, false));
+    }
+
+    #[test]
+    fn has_any_commerce_block_gates_on_real_facts() {
+        // ROADMAP item 7 refinement: the main-path /search `shopping` strip must
+        // only surface when at least one top result actually carries a REAL
+        // `commerce` block (a page that exposed structured product data). A strip
+        // of pure affiliate links over article/review results is a low-value,
+        // link-farm-like surface that misuses the affiliate thesis. This test
+        // locks the gate predicate itself (the live path also exercises it via
+        // the order-invariance + no-query-leak contract tests).
+        let with_fact = vec![
+            serde_json::json!({ "url": "https://store.example/p/1", "commerce": { "data": { "merchant": "Example" }, "source": "json-ld", "observed_at": "1", "url": "https://store.example/p/1" } }),
+            serde_json::json!({ "url": "https://review.example/a", "commerce_provenance": { "url": "https://review.example/a", "observed_at": "1", "source": null, "data": null } }),
+        ];
+        assert!(has_any_commerce_block(&with_fact));
+
+        // No `commerce` key anywhere => no strip, even though commerce_provenance
+        // (which is always attached) is present.
+        let without_fact = vec![
+            serde_json::json!({ "url": "https://guide.example/how-to" }),
+            serde_json::json!({ "url": "https://review.example/a", "commerce_provenance": { "url": "https://review.example/a", "observed_at": "1", "source": null, "data": null } }),
+        ];
+        assert!(!has_any_commerce_block(&without_fact));
     }
 
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
