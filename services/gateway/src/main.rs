@@ -2736,7 +2736,8 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
 
 // ─── Commerce: honest product-fact extraction (ROADMAP item 1) ───────
 // Extracts structured commerce facts ONLY from machine-readable page data:
-//   * schema.org JSON-LD (Product / Offer / AggregateOffer)
+//   * schema.org JSON-LD (Product / Offer / AggregateOffer / SoftwareApplication
+//     / VideoGame / Service)
 //   * OpenGraph `product:*` meta tags
 //   * schema.org MICRODATA (`itemscope` + `itemprop`) — real structured
 //     on-page product data emitted by Shopify/legacy product pages.
@@ -3070,8 +3071,18 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
         if has("itemscope") {
             // Entering a new scope. Classify by itemtype so we know whether we're
             // inside a Product/Offer (collect) or something else (e.g. Brand).
+            // ROADMAP item 1 (increment): extend to schema.org's digital-product
+            // itemtypes — `SoftwareApplication`, `VideoGame`, `Service` — which
+            // carry the SAME structured commerce facts (price, rating, brand/
+            // publisher) as a physical Product. The itemprop mapping below is
+            // identical for all of them, so a single Scope::Product branch
+            // covers every product-like type without per-type logic.
             let itype = val_of("itemtype").unwrap_or_default().to_ascii_lowercase();
-            let kind = if itype.contains("product") {
+            let kind = if itype.contains("product")
+                || itype.contains("software")
+                || itype.contains("video")
+                || itype.contains("service")
+            {
                 Scope::Product
             } else if itype.contains("offer") {
                 Scope::Offer
@@ -3340,7 +3351,22 @@ fn walk_commerce_nodes(v: &serde_json::Value, out: &mut Vec<serde_json::Value>) 
             };
             if let Some(t) = ty {
                 let tl = t.to_lowercase();
-                if tl.contains("product") || tl.contains("offer") {
+                // ROADMAP item 1 (increment): extend honest extraction to
+                // schema.org's digital-product types alongside physical
+                // Product/Offer. `SoftwareApplication` (SaaS, mobile apps),
+                // `VideoGame`, and `Service` (subscriptions) carry the SAME
+                // structured commerce facts (price, rating, publisher/developer
+                // as merchant) as a physical Product — the rest of the pipeline
+                // (merge_jsonld_nodes) reads those same fields, so no per-type
+                // logic is added. A type match WITHOUT matching fields simply
+                // yields no facts (graceful), so the broad `contains` stems here
+                // cannot fabricate facts from non-product pages.
+                if tl.contains("product")
+                    || tl.contains("offer")
+                    || tl.contains("software")
+                    || tl.contains("video")
+                    || tl.contains("service")
+                {
                     out.push(v.clone());
                 }
             }
@@ -3456,6 +3482,34 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
             if let Some(seller) = n.get("seller") {
                 facts.merchant =
                     seller.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+            }
+        }
+        // ROADMAP item 1 (increment): digital-product schemas (SoftwareApplication,
+        // VideoGame, Service) carry the merchant as `publisher` / `developer` /
+        // `provider` instead of `seller`. These are the SAME commerce role (the
+        // entity offering the product) — just a different field name per schema
+        // type. No per-type branch: we try each field in priority order, and a
+        // page with none of them simply leaves merchant null (honest).
+        if facts.merchant.is_none() {
+            if let Some(pub_name) = n
+                .get("publisher")
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    n.get("developer")
+                        .and_then(|d| d.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .or_else(|| {
+                    n.get("provider")
+                        .and_then(|p| p.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+            {
+                facts.merchant = Some(pub_name);
             }
         }
         if facts.currency.is_none() {
