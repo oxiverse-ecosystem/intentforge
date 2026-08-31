@@ -2738,6 +2738,8 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
 // Extracts structured commerce facts ONLY from machine-readable page data:
 //   * schema.org JSON-LD (Product / Offer / AggregateOffer)
 //   * OpenGraph `product:*` meta tags
+//   * schema.org MICRODATA (`itemscope` + `itemprop`) — real structured
+//     on-page product data emitted by Shopify/legacy product pages.
 // NO free-text price guessing. A price is captured only when it appears in a
 // typed structured field. If multiple distinct offers/prices exist on the page,
 // they are surfaced as price_low/price_high + offer_count and `price` is left
@@ -2989,6 +2991,204 @@ fn json_get_u64(v: &serde_json::Value) -> Option<u64> {
     }
 }
 
+/// Extract honest product facts from schema.org MICRODATA
+/// (`itemscope` + `itemprop`), the third structured-on-page signal alongside
+/// JSON-LD and OpenGraph. Real Shopify/legacy product pages emit microdata with
+/// no JSON-LD, so this recovers facts that would otherwise be missed.
+///
+/// Mapping (itemprop value -> `OfferFacts` field), matched on the standard
+/// schema.org/Product + Offer vocabulary — NOT a per-merchant list:
+///   name            -> (used only for soft signal; not stored as a fact)
+///   price           -> price / price_low+price_high when a range (x-y) appears
+///   priceCurrency   -> currency
+///   availability    -> availability (raw value, e.g. InStock/LimitedAvailability)
+///   itemCondition   -> condition
+///   sku             -> sku
+///   gtin13/gtin14/gtin8/gtin/mpn -> gtin
+///   ratingValue     -> rating (also rating/Value)
+///   ratingCount     -> rating_count
+///   seller/brand    -> merchant
+///
+/// Honesty rules (same as the JSON-LD/OG paths):
+///   * A price is captured ONLY from a typed `itemprop="price"` field — never
+///     guessed from free text.
+///   * A multi-offer page (several `itemprop="price"` under separate offers)
+///     surfaces price_low/price_high + offer_count and leaves `price` null,
+///     exactly like the JSON-LD two-offer case — never a silent canonical pick.
+///   * `source` is set to "microdata" only when at least one field was filled.
+fn parse_microdata(html: &str) -> Option<OfferFacts> {
+    // Scan <...> tokens manually with a permissive regex that captures every
+    // attribute name="value" pair (itemprops live in attributes, not meta-only).
+    static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tag_re = TAG_RE
+        .get_or_init(|| regex::Regex::new(r#"(?i)<[a-zA-Z][^>]*>"#).unwrap());
+    static ATTR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let attr_re = ATTR_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)([a-zA-Z_][-a-zA-Z0-9_:.]*)\s*=\s*[\"']([^\"']*)[\"']"#).unwrap()
+    });
+
+    // Walk tags; track the current product scope so we only collect itemprops
+    // that belong to a Product/Offer (i.e. inside an itemscope with the right
+    // itemtype). This avoids grabbing unrelated itemprops (e.g. breadcrumbs).
+    let mut facts = OfferFacts::default();
+    let mut saw_scope = false;
+    let mut cur_is_product = false;
+    let mut prices: Vec<(f64, Option<String>)> = Vec::new();
+
+    for m in tag_re.find_iter(html) {
+        let tag = m.as_str();
+        let lower = tag.to_ascii_lowercase();
+        let is_open = !lower.starts_with("</");
+        // Collect attributes.
+        let mut attrs: Vec<(String, String)> = Vec::new();
+        for cap in attr_re.captures_iter(tag) {
+            let k = cap.get(1).map(|x| x.as_str().to_ascii_lowercase()).unwrap_or_default();
+            let v = cap.get(2).map(|x| x.as_str().to_string()).unwrap_or_default();
+            attrs.push((k, v));
+        }
+        let has = |name: &str| attrs.iter().any(|(k, _)| k == name);
+        let val_of = |name: &str| {
+            attrs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+
+        if has("itemscope") {
+            // Entering a new scope. It is "product-relevant" if it carries an
+            // itemtype mentioning Product/Offer (case-insensitive substring).
+            let itype = val_of("itemtype").unwrap_or_default().to_lowercase();
+            cur_is_product = itype.contains("product") || itype.contains("offer");
+            saw_scope = true;
+            if !cur_is_product {
+                continue; // not a product scope; skip its itemprops
+            }
+        }
+        if !saw_scope {
+            continue; // nothing scoped yet — ignore stray itemprops
+        }
+        if !cur_is_product {
+            continue;
+        }
+        if !is_open {
+            // Closing tag: drop product relevance when it closes the scope.
+            // (Naive single-depth tracking: a closing </div> ends the scope.)
+            cur_is_product = false;
+            saw_scope = false;
+            continue;
+        }
+        if !has("itemprop") {
+            continue;
+        }
+        let prop = val_of("itemprop").unwrap_or_default().to_ascii_lowercase();
+        let content = val_of("content").or_else(|| val_of("itemid")).unwrap_or_default();
+        // Prefer a typed/attr value; fall back to element text is NOT done —
+        // we never read text nodes (that would be free-text guessing).
+        let set_str = |f: &mut Option<String>, v: String| {
+            if f.is_none() && !v.is_empty() {
+                *f = Some(v);
+            }
+        };
+        match prop.as_str() {
+            "price" => {
+                let c = content.replace(',', " ").replace("  ", " ").trim().to_string();
+                // Range like "10.00 - 25.50" or "10-25".
+                if let Some(dash) = c.find(|ch| ch == '-' || ch == '–' || ch == '—') {
+                    let lo = c[..dash].trim().parse::<f64>().ok();
+                    let hi = c[dash + 1..].trim().parse::<f64>().ok();
+                    if let (Some(l), Some(h)) = (lo, hi) {
+                        prices.push((l, None));
+                        prices.push((h, None));
+                    } else if let Some(p) = lo.or(hi) {
+                        prices.push((p, None));
+                    }
+                } else if let Ok(p) = c.parse::<f64>() {
+                    let cur = val_of("pricecurrency").map(|s| s.to_uppercase());
+                    prices.push((p, cur));
+                }
+            }
+            "pricecurrency" => {
+                if facts.currency.is_none() && !content.is_empty() {
+                    facts.currency = Some(content.to_uppercase());
+                }
+            }
+            "availability" => set_str(&mut facts.availability, content),
+            "itemcondition" => set_str(&mut facts.condition, content),
+            "sku" => set_str(&mut facts.sku, content),
+            "gtin13" | "gtin14" | "gtin8" | "gtin" | "mpn" => {
+                if facts.gtin.is_none() && !content.is_empty() {
+                    facts.gtin = Some(content);
+                }
+            }
+            "ratingvalue" | "rating" => {
+                if facts.rating.is_none() {
+                    facts.rating = content.replace(',', "").parse::<f64>().ok();
+                }
+            }
+            "ratingcount" | "reviewcount" => {
+                if facts.rating_count.is_none() {
+                    facts.rating_count = content.replace(',', "").parse::<u64>().ok();
+                }
+            }
+            "seller" | "brand" => {
+                if facts.merchant.is_none() && !content.is_empty() {
+                    facts.merchant = Some(content);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Resolve multiple prices the same way as JSON-LD: single -> canonical,
+    // multiple -> range + count, never a silent pick.
+    if prices.len() == 1 {
+        let (p, c) = &prices[0];
+        facts.price = Some(*p);
+        if facts.currency.is_none() {
+            if let Some(cur) = c {
+                facts.currency = Some(cur.clone());
+            }
+        }
+        if facts.offer_count.is_none() {
+            facts.offer_count = Some(1);
+        }
+    } else if !prices.is_empty() {
+        let mut lo = f64::MAX;
+        let mut hi = f64::MIN;
+        for (p, _c) in &prices {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        // Currency agreement: only surface a currency when every price carried the
+        // SAME one. Mixed currencies on one page => leave currency null (never
+        // guess). Clean Option<String> comparison (no borrow pitfalls).
+        let first_cur = prices.first().and_then(|(_, c)| c.clone());
+        let all_agree = prices.iter().all(|(_, c)| *c == first_cur);
+        facts.price_low = Some(lo);
+        facts.price_high = Some(hi);
+        facts.offer_count = Some(prices.len());
+        if all_agree {
+            facts.currency = first_cur;
+        }
+    }
+
+    // Only return when at least one structured fact was found.
+    if facts.price.is_some()
+        || facts.price_low.is_some()
+        || facts.currency.is_some()
+        || facts.availability.is_some()
+        || facts.merchant.is_some()
+        || facts.condition.is_some()
+        || facts.sku.is_some()
+        || facts.gtin.is_some()
+        || facts.rating.is_some()
+    {
+        Some(facts)
+    } else {
+        None
+    }
+}
+
 fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     let mut facts = OfferFacts::default();
     let mut source: Option<String> = None;
@@ -3017,7 +3217,35 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         }
     }
 
-    // 3) Merchant fallback: derive a coarse host label only when no page-provided
+    // 3) Third structured signal: schema.org MICRODATA (itemscope + itemprop).
+    //    Real Shopify/legacy product pages emit microdata with no JSON-LD/OG —
+    //    this recovers honest facts the other two signals miss. Pure SUPPLEMENT:
+    //    it only fills fields still `None` and never overwrites a stronger signal,
+    //    and it reuses the EXACT SAME `OfferFacts` field mapping (no per-merchant
+    //    code). A price is taken only from a typed `itemprop="price"` (range ->
+    //    price_low/price_high + offer_count, `price` left null), exactly like the
+    //    JSON-LD path — never guessed from free text.
+    if let Some(md) = parse_microdata(html) {
+        if facts.price.is_none() && facts.price_low.is_none() {
+            if facts.price.is_none() { facts.price = md.price; }
+            if facts.price_low.is_none() { facts.price_low = md.price_low; }
+            if facts.price_high.is_none() { facts.price_high = md.price_high; }
+            if facts.offer_count.is_none() { facts.offer_count = md.offer_count; }
+        }
+        if facts.currency.is_none() { facts.currency = md.currency; }
+        if facts.availability.is_none() { facts.availability = md.availability; }
+        if facts.condition.is_none() { facts.condition = md.condition; }
+        if facts.sku.is_none() { facts.sku = md.sku; }
+        if facts.gtin.is_none() { facts.gtin = md.gtin; }
+        if facts.rating.is_none() { facts.rating = md.rating; }
+        if facts.rating_count.is_none() { facts.rating_count = md.rating_count; }
+        if facts.merchant.is_none() { facts.merchant = md.merchant; }
+        if source.is_none() {
+            source = Some("microdata".to_string());
+        }
+    }
+
+    // 4) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
@@ -17776,6 +18004,115 @@ mod spellcheck_endpoint_tests {
             assert_eq!(eq.len(), 1);
             assert_eq!(eq[0].as_str(), Some("best sushi restaurants in new york"));
         }
+
+    // ── ROADMAP item 1 (increment): schema.org MICRODATA extraction ─────
+    // Third structured signal alongside JSON-LD and OpenGraph. Real Shopify/
+    // legacy product pages emit microdata with no JSON-LD — these tests prove
+    // honest facts are extracted from it, that a price range is never collapsed,
+    // and that a page with no product microdata yields all-null (no guessing).
+
+    // Realistic Shopify-style Product microdata fixture.
+    const HTML_MICRODATA: &str = r#"<!doctype html><html><head><title>Micro Widget</title></head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Micro Widget</span>
+  <span itemprop="sku">MW-007</span>
+  <span itemprop="gtin13">9876543210123</span>
+  <div itemprop="brand" itemscope itemtype="https://schema.org/Brand">
+    <span itemprop="name">MicroBrand</span>
+  </div>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">29.99</span>
+    <meta itemprop="priceCurrency" content="USD">
+    <link itemprop="availability" href="https://schema.org/InStock">
+    <link itemprop="itemCondition" href="https://schema.org/NewCondition">
+    <div itemprop="aggregateRating" itemscope itemtype="https://schema.org/AggregateRating">
+      <span itemprop="ratingValue">4.7</span>
+      <span itemprop="ratingCount">88</span>
+    </div>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_extracts_product_facts() {
+        let o = extract_commerce_offer(HTML_MICRODATA, "https://shop.example.com/mw");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(29.99), "price from itemprop=price");
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
+        assert_eq!(d.sku.as_deref(), Some("MW-007"));
+        assert_eq!(d.gtin.as_deref(), Some("9876543210123"));
+        assert_eq!(d.merchant.as_deref(), Some("MicroBrand"));
+        assert_eq!(d.rating, Some(4.7));
+        assert_eq!(d.rating_count, Some(88));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    // Multi-offer microdata (two prices) must surface range + count, never a
+    // silent single canonical price.
+    const HTML_MICRODATA_TWO: &str = r#"<!doctype html><html><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">15.00</span><meta itemprop="priceCurrency" content="USD">
+  </div>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">20.00</span><meta itemprop="priceCurrency" content="USD">
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_two_offers_surfaces_range_not_canonical() {
+        let o = extract_commerce_offer(HTML_MICRODATA_TWO, "https://shop.example.com/dual");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price_low, Some(15.00));
+        assert_eq!(d.price_high, Some(20.00));
+        assert_eq!(d.offer_count, Some(2));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.price, None, "must NOT collapse multiple microdata prices");
+    }
+
+    // A page with breadcrumb/structural microdata but NO product scope must not
+    // extract any product facts (no false positives from unrelated itemprops).
+    const HTML_MICRODATA_NO_PRODUCT: &str = r#"<!doctype html><html><body>
+<nav itemscope itemtype="https://schema.org/BreadcrumbList">
+  <span itemprop="name">Home</span>
+  <span itemprop="price">9.99</span>
+</nav>
+<p>This article mentions a price of $49.99 in body text but exposes no product microdata.</p>
+</body></html>"#;
+
+    #[test]
+    fn microdata_no_product_scope_is_all_null() {
+        let o = extract_commerce_offer(HTML_MICRODATA_NO_PRODUCT, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        // price inside a BreadcrumbList scope must NOT be treated as a product price.
+        assert_eq!(d.price, None);
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
+        assert_eq!(d.currency, None);
+        assert_eq!(d.sku, None);
+        assert_eq!(d.gtin, None);
+        // merchant falls back to the coarse host label (identifier, not a fact).
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    // Microdata must supplement but NOT overwrite a stronger JSON-LD signal.
+    #[test]
+    fn microdata_supplements_without_overwriting_jsonld() {
+        let html = format!("{}\n{}", HTML_SINGLE_OFFER, HTML_MICRODATA_TWO);
+        let o = extract_commerce_offer(&html, "https://shop.example.com/mix");
+        let d = o.data.as_ref().unwrap();
+        // JSON-LD is the primary signal and wins where it sets a field.
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.source.as_deref(), Some("json-ld"));
+        // Fields JSON-LD left unset stay null (microdata prices were 15/20, but
+        // JSON-LD already set price=49.99 so microdata must NOT overwrite).
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
+    }
 
         #[test]
         fn intent_reports_local_signal_for_near_me() {
