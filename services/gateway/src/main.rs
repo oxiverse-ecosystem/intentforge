@@ -3019,26 +3019,39 @@ fn json_get_u64(v: &serde_json::Value) -> Option<u64> {
 fn parse_microdata(html: &str) -> Option<OfferFacts> {
     // Scan <...> tokens manually with a permissive regex that captures every
     // attribute name="value" pair (itemprops live in attributes, not meta-only).
+    // NOTE: the regex must match closing tags too (char after '<' may be '/'),
+    // otherwise </div> is invisible and scopes never pop.
     static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let tag_re = TAG_RE
-        .get_or_init(|| regex::Regex::new(r#"(?i)<[a-zA-Z][^>]*>"#).unwrap());
+        .get_or_init(|| regex::Regex::new(r#"(?i)<[a-zA-Z/][^>]*>"#).unwrap());
     static ATTR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let attr_re = ATTR_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)([a-zA-Z_][-a-zA-Z0-9_:.]*)\s*=\s*[\"']([^\"']*)[\"']"#).unwrap()
+        regex::Regex::new(r#"(?i)([a-zA-Z_][-a-zA-Z0-9_:.]*)\s*=\s*["']([^"']*)["']"#).unwrap()
     });
 
-    // Walk tags; track the current product scope so we only collect itemprops
-    // that belong to a Product/Offer (i.e. inside an itemscope with the right
-    // itemtype). This avoids grabbing unrelated itemprops (e.g. breadcrumbs).
+    // Track nested itemscope kinds on a stack so we only collect itemprops that
+    // belong to a Product/Offer scope (or a Brand nested within one). This avoids
+    // grabbing unrelated itemprops (e.g. a breadcrumb's `itemprop="price"`).
+    #[derive(PartialEq, Clone, Copy)]
+    enum Scope {
+        Product,
+        Offer,
+        Other,
+    }
+    let mut stack: Vec<Scope> = Vec::new();
     let mut facts = OfferFacts::default();
-    let mut saw_scope = false;
-    let mut cur_is_product = false;
     let mut prices: Vec<(f64, Option<String>)> = Vec::new();
 
     for m in tag_re.find_iter(html) {
         let tag = m.as_str();
         let lower = tag.to_ascii_lowercase();
-        let is_open = !lower.starts_with("</");
+        let is_close = lower.starts_with("</");
+        if is_close {
+            // Pop the most-recently-opened scope. (Self-closing tags like
+            // <meta .../> are open tags and never reach here.)
+            stack.pop();
+            continue;
+        }
         // Collect attributes.
         let mut attrs: Vec<(String, String)> = Vec::new();
         for cap in attr_re.captures_iter(tag) {
@@ -3055,26 +3068,33 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
         };
 
         if has("itemscope") {
-            // Entering a new scope. It is "product-relevant" if it carries an
-            // itemtype mentioning Product/Offer (case-insensitive substring).
-            let itype = val_of("itemtype").unwrap_or_default().to_lowercase();
-            cur_is_product = itype.contains("product") || itype.contains("offer");
-            saw_scope = true;
-            if !cur_is_product {
-                continue; // not a product scope; skip its itemprops
+            // Entering a new scope. Classify by itemtype so we know whether we're
+            // inside a Product/Offer (collect) or something else (e.g. Brand).
+            let itype = val_of("itemtype").unwrap_or_default().to_ascii_lowercase();
+            let kind = if itype.contains("product") {
+                Scope::Product
+            } else if itype.contains("offer") {
+                Scope::Offer
+            } else {
+                Scope::Other
+            };
+            // Inline brand form: <span itemprop="brand">Name</span> (no nested scope).
+            if kind == Scope::Other && has("itemprop") {
+                let prop = val_of("itemprop").unwrap_or_default().to_ascii_lowercase();
+                if prop == "brand" {
+                    let c = val_of("content").or_else(|| val_of("itemid")).unwrap_or_default();
+                    if !c.is_empty() && facts.merchant.is_none() {
+                        facts.merchant = Some(c);
+                    }
+                }
             }
+            stack.push(kind);
         }
-        if !saw_scope {
-            continue; // nothing scoped yet — ignore stray itemprops
-        }
-        if !cur_is_product {
-            continue;
-        }
-        if !is_open {
-            // Closing tag: drop product relevance when it closes the scope.
-            // (Naive single-depth tracking: a closing </div> ends the scope.)
-            cur_is_product = false;
-            saw_scope = false;
+
+        // Only collect itemprops inside a Product/Offer scope (an ancestor in the
+        // stack). Stray itemprops outside any such scope are ignored.
+        let in_prod = stack.iter().any(|s| *s == Scope::Product || *s == Scope::Offer);
+        if !in_prod {
             continue;
         }
         if !has("itemprop") {
@@ -3082,8 +3102,7 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
         }
         let prop = val_of("itemprop").unwrap_or_default().to_ascii_lowercase();
         let content = val_of("content").or_else(|| val_of("itemid")).unwrap_or_default();
-        // Prefer a typed/attr value; fall back to element text is NOT done —
-        // we never read text nodes (that would be free-text guessing).
+        // Prefer a typed/attr value; we never read text nodes (free-text guessing).
         let set_str = |f: &mut Option<String>, v: String| {
             if f.is_none() && !v.is_empty() {
                 *f = Some(v);
@@ -18102,12 +18121,21 @@ mod spellcheck_endpoint_tests {
     // Microdata must supplement but NOT overwrite a stronger JSON-LD signal.
     #[test]
     fn microdata_supplements_without_overwriting_jsonld() {
-        let html = format!("{}\n{}", HTML_SINGLE_OFFER, HTML_MICRODATA_TWO);
+        // Self-contained JSON-LD single-offer page (no dependency on the
+        // commerce_extraction_tests fixtures, since this block lives in an
+        // outer module). price = 49.99 USD.
+        let jsonld = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{ "@context": "https://schema.org/", "@type": "Product",
+  "name": "Acme Widget Pro",
+  "offers": { "@type": "Offer", "price": "49.99", "priceCurrency": "USD" } }
+</script></head><body></body></html>"#;
+        let html = format!("{}\n{}", jsonld, HTML_MICRODATA_TWO);
         let o = extract_commerce_offer(&html, "https://shop.example.com/mix");
         let d = o.data.as_ref().unwrap();
         // JSON-LD is the primary signal and wins where it sets a field.
         assert_eq!(d.price, Some(49.99));
-        assert_eq!(d.source.as_deref(), Some("json-ld"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
         // Fields JSON-LD left unset stay null (microdata prices were 15/20, but
         // JSON-LD already set price=49.99 so microdata must NOT overwrite).
         assert_eq!(d.price_low, None);
