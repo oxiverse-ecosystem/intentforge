@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "note": "Runtime-loaded commerce feature config. All values can be changed WITHOUT recompile — edit this file and restart the gateway. Each field has a sensible default applied when the file is missing or a field is absent, so an empty/missing file is NOT fatal.",
+  "mainpath_top_n": 8
+}

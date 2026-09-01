@@ -3899,13 +3899,6 @@ fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
     results.iter().any(|r| r.get("commerce").is_some())
 }
 
-/// How many of the ALREADY-RANKED top results feed the main-path `shopping`
-/// block on `/search` (ROADMAP item 7). This is a presentation cap on a CLONE of
-/// the ranked results, NOT a ranking change — the real `results` array is never
-/// touched, so this number cannot affect ranking or selection. Data-free: tuning
-/// it only changes how many enriched shopping cards show, never their order.
-const COMMERCE_MAINPATH_TOP_N: usize = 8;
-
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
 /// Returns true when the in-process intent signals indicate the user wants to buy.
@@ -4113,6 +4106,64 @@ impl AffiliateCtx {
                     .map(|k| std::env::var(k).is_ok())
                     .unwrap_or(false)
         })
+    }
+}
+
+/// Runtime-loaded commerce feature configuration (ROADMAP post-item-7 increment).
+///
+/// Holds presentation/behavior toggles for the commerce pipeline that should be
+/// changeable WITHOUT recompiling — edit `data/commerce/config.json` and restart
+/// the gateway. Every field has a sensible default, so a missing/empty file is
+/// NOT fatal: the pipeline simply runs with defaults.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct CommerceConfig {
+    /// How many of the ALREADY-RANKED top results feed the main-path `shopping`
+    /// strip on `/search`. Data-only: changing it only changes how many enriched
+    /// shopping cards show, never their order (the order-invariance guarantee
+    /// holds for any value). Defaults to 8 when absent.
+    #[serde(default = "default_mainpath_top_n")]
+    mainpath_top_n: usize,
+}
+
+fn default_mainpath_top_n() -> usize {
+    8
+}
+
+impl Default for CommerceConfig {
+    fn default() -> Self {
+        Self {
+            mainpath_top_n: default_mainpath_top_n(),
+        }
+    }
+}
+
+impl CommerceConfig {
+    /// Load config from the data file. A missing/empty/malformed file is NOT
+    /// fatal — defaults are applied per-field via serde, and a totally absent
+    /// file yields `Default::default()`. This mirrors the `AffiliateCtx::load`
+    /// resilience pattern: commerce behavior must never break search.
+    fn load() -> Self {
+        let candidates = [
+            "data/commerce/config.json",
+            "/app/data/commerce/config.json",
+            "./data/commerce/config.json",
+        ];
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Ok(cfg) = serde_json::from_value::<CommerceConfig>(v.clone()) {
+                        tracing::info!(
+                            "commerce config: loaded mainpath_top_n={} from {}",
+                            cfg.mainpath_top_n,
+                            path
+                        );
+                        return cfg;
+                    }
+                }
+            }
+        }
+        tracing::info!("commerce config: no data file found, using defaults");
+        Self::default()
     }
 }
 
@@ -10422,6 +10473,12 @@ struct AppState {
     /// knowledge is data, never code. Used only as a strict post-rank decoration
     /// pass — never affects ranking/order.
     affiliate_ctx: AffiliateCtx,
+    /// Runtime-loaded commerce feature configuration (ROADMAP post-item-7
+    /// increment). Loaded once at startup from `data/commerce/config.json`;
+    /// presentation/behavior toggles (e.g. `mainpath_top_n`) are data-only and
+    /// can be changed WITHOUT recompiling. A missing/empty file falls back to
+    /// defaults — never breaks search.
+    commerce_config: CommerceConfig,
 }
 
 async fn handle_images(
@@ -11055,6 +11112,7 @@ async fn main() {
         search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         // Affiliate template engine config (ROADMAP item 3) — loaded from data.
         affiliate_ctx: AffiliateCtx::load(),
+        commerce_config: CommerceConfig::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -15866,7 +15924,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         // place. `serde_json::to_value` on `MergedResult` is lossless/Serialize.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
             .iter()
-            .take(COMMERCE_MAINPATH_TOP_N)
+            .take(state.commerce_config.mainpath_top_n)
             .filter_map(|r| serde_json::to_value(r).ok())
             .collect();
         if shop_arr.is_empty() {
@@ -18683,8 +18741,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.price, Some(14.99));
     }
 
-    #[test]
-    fn name_and_sale_date_preserved_in_enrichment_order_invariance() {
+    #[tokio::test]
+    async fn name_and_sale_date_preserved_in_enrichment_order_invariance() {
         // The mandatory order-invariance test must still pass after adding the
         // new fields: enrichment with the new fields populated never reorders
         // ranked results (the whole no-manipulation guarantee).
@@ -19161,5 +19219,54 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(c["data"]["description"], "A great widget.");
         assert_eq!(c["data"]["category"], "Gadgets");
         assert_eq!(c["data"]["price"], 10.00);
+    }
+
+    // ── ROADMAP post-item-7: commerce config is data-driven ─────────────
+    // The mainpath_top_n presentation cap MUST be changeable by editing the
+    // data file ONLY — no recompile. These tests lock that contract.
+
+    #[test]
+    fn commerce_config_default_mainpath_top_n() {
+        // When no data file exists, the default must be the documented 8.
+        let cfg = CommerceConfig::default();
+        assert_eq!(cfg.mainpath_top_n, 8, "default mainpath_top_n must be 8");
+    }
+
+    #[test]
+    fn commerce_config_loads_from_data_file() {
+        // A data file with an explicit mainpath_top_n must be honored.
+        let dir = std::env::temp_dir();
+        let path = dir.join("intentforge-commerce-config-test.json");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            r#"{ "version": 1, "mainpath_top_n": 12 }"#,
+        )
+        .unwrap();
+        // Load via the same candidate-path mechanism by pointing the load at
+        // the temp file. We can't inject the path, so we test the serde path
+        // directly (the load() function reads from fixed candidate paths).
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let cfg: CommerceConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(cfg.mainpath_top_n, 12, "mainpath_top_n from data file must be honored");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn commerce_config_missing_field_uses_default() {
+        // A data file with NO mainpath_top_n field must fall back to the
+        // serde default (8) — the field is optional.
+        let v: serde_json::Value = serde_json::from_str(r#"{ "version": 1 }"#).unwrap();
+        let cfg: CommerceConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(cfg.mainpath_top_n, 8, "missing mainpath_top_n must default to 8");
+    }
+
+    #[test]
+    fn commerce_config_empty_object_uses_default() {
+        // An empty JSON object must yield the default config (no fields).
+        let v: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
+        let cfg: CommerceConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(cfg.mainpath_top_n, 8, "empty object must default mainpath_top_n to 8");
     }
 }
