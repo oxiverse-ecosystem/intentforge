@@ -2736,7 +2736,8 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
 
 // ─── Commerce: honest product-fact extraction (ROADMAP item 1) ───────
 // Extracts structured commerce facts ONLY from machine-readable page data:
-//   * schema.org JSON-LD (Product / Offer / AggregateOffer)
+//   * schema.org JSON-LD (Product / Offer / AggregateOffer / SoftwareApplication
+//     / VideoGame / Service)
 //   * OpenGraph `product:*` meta tags
 //   * schema.org MICRODATA (`itemscope` + `itemprop`) — real structured
 //     on-page product data emitted by Shopify/legacy product pages.
@@ -2782,6 +2783,15 @@ struct OfferFacts {
     price_high: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offer_count: Option<usize>,
+    /// Product name from structured data (JSON-LD `name` / microdata `itemprop="name"` / OG `og:title`).
+    /// Only extracted from typed structured signals, never from free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// Sale end date from schema.org `priceValidUntil` (ISO 8601 date string).
+    /// Lets the frontend label a price as a limited-time offer. Only extracted
+    /// from structured data, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_valid_until: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3019,32 +3029,61 @@ fn json_get_u64(v: &serde_json::Value) -> Option<u64> {
 fn parse_microdata(html: &str) -> Option<OfferFacts> {
     // Scan <...> tokens manually with a permissive regex that captures every
     // attribute name="value" pair (itemprops live in attributes, not meta-only).
+    // NOTE: the regex must match closing tags too (char after '<' may be '/'),
+    // otherwise </div> is invisible and scopes never pop.
     static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let tag_re = TAG_RE
-        .get_or_init(|| regex::Regex::new(r#"(?i)<[a-zA-Z][^>]*>"#).unwrap());
+        .get_or_init(|| regex::Regex::new(r#"(?i)<[a-zA-Z/][^>]*>"#).unwrap());
     static ATTR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let attr_re = ATTR_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)([a-zA-Z_][-a-zA-Z0-9_:.]*)\s*=\s*[\"']([^\"']*)[\"']"#).unwrap()
+        regex::Regex::new(r#"(?i)([a-zA-Z_][-a-zA-Z0-9_:.]*)\s*=\s*["']([^"']*)["']"#).unwrap()
     });
 
-    // Walk tags; track the current product scope so we only collect itemprops
-    // that belong to a Product/Offer (i.e. inside an itemscope with the right
-    // itemtype). This avoids grabbing unrelated itemprops (e.g. breadcrumbs).
+    // Track nested itemscope kinds on a stack so we only collect itemprops that
+    // belong to a Product/Offer scope (or a Brand nested within one). This avoids
+    // grabbing unrelated itemprops (e.g. a breadcrumb's `itemprop="price"`).
+    #[derive(PartialEq, Clone, Copy)]
+    enum Scope {
+        Product,
+        Offer,
+        Other,
+    }
+    let mut stack: Vec<Scope> = Vec::new();
+    // Parallel stack tracking which TAG NAMES pushed a scope, so closing tags
+    // only pop when they match the opening tag (a </span> must NOT pop a scope
+    // pushed by a <div itemscope>).
+    let mut scope_tags: Vec<String> = Vec::new();
     let mut facts = OfferFacts::default();
-    let mut saw_scope = false;
-    let mut cur_is_product = false;
     let mut prices: Vec<(f64, Option<String>)> = Vec::new();
 
     for m in tag_re.find_iter(html) {
         let tag = m.as_str();
         let lower = tag.to_ascii_lowercase();
-        let is_open = !lower.starts_with("</");
+        let is_close = lower.starts_with("</");
+        if is_close {
+            // Only pop if this closing tag matches the opening tag that pushed
+            // the current scope. Extract tag name: first word after '</'.
+            let tag_name = tag[2..].trim_end_matches('>').trim().to_ascii_lowercase();
+            if scope_tags.last() == Some(&tag_name) {
+                scope_tags.pop();
+                stack.pop();
+            }
+            continue;
+        }
         // Collect attributes.
         let mut attrs: Vec<(String, String)> = Vec::new();
         for cap in attr_re.captures_iter(tag) {
             let k = cap.get(1).map(|x| x.as_str().to_ascii_lowercase()).unwrap_or_default();
             let v = cap.get(2).map(|x| x.as_str().to_string()).unwrap_or_default();
             attrs.push((k, v));
+        }
+        // Boolean attributes (e.g. itemscope without =value) are not captured by
+        // attr_re (which requires ="value"). Detect itemscope explicitly so the
+        // scope stack is pushed even for <div itemscope itemtype="...">.
+        if lower.split_whitespace().any(|w| w == "itemscope")
+            && !attrs.iter().any(|(k, _)| k == "itemscope")
+        {
+            attrs.push(("itemscope".to_string(), String::new()));
         }
         let has = |name: &str| attrs.iter().any(|(k, _)| k == name);
         let val_of = |name: &str| {
@@ -3055,35 +3094,67 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
         };
 
         if has("itemscope") {
-            // Entering a new scope. It is "product-relevant" if it carries an
-            // itemtype mentioning Product/Offer (case-insensitive substring).
-            let itype = val_of("itemtype").unwrap_or_default().to_lowercase();
-            cur_is_product = itype.contains("product") || itype.contains("offer");
-            saw_scope = true;
-            if !cur_is_product {
-                continue; // not a product scope; skip its itemprops
+            // Entering a new scope. Classify by itemtype so we know whether we're
+            // inside a Product/Offer (collect) or something else (e.g. Brand).
+            // ROADMAP item 1 (increment): extend to schema.org's digital-product
+            // itemtypes — `SoftwareApplication`, `VideoGame`, `Service` — which
+            // carry the SAME structured commerce facts (price, rating, brand/
+            // publisher) as a physical Product. The itemprop mapping below is
+            // identical for all of them, so a single Scope::Product branch
+            // covers every product-like type without per-type logic.
+            let itype = val_of("itemtype").unwrap_or_default().to_ascii_lowercase();
+            let kind = if itype.contains("product")
+                || itype.contains("software")
+                || itype.contains("video")
+                || itype.contains("service")
+            {
+                Scope::Product
+            } else if itype.contains("offer") {
+                Scope::Offer
+            } else {
+                Scope::Other
+            };
+            // Inline brand form: <span itemprop="brand">Name</span> (no nested scope).
+            if kind == Scope::Other && has("itemprop") {
+                let prop = val_of("itemprop").unwrap_or_default().to_ascii_lowercase();
+                if prop == "brand" {
+                    let c = val_of("content").or_else(|| val_of("itemid")).unwrap_or_default();
+                    if !c.is_empty() && facts.merchant.is_none() {
+                        facts.merchant = Some(c);
+                    }
+                }
             }
+            stack.push(kind);
+            // Record the tag name so the matching closing tag pops this scope.
+            let tag_name = tag[1..].split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            scope_tags.push(tag_name);
         }
-        if !saw_scope {
-            continue; // nothing scoped yet — ignore stray itemprops
-        }
-        if !cur_is_product {
-            continue;
-        }
-        if !is_open {
-            // Closing tag: drop product relevance when it closes the scope.
-            // (Naive single-depth tracking: a closing </div> ends the scope.)
-            cur_is_product = false;
-            saw_scope = false;
+
+        // Only collect itemprops inside a Product/Offer scope (an ancestor in the
+        // stack). Stray itemprops outside any such scope are ignored.
+        let in_prod = stack.iter().any(|s| *s == Scope::Product || *s == Scope::Offer);
+        if !in_prod {
             continue;
         }
         if !has("itemprop") {
             continue;
         }
         let prop = val_of("itemprop").unwrap_or_default().to_ascii_lowercase();
-        let content = val_of("content").or_else(|| val_of("itemid")).unwrap_or_default();
-        // Prefer a typed/attr value; fall back to element text is NOT done —
-        // we never read text nodes (that would be free-text guessing).
+        // Prefer typed attributes (content/itemid), then href (for <link> elements
+        // like availability/itemCondition), then text content between open and
+        // close tags (e.g. <span itemprop="price">29.99</span>).
+        let attr_content = val_of("content")
+            .or_else(|| val_of("itemid"))
+            .or_else(|| val_of("href"))
+            .unwrap_or_default();
+        let content = if attr_content.is_empty() {
+            let after = &html[m.end()..];
+            let end = after.find('<').unwrap_or(after.len());
+            after[..end].trim().to_string()
+        } else {
+            attr_content
+        };
+        // Prefer a typed/attr value; text-node fallback only when no attribute.
         let set_str = |f: &mut Option<String>, v: String| {
             if f.is_none() && !v.is_empty() {
                 *f = Some(v);
@@ -3135,6 +3206,22 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
                     facts.merchant = Some(content);
                 }
             }
+            "name" => {
+                // itemprop="name" inside a Brand scope (top of stack is Other) is the
+                // brand/merchant name, not the product name.
+                if stack.last() == Some(&Scope::Other) {
+                    if facts.merchant.is_none() && !content.is_empty() {
+                        facts.merchant = Some(content);
+                    }
+                } else if facts.name.is_none() && !content.is_empty() {
+                    facts.name = Some(content);
+                }
+            }
+            "pricevaliduntil" => {
+                if facts.price_valid_until.is_none() && !content.is_empty() {
+                    facts.price_valid_until = Some(content);
+                }
+            }
             _ => {}
         }
     }
@@ -3167,7 +3254,7 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
         facts.price_low = Some(lo);
         facts.price_high = Some(hi);
         facts.offer_count = Some(prices.len());
-        if all_agree {
+        if facts.currency.is_none() && all_agree {
             facts.currency = first_cur;
         }
     }
@@ -3240,6 +3327,8 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         if facts.rating.is_none() { facts.rating = md.rating; }
         if facts.rating_count.is_none() { facts.rating_count = md.rating_count; }
         if facts.merchant.is_none() { facts.merchant = md.merchant; }
+        if facts.name.is_none() { facts.name = md.name; }
+        if facts.price_valid_until.is_none() { facts.price_valid_until = md.price_valid_until; }
         if source.is_none() {
             source = Some("microdata".to_string());
         }
@@ -3321,7 +3410,22 @@ fn walk_commerce_nodes(v: &serde_json::Value, out: &mut Vec<serde_json::Value>) 
             };
             if let Some(t) = ty {
                 let tl = t.to_lowercase();
-                if tl.contains("product") || tl.contains("offer") {
+                // ROADMAP item 1 (increment): extend honest extraction to
+                // schema.org's digital-product types alongside physical
+                // Product/Offer. `SoftwareApplication` (SaaS, mobile apps),
+                // `VideoGame`, and `Service` (subscriptions) carry the SAME
+                // structured commerce facts (price, rating, publisher/developer
+                // as merchant) as a physical Product — the rest of the pipeline
+                // (merge_jsonld_nodes) reads those same fields, so no per-type
+                // logic is added. A type match WITHOUT matching fields simply
+                // yields no facts (graceful), so the broad `contains` stems here
+                // cannot fabricate facts from non-product pages.
+                if tl.contains("product")
+                    || tl.contains("offer")
+                    || tl.contains("software")
+                    || tl.contains("video")
+                    || tl.contains("service")
+                {
                     out.push(v.clone());
                 }
             }
@@ -3439,9 +3543,55 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
                     seller.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
             }
         }
+        // ROADMAP item 1 (increment): digital-product schemas (SoftwareApplication,
+        // VideoGame, Service) carry the merchant as `publisher` / `developer` /
+        // `provider` instead of `seller`. These are the SAME commerce role (the
+        // entity offering the product) — just a different field name per schema
+        // type. No per-type branch: we try each field in priority order, and a
+        // page with none of them simply leaves merchant null (honest).
+        if facts.merchant.is_none() {
+            if let Some(pub_name) = n
+                .get("publisher")
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    n.get("developer")
+                        .and_then(|d| d.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .or_else(|| {
+                    n.get("provider")
+                        .and_then(|p| p.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+            {
+                facts.merchant = Some(pub_name);
+            }
+        }
         if facts.currency.is_none() {
             facts.currency = n
                 .get("priceCurrency")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        // ROADMAP item 1 (increment): extract product `name` and `priceValidUntil`
+        // from the SAME typed structured node. `name` is the product title (e.g.
+        // "Acme Widget Pro"); `priceValidUntil` is an ISO 8601 sale-end date that
+        // lets the frontend label a price as a limited-time offer. Both are
+        // optional and only set when the page actually exposes them — never
+        // guessed. The fields live on the Product/Offer node itself.
+        if facts.name.is_none() {
+            facts.name = n
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if facts.price_valid_until.is_none() {
+            facts.price_valid_until = n
+                .get("priceValidUntil")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
         }
@@ -16876,11 +17026,18 @@ mod constraint_fix_tests {
                 q, kept
             );
             let joined = kept.join(" ");
-            assert!(
-                joined.contains("dairy") && joined.contains("gelatin"),
-                "legitimate exclusions must survive: q={:?} kept={:?}",
-                q, kept
-            );
+            match q {
+                "how do I make a vegan chocolate mousse that uses no dairy and no gelatin" => {
+                    assert!(joined.contains("dairy") && joined.contains("gelatin"), "legitimate exclusions must survive: q={:?} kept={:?}", q, kept);
+                }
+                "recipes with no nuts and no dairy" => {
+                    assert!(joined.contains("nuts") && joined.contains("dairy"), "legitimate exclusions must survive: q={:?} kept={:?}", q, kept);
+                }
+                "shoes without laces or without velcro" => {
+                    assert!(joined.contains("laces") && joined.contains("velcro"), "legitimate exclusions must survive: q={:?} kept={:?}", q, kept);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -18102,12 +18259,21 @@ mod spellcheck_endpoint_tests {
     // Microdata must supplement but NOT overwrite a stronger JSON-LD signal.
     #[test]
     fn microdata_supplements_without_overwriting_jsonld() {
-        let html = format!("{}\n{}", HTML_SINGLE_OFFER, HTML_MICRODATA_TWO);
+        // Self-contained JSON-LD single-offer page (no dependency on the
+        // commerce_extraction_tests fixtures, since this block lives in an
+        // outer module). price = 49.99 USD.
+        let jsonld = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{ "@context": "https://schema.org/", "@type": "Product",
+  "name": "Acme Widget Pro",
+  "offers": { "@type": "Offer", "price": "49.99", "priceCurrency": "USD" } }
+</script></head><body></body></html>"#;
+        let html = format!("{}\n{}", jsonld, HTML_MICRODATA_TWO);
         let o = extract_commerce_offer(&html, "https://shop.example.com/mix");
         let d = o.data.as_ref().unwrap();
         // JSON-LD is the primary signal and wins where it sets a field.
         assert_eq!(d.price, Some(49.99));
-        assert_eq!(d.source.as_deref(), Some("json-ld"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
         // Fields JSON-LD left unset stay null (microdata prices were 15/20, but
         // JSON-LD already set price=49.99 so microdata must NOT overwrite).
         assert_eq!(d.price_low, None);
@@ -18340,6 +18506,131 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(o.observed_at.is_some());
         // A unix-second string is digits only.
         assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn jsonld_extracts_product_name_and_sale_end_date() {
+        // ROADMAP item 1 (increment): the product `name` (e.g. "Acme Widget Pro")
+        // and the offer's `priceValidUntil` (ISO 8601 sale-end date) are extracted
+        // from the SAME typed structured node. Both must be present when the page
+        // exposes them and null when absent — never guessed from free text.
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Acme Widget Pro",
+  "offers": {
+    "@type": "Offer",
+    "price": "49.99",
+    "priceCurrency": "USD",
+    "priceValidUntil": "2026-12-31"
+  }
+}
+</script></head><body><h1>Acme Widget Pro</h1></body></html>"#;
+        let o = extract_commerce_offer(html, "https://store.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.name.as_deref(), Some("Acme Widget Pro"), "product name from JSON-LD");
+        assert_eq!(d.price_valid_until.as_deref(), Some("2026-12-31"), "sale end date from JSON-LD");
+        // Existing fields still extract correctly alongside new ones.
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+    }
+
+    #[test]
+    fn jsonld_missing_name_and_sale_date_stay_null() {
+        // A product page that exposes NO `name` and NO `priceValidUntil` must
+        // leave both null — we never guess them from any other field.
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "offers": {
+    "@type": "Offer",
+    "price": "9.99",
+    "priceCurrency": "USD"
+  }
+}
+</script></head><body><body></html>"#;
+        let o = extract_commerce_offer(html, "https://store.example.com/no-name");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.name, None, "no name in structured data => null");
+        assert_eq!(d.price_valid_until, None, "no priceValidUntil => null");
+        assert_eq!(d.price, Some(9.99));
+    }
+
+    #[test]
+    fn microdata_extracts_product_name_and_sale_end_date() {
+        // ROADMAP item 1 (increment): schema.org microdata `itemprop="name"` and
+        // `itemprop="priceValidUntil"` are extracted alongside the existing price/
+        // rating/sku fields. This exercises the parse_microdata path.
+        let html = r#"<!doctype html><html><head><title>Microdata Product</title></head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Microdata Widget</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">29.99</span>
+    <span itemprop="priceCurrency">EUR</span>
+    <time itemprop="priceValidUntil" datetime="2026-11-30">2026-11-30</time>
+  </div>
+</div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/md");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.name.as_deref(), Some("Microdata Widget"), "name from microdata");
+        assert_eq!(d.price_valid_until.as_deref(), Some("2026-11-30"), "sale end date from microdata");
+        assert_eq!(d.price, Some(29.99));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    #[test]
+    fn microdata_missing_name_and_sale_date_stay_null() {
+        // A microdata product page with NO `itemprop="name"` and NO
+        // `itemprop="priceValidUntil"` leaves both null.
+        let html = r#"<!doctype html><html><head></head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">14.99</span>
+  </div>
+</div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/md-no-name");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.name, None);
+        assert_eq!(d.price_valid_until, None);
+        assert_eq!(d.price, Some(14.99));
+    }
+
+    #[tokio::test]
+    async fn name_and_sale_date_preserved_in_enrichment_order_invariance() {
+        // The mandatory order-invariance test must still pass after adding the
+        // new fields: enrichment with the new fields populated never reorders
+        // ranked results (the whole no-manipulation guarantee).
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://a.example.com/x", "score": 9.0 }),
+        ];
+        let fake_html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Widget",
+  "offers": {"@type": "Offer", "price": "10.00", "priceValidUntil": "2026-12-31"}
+}
+</script></head><body></body></html>"#;
+        let h = fake_html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        assert_eq!(r["url"], "https://a.example.com/x", "order preserved");
+        let c = r.get("commerce").expect("commerce block attached");
+        assert_eq!(c["data"]["name"], "Widget");
+        assert_eq!(c["data"]["price_valid_until"], "2026-12-31");
+        assert_eq!(c["data"]["price"], 10.00);
     }
 
     // ── ROADMAP item 3: monetization MUST NOT affect ranking/order ────────────
