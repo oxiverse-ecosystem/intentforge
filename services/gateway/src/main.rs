@@ -2814,6 +2814,36 @@ struct OfferFacts {
     /// guessed from free text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     brand: Option<String>,
+    /// Product model identifier from structured data (JSON-LD `model`,
+    /// microdata `itemprop="model"`, OG `product:model`). E.g. "WH-1000XM5".
+    /// Only extracted from typed structured signals, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    /// Product color from structured data (JSON-LD `color`, microdata
+    /// `itemprop="color"`, OG `product:color`). Only extracted from typed
+    /// structured signals, never guessed from free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
+    /// Product size from structured data (JSON-LD `size`, microdata
+    /// `itemprop="size"`, OG `product:size`). Only extracted from typed
+    /// structured signals, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    size: Option<String>,
+    /// Product material from structured data (JSON-LD `material`, microdata
+    /// `itemprop="material"`, OG `product:material`). Only extracted from typed
+    /// structured signals, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    material: Option<String>,
+    /// Target gender from structured data (JSON-LD `gender`, microdata
+    /// `itemprop="gender"`, OG `product:gender`). Only extracted from typed
+    /// structured signals, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gender: Option<String>,
+    /// Target age group from structured data (JSON-LD `ageGroup`, microdata
+    /// `itemprop="age_group"`, OG `product:age_group`). Only extracted from
+    /// typed structured signals, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    age_group: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3264,6 +3294,40 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
                     facts.category = Some(content);
                 }
             }
+            // ROADMAP item 1 (increment): product variation fields from
+            // microdata. Same schema.org vocabulary as the JSON-LD path —
+            // model, color, size, material, gender, age_group. Only set
+            // when the page exposes them, never guessed.
+            "model" => {
+                if facts.model.is_none() && !content.is_empty() {
+                    facts.model = Some(content);
+                }
+            }
+            "color" => {
+                if facts.color.is_none() && !content.is_empty() {
+                    facts.color = Some(content);
+                }
+            }
+            "size" => {
+                if facts.size.is_none() && !content.is_empty() {
+                    facts.size = Some(content);
+                }
+            }
+            "material" => {
+                if facts.material.is_none() && !content.is_empty() {
+                    facts.material = Some(content);
+                }
+            }
+            "gender" => {
+                if facts.gender.is_none() && !content.is_empty() {
+                    facts.gender = Some(content);
+                }
+            }
+            "age_group" | "agegroup" => {
+                if facts.age_group.is_none() && !content.is_empty() {
+                    facts.age_group = Some(content);
+                }
+            }
             _ => {}
         }
     }
@@ -3369,6 +3433,20 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         if facts.rating.is_none() { facts.rating = md.rating; }
         if facts.rating_count.is_none() { facts.rating_count = md.rating_count; }
         if facts.merchant.is_none() { facts.merchant = md.merchant; }
+        if facts.name.is_none() { facts.name = md.name; }
+        if facts.price_valid_until.is_none() {
+            facts.price_valid_until = md.price_valid_until;
+        }
+        if facts.image.is_none() { facts.image = md.image; }
+        if facts.description.is_none() { facts.description = md.description; }
+        if facts.category.is_none() { facts.category = md.category; }
+        if facts.brand.is_none() { facts.brand = md.brand; }
+        if facts.model.is_none() { facts.model = md.model; }
+        if facts.color.is_none() { facts.color = md.color; }
+        if facts.size.is_none() { facts.size = md.size; }
+        if facts.material.is_none() { facts.material = md.material; }
+        if facts.gender.is_none() { facts.gender = md.gender; }
+        if facts.age_group.is_none() { facts.age_group = md.age_group; }
         if source.is_none() {
             source = Some("microdata".to_string());
         }
@@ -3694,6 +3772,46 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
                 }
             }
         }
+        // ROADMAP item 1 (increment): product variation fields — model, color,
+        // size, material, gender, age_group. These are standard schema.org
+        // Product properties that real product pages expose for variant
+        // selection. Each is Optional and only set when the page actually
+        // exposes it — never guessed from free text. All three signal paths
+        // (JSON-LD, microdata, OG) extract the SAME fields from the SAME
+        // vocabulary, just different serialization syntax.
+        if facts.model.is_none() {
+            facts.model = n.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+        if facts.color.is_none() {
+            facts.color = n
+                .get("color")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if facts.size.is_none() {
+            facts.size = n
+                .get("size")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if facts.material.is_none() {
+            facts.material = n
+                .get("material")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if facts.gender.is_none() {
+            facts.gender = n
+                .get("gender")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if facts.age_group.is_none() {
+            facts.age_group = n
+                .get("ageGroup")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
     }
 
     // Multiple distinct offers: never silently pick one as canonical.
@@ -3802,6 +3920,40 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
             "product:category" | "og:product_category" => {
                 if o.category.is_none() {
                     o.category = Some(content.clone());
+                }
+            }
+            // ROADMAP item 1 (increment): product variation fields from OG
+            // meta tags. og:model / product:model, product:color, product:size,
+            // product:material, product:gender, product:age_group. Same
+            // vocabulary as the JSON-LD and microdata paths.
+            "og:model" | "product:model" => {
+                if o.model.is_none() {
+                    o.model = Some(content.clone());
+                }
+            }
+            "product:color" => {
+                if o.color.is_none() {
+                    o.color = Some(content.clone());
+                }
+            }
+            "product:size" => {
+                if o.size.is_none() {
+                    o.size = Some(content.clone());
+                }
+            }
+            "product:material" => {
+                if o.material.is_none() {
+                    o.material = Some(content.clone());
+                }
+            }
+            "product:gender" => {
+                if o.gender.is_none() {
+                    o.gender = Some(content.clone());
+                }
+            }
+            "product:age_group" => {
+                if o.age_group.is_none() {
+                    o.age_group = Some(content.clone());
                 }
             }
             _ => {}
@@ -19327,5 +19479,120 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let v: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
         let cfg: CommerceConfig = serde_json::from_value(v).unwrap();
         assert_eq!(cfg.mainpath_top_n, 8, "empty object must default mainpath_top_n to 8");
+    }
+
+    // ── ROADMAP item 1 (increment): product variation fields ─────────────
+    // model, color, size, material, gender, age_group are standard schema.org
+    // Product properties. These tests prove they are extracted from all three
+    // signal paths (JSON-LD, microdata, OG) and that a page without them yields
+    // null (never guessed).
+
+    const HTML_JSONLD_VARIATIONS: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Acme Running Shoe",
+  "model": "RX-7",
+  "color": "Blue",
+  "size": "10",
+  "material": "Mesh",
+  "gender": "Male",
+  "ageGroup": "Adult",
+  "offers": {"@type": "Offer", "price": "89.99", "priceCurrency": "USD"}
+}
+</script></head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_extracts_variation_fields() {
+        let o = extract_commerce_offer(HTML_JSONLD_VARIATIONS, "https://shop.example.com/rx7");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.model.as_deref(), Some("RX-7"));
+        assert_eq!(d.color.as_deref(), Some("Blue"));
+        assert_eq!(d.size.as_deref(), Some("10"));
+        assert_eq!(d.material.as_deref(), Some("Mesh"));
+        assert_eq!(d.gender.as_deref(), Some("Male"));
+        assert_eq!(d.age_group.as_deref(), Some("Adult"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    const HTML_MICRODATA_VARIATIONS: &str = r#"<!doctype html><html><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Acme Running Shoe</span>
+  <span itemprop="model">RX-7</span>
+  <span itemprop="color">Blue</span>
+  <span itemprop="size">10</span>
+  <span itemprop="material">Mesh</span>
+  <span itemprop="gender">Male</span>
+  <span itemprop="age_group">Adult</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">89.99</span><meta itemprop="priceCurrency" content="USD">
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_extracts_variation_fields() {
+        let o = extract_commerce_offer(HTML_MICRODATA_VARIATIONS, "https://shop.example.com/rx7");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.model.as_deref(), Some("RX-7"));
+        assert_eq!(d.color.as_deref(), Some("Blue"));
+        assert_eq!(d.size.as_deref(), Some("10"));
+        assert_eq!(d.material.as_deref(), Some("Mesh"));
+        assert_eq!(d.gender.as_deref(), Some("Male"));
+        assert_eq!(d.age_group.as_deref(), Some("Adult"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    const HTML_OG_VARIATIONS: &str = r#"<!doctype html><html><head>
+<meta property="og:title" content="Acme Running Shoe">
+<meta property="product:model" content="RX-7">
+<meta property="product:color" content="Blue">
+<meta property="product:size" content="10">
+<meta property="product:material" content="Mesh">
+<meta property="product:gender" content="Male">
+<meta property="product:age_group" content="Adult">
+<meta property="product:price:amount" content="89.99">
+<meta property="product:price:currency" content="USD">
+</head><body></body></html>"#;
+
+    #[test]
+    fn og_extracts_variation_fields() {
+        let o = extract_commerce_offer(HTML_OG_VARIATIONS, "https://shop.example.com/rx7");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.model.as_deref(), Some("RX-7"));
+        assert_eq!(d.color.as_deref(), Some("Blue"));
+        assert_eq!(d.size.as_deref(), Some("10"));
+        assert_eq!(d.material.as_deref(), Some("Mesh"));
+        assert_eq!(d.gender.as_deref(), Some("Male"));
+        assert_eq!(d.age_group.as_deref(), Some("Adult"));
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    const HTML_NO_VARIATIONS: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Acme Widget",
+  "offers": {"@type": "Offer", "price": "49.99", "priceCurrency": "USD"}
+}
+</script></head><body></body></html>"#;
+
+    #[test]
+    fn no_variation_fields_when_page_lacks_them() {
+        // A page with no variation properties must yield null for all of them —
+        // never guessed from free text or the product name.
+        let o = extract_commerce_offer(HTML_NO_VARIATIONS, "https://shop.example.com/widget");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.model, None, "model must be null when page lacks it");
+        assert_eq!(d.color, None, "color must be null when page lacks it");
+        assert_eq!(d.size, None, "size must be null when page lacks it");
+        assert_eq!(d.material, None, "material must be null when page lacks it");
+        assert_eq!(d.gender, None, "gender must be null when page lacks it");
+        assert_eq!(d.age_group, None, "age_group must be null when page lacks it");
+        // Price and name should still extract normally (sanity check).
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.name.as_deref(), Some("Acme Widget"));
     }
 }
