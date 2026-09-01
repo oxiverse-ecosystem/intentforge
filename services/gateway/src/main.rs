@@ -2844,6 +2844,18 @@ struct OfferFacts {
     /// typed structured signals, never guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     age_group: Option<String>,
+    /// Product author from schema.org `Book` (`author` field, Person or
+    /// Organization). Distinct from `merchant` (the seller) and `brand` (the
+    /// manufacturer). A book authored by "J.K. Rowling" sold on Amazon has
+    /// author="J.K. Rowling", merchant=Amazon. Only extracted from typed
+    /// structured signals, never guessed from free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author: Option<String>,
+    /// ISBN from schema.org `Book` (`isbn` field). The canonical product
+    /// identifier for books. Only extracted from typed structured signals,
+    /// never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    isbn: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3151,6 +3163,7 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
                 || itype.contains("software")
                 || itype.contains("video")
                 || itype.contains("service")
+                || itype.contains("book")
             {
                 Scope::Product
             } else if itype.contains("offer") {
@@ -3248,6 +3261,24 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
             "seller" => {
                 if facts.merchant.is_none() && !content.is_empty() {
                     facts.merchant = Some(content);
+                }
+            }
+            // ROADMAP item 1 (increment): product author + isbn from Book schema.
+            // Microdata `itemprop="author"` (Person or Organization, so `name`
+            // is nested) and `itemprop="isbn"`. Distinct from merchant (seller)
+            // and brand (manufacturer). No per-type branch — the same extraction
+            // works for any product-like type; a non-book page simply lacks
+            // these fields, so both stay null (honest).
+            "author" => {
+                if facts.author.is_none() {
+                    if let Ok(name) = content.parse::<String>() {
+                        facts.author = Some(name);
+                    }
+                }
+            }
+            "isbn" => {
+                if facts.isbn.is_none() && !content.is_empty() {
+                    facts.isbn = Some(content);
                 }
             }
             // ROADMAP item 1 (increment): product brand (manufacturer) is
@@ -3543,6 +3574,7 @@ fn walk_commerce_nodes(v: &serde_json::Value, out: &mut Vec<serde_json::Value>) 
                     || tl.contains("software")
                     || tl.contains("video")
                     || tl.contains("service")
+                    || tl.contains("book")
                 {
                     out.push(v.clone());
                 }
@@ -3688,6 +3720,30 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
             {
                 facts.merchant = Some(pub_name);
             }
+        }
+        // ROADMAP item 1 (increment): extract author + isbn from Book schema.
+        // schema.org `Book` carries `author` (Person or Organization, so `name`
+        // is nested) and `isbn` (a plain string). Distinct from merchant
+        // (seller) and brand (manufacturer). No per-type branch — the same
+        // extraction works for any product-like type; a non-book page simply
+        // lacks these fields, so both stay null (honest).
+        if facts.author.is_none() {
+            if let Some(a) = n.get("author") {
+                if let Some(s) = a.as_str() {
+                    facts.author = Some(s.to_string());
+                } else if let Some(obj) = a.as_object() {
+                    facts.author = obj
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+        }
+        if facts.isbn.is_none() {
+            facts.isbn = n
+                .get("isbn")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
         }
         if facts.currency.is_none() {
             facts.currency = n
@@ -4091,6 +4147,8 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.description.is_some()
         || d.category.is_some()
         || d.brand.is_some()
+        || d.author.is_some()
+        || d.isbn.is_some()
 }
 
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
@@ -18950,6 +19008,80 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.name, None);
         assert_eq!(d.price_valid_until, None);
         assert_eq!(d.price, Some(14.99));
+    }
+
+    // ROADMAP item 1 (increment): Book schema (author + isbn) extraction.
+    // Both JSON-LD and microdata paths must extract `author` (Person or
+    // Organization, so `name` is nested) and `isbn`. A non-book page must
+    // leave both null (honest — never guessed from free text).
+
+    const HTML_BOOK_JSONLD: &str = r#"<!doctype html><html><head>
+<title>The Pragmatic Programmer</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Book",
+  "name": "The Pragmatic Programmer",
+  "isbn": "978-0201616224",
+  "author": {
+    "@type": "Person",
+    "name": "David Thomas"
+  },
+  "offers": {
+    "@type": "Offer",
+    "price": "49.99",
+    "priceCurrency": "USD",
+    "availability": "https://schema.org/InStock",
+    "seller": {"@type": "Organization", "name": "Books Inc"}
+  }
+}
+</script></head><body><h1>The Pragmatic Programmer</h1></body></html>"#;
+
+    #[test]
+    fn book_jsonld_extracts_author_and_isbn() {
+        let o = extract_commerce_offer(HTML_BOOK_JSONLD, "https://books.example.com/pragmatic");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.author.as_deref(), Some("David Thomas"), "author from Book JSON-LD");
+        assert_eq!(d.isbn.as_deref(), Some("978-0201616224"), "isbn from Book JSON-LD");
+        // Other commerce facts still extract correctly.
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.merchant.as_deref(), Some("Books Inc"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    const HTML_BOOK_MICRODATA: &str = r#"<!doctype html><html><head><title>Book Page</title></head><body>
+<div itemscope itemtype="https://schema.org/Book">
+  <span itemprop="name">Clean Code</span>
+  <div itemprop="author" itemscope itemtype="https://schema.org/Person">
+    <span itemprop="name">Robert C. Martin</span>
+  </div>
+  <span itemprop="isbn">978-0132350884</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">39.99</span>
+    <span itemprop="priceCurrency">USD</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn book_microdata_extracts_author_and_isbn() {
+        let o = extract_commerce_offer(HTML_BOOK_MICRODATA, "https://books.example.com/clean-code");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.author.as_deref(), Some("Robert C. Martin"), "author from Book microdata");
+        assert_eq!(d.isbn.as_deref(), Some("978-0132350884"), "isbn from Book microdata");
+        assert_eq!(d.price, Some(39.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    #[test]
+    fn non_book_page_leaves_author_and_isbn_null() {
+        // A regular product page (not a Book) must leave author + isbn null.
+        let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.author, None, "non-book page => author null");
+        assert_eq!(d.isbn, None, "non-book page => isbn null");
     }
 
     #[tokio::test]
