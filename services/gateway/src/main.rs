@@ -2807,6 +2807,13 @@ struct OfferFacts {
     /// from typed structured signals, never guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     category: Option<String>,
+    /// Product brand (manufacturer) from structured data (JSON-LD `brand`,
+    /// OG `product:brand`, microdata `itemprop="brand"`). Distinct from
+    /// `merchant` (the seller): a Sony WH-1000xm5 sold on Amazon has brand=Sony,
+    /// merchant=Amazon. Only extracted from typed structured signals, never
+    /// guessed from free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    brand: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3208,17 +3215,25 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
                     facts.rating_count = content.replace(',', "").parse::<u64>().ok();
                 }
             }
-            "seller" | "brand" => {
+            "seller" => {
                 if facts.merchant.is_none() && !content.is_empty() {
                     facts.merchant = Some(content);
                 }
             }
+            // ROADMAP item 1 (increment): product brand (manufacturer) is
+            // distinct from merchant (seller). Microdata `itemprop="brand"`
+            // maps to the new `brand` field, NOT merchant.
+            "brand" => {
+                if facts.brand.is_none() && !content.is_empty() {
+                    facts.brand = Some(content);
+                }
+            }
             "name" => {
-                // itemprop="name" inside a Brand scope (top of stack is Other) is the
-                // brand/merchant name, not the product name.
+                // itemprop="name" inside a Brand scope (top of stack is Other) is
+                // the brand name, not the product name.
                 if stack.last() == Some(&Scope::Other) {
-                    if facts.merchant.is_none() && !content.is_empty() {
-                        facts.merchant = Some(content);
+                    if facts.brand.is_none() && !content.is_empty() {
+                        facts.brand = Some(content);
                     }
                 } else if facts.name.is_none() && !content.is_empty() {
                     facts.name = Some(content);
@@ -3653,6 +3668,32 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
         }
+        // ROADMAP item 1 (increment): extract product brand (manufacturer)
+        // from JSON-LD. schema.org `brand` can be a string, an object with a
+        // `name`, or an array of either. Distinct from `merchant` (the seller):
+        // a Sony WH-1000xm5 sold on Amazon has brand=Sony, merchant=Amazon.
+        if facts.brand.is_none() {
+            if let Some(b) = n.get("brand") {
+                if let Some(s) = b.as_str() {
+                    facts.brand = Some(s.to_string());
+                } else if let Some(obj) = b.as_object() {
+                    facts.brand = obj
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                } else if let Some(arr) = b.as_array() {
+                    facts.brand = arr.first().and_then(|x| {
+                        if let Some(s) = x.as_str() {
+                            Some(s.to_string())
+                        } else if let Some(obj) = x.as_object() {
+                            obj.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    });
+                }
+            }
+        }
     }
 
     // Multiple distinct offers: never silently pick one as canonical.
@@ -3714,9 +3755,18 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
                     o.condition = Some(content.clone());
                 }
             }
-            "product:retailer" | "og:site_name" | "product:brand" => {
+            "product:retailer" | "og:site_name" => {
                 if o.merchant.is_none() {
                     o.merchant = Some(content.clone());
+                }
+            }
+            // ROADMAP item 1 (increment): product brand (manufacturer) is
+            // distinct from merchant (seller). OG `product:brand` maps to the
+            // new `brand` field, NOT merchant. A Sony WH-1000xm5 sold on Amazon
+            // has brand=Sony, merchant=Amazon.
+            "product:brand" => {
+                if o.brand.is_none() {
+                    o.brand = Some(content.clone());
                 }
             }
             "product:item_id" | "product:gtin" | "product:sku" => {
@@ -3888,6 +3938,7 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.image.is_some()
         || d.description.is_some()
         || d.category.is_some()
+        || d.brand.is_some()
 }
 
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
@@ -18339,7 +18390,11 @@ mod spellcheck_endpoint_tests {
         assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
         assert_eq!(d.sku.as_deref(), Some("MW-007"));
         assert_eq!(d.gtin.as_deref(), Some("9876543210123"));
-        assert_eq!(d.merchant.as_deref(), Some("MicroBrand"));
+        // ROADMAP item 1 (increment): brand (manufacturer) is distinct from
+        // merchant (seller). The fixture's nested Brand scope has the brand
+        // name "MicroBrand" — it must land in `brand`, NOT `merchant`.
+        assert_eq!(d.brand.as_deref(), Some("MicroBrand"), "brand from nested Brand scope");
+        assert_eq!(d.merchant.as_deref(), None, "no seller in fixture => merchant null");
         assert_eq!(d.rating, Some(4.7));
         assert_eq!(d.rating_count, Some(88));
         assert_eq!(o.source.as_deref(), Some("microdata"));
@@ -18602,7 +18657,11 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.price, Some(1299.00));
         assert_eq!(d.currency.as_deref(), Some("INR"));
         assert_eq!(d.availability.as_deref(), Some("in stock"));
-        assert_eq!(d.merchant.as_deref(), Some("OG Brand"));
+        // ROADMAP item 1 (increment): OG `product:brand` now maps to `brand`
+        // (manufacturer), NOT `merchant` (seller). The fixture has no
+        // product:retailer/og:site_name, so merchant stays null.
+        assert_eq!(d.brand.as_deref(), Some("OG Brand"), "OG product:brand → brand");
+        assert_eq!(d.merchant.as_deref(), None, "no retailer in OG fixture => merchant null");
         assert_eq!(d.gtin.as_deref(), Some("OG-99"));
         assert_eq!(o.source.as_deref(), Some("og"));
     }
