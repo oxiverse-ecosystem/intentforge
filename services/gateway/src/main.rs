@@ -18593,7 +18593,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     }
 
     #[tokio::test]
-    fn name_and_sale_date_preserved_in_enrichment_order_invariance() {
+    async fn name_and_sale_date_preserved_in_enrichment_order_invariance() {
         // The mandatory order-invariance test must still pass after adding the
         // new fields: enrichment with the new fields populated never reorders
         // ranked results (the whole no-manipulation guarantee).
