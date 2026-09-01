@@ -3077,6 +3077,14 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
             let v = cap.get(2).map(|x| x.as_str().to_string()).unwrap_or_default();
             attrs.push((k, v));
         }
+        // Boolean attributes (e.g. itemscope without =value) are not captured by
+        // attr_re (which requires ="value"). Detect itemscope explicitly so the
+        // scope stack is pushed even for <div itemscope itemtype="...">.
+        if lower.split_whitespace().any(|w| w == "itemscope")
+            && !attrs.iter().any(|(k, _)| k == "itemscope")
+        {
+            attrs.push(("itemscope".to_string(), String::new()));
+        }
         let has = |name: &str| attrs.iter().any(|(k, _)| k == name);
         let val_of = |name: &str| {
             attrs
