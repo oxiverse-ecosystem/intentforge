@@ -3049,6 +3049,10 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
         Other,
     }
     let mut stack: Vec<Scope> = Vec::new();
+    // Parallel stack tracking which TAG NAMES pushed a scope, so closing tags
+    // only pop when they match the opening tag (a </span> must NOT pop a scope
+    // pushed by a <div itemscope>).
+    let mut scope_tags: Vec<String> = Vec::new();
     let mut facts = OfferFacts::default();
     let mut prices: Vec<(f64, Option<String>)> = Vec::new();
 
@@ -3057,9 +3061,13 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
         let lower = tag.to_ascii_lowercase();
         let is_close = lower.starts_with("</");
         if is_close {
-            // Pop the most-recently-opened scope. (Self-closing tags like
-            // <meta .../> are open tags and never reach here.)
-            stack.pop();
+            // Only pop if this closing tag matches the opening tag that pushed
+            // the current scope. Extract tag name: first word after '</'.
+            let tag_name = tag[2..].trim_end_matches('>').trim().to_ascii_lowercase();
+            if scope_tags.last() == Some(&tag_name) {
+                scope_tags.pop();
+                stack.pop();
+            }
             continue;
         }
         // Collect attributes.
@@ -3109,6 +3117,9 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
                 }
             }
             stack.push(kind);
+            // Record the tag name so the matching closing tag pops this scope.
+            let tag_name = tag[1..].split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            scope_tags.push(tag_name);
         }
 
         // Only collect itemprops inside a Product/Offer scope (an ancestor in the
@@ -3121,8 +3132,21 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
             continue;
         }
         let prop = val_of("itemprop").unwrap_or_default().to_ascii_lowercase();
-        let content = val_of("content").or_else(|| val_of("itemid")).unwrap_or_default();
-        // Prefer a typed/attr value; we never read text nodes (free-text guessing).
+        // Prefer typed attributes (content/itemid), then href (for <link> elements
+        // like availability/itemCondition), then text content between open and
+        // close tags (e.g. <span itemprop="price">29.99</span>).
+        let attr_content = val_of("content")
+            .or_else(|| val_of("itemid"))
+            .or_else(|| val_of("href"))
+            .unwrap_or_default();
+        let content = if attr_content.is_empty() {
+            let after = &html[m.end()..];
+            let end = after.find('<').unwrap_or(after.len());
+            after[..end].trim().to_string()
+        } else {
+            attr_content
+        };
+        // Prefer a typed/attr value; text-node fallback only when no attribute.
         let set_str = |f: &mut Option<String>, v: String| {
             if f.is_none() && !v.is_empty() {
                 *f = Some(v);
@@ -3175,7 +3199,13 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
                 }
             }
             "name" => {
-                if facts.name.is_none() && !content.is_empty() {
+                // itemprop="name" inside a Brand scope (top of stack is Other) is the
+                // brand/merchant name, not the product name.
+                if stack.last() == Some(&Scope::Other) {
+                    if facts.merchant.is_none() && !content.is_empty() {
+                        facts.merchant = Some(content);
+                    }
+                } else if facts.name.is_none() && !content.is_empty() {
                     facts.name = Some(content);
                 }
             }
@@ -3216,7 +3246,7 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
         facts.price_low = Some(lo);
         facts.price_high = Some(hi);
         facts.offer_count = Some(prices.len());
-        if all_agree {
+        if facts.currency.is_none() && all_agree {
             facts.currency = first_cur;
         }
     }
@@ -16986,11 +17016,18 @@ mod constraint_fix_tests {
                 q, kept
             );
             let joined = kept.join(" ");
-            assert!(
-                joined.contains("dairy") && joined.contains("gelatin"),
-                "legitimate exclusions must survive: q={:?} kept={:?}",
-                q, kept
-            );
+            match q {
+                "how do I make a vegan chocolate mousse that uses no dairy and no gelatin" => {
+                    assert!(joined.contains("dairy") && joined.contains("gelatin"), "legitimate exclusions must survive: q={:?} kept={:?}", q, kept);
+                }
+                "recipes with no nuts and no dairy" => {
+                    assert!(joined.contains("nuts") && joined.contains("dairy"), "legitimate exclusions must survive: q={:?} kept={:?}", q, kept);
+                }
+                "shoes without laces or without velcro" => {
+                    assert!(joined.contains("laces") && joined.contains("velcro"), "legitimate exclusions must survive: q={:?} kept={:?}", q, kept);
+                }
+                _ => {}
+            }
         }
     }
 
