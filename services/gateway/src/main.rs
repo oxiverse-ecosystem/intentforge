@@ -2856,6 +2856,15 @@ struct OfferFacts {
     /// never guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     isbn: Option<String>,
+    /// Event start date/time from schema.org `Event` (`startDate`, ISO 8601).
+    /// Only extracted from typed structured signals, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_start: Option<String>,
+    /// Event location/venue from schema.org `Event` (`location.name` or
+    /// `location.address`). Only extracted from typed structured signals,
+    /// never guessed from free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_location: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3164,6 +3173,7 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
                 || itype.contains("video")
                 || itype.contains("service")
                 || itype.contains("book")
+                || itype.contains("event")
             {
                 Scope::Product
             } else if itype.contains("offer") {
@@ -3575,6 +3585,7 @@ fn walk_commerce_nodes(v: &serde_json::Value, out: &mut Vec<serde_json::Value>) 
                     || tl.contains("video")
                     || tl.contains("service")
                     || tl.contains("book")
+                    || tl.contains("event")
                 {
                     out.push(v.clone());
                 }
@@ -3768,6 +3779,48 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
                 .get("priceValidUntil")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+        }
+        // ROADMAP item 1 (increment): extract event facts from schema.org
+        // `Event` — `startDate` (ISO 8601 datetime) and `location` (venue name
+        // or address). These are the SAME typed structured fields the pipeline
+        // already reads for products; an Event node simply carries different
+        // field names. No per-type branch: a non-event page lacks these fields,
+        // so both stay null (honest). `location` can be a string, an object
+        // with `name`/`address`, or an array of either.
+        if facts.event_start.is_none() {
+            facts.event_start = n
+                .get("startDate")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if facts.event_location.is_none() {
+            facts.event_location = n.get("location").and_then(|loc| {
+                if let Some(s) = loc.as_str() {
+                    return Some(s.to_string());
+                }
+                if let Some(obj) = loc.as_object() {
+                    if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+                        return Some(name.to_string());
+                    }
+                    if let Some(addr) = obj.get("address").and_then(|v| v.as_str()) {
+                        return Some(addr.to_string());
+                    }
+                }
+                if let Some(arr) = loc.as_array() {
+                    return arr.first().and_then(|x| {
+                        if let Some(s) = x.as_str() {
+                            return Some(s.to_string());
+                        }
+                        if let Some(obj) = x.as_object() {
+                            if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+                                return Some(name.to_string());
+                            }
+                        }
+                        None
+                    });
+                }
+                None
+            });
         }
         // ROADMAP item 1 (increment): extract product image, description, and
         // category from the SAME typed structured node. `image` can be a string
@@ -19726,5 +19779,124 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // Price and name should still extract normally (sanity check).
         assert_eq!(d.price, Some(49.99));
         assert_eq!(d.name.as_deref(), Some("Acme Widget"));
+    }
+
+    // ─── Event schema fixtures ─────────────────────────────────────────
+
+    /// JSON-LD Event with `startDate` and nested `location.name` + `location.address`.
+    const HTML_EVENT_JSONLD: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Event",
+  "name": "Test Concert",
+  "startDate": "2026-09-15T19:30:00+05:30",
+  "location": {
+    "@type": "Place",
+    "name": "Madison Square Garden",
+    "address": "4 Pennsylvania Plaza, New York, NY 10001"
+  }
+}
+</script></head><body></body></html>"#;
+
+    /// JSON-LD Event with `location` as a plain string (venue name only).
+    const HTML_EVENT_STRING_LOC: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Event",
+  "name": "Conference Talk",
+  "startDate": "2026-10-01T14:00:00Z",
+  "location": "Room 101, Convention Center"
+}
+</script></head><body></body></html>"#;
+
+    /// Microdata Event with `itemprop="startDate"` and `itemprop="location"`.
+    const HTML_EVENT_MICRODATA: &str = r#"<!doctype html><html><body>
+<div itemscope itemtype="https://schema.org/Event">
+  <span itemprop="name">Workshop</span>
+  <time itemprop="startDate" datetime="2026-11-20T10:00:00Z">Nov 20</time>
+  <span itemprop="location">Building B, Room 202</span>
+</div>
+</body></html>"#;
+
+    /// A Product page must NOT accidentally populate event fields from unrelated data.
+    const HTML_PRODUCT_NO_EVENT: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Widget",
+  "offers": {"@type": "Offer", "price": "9.99", "priceCurrency": "USD"}
+}
+</script></head><body></body></html>"#;
+
+    #[test]
+    fn extracts_event_start_and_location_from_jsonld() {
+        let o = extract_commerce_offer(HTML_EVENT_JSONLD, "https://events.example.com/concert/123");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(
+            d.event_start.as_deref(),
+            Some("2026-09-15T19:30:00+05:30"),
+            "event_start must come from Event.startDate"
+        );
+        assert_eq!(
+            d.event_location.as_deref(),
+            Some("Madison Square Garden"),
+            "event_location must prefer location.name over address"
+        );
+        assert_eq!(d.name.as_deref(), Some("Test Concert"), "name must still extract");
+        // No price on an event page — must stay null (never guessed).
+        assert_eq!(d.price, None, "event page has no price");
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    #[test]
+    fn extracts_event_location_as_string() {
+        let o = extract_commerce_offer(HTML_EVENT_STRING_LOC, "https://events.example.com/talk");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(
+            d.event_start.as_deref(),
+            Some("2026-10-01T14:00:00Z")
+        );
+        assert_eq!(
+            d.event_location.as_deref(),
+            Some("Room 101, Convention Center"),
+            "event_location must accept a plain string location"
+        );
+    }
+
+    #[test]
+    fn extracts_event_from_microdata() {
+        let o = extract_commerce_offer(HTML_EVENT_MICRODATA, "https://events.example.com/workshop");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(
+            d.event_start.as_deref(),
+            Some("2026-11-20T10:00:00Z"),
+            "event_start must extract from microdata itemprop=\"startDate\""
+        );
+        assert_eq!(
+            d.event_location.as_deref(),
+            Some("Building B, Room 202"),
+            "event_location must extract from microdata itemprop=\"location\""
+        );
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    #[test]
+    fn product_page_has_null_event_fields() {
+        let o = extract_commerce_offer(HTML_PRODUCT_NO_EVENT, "https://shop.example.com/widget");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(
+            d.event_start, None,
+            "event_start must be null for a Product page"
+        );
+        assert_eq!(
+            d.event_location, None,
+            "event_location must be null for a Product page"
+        );
+        // Sanity: product fields still extract.
+        assert_eq!(d.price, Some(9.99));
+        assert_eq!(d.name.as_deref(), Some("Widget"));
     }
 }
