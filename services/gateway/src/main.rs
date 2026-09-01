@@ -18592,7 +18592,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.price, Some(14.99));
     }
 
-    #[test]
+    #[tokio::test]
     fn name_and_sale_date_preserved_in_enrichment_order_invariance() {
         // The mandatory order-invariance test must still pass after adding the
         // new fields: enrichment with the new fields populated never reorders
