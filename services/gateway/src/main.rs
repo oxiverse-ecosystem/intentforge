@@ -2792,6 +2792,21 @@ struct OfferFacts {
     /// from structured data, never guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     price_valid_until: Option<String>,
+    /// Product image URL from structured data (JSON-LD `image`, OG `og:image`,
+    /// microdata `itemprop="image"`). Only extracted from typed structured
+    /// signals, never guessed from free text or CSS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
+    /// Product description from structured data (JSON-LD `description`, OG
+    /// `og:description`, microdata `itemprop="description"`). Only extracted
+    /// from typed structured signals, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    /// Product category from structured data (JSON-LD `category`, OG
+    /// `product:category`, microdata `itemprop="category"`). Only extracted
+    /// from typed structured signals, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    category: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3214,6 +3229,26 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
                     facts.price_valid_until = Some(content);
                 }
             }
+            // ROADMAP item 1 (increment): product image, description, and
+            // category from schema.org microdata. `image` can be a `content`
+            // attribute, an `href` (for <link>), or text between tags. Same
+            // honest extraction as the existing fields — only set when the
+            // page exposes them, never guessed.
+            "image" => {
+                if facts.image.is_none() && !content.is_empty() {
+                    facts.image = Some(content);
+                }
+            }
+            "description" => {
+                if facts.description.is_none() && !content.is_empty() {
+                    facts.description = Some(content);
+                }
+            }
+            "category" => {
+                if facts.category.is_none() && !content.is_empty() {
+                    facts.category = Some(content);
+                }
+            }
             _ => {}
         }
     }
@@ -3585,6 +3620,39 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
         }
+        // ROADMAP item 1 (increment): extract product image, description, and
+        // category from the SAME typed structured node. `image` can be a string
+        // URL, an array of URLs, or an object with a `url` field (schema.org
+        // allows all three). `description` and `category` are plain strings.
+        // All optional, only set when the page exposes them — never guessed.
+        if facts.image.is_none() {
+            facts.image = n
+                .get("image")
+                .and_then(|v| {
+                    if let Some(s) = v.as_str() {
+                        return Some(s.to_string());
+                    }
+                    if let Some(arr) = v.as_array() {
+                        return arr.first().and_then(|x| x.as_str()).map(|s| s.to_string());
+                    }
+                    if let Some(obj) = v.as_object() {
+                        return obj.get("url").and_then(|x| x.as_str()).map(|s| s.to_string());
+                    }
+                    None
+                });
+        }
+        if facts.description.is_none() {
+            facts.description = n
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if facts.category.is_none() {
+            facts.category = n
+                .get("category")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
     }
 
     // Multiple distinct offers: never silently pick one as canonical.
@@ -3664,6 +3732,26 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
             "product:rating:count" | "product:rating:scale" | "product:review_count" => {
                 if o.rating_count.is_none() {
                     o.rating_count = content.parse::<u64>().ok();
+                }
+            }
+            // ROADMAP item 1 (increment): product image, description, and
+            // category from OG meta tags. og:image is the most widely used
+            // product image tag; og:description / product:description and
+            // product:category / og:product_category carry the rest. Only
+            // set when the page exposes them — never guessed.
+            "og:image" | "product:image" => {
+                if o.image.is_none() {
+                    o.image = Some(content.clone());
+                }
+            }
+            "og:description" | "product:description" => {
+                if o.description.is_none() {
+                    o.description = Some(content.clone());
+                }
+            }
+            "product:category" | "og:product_category" => {
+                if o.category.is_none() {
+                    o.category = Some(content.clone());
                 }
             }
             _ => {}
@@ -3797,6 +3885,9 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.sku.is_some()
         || d.gtin.is_some()
         || d.rating.is_some()
+        || d.image.is_some()
+        || d.description.is_some()
+        || d.category.is_some()
 }
 
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
@@ -18914,5 +19005,161 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!out.contains("q="), "no query text");
         assert!(!out.contains("user"), "no user id");
         assert!(!out.contains("ip="), "no ip");
+    }
+
+    // ── ROADMAP item 1 (increment): image / description / category extraction ──
+
+    #[test]
+    fn jsonld_extracts_image_description_category() {
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Acme Widget Pro",
+  "image": "https://store.example.com/images/widget-pro.jpg",
+  "description": "The ultimate widget for all your widgeting needs.",
+  "category": "Electronics > Gadgets",
+  "offers": {"@type": "Offer", "price": "49.99", "priceCurrency": "USD"}
+}
+</script></head><body></body></html>"#;
+        let o = extract_commerce_offer(html, "https://store.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://store.example.com/images/widget-pro.jpg"), "image from JSON-LD string");
+        assert_eq!(d.description.as_deref(), Some("The ultimate widget for all your widgeting needs."), "description from JSON-LD");
+        assert_eq!(d.category.as_deref(), Some("Electronics > Gadgets"), "category from JSON-LD");
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.name.as_deref(), Some("Acme Widget Pro"));
+    }
+
+    #[test]
+    fn jsonld_image_as_array_takes_first() {
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Multi Image Product",
+  "image": [
+    "https://store.example.com/images/1.jpg",
+    "https://store.example.com/images/2.jpg"
+  ],
+  "offers": {"@type": "Offer", "price": "10.00", "priceCurrency": "USD"}
+}
+</script></head><body></body></html>"#;
+        let o = extract_commerce_offer(html, "https://store.example.com/multi");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://store.example.com/images/1.jpg"), "first image from array");
+    }
+
+    #[test]
+    fn jsonld_image_as_object_takes_url_field() {
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Object Image Product",
+  "image": {"@type": "ImageObject", "url": "https://store.example.com/images/obj.jpg", "width": 800},
+  "offers": {"@type": "Offer", "price": "20.00", "priceCurrency": "USD"}
+}
+</script></head><body></body></html>"#;
+        let o = extract_commerce_offer(html, "https://store.example.com/obj");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://store.example.com/images/obj.jpg"), "url from image object");
+    }
+
+    #[test]
+    fn open_graph_extracts_image_description_category() {
+        let html = r#"<!doctype html><html><head>
+<title>OG Full Product</title>
+<meta property="og:image" content="https://cdn.example.com/product.jpg">
+<meta property="og:description" content="A great product for everyday use.">
+<meta property="product:category" content="Home & Garden">
+<meta property="product:price:amount" content="29.99">
+<meta property="product:price:currency" content="USD">
+</head><body></body></html>"#;
+        let o = extract_commerce_offer(html, "https://og.example.com/full");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/product.jpg"), "image from og:image");
+        assert_eq!(d.description.as_deref(), Some("A great product for everyday use."), "description from og:description");
+        assert_eq!(d.category.as_deref(), Some("Home & Garden"), "category from product:category");
+        assert_eq!(d.price, Some(29.99));
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    #[test]
+    fn microdata_extracts_image_description_category() {
+        let html = r#"<!doctype html><html><head><title>Microdata Full</title></head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Full Microdata Widget</span>
+  <img itemprop="image" src="https://shop.example.com/md-img.jpg" alt="Widget">
+  <span itemprop="description">A widget with full microdata facts.</span>
+  <span itemprop="category">Tools > Hand Tools</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">39.99</span>
+    <span itemprop="priceCurrency">EUR</span>
+  </div>
+</div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/md-full");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://shop.example.com/md-img.jpg"), "image from microdata itemprop=image");
+        assert_eq!(d.description.as_deref(), Some("A widget with full microdata facts."), "description from microdata");
+        assert_eq!(d.category.as_deref(), Some("Tools > Hand Tools"), "category from microdata");
+        assert_eq!(d.price, Some(39.99));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    #[test]
+    fn missing_image_description_category_stay_null() {
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "No Extras Product",
+  "offers": {"@type": "Offer", "price": "5.00", "priceCurrency": "USD"}
+}
+</script></head><body></body></html>"#;
+        let o = extract_commerce_offer(html, "https://store.example.com/no-extras");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image, None, "no image in structured data => null");
+        assert_eq!(d.description, None, "no description => null");
+        assert_eq!(d.category, None, "no category => null");
+        assert_eq!(d.price, Some(5.00));
+    }
+
+    #[tokio::test]
+    async fn image_description_category_preserved_in_enrichment_order_invariance() {
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://a.example.com/x", "score": 9.0 }),
+        ];
+        let fake_html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Widget",
+  "image": "https://a.example.com/img.jpg",
+  "description": "A great widget.",
+  "category": "Gadgets",
+  "offers": {"@type": "Offer", "price": "10.00", "priceCurrency": "USD"}
+}
+</script></head><body></body></html>"#;
+        let h = fake_html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        assert_eq!(r["url"], "https://a.example.com/x", "order preserved");
+        let c = r.get("commerce").expect("commerce block attached");
+        assert_eq!(c["data"]["image"], "https://a.example.com/img.jpg");
+        assert_eq!(c["data"]["description"], "A great widget.");
+        assert_eq!(c["data"]["category"], "Gadgets");
+        assert_eq!(c["data"]["price"], 10.00);
     }
 }
