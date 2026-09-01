@@ -3327,6 +3327,8 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         if facts.rating.is_none() { facts.rating = md.rating; }
         if facts.rating_count.is_none() { facts.rating_count = md.rating_count; }
         if facts.merchant.is_none() { facts.merchant = md.merchant; }
+        if facts.name.is_none() { facts.name = md.name; }
+        if facts.price_valid_until.is_none() { facts.price_valid_until = md.price_valid_until; }
         if source.is_none() {
             source = Some("microdata".to_string());
         }
