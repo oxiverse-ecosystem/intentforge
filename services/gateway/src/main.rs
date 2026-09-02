@@ -15408,16 +15408,30 @@ let mut results = match tokio::task::spawn_blocking(move || {
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
-            // Read-only multi-merchant offer comparison from the attached facts.
-            let mut block = serde_json::json!({ "results": shop_arr });
-            if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                let comparisons = build_offer_comparisons(arr_ref);
-                if !comparisons.is_empty() {
-                    block["offer_comparisons"] =
-                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+            // HONEST PRESENTATION GATE: only surface a `shopping` block when at
+            // least one of the enriched top-N results actually carries a `commerce`
+            // block (i.e. the page exposed structured product data). If none do,
+            // the upstream pages don't support honest product facts — emitting a
+            // near-empty strip would be misleading, so we omit `shopping` entirely.
+            // This is a pure presentation filter on an already-enriched clone; it
+            // never touches ranking, selection, or the real `results` array.
+            let any_commerce = shop_arr
+                .iter()
+                .any(|r| r.get("commerce").map(|v| !v.is_null()).unwrap_or(false));
+            if !any_commerce {
+                None
+            } else {
+                // Read-only multi-merchant offer comparison from the attached facts.
+                let mut block = serde_json::json!({ "results": shop_arr });
+                if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                    let comparisons = build_offer_comparisons(arr_ref);
+                    if !comparisons.is_empty() {
+                        block["offer_comparisons"] =
+                            serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+                    }
                 }
+                Some(block)
             }
-            Some(block)
         }
     } else {
         None
