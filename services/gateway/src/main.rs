@@ -2736,11 +2736,8 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
 
 // ─── Commerce: honest product-fact extraction (ROADMAP item 1) ───────
 // Extracts structured commerce facts ONLY from machine-readable page data:
-//   * schema.org JSON-LD (Product / Offer / AggregateOffer / SoftwareApplication
-//     / VideoGame / Service)
+//   * schema.org JSON-LD (Product / Offer / AggregateOffer)
 //   * OpenGraph `product:*` meta tags
-//   * schema.org MICRODATA (`itemscope` + `itemprop`) — real structured
-//     on-page product data emitted by Shopify/legacy product pages.
 // NO free-text price guessing. A price is captured only when it appears in a
 // typed structured field. If multiple distinct offers/prices exist on the page,
 // they are surfaced as price_low/price_high + offer_count and `price` is left
@@ -2783,146 +2780,6 @@ struct OfferFacts {
     price_high: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offer_count: Option<usize>,
-    /// Product name from structured data (JSON-LD `name` / microdata `itemprop="name"` / OG `og:title`).
-    /// Only extracted from typed structured signals, never from free text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    /// Sale end date from schema.org `priceValidUntil` (ISO 8601 date string).
-    /// Lets the frontend label a price as a limited-time offer. Only extracted
-    /// from structured data, never guessed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    price_valid_until: Option<String>,
-    /// Product image URL from structured data (JSON-LD `image`, OG `og:image`,
-    /// microdata `itemprop="image"`). Only extracted from typed structured
-    /// signals, never guessed from free text or CSS.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    image: Option<String>,
-    /// Product description from structured data (JSON-LD `description`, OG
-    /// `og:description`, microdata `itemprop="description"`). Only extracted
-    /// from typed structured signals, never guessed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    /// Product category from structured data (JSON-LD `category`, OG
-    /// `product:category`, microdata `itemprop="category"`). Only extracted
-    /// from typed structured signals, never guessed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    category: Option<String>,
-    /// Product brand (manufacturer) from structured data (JSON-LD `brand`,
-    /// OG `product:brand`, microdata `itemprop="brand"`). Distinct from
-    /// `merchant` (the seller): a Sony WH-1000xm5 sold on Amazon has brand=Sony,
-    /// merchant=Amazon. Only extracted from typed structured signals, never
-    /// guessed from free text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    brand: Option<String>,
-    /// Product model identifier from structured data (JSON-LD `model`,
-    /// microdata `itemprop="model"`, OG `product:model`). E.g. "WH-1000XM5".
-    /// Only extracted from typed structured signals, never guessed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    /// Product color from structured data (JSON-LD `color`, microdata
-    /// `itemprop="color"`, OG `product:color`). Only extracted from typed
-    /// structured signals, never guessed from free text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    color: Option<String>,
-    /// Product size from structured data (JSON-LD `size`, microdata
-    /// `itemprop="size"`, OG `product:size`). Only extracted from typed
-    /// structured signals, never guessed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    size: Option<String>,
-    /// Product material from structured data (JSON-LD `material`, microdata
-    /// `itemprop="material"`, OG `product:material`). Only extracted from typed
-    /// structured signals, never guessed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    material: Option<String>,
-    /// Target gender from structured data (JSON-LD `gender`, microdata
-    /// `itemprop="gender"`, OG `product:gender`). Only extracted from typed
-    /// structured signals, never guessed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    gender: Option<String>,
-    /// Target age group from structured data (JSON-LD `ageGroup`, microdata
-    /// `itemprop="age_group"`, OG `product:age_group`). Only extracted from
-    /// typed structured signals, never guessed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    age_group: Option<String>,
-    /// Product author from schema.org `Book` (`author` field, Person or
-    /// Organization). Distinct from `merchant` (the seller) and `brand` (the
-    /// manufacturer). A book authored by "J.K. Rowling" sold on Amazon has
-    /// author="J.K. Rowling", merchant=Amazon. Only extracted from typed
-    /// structured signals, never guessed from free text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    author: Option<String>,
-    /// ISBN from schema.org `Book` (`isbn` field). The canonical product
-    /// identifier for books. Only extracted from typed structured signals,
-    /// never guessed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    isbn: Option<String>,
-    /// Event start date/time from schema.org `Event` (`startDate`, ISO 8601).
-    /// Only extracted from typed structured signals, never guessed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    event_start: Option<String>,
-    /// Event location/venue from schema.org `Event` (`location.name` or
-    /// `location.address`). Only extracted from typed structured signals,
-    /// never guessed from free text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    event_location: Option<String>,
-    /// Job posting title from schema.org `JobPosting` (`title`). Distinct from
-    /// product `name` (a job posting's label is its title). Only extracted
-    /// from typed structured signals, never guessed from free text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    job_title: Option<String>,
-    /// When the job was posted, from schema.org `JobPosting` (`datePosted`,
-    /// ISO 8601 date/datetime). Only extracted from typed structured signals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    job_posted_at: Option<String>,
-    /// Organization hiring for the job, from schema.org `JobPosting`
-    /// (`hiringOrganization.name`). An Organization or a plain string. Only
-    /// extracted from typed structured signals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    hiring_organization: Option<String>,
-    /// Job location, from schema.org `JobPosting` (`jobLocation`). Can be a
-    /// plain string, a Place object (`name`/`address`), or an array of either.
-    /// Only extracted from typed structured signals, never guessed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    job_location: Option<String>,
-    /// Base salary for the job, from schema.org `JobPosting` (`baseSalary`).
-    /// Can be a MonetaryAmount (`value`+`currency`), a PriceRange, or a plain
-    /// string. Stored as a raw string to avoid misrepresenting structured
-    /// salary data. Only extracted from typed structured signals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    base_salary: Option<String>,
-    /// Employment type, from schema.org `JobPosting` (`employmentType`).
-    /// E.g. "FULL_TIME", "PART_TIME", "CONTRACTOR", "TEMPORARY", "INTERN".
-    /// Only extracted from typed structured signals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    employment_type: Option<String>,
-    /// Course provider, from schema.org `Course` (`provider`). An Organization
-    /// with a `name`, or a plain string. Only extracted from typed structured
-    /// signals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    course_provider: Option<String>,
-    /// Course delivery mode, from schema.org `Course` → `hasCourseInstance`
-    /// → `courseMode`. E.g. "online", "onsite", "blended". Only extracted
-    /// from typed structured signals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    course_mode: Option<String>,
-    /// Recipe preparation time, from schema.org `Recipe` (`prepTime`). ISO 8601
-    /// duration string (e.g. "PT30M"). Only extracted from typed structured
-    /// signals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    prep_time: Option<String>,
-    /// Recipe cook time, from schema.org `Recipe` (`cookTime`). ISO 8601
-    /// duration string (e.g. "PT1H"). Only extracted from typed structured
-    /// signals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cook_time: Option<String>,
-    /// Recipe total time, from schema.org `Recipe` (`totalTime`). ISO 8601
-    /// duration string. Only extracted from typed structured signals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    total_time: Option<String>,
-    /// Recipe yield, from schema.org `Recipe` (`recipeYield`). E.g. "4 servings"
-    /// or "1 cake". Only extracted from typed structured signals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    recipe_yield: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3132,370 +2989,6 @@ fn json_get_u64(v: &serde_json::Value) -> Option<u64> {
     }
 }
 
-/// Extract honest product facts from schema.org MICRODATA
-/// (`itemscope` + `itemprop`), the third structured-on-page signal alongside
-/// JSON-LD and OpenGraph. Real Shopify/legacy product pages emit microdata with
-/// no JSON-LD, so this recovers facts that would otherwise be missed.
-///
-/// Mapping (itemprop value -> `OfferFacts` field), matched on the standard
-/// schema.org/Product + Offer vocabulary — NOT a per-merchant list:
-///   name            -> (used only for soft signal; not stored as a fact)
-///   price           -> price / price_low+price_high when a range (x-y) appears
-///   priceCurrency   -> currency
-///   availability    -> availability (raw value, e.g. InStock/LimitedAvailability)
-///   itemCondition   -> condition
-///   sku             -> sku
-///   gtin13/gtin14/gtin8/gtin/mpn -> gtin
-///   ratingValue     -> rating (also rating/Value)
-///   ratingCount     -> rating_count
-///   seller/brand    -> merchant
-///
-/// Honesty rules (same as the JSON-LD/OG paths):
-///   * A price is captured ONLY from a typed `itemprop="price"` field — never
-///     guessed from free text.
-///   * A multi-offer page (several `itemprop="price"` under separate offers)
-///     surfaces price_low/price_high + offer_count and leaves `price` null,
-///     exactly like the JSON-LD two-offer case — never a silent canonical pick.
-///   * `source` is set to "microdata" only when at least one field was filled.
-fn parse_microdata(html: &str) -> Option<OfferFacts> {
-    // Scan <...> tokens manually with a permissive regex that captures every
-    // attribute name="value" pair (itemprops live in attributes, not meta-only).
-    // NOTE: the regex must match closing tags too (char after '<' may be '/'),
-    // otherwise </div> is invisible and scopes never pop.
-    static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let tag_re = TAG_RE
-        .get_or_init(|| regex::Regex::new(r#"(?i)<[a-zA-Z/][^>]*>"#).unwrap());
-    static ATTR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let attr_re = ATTR_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)([a-zA-Z_][-a-zA-Z0-9_:.]*)\s*=\s*["']([^"']*)["']"#).unwrap()
-    });
-
-    // Track nested itemscope kinds on a stack so we only collect itemprops that
-    // belong to a Product/Offer scope (or a Brand nested within one). This avoids
-    // grabbing unrelated itemprops (e.g. a breadcrumb's `itemprop="price"`).
-    #[derive(PartialEq, Clone, Copy)]
-    enum Scope {
-        Product,
-        Offer,
-        Other,
-    }
-    let mut stack: Vec<Scope> = Vec::new();
-    // Parallel stack tracking which TAG NAMES pushed a scope, so closing tags
-    // only pop when they match the opening tag (a </span> must NOT pop a scope
-    // pushed by a <div itemscope>).
-    let mut scope_tags: Vec<String> = Vec::new();
-    let mut facts = OfferFacts::default();
-    let mut prices: Vec<(f64, Option<String>)> = Vec::new();
-
-    for m in tag_re.find_iter(html) {
-        let tag = m.as_str();
-        let lower = tag.to_ascii_lowercase();
-        let is_close = lower.starts_with("</");
-        if is_close {
-            // Only pop if this closing tag matches the opening tag that pushed
-            // the current scope. Extract tag name: first word after '</'.
-            let tag_name = tag[2..].trim_end_matches('>').trim().to_ascii_lowercase();
-            if scope_tags.last() == Some(&tag_name) {
-                scope_tags.pop();
-                stack.pop();
-            }
-            continue;
-        }
-        // Collect attributes.
-        let mut attrs: Vec<(String, String)> = Vec::new();
-        for cap in attr_re.captures_iter(tag) {
-            let k = cap.get(1).map(|x| x.as_str().to_ascii_lowercase()).unwrap_or_default();
-            let v = cap.get(2).map(|x| x.as_str().to_string()).unwrap_or_default();
-            attrs.push((k, v));
-        }
-        let has = |name: &str| attrs.iter().any(|(k, _)| k == name);
-        let val_of = |name: &str| {
-            attrs
-                .iter()
-                .find(|(k, _)| k == name)
-                .map(|(_, v)| v.clone())
-        };
-
-        if has("itemscope") {
-            // Entering a new scope. Classify by itemtype so we know whether we're
-            // inside a Product/Offer (collect) or something else (e.g. Brand).
-            // ROADMAP item 1 (increment): extend to schema.org's digital-product
-            // itemtypes — `SoftwareApplication`, `VideoGame`, `Service` — which
-            // carry the SAME structured commerce facts (price, rating, brand/
-            // publisher) as a physical Product. The itemprop mapping below is
-            // identical for all of them, so a single Scope::Product branch
-            // covers every product-like type without per-type logic.
-            let itype = val_of("itemtype").unwrap_or_default().to_ascii_lowercase();
-            let kind = if itype.contains("product")
-                || itype.contains("software")
-                || itype.contains("video")
-                || itype.contains("service")
-                || itype.contains("book")
-                || itype.contains("event")
-                || itype.contains("jobposting")
-                || itype.contains("course")
-                || itype.contains("recipe")
-            {
-                Scope::Product
-            } else if itype.contains("offer") {
-                Scope::Offer
-            } else {
-                Scope::Other
-            };
-            // Inline brand form: <span itemprop="brand">Name</span> (no nested scope).
-            if kind == Scope::Other && has("itemprop") {
-                let prop = val_of("itemprop").unwrap_or_default().to_ascii_lowercase();
-                if prop == "brand" {
-                    let c = val_of("content").or_else(|| val_of("itemid")).unwrap_or_default();
-                    if !c.is_empty() && facts.merchant.is_none() {
-                        facts.merchant = Some(c);
-                    }
-                }
-            }
-            stack.push(kind);
-            // Record the tag name so the matching closing tag pops this scope.
-            let tag_name = tag[1..].split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-            scope_tags.push(tag_name);
-        }
-
-        // Only collect itemprops inside a Product/Offer scope (an ancestor in the
-        // stack). Stray itemprops outside any such scope are ignored.
-        let in_prod = stack.iter().any(|s| *s == Scope::Product || *s == Scope::Offer);
-        if !in_prod {
-            continue;
-        }
-        if !has("itemprop") {
-            continue;
-        }
-        let prop = val_of("itemprop").unwrap_or_default().to_ascii_lowercase();
-        // Prefer typed attributes (content/itemid), then href (for <link> elements
-        // like availability/itemCondition), then text content between open and
-        // close tags (e.g. <span itemprop="price">29.99</span>).
-        let attr_content = val_of("content")
-            .or_else(|| val_of("itemid"))
-            .or_else(|| val_of("href"))
-            .unwrap_or_default();
-        let content = if attr_content.is_empty() {
-            let after = &html[m.end()..];
-            let end = after.find('<').unwrap_or(after.len());
-            after[..end].trim().to_string()
-        } else {
-            attr_content
-        };
-        // Prefer a typed/attr value; text-node fallback only when no attribute.
-        let set_str = |f: &mut Option<String>, v: String| {
-            if f.is_none() && !v.is_empty() {
-                *f = Some(v);
-            }
-        };
-        match prop.as_str() {
-            "price" => {
-                let c = content.replace(',', " ").replace("  ", " ").trim().to_string();
-                // Range like "10.00 - 25.50" or "10-25".
-                if let Some(dash) = c.find(|ch| ch == '-' || ch == '–' || ch == '—') {
-                    let lo = c[..dash].trim().parse::<f64>().ok();
-                    let hi = c[dash + 1..].trim().parse::<f64>().ok();
-                    if let (Some(l), Some(h)) = (lo, hi) {
-                        prices.push((l, None));
-                        prices.push((h, None));
-                    } else if let Some(p) = lo.or(hi) {
-                        prices.push((p, None));
-                    }
-                } else if let Ok(p) = c.parse::<f64>() {
-                    let cur = val_of("pricecurrency").map(|s| s.to_uppercase());
-                    prices.push((p, cur));
-                }
-            }
-            "pricecurrency" => {
-                if facts.currency.is_none() && !content.is_empty() {
-                    facts.currency = Some(content.to_uppercase());
-                }
-            }
-            "availability" => set_str(&mut facts.availability, content),
-            "itemcondition" => set_str(&mut facts.condition, content),
-            "sku" => set_str(&mut facts.sku, content),
-            "gtin13" | "gtin14" | "gtin8" | "gtin" | "mpn" => {
-                if facts.gtin.is_none() && !content.is_empty() {
-                    facts.gtin = Some(content);
-                }
-            }
-            "title" => set_str(&mut facts.job_title, content),
-            "dateposted" => set_str(&mut facts.job_posted_at, content),
-            "hiringorganization" => set_str(&mut facts.hiring_organization, content),
-            "joblocation" => set_str(&mut facts.job_location, content),
-            "basesalary" => set_str(&mut facts.base_salary, content),
-            "employmenttype" => set_str(&mut facts.employment_type, content),
-            "provider" => set_str(&mut facts.course_provider, content),
-            "coursemode" => set_str(&mut facts.course_mode, content),
-            "preptime" => set_str(&mut facts.prep_time, content),
-            "cooktime" => set_str(&mut facts.cook_time, content),
-            "totaltime" => set_str(&mut facts.total_time, content),
-            "recipeyield" => set_str(&mut facts.recipe_yield, content),
-            "ratingvalue" | "rating" => {
-                if facts.rating.is_none() {
-                    facts.rating = content.replace(',', "").parse::<f64>().ok();
-                }
-            }
-            "ratingcount" | "reviewcount" => {
-                if facts.rating_count.is_none() {
-                    facts.rating_count = content.replace(',', "").parse::<u64>().ok();
-                }
-            }
-            "seller" => {
-                if facts.merchant.is_none() && !content.is_empty() {
-                    facts.merchant = Some(content);
-                }
-            }
-            // ROADMAP item 1 (increment): product author + isbn from Book schema.
-            // Microdata `itemprop="author"` (Person or Organization, so `name`
-            // is nested) and `itemprop="isbn"`. Distinct from merchant (seller)
-            // and brand (manufacturer). No per-type branch — the same extraction
-            // works for any product-like type; a non-book page simply lacks
-            // these fields, so both stay null (honest).
-            "author" => {
-                if facts.author.is_none() {
-                    if let Ok(name) = content.parse::<String>() {
-                        facts.author = Some(name);
-                    }
-                }
-            }
-            "isbn" => {
-                if facts.isbn.is_none() && !content.is_empty() {
-                    facts.isbn = Some(content);
-                }
-            }
-            // ROADMAP item 1 (increment): product brand (manufacturer) is
-            // distinct from merchant (seller). Microdata `itemprop="brand"`
-            // maps to the new `brand` field, NOT merchant.
-            "brand" => {
-                if facts.brand.is_none() && !content.is_empty() {
-                    facts.brand = Some(content);
-                }
-            }
-            "name" => {
-                // itemprop="name" inside a Brand scope (top of stack is Other) is
-                // the brand name, not the product name.
-                if stack.last() == Some(&Scope::Other) {
-                    if facts.brand.is_none() && !content.is_empty() {
-                        facts.brand = Some(content);
-                    }
-                } else if facts.name.is_none() && !content.is_empty() {
-                    facts.name = Some(content);
-                }
-            }
-            "pricevaliduntil" => {
-                if facts.price_valid_until.is_none() && !content.is_empty() {
-                    facts.price_valid_until = Some(content);
-                }
-            }
-            // ROADMAP item 1 (increment): product image, description, and
-            // category from schema.org microdata. `image` can be a `content`
-            // attribute, an `href` (for <link>), or text between tags. Same
-            // honest extraction as the existing fields — only set when the
-            // page exposes them, never guessed.
-            "image" => {
-                if facts.image.is_none() && !content.is_empty() {
-                    facts.image = Some(content);
-                }
-            }
-            "description" => {
-                if facts.description.is_none() && !content.is_empty() {
-                    facts.description = Some(content);
-                }
-            }
-            "category" => {
-                if facts.category.is_none() && !content.is_empty() {
-                    facts.category = Some(content);
-                }
-            }
-            // ROADMAP item 1 (increment): product variation fields from
-            // microdata. Same schema.org vocabulary as the JSON-LD path —
-            // model, color, size, material, gender, age_group. Only set
-            // when the page exposes them, never guessed.
-            "model" => {
-                if facts.model.is_none() && !content.is_empty() {
-                    facts.model = Some(content);
-                }
-            }
-            "color" => {
-                if facts.color.is_none() && !content.is_empty() {
-                    facts.color = Some(content);
-                }
-            }
-            "size" => {
-                if facts.size.is_none() && !content.is_empty() {
-                    facts.size = Some(content);
-                }
-            }
-            "material" => {
-                if facts.material.is_none() && !content.is_empty() {
-                    facts.material = Some(content);
-                }
-            }
-            "gender" => {
-                if facts.gender.is_none() && !content.is_empty() {
-                    facts.gender = Some(content);
-                }
-            }
-            "age_group" | "agegroup" => {
-                if facts.age_group.is_none() && !content.is_empty() {
-                    facts.age_group = Some(content);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Resolve multiple prices the same way as JSON-LD: single -> canonical,
-    // multiple -> range + count, never a silent pick.
-    if prices.len() == 1 {
-        let (p, c) = &prices[0];
-        facts.price = Some(*p);
-        if facts.currency.is_none() {
-            if let Some(cur) = c {
-                facts.currency = Some(cur.clone());
-            }
-        }
-        if facts.offer_count.is_none() {
-            facts.offer_count = Some(1);
-        }
-    } else if !prices.is_empty() {
-        let mut lo = f64::MAX;
-        let mut hi = f64::MIN;
-        for (p, _c) in &prices {
-            lo = lo.min(*p);
-            hi = hi.max(*p);
-        }
-        // Currency agreement: only surface a currency when every price carried the
-        // SAME one. Mixed currencies on one page => leave currency null (never
-        // guess). Clean Option<String> comparison (no borrow pitfalls).
-        let first_cur = prices.first().and_then(|(_, c)| c.clone());
-        let all_agree = prices.iter().all(|(_, c)| *c == first_cur);
-        facts.price_low = Some(lo);
-        facts.price_high = Some(hi);
-        facts.offer_count = Some(prices.len());
-        if facts.currency.is_none() && all_agree {
-            facts.currency = first_cur;
-        }
-    }
-
-    // Only return when at least one structured fact was found.
-    if facts.price.is_some()
-        || facts.price_low.is_some()
-        || facts.currency.is_some()
-        || facts.availability.is_some()
-        || facts.merchant.is_some()
-        || facts.condition.is_some()
-        || facts.sku.is_some()
-        || facts.gtin.is_some()
-        || facts.rating.is_some()
-    {
-        Some(facts)
-    } else {
-        None
-    }
-}
-
 fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     let mut facts = OfferFacts::default();
     let mut source: Option<String> = None;
@@ -3524,49 +3017,7 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         }
     }
 
-    // 3) Third structured signal: schema.org MICRODATA (itemscope + itemprop).
-    //    Real Shopify/legacy product pages emit microdata with no JSON-LD/OG —
-    //    this recovers honest facts the other two signals miss. Pure SUPPLEMENT:
-    //    it only fills fields still `None` and never overwrites a stronger signal,
-    //    and it reuses the EXACT SAME `OfferFacts` field mapping (no per-merchant
-    //    code). A price is taken only from a typed `itemprop="price"` (range ->
-    //    price_low/price_high + offer_count, `price` left null), exactly like the
-    //    JSON-LD path — never guessed from free text.
-    if let Some(md) = parse_microdata(html) {
-        if facts.price.is_none() && facts.price_low.is_none() {
-            if facts.price.is_none() { facts.price = md.price; }
-            if facts.price_low.is_none() { facts.price_low = md.price_low; }
-            if facts.price_high.is_none() { facts.price_high = md.price_high; }
-            if facts.offer_count.is_none() { facts.offer_count = md.offer_count; }
-        }
-        if facts.currency.is_none() { facts.currency = md.currency; }
-        if facts.availability.is_none() { facts.availability = md.availability; }
-        if facts.condition.is_none() { facts.condition = md.condition; }
-        if facts.sku.is_none() { facts.sku = md.sku; }
-        if facts.gtin.is_none() { facts.gtin = md.gtin; }
-        if facts.rating.is_none() { facts.rating = md.rating; }
-        if facts.rating_count.is_none() { facts.rating_count = md.rating_count; }
-        if facts.merchant.is_none() { facts.merchant = md.merchant; }
-        if facts.name.is_none() { facts.name = md.name; }
-        if facts.price_valid_until.is_none() {
-            facts.price_valid_until = md.price_valid_until;
-        }
-        if facts.image.is_none() { facts.image = md.image; }
-        if facts.description.is_none() { facts.description = md.description; }
-        if facts.category.is_none() { facts.category = md.category; }
-        if facts.brand.is_none() { facts.brand = md.brand; }
-        if facts.model.is_none() { facts.model = md.model; }
-        if facts.color.is_none() { facts.color = md.color; }
-        if facts.size.is_none() { facts.size = md.size; }
-        if facts.material.is_none() { facts.material = md.material; }
-        if facts.gender.is_none() { facts.gender = md.gender; }
-        if facts.age_group.is_none() { facts.age_group = md.age_group; }
-        if source.is_none() {
-            source = Some("microdata".to_string());
-        }
-    }
-
-    // 4) Merchant fallback: derive a coarse host label only when no page-provided
+    // 3) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
@@ -3642,27 +3093,7 @@ fn walk_commerce_nodes(v: &serde_json::Value, out: &mut Vec<serde_json::Value>) 
             };
             if let Some(t) = ty {
                 let tl = t.to_lowercase();
-                // ROADMAP item 1 (increment): extend honest extraction to
-                // schema.org's digital-product types alongside physical
-                // Product/Offer. `SoftwareApplication` (SaaS, mobile apps),
-                // `VideoGame`, and `Service` (subscriptions) carry the SAME
-                // structured commerce facts (price, rating, publisher/developer
-                // as merchant) as a physical Product — the rest of the pipeline
-                // (merge_jsonld_nodes) reads those same fields, so no per-type
-                // logic is added. A type match WITHOUT matching fields simply
-                // yields no facts (graceful), so the broad `contains` stems here
-                // cannot fabricate facts from non-product pages.
-                if tl.contains("product")
-                    || tl.contains("offer")
-                    || tl.contains("software")
-                    || tl.contains("video")
-                    || tl.contains("service")
-                    || tl.contains("book")
-                    || tl.contains("event")
-                    || tl.contains("jobposting")
-                    || tl.contains("course")
-                    || tl.contains("recipe")
-                {
+                if tl.contains("product") || tl.contains("offer") {
                     out.push(v.clone());
                 }
             }
@@ -3780,308 +3211,11 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
                     seller.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
             }
         }
-        // ROADMAP item 1 (increment): digital-product schemas (SoftwareApplication,
-        // VideoGame, Service) carry the merchant as `publisher` / `developer` /
-        // `provider` instead of `seller`. These are the SAME commerce role (the
-        // entity offering the product) — just a different field name per schema
-        // type. No per-type branch: we try each field in priority order, and a
-        // page with none of them simply leaves merchant null (honest).
-        if facts.merchant.is_none() {
-            if let Some(pub_name) = n
-                .get("publisher")
-                .and_then(|p| p.get("name"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    n.get("developer")
-                        .and_then(|d| d.get("name"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .or_else(|| {
-                    n.get("provider")
-                        .and_then(|p| p.get("name"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-            {
-                facts.merchant = Some(pub_name);
-            }
-        }
-        // ROADMAP item 1 (increment): extract author + isbn from Book schema.
-        // schema.org `Book` carries `author` (Person or Organization, so `name`
-        // is nested) and `isbn` (a plain string). Distinct from merchant
-        // (seller) and brand (manufacturer). No per-type branch — the same
-        // extraction works for any product-like type; a non-book page simply
-        // lacks these fields, so both stay null (honest).
-        if facts.author.is_none() {
-            if let Some(a) = n.get("author") {
-                if let Some(s) = a.as_str() {
-                    facts.author = Some(s.to_string());
-                } else if let Some(obj) = a.as_object() {
-                    facts.author = obj
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                }
-            }
-        }
-        if facts.isbn.is_none() {
-            facts.isbn = n
-                .get("isbn")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
         if facts.currency.is_none() {
             facts.currency = n
                 .get("priceCurrency")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-        }
-        // ROADMAP item 1 (increment): extract product `name` and `priceValidUntil`
-        // from the SAME typed structured node. `name` is the product title (e.g.
-        // "Acme Widget Pro"); `priceValidUntil` is an ISO 8601 sale-end date that
-        // lets the frontend label a price as a limited-time offer. Both are
-        // optional and only set when the page actually exposes them — never
-        // guessed. The fields live on the Product/Offer node itself.
-        if facts.name.is_none() {
-            facts.name = n
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        if facts.price_valid_until.is_none() {
-            facts.price_valid_until = n
-                .get("priceValidUntil")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        // ROADMAP item 1 (increment): extract event facts from schema.org
-        // `Event` — `startDate` (ISO 8601 datetime) and `location` (venue name
-        // or address). These are the SAME typed structured fields the pipeline
-        // already reads for products; an Event node simply carries different
-        // field names. No per-type branch: a non-event page lacks these fields,
-        // so both stay null (honest). `location` can be a string, an object
-        // with `name`/`address`, or an array of either.
-        if facts.event_start.is_none() {
-            facts.event_start = n
-                .get("startDate")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        if facts.event_location.is_none() {
-            facts.event_location = n.get("location").and_then(|loc| {
-                if let Some(s) = loc.as_str() {
-                    return Some(s.to_string());
-                }
-                if let Some(obj) = loc.as_object() {
-                    if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
-                        return Some(name.to_string());
-                    }
-                    if let Some(addr) = obj.get("address").and_then(|v| v.as_str()) {
-                        return Some(addr.to_string());
-                    }
-                }
-                if let Some(arr) = loc.as_array() {
-                    return arr.first().and_then(|x| {
-                        if let Some(s) = x.as_str() {
-                            return Some(s.to_string());
-                        }
-                        if let Some(obj) = x.as_object() {
-                            if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
-                                return Some(name.to_string());
-                            }
-                        }
-                        None
-                    });
-                }
-                None
-            });
-        }
-        // ROADMAP item 1 (increment): extract product image, description, and
-        // category from the SAME typed structured node. `image` can be a string
-        // URL, an array of URLs, or an object with a `url` field (schema.org
-        // allows all three). `description` and `category` are plain strings.
-        // All optional, only set when the page exposes them — never guessed.
-        if facts.image.is_none() {
-            facts.image = n
-                .get("image")
-                .and_then(|v| {
-                    if let Some(s) = v.as_str() {
-                        return Some(s.to_string());
-                    }
-                    if let Some(arr) = v.as_array() {
-                        return arr.first().and_then(|x| x.as_str()).map(|s| s.to_string());
-                    }
-                    if let Some(obj) = v.as_object() {
-                        return obj.get("url").and_then(|x| x.as_str()).map(|s| s.to_string());
-                    }
-                    None
-                });
-        }
-        if facts.description.is_none() {
-            facts.description = n
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        if facts.category.is_none() {
-            facts.category = n
-                .get("category")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        // ROADMAP item 1 (increment): extract product brand (manufacturer)
-        // from JSON-LD. schema.org `brand` can be a string, an object with a
-        // `name`, or an array of either. Distinct from `merchant` (the seller):
-        // a Sony WH-1000xm5 sold on Amazon has brand=Sony, merchant=Amazon.
-        if facts.brand.is_none() {
-            if let Some(b) = n.get("brand") {
-                if let Some(s) = b.as_str() {
-                    facts.brand = Some(s.to_string());
-                } else if let Some(obj) = b.as_object() {
-                    facts.brand = obj
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                } else if let Some(arr) = b.as_array() {
-                    facts.brand = arr.first().and_then(|x| {
-                        if let Some(s) = x.as_str() {
-                            Some(s.to_string())
-                        } else if let Some(obj) = x.as_object() {
-                            obj.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
-                        } else {
-                            None
-                        }
-                    });
-                }
-            }
-        }
-        // ROADMAP item 1 (increment): product variation fields — model, color,
-        // size, material, gender, age_group. These are standard schema.org
-        // Product properties that real product pages expose for variant
-        // selection. Each is Optional and only set when the page actually
-        // exposes it — never guessed from free text. All three signal paths
-        // (JSON-LD, microdata, OG) extract the SAME fields from the SAME
-        // vocabulary, just different serialization syntax.
-        if facts.model.is_none() {
-            facts.model = n.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
-        }
-        if facts.color.is_none() {
-            facts.color = n
-                .get("color")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        if facts.size.is_none() {
-            facts.size = n
-                .get("size")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        if facts.material.is_none() {
-            facts.material = n
-                .get("material")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        if facts.gender.is_none() {
-            facts.gender = n
-                .get("gender")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        if facts.age_group.is_none() {
-            facts.age_group = n
-                .get("ageGroup")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        // ROADMAP item 1 (increment): extract JobPosting facts
-        if facts.job_title.is_none() {
-            facts.job_title = n.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
-        }
-        if facts.job_posted_at.is_none() {
-            facts.job_posted_at = n.get("datePosted").and_then(|v| v.as_str()).map(|s| s.to_string());
-        }
-        if facts.hiring_organization.is_none() {
-            facts.hiring_organization = n.get("hiringOrganization").and_then(|org| {
-                if let Some(s) = org.as_str() { return Some(s.to_string()); }
-                if let Some(obj) = org.as_object() {
-                    return obj.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
-                }
-                None
-            });
-        }
-        if facts.job_location.is_none() {
-            facts.job_location = n.get("jobLocation").and_then(|loc| {
-                if let Some(s) = loc.as_str() { return Some(s.to_string()); }
-                if let Some(obj) = loc.as_object() {
-                    if let Some(name) = obj.get("name").and_then(|v| v.as_str()) { return Some(name.to_string()); }
-                    if let Some(addr) = obj.get("address").and_then(|v| v.as_str()) { return Some(addr.to_string()); }
-                }
-                if let Some(arr) = loc.as_array() {
-                    return arr.first().and_then(|x| {
-                        if let Some(s) = x.as_str() { return Some(s.to_string()); }
-                        if let Some(obj) = x.as_object() {
-                            if let Some(name) = obj.get("name").and_then(|v| v.as_str()) { return Some(name.to_string()); }
-                        }
-                        None
-                    });
-                }
-                None
-            });
-        }
-        if facts.base_salary.is_none() {
-            facts.base_salary = n.get("baseSalary").and_then(|sal| {
-                if let Some(s) = sal.as_str() { return Some(s.to_string()); }
-                if let Some(obj) = sal.as_object() {
-                    if let Some(val) = obj.get("value") {
-                        if let Some(v) = val.as_f64() { let cur = obj.get("currency").and_then(|c| c.as_str()).unwrap_or("USD"); return Some(format!("{} {}", v, cur)); }
-                        if let Some(s) = val.as_str() { return Some(s.to_string()); }
-                    }
-                    if let Some(min) = obj.get("minValue").and_then(|v| v.as_f64()) {
-                        if let Some(max) = obj.get("maxValue").and_then(|v| v.as_f64()) { let cur = obj.get("currency").and_then(|c| c.as_str()).unwrap_or("USD"); return Some(format!("{} - {} {}", min, max, cur)); }
-                    }
-                }
-                None
-            });
-        }
-        if facts.employment_type.is_none() {
-            facts.employment_type = n.get("employmentType").and_then(|v| v.as_str()).map(|s| s.to_string());
-        }
-        if facts.course_provider.is_none() {
-            facts.course_provider = n.get("provider").and_then(|p| {
-                if let Some(s) = p.as_str() { return Some(s.to_string()); }
-                if let Some(obj) = p.as_object() { return obj.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()); }
-                None
-            });
-        }
-        if facts.course_mode.is_none() {
-            facts.course_mode = n.get("hasCourseInstance").and_then(|ci| {
-                if let Some(s) = ci.as_str() { return Some(s.to_string()); }
-                if let Some(obj) = ci.as_object() { return obj.get("courseMode").and_then(|v| v.as_str()).map(|s| s.to_string()); }
-                if let Some(arr) = ci.as_array() {
-                    return arr.first().and_then(|x| {
-                        if let Some(s) = x.as_str() { return Some(s.to_string()); }
-                        if let Some(obj) = x.as_object() { return obj.get("courseMode").and_then(|v| v.as_str()).map(|s| s.to_string()); }
-                        None
-                    });
-                }
-                None
-            });
-        }
-        if facts.prep_time.is_none() {
-            facts.prep_time = n.get("prepTime").and_then(|v| v.as_str()).map(|s| s.to_string());
-        }
-        if facts.cook_time.is_none() {
-            facts.cook_time = n.get("cookTime").and_then(|v| v.as_str()).map(|s| s.to_string());
-        }
-        if facts.total_time.is_none() {
-            facts.total_time = n.get("totalTime").and_then(|v| v.as_str()).map(|s| s.to_string());
-        }
-        if facts.recipe_yield.is_none() {
-            facts.recipe_yield = n.get("recipeYield").and_then(|v| v.as_str()).map(|s| s.to_string());
         }
     }
 
@@ -4144,18 +3278,9 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
                     o.condition = Some(content.clone());
                 }
             }
-            "product:retailer" | "og:site_name" => {
+            "product:retailer" | "og:site_name" | "product:brand" => {
                 if o.merchant.is_none() {
                     o.merchant = Some(content.clone());
-                }
-            }
-            // ROADMAP item 1 (increment): product brand (manufacturer) is
-            // distinct from merchant (seller). OG `product:brand` maps to the
-            // new `brand` field, NOT merchant. A Sony WH-1000xm5 sold on Amazon
-            // has brand=Sony, merchant=Amazon.
-            "product:brand" => {
-                if o.brand.is_none() {
-                    o.brand = Some(content.clone());
                 }
             }
             "product:item_id" | "product:gtin" | "product:sku" => {
@@ -4171,60 +3296,6 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
             "product:rating:count" | "product:rating:scale" | "product:review_count" => {
                 if o.rating_count.is_none() {
                     o.rating_count = content.parse::<u64>().ok();
-                }
-            }
-            // ROADMAP item 1 (increment): product image, description, and
-            // category from OG meta tags. og:image is the most widely used
-            // product image tag; og:description / product:description and
-            // product:category / og:product_category carry the rest. Only
-            // set when the page exposes them — never guessed.
-            "og:image" | "product:image" => {
-                if o.image.is_none() {
-                    o.image = Some(content.clone());
-                }
-            }
-            "og:description" | "product:description" => {
-                if o.description.is_none() {
-                    o.description = Some(content.clone());
-                }
-            }
-            "product:category" | "og:product_category" => {
-                if o.category.is_none() {
-                    o.category = Some(content.clone());
-                }
-            }
-            // ROADMAP item 1 (increment): product variation fields from OG
-            // meta tags. og:model / product:model, product:color, product:size,
-            // product:material, product:gender, product:age_group. Same
-            // vocabulary as the JSON-LD and microdata paths.
-            "og:model" | "product:model" => {
-                if o.model.is_none() {
-                    o.model = Some(content.clone());
-                }
-            }
-            "product:color" => {
-                if o.color.is_none() {
-                    o.color = Some(content.clone());
-                }
-            }
-            "product:size" => {
-                if o.size.is_none() {
-                    o.size = Some(content.clone());
-                }
-            }
-            "product:material" => {
-                if o.material.is_none() {
-                    o.material = Some(content.clone());
-                }
-            }
-            "product:gender" => {
-                if o.gender.is_none() {
-                    o.gender = Some(content.clone());
-                }
-            }
-            "product:age_group" => {
-                if o.age_group.is_none() {
-                    o.age_group = Some(content.clone());
                 }
             }
             _ => {}
@@ -4247,6 +3318,90 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
 /// endpoint and applies NO ranking or monetization — it only surfaces facts
 /// extracted from the given page. The user-facing `/shopping` endpoint and
 /// affiliate decoration land in later roadmap increments.
+/// Query params for the `/commerce/bid` reporting endpoint.
+#[derive(Deserialize)]
+struct BidCheckParams {
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// Reporting-only Sovrn Commerce Bid Check endpoint.
+async fn handle_commerce_bid(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<AppState>>,
+    axum::extract::Query(params): Query<BidCheckParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let dest_url = match params.url.as_deref() {
+        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "missing_url",
+                "message": "Query parameter 'url' is required"
+            })),
+        ),
+    };
+    let net = match state.affiliate_ctx.networks.iter().find(|n| {
+        n.enabled && n.bid_check_url.is_some()
+            && n.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false)
+    }) {
+        Some(n) => n,
+        None => return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "no_bid_check_network",
+                "message": "No network with bid-check configured and a usable key"
+            })),
+        ),
+    };
+    let key = std::env::var(net.key_env.as_deref().unwrap_or("")).unwrap_or_default();
+    let check_template = net.bid_check_url.as_deref().unwrap_or("");
+    let encoded_dest = urlencoding::encode(&dest_url);
+    let check_url = check_template
+        .replace("{key}", &key)
+        .replace("{url}", &encoded_dest);
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.http_client.get(&check_url).send(),
+    ).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "bid_check_upstream_error",
+                "message": format!("Bid-check request failed: {}", e)
+            })),
+        ),
+        Err(_) => return (
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "error": "bid_check_timeout",
+                "message": "Bid-check request timed out"
+            })),
+        ),
+    };
+    let status = resp.status();
+    let body_text = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        resp.text(),
+    ).await {
+        Ok(Ok(t)) => t,
+        _ => String::new(),
+    };
+    let upstream_json = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body_text) {
+        v
+    } else {
+        serde_json::json!({ "raw": body_text })
+    };
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "url": dest_url,
+            "network": &net.network,
+            "upstream_status": status.as_u16(),
+            "upstream_body": upstream_json,
+        })),
+    )
+}
 async fn handle_commerce_extract(
     Json(body): Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
@@ -4358,22 +3513,14 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.sku.is_some()
         || d.gtin.is_some()
         || d.rating.is_some()
-        || d.image.is_some()
-        || d.description.is_some()
-        || d.category.is_some()
-        || d.brand.is_some()
-        || d.author.is_some()
-        || d.isbn.is_some()
 }
 
-/// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
-/// page exposed structured product data, attached by `enrich_with_commerce`).
-/// Powers the main-path `shopping` gate: the strip is only surfaced when at
-/// least one top result actually has product facts — never an empty link-farm
-/// strip of bare affiliate links. Pure + offline-testable.
-fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
-    results.iter().any(|r| r.get("commerce").is_some())
-}
+/// How many of the ALREADY-RANKED top results feed the main-path `shopping`
+/// block on `/search` (ROADMAP item 7). This is a presentation cap on a CLONE of
+/// the ranked results, NOT a ranking change — the real `results` array is never
+/// touched, so this number cannot affect ranking or selection. Data-free: tuning
+/// it only changes how many enriched shopping cards show, never their order.
+const COMMERCE_MAINPATH_TOP_N: usize = 8;
 
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
@@ -4522,6 +3669,12 @@ struct AffiliateNetwork {
     /// url-encoded as a query param. DATA-ONLY.
     #[serde(default)]
     fallback_url: Option<String>,
+    /// Bid-check endpoint template for Sovrn's reporting API
+    /// (`/api/bid?key=...&out=...&ip=...&userAgent=...`). Used by the
+    /// `/commerce/bid` reporting endpoint ONLY — never for ranking. DATA-ONLY:
+    /// the URL template comes from the data file; the key comes from env.
+    #[serde(default)]
+    bid_check_url: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -4582,64 +3735,6 @@ impl AffiliateCtx {
                     .map(|k| std::env::var(k).is_ok())
                     .unwrap_or(false)
         })
-    }
-}
-
-/// Runtime-loaded commerce feature configuration (ROADMAP post-item-7 increment).
-///
-/// Holds presentation/behavior toggles for the commerce pipeline that should be
-/// changeable WITHOUT recompiling — edit `data/commerce/config.json` and restart
-/// the gateway. Every field has a sensible default, so a missing/empty file is
-/// NOT fatal: the pipeline simply runs with defaults.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-struct CommerceConfig {
-    /// How many of the ALREADY-RANKED top results feed the main-path `shopping`
-    /// strip on `/search`. Data-only: changing it only changes how many enriched
-    /// shopping cards show, never their order (the order-invariance guarantee
-    /// holds for any value). Defaults to 8 when absent.
-    #[serde(default = "default_mainpath_top_n")]
-    mainpath_top_n: usize,
-}
-
-fn default_mainpath_top_n() -> usize {
-    8
-}
-
-impl Default for CommerceConfig {
-    fn default() -> Self {
-        Self {
-            mainpath_top_n: default_mainpath_top_n(),
-        }
-    }
-}
-
-impl CommerceConfig {
-    /// Load config from the data file. A missing/empty/malformed file is NOT
-    /// fatal — defaults are applied per-field via serde, and a totally absent
-    /// file yields `Default::default()`. This mirrors the `AffiliateCtx::load`
-    /// resilience pattern: commerce behavior must never break search.
-    fn load() -> Self {
-        let candidates = [
-            "data/commerce/config.json",
-            "/app/data/commerce/config.json",
-            "./data/commerce/config.json",
-        ];
-        for path in candidates {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Ok(cfg) = serde_json::from_value::<CommerceConfig>(v.clone()) {
-                        tracing::info!(
-                            "commerce config: loaded mainpath_top_n={} from {}",
-                            cfg.mainpath_top_n,
-                            path
-                        );
-                        return cfg;
-                    }
-                }
-            }
-        }
-        tracing::info!("commerce config: no data file found, using defaults");
-        Self::default()
     }
 }
 
@@ -7277,18 +6372,11 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         k += 1;
                     }
                     let joined = compound.join(" ");
-                    // GUARD (2026-08-31 round): never emit an EMPTY exclusion term.
-                    // A compound finalised via a list connector ("and"/"or") inside
-                    // the loop above is now empty; if we still ran the gate on it,
-                    // `is_real_exclusion("")` returns true for any contrastive query
-                    // (a query containing "no"/"without" is contrastive), pushing ""
-                    // as a negative. An empty `not:` substring-matches EVERY title
-                    // ("" is present everywhere), so the hard-drop would delete ALL
-                    // retrieved results and collapse the query to 0 hits — exactly
-                    // the catastrophic failure seen for "no dairy and no gelatin".
-                    // General + structural: an empty exclusion is never meaningful.
-                    if !joined.is_empty()
-                        && is_real_exclusion(&joined, q_orig, query_contrastive)
+                    // Gate: only keep the compound as a real exclusion when it is in
+                    // contrastive framing or names a recognized entity. Manner
+                    // qualifiers ("without soap", "with no music background") are
+                    // dropped so they don't penalize the user's own topical words.
+                    if is_real_exclusion(&joined, q_orig, query_contrastive)
                         && !terms.contains(&joined)
                     {
                         terms.push(joined);
@@ -10949,12 +10037,6 @@ struct AppState {
     /// knowledge is data, never code. Used only as a strict post-rank decoration
     /// pass — never affects ranking/order.
     affiliate_ctx: AffiliateCtx,
-    /// Runtime-loaded commerce feature configuration (ROADMAP post-item-7
-    /// increment). Loaded once at startup from `data/commerce/config.json`;
-    /// presentation/behavior toggles (e.g. `mainpath_top_n`) are data-only and
-    /// can be changed WITHOUT recompiling. A missing/empty file falls back to
-    /// defaults — never breaks search.
-    commerce_config: CommerceConfig,
 }
 
 async fn handle_images(
@@ -11588,7 +10670,6 @@ async fn main() {
         search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         // Affiliate template engine config (ROADMAP item 3) — loaded from data.
         affiliate_ctx: AffiliateCtx::load(),
-        commerce_config: CommerceConfig::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -11681,7 +10762,8 @@ async fn main() {
         // Returns the typed CommerceOffer extracted from supplied HTML — no
         // ranking, no monetization, no user-tracking surface. The /shopping
         // endpoint and affiliate decoration land in later increments.
-        .route("/commerce/extract", post(handle_commerce_extract))
+        .route("/commerce/bid", get(handle_commerce_bid))
+.route("/commerce/extract", post(handle_commerce_extract))
         .route("/shopping", get(handle_shopping))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
@@ -16400,7 +15482,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         // place. `serde_json::to_value` on `MergedResult` is lossless/Serialize.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
             .iter()
-            .take(state.commerce_config.mainpath_top_n)
+            .take(COMMERCE_MAINPATH_TOP_N)
             .filter_map(|r| serde_json::to_value(r).ok())
             .collect();
         if shop_arr.is_empty() {
@@ -16417,30 +15499,16 @@ let mut results = match tokio::task::spawn_blocking(move || {
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
-            // ROADMAP item 7 (refinement): only surface the main-path `shopping`
-            // strip when at least one of the top-N ranked results actually exposed
-            // structured product data (a `commerce` block). A commercial-intent
-            // query whose top results are articles/reviews/guides with no product
-            // schema would otherwise render an empty strip of cards carrying only
-            // affiliate links — a low-value, link-farm-like surface that invites
-            // misuse of the affiliate thesis. Gating on a REAL `commerce` block
-            // keeps the block honest: it appears only when we have product facts to
-            // show. Pure post-enrichment signal, no query-specific logic, and the
-            // `results` ordering is untouched either way (no-manipulation holds).
-            if !shop_arr.iter().any(|r| r.get("commerce").is_some()) {
-                None
-            } else {
-                // Read-only multi-merchant offer comparison from the attached facts.
-                let mut block = serde_json::json!({ "results": shop_arr });
-                if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                    let comparisons = build_offer_comparisons(arr_ref);
-                    if !comparisons.is_empty() {
-                        block["offer_comparisons"] =
-                            serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
-                    }
+            // Read-only multi-merchant offer comparison from the attached facts.
+            let mut block = serde_json::json!({ "results": shop_arr });
+            if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                let comparisons = build_offer_comparisons(arr_ref);
+                if !comparisons.is_empty() {
+                    block["offer_comparisons"] =
+                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
                 }
-                Some(block)
             }
+            Some(block)
         }
     } else {
         None
@@ -17622,41 +16690,6 @@ mod constraint_fix_tests {
     }
 
     #[test]
-    fn negation_never_emits_empty_exclusion_on_compound_no_and_no() {
-        // REGRESSION (round 2026-08-31T1132Z): a no X and no Y / without X or Y
-        // compound finalised via a list connector (and/or) inside the collection
-        // loop leaves an EMPTY trailing compound; the post-loop finalise must NOT
-        // push an empty string as an exclusion. An empty not: substring-matches
-        // EVERY title, hard-drops ALL retrieved results, and collapses the query
-        // to 0 hits. General defect (any no A and no B phrasing), not a fluke.
-        for q in [
-            "how do I make a vegan chocolate mousse that uses no dairy and no gelatin",
-            "recipes with no nuts and no dairy",
-            "shoes without laces or without velcro",
-        ] {
-            let (kept, _declined, _manner) = extract_query_negative_terms_with_dropped(q);
-            assert!(
-                !kept.iter().any(|t| t.trim().is_empty()),
-                "empty exclusion must never be emitted (collapses query to 0): q={:?} kept={:?}",
-                q, kept
-            );
-            let joined = kept.join(" ");
-            match q {
-                "how do I make a vegan chocolate mousse that uses no dairy and no gelatin" => {
-                    assert!(joined.contains("dairy") && joined.contains("gelatin"), "legitimate exclusions must survive: q={:?} kept={:?}", q, kept);
-                }
-                "recipes with no nuts and no dairy" => {
-                    assert!(joined.contains("nuts") && joined.contains("dairy"), "legitimate exclusions must survive: q={:?} kept={:?}", q, kept);
-                }
-                "shoes without laces or without velcro" => {
-                    assert!(joined.contains("laces") && joined.contains("velcro"), "legitimate exclusions must survive: q={:?} kept={:?}", q, kept);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    #[test]
     fn analyze_endpoint_response_shape_matches_docs() {
         // Locks the JSON shape documented in API_REFERENCE.md `GET /analyze`:
         // the handler builds `{query, contrastive_framing, exclusions, declined,
@@ -18777,128 +17810,6 @@ mod spellcheck_endpoint_tests {
             assert_eq!(eq[0].as_str(), Some("best sushi restaurants in new york"));
         }
 
-    // ── ROADMAP item 1 (increment): schema.org MICRODATA extraction ─────
-    // Third structured signal alongside JSON-LD and OpenGraph. Real Shopify/
-    // legacy product pages emit microdata with no JSON-LD — these tests prove
-    // honest facts are extracted from it, that a price range is never collapsed,
-    // and that a page with no product microdata yields all-null (no guessing).
-
-    // Realistic Shopify-style Product microdata fixture.
-    const HTML_MICRODATA: &str = r#"<!doctype html><html><head><title>Micro Widget</title></head><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <span itemprop="name">Micro Widget</span>
-  <span itemprop="sku">MW-007</span>
-  <span itemprop="gtin13">9876543210123</span>
-  <div itemprop="brand" itemscope itemtype="https://schema.org/Brand">
-    <span itemprop="name">MicroBrand</span>
-  </div>
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price">29.99</span>
-    <meta itemprop="priceCurrency" content="USD">
-    <link itemprop="availability" href="https://schema.org/InStock">
-    <link itemprop="itemCondition" href="https://schema.org/NewCondition">
-    <div itemprop="aggregateRating" itemscope itemtype="https://schema.org/AggregateRating">
-      <span itemprop="ratingValue">4.7</span>
-      <span itemprop="ratingCount">88</span>
-    </div>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn microdata_extracts_product_facts() {
-        let o = extract_commerce_offer(HTML_MICRODATA, "https://shop.example.com/mw");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(29.99), "price from itemprop=price");
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
-        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
-        assert_eq!(d.sku.as_deref(), Some("MW-007"));
-        assert_eq!(d.gtin.as_deref(), Some("9876543210123"));
-        // ROADMAP item 1 (increment): brand (manufacturer) is distinct from
-        // merchant (seller). The fixture's nested Brand scope has the brand
-        // name "MicroBrand" — it must land in `brand`, NOT `merchant`.
-        assert_eq!(d.brand.as_deref(), Some("MicroBrand"), "brand from nested Brand scope");
-        assert_eq!(d.merchant.as_deref(), None, "no seller in fixture => merchant null");
-        assert_eq!(d.rating, Some(4.7));
-        assert_eq!(d.rating_count, Some(88));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    // Multi-offer microdata (two prices) must surface range + count, never a
-    // silent single canonical price.
-    const HTML_MICRODATA_TWO: &str = r#"<!doctype html><html><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price">15.00</span><meta itemprop="priceCurrency" content="USD">
-  </div>
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price">20.00</span><meta itemprop="priceCurrency" content="USD">
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn microdata_two_offers_surfaces_range_not_canonical() {
-        let o = extract_commerce_offer(HTML_MICRODATA_TWO, "https://shop.example.com/dual");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price_low, Some(15.00));
-        assert_eq!(d.price_high, Some(20.00));
-        assert_eq!(d.offer_count, Some(2));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(d.price, None, "must NOT collapse multiple microdata prices");
-    }
-
-    // A page with breadcrumb/structural microdata but NO product scope must not
-    // extract any product facts (no false positives from unrelated itemprops).
-    const HTML_MICRODATA_NO_PRODUCT: &str = r#"<!doctype html><html><body>
-<nav itemscope itemtype="https://schema.org/BreadcrumbList">
-  <span itemprop="name">Home</span>
-  <span itemprop="price">9.99</span>
-</nav>
-<p>This article mentions a price of $49.99 in body text but exposes no product microdata.</p>
-</body></html>"#;
-
-    #[test]
-    fn microdata_no_product_scope_is_all_null() {
-        let o = extract_commerce_offer(HTML_MICRODATA_NO_PRODUCT, "https://blog.example.com/post");
-        let d = o.data.as_ref().unwrap();
-        // price inside a BreadcrumbList scope must NOT be treated as a product price.
-        assert_eq!(d.price, None);
-        assert_eq!(d.price_low, None);
-        assert_eq!(d.price_high, None);
-        assert_eq!(d.currency, None);
-        assert_eq!(d.sku, None);
-        assert_eq!(d.gtin, None);
-        // merchant falls back to the coarse host label (identifier, not a fact).
-        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
-        assert_eq!(o.source.as_deref(), None);
-    }
-
-    // Microdata must supplement but NOT overwrite a stronger JSON-LD signal.
-    #[test]
-    fn microdata_supplements_without_overwriting_jsonld() {
-        // Self-contained JSON-LD single-offer page (no dependency on the
-        // commerce_extraction_tests fixtures, since this block lives in an
-        // outer module). price = 49.99 USD.
-        let jsonld = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{ "@context": "https://schema.org/", "@type": "Product",
-  "name": "Acme Widget Pro",
-  "offers": { "@type": "Offer", "price": "49.99", "priceCurrency": "USD" } }
-</script></head><body></body></html>"#;
-        let html = format!("{}\n{}", jsonld, HTML_MICRODATA_TWO);
-        let o = extract_commerce_offer(&html, "https://shop.example.com/mix");
-        let d = o.data.as_ref().unwrap();
-        // JSON-LD is the primary signal and wins where it sets a field.
-        assert_eq!(d.price, Some(49.99));
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-        // Fields JSON-LD left unset stay null (microdata prices were 15/20, but
-        // JSON-LD already set price=49.99 so microdata must NOT overwrite).
-        assert_eq!(d.price_low, None);
-        assert_eq!(d.price_high, None);
-    }
-
         #[test]
         fn intent_reports_local_signal_for_near_me() {
             // "near me" must set local_intent=true (drives /search geo-boost).
@@ -19082,11 +17993,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.price, Some(1299.00));
         assert_eq!(d.currency.as_deref(), Some("INR"));
         assert_eq!(d.availability.as_deref(), Some("in stock"));
-        // ROADMAP item 1 (increment): OG `product:brand` now maps to `brand`
-        // (manufacturer), NOT `merchant` (seller). The fixture has no
-        // product:retailer/og:site_name, so merchant stays null.
-        assert_eq!(d.brand.as_deref(), Some("OG Brand"), "OG product:brand → brand");
-        assert_eq!(d.merchant.as_deref(), None, "no retailer in OG fixture => merchant null");
+        assert_eq!(d.merchant.as_deref(), Some("OG Brand"));
         assert_eq!(d.gtin.as_deref(), Some("OG-99"));
         assert_eq!(o.source.as_deref(), Some("og"));
     }
@@ -19129,205 +18036,6 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(o.observed_at.is_some());
         // A unix-second string is digits only.
         assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
-    }
-
-    #[test]
-    fn jsonld_extracts_product_name_and_sale_end_date() {
-        // ROADMAP item 1 (increment): the product `name` (e.g. "Acme Widget Pro")
-        // and the offer's `priceValidUntil` (ISO 8601 sale-end date) are extracted
-        // from the SAME typed structured node. Both must be present when the page
-        // exposes them and null when absent — never guessed from free text.
-        let html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Acme Widget Pro",
-  "offers": {
-    "@type": "Offer",
-    "price": "49.99",
-    "priceCurrency": "USD",
-    "priceValidUntil": "2026-12-31"
-  }
-}
-</script></head><body><h1>Acme Widget Pro</h1></body></html>"#;
-        let o = extract_commerce_offer(html, "https://store.example.com/p/1");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.name.as_deref(), Some("Acme Widget Pro"), "product name from JSON-LD");
-        assert_eq!(d.price_valid_until.as_deref(), Some("2026-12-31"), "sale end date from JSON-LD");
-        // Existing fields still extract correctly alongside new ones.
-        assert_eq!(d.price, Some(49.99));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-    }
-
-    #[test]
-    fn jsonld_missing_name_and_sale_date_stay_null() {
-        // A product page that exposes NO `name` and NO `priceValidUntil` must
-        // leave both null — we never guess them from any other field.
-        let html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "offers": {
-    "@type": "Offer",
-    "price": "9.99",
-    "priceCurrency": "USD"
-  }
-}
-</script></head><body><body></html>"#;
-        let o = extract_commerce_offer(html, "https://store.example.com/no-name");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.name, None, "no name in structured data => null");
-        assert_eq!(d.price_valid_until, None, "no priceValidUntil => null");
-        assert_eq!(d.price, Some(9.99));
-    }
-
-    #[test]
-    fn microdata_extracts_product_name_and_sale_end_date() {
-        // ROADMAP item 1 (increment): schema.org microdata `itemprop="name"` and
-        // `itemprop="priceValidUntil"` are extracted alongside the existing price/
-        // rating/sku fields. This exercises the parse_microdata path.
-        let html = r#"<!doctype html><html><head><title>Microdata Product</title></head><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <span itemprop="name">Microdata Widget</span>
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price">29.99</span>
-    <span itemprop="priceCurrency">EUR</span>
-    <time itemprop="priceValidUntil" datetime="2026-11-30">2026-11-30</time>
-  </div>
-</div>
-</body></html>"#;
-        let o = extract_commerce_offer(html, "https://shop.example.com/md");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.name.as_deref(), Some("Microdata Widget"), "name from microdata");
-        assert_eq!(d.price_valid_until.as_deref(), Some("2026-11-30"), "sale end date from microdata");
-        assert_eq!(d.price, Some(29.99));
-        assert_eq!(d.currency.as_deref(), Some("EUR"));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    #[test]
-    fn microdata_missing_name_and_sale_date_stay_null() {
-        // A microdata product page with NO `itemprop="name"` and NO
-        // `itemprop="priceValidUntil"` leaves both null.
-        let html = r#"<!doctype html><html><head></head><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price">14.99</span>
-  </div>
-</div>
-</body></html>"#;
-        let o = extract_commerce_offer(html, "https://shop.example.com/md-no-name");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.name, None);
-        assert_eq!(d.price_valid_until, None);
-        assert_eq!(d.price, Some(14.99));
-    }
-
-    // ROADMAP item 1 (increment): Book schema (author + isbn) extraction.
-    // Both JSON-LD and microdata paths must extract `author` (Person or
-    // Organization, so `name` is nested) and `isbn`. A non-book page must
-    // leave both null (honest — never guessed from free text).
-
-    const HTML_BOOK_JSONLD: &str = r#"<!doctype html><html><head>
-<title>The Pragmatic Programmer</title>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Book",
-  "name": "The Pragmatic Programmer",
-  "isbn": "978-0201616224",
-  "author": {
-    "@type": "Person",
-    "name": "David Thomas"
-  },
-  "offers": {
-    "@type": "Offer",
-    "price": "49.99",
-    "priceCurrency": "USD",
-    "availability": "https://schema.org/InStock",
-    "seller": {"@type": "Organization", "name": "Books Inc"}
-  }
-}
-</script></head><body><h1>The Pragmatic Programmer</h1></body></html>"#;
-
-    #[test]
-    fn book_jsonld_extracts_author_and_isbn() {
-        let o = extract_commerce_offer(HTML_BOOK_JSONLD, "https://books.example.com/pragmatic");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.author.as_deref(), Some("David Thomas"), "author from Book JSON-LD");
-        assert_eq!(d.isbn.as_deref(), Some("978-0201616224"), "isbn from Book JSON-LD");
-        // Other commerce facts still extract correctly.
-        assert_eq!(d.price, Some(49.99));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(d.merchant.as_deref(), Some("Books Inc"));
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-    }
-
-    const HTML_BOOK_MICRODATA: &str = r#"<!doctype html><html><head><title>Book Page</title></head><body>
-<div itemscope itemtype="https://schema.org/Book">
-  <span itemprop="name">Clean Code</span>
-  <div itemprop="author" itemscope itemtype="https://schema.org/Person">
-    <span itemprop="name">Robert C. Martin</span>
-  </div>
-  <span itemprop="isbn">978-0132350884</span>
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price">39.99</span>
-    <span itemprop="priceCurrency">USD</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn book_microdata_extracts_author_and_isbn() {
-        let o = extract_commerce_offer(HTML_BOOK_MICRODATA, "https://books.example.com/clean-code");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.author.as_deref(), Some("Robert C. Martin"), "author from Book microdata");
-        assert_eq!(d.isbn.as_deref(), Some("978-0132350884"), "isbn from Book microdata");
-        assert_eq!(d.price, Some(39.99));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    #[test]
-    fn non_book_page_leaves_author_and_isbn_null() {
-        // A regular product page (not a Book) must leave author + isbn null.
-        let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.author, None, "non-book page => author null");
-        assert_eq!(d.isbn, None, "non-book page => isbn null");
-    }
-
-    #[tokio::test]
-    async fn name_and_sale_date_preserved_in_enrichment_order_invariance() {
-        // The mandatory order-invariance test must still pass after adding the
-        // new fields: enrichment with the new fields populated never reorders
-        // ranked results (the whole no-manipulation guarantee).
-        let mut ranked = vec![
-            serde_json::json!({ "url": "https://a.example.com/x", "score": 9.0 }),
-        ];
-        let fake_html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Widget",
-  "offers": {"@type": "Offer", "price": "10.00", "priceValidUntil": "2026-12-31"}
-}
-</script></head><body></body></html>"#;
-        let h = fake_html.to_string();
-        let fetch = |url: String| {
-            let html = h.clone();
-            async move { Some(html) }
-        };
-        enrich_with_commerce(&mut ranked, fetch).await;
-        let r = &ranked[0];
-        assert_eq!(r["url"], "https://a.example.com/x", "order preserved");
-        let c = r.get("commerce").expect("commerce block attached");
-        assert_eq!(c["data"]["name"], "Widget");
-        assert_eq!(c["data"]["price_valid_until"], "2026-12-31");
-        assert_eq!(c["data"]["price"], 10.00);
     }
 
     // ── ROADMAP item 3: monetization MUST NOT affect ranking/order ────────────
@@ -19444,30 +18152,6 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!is_commercial_intent("informational", &dist, false));
     }
 
-    #[test]
-    fn has_any_commerce_block_gates_on_real_facts() {
-        // ROADMAP item 7 refinement: the main-path /search `shopping` strip must
-        // only surface when at least one top result actually carries a REAL
-        // `commerce` block (a page that exposed structured product data). A strip
-        // of pure affiliate links over article/review results is a low-value,
-        // link-farm-like surface that misuses the affiliate thesis. This test
-        // locks the gate predicate itself (the live path also exercises it via
-        // the order-invariance + no-query-leak contract tests).
-        let with_fact = vec![
-            serde_json::json!({ "url": "https://store.example/p/1", "commerce": { "data": { "merchant": "Example" }, "source": "json-ld", "observed_at": "1", "url": "https://store.example/p/1" } }),
-            serde_json::json!({ "url": "https://review.example/a", "commerce_provenance": { "url": "https://review.example/a", "observed_at": "1", "source": null, "data": null } }),
-        ];
-        assert!(has_any_commerce_block(&with_fact));
-
-        // No `commerce` key anywhere => no strip, even though commerce_provenance
-        // (which is always attached) is present.
-        let without_fact = vec![
-            serde_json::json!({ "url": "https://guide.example/how-to" }),
-            serde_json::json!({ "url": "https://review.example/a", "commerce_provenance": { "url": "https://review.example/a", "observed_at": "1", "source": null, "data": null } }),
-        ];
-        assert!(!has_any_commerce_block(&without_fact));
-    }
-
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
     // Honest, data-driven affiliate decoration. These tests lock the contract:
     //  * two template kinds render correctly with correct URL-encoding
@@ -19490,6 +18174,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             param_env: HashMap::new(),
             bid_floor: None,
             fallback_url: None,
+            bid_check_url: None,
         }
     }
 
@@ -19622,593 +18307,4 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!out.contains("user"), "no user id");
         assert!(!out.contains("ip="), "no ip");
     }
-
-    // ── ROADMAP item 1 (increment): image / description / category extraction ──
-
-    #[test]
-    fn jsonld_extracts_image_description_category() {
-        let html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Acme Widget Pro",
-  "image": "https://store.example.com/images/widget-pro.jpg",
-  "description": "The ultimate widget for all your widgeting needs.",
-  "category": "Electronics > Gadgets",
-  "offers": {"@type": "Offer", "price": "49.99", "priceCurrency": "USD"}
 }
-</script></head><body></body></html>"#;
-        let o = extract_commerce_offer(html, "https://store.example.com/p/1");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://store.example.com/images/widget-pro.jpg"), "image from JSON-LD string");
-        assert_eq!(d.description.as_deref(), Some("The ultimate widget for all your widgeting needs."), "description from JSON-LD");
-        assert_eq!(d.category.as_deref(), Some("Electronics > Gadgets"), "category from JSON-LD");
-        assert_eq!(d.price, Some(49.99));
-        assert_eq!(d.name.as_deref(), Some("Acme Widget Pro"));
-    }
-
-    #[test]
-    fn jsonld_image_as_array_takes_first() {
-        let html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Multi Image Product",
-  "image": [
-    "https://store.example.com/images/1.jpg",
-    "https://store.example.com/images/2.jpg"
-  ],
-  "offers": {"@type": "Offer", "price": "10.00", "priceCurrency": "USD"}
-}
-</script></head><body></body></html>"#;
-        let o = extract_commerce_offer(html, "https://store.example.com/multi");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://store.example.com/images/1.jpg"), "first image from array");
-    }
-
-    #[test]
-    fn jsonld_image_as_object_takes_url_field() {
-        let html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Object Image Product",
-  "image": {"@type": "ImageObject", "url": "https://store.example.com/images/obj.jpg", "width": 800},
-  "offers": {"@type": "Offer", "price": "20.00", "priceCurrency": "USD"}
-}
-</script></head><body></body></html>"#;
-        let o = extract_commerce_offer(html, "https://store.example.com/obj");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://store.example.com/images/obj.jpg"), "url from image object");
-    }
-
-    #[test]
-    fn open_graph_extracts_image_description_category() {
-        let html = r#"<!doctype html><html><head>
-<title>OG Full Product</title>
-<meta property="og:image" content="https://cdn.example.com/product.jpg">
-<meta property="og:description" content="A great product for everyday use.">
-<meta property="product:category" content="Home & Garden">
-<meta property="product:price:amount" content="29.99">
-<meta property="product:price:currency" content="USD">
-</head><body></body></html>"#;
-        let o = extract_commerce_offer(html, "https://og.example.com/full");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/product.jpg"), "image from og:image");
-        assert_eq!(d.description.as_deref(), Some("A great product for everyday use."), "description from og:description");
-        assert_eq!(d.category.as_deref(), Some("Home & Garden"), "category from product:category");
-        assert_eq!(d.price, Some(29.99));
-        assert_eq!(o.source.as_deref(), Some("og"));
-    }
-
-    #[test]
-    fn microdata_extracts_image_description_category() {
-        let html = r#"<!doctype html><html><head><title>Microdata Full</title></head><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <span itemprop="name">Full Microdata Widget</span>
-  <img itemprop="image" src="https://shop.example.com/md-img.jpg" alt="Widget">
-  <span itemprop="description">A widget with full microdata facts.</span>
-  <span itemprop="category">Tools > Hand Tools</span>
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price">39.99</span>
-    <span itemprop="priceCurrency">EUR</span>
-  </div>
-</div>
-</body></html>"#;
-        let o = extract_commerce_offer(html, "https://shop.example.com/md-full");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://shop.example.com/md-img.jpg"), "image from microdata itemprop=image");
-        assert_eq!(d.description.as_deref(), Some("A widget with full microdata facts."), "description from microdata");
-        assert_eq!(d.category.as_deref(), Some("Tools > Hand Tools"), "category from microdata");
-        assert_eq!(d.price, Some(39.99));
-        assert_eq!(d.currency.as_deref(), Some("EUR"));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    #[test]
-    fn missing_image_description_category_stay_null() {
-        let html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "No Extras Product",
-  "offers": {"@type": "Offer", "price": "5.00", "priceCurrency": "USD"}
-}
-</script></head><body></body></html>"#;
-        let o = extract_commerce_offer(html, "https://store.example.com/no-extras");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image, None, "no image in structured data => null");
-        assert_eq!(d.description, None, "no description => null");
-        assert_eq!(d.category, None, "no category => null");
-        assert_eq!(d.price, Some(5.00));
-    }
-
-    #[tokio::test]
-    async fn image_description_category_preserved_in_enrichment_order_invariance() {
-        let mut ranked = vec![
-            serde_json::json!({ "url": "https://a.example.com/x", "score": 9.0 }),
-        ];
-        let fake_html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Widget",
-  "image": "https://a.example.com/img.jpg",
-  "description": "A great widget.",
-  "category": "Gadgets",
-  "offers": {"@type": "Offer", "price": "10.00", "priceCurrency": "USD"}
-}
-</script></head><body></body></html>"#;
-        let h = fake_html.to_string();
-        let fetch = |url: String| {
-            let html = h.clone();
-            async move { Some(html) }
-        };
-        enrich_with_commerce(&mut ranked, fetch).await;
-        let r = &ranked[0];
-        assert_eq!(r["url"], "https://a.example.com/x", "order preserved");
-        let c = r.get("commerce").expect("commerce block attached");
-        assert_eq!(c["data"]["image"], "https://a.example.com/img.jpg");
-        assert_eq!(c["data"]["description"], "A great widget.");
-        assert_eq!(c["data"]["category"], "Gadgets");
-        assert_eq!(c["data"]["price"], 10.00);
-    }
-
-    // ── ROADMAP post-item-7: commerce config is data-driven ─────────────
-    // The mainpath_top_n presentation cap MUST be changeable by editing the
-    // data file ONLY — no recompile. These tests lock that contract.
-
-    #[test]
-    fn commerce_config_default_mainpath_top_n() {
-        // When no data file exists, the default must be the documented 8.
-        let cfg = CommerceConfig::default();
-        assert_eq!(cfg.mainpath_top_n, 8, "default mainpath_top_n must be 8");
-    }
-
-    #[test]
-    fn commerce_config_loads_from_data_file() {
-        // A data file with an explicit mainpath_top_n must be honored.
-        let dir = std::env::temp_dir();
-        let path = dir.join("intentforge-commerce-config-test.json");
-        let _ = std::fs::remove_file(&path);
-        std::fs::write(
-            &path,
-            r#"{ "version": 1, "mainpath_top_n": 12 }"#,
-        )
-        .unwrap();
-        // Load via the same candidate-path mechanism by pointing the load at
-        // the temp file. We can't inject the path, so we test the serde path
-        // directly (the load() function reads from fixed candidate paths).
-        let text = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let cfg: CommerceConfig = serde_json::from_value(v).unwrap();
-        assert_eq!(cfg.mainpath_top_n, 12, "mainpath_top_n from data file must be honored");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn commerce_config_missing_field_uses_default() {
-        // A data file with NO mainpath_top_n field must fall back to the
-        // serde default (8) — the field is optional.
-        let v: serde_json::Value = serde_json::from_str(r#"{ "version": 1 }"#).unwrap();
-        let cfg: CommerceConfig = serde_json::from_value(v).unwrap();
-        assert_eq!(cfg.mainpath_top_n, 8, "missing mainpath_top_n must default to 8");
-    }
-
-    #[test]
-    fn commerce_config_empty_object_uses_default() {
-        // An empty JSON object must yield the default config (no fields).
-        let v: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
-        let cfg: CommerceConfig = serde_json::from_value(v).unwrap();
-        assert_eq!(cfg.mainpath_top_n, 8, "empty object must default mainpath_top_n to 8");
-    }
-
-    // ── ROADMAP item 1 (increment): product variation fields ─────────────
-    // model, color, size, material, gender, age_group are standard schema.org
-    // Product properties. These tests prove they are extracted from all three
-    // signal paths (JSON-LD, microdata, OG) and that a page without them yields
-    // null (never guessed).
-
-    const HTML_JSONLD_VARIATIONS: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Acme Running Shoe",
-  "model": "RX-7",
-  "color": "Blue",
-  "size": "10",
-  "material": "Mesh",
-  "gender": "Male",
-  "ageGroup": "Adult",
-  "offers": {"@type": "Offer", "price": "89.99", "priceCurrency": "USD"}
-}
-</script></head><body></body></html>"#;
-
-    #[test]
-    fn jsonld_extracts_variation_fields() {
-        let o = extract_commerce_offer(HTML_JSONLD_VARIATIONS, "https://shop.example.com/rx7");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.model.as_deref(), Some("RX-7"));
-        assert_eq!(d.color.as_deref(), Some("Blue"));
-        assert_eq!(d.size.as_deref(), Some("10"));
-        assert_eq!(d.material.as_deref(), Some("Mesh"));
-        assert_eq!(d.gender.as_deref(), Some("Male"));
-        assert_eq!(d.age_group.as_deref(), Some("Adult"));
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-    }
-
-    const HTML_MICRODATA_VARIATIONS: &str = r#"<!doctype html><html><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <span itemprop="name">Acme Running Shoe</span>
-  <span itemprop="model">RX-7</span>
-  <span itemprop="color">Blue</span>
-  <span itemprop="size">10</span>
-  <span itemprop="material">Mesh</span>
-  <span itemprop="gender">Male</span>
-  <span itemprop="age_group">Adult</span>
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price">89.99</span><meta itemprop="priceCurrency" content="USD">
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn microdata_extracts_variation_fields() {
-        let o = extract_commerce_offer(HTML_MICRODATA_VARIATIONS, "https://shop.example.com/rx7");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.model.as_deref(), Some("RX-7"));
-        assert_eq!(d.color.as_deref(), Some("Blue"));
-        assert_eq!(d.size.as_deref(), Some("10"));
-        assert_eq!(d.material.as_deref(), Some("Mesh"));
-        assert_eq!(d.gender.as_deref(), Some("Male"));
-        assert_eq!(d.age_group.as_deref(), Some("Adult"));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    const HTML_OG_VARIATIONS: &str = r#"<!doctype html><html><head>
-<meta property="og:title" content="Acme Running Shoe">
-<meta property="product:model" content="RX-7">
-<meta property="product:color" content="Blue">
-<meta property="product:size" content="10">
-<meta property="product:material" content="Mesh">
-<meta property="product:gender" content="Male">
-<meta property="product:age_group" content="Adult">
-<meta property="product:price:amount" content="89.99">
-<meta property="product:price:currency" content="USD">
-</head><body></body></html>"#;
-
-    #[test]
-    fn og_extracts_variation_fields() {
-        let o = extract_commerce_offer(HTML_OG_VARIATIONS, "https://shop.example.com/rx7");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.model.as_deref(), Some("RX-7"));
-        assert_eq!(d.color.as_deref(), Some("Blue"));
-        assert_eq!(d.size.as_deref(), Some("10"));
-        assert_eq!(d.material.as_deref(), Some("Mesh"));
-        assert_eq!(d.gender.as_deref(), Some("Male"));
-        assert_eq!(d.age_group.as_deref(), Some("Adult"));
-        assert_eq!(o.source.as_deref(), Some("og"));
-    }
-
-    const HTML_NO_VARIATIONS: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Acme Widget",
-  "offers": {"@type": "Offer", "price": "49.99", "priceCurrency": "USD"}
-}
-</script></head><body></body></html>"#;
-
-    #[test]
-    fn no_variation_fields_when_page_lacks_them() {
-        // A page with no variation properties must yield null for all of them —
-        // never guessed from free text or the product name.
-        let o = extract_commerce_offer(HTML_NO_VARIATIONS, "https://shop.example.com/widget");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.model, None, "model must be null when page lacks it");
-        assert_eq!(d.color, None, "color must be null when page lacks it");
-        assert_eq!(d.size, None, "size must be null when page lacks it");
-        assert_eq!(d.material, None, "material must be null when page lacks it");
-        assert_eq!(d.gender, None, "gender must be null when page lacks it");
-        assert_eq!(d.age_group, None, "age_group must be null when page lacks it");
-        // Price and name should still extract normally (sanity check).
-        assert_eq!(d.price, Some(49.99));
-        assert_eq!(d.name.as_deref(), Some("Acme Widget"));
-    }
-
-    // ─── Event schema fixtures ─────────────────────────────────────────
-
-    /// JSON-LD Event with `startDate` and nested `location.name` + `location.address`.
-    const HTML_EVENT_JSONLD: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Event",
-  "name": "Test Concert",
-  "startDate": "2026-09-15T19:30:00+05:30",
-  "location": {
-    "@type": "Place",
-    "name": "Madison Square Garden",
-    "address": "4 Pennsylvania Plaza, New York, NY 10001"
-  }
-}
-</script></head><body></body></html>"#;
-
-    /// JSON-LD Event with `location` as a plain string (venue name only).
-    const HTML_EVENT_STRING_LOC: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Event",
-  "name": "Conference Talk",
-  "startDate": "2026-10-01T14:00:00Z",
-  "location": "Room 101, Convention Center"
-}
-</script></head><body></body></html>"#;
-
-    /// Microdata Event with `itemprop="startDate"` and `itemprop="location"`.
-    const HTML_EVENT_MICRODATA: &str = r#"<!doctype html><html><body>
-<div itemscope itemtype="https://schema.org/Event">
-  <span itemprop="name">Workshop</span>
-  <time itemprop="startDate" datetime="2026-11-20T10:00:00Z">Nov 20</time>
-  <span itemprop="location">Building B, Room 202</span>
-</div>
-</body></html>"#;
-
-    /// A Product page must NOT accidentally populate event fields from unrelated data.
-    const HTML_PRODUCT_NO_EVENT: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Widget",
-  "offers": {"@type": "Offer", "price": "9.99", "priceCurrency": "USD"}
-}
-</script></head><body></body></html>"#;
-
-    #[test]
-    fn extracts_event_start_and_location_from_jsonld() {
-        let o = extract_commerce_offer(HTML_EVENT_JSONLD, "https://events.example.com/concert/123");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(
-            d.event_start.as_deref(),
-            Some("2026-09-15T19:30:00+05:30"),
-            "event_start must come from Event.startDate"
-        );
-        assert_eq!(
-            d.event_location.as_deref(),
-            Some("Madison Square Garden"),
-            "event_location must prefer location.name over address"
-        );
-        assert_eq!(d.name.as_deref(), Some("Test Concert"), "name must still extract");
-        // No price on an event page — must stay null (never guessed).
-        assert_eq!(d.price, None, "event page has no price");
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-    }
-
-    #[test]
-    fn extracts_event_location_as_string() {
-        let o = extract_commerce_offer(HTML_EVENT_STRING_LOC, "https://events.example.com/talk");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(
-            d.event_start.as_deref(),
-            Some("2026-10-01T14:00:00Z")
-        );
-        assert_eq!(
-            d.event_location.as_deref(),
-            Some("Room 101, Convention Center"),
-            "event_location must accept a plain string location"
-        );
-    }
-
-    #[test]
-    fn extracts_event_from_microdata() {
-        let o = extract_commerce_offer(HTML_EVENT_MICRODATA, "https://events.example.com/workshop");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(
-            d.event_start.as_deref(),
-            Some("2026-11-20T10:00:00Z"),
-            "event_start must extract from microdata itemprop=\"startDate\""
-        );
-        assert_eq!(
-            d.event_location.as_deref(),
-            Some("Building B, Room 202"),
-            "event_location must extract from microdata itemprop=\"location\""
-        );
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    #[test]
-    fn product_page_has_null_event_fields() {
-        let o = extract_commerce_offer(HTML_PRODUCT_NO_EVENT, "https://shop.example.com/widget");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(
-            d.event_start, None,
-            "event_start must be null for a Product page"
-        );
-        assert_eq!(
-            d.event_location, None,
-            "event_location must be null for a Product page"
-        );
-        // Sanity: product fields still extract.
-        assert_eq!(d.price, Some(9.99));
-        assert_eq!(d.name.as_deref(), Some("Widget"));
-    }
-}
-
-    // -- JobPosting fixtures + tests --
-
-    const HTML_JOBPOSTING_FULL: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "JobPosting",
-  "title": "Senior Rust Engineer",
-  "datePosted": "2026-08-15",
-  "hiringOrganization": {
-    "@type": "Organization",
-    "name": "Acme Corp"
-  },
-  "jobLocation": {
-    "@type": "Place",
-    "name": "Remote",
-    "address": "Anywhere, Earth"
-  },
-  "baseSalary": {
-    "@type": "MonetaryAmount",
-    "value": 150000.0,
-    "currency": "USD"
-  },
-  "employmentType": "FULL_TIME"
-}
-</script></head><body></body></html>"#;
-
-    const HTML_JOBPOSTING_MICRODATA: &str = r#"<!doctype html><html><body>
-<div itemscope itemtype="https://schema.org/JobPosting">
-  <span itemprop="title">Frontend Developer</span>
-  <span itemprop="hiringOrganization">Tech Inc</span>
-  <span itemprop="joblocation">San Francisco, CA</span>
-</div>
-</body></html>"#;
-
-    const HTML_COURSE_FULL: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Course",
-  "name": "Rust Fundamentals",
-  "provider": {
-    "@type": "Organization",
-    "name": "Rust Academy"
-  },
-  "hasCourseInstance": {
-    "@type": "CourseInstance",
-    "courseMode": "online"
-  }
-}
-</script></head><body></body></html>"#;
-
-    const HTML_RECIPE_FULL: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Recipe",
-  "name": "Classic Spaghetti Carbonara",
-  "prepTime": "PT15M",
-  "cookTime": "PT20M",
-  "totalTime": "PT35M",
-  "recipeYield": "4 servings"
-}
-</script></head><body></body></html>"#;
-
-    const HTML_PRODUCT_NO_NEW_TYPES: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Widget",
-  "offers": {"@type": "Offer", "price": "9.99", "priceCurrency": "USD"}
-}
-</script></head><body></body></html>"#;
-
-    #[test]
-    fn extracts_jobposting_fields_from_jsonld() {
-        let o = extract_commerce_offer(HTML_JOBPOSTING_FULL, "https://jobs.example.com/rust-eng");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.job_title.as_deref(), Some("Senior Rust Engineer"));
-        assert_eq!(d.job_posted_at.as_deref(), Some("2026-08-15"));
-        assert_eq!(d.hiring_organization.as_deref(), Some("Acme Corp"));
-        assert_eq!(d.job_location.as_deref(), Some("Remote"), "job_location prefers Place.name");
-        assert_eq!(d.base_salary.as_deref(), Some("150000 USD"));
-        assert_eq!(d.employment_type.as_deref(), Some("FULL_TIME"));
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-        assert_eq!(d.price, None, "job has no product price");
-    }
-
-    #[test]
-    fn extracts_jobposting_from_microdata() {
-        let o = extract_commerce_offer(HTML_JOBPOSTING_MICRODATA, "https://jobs.example.com/frontend");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.job_title.as_deref(), Some("Frontend Developer"));
-        assert_eq!(d.hiring_organization.as_deref(), Some("Tech Inc"));
-        assert_eq!(d.job_location.as_deref(), Some("San Francisco, CA"));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    #[test]
-    fn extracts_course_fields_from_jsonld() {
-        let o = extract_commerce_offer(HTML_COURSE_FULL, "https://learn.example.com/rust");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.course_provider.as_deref(), Some("Rust Academy"));
-        assert_eq!(d.course_mode.as_deref(), Some("online"));
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-        assert_eq!(d.price, None, "course has no product price");
-    }
-
-    #[test]
-    fn extracts_recipe_fields_from_jsonld() {
-        let o = extract_commerce_offer(HTML_RECIPE_FULL, "https://recipes.example.com/carbonara");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.prep_time.as_deref(), Some("PT15M"));
-        assert_eq!(d.cook_time.as_deref(), Some("PT20M"));
-        assert_eq!(d.total_time.as_deref(), Some("PT35M"));
-        assert_eq!(d.recipe_yield.as_deref(), Some("4 servings"));
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-    }
-
-    #[test]
-    fn product_page_has_null_new_type_fields() {
-        let o = extract_commerce_offer(HTML_PRODUCT_NO_NEW_TYPES, "https://shop.example.com/widget");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.job_title, None, "job_title null for Product");
-        assert_eq!(d.job_posted_at, None, "job_posted_at null for Product");
-        assert_eq!(d.hiring_organization, None, "hiring_organization null for Product");
-        assert_eq!(d.job_location, None, "job_location null for Product");
-        assert_eq!(d.base_salary, None, "base_salary null for Product");
-        assert_eq!(d.employment_type, None, "employment_type null for Product");
-        assert_eq!(d.course_provider, None, "course_provider null for Product");
-        assert_eq!(d.course_mode, None, "course_mode null for Product");
-        assert_eq!(d.prep_time, None, "prep_time null for Product");
-        assert_eq!(d.cook_time, None, "cook_time null for Product");
-        assert_eq!(d.total_time, None, "total_time null for Product");
-        assert_eq!(d.recipe_yield, None, "recipe_yield null for Product");
-        // Sanity: product fields still extract.
-        assert_eq!(d.price, Some(9.99));
-        assert_eq!(d.name.as_deref(), Some("Widget"));
-    }
-
-    #[test]
-    fn jobposting_does_not_populate_event_fields() {
-        let o = extract_commerce_offer(HTML_JOBPOSTING_FULL, "https://jobs.example.com/rust-eng");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.event_start, None, "event_start null for JobPosting");
-        assert_eq!(d.event_location, None, "event_location null for JobPosting");
-    }
-
