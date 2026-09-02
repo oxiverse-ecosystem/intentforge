@@ -1612,8 +1612,11 @@ would attach, or in tests/fixtures.
 
 **Response** — a `CommerceOffer` JSON object (`price`, `currency`, `availability`,
 `merchant`, `condition`, `sku`, `gtin`, `rating`, `price_low`, `price_high`,
-`offer_count`, `observed_at`, `source`). All fields `Optional`. If the page has no
-structured product data, the returned object carries `null` for every fact (no guess).
+`offer_count`, `author`, `isbn`, `event_start`, `event_location`, `observed_at`, `source`).
+All fields `Optional`. If the page has no structured product data, the returned object
+carries `null` for every fact (no guess). For an `Event` page, `event_start` (ISO 8601
+`startDate`) and `event_location` (`location.name` or `location.address`) are extracted
+from the same typed structured signals.
 
 **Honesty properties (locked by unit tests):**
 
