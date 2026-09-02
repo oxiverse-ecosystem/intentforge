@@ -18075,6 +18075,52 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!is_commercial_intent("informational", &dist, false));
     }
 
+    // ── Presentation gate: omit `shopping` when no result has commerce ──
+    // When every enriched top-N result lacks a `commerce` block (the upstream
+    // page exposed no structured product data), the main-path `shopping` field
+    // must be omitted entirely rather than showing a near-empty strip.
+
+    #[test]
+    fn shopping_block_omitted_when_no_result_has_commerce() {
+        // Simulate an enriched top-N where NONE of the results carry a commerce
+        // block (all upstream pages lacked structured product data).
+        let shop_arr: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0 }),
+        ];
+        let any_commerce = shop_arr
+            .iter()
+            .any(|r| r.get("commerce").map(|v| !v.is_null()).unwrap_or(false));
+        assert!(!any_commerce, "no commerce block => gate must suppress shopping");
+    }
+
+    #[test]
+    fn shopping_block_present_when_at_least_one_result_has_commerce() {
+        // At least one enriched result carries a real commerce block (page had
+        // structured product data) => the shopping block should be surfaced.
+        let shop_arr: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0, "commerce": { "price": 49.99, "currency": "USD" } }),
+        ];
+        let any_commerce = shop_arr
+            .iter()
+            .any(|r| r.get("commerce").map(|v| !v.is_null()).unwrap_or(false));
+        assert!(any_commerce, "one commerce block => gate must allow shopping");
+    }
+
+    #[test]
+    fn shopping_block_omitted_when_commerce_is_null() {
+        // A result with `"commerce": null` (explicitly absent) must NOT count as
+        // having commerce — only a real object does.
+        let shop_arr: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0, "commerce": serde_json::Value::Null }),
+        ];
+        let any_commerce = shop_arr
+            .iter()
+            .any(|r| r.get("commerce").map(|v| !v.is_null()).unwrap_or(false));
+        assert!(!any_commerce, "commerce: null => gate must suppress shopping");
+    }
+
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
     // Honest, data-driven affiliate decoration. These tests lock the contract:
     //  * two template kinds render correctly with correct URL-encoding
