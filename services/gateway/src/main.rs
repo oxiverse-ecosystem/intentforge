@@ -2865,6 +2865,64 @@ struct OfferFacts {
     /// never guessed from free text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     event_location: Option<String>,
+    /// Job posting title from schema.org `JobPosting` (`title`). Distinct from
+    /// product `name` (a job posting's label is its title). Only extracted
+    /// from typed structured signals, never guessed from free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    job_title: Option<String>,
+    /// When the job was posted, from schema.org `JobPosting` (`datePosted`,
+    /// ISO 8601 date/datetime). Only extracted from typed structured signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    job_posted_at: Option<String>,
+    /// Organization hiring for the job, from schema.org `JobPosting`
+    /// (`hiringOrganization.name`). An Organization or a plain string. Only
+    /// extracted from typed structured signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hiring_organization: Option<String>,
+    /// Job location, from schema.org `JobPosting` (`jobLocation`). Can be a
+    /// plain string, a Place object (`name`/`address`), or an array of either.
+    /// Only extracted from typed structured signals, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    job_location: Option<String>,
+    /// Base salary for the job, from schema.org `JobPosting` (`baseSalary`).
+    /// Can be a MonetaryAmount (`value`+`currency`), a PriceRange, or a plain
+    /// string. Stored as a raw string to avoid misrepresenting structured
+    /// salary data. Only extracted from typed structured signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_salary: Option<String>,
+    /// Employment type, from schema.org `JobPosting` (`employmentType`).
+    /// E.g. "FULL_TIME", "PART_TIME", "CONTRACTOR", "TEMPORARY", "INTERN".
+    /// Only extracted from typed structured signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    employment_type: Option<String>,
+    /// Course provider, from schema.org `Course` (`provider`). An Organization
+    /// with a `name`, or a plain string. Only extracted from typed structured
+    /// signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    course_provider: Option<String>,
+    /// Course delivery mode, from schema.org `Course` → `hasCourseInstance`
+    /// → `courseMode`. E.g. "online", "onsite", "blended". Only extracted
+    /// from typed structured signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    course_mode: Option<String>,
+    /// Recipe preparation time, from schema.org `Recipe` (`prepTime`). ISO 8601
+    /// duration string (e.g. "PT30M"). Only extracted from typed structured
+    /// signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prep_time: Option<String>,
+    /// Recipe cook time, from schema.org `Recipe` (`cookTime`). ISO 8601
+    /// duration string (e.g. "PT1H"). Only extracted from typed structured
+    /// signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cook_time: Option<String>,
+    /// Recipe total time, from schema.org `Recipe` (`totalTime`). ISO 8601
+    /// duration string. Only extracted from typed structured signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_time: Option<String>,
+    /// Recipe yield, from schema.org `Recipe` (`recipeYield`). E.g. "4 servings"
+    /// or "1 cake". Only extracted from typed structured signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recipe_yield: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3174,6 +3232,9 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
                 || itype.contains("service")
                 || itype.contains("book")
                 || itype.contains("event")
+                || itype.contains("jobposting")
+                || itype.contains("course")
+                || itype.contains("recipe")
             {
                 Scope::Product
             } else if itype.contains("offer") {
@@ -3258,6 +3319,18 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
                     facts.gtin = Some(content);
                 }
             }
+            "title" => set_str(&mut facts.job_title, content),
+            "dateposted" => set_str(&mut facts.job_posted_at, content),
+            "hiringorganization" => set_str(&mut facts.hiring_organization, content),
+            "joblocation" => set_str(&mut facts.job_location, content),
+            "basesalary" => set_str(&mut facts.base_salary, content),
+            "employmenttype" => set_str(&mut facts.employment_type, content),
+            "provider" => set_str(&mut facts.course_provider, content),
+            "coursemode" => set_str(&mut facts.course_mode, content),
+            "preptime" => set_str(&mut facts.prep_time, content),
+            "cooktime" => set_str(&mut facts.cook_time, content),
+            "totaltime" => set_str(&mut facts.total_time, content),
+            "recipeyield" => set_str(&mut facts.recipe_yield, content),
             "ratingvalue" | "rating" => {
                 if facts.rating.is_none() {
                     facts.rating = content.replace(',', "").parse::<f64>().ok();
@@ -3586,6 +3659,9 @@ fn walk_commerce_nodes(v: &serde_json::Value, out: &mut Vec<serde_json::Value>) 
                     || tl.contains("service")
                     || tl.contains("book")
                     || tl.contains("event")
+                    || tl.contains("jobposting")
+                    || tl.contains("course")
+                    || tl.contains("recipe")
                 {
                     out.push(v.clone());
                 }
@@ -3920,6 +3996,92 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
                 .get("ageGroup")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+        }
+        // ROADMAP item 1 (increment): extract JobPosting facts
+        if facts.job_title.is_none() {
+            facts.job_title = n.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+        if facts.job_posted_at.is_none() {
+            facts.job_posted_at = n.get("datePosted").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+        if facts.hiring_organization.is_none() {
+            facts.hiring_organization = n.get("hiringOrganization").and_then(|org| {
+                if let Some(s) = org.as_str() { return Some(s.to_string()); }
+                if let Some(obj) = org.as_object() {
+                    return obj.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                }
+                None
+            });
+        }
+        if facts.job_location.is_none() {
+            facts.job_location = n.get("jobLocation").and_then(|loc| {
+                if let Some(s) = loc.as_str() { return Some(s.to_string()); }
+                if let Some(obj) = loc.as_object() {
+                    if let Some(name) = obj.get("name").and_then(|v| v.as_str()) { return Some(name.to_string()); }
+                    if let Some(addr) = obj.get("address").and_then(|v| v.as_str()) { return Some(addr.to_string()); }
+                }
+                if let Some(arr) = loc.as_array() {
+                    return arr.first().and_then(|x| {
+                        if let Some(s) = x.as_str() { return Some(s.to_string()); }
+                        if let Some(obj) = x.as_object() {
+                            if let Some(name) = obj.get("name").and_then(|v| v.as_str()) { return Some(name.to_string()); }
+                        }
+                        None
+                    });
+                }
+                None
+            });
+        }
+        if facts.base_salary.is_none() {
+            facts.base_salary = n.get("baseSalary").and_then(|sal| {
+                if let Some(s) = sal.as_str() { return Some(s.to_string()); }
+                if let Some(obj) = sal.as_object() {
+                    if let Some(val) = obj.get("value") {
+                        if let Some(v) = val.as_f64() { let cur = obj.get("currency").and_then(|c| c.as_str()).unwrap_or("USD"); return Some(format!("{} {}", v, cur)); }
+                        if let Some(s) = val.as_str() { return Some(s.to_string()); }
+                    }
+                    if let Some(min) = obj.get("minValue").and_then(|v| v.as_f64()) {
+                        if let Some(max) = obj.get("maxValue").and_then(|v| v.as_f64()) { let cur = obj.get("currency").and_then(|c| c.as_str()).unwrap_or("USD"); return Some(format!("{} - {} {}", min, max, cur)); }
+                    }
+                }
+                None
+            });
+        }
+        if facts.employment_type.is_none() {
+            facts.employment_type = n.get("employmentType").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+        if facts.course_provider.is_none() {
+            facts.course_provider = n.get("provider").and_then(|p| {
+                if let Some(s) = p.as_str() { return Some(s.to_string()); }
+                if let Some(obj) = p.as_object() { return obj.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()); }
+                None
+            });
+        }
+        if facts.course_mode.is_none() {
+            facts.course_mode = n.get("hasCourseInstance").and_then(|ci| {
+                if let Some(s) = ci.as_str() { return Some(s.to_string()); }
+                if let Some(obj) = ci.as_object() { return obj.get("courseMode").and_then(|v| v.as_str()).map(|s| s.to_string()); }
+                if let Some(arr) = ci.as_array() {
+                    return arr.first().and_then(|x| {
+                        if let Some(s) = x.as_str() { return Some(s.to_string()); }
+                        if let Some(obj) = x.as_object() { return obj.get("courseMode").and_then(|v| v.as_str()).map(|s| s.to_string()); }
+                        None
+                    });
+                }
+                None
+            });
+        }
+        if facts.prep_time.is_none() {
+            facts.prep_time = n.get("prepTime").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+        if facts.cook_time.is_none() {
+            facts.cook_time = n.get("cookTime").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+        if facts.total_time.is_none() {
+            facts.total_time = n.get("totalTime").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+        if facts.recipe_yield.is_none() {
+            facts.recipe_yield = n.get("recipeYield").and_then(|v| v.as_str()).map(|s| s.to_string());
         }
     }
 
@@ -19900,3 +20062,153 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.name.as_deref(), Some("Widget"));
     }
 }
+
+    // -- JobPosting fixtures + tests --
+
+    const HTML_JOBPOSTING_FULL: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "JobPosting",
+  "title": "Senior Rust Engineer",
+  "datePosted": "2026-08-15",
+  "hiringOrganization": {
+    "@type": "Organization",
+    "name": "Acme Corp"
+  },
+  "jobLocation": {
+    "@type": "Place",
+    "name": "Remote",
+    "address": "Anywhere, Earth"
+  },
+  "baseSalary": {
+    "@type": "MonetaryAmount",
+    "value": 150000.0,
+    "currency": "USD"
+  },
+  "employmentType": "FULL_TIME"
+}
+</script></head><body></body></html>"#;
+
+    const HTML_JOBPOSTING_MICRODATA: &str = r#"<!doctype html><html><body>
+<div itemscope itemtype="https://schema.org/JobPosting">
+  <span itemprop="title">Frontend Developer</span>
+  <span itemprop="hiringOrganization">Tech Inc</span>
+  <span itemprop="joblocation">San Francisco, CA</span>
+</div>
+</body></html>"#;
+
+    const HTML_COURSE_FULL: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Course",
+  "name": "Rust Fundamentals",
+  "provider": {
+    "@type": "Organization",
+    "name": "Rust Academy"
+  },
+  "hasCourseInstance": {
+    "@type": "CourseInstance",
+    "courseMode": "online"
+  }
+}
+</script></head><body></body></html>"#;
+
+    const HTML_RECIPE_FULL: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Recipe",
+  "name": "Classic Spaghetti Carbonara",
+  "prepTime": "PT15M",
+  "cookTime": "PT20M",
+  "totalTime": "PT35M",
+  "recipeYield": "4 servings"
+}
+</script></head><body></body></html>"#;
+
+    const HTML_PRODUCT_NO_NEW_TYPES: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Widget",
+  "offers": {"@type": "Offer", "price": "9.99", "priceCurrency": "USD"}
+}
+</script></head><body></body></html>"#;
+
+    #[test]
+    fn extracts_jobposting_fields_from_jsonld() {
+        let o = extract_commerce_offer(HTML_JOBPOSTING_FULL, "https://jobs.example.com/rust-eng");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.job_title.as_deref(), Some("Senior Rust Engineer"));
+        assert_eq!(d.job_posted_at.as_deref(), Some("2026-08-15"));
+        assert_eq!(d.hiring_organization.as_deref(), Some("Acme Corp"));
+        assert_eq!(d.job_location.as_deref(), Some("Remote"), "job_location prefers Place.name");
+        assert_eq!(d.base_salary.as_deref(), Some("150000 USD"));
+        assert_eq!(d.employment_type.as_deref(), Some("FULL_TIME"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+        assert_eq!(d.price, None, "job has no product price");
+    }
+
+    #[test]
+    fn extracts_jobposting_from_microdata() {
+        let o = extract_commerce_offer(HTML_JOBPOSTING_MICRODATA, "https://jobs.example.com/frontend");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.job_title.as_deref(), Some("Frontend Developer"));
+        assert_eq!(d.hiring_organization.as_deref(), Some("Tech Inc"));
+        assert_eq!(d.job_location.as_deref(), Some("San Francisco, CA"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    #[test]
+    fn extracts_course_fields_from_jsonld() {
+        let o = extract_commerce_offer(HTML_COURSE_FULL, "https://learn.example.com/rust");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.course_provider.as_deref(), Some("Rust Academy"));
+        assert_eq!(d.course_mode.as_deref(), Some("online"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+        assert_eq!(d.price, None, "course has no product price");
+    }
+
+    #[test]
+    fn extracts_recipe_fields_from_jsonld() {
+        let o = extract_commerce_offer(HTML_RECIPE_FULL, "https://recipes.example.com/carbonara");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.prep_time.as_deref(), Some("PT15M"));
+        assert_eq!(d.cook_time.as_deref(), Some("PT20M"));
+        assert_eq!(d.total_time.as_deref(), Some("PT35M"));
+        assert_eq!(d.recipe_yield.as_deref(), Some("4 servings"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    #[test]
+    fn product_page_has_null_new_type_fields() {
+        let o = extract_commerce_offer(HTML_PRODUCT_NO_NEW_TYPES, "https://shop.example.com/widget");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.job_title, None, "job_title null for Product");
+        assert_eq!(d.job_posted_at, None, "job_posted_at null for Product");
+        assert_eq!(d.hiring_organization, None, "hiring_organization null for Product");
+        assert_eq!(d.job_location, None, "job_location null for Product");
+        assert_eq!(d.base_salary, None, "base_salary null for Product");
+        assert_eq!(d.employment_type, None, "employment_type null for Product");
+        assert_eq!(d.course_provider, None, "course_provider null for Product");
+        assert_eq!(d.course_mode, None, "course_mode null for Product");
+        assert_eq!(d.prep_time, None, "prep_time null for Product");
+        assert_eq!(d.cook_time, None, "cook_time null for Product");
+        assert_eq!(d.total_time, None, "total_time null for Product");
+        assert_eq!(d.recipe_yield, None, "recipe_yield null for Product");
+        // Sanity: product fields still extract.
+        assert_eq!(d.price, Some(9.99));
+        assert_eq!(d.name.as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn jobposting_does_not_populate_event_fields() {
+        let o = extract_commerce_offer(HTML_JOBPOSTING_FULL, "https://jobs.example.com/rust-eng");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.event_start, None, "event_start null for JobPosting");
+        assert_eq!(d.event_location, None, "event_location null for JobPosting");
+    }
+
