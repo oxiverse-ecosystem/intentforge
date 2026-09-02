@@ -3318,6 +3318,90 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
 /// endpoint and applies NO ranking or monetization — it only surfaces facts
 /// extracted from the given page. The user-facing `/shopping` endpoint and
 /// affiliate decoration land in later roadmap increments.
+/// Query params for the `/commerce/bid` reporting endpoint.
+#[derive(Deserialize)]
+struct BidCheckParams {
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// Reporting-only Sovrn Commerce Bid Check endpoint.
+async fn handle_commerce_bid(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<AppState>>,
+    axum::extract::Query(params): Query<BidCheckParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let dest_url = match params.url.as_deref() {
+        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "missing_url",
+                "message": "Query parameter 'url' is required"
+            })),
+        ),
+    };
+    let net = match state.affiliate_ctx.networks.iter().find(|n| {
+        n.enabled && n.bid_check_url.is_some()
+            && n.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false)
+    }) {
+        Some(n) => n,
+        None => return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "no_bid_check_network",
+                "message": "No network with bid-check configured and a usable key"
+            })),
+        ),
+    };
+    let key = std::env::var(net.key_env.as_deref().unwrap_or("")).unwrap_or_default();
+    let check_template = net.bid_check_url.as_deref().unwrap_or("");
+    let encoded_dest = urlencoding::encode(&dest_url);
+    let check_url = check_template
+        .replace("{key}", &key)
+        .replace("{url}", &encoded_dest);
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.http_client.get(&check_url).send(),
+    ).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "bid_check_upstream_error",
+                "message": format!("Bid-check request failed: {}", e)
+            })),
+        ),
+        Err(_) => return (
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "error": "bid_check_timeout",
+                "message": "Bid-check request timed out"
+            })),
+        ),
+    };
+    let status = resp.status();
+    let body_text = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        resp.text(),
+    ).await {
+        Ok(Ok(t)) => t,
+        _ => String::new(),
+    };
+    let upstream_json = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body_text) {
+        v
+    } else {
+        serde_json::json!({ "raw": body_text })
+    };
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "url": dest_url,
+            "network": &net.network,
+            "upstream_status": status.as_u16(),
+            "upstream_body": upstream_json,
+        })),
+    )
+}
 async fn handle_commerce_extract(
     Json(body): Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
@@ -3585,6 +3669,12 @@ struct AffiliateNetwork {
     /// url-encoded as a query param. DATA-ONLY.
     #[serde(default)]
     fallback_url: Option<String>,
+    /// Bid-check endpoint template for Sovrn's reporting API
+    /// (`/api/bid?key=...&out=...&ip=...&userAgent=...`). Used by the
+    /// `/commerce/bid` reporting endpoint ONLY — never for ranking. DATA-ONLY:
+    /// the URL template comes from the data file; the key comes from env.
+    #[serde(default)]
+    bid_check_url: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -10672,7 +10762,8 @@ async fn main() {
         // Returns the typed CommerceOffer extracted from supplied HTML — no
         // ranking, no monetization, no user-tracking surface. The /shopping
         // endpoint and affiliate decoration land in later increments.
-        .route("/commerce/extract", post(handle_commerce_extract))
+        .route("/commerce/bid", get(handle_commerce_bid))
+.route("/commerce/extract", post(handle_commerce_extract))
         .route("/shopping", get(handle_shopping))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
@@ -18143,6 +18234,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             param_env: HashMap::new(),
             bid_floor: None,
             fallback_url: None,
+            bid_check_url: None,
         }
     }
 
