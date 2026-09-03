@@ -1802,7 +1802,7 @@ pub(crate) const WORD_FREQUENCIES: &[(&str, f64)] = &[
     ("dmc", 0.010), ("rupee", 0.010), ("ments", 0.010), ("subsidy", 0.010), ("demolition", 0.010), ("irene", 0.010), ("empowerment", 0.010), ("felony", 0.010),
     ("lungs", 0.010), ("embarrass", 0.010), ("embarrassed", 0.010), ("embarrassing", 0.010), ("embarrassment", 0.010), ("embarrasses", 0.010), ("minuscule", 0.010), ("allotment", 0.010),
     ("occurrences", 0.010), ("recommending", 0.010), ("harass", 0.010), ("harassed", 0.010), ("achieves", 0.010), ("misspell", 0.010), ("misspelled", 0.010), ("misspelling", 0.010),
-    ("misspellings", 0.010), ("remembers", 0.010), ("curricula", 0.010), ("async", 0.010), ("concurrency", 0.010), ("zonal", 0.010), ("skillet", 0.010), ("migrating", 0.010),
+    ("misspellings", 0.010), ("remembers", 0.010), ("curricula", 0.010), ("async", 0.010), ("await", 0.010), ("concurrency", 0.010), ("zonal", 0.010), ("skillet", 0.010), ("migrating", 0.010),
     ("migrated", 0.010), ("migrates", 0.010), ("spreadsheets", 0.010), ("monuments", 0.0100), ("veronica", 0.0100), ("filtered", 0.0100), ("replacements", 0.0099), ("growers", 0.0099),
     ("vinci", 0.0099), ("subtitles", 0.0099), ("adj", 0.0099), ("gcse", 0.0099), ("haul", 0.0099), ("acupuncture", 0.0099), ("workload", 0.0099), ("acknowledgement", 0.0098),
     ("highlighting", 0.0098), ("duly", 0.0098), ("roasted", 0.0098), ("tenders", 0.0098), ("inviting", 0.0098), ("rig", 0.0098), ("ov", 0.0098), ("grassroots", 0.0097),
