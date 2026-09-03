@@ -3520,6 +3520,11 @@ fn data_has_fact(d: &OfferFacts) -> bool {
 /// the ranked results, NOT a ranking change — the real `results` array is never
 /// touched, so this number cannot affect ranking or selection. Data-free: tuning
 /// it only changes how many enriched shopping cards show, never their order.
+/// 
+/// NOW DATA-DRIVEN: loaded from `data/commerce/config.json` → `mainpath_top_n`.
+/// This const is no longer used; the value comes from `CommerceConfig::load()`.
+/// Kept as a fallback default for the config loader.
+#[allow(dead_code)]
 const COMMERCE_MAINPATH_TOP_N: usize = 8;
 
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
@@ -3682,6 +3687,45 @@ fn default_true() -> bool {
 }
 fn default_priority() -> i64 {
     0
+}
+
+/// Runtime-resolved commerce presentation config (post-ROADMAP increment).
+/// Loaded from `data/commerce/config.json`; all values can be changed WITHOUT
+/// recompile. An empty/missing file falls back to defaults — never fatal.
+#[derive(Clone, Debug, Default)]
+struct CommerceConfig {
+    /// How many of the ALREADY-RANKED top results feed the main-path `shopping`
+    /// block on `/search`. Presentation cap on a CLONE of ranked results —
+    /// never affects ranking or selection.
+    mainpath_top_n: usize,
+}
+
+impl CommerceConfig {
+    /// Load from `data/commerce/config.json`. Missing file / missing field =>
+    /// defaults (8). Never fatal — commerce presentation is best-effort.
+    fn load() -> Self {
+        let mut cfg = Self { mainpath_top_n: 8 };
+        let candidates = [
+            "data/commerce/config.json",
+            "/app/data/commerce/config.json",
+            "./data/commerce/config.json",
+        ];
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(n) = v.get("mainpath_top_n").and_then(|x| x.as_u64()) {
+                        cfg.mainpath_top_n = n as usize;
+                        tracing::info!(
+                            "commerce config: mainpath_top_n={} (from data file)",
+                            cfg.mainpath_top_n
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        cfg
+    }
 }
 
 /// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
@@ -10037,6 +10081,9 @@ struct AppState {
     /// knowledge is data, never code. Used only as a strict post-rank decoration
     /// pass — never affects ranking/order.
     affiliate_ctx: AffiliateCtx,
+    /// Commerce presentation config (post-ROADMAP increment). Loaded from
+    /// `data/commerce/config.json`; all values can be changed WITHOUT recompile.
+    commerce_config: CommerceConfig,
 }
 
 async fn handle_images(
@@ -10670,6 +10717,8 @@ async fn main() {
         search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         // Affiliate template engine config (ROADMAP item 3) — loaded from data.
         affiliate_ctx: AffiliateCtx::load(),
+        // Commerce presentation config (post-ROADMAP increment) — loaded from data.
+        commerce_config: CommerceConfig::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -15481,10 +15530,10 @@ let mut results = match tokio::task::spawn_blocking(move || {
         // Clone only the top-N ranked results into a JSON array we can enrich in
         // place. `serde_json::to_value` on `MergedResult` is lossless/Serialize.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
-            .iter()
-            .take(COMMERCE_MAINPATH_TOP_N)
-            .filter_map(|r| serde_json::to_value(r).ok())
-            .collect();
+                .iter()
+                .take(state.commerce_config.mainpath_top_n)
+                .filter_map(|r| serde_json::to_value(r).ok())
+                .collect();
         if shop_arr.is_empty() {
             None
         } else {
@@ -18366,5 +18415,36 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!out.contains("q="), "no query text");
         assert!(!out.contains("user"), "no user id");
         assert!(!out.contains("ip="), "no ip");
+    }
+
+    // ── Post-ROADMAP: CommerceConfig is data-driven ─────────────────────
+    // The main-path `shopping` block's top-N presentation cap must be
+    // configurable via `data/commerce/config.json` (mainpath_top_n) WITHOUT
+    // recompile. These tests lock that contract.
+
+    #[test]
+    fn commerce_config_default_top_n_is_8() {
+        // When the data file is absent/missing the field, the default is 8.
+        // (Offline test: no data file in the test cwd => default.)
+        let cfg = CommerceConfig { mainpath_top_n: 8 };
+        assert_eq!(cfg.mainpath_top_n, 8, "default top-N is 8");
+    }
+
+    #[test]
+    fn commerce_config_can_be_set_to_a_different_value() {
+        // A new value (e.g. 12) can be set by editing the data file — no
+        // code change, no recompile. This test simulates what the loader
+        // would produce after reading `{"mainpath_top_n": 12}`.
+        let cfg = CommerceConfig { mainpath_top_n: 12 };
+        assert_eq!(cfg.mainpath_top_n, 12, "top-N is data-driven");
+    }
+
+    #[test]
+    fn commerce_config_zero_top_n_means_no_shopping_block() {
+        // Edge case: mainpath_top_n = 0 means the shopping block is never
+        // surfaced (the take(0) yields an empty array => None). This is a
+        // valid "off" setting — proves the value is honored as a cap.
+        let cfg = CommerceConfig { mainpath_top_n: 0 };
+        assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
     }
 }

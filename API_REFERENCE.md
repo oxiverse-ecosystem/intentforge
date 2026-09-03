@@ -1596,6 +1596,12 @@ curl -s "localhost:4000/search?q=rust%20ownership%20explained" | python -c "impo
 > user id / query text / session id / IP ever reaches an affiliate parameter (locked by
 > `test_affiliate_decoration_does_not_change_ranking` + the contract tests in
 > `commerce_contract_tests.rs`).
+>
+> **Tuning the presentation cap (post-ROADMAP):** the number of enriched shopping
+> cards surfaced is capped at `mainpath_top_n`, loaded at startup from
+> `data/commerce/config.json` (`{"mainpath_top_n": 8}`). Change it WITHOUT
+> recompiling — just edit the file and `docker compose up -d gateway`. The cap
+> affects *presentation only*; it never influences ranking, selection, or ordering.
 
 ### POST /commerce/extract
 
