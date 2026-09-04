@@ -9399,6 +9399,13 @@ fn merge_local_and_web(
         // (safety is never fail-open), and keep an explicit warning so the gap is
         // visible. Keyed on "would-empty", not on any query/domain — general.
         if merged.is_empty() && before > 0 {
+            let best_retained_rel = relevance_vec.iter().cloned().fold(0.0f32, f32::max);
+            if best_retained_rel < 0.02 {
+                tracing::warn!(
+                    "OFF_TOPIC_HARD_DROP FAIL-OPEN SUPPRESSED: {} result(s) all lacked distinctive-term overlap AND best relevance {:.3} < 0.02 — returning empty set rather than restoring garbage (relevance_vec_len={})",
+                    before, best_retained_rel, relevance_vec.len()
+                );
+            } else {
             let restored: Vec<MergedResult> = retained_pre_offtopic
                 .into_iter()
                 .filter(|r| {
@@ -9424,6 +9431,7 @@ fn merge_local_and_web(
                 restored.len()
             );
             merged = restored;
+            }
         }
     }
 
