@@ -9406,6 +9406,13 @@ fn merge_local_and_web(
         // (safety is never fail-open), and keep an explicit warning so the gap is
         // visible. Keyed on "would-empty", not on any query/domain — general.
         if merged.is_empty() && before > 0 {
+            let best_retained_rel = relevance_vec.iter().cloned().fold(0.0f32, f32::max);
+            if best_retained_rel < 0.02 {
+                tracing::warn!(
+                    "OFF_TOPIC_HARD_DROP FAIL-OPEN SUPPRESSED: {} result(s) all lacked distinctive-term overlap AND best relevance {:.3} < 0.02 — returning empty set rather than restoring garbage (relevance_vec_len={})",
+                    before, best_retained_rel, relevance_vec.len()
+                );
+            } else {
             let restored: Vec<MergedResult> = retained_pre_offtopic
                 .into_iter()
                 .filter(|r| {
@@ -9431,6 +9438,7 @@ fn merge_local_and_web(
                 restored.len()
             );
             merged = restored;
+            }
         }
     }
 
@@ -9825,6 +9833,28 @@ fn merge_local_and_web(
             .map(|r| r.score)
             .fold(0.0f32, f32::max);
 
+        // (b) single-distinctive-term-only match on a multi-topic query
+        // FAIL-OPEN: only fire this cap when at least one result actually
+        // matches >= 2 topics. If NO result reaches that bar, the cap would
+        // flatten EVERYTHING to 0.04 indiscriminately — destroying ranking
+        // differentiation for queries where upstream returns only off-topic
+        // results (e.g. "how to fix a bicycle puncture" returning KIT/Gemini
+        // pages). Let normal ranking differentiate instead.
+        let any_strong_match = if query_has_many_topics {
+            merged.iter().any(|r| {
+                let rl = r.title.to_lowercase();
+                let cl = r.content.to_lowercase();
+                let ul = r.url.to_lowercase();
+                let matched_strong = strong_topics.iter().filter(|t| {
+                    let lt = t.to_lowercase();
+                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
+                }).count();
+                matched_strong >= 2
+            })
+        } else {
+            false
+        };
+
         for r in merged.iter_mut() {
             let rl = r.title.to_lowercase();
             let cl = r.content.to_lowercase();
@@ -9877,7 +9907,7 @@ fn merge_local_and_web(
             }
 
             // (b) single-distinctive-term-only match on a multi-topic query
-            if query_has_many_topics {
+            if query_has_many_topics && any_strong_match {
                 let matched_strong = strong_topics.iter().filter(|t| {
                     let lt = t.to_lowercase();
                     rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
