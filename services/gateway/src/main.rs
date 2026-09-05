@@ -5318,28 +5318,31 @@ fn calibrate_scores(scores: &mut [f32]) {
     // relevance fold) and only lift the floor. On-topic queries with a healthy result
     // have raw_max >= 0.10, so the standard [0.05,1.0] remap runs unchanged (no regression).
     if raw_max < 0.10 {
-        // WEAK-SET SPREAD (round-7 fix): the original guard pinned every score to
-        // the 0.05 floor whenever the best raw score was < 0.10. That regime is
-        // NORMAL for web queries: RRF contributions for top positions are ~0.05-0.08
-        // and authority/semantic weights are small, so base scores land at
-        // 0.005-0.02. Pinning to floor destroyed the ranker's ordering, so a leaked
-        // off-topic page (e.g. a Vale earnings release for "noise cancelling
-        // earbuds", thesaurus.com/"biggest" for "cybersecurity breaches", a Zomato
-        // "Thai Restaurants in Jaipur" for "vegetarian thali ... jaipur") tied with
-        // the genuinely on-topic page at 0.05 and won by insertion order.
-        // Instead, rescale the weak set onto a CONSTRAINED low sub-range
-        // [0.05, 0.12] that preserves the raw relative order. This keeps the round-6
-        // off-topic defense (no weak result is stretched to ~1.0, so an off-topic
-        // survivor cannot invert the ranking — on-topic pages have higher raw base
-        // and stay above) while differentiating on-topic pages from leaked ones.
-        // The off-topic sole-survivor case is already removed pre-scoring by the
-        // distinctive-term hard-drop, so the only remaining weak sets are legit.
+        // WEAK-SET LOG-SCALE (IF-2 fix): the original guard compressed every
+        // weak set onto [0.05, 0.12] — a 7-point band that collapsed the
+        // relevance fold's separation so off-topic survivors tied with on-topic
+        // pages and won by insertion order (IF-2). A linear remap, even widened,
+        // still destroys relative ordering when all scores sit in a narrow raw
+        // band. Instead, use log-scaling: mapping x → log(1+x) stretches the
+        // low end (where weak scores live) while keeping ordering intact, then
+        // remap onto [0.05, 1.0] like the normal path. This way a 2x raw
+        // difference (e.g. 0.02 vs 0.01) still reads as a clear score gap
+        // (0.64 vs 0.37) without ever inflating a weak max to 1.0.
+        //
+        // Log-scaling is monotonic and unbounded — it preserves rank order by
+        // construction, generalises to any weak-set shape, and has no magic
+        // threshold tuned to one query. The 0.10 gate stays as a regime
+        // switch (weak vs healthy) but no longer decides the output spread.
+        let log_min = (raw_min + 1.0).ln();
+        let log_max = (raw_max + 1.0).ln();
+        let log_span = (log_max - log_min).max(1e-6);
         let lo = 0.05f32;
-        let hi = 0.12f32;
-        let norm = (raw_max - raw_min).max(1e-6);
+        let hi = 1.0f32;
+        let span = hi - lo;
         for score in scores.iter_mut() {
-            let t = ((*score - raw_min) / norm).clamp(0.0, 1.0);
-            *score = lo + t * (hi - lo);
+            let log_s = (*score + 1.0).ln();
+            let t = ((log_s - log_min) / log_span).clamp(0.0, 1.0);
+            *score = lo + t * span;
         }
         return;
     }
