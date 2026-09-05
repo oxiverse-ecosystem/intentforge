@@ -6839,6 +6839,15 @@ fn preprocess_searxng_query(query: &str) -> String {
         }
     }
     
+    // Strip "show me / show us" prefixes
+    let show_triggers = ["show me ", "show us "];
+    for prefix in &show_triggers {
+        if let Some(rest) = cleaned.strip_prefix(prefix) {
+            cleaned = rest.to_string();
+            break;
+        }
+    }
+    
     // Action verbs that trigger dictionary/definition results on Bing/Google
     let action_verbs: std::collections::HashSet<&str> = [
         "deploy", "implement", "configure", "setup", "install", "migrate",
@@ -13452,6 +13461,35 @@ async fn handle_search(
                 eq.push(localized);
             }
             eq
+        } else {
+            expanded_queries
+        }
+    } else {
+        expanded_queries
+    };
+    // "show me" prefix strip for fresh-intent queries: when the query starts
+    // with "show me" and intent is fresh, the word "show" confuses upstream
+    // (SearXNG returns dictionary/definition pages for "Show"). Seed the
+    // expanded query set with the stripped variant so the retry fan-out
+    // fetches with clean terms (structural reformulation, not per-query literal).
+    let expanded_queries = if intent.intent == "fresh" {
+        let q_lc = q.to_lowercase();
+        let stripped = if let Some(rest) = q_lc.strip_prefix("show me ") {
+            Some(rest.trim().to_string())
+        } else if let Some(rest) = q_lc.strip_prefix("show us ") {
+            Some(rest.trim().to_string())
+        } else {
+            None
+        };
+        if let Some(s) = stripped {
+            if !s.is_empty() && !expanded_queries.iter().any(|eq| eq.eq_ignore_ascii_case(&s)) {
+                tracing::info!("FRESH SHOW-ME STRIP: '{}' -> '{}' (added to retry fan-out)", q, s);
+                let mut eq = expanded_queries;
+                eq.push(s);
+                eq
+            } else {
+                expanded_queries
+            }
         } else {
             expanded_queries
         }
