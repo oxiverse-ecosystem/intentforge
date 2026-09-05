@@ -13442,6 +13442,42 @@ async fn handle_search(
             let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
             intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
         }
+
+        // Override 10: "why do" + scientific/natural-phenomenon term → informational
+        // Backfill fix IF-1: "why do we see lightning before hearing thunder"
+        // is clearly informational (explanation sought), but the intent-engine
+        // misclassifies it as transactional (0.80). This is a structural pattern,
+        // not a per-query literal: any "why do" query naming a natural phenomenon
+        // gets forced to informational regardless of what the engine returns.
+        // Regression guard: "why do I need a new laptop" has no science term →
+        // stays transactional (the how-to/study/research overrides don't fire on it).
+        let why_do_prefix = q_lower.starts_with("why do");
+        if why_do_prefix {
+            let science_terms = [
+                "lightning", "thunder", "rain", "snow", "wind", "storm", "hurricane",
+                "tornado", "earthquake", "volcano", "flood", "tsunami", "eclipse",
+                "comet", "meteor", "gravity", "magnet", "electricity", "photosynthesis",
+                "evolution", "atom", "molecule", "cell", "dna", "protein",
+                "tide", "wave", "spectrum", "particle", "radiation", "magnetic",
+                "atmosphere", "ocean", "climate", "geology", "ecology", "biology",
+                "physics", "chemistry", "astronomy", "weather", "temperature",
+            ];
+            let has_science_term = science_terms.iter().any(|t| q_has_word(&q_lower, t));
+            if has_science_term && intent.intent == "transactional" {
+                tracing::info!(
+                    "INTENT OVERRIDE (WHY_INQUIRY): science '{}' was '{}' (conf={:.3}) → informational",
+                    q, intent.intent, intent.confidence
+                );
+                intent.intent = "informational".to_string();
+                intent.confidence = intent.confidence.max(0.60);
+                let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+                let current_top = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+                intent.distribution.insert("informational".to_string(), (info_prob + current_top * 0.4).min(0.85));
+                let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
+                intent.distribution.insert("transactional".to_string(), tx_prob * 0.3);
+            }
+        }
+
     }
 
     let vector: Option<Vec<f32>> = match embed_res {
