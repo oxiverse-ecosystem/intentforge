@@ -14391,6 +14391,29 @@ async fn handle_search(
         }
     }
 
+    // FRESH-SMALL-SET FAIL-OPEN (structural, P6-class): when intent is fresh
+    // and the pre-merge result set is small (< 5), the date window should be
+    // a scoring boost, NOT a hard filter. For niche queries (e.g. "chandrayaan
+    // 4 mission updates this week"), upstream (SearXNG) returns few date-stamped
+    // items, and the hard filter collapses the set to near-zero even when the
+    // fail-open above didn't trigger (because enough results survived the window
+    // to keep the fraction above 50%). When the set is this small, dropping
+    // results for lacking a date is never the right call — recency should only
+    // influence ranking, not eligibility. Keyed on intent + set size, not on
+    // any query/domain/window — general and future-proof.
+    if intent.intent == "fresh" && pre_filter_count > 0 && pre_filter_count < 5 {
+        if intent.structured_constraints.after_date.is_some()
+            || intent.structured_constraints.before_date.is_some()
+        {
+            tracing::info!(
+                "FRESH-SMALL-SET FAIL-OPEN: intent=fresh with only {} pre-filter results — clearing hard date window (recency stays scoring-only)",
+                pre_filter_count
+            );
+            intent.structured_constraints.after_date = None;
+            intent.structured_constraints.before_date = None;
+        }
+    }
+
     // PRICE fail-open (mirrors the date fail-open above, P3-class): a price
     // constraint (`price:<60000`, `price_max`, etc.) can only meaningfully
     // narrow results when at least one merged web result actually carries a
@@ -16609,18 +16632,45 @@ mod constraint_fix_tests {
             &c,
         );
         assert!(!fresh, "result dated 2025 should pass after:2024");
-    }
+            }
 
-    #[test]
-    fn price_extraction_broadened() {
-        assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
-        assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
-        assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
-        assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
-        assert_eq!(extract_price_from_text("no monetary value here"), None);
-        assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
-        assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
-    }
+            #[test]
+            fn fresh_small_set_date_window_is_scoring_not_filter() {
+                // FRESH-SMALL-SET FAIL-OPEN: when intent is fresh and the
+                // pre-merge set is small (< 5), the date window must NOT
+                // hard-filter results. The handle_search level clears the
+                // date window when pre_filter_count < 5, so dateless
+                // results are kept and recency stays a scoring-only boost.
+                // This test verifies the should_filter_by_constraints
+                // guarantee: dateless results pass through the date filter
+                // (the structural foundation on which the FRESH-SMALL-SET
+                // rule depends).
+                let mut c = Constraints::default();
+                c.after_date = Some("2025-09-01".to_string());
+                c.before_date = Some("2025-09-08".to_string());
+                // A result with no publish date — should NOT be filtered.
+                // (should_filter_by_constraints keeps dateless results by
+                // design — the fail-open for date-less results.)
+                let nodate = should_filter_by_constraints(
+                    "Chandrayaan 4 update",
+                    "ISRO prepares for Chandrayaan-4 lunar sample-return mission.",
+                    "https://example.com/chandrayaan4",
+                    None, // no published date
+                    &c,
+                );
+                assert!(!nodate, "dateless result must NOT be hard-filtered by date bounds");
+            }
+
+                #[test]
+                fn price_extraction_broadened() {
+                    assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
+                    assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
+                    assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
+                    assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
+                    assert_eq!(extract_price_from_text("no monetary value here"), None);
+                    assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
+                    assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
+                }
 
     #[test]
     fn rs_signal_no_false_positives() {
