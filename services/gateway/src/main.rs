@@ -7030,6 +7030,73 @@ fn filetype_relax_variant(query: &str) -> Option<String> {
 
 /// Extract core keyphrases by removing natural-language filler/stop words
 /// from verbose queries (e.g. "construct a warp drive using exotic matter" → "warp drive exotic matter").
+/// Generic-verb drop variant: when recall-gap terms exist, detect that the
+/// result set is off-topic (the distinctive noun is absent from ALL results)
+/// and produce a reformulated query that drops generic verbs and keeps only
+/// the distinctive nouns. Structural — no per-query literals.
+///
+/// Example: "remove curry stains from white shirt" with recall_gap=["curry"]
+/// → Some("curry stains white shirt")
+fn generic_verb_drop_variant(query: &str, recall_gap_terms: &[String]) -> Option<String> {
+    if recall_gap_terms.is_empty() {
+        return None;
+    }
+    // Check: at least one recall-gap term is a distinctive noun (len >= 3,
+    // not a stopword, not a weak anchor). This is the signal that the
+    // generic verbs in the query are polluting the upstream results.
+    let stops = recall_gap_stopwords();
+    let has_distinctive_gap = recall_gap_terms.iter().any(|t| {
+        t.len() >= 3
+            && !stops.contains(t.as_str())
+            && !is_weak_anchor_word(t)
+    });
+    if !has_distinctive_gap {
+        return None;
+    }
+    // Identify which recall-gap terms are distinctive nouns (real content words).
+    let distinctive_gaps: Vec<&str> = recall_gap_terms
+        .iter()
+        .filter(|t| {
+            t.len() >= 3
+                && !stops.contains(t.as_str())
+                && !is_weak_anchor_word(t)
+        })
+        .map(|t| t.as_str())
+        .collect();
+    if distinctive_gaps.is_empty() {
+        return None;
+    }
+    // Drop generic verbs/function words from the query, keeping only
+    // distinctive nouns + the distinctive recall-gap terms.
+    // Generic words = words that appear in recall_gap_stopwords OR
+    // is_weak_anchor_word AND are NOT one of the distinctive gap terms.
+    let filtered: Vec<String> = query
+        .split_whitespace()
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            let is_gap_term = distinctive_gaps.iter().any(|g| g == &lower);
+            // Keep: distinctive gap terms (the actual topic words)
+            if is_gap_term { return true; }
+            // Drop: generic stopwords and weak-anchor words (they pollute results)
+            stops.contains(lower.as_str()) || is_weak_anchor_word(&lower)
+        })
+        .map(|w| w.to_string())
+        .collect();
+    if filtered.len() < 2 {
+        return None;
+    }
+    // Ensure we kept at least one distinctive gap term
+    let kept_gaps: Vec<String> = filtered.iter()
+        .map(|w| w.to_lowercase())
+        .filter(|w| distinctive_gaps.iter().any(|g| *g == w.as_str()))
+        .collect();
+    if kept_gaps.is_empty() {
+        return None;
+    }
+    Some(filtered.join(" "))
+}
+
+
 /// Fires in parallel during the initial fan-out to ensure upstream engines return
 /// relevant hits even when verbose natural-language framing yields 0 exact matches.
 fn keyphrase_relax_variant(query: &str) -> Option<String> {
@@ -10678,9 +10745,29 @@ fn distinctive_query_terms(query: &str) -> Vec<String> {
 /// Returns `None` when there are no results at all (nothing to compare against)
 /// so the signal is never emitted for an empty SERP (that's a different problem
 /// class — see `warnings`).
-fn compute_recall_gap_terms(
+/// Trait for types that can provide the fields needed for recall-gap computation.
+/// Implemented by both MergedResult (post-merge) and SearxResult (pre-merge).
+trait RecallGapSource {
+    fn title(&self) -> &str;
+    fn content(&self) -> &str;
+    fn url(&self) -> &str;
+}
+
+impl RecallGapSource for MergedResult {
+    fn title(&self) -> &str { &self.title }
+    fn content(&self) -> &str { &self.content }
+    fn url(&self) -> &str { &self.url }
+}
+
+impl RecallGapSource for SearxResult {
+    fn title(&self) -> &str { &self.title }
+    fn content(&self) -> &str { &self.content }
+    fn url(&self) -> &str { &self.url }
+}
+
+fn compute_recall_gap_terms<T: RecallGapSource>(
     query: &str,
-    results: &[MergedResult],
+    results: &[T],
 ) -> Option<Vec<String>> {
     if results.is_empty() {
         return None;
@@ -10694,12 +10781,12 @@ fn compute_recall_gap_terms(
     let covered: std::collections::HashSet<String> = results
         .iter()
         .map(|r| {
-            let preview = r.content.chars().take(500).collect::<String>();
+            let preview = r.content().chars().take(500).collect::<String>();
             format!(
                 "{} {} {}",
-                r.title.to_lowercase(),
+                r.title().to_lowercase(),
                 preview.to_lowercase(),
-                r.url.to_lowercase()
+                r.url().to_lowercase()
             )
         })
         .collect::<std::collections::HashSet<String>>();
@@ -13710,6 +13797,16 @@ async fn handle_search(
 
     // Count-based retry (no relevance needed yet — fires before Invidious/news/image)
     if (needs_more_results || has_contrastive_negatives) && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
+        // Compute recall-gap terms BEFORE web_results is moved into
+        // async closures. The temporary Vec from compute_recall_gap_terms
+        // is dropped by end of this block, so no borrow conflicts.
+        let recall_gap_terms: Vec<String> = {
+            if web_results.is_empty() {
+                Vec::new()
+            } else {
+                compute_recall_gap_terms(&q_trimmed, &web_results).unwrap_or_default()
+            }
+        };
         let mut retry_futs = Vec::new();
         let retry_timeout = Duration::from_secs(4); // shorter than initial 5s
         let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 6 } else { 3 };
@@ -13724,7 +13821,28 @@ async fn handle_search(
                 // For normal queries, only use VPN instance (SearXNG1) for speed.
                 if !only_negative && intent.structured_constraints.negative.is_empty() && inst_idx > 0 { continue; }
                 if circuit_ref.is_open(&retry_key) { continue; }
-                let retry_url = searxng_url(base_url, &clean_eq, geo_location.as_ref(), lang);
+                // Generic-verb drop: when recall_gap_terms contains a
+                // distinctive noun absent from ALL results, the query's
+                // generic verbs (e.g. "remove", "clean", "get") are
+                // polluting the upstream results. Drop them and re-fetch
+                // with only distinctive nouns so the engine returns the
+                // right pages instead of off-topic generic results.
+                let recall_gap = recall_gap_terms.clone();
+                let retry_eq = if !recall_gap.is_empty() {
+                    if let Some(dropped) = generic_verb_drop_variant(eq, &recall_gap) {
+                        if dropped.to_lowercase() != eq.to_lowercase() {
+                            tracing::info!("GENERIC_VERB_DROP: '{}' -> '{}' (recall_gap={:?})", eq, dropped, recall_gap);
+                            dropped
+                        } else {
+                            eq.clone()
+                        }
+                    } else {
+                        eq.clone()
+                    }
+                } else {
+                    eq.clone()
+                };
+                let retry_url = searxng_url(base_url, &preprocess_searxng_query(&retry_eq), geo_location.as_ref(), lang);
                 let client = client.clone();
                 let key = retry_key.clone();
                 let url_for_log = retry_url[..retry_url.find('?').unwrap_or(retry_url.len())].to_string();
