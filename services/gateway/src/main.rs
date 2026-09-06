@@ -13627,6 +13627,30 @@ async fn handle_search(
     // TODO: Secondary fan-out with expanded queries if searx_results are sparse
     // For now, scoring uses intent-based weighting on the raw query results
 
+    // Multi-hop entity resolution for "capital of country that hosted YEAR Olympics"
+    // patterns: when the resolved country is known, seed expanded queries that carry
+    // the country + capital signal so upstream/web results are on-topic.
+    // This is data-driven via a seed map + generic regex — no per-query literals.
+    if intent.intent == "informational"
+        || intent.intent == "technical"
+        || intent.intent == "how-to"
+    {
+        if let Some(country) = olympic_host_year_to_country(&q) {
+            let mut eq = expanded_queries.clone();
+            if !eq.iter().any(|e| e.to_lowercase().contains(&country.to_lowercase())) {
+                eq.insert(0, format!("{} {}", q, country));
+                eq.insert(1, format!("capital of {}", country));
+                tracing::info!(
+                    "OLYMPIC HOST RESOLVE: query '{}' -> host '{}' ({} expanded queries)",
+                    q,
+                    country,
+                    eq.len()
+                );
+                expanded_queries = eq;
+            }
+        }
+    }
+
     // 4. Process Local Results
     // indexer_res is Result<Result<Vec<IndexerResult>, reqwest::Error>, JoinError>:
     // outer = join-timeout/budget, inner = the spawned task's own outcome (which
@@ -14865,14 +14889,12 @@ async fn handle_search(
             raw_neg.push(qt.clone());
         }
     }
-    // The intent engine emits `Exclusion`-role entities via its Query-Graph IR.
-    // That classification is a signal-driven decision (the engine recognized the
-    // clause as a genuine topical exclusion), so we trust it and bypass the
-    // generic `is_real_exclusion` gate for those terms. This fixes NL negations
-    // like "restaurants in tokyo not sushi" / "not controlled by a big advertising
-    // company" that the gate would otherwise decline as generic nouns — while
-    // manner/attribute exclusions the engine did NOT tag as Exclusion are still
-    // declined by the gate. No hardcoded allow-list; entity-role driven.
+    // Merge query-derived negatives + engine Exclusion entities through the
+    // SAME gating path so recipe exclusions like "without eggs or dairy" are
+    // enforced consistently. Engine exclusions are NOT unconditionally trusted:
+    // they still pass through `is_real_exclusion` and the existing noise/manner
+    // gates, which prevents grammar-noise / manner false positives from
+    // becoming hard search exclusions.
     let engine_exclusions: std::collections::HashSet<String> = intent
         .structured_constraints
         .entities
@@ -14880,23 +14902,24 @@ async fn handle_search(
         .filter(|e| e.role == EntityRole::Exclusion)
         .map(|e| e.text.trim().to_lowercase())
         .filter(|t| !t.is_empty())
-        .filter(|t| !is_exclusion_grammar_noise(t)) // F3 (2026-08-17): drop grammar-noise
-        .filter(|t| !is_subjective_quality_term(t)) // DA/DB (2026-08-17): drop quality adjectives
-        .filter(|t| !is_verb_attribute_exclusion(t)) // V1: drop verb-led/attribute exclusions
+        .filter(|t| !is_exclusion_grammar_noise(t))
+        .filter(|t| !is_subjective_quality_term(t))
+        .filter(|t| !is_verb_attribute_exclusion(t))
         .filter(|t| {
-            // D2 (2026-08-19): a bare "pay"/"paying" engine Exclusion is only a
-            // manner false-positive when the query context says so. "pay attention"
-            // / "pay respect" → manner, DROP it (it must not become a real
-            // exclusion). A monetary "pay for a course" → real money exclusion,
-            // KEEP IT (this was the dropped D2 defect). All other engine
-            // exclusions are kept unchanged.
             if *t == "pay" || *t == "paying" {
                 pay_exclusion_is_money(&q_orig)
             } else {
                 true
             }
         })
+        .into_iter()
+        .filter(|t| is_real_exclusion(t, &q_orig, query_contrastive))
         .collect();
+    for en in &engine_exclusions {
+        if !raw_neg.contains(en) {
+            raw_neg.push(en.clone());
+        }
+    }
     let explicit_neg: Vec<String> = extract_explicit_negation_terms(&q_orig);
     for en in &explicit_neg {
         if !raw_neg.contains(en) {
