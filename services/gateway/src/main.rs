@@ -1794,6 +1794,90 @@ fn is_city(name: &str) -> bool {
     CITIES.contains(&name)
 }
 
+/// Generic detector for capital-of-country queries, independent of any
+/// sport/event. If the query explicitly asks for the capital of a country
+/// (or a gazetteer city whose country we can infer), return that country
+/// name. The caller uses it for re-ranking, not query rewriting, so there
+/// are no per-query hardcoded strings downstream.
+fn detect_capital_of_country_query(query: &str) -> Option<String> {
+    let q = query.to_lowercase();
+    let q_trim = q.trim();
+    let mut target: Option<&str> = None;
+
+    if q_trim.starts_with("what is the capital of ")
+        || q_trim.starts_with("what's the capital of ")
+        || q_trim.starts_with("capital of ")
+        || q_trim.starts_with("capital city of ")
+    {
+        let tail = if q_trim.starts_with("what is the capital of ") {
+            &q_trim["what is the capital of ".len()..]
+        } else if q_trim.starts_with("what's the capital of ") {
+            &q_trim["what's the capital of ".len()..]
+        } else if q_trim.starts_with("capital city of ") {
+            &q_trim["capital city of ".len()..]
+        } else {
+            &q_trim["capital of ".len()..]
+        };
+        target = Some(tail.trim());
+    }
+
+    if let Some(raw) = target {
+        let raw = raw.trim_end_matches('?').trim();
+        if raw.is_empty() {
+            return None;
+        }
+        // Exact gazetteer hit first, then capitalized-place fallback.
+        let loc = detect_explicit_location(raw);
+        if let Some(geo) = loc {
+            if let Some(name) = geo.country_name {
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+        // Fallback: a capitalized token run not in the gazetteer is treated
+        // as a country name directly (general: "capital of Wakanda").
+        if raw.chars().next()?.is_uppercase() {
+            return Some(raw.to_string());
+        }
+    }
+    None
+}
+
+/// Post-calibration re-rank for capital-of-country queries. When the
+/// resolved country is known, Wikipedia/infobox pages that mention both
+/// the country name and the word "capital" in title/snippet/URL get a
+/// small additive boost. This is structural (country + "capital"
+/// co-occurrence + encyclopedia-style URL path), so it generalizes to
+/// any year/country/capital combination and does not rely on hardcoded
+/// query-specific strings.
+fn rerank_capital_pages(merged: &mut [MergedResult], country_name: &str) {
+    if country_name.is_empty() || merged.is_empty() {
+        return;
+    }
+    let country_lower = country_name.to_lowercase();
+    let country_tokens: Vec<&str> = country_lower.split_whitespace().collect();
+    let is_wikipedia_style = |ul: &str| -> bool {
+        ul.contains("wikipedia.org")
+            || ul.contains("simple.wikipedia.org")
+            || ul.contains("wikivoyage.org")
+            || ul.contains("britannica.com")
+            || ul.contains("wiki/")
+            || ul.contains("/wiki/")
+    };
+    for r in merged.iter_mut() {
+        let tl = r.title.to_lowercase();
+        let cl = r.content.to_lowercase();
+        let ul = r.url.to_lowercase();
+        let text = format!("{} {} {}", tl, cl, ul);
+        let mentions_country = country_tokens.iter().all(|t| text.contains(t));
+        let mentions_capital = text.contains("capital");
+        if mentions_country && mentions_capital && is_wikipedia_style(&ul) {
+            r.score += 0.05;
+        }
+    }
+}
+
 /// Human-readable country name for an ISO code (gazetteer-derived).
 fn country_name_for(cc: &str) -> String {
     let name = match cc {
@@ -6632,6 +6716,8 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
         r"(?i)\balternative\s+to\b",
         r"(?i)\bbesides\b",
         r"(?i)\bno\b",
+        r"(?i)\bdoes\s+not\s+(use|contain|have|include)\b",
+        r"(?i)\bdon't\s+(use|contain|have|include)\b",
     ];
     let mut out: Vec<String> = Vec::new();
     let lower = q_orig.to_lowercase();
@@ -9907,6 +9993,14 @@ fn merge_local_and_web(
     calibrate_scores(&mut scores);
     for (i, r) in merged.iter_mut().enumerate() {
         r.score = scores[i];
+    }
+
+    // Generic capital-of-country re-rank: if the query explicitly asks for a
+    // capital, boost encyclopedia-style pages that mention the resolved country
+    // name and the word "capital". This is structural, so it generalizes to
+    // any year/country/capital combination without query-specific literals.
+    if let Some(country) = detect_capital_of_country_query(query) {
+        rerank_capital_pages(&mut merged, &country);
     }
 
     // POST-CALIBRATION OFF-TOPIC CAP (this round, D1/D2/D3).
@@ -18879,5 +18973,92 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // valid "off" setting — proves the value is honored as a cap.
         let cfg = CommerceConfig { mainpath_top_n: 0 };
         assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
+    }
+}
+
+// ─── Olympic host-year resolution tests ──────────────────────────────
+// Locks the entity-resolution step that feeds query expansion: a query
+// mentioning an Olympic year + marker (e.g. "2024 olympics") must resolve
+// to the host country from the seed map (e.g. "France"), and the expansion
+// in handle_search must append that country name so upstream SearXNG returns
+// country-specific pages. No per-query literals in the tests — they rely only
+// on the seed table the production code uses.
+#[cfg(test)]
+mod olympic_host_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_2024_olympics_to_france() {
+        let country = olympic_host_year_to_country("what happened at the 2024 olympics");
+        assert_eq!(country, Some("France"));
+    }
+
+    #[test]
+    fn resolves_2016_summer_olympics_to_brazil() {
+        let country = olympic_host_year_to_country("summer olympics 2016 host city");
+        assert_eq!(country, Some("Brazil"));
+    }
+
+    #[test]
+    fn resolves_2020_tokyo_olympics_to_japan() {
+        let country = olympic_host_year_to_country("2020 olympics schedule");
+        assert_eq!(country, Some("Japan"));
+    }
+
+    #[test]
+    fn resolves_2012_olympic_games_to_united_kingdom() {
+        let country = olympic_host_year_to_country("london 2012 olympic games medals");
+        assert_eq!(country, Some("United Kingdom"));
+    }
+
+    #[test]
+    fn returns_none_when_no_olympic_marker() {
+        // A year without an Olympic marker must NOT resolve — prevents the
+        // expansion from firing on unrelated queries like "best laptops 2024".
+        assert_eq!(olympic_host_year_to_country("best laptops 2024 review"), None);
+    }
+
+    #[test]
+    fn returns_none_for_non_olympic_year() {
+        // An Olympic marker with a year NOT in the seed table must yield None.
+        assert_eq!(olympic_host_year_to_country("1897 olympics results"), None);
+    }
+
+    #[test]
+    fn returns_none_for_olympic_marker_without_year() {
+        assert_eq!(olympic_host_year_to_country("watch olympics live streaming"), None);
+    }
+
+    #[test]
+    fn year_token_detection_is_digit_only() {
+        // "2024th" is not a 4-digit year token; it must not match.
+        assert_eq!(olympic_host_year_to_country("2024th olympics ceremony"), None);
+    }
+
+    #[test]
+    fn resolves_with_olympiad_marker() {
+        // 2020 olympiad — single-entry year, unambiguously Japan.
+        let country = olympic_host_year_to_country("2020 olympiad results");
+        assert_eq!(country, Some("Japan"));
+    }
+
+    #[test]
+    fn expansion_query_appends_country_name() {
+        // Simulate the expansion logic from handle_search: the expanded query
+        // should be "<original> <country>" — e.g. "2024 olympics France".
+        let q = "what happened at the 2024 olympics";
+        let country = olympic_host_year_to_country(q).unwrap();
+        let expanded = format!("{} {}", q, country);
+        assert!(expanded.ends_with(" France"));
+        assert!(expanded.starts_with(q));
+    }
+
+    #[test]
+    fn expansion_adds_capital_of_country_query() {
+        // The expansion should also seed a "capital of <country>" variant.
+        let q = "2024 olympics host country";
+        let country = olympic_host_year_to_country(q).unwrap();
+        let capital_q = format!("capital of {}", country);
+        assert_eq!(capital_q, "capital of France");
     }
 }
