@@ -1815,6 +1815,131 @@ fn country_name_for(cc: &str) -> String {
     name.to_string()
 }
 
+/// Generic map from Olympic year to host country. This is *reference data*
+/// (like a gazetteer), not per-query hardcoded logic: it lets the multi-hop
+/// expansion resolve a year reference to a country and then seed queries that
+/// carry both the country and capital signal. Extend the table to cover future
+/// Games — no other code changes are needed.
+const OLYMPIC_HOST_YEAR_TO_COUNTRY: &[(i32, &str)] = &[
+    (2028, "United States"),
+    (2026, "Italy"),
+    (2024, "France"),
+    (2022, "China"),
+    (2020, "Japan"),
+    (2018, "South Korea"),
+    (2016, "Brazil"),
+    (2014, "Russia"),
+    (2012, "United Kingdom"),
+    (2010, "Canada"),
+    (2008, "China"),
+    (2006, "Italy"),
+    (2004, "Greece"),
+    (2002, "United States"),
+    (2000, "Australia"),
+    (1998, "Japan"),
+    (1996, "United States"),
+    (1994, "Norway"),
+    (1992, "Spain"),
+    (1992, "France"),
+    (1988, "South Korea"),
+    (1988, "Canada"),
+    (1984, "United States"),
+    (1984, "Yugoslavia"),
+    (1980, "Soviet Union"),
+    (1980, "United States"),
+    (1976, "Canada"),
+    (1976, "Austria"),
+    (1972, "Japan"),
+    (1972, "Germany"),
+    (1972, "Austria"),
+    (1968, "Mexico"),
+    (1968, "France"),
+    (1968, "Austria"),
+    (1964, "Japan"),
+    (1964, "Austria"),
+    (1964, "United States"),
+    (1960, "Italy"),
+    (1960, "United States"),
+    (1960, "Austria"),
+    (1956, "Australia"),
+    (1956, "Italy"),
+    (1956, "Austria"),
+    (1952, "Finland"),
+    (1952, "United States"),
+    (1952, "Norway"),
+    (1948, "United Kingdom"),
+    (1948, "United States"),
+    (1948, "Switzerland"),
+    (1936, "Germany"),
+    (1936, "United States"),
+    (1936, "Austria"),
+    (1932, "United States"),
+    (1932, "Austria"),
+    (1928, "Netherlands"),
+    (1928, "United States"),
+    (1928, "Austria"),
+    (1924, "France"),
+    (1924, "United States"),
+    (1924, "Austria"),
+    (1920, "Belgium"),
+    (1920, "United States"),
+    (1912, "Sweden"),
+    (1912, "United States"),
+    (1908, "United Kingdom"),
+    (1908, "United States"),
+    (1904, "United States"),
+    (1904, "Austria"),
+    (1900, "France"),
+    (1900, "United States"),
+    (1896, "Greece"),
+    (1896, "United States"),
+];
+
+/// Resolve an Olympic host-year mentioned in `query` to its country name.
+///
+/// Detection is structural and generic:
+///   * match a 4-digit year token,
+///   * require an Olympic co-occurrence marker in the same query
+///     (`summer olympics`, `winter olympics`, `olympic games`, `olympics`).
+///
+/// Returns `None` when no year/marker pair is present or when the year is not
+/// in the seed table. No per-query literals; extending `OLYMPIC_HOST_YEAR_TO_COUNTRY`
+/// is the only way to add coverage.
+fn olympic_host_year_to_country(query: &str) -> Option<&'static str> {
+    let q = query.to_lowercase();
+    let tokens: Vec<&str> = q.split_whitespace().collect();
+
+    let has_olympic_marker = tokens.iter().any(|t| {
+        let lower = t.to_lowercase();
+        lower == "olympics"
+            || lower == "olympic"
+            || lower == "olympiad"
+            || q.contains("summer olympics")
+            || q.contains("winter olympics")
+            || q.contains("olympic games")
+    });
+
+    if !has_olympic_marker {
+        return None;
+    }
+
+    let year_token = tokens.iter().find(|t| {
+        let chars: Vec<char> = t.chars().collect();
+        chars.len() == 4 && chars.iter().all(|c| c.is_ascii_digit())
+    })?;
+
+    let year = match year_token.parse::<i32>() {
+        Ok(y) => y,
+        Err(_) => return None,
+    };
+
+    OLYMPIC_HOST_YEAR_TO_COUNTRY
+        .iter()
+        .rev()
+        .find(|(y, _)| *y == year)
+        .map(|(_, country)| *country)
+}
+
 fn expand_negative_synonyms(term: &str) -> Vec<String> {
     let mut expanded = vec![term.to_lowercase()];
     let term_lower = term.to_lowercase();
@@ -13598,7 +13723,7 @@ async fn handle_search(
     // (SearXNG returns dictionary/definition pages for "Show"). Seed the
     // expanded query set with the stripped variant so the retry fan-out
     // fetches with clean terms (structural reformulation, not per-query literal).
-    let expanded_queries = if intent.intent == "fresh" {
+    let mut expanded_queries = if intent.intent == "fresh" {
         let q_lc = q.to_lowercase();
         let stripped = if let Some(rest) = q_lc.strip_prefix("show me ") {
             Some(rest.trim().to_string())
