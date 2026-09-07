@@ -6778,6 +6778,19 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                         }
                         break; // trailing stopword ends the entity
                     }
+                    // A trailing comma/semicolon on the word (e.g. "eggs," or
+                    // "dairy;") separates exclusion targets: "without eggs,
+                    // dairy or nuts" → ["eggs", "dairy", "nuts"]. Record the
+                    // current entity and start collecting the next one.
+                    if ent.len() >= 1 && w != wc && (w.ends_with(',') || w.ends_with(';')) {
+                        let entity = ent.join(" ");
+                        if !out.contains(&entity) {
+                            out.push(entity);
+                        }
+                        ent.clear();
+                        idx += 1;
+                        continue;
+                    }
                     ent.push(wc);
                     idx += 1;
                 }
