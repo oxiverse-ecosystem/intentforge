@@ -6754,6 +6754,28 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                         break; // a fresh price constraint starts here
                     }
                     if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        // "or"/"and" between exclusion targets separate MULTIPLE
+                        // exclusions (e.g. "without eggs or dairy" → ["eggs",
+                        // "dairy"], not just ["eggs"]). Record the current entity,
+                        // skip the connector, then start collecting the next one.
+                        if wc == "or" || wc == "and" {
+                            let entity = ent.join(" ");
+                            if !out.contains(&entity) {
+                                out.push(entity);
+                            }
+                            ent.clear();
+                            idx += 1;
+                            // Skip leading function words after the connector.
+                            while idx < words.len() {
+                                let wc2: String = words[idx].chars().filter(|c| c.is_alphanumeric()).collect();
+                                if wc2.is_empty() || NL_NEG_STOPWORDS.contains(&wc2.as_str()) {
+                                    idx += 1;
+                                    continue;
+                                }
+                                break;
+                            }
+                            continue;
+                        }
                         break; // trailing stopword ends the entity
                     }
                     ent.push(wc);
@@ -17665,6 +17687,26 @@ mod constraint_fix_tests {
         let applied = c["applied_constraints"].as_array().expect("applied_constraints must be an array");
         assert!(applied.iter().any(|a| a.as_str() == Some("not:flask")),
             "NOT:flask must appear in applied_constraints as 'not:flask', got: {:?}", applied);
+    }
+
+    #[test]
+    fn explicit_negation_captures_or_and_and_separated_targets() {
+        // Regression: "without eggs or dairy" must capture BOTH "eggs" and
+        // "dairy" as separate exclusions. Before the fix, "or"/"and" were
+        // treated as stopwords and only the first target was captured.
+        let terms = extract_explicit_negation_terms("recipe without eggs or dairy");
+        assert!(terms.contains(&"eggs".to_string()), "must capture 'eggs', got {:?}", terms);
+        assert!(terms.contains(&"dairy".to_string()), "must capture 'dairy', got {:?}", terms);
+
+        let terms2 = extract_explicit_negation_terms("recipes without gluten and nuts");
+        assert!(terms2.contains(&"gluten".to_string()), "must capture 'gluten', got {:?}", terms2);
+        assert!(terms2.contains(&"nuts".to_string()), "must capture 'nuts', got {:?}", terms2);
+
+        // Three targets separated by commas/or.
+        let terms3 = extract_explicit_negation_terms("cake without eggs, dairy or nuts");
+        assert!(terms3.contains(&"eggs".to_string()), "must capture 'eggs', got {:?}", terms3);
+        assert!(terms3.contains(&"dairy".to_string()), "must capture 'dairy', got {:?}", terms3);
+        assert!(terms3.contains(&"nuts".to_string()), "must capture 'nuts', got {:?}", terms3);
     }
 
 
