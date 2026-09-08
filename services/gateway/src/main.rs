@@ -829,6 +829,25 @@ fn month_num(s: &str) -> Option<i32> {
     months.iter().find(|(n, _)| s.starts_with(n)).map(|(_, m)| *m)
 }
 
+/// Extract a 4-digit year from a query string, if present.
+/// Used by the P6 temporal anchor fix to match results that explicitly mention
+/// the query's time period.
+fn extract_year_from_query(query: &str) -> Option<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"\b(\d{4})\b").unwrap());
+    re.captures(query).map(|c| c.get(1).unwrap().as_str().to_string())
+}
+
+/// Extract a month name from a query string, if present.
+/// Used by the P6 temporal anchor fix to match results that explicitly mention
+/// the query's time period.
+fn extract_month_from_query(query: &str) -> Option<String> {
+    let months = ["january", "february", "march", "april", "may", "june",
+                  "july", "august", "september", "october", "november", "december"];
+    let q_lower = query.to_lowercase();
+    months.iter().find(|m| q_lower.contains(**m)).map(|m| m.to_string())
+}
+
 /// Extract a calendar date from free text (title/content snippet).
 fn extract_date_from_text(text: &str) -> Option<(i32, i32, i32)> {
     // Numeric YYYY-MM-DD / YYYY/MM/DD first (precise).
@@ -2099,6 +2118,15 @@ fn constraint_score(
                     neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
                     boost);
                 score *= boost;
+                // ALT-PAGE FIX: even when the term is in negating context,
+                // alt pages that mention the excluded term must still be
+                // penalized relative to pages that don't mention it at all.
+                // Without this, the 1.18 boost lifts Google-titled pages
+                // above non-Google pages (c_score 1.18 > 1.0), inverting
+                // the intended ranking for "alternative to X" queries.
+                if is_alt_page {
+                    any_unresolved_violation = true;
+                }
             } else if !is_alt_page {
                 let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
                 tracing::info!("CONSTRAINT HIT (TITLE/URL): '{}' in '{}' → penalty={:.4} (non-alt)",
@@ -7645,6 +7673,14 @@ fn merge_local_and_web(
     // so it stays in scope for the per-result loop.
     let priced_result_count = web.iter().filter(|r| r.get_price().is_some()).count();
 
+    // P6: how many web results carry a parseable date. When 0 for a fresh query,
+    // the date window fails open and recency stays a pure scoring boost — we then
+    // use temporal anchors (year/month in title/URL) to lift recent-content pages
+    // above generic aggregator/database pages.
+    let dated_result_count = web.iter().filter(|r| {
+        resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
+    }).count();
+
     // Helper: normalize URL for dedup matching
     let normalize = |url: &str| -> String {
         let lower = url.to_lowercase();
@@ -8498,13 +8534,32 @@ fn merge_local_and_web(
                 })
                 .copied()
                 .collect();
-            let topic_mentioned = topic_anchor_terms.is_empty()
-                || topic_anchor_terms.iter().any(|t| {
+            // P2c (round-2026-09-08): when the query has >= 2 topic anchor terms,
+            // require at least TWO to be present in the result. A page matching
+            // only ONE of several topic terms is a partial/incidental match — e.g.
+            // "Fluffy Fluffy Dessert Cafe" for "how to make fluffy pancakes" matches
+            // "fluffy" but not "pancakes". The old `any()` let such pages survive the
+            // gate and outrank genuinely on-topic web results. Requiring >= 2 matches
+            // crushes partial matches while letting full-topic pages (which name
+            // multiple query subjects) pass. Single-term queries are unaffected.
+            let topic_mentioned = if topic_anchor_terms.is_empty() {
+                true
+            } else if topic_anchor_terms.len() >= 2 {
+                let matched_count = topic_anchor_terms.iter().filter(|t| {
                     let tl = t.to_lowercase();
                     let bare = tl.trim_end_matches('s');
                     title_lower.contains(&tl) || content_lower.contains(&tl)
                         || title_lower.contains(bare) || content_lower.contains(bare)
-                });
+                }).count();
+                matched_count >= 2
+            } else {
+                topic_anchor_terms.iter().any(|t| {
+                    let tl = t.to_lowercase();
+                    let bare = tl.trim_end_matches('s');
+                    title_lower.contains(&tl) || content_lower.contains(&tl)
+                        || title_lower.contains(bare) || content_lower.contains(bare)
+                })
+            };
             // P2b: high-quality local pages that match the query ONLY on comparison
             // STRUCTURE ("difference between X and Y", "X vs Y") but share NONE of the
             // query's substantive entity terms are off-topic crawl noise — e.g.
@@ -8834,6 +8889,57 @@ fn merge_local_and_web(
                 "D4 FRESH OFF-TOPIC CRUSH x0.12: '{}' shares no distinctive topic term and has no date signal (fresh intent, date window failed open)",
                 r.url.chars().take(60).collect::<String>()
             );
+        }
+
+        // ── P6: fresh-intent temporal-anchor boost (date window failed open) ──
+        // When NO web result carries a parseable date (dated_result_count == 0),
+        // the hard recency window fails open and recency stays a pure scoring
+        // boost. Generic aggregator/database pages with high authority then crowd
+        // out actual recent content. We rescue the ranking by boosting results
+        // whose title or URL explicitly mentions the query's year or month —
+        // these are temporal anchors that correlate with recency even when the
+        // upstream snippet lacks a parseable published_date. A result that names
+        // the time period is more likely to be about that period than a generic
+        // portal page. Keyed on the query's own year/month tokens, no domain
+        // lists, no per-query tuning — general and future-proof.
+        if intent == "fresh" && (constraints.after_date.is_some() || constraints.before_date.is_some()) {
+            let query_year = extract_year_from_query(&clean_query);
+            let query_month = extract_month_from_query(&clean_query);
+            let title_has_year = query_year.as_ref().map_or(false, |y| title_lower.contains(y.as_str()));
+            let url_has_year = query_year.as_ref().map_or(false, |y| url_lower.contains(y.as_str()));
+            let title_has_month = query_month.as_ref().map_or(false, |m| title_lower.contains(m.as_str()));
+            let url_has_month = query_month.as_ref().map_or(false, |m| url_lower.contains(m.as_str()));
+            if title_has_year || url_has_year || title_has_month || url_has_month {
+                relevance *= 1.30;
+                tracing::info!(
+                    "P6 TEMPORAL ANCHOR BOOST x1.30: '{}' mentions query time period (year={:?}, month={:?})",
+                    r.url.chars().take(60).collect::<String>(),
+                    query_year,
+                    query_month
+                );
+            }
+            // ── P6: fresh-intent temporal-anchor PENALTY ──
+            // The boost above rewards results naming the query's year/month, but
+            // without a corresponding penalty the generic aggregator/database pages
+            // (JustWatch, IMDb, Moviefone, Netflix…) that dominate fresh queries
+            // still crowd out actual recent content — they contain query words like
+            // "movies" but no temporal anchor. Penalize results that LACK the time
+            // period so dated/anchored results rise above the generic portals. Keys
+            // on the same year/month tokens as the boost — no domain lists, no
+            // per-query tuning. Symmetric: boost rewards presence, penalty punishes
+            // absence, both gated on date_window_present (when a recency window is
+            // active). Fires even when dated_result_count > 0 but small — the window
+            // filters only the few dated results while date-less portals survive and
+            // dominate.
+            if !(title_has_year || url_has_year || title_has_month || url_has_month) {
+                relevance *= 0.50;
+                tracing::info!(
+                    "P6 TEMPORAL ANCHOR PENALTY x0.50: '{}' lacks query time period (year={:?}, month={:?})",
+                    r.url.chars().take(60).collect::<String>(),
+                    query_year,
+                    query_month
+                );
+            }
         }
 
         // ── Fresh-intent news-portal demotion (this round, #16/#22) ──
@@ -14381,7 +14487,22 @@ async fn handle_search(
     let date_window_present = intent.structured_constraints.after_date.is_some()
         || intent.structured_constraints.before_date.is_some();
     if date_window_present && pre_filter_count > 0 {
+        // Fail-open case (A): NO merged web result carries a parseable date.
+        // The dry-run below counts date-less results as "surviving" (because
+        // should_filter_by_constraints keeps them), so when ALL results are
+        // date-less the survivor fraction is 1.0 and the window never clears.
+        // But a date window that cannot filter anything is structurally useless
+        // — recency should stay a pure scoring boost. Fail open immediately.
+        if dated_result_count == 0 {
+            tracing::info!(
+                "DATE WINDOW FAIL-OPEN (no dated results): {} web results, 0 carry a parseable date — clearing hard recency window (recency stays scoring-only)",
+                pre_filter_count
+            );
+            intent.structured_constraints.after_date = None;
+            intent.structured_constraints.before_date = None;
+        }
         // Dry-run the same date test should_filter_by_constraints applies.
+        else {
         let survivors_after_window = web_results.iter().filter(|r| {
             let mut ok = true;
             if let Some(ref ad) = intent.structured_constraints.after_date {
@@ -14428,6 +14549,7 @@ async fn handle_search(
             intent.structured_constraints.after_date = None;
             intent.structured_constraints.before_date = None;
         }
+        } // end else (dated_result_count > 0)
     }
 
     // FRESH-SMALL-SET FAIL-OPEN (structural, P6-class): when intent is fresh
@@ -14472,6 +14594,13 @@ async fn handle_search(
     // reported `structured_constraints` (that made `price_lt` come back `None`
     // while `applied_constraints` still said `price:<200` — a self-contradictory
     // response). Restored just before serialization below.
+    //
+    // CRITICAL: clone constraints BEFORE the PRICE FAIL-OPEN below clears
+    // intent.structured_constraints.price_*. The merge_local_and_web price-
+    // aware ranking block (line 8574) needs the original bound to apply
+    // budget crush/boost. If we clone after the clearing, the bound is gone
+    // and price ranking is a silent no-op.
+    let constraints_clone = intent.structured_constraints.clone();
     let price_bound_snapshot = (
         intent.structured_constraints.price_min,
         intent.structured_constraints.price_max,
@@ -14828,7 +14957,6 @@ async fn handle_search(
     // Clone data for CPU-intensive scoring on blocking thread
     let q_clone = q.clone();
     let intent_clone = intent.intent.clone();
-    let constraints_clone = intent.structured_constraints.clone();
     let distribution_clone = intent.distribution.clone();
     let geo_clone = geo_location.clone();
     
@@ -15370,6 +15498,43 @@ let mut results = match tokio::task::spawn_blocking(move || {
             r.score += constraint_boost(&r.title, &r.content, &r.url, &intent.structured_constraints);
         }
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    // POST-RANKING NEGATIVE PENALTY: demote results whose title contains a
+    // negated term. After all scoring is complete, multiply the score of any
+    // result mentioning an excluded term by 0.3 so clean results (no negated
+    // term in title) outrank them. This is a pure presentation decoration —
+    // it does not affect relevance scoring, only final order. Without this,
+    // "alternative to google" surfaces Google-titled pages at #1 because
+    // they're about the topic, even though the user excluded the term.
+    if !intent.structured_constraints.negative.is_empty() && !results.is_empty() {
+        let neg_refs: Vec<&str> = intent.structured_constraints.negative
+            .iter().map(|s| s.as_str()).collect();
+        let mut any_demoted = false;
+        for r in results.iter_mut() {
+            let title_lower = r.title.to_lowercase();
+            let has_neg_in_title = neg_refs.iter().any(|n| {
+                let n_lower = n.to_lowercase();
+                let n_words: Vec<&str> = n_lower.split_whitespace().collect();
+                if n_words.len() == 1 {
+                    title_lower.split_whitespace().any(|tw| {
+                        let tw_clean: String = tw.chars().filter(|c| c.is_alphanumeric()).collect();
+                        let n_clean: String = n_lower.chars().filter(|c| c.is_alphanumeric()).collect();
+                        tw_clean == n_clean || tw_clean.starts_with(&n_clean)
+                    })
+                } else {
+                    let joined = n_words.join(" ");
+                    title_lower.contains(&joined)
+                }
+            });
+            if has_neg_in_title {
+                r.score *= 0.3;
+                any_demoted = true;
+            }
+        }
+        if any_demoted {
+            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
     }
 
     // Sanitize content and clamp final score for safe JSON serialization and API spec conformance.
