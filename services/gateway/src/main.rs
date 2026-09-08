@@ -8902,7 +8902,16 @@ fn merge_local_and_web(
         // the time period is more likely to be about that period than a generic
         // portal page. Keyed on the query's own year/month tokens, no domain
         // lists, no per-query tuning — general and future-proof.
-        if intent == "fresh" && (constraints.after_date.is_some() || constraints.before_date.is_some()) {
+        //
+        // BUG FIX (2026-09-08): the original gate required
+        // `constraints.after_date.is_some() || constraints.before_date.is_some()`,
+        // but the date window fail-open logic (line ~14496) CLEARS those bounds
+        // when dated_result_count == 0 — exactly the case P6 must handle. The
+        // clone passed to merge_local_and_web() therefore has no date bounds,
+        // so the P6 logic never fired when it was most needed. The correct
+        // trigger is `dated_result_count == 0` (the window failed open) OR the
+        // presence of a date constraint (window is active, dated_result_count > 0).
+        if intent == "fresh" && (dated_result_count == 0 || constraints.after_date.is_some() || constraints.before_date.is_some()) {
             let query_year = extract_year_from_query(&clean_query);
             let query_month = extract_month_from_query(&clean_query);
             let title_has_year = query_year.as_ref().map_or(false, |y| title_lower.contains(y.as_str()));
