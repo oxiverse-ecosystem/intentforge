@@ -9485,13 +9485,12 @@ fn merge_local_and_web(
         // (safety is never fail-open), and keep an explicit warning so the gap is
         // visible. Keyed on "would-empty", not on any query/domain — general.
         if merged.is_empty() && before > 0 {
-            let best_retained_rel = relevance_vec.iter().cloned().fold(0.0f32, f32::max);
-            if best_retained_rel < 0.02 {
-                tracing::warn!(
-                    "OFF_TOPIC_HARD_DROP FAIL-OPEN SUPPRESSED: {} result(s) all lacked distinctive-term overlap AND best relevance {:.3} < 0.02 — returning empty set rather than restoring garbage (relevance_vec_len={})",
-                    before, best_retained_rel, relevance_vec.len()
-                );
-            } else {
+            // Fail-open: restore results even when relevance is low.
+            // The previous suppression (relevance < 0.02) threw away legitimate
+            // results for many queries (e.g. "how to tell if an avocado is ripe
+            // without squeezing it" returned 0 results). The adult hard-drop
+            // below still enforces safety — this fail-open only restores
+            // non-adult results that lack distinctive-term overlap.
             let restored: Vec<MergedResult> = retained_pre_offtopic
                 .into_iter()
                 .filter(|r| {
@@ -9517,7 +9516,6 @@ fn merge_local_and_web(
                 restored.len()
             );
             merged = restored;
-            }
         }
     }
 
@@ -14362,6 +14360,27 @@ async fn handle_search(
         resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
     }).count();
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
+
+    // P6 FRESH DATE FAIL-OPEN (gate at dated_result_count site): when NO
+    // merged web result carries a parseable date, the hard recency window
+    // can't meaningfully filter anything — clear it so recency stays a pure
+    // scoring boost (freshness half-life) and all results survive. Without
+    // this, a narrow window (e.g. "today" → single-day) combined with
+    // date-less upstream results drops dated-but-out-of-range items while
+    // the fail-open below (which counts dateless results as survivors)
+    // never triggers because dateless results always pass the window check.
+    // Keyed on dated_result_count == 0, not on any query/domain/window.
+    if intent.intent == "fresh" && dated_result_count == 0 {
+        if intent.structured_constraints.after_date.is_some()
+            || intent.structured_constraints.before_date.is_some()
+        {
+            tracing::info!(
+                "P6 FRESH DATE FAIL-OPEN: intent=fresh with 0 dated results — clearing hard recency window (recency stays scoring-only)"
+            );
+            intent.structured_constraints.after_date = None;
+            intent.structured_constraints.before_date = None;
+        }
+    }
 
     // FRESH/date fail-open (prevents 0-result collapse): the FRESH OVERRIDE may have
     // flagged this as a recency query, and should_filter_by_constraints DROPS any
