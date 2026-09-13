@@ -5874,6 +5874,34 @@ const COUNTRY_DEMONYMS: &[&str] = &[
     "australian", "australia",
 ];
 
+/// BRAND_SEED: well-known commercial entity names whose negation is a genuine
+/// topical exclusion (e.g. "search engine not google", "laptop not apple").
+/// This is a general data seed (like COUNTRY_DEMONYMS / PROTECTED_TERMS), not
+/// tuned to any one query: covering major consumer-tech / auto / retail brands
+/// closes the "not <brand>" negation class broadly. No per-query literals.
+///
+/// These are the brands users most commonly want excluded from results — and
+/// the ones most likely to dominate ranking when the exclusion is declined.
+/// A negated brand that ISN'T in this list still works via the protected-term
+/// list (PROTECTED_TERMS in spell.rs) or contrastive framing; this seed only
+/// adds coverage for major brands that aren't already protected terms.
+const BRAND_SEED: &[&str] = &[
+    // Search engines / platforms (the most commonly excluded brands)
+    "google", "bing", "yahoo", "duckduckgo", "brave", "ecosia", "startpage",
+    "qwant", "yandex", "baidu", "naver", "seznam", "swisscows", "gibiru",
+    // Major consumer tech (commonly excluded by preference/ideology)
+    "apple", "microsoft", "samsung", "sony", "nintendo", "tesla", "spotify",
+    "netflix", "adobe", "oracle", "salesforce", "zoom", "uber", "airbnb",
+    // Social / advertising platforms (privacy-sensitive exclusions)
+    "facebook", "meta", "instagram", "tiktok", "twitter", "x", "snapchat",
+    "linkedin", "pinterest", "reddit", "youtube", "twitch",
+    // Auto (common "not <brand>" for repair/shopping queries)
+    "toyota", "honda", "ford", "bmw", "mercedes", "audi", "volkswagen",
+    "nissan", "hyundai", "kia", "chevrolet", "tesla", "subaru", "mazda",
+    // Retail / e-commerce (common price/availability exclusions)
+    "amazon", "walmart", "target", "costco", "ikea", "homedepot", "bestbuy",
+];
+
 /// D3: precise manner-frame detection at the PHRASE level (not the bare-token
 /// level that `is_manner_phrase` uses). A declined candidate is a manner
 /// qualifier when it appears inside a "without/with-no <optional article> <term>"
@@ -6056,6 +6084,16 @@ fn is_real_exclusion(
     // literal, so excluding "made in china" / "american cloud" etc. all work.
     if COUNTRY_DEMONYMS.contains(&lc.as_str())
         || tokens.iter().any(|t| COUNTRY_DEMONYMS.contains(t))
+    {
+        return true;
+    }
+    // IFIX (2026-09-13): a well-known commercial brand (e.g. "google", "apple",
+    // "amazon") is a genuine topical exclusion when negated. The BRAND_SEED data
+    // list closes the "not <brand>" exclusion class broadly without per-query
+    // tuning — "search engine not google" now works even without contrastive
+    // framing (no "alternative to" / "except" / double negation required).
+    if BRAND_SEED.contains(&lc.as_str())
+        || tokens.iter().any(|t| BRAND_SEED.contains(t))
     {
         return true;
     }
