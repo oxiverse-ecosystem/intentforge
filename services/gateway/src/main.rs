@@ -1509,6 +1509,61 @@ fn text_matches_negative(text_lower: &str, term_lower: &str) -> bool {
     })
 }
 
+
+/// Check if a result is a genuine alternative-listing / comparison page.
+/// Uses the same strong-alt criteria as the hard-drop gate (genuine_alt).
+fn result_is_genuine_alt_page(r: &MergedResult) -> bool {
+    let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
+    let title_lower = r.title.to_lowercase();
+    alt_score >= 0.70
+        || title_lower.contains("alternative")
+        || title_lower.contains(" vs ")
+        || title_lower.contains(" versus ")
+        || title_lower.contains("instead of")
+        || title_lower.contains("replacement")
+        || title_lower.contains("compared to")
+        || title_lower.contains("migrate from")
+}
+
+/// Check if a result matches any of the negative constraints.
+fn result_matches_any_negative(r: &MergedResult, negative_norm: &[String]) -> bool {
+    let text = format!("{} {}", r.title, r.url);
+    let text_lower = text.to_lowercase();
+    let text_normalized = normalize_text_for_negative(&text_lower);
+    negative_norm.iter().any(|neg| {
+        let neg_lower = neg.to_lowercase();
+        let words: Vec<&str> = neg_lower.split_whitespace().collect();
+        if words.len() == 1 {
+            text_matches_negative(&text_lower, &neg_lower)
+        } else {
+            let joined = words.join(" ");
+            text_lower.contains(&joined) || text_normalized.contains(&joined)
+        }
+    })
+}
+
+/// Normalize text for negative matching: collapse separators between alphanumerics.
+fn normalize_text_for_negative(text_lower: &str) -> String {
+    let chars: Vec<char> = text_lower.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '.' || c == '-' || c == '_' {
+            if i > 0
+                && i + 1 < chars.len()
+                && chars[i - 1].is_alphanumeric()
+                && chars[i + 1].is_alphanumeric()
+            {
+                // Skip separator — collapse "node.js" to "nodejs"
+            } else {
+                out.push(c);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Gazetteer mapping well-known place names to ISO-3166 country codes.
 /// This is *reference data* (like a dictionary), NOT per-query hardcoded logic:
 /// it lets a query that explicitly names a location override the IP-derived
@@ -2657,6 +2712,46 @@ fn get_related_domains(domain: &str) -> Vec<String> {
 fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
     let lower = text.to_lowercase();
     let amount_pat = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
+
+    // 0. Indian number words: "45k", "2.5 lakh", "1.2 crore", "50 thousand"
+    //    Must run before the currency patterns so "45k" is captured as 45,000.
+    //    GUARD: "4k" in "4k monitor/TV" is a RESOLUTION, not a price. Require
+    //    either a currency indicator (before or after) or >= 2 digits before "k".
+    static RE_K: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re_k = RE_K.get_or_init(|| {
+        regex::Regex::new(r"(?i)(?:[\$₹€£]|usd|inr|rs|rupees?|dollars?|euros?|pounds?|gbp|eur)\s*(\d+(?:\.\d+)?)\s*k\b|(\d+(?:\.\d+)?)\s*k\s*(?:rupees?|dollars?|euros?|pounds?|gbp|eur|usd|inr|rs)|(\d{2,}(?:\.\d+)?)\s*k\b|(\d+(?:\.\d+)?)\s*(?:thousand|lakh|crore)").unwrap()
+    });
+    if let Some(caps) = re_k.captures(&lower) {
+        let (amount_str, suffix) = if let Some(m) = caps.get(1) {
+            (m.as_str(), "k")
+        } else if let Some(m) = caps.get(2) {
+            (m.as_str(), "k")
+        } else if let Some(m) = caps.get(3) {
+            (m.as_str(), "k")
+        } else if let Some(m) = caps.get(4) {
+            let suffix = if lower.contains("lakh") { "lakh" } else if lower.contains("crore") { "crore" } else { "thousand" };
+            (m.as_str(), suffix)
+        } else {
+            unreachable!()
+        };
+        if let Ok(v) = amount_str.replace(',', "").parse::<f64>() {
+            let multiplier = match suffix {
+                "k" => 1_000.0,
+                "thousand" => 1_000.0,
+                "lakh" => 100_000.0,
+                "crore" => 10_000_000.0,
+                _ => 1.0,
+            };
+            let amount = v * multiplier;
+            // Infer currency from context: if the text mentions INR/Rs/₹, use INR; else USD
+            let currency = if lower.contains('₹') || lower.contains("rs") || lower.contains("rupee") || lower.contains("inr") {
+                "INR".to_string()
+            } else {
+                "USD".to_string()
+            };
+            return Some(PriceInfo { amount, currency });
+        }
+    }
 
     // 1. Range pattern: "$10 - $20", "$100-$200", "₹1,000 - ₹2,000" -> low bound
     static RE_RANGE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -15232,94 +15327,77 @@ let mut results = match tokio::task::spawn_blocking(move || {
             before_count
         );
     } else {
-        results.retain(|r| {
-            // Alternative-listing page check: keep comparison/alternative pages
-            // even if they mention excluded terms (they are HIGHLY relevant).
-            let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-            let title_lower = r.title.to_lowercase();
-            // Exempt GENUINE alternative-listing / comparison pages from the hard
-            // negative drop. A genuine alt page (alt_score >= 0.70, or an explicit
-            // comparison marker in the title) mentions the excluded term
-            // *referentially* — exactly what an "alternative to X", "except X", or
-            // "without X" query wants (e.g. "25 Alternative Search Engines You Can
-            // Use Instead of Google" for "search engine alternative to google").
-            //
-            // CRITICAL FIX (round 2026-08-15T0830Z): the old gate exempted anything
-            // with alt_score > 0.3. But is_alternative_listing_page() also assigns a
-            // WEAK alt signal (~0.42) to generic "best/top/review" listicle titles
-            // — including a brand's OWN catalog page like "Dell Laptop Computers -
-            // Best Buy" or "Best Dell Laptops". Those are NOT comparison/alternative
-            // listings; they ARE the excluded brand. Exempting them meant "laptops
-            // not dell" still surfaced 6 Dell pages (auditor: before==after,
-            // dropped=0 for the negative hard-filter). The exemption must require a
-            // STRONG comparison signal, not a generic listicle, so brand-owned /
-            // "best <brand>" pages are correctly hard-dropped while true alt pages
-            // survive. This mirrors constraint_score's is_strong_alt_page (>0.5)
-            // convention. We do NOT also require is_comparison_or_alternative_query()
-            // (the word "alternative" is consumed into the negative constraint).
-            let genuine_alt = alt_score >= 0.70
-                || title_lower.contains("alternative")
-                || title_lower.contains(" vs ")
-                || title_lower.contains(" versus ")
-                || title_lower.contains("instead of")
-                || title_lower.contains("replacement")
-                || title_lower.contains("compared to")
-                || title_lower.contains("migrate from");
-            if genuine_alt {
-                return true;
+        // PREVALENCE CHECK (structural, not per-term): when a negative term like
+        // "coding" appears in a query ("build a website without coding"), almost
+        // every relevant result contains that term. Hard-dropping all of them would
+        // collapse a 49-result set to ZERO. Instead, measure what fraction of results
+        // the hard filter would remove; if >80%, fall back to soft demotion (x0.3)
+        // and report the constraint as ignored. This is prevalence-based: it triggers
+        // whenever the exclusion is common in the result set, regardless of which
+        // specific term it is. Genuine exclusions ("python not flask") are unaffected
+        // — their candidate sets never empty.
+        let total_before_prevalence = results.len();
+        let mut would_remove = 0usize;
+        for r in &results {
+            if result_is_genuine_alt_page(r) {
+                continue;
             }
+            if result_matches_any_negative(r, &negative_norm) {
+                would_remove += 1;
+            }
+        }
+        let removal_fraction = if total_before_prevalence > 0 {
+            would_remove as f32 / total_before_prevalence as f32
+        } else {
+            0.0
+        };
 
-            let text = format!("{} {}", r.title, r.url);
-            let text_lower = text.to_lowercase();
-            let text_normalized = {
-                let chars: Vec<char> = text_lower.chars().collect();
-                let mut out = String::with_capacity(chars.len());
-                for (i, &c) in chars.iter().enumerate() {
-                    if c == '.' || c == '-' || c == '_' {
-                        if i > 0
-                            && i + 1 < chars.len()
-                            && chars[i - 1].is_alphanumeric()
-                            && chars[i + 1].is_alphanumeric()
-                        {
-                        } else {
-                            out.push(c);
-                        }
+        if removal_fraction > 0.8 {
+            // SOFT DEMOTION: keep results but demote those matching the negative term.
+            tracing::warn!(
+                "NEGATIVE PREVALENCE: {:.0}% of {} results would be removed by negative constraint {:?}; using soft demotion (x0.3) instead of hard drop",
+                removal_fraction * 100.0, total_before_prevalence, negative_norm
+            );
+            for r in results.iter_mut() {
+                if result_is_genuine_alt_page(r) {
+                    continue;
+                }
+                if result_matches_any_negative(r, &negative_norm) {
+                    r.score *= 0.3;
+                }
+            }
+            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            // Report in ignored_constraints for transparency (D3).
+            ignored.push(format!(
+                "negative constraint {:?} declined — {:.0}% of results would be hard-dropped (prevalence >80%), falling back to soft demotion",
+                intent.structured_constraints.negative, removal_fraction * 100.0
+            ));
+        } else {
+            // ORIGINAL HARD REMOVAL (below the 80% prevalence threshold)
+            results.retain(|r| {
+                if result_is_genuine_alt_page(r) {
+                    return true;
+                }
+                let text = format!("{} {}", r.title, r.url);
+                let text_lower = text.to_lowercase();
+                let text_normalized = normalize_text_for_negative(&text_lower);
+                let should_keep = negative_norm.iter().all(|neg| {
+                    let neg_lower = neg.to_lowercase();
+                    let words: Vec<&str> = neg_lower.split_whitespace().collect();
+                    if words.len() == 1 {
+                        !text_matches_negative(&text_lower, &neg_lower)
                     } else {
-                        out.push(c);
+                        let joined = words.join(" ");
+                        !(text_lower.contains(&joined) || text_normalized.contains(&joined))
                     }
+                });
+                if !should_keep {
+                    tracing::info!("HARD NEGATIVE DROP (post-merge): result \"{}\" (local={}) removed because negative constraint matched (not alt page)",
+                        &r.title.chars().take(50).collect::<String>(), r.is_local);
                 }
-                out
-            };
-
-            let should_keep = negative_norm.iter().all(|neg| {
-                let neg_lower = neg.to_lowercase();
-                let words: Vec<&str> = neg_lower.split_whitespace().collect();
-                if words.len() == 1 {
-                    // Word-boundary aware match — never substring. Prevents
-                    // "not java" from dropping every "javascript" result.
-                    !text_matches_negative(&text_lower, &neg_lower)
-                } else {
-                    let joined = words.join(" ");
-                    !(text_lower.contains(&joined) || text_normalized.contains(&joined))
-                }
+                should_keep
             });
-
-            if !should_keep {
-                tracing::info!("HARD NEGATIVE DROP (post-merge): result \"{}\" (local={}) removed because negative constraint matched (not alt page)",
-                    &r.title.chars().take(50).collect::<String>(), r.is_local);
-            } else {
-                // TITLE-ONLY HARD CHECK: even if alt page, demote by 90% if title contains excluded term
-                let title_lower = r.title.to_lowercase();
-                for nt_after in &negative_norm {
-                    if text_matches_negative(&title_lower, &nt_after.to_lowercase()) {
-                        // Score penalty moved to separate loop before retain
-                        tracing::info!("TITLE HARD PENALTY: title contains excluded term -> score *= 0.01 (penalty applied in separate loop)");
-                        break;
-                    }
-                }
-            }
-            should_keep
-        });
+        }
     }
         let removed = before_count.saturating_sub(results.len());
         if removed > 0 {
