@@ -8608,8 +8608,8 @@ fn merge_local_and_web(
         //     in-budget -> small boost "this is the product");
         //   • if NO price is stated AND the query is a transactional-product query (price
         //     bound present) AND the result shows no price/product lexical signal, demote
-        //     it — almost certainly not the priced product asked for. Generic; no hardcoded
-        //     merchants or domains.
+        //     it (×0.5) — almost certainly not the priced product asked for. Generic; no
+        //     hardcoded merchants or domains.
         let price_bound = constraints.price_max.or(constraints.price_lt)
             .or_else(|| constraints.price_min.or(constraints.price_gt));
         if let Some(_bound) = price_bound {
@@ -8627,19 +8627,15 @@ fn merge_local_and_web(
                     relevance *= 1.10;
                 }
             } else if !price_signal {
-                // Fail-open: only demote price-less results when at least one merged
-                // result actually carries a detectable price. When NO result has a
-                // price (the normal web-snippet case), demoting every price-less
-                // result would collapse a valid product query to zero results — so
-                // the bound stays ranking-only and the gap is reported via
-                // `ignored_constraints`. This replaces the old PRICE FAIL-OPEN branch
-                // that MUTATED `structured_constraints` (deleting the user's stated
-                // price bound), which misrepresented the query to downstream
-                // consumers (notably commerce/shopping). Extraction truth is now
-                // preserved regardless of upstream price availability.
-                if priced_result_count > 0 {
-                    relevance *= 0.45;
-                }
+                // Demote price-less results for transactional queries with a price
+                // bound. They might still be relevant (e.g., a product category
+                // page), but the user asked for products within a budget and this
+                // result shows no price. Gentle demotion (×0.5) — never hard-drop.
+                // Applied regardless of priced_result_count: even when NO result
+                // carries a parseable price, price-less pages rank below any that
+                // do mention a price/price-signal, which is the correct semantic
+                // for a transactional-product query.
+                relevance *= 0.5;
             }
         }
 
