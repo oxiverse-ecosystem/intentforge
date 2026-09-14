@@ -3143,6 +3143,11 @@ struct OfferFacts {
     price_high: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offer_count: Option<usize>,
+    /// Product image URL extracted from the page (JSON-LD `image`, OpenGraph
+    /// `og:image`, microdata `itemprop="image"`, or RDFa `property="image"`).
+    /// Always a URL string from structured data — never guessed from free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3388,6 +3393,9 @@ fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
     }
     if dst.offer_count.is_none() {
         dst.offer_count = src.offer_count;
+    }
+    if dst.image.is_none() {
+        dst.image = src.image.clone();
     }
 }
 
