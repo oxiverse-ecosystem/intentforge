@@ -3434,6 +3434,10 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
     let content_re = CONTENT_RE.get_or_init(|| {
         regex::Regex::new(r#"(?i)content\s*=\s*["']([^"']*)["']"#).unwrap()
     });
+    static HREF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let href_re = HREF_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)href\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
 
     let mut o = OfferFacts::default();
 
@@ -3508,8 +3512,22 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
             .captures(tag)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
+        let href = href_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let src = src_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
         if let Some(p) = prop {
-            if let Some(v) = content {
+            // For image, prefer href (link itemprop="image" href=...) then
+            // content (meta itemprop="image" content=...) then src.
+            if p == "image" {
+                if let Some(v) = href.or(content).or(src) {
+                    apply(&p, &v);
+                }
+            } else if let Some(v) = content {
                 apply(&p, &v);
             } else {
                 // Text content form: extract text after the tag until the next '<'.
@@ -3573,6 +3591,14 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
     static CONTENT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let content_re = CONTENT_RE.get_or_init(|| {
         regex::Regex::new(r#"(?i)content\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static HREF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let href_re = HREF_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)href\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let src_re = SRC_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
     });
 
     let mut o = OfferFacts::default();
@@ -3654,8 +3680,22 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
             .captures(tag)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
+        let href = href_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let src = src_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
         if let Some(p) = prop {
-            if let Some(v) = content {
+            // For image, prefer href (link itemprop="image" href=...) then
+            // content (meta itemprop="image" content=...) then src.
+            if p == "image" {
+                if let Some(v) = href.or(content).or(src) {
+                    apply(&p, &v);
+                }
+            } else if let Some(v) = content {
                 apply(&p, &v);
             } else {
                 // Text content form: extract text after the tag until the next '<'.
