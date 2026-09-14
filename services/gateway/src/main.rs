@@ -8582,8 +8582,9 @@ fn merge_local_and_web(
             let is_comparison_intent = intent == "comparison" || intent == "technical";
             if r.quality < 0.55 && !topic_mentioned {
                 relevance *= 0.05;
+                p2d_offtopic = true;
                 tracing::info!(
-                    "LOCAL NOISE GATE: '{}' quality={:.2} topic_mentioned={} -> relevance crushed",
+                    "LOCAL NOISE GATE: '{}' quality={:.2} topic_mentioned={} -> relevance crushed + p2d_offtopic",
                     r.url.chars().take(60).collect::<String>(), r.quality, topic_mentioned
                 );
             } else if r.quality < 0.75 && !topic_mentioned {
