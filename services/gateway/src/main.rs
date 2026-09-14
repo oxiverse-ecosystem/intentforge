@@ -3731,12 +3731,24 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
 
     // 5) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
-    if facts.merchant.is_none() {
-        if let Ok(parsed) = reqwest::Url::parse(url) {
-            if let Some(host) = parsed.host_str() {
-                facts.merchant = Some(host.to_string());
-            }
+    // Seller always takes precedence over brand (more specific). A Product
+    // node may set brand first; a nested Offer node's seller overwrites it.
+    if let Some(seller) = n.get("seller") {
+        facts.merchant = seller
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+    } else if facts.merchant.is_none() {
+        if let Some(brand) = n.get("brand") {
+            facts.merchant = match brand {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(o) => {
+                    o.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
+                }
+                _ => None,
+            };
         }
+    }
     }
 
     CommerceOffer {
@@ -3917,23 +3929,25 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
                 }
             }
         }
-        if facts.merchant.is_none() {
-            if let Some(seller) = n.get("seller") {
-                facts.merchant =
-                    seller.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
-            }
-            if facts.merchant.is_none() {
-                if let Some(brand) = n.get("brand") {
-                    facts.merchant = match brand {
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        serde_json::Value::Object(o) => {
-                            o.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
-                        }
-                        _ => None,
-                    };
-                }
+        // Seller always takes precedence over brand (more specific). A Product
+        // node may set brand first; a nested Offer node's seller overwrites it.
+        if let Some(seller) = n.get("seller") {
+            facts.merchant = seller
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        } else if facts.merchant.is_none() {
+            if let Some(brand) = n.get("brand") {
+                facts.merchant = match brand {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Object(o) => {
+                        o.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    }
+                    _ => None,
+                };
             }
         }
+
         if facts.image.is_none() {
             facts.image = extract_jsonld_image(n);
         }
