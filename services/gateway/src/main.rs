@@ -14167,6 +14167,12 @@ async fn handle_search(
 
         // Override 5: Comparison & Alternatives signals (H2 fix)
         // e.g. "alternatives to adobe photoshop that are free", "best budget smartphones under 30000 rupees"
+        // Skip when the query is a how-to/explanation question — "how does X work" +
+        // "apps like X" is referential, not a comparison request. The "apps like"/"tools like"
+        // signals are legitimately comparative in isolation but NOT when the query opens with
+        // a how-to frame (the user is asking for an explanation of a category, not "which is better").
+        let is_howto_question = q_lower.starts_with("how ") || q_lower.starts_with("what is ") || q_lower.starts_with("what are ")
+            || q_lower.starts_with("why ") || q_lower.starts_with("explain ") || q_lower.starts_with("can you explain ");
         let comp_signals = [
             "alternatives to", "alternative to", "alternatives for", "alternative for",
             "similar to", "apps like", "tools like", "software like", "sites like",
@@ -14174,11 +14180,22 @@ async fn handle_search(
             "best budget", "best ... under", "top ... under", "compared to", "difference between",
             "which is better", "comparison", "compare "
         ];
+        // Referential signals ("apps like X in how does X work") — these only signal
+        // comparison when NOT inside a how-to/explanation question.
+        let referential_signals = ["apps like", "tools like", "software like", "sites like",
+                                   "similar to", "equivalent to", "replacement for",
+                                   "competing with", "best budget", "best ... under",
+                                   "top ... under"];
         let has_comp_signal = comp_signals.iter().any(|s| {
             if s.contains("...") {
                 let parts: Vec<&str> = s.split("...").collect();
                 parts.len() == 2 && q_lower.contains(parts[0].trim()) && q_lower.contains(parts[1].trim())
             } else {
+                // In a how-to question, skip referential signals — they're category
+                // membership markers ("encryption in apps like signal"), not comparison requests.
+                if is_howto_question && referential_signals.contains(s) {
+                    return false;
+                }
                 q_lower.contains(s)
             }
         });
