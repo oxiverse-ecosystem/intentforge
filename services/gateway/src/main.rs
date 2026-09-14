@@ -3337,6 +3337,292 @@ fn json_get_u64(v: &serde_json::Value) -> Option<u64> {
     }
 }
 
+fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
+    if dst.price.is_none() {
+        dst.price = src.price;
+    }
+    if dst.currency.is_none() {
+        dst.currency = src.currency.clone();
+    }
+    if dst.availability.is_none() {
+        dst.availability = src.availability.clone();
+    }
+    if dst.merchant.is_none() {
+        dst.merchant = src.merchant.clone();
+    }
+    if dst.condition.is_none() {
+        dst.condition = src.condition.clone();
+    }
+    if dst.sku.is_none() {
+        dst.sku = src.sku.clone();
+    }
+    if dst.gtin.is_none() {
+        dst.gtin = src.gtin.clone();
+    }
+    if dst.rating.is_none() {
+        dst.rating = src.rating;
+    }
+    if dst.rating_count.is_none() {
+        dst.rating_count = src.rating_count;
+    }
+    if dst.price_low.is_none() {
+        dst.price_low = src.price_low;
+    }
+    if dst.price_high.is_none() {
+        dst.price_high = src.price_high;
+    }
+    if dst.offer_count.is_none() {
+        dst.offer_count = src.offer_count;
+    }
+}
+
+/// True when the page declares a Product or Offer via microdata `itemtype`.
+fn has_microdata_product(html: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)itemtype\s*=\s*["'][^"']*(?:product|offer)[^"']*["']"#,
+        )
+        .unwrap()
+    });
+    re.is_match(html)
+}
+
+/// Extract product facts from HTML microdata (itemprop/itemscope).
+/// Only fires when the page carries a Product/Offer `itemtype`, so
+/// non-product pages (Article, Event, …) never trigger it.
+fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
+    if !has_microdata_product(html) {
+        return None;
+    }
+
+    static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tag_re = TAG_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)<\w+\b[^>]*itemprop[^>]*>"#).unwrap()
+    });
+    static PROP_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let prop_re = PROP_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)itemprop\s*=\s*["']([^"']+)["']"#).unwrap()
+    });
+    static CONTENT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let content_re = CONTENT_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)content\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+
+    let mut o = OfferFacts::default();
+
+    let mut apply = |prop: &str, val: &str| {
+        if val.is_empty() {
+            return;
+        }
+        match prop {
+            "price" => {
+                if o.price.is_none() {
+                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
+                        o.price = Some(v);
+                    }
+                }
+            }
+            "pricecurrency" => {
+                if o.currency.is_none() {
+                    o.currency = Some(val.to_string());
+                }
+            }
+            "availability" => {
+                if o.availability.is_none() {
+                    o.availability = Some(val.to_string());
+                }
+            }
+            "itemcondition" => {
+                if o.condition.is_none() {
+                    o.condition = Some(val.to_string());
+                }
+            }
+            "sku" => {
+                if o.sku.is_none() {
+                    o.sku = Some(val.to_string());
+                }
+            }
+            "gtin13" | "gtin14" | "gtin8" | "gtin" | "mpn" => {
+                if o.gtin.is_none() {
+                    o.gtin = Some(val.to_string());
+                }
+            }
+            "brand" | "seller" | "name" => {
+                if o.merchant.is_none() {
+                    o.merchant = Some(val.to_string());
+                }
+            }
+            "ratingvalue" => {
+                if o.rating.is_none() {
+                    o.rating = val.parse::<f64>().ok();
+                }
+            }
+            "reviewcount" | "ratingcount" => {
+                if o.rating_count.is_none() {
+                    o.rating_count = val.parse::<u64>().ok();
+                }
+            }
+            _ => {}
+        }
+    };
+
+    for tag_cap in tag_re.captures_iter(html) {
+        let tag = tag_cap.get(0).unwrap().as_str();
+        let prop = prop_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_lowercase());
+        let content = content_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        if let (Some(p), Some(v)) = (prop, content) {
+            apply(&p, &v);
+        }
+    }
+
+    if o.price.is_none()
+        && o.currency.is_none()
+        && o.availability.is_none()
+        && o.merchant.is_none()
+        && o.condition.is_none()
+        && o.sku.is_none()
+        && o.gtin.is_none()
+        && o.rating.is_none()
+        && o.rating_count.is_none()
+    {
+        return None;
+    }
+    Some(o)
+}
+
+/// True when the page carries product-ish RDFa (typeof/property on Product/Offer/price).
+fn has_rdfa_product(html: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)(?:typeof|property)\s*=\s*["'][^"']*(?:product|offer|price|currency|availability|sku|gtin)[^"']*["']"#,
+        )
+        .unwrap()
+    });
+    re.is_match(html)
+}
+
+/// Extract product facts from RDFa (property attribute with `schema:` prefix or full URI).
+/// Only fires on pages that look product-ish.
+fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
+    if !has_rdfa_product(html) {
+        return None;
+    }
+
+    static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tag_re = TAG_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)<\w+\b[^>]*property[^>]*>"#).unwrap()
+    });
+    static PROP_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let prop_re = PROP_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)property\s*=\s*["']([^"']+)["']"#).unwrap()
+    });
+    static CONTENT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let content_re = CONTENT_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)content\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+
+    let mut o = OfferFacts::default();
+
+    let mut apply = |prop: &str, val: &str| {
+        if val.is_empty() {
+            return;
+        }
+        // Strip schema: prefix or full schema.org URI.
+        let stripped = prop
+            .strip_prefix("schema:")
+            .or_else(|| prop.strip_prefix("http://schema.org/"))
+            .or_else(|| prop.strip_prefix("https://schema.org/"))
+            .unwrap_or(prop);
+        match stripped {
+            "price" => {
+                if o.price.is_none() {
+                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
+                        o.price = Some(v);
+                    }
+                }
+            }
+            "pricecurrency" => {
+                if o.currency.is_none() {
+                    o.currency = Some(val.to_string());
+                }
+            }
+            "availability" => {
+                if o.availability.is_none() {
+                    o.availability = Some(val.to_string());
+                }
+            }
+            "itemcondition" => {
+                if o.condition.is_none() {
+                    o.condition = Some(val.to_string());
+                }
+            }
+            "sku" => {
+                if o.sku.is_none() {
+                    o.sku = Some(val.to_string());
+                }
+            }
+            "gtin13" | "gtin14" | "gtin8" | "gtin" | "mpn" => {
+                if o.gtin.is_none() {
+                    o.gtin = Some(val.to_string());
+                }
+            }
+            "brand" | "seller" | "name" => {
+                if o.merchant.is_none() {
+                    o.merchant = Some(val.to_string());
+                }
+            }
+            "ratingvalue" => {
+                if o.rating.is_none() {
+                    o.rating = val.parse::<f64>().ok();
+                }
+            }
+            "reviewcount" | "ratingcount" => {
+                if o.rating_count.is_none() {
+                    o.rating_count = val.parse::<u64>().ok();
+                }
+            }
+            _ => {}
+        }
+    };
+
+    for tag_cap in tag_re.captures_iter(html) {
+        let tag = tag_cap.get(0).unwrap().as_str();
+        let prop = prop_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_lowercase());
+        let content = content_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        if let (Some(p), Some(v)) = (prop, content) {
+            apply(&p, &v);
+        }
+    }
+
+    if o.price.is_none()
+        && o.currency.is_none()
+        && o.availability.is_none()
+        && o.merchant.is_none()
+        && o.condition.is_none()
+        && o.sku.is_none()
+        && o.gtin.is_none()
+        && o.rating.is_none()
+        && o.rating_count.is_none()
+    {
+        return None;
+    }
+    Some(o)
+}
+
 fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     let mut facts = OfferFacts::default();
     let mut source: Option<String> = None;
@@ -3353,19 +3639,34 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     // 2) Fallback / supplement: OpenGraph product:* meta (only when no price yet).
     if facts.price.is_none() && facts.price_low.is_none() {
         if let Some(og) = parse_og_product(html) {
-            if facts.price.is_none() { facts.price = og.price; }
-            if facts.currency.is_none() { facts.currency = og.currency; }
-            if facts.availability.is_none() { facts.availability = og.availability; }
-            if facts.condition.is_none() { facts.condition = og.condition; }
-            if facts.merchant.is_none() { facts.merchant = og.merchant; }
-            if facts.gtin.is_none() { facts.gtin = og.gtin; }
-            if facts.rating.is_none() { facts.rating = og.rating; }
-            if facts.rating_count.is_none() { facts.rating_count = og.rating_count; }
-            if source.is_none() { source = Some("og".to_string()); }
+            merge_offer_facts(&mut facts, &og);
+            if source.is_none() {
+                source = Some("og".to_string());
+            }
         }
     }
 
-    // 3) Merchant fallback: derive a coarse host label only when no page-provided
+    // 3) Fallback: microdata (only when no price yet).
+    if facts.price.is_none() && facts.price_low.is_none() {
+        if let Some(md) = parse_microdata_product(html) {
+            merge_offer_facts(&mut facts, &md);
+            if source.is_none() {
+                source = Some("microdata".to_string());
+            }
+        }
+    }
+
+    // 4) Fallback: RDFa (only when no price yet).
+    if facts.price.is_none() && facts.price_low.is_none() {
+        if let Some(rdf) = parse_rdfa_product(html) {
+            merge_offer_facts(&mut facts, &rdf);
+            if source.is_none() {
+                source = Some("rdfa".to_string());
+            }
+        }
+    }
+
+    // 5) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
