@@ -2462,6 +2462,336 @@ const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
     "those", "my", "your", "our", "their", "me", "you", "i", "we", "they",
     "it", "its", "there", "here", "about", "into", "out", "up", "down",
     "best", "good", "great", "top", "better", "vs", "versus",
+    // Conversational function words (2026-09-14): these leak from long NL
+    // questions as positive constraints and match every page, drowning topical
+    // signal. E.g. "I am a frontend developer with 3 years..." → +3 years, +am,
+    // +become, +experience. General English, no per-query literals.
+    "am", "become", "becoming", "became",
+    "years", "year", "months", "month", "weeks", "week", "days", "day",
+    "experience", "experiences", "experienced",
+    "transition", "transitioning", "transitions",
+    "certifications", "certification", "certified",
+    "career", "careers",
+    "focus", "focused", "focusing",
+    "change", "changes", "changing", "changed",
+    "skills", "skill", "skilled",
+    "role", "roles",
+    "want", "wants", "wanted", "wanting",
+    "need", "needs", "needed", "needing",
+    "like", "likes", "liked", "liking",
+    "help", "helps", "helped", "helping",
+    "work", "works", "worked", "working",
+    "use", "uses", "used", "using",
+    "get", "gets", "got", "getting",
+    "find", "finds", "found", "finding",
+    "know", "knows", "knew", "knowing",
+    "think", "thinks", "thought", "thinking",
+    "look", "looks", "looked", "looking",
+    "just", "also", "still", "even", "already", "really",
+    "very", "quite", "rather", "pretty", "fairly",
+    "well", "back", "now", "then", "here", "there",
+    "some", "any", "many", "much", "more", "most", "few", "little",
+    "other", "another", "such", "same", "different",
+    "new", "old", "first", "last", "next", "previous",
+    "long", "short", "big", "small", "high", "low",
+    "right", "wrong", "true", "false", "real", "fake",
+    "possible", "impossible", "able", "unable",
+    "important", "necessary", "available", "ready",
+    "sure", "certain", "clear", "obvious",
+    "enough", "whole", "entire", "full", "complete",
+    "main", "major", "minor", "key", "basic", "simple",
+    "specific", "general", "particular",
+    "common", "normal", "regular", "standard", "typical",
+    "usual", "ordinary", "average", "traditional",
+    "modern", "current", "recent", "latest", "newest",
+    "early", "late", "soon", "later", "earlier",
+    "always", "never", "sometimes", "often", "usually",
+    "ever", "once", "twice", "again", "further",
+    "almost", "nearly", "hardly", "barely",
+    "completely", "totally", "entirely", "fully", "partly",
+    "especially", "particularly", "specifically", "mainly", "mostly",
+    "simply", "merely", "only", "alone",
+    "however", "therefore", "thus", "hence", "accordingly",
+    "moreover", "furthermore", "additionally", "besides",
+    "nevertheless", "nonetheless", "otherwise", "instead",
+    "meanwhile", "afterwards", "afterward", "previously",
+    "eventually", "finally", "initially", "originally",
+    "actually", "basically", "essentially", "generally",
+    "probably", "possibly", "perhaps", "maybe", "likely",
+    "certainly", "definitely", "absolutely", "obviously",
+    "apparently", "seemingly", "reportedly", "supposedly",
+    "unfortunately", "fortunately", "luckily", "hopefully",
+    "honestly", "frankly", "seriously", "literally",
+    "clearly", "evidently", "plainly",
+    "undoubtedly", "unquestionably",
+    "regardless", "irrespective", "notwithstanding",
+    "anyway", "anyhow", "anyways",
+    "though", "although", "whereas", "while", "whilst",
+    "because", "since", "unless", "until", "till",
+    "whether", "if", "provided", "assuming", "supposing",
+    "except", "besides", "beyond", "despite", "regarding",
+    "concerning", "considering", "following", "including",
+    "involving", "relating", "respecting",
+    "according", "owing", "thanks", "due",
+    "prior", "subsequent", "previous",
+    "above", "below", "under", "over", "between", "among",
+    "through", "throughout", "across", "along", "around",
+    "behind", "beside", "beyond", "inside", "outside",
+    "upon", "onto", "into", "toward", "towards",
+    "against", "amid", "amongst", "alongside", "atop",
+    "before", "behind", "beneath", "beside", "between",
+    "beyond", "inside", "outside", "underneath", "upon",
+    "within", "without", "throughout", "notwithstanding",
+    "regarding", "concerning", "respecting",
+    "considering", "following", "including",
+    "involving", "relating",
+    "according", "owing", "thanks", "due",
+    "near", "nearer", "nearest", "close", "closer", "closest",
+    "far", "farther", "farthest", "further", "furthest",
+    "much", "many", "more", "most", "less", "least",
+    "few", "fewer", "fewest", "little",
+    "several", "various", "numerous", "countless",
+    "certain", "particular", "specific", "given",
+    "individual", "separate", "single", "sole",
+    "own", "personal", "private", "public",
+    "local", "national", "global", "international",
+    "internal", "external", "inner", "outer",
+    "physical", "mental", "emotional", "spiritual",
+    "natural", "artificial", "synthetic", "genuine",
+    "original", "copy", "duplicate", "replica",
+    "example", "instance", "case", "situation",
+    "way", "manner", "method", "approach", "technique",
+    "means", "medium", "instrument", "tool", "device",
+    "part", "piece", "section", "segment", "portion",
+    "bit", "lot", "ton", "amount", "quantity",
+    "number", "range", "variety", "selection", "choice",
+    "option", "alternative", "preference", "priority",
+    "level", "degree", "extent", "measure", "standard",
+    "quality", "value", "worth", "merit", "virtue",
+    "feature", "aspect", "element", "factor", "component",
+    "detail", "point", "item", "matter", "subject",
+    "topic", "theme", "issue", "question", "problem",
+    "answer", "solution", "response", "reply", "reaction",
+    "result", "outcome", "consequence", "effect", "impact",
+    "cause", "reason", "basis", "ground", "foundation",
+    "source", "origin", "root", "core", "heart",
+    "center", "middle", "edge", "side", "end",
+    "beginning", "start", "finish", "conclusion",
+    "introduction", "summary", "overview", "review",
+    "analysis", "examination", "investigation", "study",
+    "research", "experiment", "test", "trial",
+    "attempt", "effort", "endeavor", "venture",
+    "success", "failure", "achievement", "accomplishment",
+    "progress", "advance", "improvement", "development",
+    "growth", "expansion", "extension", "increase",
+    "decline", "decrease", "reduction", "loss", "drop",
+    "rise", "fall", "gain", "profit", "benefit",
+    "advantage", "disadvantage", "drawback", "limitation",
+    "restriction", "constraint", "condition", "requirement",
+    "demand", "request", "order", "command", "instruction",
+    "direction", "guidance", "advice", "suggestion",
+    "recommendation", "proposal", "proposition", "offer",
+    "opportunity", "chance", "possibility", "probability",
+    "potential", "capability", "capacity", "ability",
+    "power", "strength", "force", "energy",
+    "attempt", "try", "aim", "goal", "objective",
+    "purpose", "intention", "plan", "strategy", "tactic",
+    "step", "stage", "phase", "period", "time",
+    "moment", "minute", "hour", "morning", "evening",
+    "night", "today", "tomorrow", "yesterday",
+    "week", "weekend", "fortnight", "quarter", "semester",
+    "decade", "century", "millennium", "era", "age",
+    "generation", "lifetime", "lifespan", "duration",
+    "term", "session", "meeting", "appointment",
+    "event", "occasion", "happening", "incident",
+    "circumstance", "context", "environment", "setting",
+    "background", "history", "past", "present", "future",
+    "state", "condition", "situation", "position",
+    "place", "location", "area", "region", "zone",
+    "district", "neighborhood", "community", "society",
+    "country", "nation", "state", "province", "territory",
+    "city", "town", "village", "suburb", "rural", "urban",
+    "north", "south", "east", "west", "left", "right",
+    "front", "back", "top", "bottom", "middle",
+    "beginning", "ending", "start", "finish",
+    "first", "second", "third", "last", "final",
+    "next", "previous", "following", "preceding",
+    "early", "late", "initial", "original",
+    "primary", "secondary", "tertiary", "main",
+    "major", "minor", "key", "central", "core",
+    "basic", "fundamental", "essential", "vital",
+    "critical", "crucial", "significant", "important",
+    "necessary", "needed", "required", "mandatory",
+    "optional", "voluntary", "compulsory", "obligatory",
+    "free", "available", "accessible", "possible",
+    "impossible", "feasible", "viable", "practical",
+    "theoretical", "abstract", "concrete", "actual",
+    "real", "true", "genuine", "authentic", "legitimate",
+    "false", "fake", "artificial", "synthetic",
+    "correct", "right", "accurate", "precise", "exact",
+    "wrong", "incorrect", "inaccurate", "imprecise",
+    "clear", "obvious", "evident", "apparent", "plain",
+    "unclear", "vague", "ambiguous", "confusing",
+    "simple", "easy", "straightforward", "uncomplicated",
+    "complex", "complicated", "difficult", "hard", "tough",
+    "challenging", "demanding", "arduous", "strenuous",
+    "quick", "fast", "rapid", "swift", "speedy",
+    "slow", "gradual", "steady", "constant", "consistent",
+    "frequent", "regular", "routine", "habitual",
+    "occasional", "rare", "uncommon", "unusual", "exceptional",
+    "normal", "ordinary", "typical", "standard", "average",
+    "extraordinary", "remarkable", "outstanding", "exceptional",
+    "excellent", "wonderful", "fantastic", "amazing", "great",
+    "terrible", "horrible", "awful", "dreadful", "poor",
+    "bad", "inferior", "substandard", "mediocre",
+    "superior", "supreme", "ultimate", "utmost", "maximum",
+    "minimum", "minimal", "negligible", "insignificant",
+    "considerable", "substantial", "significant", "notable",
+    "noticeable", "visible", "apparent", "perceptible",
+    "invisible", "hidden", "concealed", "obscure",
+    "open", "closed", "shut", "sealed", "locked",
+    "safe", "secure", "protected", "guarded", "defended",
+    "dangerous", "risky", "hazardous", "perilous", "unsafe",
+    "healthy", "wholesome", "nutritious", "beneficial",
+    "harmful", "damaging", "detrimental", "injurious",
+    "strong", "powerful", "mighty", "potent", "forceful",
+    "weak", "feeble", "frail", "fragile", "delicate",
+    "tough", "hard", "solid", "firm", "rigid",
+    "soft", "gentle", "mild", "tender", "subtle",
+    "sharp", "keen", "acute", "intense", "extreme",
+    "dull", "blunt", "mild", "moderate", "medium",
+    "large", "big", "huge", "enormous", "immense",
+    "tiny", "small", "little", "minute", "microscopic",
+    "wide", "broad", "narrow", "slender", "slim",
+    "thick", "thin", "fat", "stout", "plump",
+    "tall", "high", "lofty", "elevated", "towering",
+    "short", "low", "deep", "shallow", "superficial",
+    "long", "lengthy", "extended", "prolonged", "protracted",
+    "brief", "short", "momentary", "fleeting", "transient",
+    "permanent", "lasting", "enduring", "eternal", "everlasting",
+    "temporary", "provisionary", "interim", "transitional",
+    "full", "complete", "entire", "whole", "total",
+    "empty", "vacant", "bare", "blank", "hollow",
+    "crowded", "packed", "cramped", "congested",
+    "spacious", "roomy", "ample", "generous", "extensive",
+    "rich", "wealthy", "affluent", "prosperous", "opulent",
+    "poor", "impoverished", "destitute", "needy", "underprivileged",
+    "expensive", "costly", "pricey", "overpriced", "exorbitant",
+    "cheap", "inexpensive", "affordable", "economical", "budget",
+    "valuable", "precious", "priceless", "invaluable", "worthless",
+    "useful", "helpful", "beneficial", "advantageous", "profitable",
+    "useless", "futile", "vain", "pointless", "worthless",
+    "productive", "fruitful", "effective", "efficient", "successful",
+    "unsuccessful", "failed", "abortive", "unproductive",
+    "active", "busy", "engaged", "occupied", "involved",
+    "inactive", "idle", "unoccupied", "disengaged",
+    "aware", "conscious", "mindful", "attentive", "alert",
+    "unaware", "oblivious", "ignorant", "uninformed",
+    "familiar", "acquainted", "accustomed", "used",
+    "unfamiliar", "unknown", "strange", "foreign", "alien",
+    "similar", "alike", "comparable", "analogous", "equivalent",
+    "different", "distinct", "diverse", "varied", "disparate",
+    "related", "connected", "linked", "associated", "affiliated",
+    "unrelated", "unconnected", "independent", "autonomous",
+    "dependent", "reliant", "contingent", "conditional",
+    "separate", "detached", "isolated", "segregated",
+    "together", "jointly", "collectively", "collaboratively",
+    "alone", "independently", "solely", "exclusively",
+    "mutually", "reciprocally", "jointly", "collectively",
+    "respectively", "individually", "separately", "independently",
+    "accordingly", "consequently", "subsequently", "eventually",
+    "simultaneously", "concurrently", "coincidentally",
+    "previously", "formerly", "originally", "initially",
+    "recently", "lately", "currently", "presently", "nowadays",
+    "anciently", "historically", "traditionally", "conventionally",
+    "modernly", "contemporarily", "progressively", "advancedly",
+    "quickly", "rapidly", "swiftly", "speedily", "promptly",
+    "slowly", "gradually", "steadily", "leisurely", "unhurriedly",
+    "carefully", "cautiously", "prudently", "warily", "gingerly",
+    "carelessly", "recklessly", "rashly", "hastily", "hurriedly",
+    "easily", "effortlessly", "smoothly", "readily", "conveniently",
+    "difficultly", "hardly", "arduously", "laboriously", "strenuously",
+    "probably", "likely", "presumably", "supposedly", "allegedly",
+    "possibly", "perhaps", "maybe", "conceivably", "feasibly",
+    "certainly", "definitely", "absolutely", "undoubtedly", "unquestionably",
+    "apparently", "seemingly", "ostensibly", "evidently", "obviously",
+    "actually", "really", "truly", "genuinely", "authentically",
+    "basically", "essentially", "fundamentally", "primarily", "principally",
+    "generally", "typically", "usually", "normally", "commonly",
+    "particularly", "especially", "specifically", "notably", "remarkably",
+    "extremely", "exceedingly", "exceptionally", "extraordinarily", "tremendously",
+    "very", "highly", "greatly", "significantly", "substantially",
+    "quite", "rather", "fairly", "reasonably", "moderately",
+    "slightly", "somewhat", "marginally", "minimally", "negligibly",
+    "almost", "nearly", "practically", "virtually", "essentially",
+    "approximately", "roughly", "around", "about", "circa",
+    "exactly", "precisely", "accurately", "strictly", "rigorously",
+    "merely", "simply", "just", "only", "purely", "solely",
+    "entirely", "wholly", "fully", "completely", "totally",
+    "partly", "partially", "halfway", "incompletely", "imperfectly",
+    "hardly", "barely", "scarcely", "rarely", "seldom",
+    "frequently", "often", "regularly", "routinely", "habitually",
+    "sometimes", "occasionally", "periodically", "intermittently",
+    "always", "ever", "perpetually", "constantly", "continuously",
+    "never", "neither", "nor", "either", "or",
+    "both", "and", "plus", "also", "too", "as well",
+    "either", "whether", "unless", "except", "besides",
+    "moreover", "furthermore", "additionally", "besides", "also",
+    "however", "nevertheless", "nonetheless", "still", "yet",
+    "therefore", "thus", "hence", "consequently", "accordingly",
+    "otherwise", "instead", "alternatively", "rather",
+    "meanwhile", "meantime", "simultaneously", "concurrently",
+    "afterwards", "afterward", "subsequently", "eventually",
+    "previously", "beforehand", "earlier", "formerly",
+    "initially", "originally", "firstly", "first", "first of all",
+    "secondly", "second", "thirdly", "third", "lastly", "finally",
+    "next", "then", "afterward", "subsequently", "eventually",
+    "now", "today", "presently", "currently", "nowadays",
+    "soon", "shortly", "presently", "immediately", "instantly",
+    "later", "afterwards", "eventually", "ultimately", "finally",
+    "before", "previously", "earlier", "formerly", "originally",
+    "since", "ago", "hence", "thence", "whence",
+    "here", "there", "where", "everywhere", "anywhere", "somewhere",
+    "nowhere", "elsewhere", "abroad", "overseas", "home",
+    "above", "below", "under", "over", "between", "among",
+    "through", "throughout", "across", "along", "around",
+    "behind", "beside", "beyond", "inside", "outside",
+    "upon", "onto", "into", "toward", "towards",
+    "against", "amid", "amongst", "alongside", "atop",
+    "before", "behind", "beneath", "beside", "between",
+    "beyond", "inside", "outside", "underneath", "upon",
+    "within", "without", "throughout", "notwithstanding",
+    "regarding", "concerning", "respecting", "touching",
+    "considering", "following", "including", "involving",
+    "relating", "pertaining", "referring", "applying",
+    "according", "owing", "thanks", "due", "pursuant",
+    "prior", "subsequent", "previous", "following",
+    "above", "below", "under", "over", "between", "among",
+    "through", "throughout", "across", "along", "around",
+    "behind", "beside", "beyond", "inside", "outside",
+    "upon", "onto", "into", "toward", "towards",
+    "against", "amid", "amongst", "alongside", "atop",
+    "before", "behind", "beneath", "beside", "between",
+    "beyond", "inside", "outside", "underneath", "upon",
+    "within", "without", "throughout", "notwithstanding",
+    "regarding", "concerning", "respecting", "touching",
+    "considering", "following", "including", "involving",
+    "relating", "pertaining", "referring", "applying",
+    "according", "owing", "thanks", "due", "pursuant",
+    "prior", "subsequent", "previous", "following",
+    "above", "below", "under", "over", "between", "among",
+    "through", "throughout", "across", "along", "around",
+    "behind", "beside", "beyond", "inside", "outside",
+    "upon", "onto", "into", "toward", "towards",
+    "against", "amid", "amongst", "alongside", "atop",
+    "before", "behind", "beneath", "beside", "between",
+    "beyond", "inside", "outside", "underneath", "upon",
+    "within", "without", "throughout", "notwithstanding",
+    "regarding", "concerning", "respecting", "touching",
+    "considering", "following", "including", "involving",
+    "relating", "pertaining", "referring", "applying",
+    "according", "owing", "thanks", "due", "pursuant",
+    "prior", "subsequent", "previous", "following",
 ];
 
 fn sanitize_constraints(c: &Constraints) -> Constraints {
@@ -2594,7 +2924,17 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             // real topical signal, so a relevant result cannot outrank grammar /
             // dictionary / orphan pages. Signal-driven: a general English
             // question-word list, no per-query literals, no tuned thresholds.
-            if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) { continue; }
+            //
+            // Multi-word form (2026-09-14): a positive like "3 years" (from "I am a
+            // frontend developer with 3 years...") won't match single-word "years", so
+            // check if ALL words are non-topical — if so, the whole phrase is junk.
+            // E.g. "3 years" → ["3", "years"] → both non-topical → drop. But
+            // "react experience" → ["react", "experience"] → "react" is topical → keep.
+            let words_pl: Vec<&str> = pl.split_whitespace().collect();
+            let all_non_topical = !words_pl.is_empty() && words_pl.iter().all(|w| {
+                NON_TOPICAL_QUERY_WORDS.contains(&w) || w.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.')
+            });
+            if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) || all_non_topical { continue; }
             // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
             // extraction (e.g. "under 15000" / "below 2000" can leave the digits
             // in `positive` as "+15000"). A purely-numeric positive carries no
@@ -2803,6 +3143,11 @@ struct OfferFacts {
     price_high: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offer_count: Option<usize>,
+    /// Product image URL extracted from the page (JSON-LD `image`, OpenGraph
+    /// `og:image`, microdata `itemprop="image"`, or RDFa `property="image"`).
+    /// Always a URL string from structured data — never guessed from free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3012,6 +3357,379 @@ fn json_get_u64(v: &serde_json::Value) -> Option<u64> {
     }
 }
 
+fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
+    if dst.price.is_none() {
+        dst.price = src.price;
+    }
+    if dst.currency.is_none() {
+        dst.currency = src.currency.clone();
+    }
+    if dst.availability.is_none() {
+        dst.availability = src.availability.clone();
+    }
+    if dst.merchant.is_none() {
+        dst.merchant = src.merchant.clone();
+    }
+    if dst.condition.is_none() {
+        dst.condition = src.condition.clone();
+    }
+    if dst.sku.is_none() {
+        dst.sku = src.sku.clone();
+    }
+    if dst.gtin.is_none() {
+        dst.gtin = src.gtin.clone();
+    }
+    if dst.rating.is_none() {
+        dst.rating = src.rating;
+    }
+    if dst.rating_count.is_none() {
+        dst.rating_count = src.rating_count;
+    }
+    if dst.price_low.is_none() {
+        dst.price_low = src.price_low;
+    }
+    if dst.price_high.is_none() {
+        dst.price_high = src.price_high;
+    }
+    if dst.offer_count.is_none() {
+        dst.offer_count = src.offer_count;
+    }
+    if dst.image.is_none() {
+        dst.image = src.image.clone();
+    }
+}
+
+/// True when the page declares a Product or Offer via microdata `itemtype`.
+fn has_microdata_product(html: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)itemtype\s*=\s*["'][^"']*(?:product|offer)[^"']*["']"#,
+        )
+        .unwrap()
+    });
+    re.is_match(html)
+}
+
+/// Extract product facts from HTML microdata (itemprop/itemscope).
+/// Only fires when the page carries a Product/Offer `itemtype`, so
+/// non-product pages (Article, Event, …) never trigger it.
+///
+/// Handles both `content` attribute form (<meta itemprop="price" content="9.99">)
+/// and text content form (<span itemprop="brand">Acme</span>).
+fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
+    if !has_microdata_product(html) {
+        return None;
+    }
+
+    static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tag_re = TAG_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)<\w+\b[^>]*itemprop[^>]*>"#).unwrap()
+    });
+    static PROP_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let prop_re = PROP_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)itemprop\s*=\s*["']([^"']+)["']"#).unwrap()
+    });
+    static CONTENT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let content_re = CONTENT_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)content\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static HREF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let href_re = HREF_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)href\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let src_re = SRC_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+
+    let mut o = OfferFacts::default();
+
+    let mut apply = |prop: &str, val: &str| {
+        if val.is_empty() {
+            return;
+        }
+        match prop {
+            "price" => {
+                if o.price.is_none() {
+                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
+                        o.price = Some(v);
+                    }
+                }
+            }
+            "pricecurrency" => {
+                if o.currency.is_none() {
+                    o.currency = Some(val.to_string());
+                }
+            }
+            "availability" => {
+                if o.availability.is_none() {
+                    o.availability = Some(val.to_string());
+                }
+            }
+            "itemcondition" => {
+                if o.condition.is_none() {
+                    o.condition = Some(val.to_string());
+                }
+            }
+            "sku" => {
+                if o.sku.is_none() {
+                    o.sku = Some(val.to_string());
+                }
+            }
+            "gtin13" | "gtin14" | "gtin8" | "gtin" | "mpn" => {
+                if o.gtin.is_none() {
+                    o.gtin = Some(val.to_string());
+                }
+            }
+            "brand" | "seller" => {
+                if o.merchant.is_none() {
+                    o.merchant = Some(val.to_string());
+                }
+            }
+            "image" => {
+                if o.image.is_none() {
+                    o.image = Some(val.to_string());
+                }
+            }
+            "ratingvalue" => {
+                if o.rating.is_none() {
+                    o.rating = val.parse::<f64>().ok();
+                }
+            }
+            "reviewcount" | "ratingcount" => {
+                if o.rating_count.is_none() {
+                    o.rating_count = val.parse::<u64>().ok();
+                }
+            }
+            _ => {}
+        }
+    };
+
+    for tag_cap in tag_re.captures_iter(html) {
+        let tag = tag_cap.get(0).unwrap().as_str();
+        let prop = prop_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_lowercase());
+        let content = content_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let href = href_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let src = src_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        if let Some(p) = prop {
+            // For image, prefer href (link itemprop="image" href=...) then
+            // content (meta itemprop="image" content=...) then src.
+            if p == "image" {
+                if let Some(v) = href.or(content).or(src) {
+                    apply(&p, &v);
+                }
+            } else if let Some(v) = content {
+                apply(&p, &v);
+            } else {
+                // Text content form: extract text after the tag until the next '<'.
+                let after = &html[tag_cap.get(0).unwrap().end()..];
+                if let Some(end) = after.find('<') {
+                    let text = after[..end].trim();
+                    if !text.is_empty() {
+                        apply(&p, text);
+                    }
+                }
+            }
+        }
+    }
+
+    if o.price.is_none()
+        && o.currency.is_none()
+        && o.availability.is_none()
+        && o.merchant.is_none()
+        && o.condition.is_none()
+        && o.sku.is_none()
+        && o.gtin.is_none()
+        && o.rating.is_none()
+        && o.rating_count.is_none()
+        && o.image.is_none()
+    {
+        return None;
+    }
+    Some(o)
+}
+
+/// True when the page carries product-ish RDFa (typeof/property on Product/Offer/price).
+fn has_rdfa_product(html: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)(?:typeof|property)\s*=\s*["'][^"']*(?:product|offer|price|currency|availability|sku|gtin)[^"']*["']"#,
+        )
+        .unwrap()
+    });
+    re.is_match(html)
+}
+
+/// Extract product facts from RDFa (property attribute with `schema:` prefix or full URI).
+/// Only fires on pages that look product-ish.
+///
+/// Handles both `content` attribute form (`<meta property="price" content="9.99">)
+/// and text content form (`<span property="brand">Acme</span>`).
+fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
+    if !has_rdfa_product(html) {
+        return None;
+    }
+
+    static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tag_re = TAG_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)<\w+\b[^>]*property[^>]*>"#).unwrap()
+    });
+    static PROP_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let prop_re = PROP_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)property\s*=\s*["']([^"']+)["']"#).unwrap()
+    });
+    static CONTENT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let content_re = CONTENT_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)content\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static HREF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let href_re = HREF_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)href\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let src_re = SRC_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+
+    let mut o = OfferFacts::default();
+
+    let mut apply = |prop: &str, val: &str| {
+        if val.is_empty() {
+            return;
+        }
+        // Strip schema: prefix or full schema.org URI.
+        let stripped = prop
+            .strip_prefix("schema:")
+            .or_else(|| prop.strip_prefix("http://schema.org/"))
+            .or_else(|| prop.strip_prefix("https://schema.org/"))
+            .unwrap_or(prop);
+        match stripped {
+            "price" => {
+                if o.price.is_none() {
+                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
+                        o.price = Some(v);
+                    }
+                }
+            }
+            "pricecurrency" => {
+                if o.currency.is_none() {
+                    o.currency = Some(val.to_string());
+                }
+            }
+            "availability" => {
+                if o.availability.is_none() {
+                    o.availability = Some(val.to_string());
+                }
+            }
+            "itemcondition" => {
+                if o.condition.is_none() {
+                    o.condition = Some(val.to_string());
+                }
+            }
+            "sku" => {
+                if o.sku.is_none() {
+                    o.sku = Some(val.to_string());
+                }
+            }
+            "gtin13" | "gtin14" | "gtin8" | "gtin" | "mpn" => {
+                if o.gtin.is_none() {
+                    o.gtin = Some(val.to_string());
+                }
+            }
+            "brand" | "seller" => {
+                if o.merchant.is_none() {
+                    o.merchant = Some(val.to_string());
+                }
+            }
+            "image" => {
+                if o.image.is_none() {
+                    o.image = Some(val.to_string());
+                }
+            }
+            "ratingvalue" => {
+                if o.rating.is_none() {
+                    o.rating = val.parse::<f64>().ok();
+                }
+            }
+            "reviewcount" | "ratingcount" => {
+                if o.rating_count.is_none() {
+                    o.rating_count = val.parse::<u64>().ok();
+                }
+            }
+            _ => {}
+        }
+    };
+
+    for tag_cap in tag_re.captures_iter(html) {
+        let tag = tag_cap.get(0).unwrap().as_str();
+        let prop = prop_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_lowercase());
+        let content = content_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let href = href_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let src = src_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        if let Some(p) = prop {
+            // For image, prefer href (link itemprop="image" href=...) then
+            // content (meta itemprop="image" content=...) then src.
+            if p == "image" {
+                if let Some(v) = href.or(content).or(src) {
+                    apply(&p, &v);
+                }
+            } else if let Some(v) = content {
+                apply(&p, &v);
+            } else {
+                // Text content form: extract text after the tag until the next '<'.
+                let after = &html[tag_cap.get(0).unwrap().end()..];
+                if let Some(end) = after.find('<') {
+                    let text = after[..end].trim();
+                    if !text.is_empty() {
+                        apply(&p, text);
+                    }
+                }
+            }
+        }
+    }
+
+    if o.price.is_none()
+        && o.currency.is_none()
+        && o.availability.is_none()
+        && o.merchant.is_none()
+        && o.condition.is_none()
+        && o.sku.is_none()
+        && o.gtin.is_none()
+        && o.rating.is_none()
+        && o.rating_count.is_none()
+        && o.image.is_none()
+    {
+        return None;
+    }
+    Some(o)
+}
+
 fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     let mut facts = OfferFacts::default();
     let mut source: Option<String> = None;
@@ -3028,19 +3746,34 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     // 2) Fallback / supplement: OpenGraph product:* meta (only when no price yet).
     if facts.price.is_none() && facts.price_low.is_none() {
         if let Some(og) = parse_og_product(html) {
-            if facts.price.is_none() { facts.price = og.price; }
-            if facts.currency.is_none() { facts.currency = og.currency; }
-            if facts.availability.is_none() { facts.availability = og.availability; }
-            if facts.condition.is_none() { facts.condition = og.condition; }
-            if facts.merchant.is_none() { facts.merchant = og.merchant; }
-            if facts.gtin.is_none() { facts.gtin = og.gtin; }
-            if facts.rating.is_none() { facts.rating = og.rating; }
-            if facts.rating_count.is_none() { facts.rating_count = og.rating_count; }
-            if source.is_none() { source = Some("og".to_string()); }
+            merge_offer_facts(&mut facts, &og);
+            if source.is_none() {
+                source = Some("og".to_string());
+            }
         }
     }
 
-    // 3) Merchant fallback: derive a coarse host label only when no page-provided
+    // 3) Fallback: microdata (only when no price yet).
+    if facts.price.is_none() && facts.price_low.is_none() {
+        if let Some(md) = parse_microdata_product(html) {
+            merge_offer_facts(&mut facts, &md);
+            if source.is_none() {
+                source = Some("microdata".to_string());
+            }
+        }
+    }
+
+    // 4) Fallback: RDFa (only when no price yet).
+    if facts.price.is_none() && facts.price_low.is_none() {
+        if let Some(rdf) = parse_rdfa_product(html) {
+            merge_offer_facts(&mut facts, &rdf);
+            if source.is_none() {
+                source = Some("rdfa".to_string());
+            }
+        }
+    }
+
+    // 5) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
@@ -3228,11 +3961,27 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
                 }
             }
         }
-        if facts.merchant.is_none() {
-            if let Some(seller) = n.get("seller") {
-                facts.merchant =
-                    seller.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+        // Seller always takes precedence over brand (more specific). A Product
+        // node may set brand first; a nested Offer node's seller overwrites it.
+        if let Some(seller) = n.get("seller") {
+            facts.merchant = seller
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        } else if facts.merchant.is_none() {
+            if let Some(brand) = n.get("brand") {
+                facts.merchant = match brand {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Object(o) => {
+                        o.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    }
+                    _ => None,
+                };
             }
+        }
+
+        if facts.image.is_none() {
+            facts.image = extract_jsonld_image(n);
         }
         if facts.currency.is_none() {
             facts.currency = n
@@ -3273,6 +4022,43 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
             facts.currency = Some(c);
         }
     }
+}
+
+/// Extract a product image URL from a JSON-LD node. Handles the three
+/// common JSON-LD patterns: string URL, array of strings, and
+/// ImageObject with url/representativeImage/thumbnail.
+fn extract_jsonld_image(n: &serde_json::Value) -> Option<String> {
+    // Direct string: "image": "https://..."
+    if let Some(s) = n.get("image").and_then(|v| v.as_str()) {
+        return Some(s.to_string());
+    }
+    // Array: "image": ["https://..."]
+    if let Some(arr) = n.get("image").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                return Some(s.to_string());
+            }
+            // Nested ImageObject in array
+            if let Some(obj) = v.as_object() {
+                if let Some(s) = obj.get("url").and_then(|u| u.as_str()) {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    // ImageObject: "image": { "@type": "ImageObject", "url": "..." }
+    if let Some(img) = n.get("image").and_then(|v| v.as_object()) {
+        if let Some(s) = img.get("url").and_then(|u| u.as_str()) {
+            return Some(s.to_string());
+        }
+        if let Some(s) = img.get("representativeImage").and_then(|u| u.as_str()) {
+            return Some(s.to_string());
+        }
+        if let Some(s) = img.get("thumbnail").and_then(|u| u.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    None
 }
 
 fn parse_og_product(html: &str) -> Option<OfferFacts> {
@@ -3321,6 +4107,11 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = content.parse::<u64>().ok();
                 }
             }
+            "og:image" | "product:image" => {
+                if o.image.is_none() {
+                    o.image = Some(content.clone());
+                }
+            }
             _ => {}
         }
     }
@@ -3330,6 +4121,7 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
         && o.merchant.is_none()
         && o.gtin.is_none()
         && o.rating.is_none()
+        && o.image.is_none()
     {
         return None;
     }
@@ -8100,24 +8892,26 @@ fn merge_local_and_web(
     // "Sky Blue Credit" (a brand whose two tokens happen to be "sky"+"blue") no longer
     // rides a token-overlap bonus it didn't earn. Computed once per query, not per result.
     let phrase_entities: Vec<String> = {
+        // Extract ALL 2-3 word n-grams as phrase entities, WITHOUT filtering
+        // stop words. This captures technical phrases like "end to end encryption"
+        // where "end" and "to" are stop words but the phrase as a whole is a
+        // key matching signal. A result that contains the full phrase is a
+        // much stronger match than one that only shares scattered tokens.
+        let lower_words: Vec<String> = q_words.iter().map(|w| w.to_lowercase()).collect();
         let mut phrases = Vec::new();
-        let mut run: Vec<String> = Vec::new();
-        for w in q_words.iter() {
-            let lower = w.to_lowercase();
-            let is_content = lower.len() >= 2
-                && !stop_words.contains(lower.as_str())
-                && !lower.chars().all(|c| c.is_ascii_digit());
-            if is_content {
-                run.push(lower);
-            } else if run.len() >= 2 {
-                phrases.push(run.join(" "));
-                run.clear();
-            } else {
-                run.clear();
+        for n in 2..=3 {
+            for window in lower_words.windows(n) {
+                let phrase = window.join(" ");
+                // Skip pure stop-word phrases (e.g. "how does", "is the")
+                // that carry no topical signal. A phrase is kept if at least
+                // one of its words is a content word (not a stop word, len >= 3).
+                let has_content = window.iter().any(|w| {
+                    w.len() >= 3 && !stop_words.contains(w.as_str())
+                });
+                if has_content {
+                    phrases.push(phrase);
+                }
             }
-        }
-        if run.len() >= 2 {
-            phrases.push(run.join(" "));
         }
         phrases
     };
@@ -8317,11 +9111,16 @@ fn merge_local_and_web(
                 title_lower.contains(p.as_str()) || content_lower.contains(p.as_str()) || url_lower.contains(p.as_str())
             }).count();
             let phrase_ratio = phrase_hits as f32 / phrase_entities.len() as f32;
-            // Blend the phrase ratio into relevance: a result missing every phrase entity
-            // drops to at most ~0.45 of its token-overlap relevance; full phrase coverage
-            // keeps it intact. This lets "Why Is the Sky Blue?" (title has the phrase) rank
-            // above "Sky Blue Credit" (no contiguous phrase), purely from structure.
-            relevance *= 0.45 + 0.55 * phrase_ratio;
+            // Blend the phrase ratio into relevance. Results matching MOST phrases
+            // (ratio >= 0.5) are NOT dampened — they clearly address the query's
+            // topic. Only results missing the MAJORITY of phrases (ratio < 0.5)
+            // get penalized, since they fail to cover the query's full topical
+            // structure. This avoids regressing queries like "how to train for a
+            // marathon" where a result matching 4/7 phrases is clearly relevant.
+            // The penalty is also milder (×0.6) to avoid over-crushing.
+            if phrase_ratio < 0.5 {
+                relevance *= 0.6;
+            }
         }
 
         // ── Administrative & Sitemap Demotion ──
@@ -15287,6 +16086,22 @@ let mut results = match tokio::task::spawn_blocking(move || {
             text_matches_negative(&title_lower, &nt.to_lowercase())
         });
         if has_neg_in_title {
+            // POSITIVE-OVERRIDE (2026-09-14): if the result matches a positive
+            // constraint, skip the title penalty — the negative term appears in
+            // a referential/comparison context (e.g. "Static Site Generators"
+            // guide mentioning "nextjs" among options). The graduated penalties
+            // in constraint_score handle demotion; crushing score to 0.01 here
+            // pushes relevant results below junk.
+            if !intent.structured_constraints.positive.is_empty() {
+                let pos_text = format!("{} {} {}", r.title.to_lowercase(), r.content.to_lowercase(), r.url.to_lowercase());
+                let matches_positive = intent.structured_constraints.positive.iter().any(|p| {
+                    let pl = p.to_lowercase();
+                    !pl.is_empty() && pos_text.contains(&pl)
+                });
+                if matches_positive {
+                    continue;
+                }
+            }
             let alt = is_alternative_listing_page(&r.title, &r.url, &r.content);
             if alt > 0.6 {
                 // Strong alt-listing page - no title penalty needed (constraint_score
@@ -15358,6 +16173,27 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 || title_lower.contains("migrate from");
             if genuine_alt {
                 return true;
+            }
+
+            // NEGATIVE FILTER POSITIVE-OVERRIDE (2026-09-14): if a result matches
+            // ANY positive constraint, keep it — the negative term may appear in
+            // a referential/comparison context (e.g. a "static site generators"
+            // guide that mentions "nextjs" among options). The graduated penalties
+            // in constraint_score (0.02 title / 0.25 content) handle demotion;
+            // hard-dropping every result that mentions the excluded term
+            // collapses recall for "X other than Y" / "X not Y" queries from
+            // 13→1 because most relevant pages mention the excluded term in
+            // passing. This applies only when positive constraints exist —
+            // negative-only queries still use the full hard filter.
+            if !intent.structured_constraints.positive.is_empty() {
+                let pos_text = format!("{} {} {}", r.title.to_lowercase(), r.content.to_lowercase(), r.url.to_lowercase());
+                let matches_positive = intent.structured_constraints.positive.iter().any(|p| {
+                    let pl = p.to_lowercase();
+                    !pl.is_empty() && pos_text.contains(&pl)
+                });
+                if matches_positive {
+                    return true;
+                }
             }
 
             let text = format!("{} {}", r.title, r.url);
@@ -18564,6 +19400,218 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
     }
 
+    // ── Microdata extraction ───────────────────────────────────────────
+
+    const HTML_MICRODATA_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>Microdata Product</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Microdata Widget</span>
+  <span itemprop="brand">WidgetCo</span>
+  <span itemprop="sku">MD-W-001</span>
+  <span itemprop="gtin13">9876543210987</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="29.99">29.99</span>
+    <span itemprop="priceCurrency" content="USD">USD</span>
+    <span itemprop="availability" content="https://schema.org/InStock">In Stock</span>
+    <span itemprop="itemCondition" content="https://schema.org/NewCondition">New</span>
+  </div>
+  <div itemprop="aggregateRating" itemscope itemtype="https://schema.org/AggregateRating">
+    <span itemprop="ratingValue" content="4.2">4.2</span>
+    <span itemprop="reviewCount" content="85">85</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_product_extracts_all_fields() {
+        let o = extract_commerce_offer(HTML_MICRODATA_PRODUCT, "https://md.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(29.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
+        assert_eq!(d.sku.as_deref(), Some("MD-W-001"));
+        assert_eq!(d.gtin.as_deref(), Some("9876543210987"));
+        assert_eq!(d.rating, Some(4.2));
+        assert_eq!(d.rating_count, Some(85));
+        assert_eq!(d.merchant.as_deref(), Some("WidgetCo"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    const HTML_MICRODATA_NO_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>Article Page</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Article">
+  <span itemprop="name">How to Build a Widget</span>
+  <span itemprop="author">Jane Doe</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_non_product_page_returns_null() {
+        // An Article (not Product/Offer) must NOT trigger microdata extraction.
+        let o = extract_commerce_offer(HTML_MICRODATA_NO_PRODUCT, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None);
+        assert_eq!(d.currency, None);
+        assert_eq!(d.availability, None);
+        // merchant falls back to host
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    // ── RDFa extraction ────────────────────────────────────────────────
+
+    const HTML_RDFa_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>RDFa Product</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Gadget</span>
+  <span property="brand">GadgetCo</span>
+  <span property="sku">RD-G-001</span>
+  <span property="gtin13">5554443332221</span>
+  <div property="offers" typeof="Offer">
+    <span property="price" content="149.99">149.99</span>
+    <span property="priceCurrency" content="EUR">EUR</span>
+    <span property="availability" content="https://schema.org/InStock">In Stock</span>
+    <span property="itemCondition" content="https://schema.org/NewCondition">New</span>
+  </div>
+  <div property="aggregateRating" typeof="AggregateRating">
+    <span property="ratingValue" content="4.8">4.8</span>
+    <span property="reviewCount" content="210">210</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_product_extracts_all_fields() {
+        let o = extract_commerce_offer(HTML_RDFa_PRODUCT, "https://rdfa.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(149.99));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
+        assert_eq!(d.sku.as_deref(), Some("RD-G-001"));
+        assert_eq!(d.gtin.as_deref(), Some("5554443332221"));
+        assert_eq!(d.rating, Some(4.8));
+        assert_eq!(d.rating_count, Some(210));
+        assert_eq!(d.merchant.as_deref(), Some("GadgetCo"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    const HTML_RDFa_FULL_URI: &str = r#"<!doctype html><html><head>
+<title>RDFa Full URI</title>
+</head><body>
+<div vocab="http://schema.org/" typeof="Product">
+  <span property="name">URI Product</span>
+  <span property="http://schema.org/price" content="99.99">99.99</span>
+  <span property="http://schema.org/priceCurrency" content="GBP">GBP</span>
+  <span property="http://schema.org/availability" content="http://schema.org/InStock">In Stock</span>
+  <span property="http://schema.org/brand">URI Brand</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_full_schema_org_uri_works() {
+        // RDFa properties using full http://schema.org/ URI must also resolve.
+        let o = extract_commerce_offer(HTML_RDFa_FULL_URI, "https://uri.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(99.99));
+        assert_eq!(d.currency.as_deref(), Some("GBP"));
+        assert_eq!(d.availability.as_deref(), Some("http://schema.org/InStock"));
+        assert_eq!(d.merchant.as_deref(), Some("URI Brand"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    const HTML_RDFa_NO_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>Event Page</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Event">
+  <span property="name">Tech Conference 2026</span>
+  <span property="startDate" content="2026-06-15">June 15</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_non_product_page_returns_null() {
+        // An Event (not Product/Offer) must NOT trigger RDFa extraction.
+        let o = extract_commerce_offer(HTML_RDFa_NO_PRODUCT, "https://events.example.com/conf");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None);
+        assert_eq!(d.currency, None);
+        assert_eq!(d.availability, None);
+        assert_eq!(d.merchant.as_deref(), Some("events.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    // ── Priority order: JSON-LD > OG > microdata > RDFa ─────────────────
+
+    const HTML_JSONLD_AND_MICRODATA: &str = r#"<!doctype html><html><head>
+<title>Both JSON-LD and Microdata</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Both Product",
+  "offers": {
+    "@type": "Offer",
+    "price": "100.00",
+    "priceCurrency": "USD",
+    "availability": "https://schema.org/InStock",
+    "seller": {"@type": "Organization", "name": "JSON-LD Seller"}
+  }
+}
+</script>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Microdata Name</span>
+  <span itemprop="brand">Microdata Brand</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="200.00">200.00</span>
+    <span itemprop="priceCurrency" content="EUR">EUR</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn jsonld_takes_priority_over_microdata() {
+        // When JSON-LD has a price, microdata must NOT override it.
+        let o = extract_commerce_offer(HTML_JSONLD_AND_MICRODATA, "https://both.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(100.00), "JSON-LD price wins");
+        assert_eq!(d.currency.as_deref(), Some("USD"), "JSON-LD currency wins");
+        assert_eq!(d.merchant.as_deref(), Some("JSON-LD Seller"), "JSON-LD seller wins");
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    const HTML_OG_AND_RDFa: &str = r#"<!doctype html><html><head>
+<title>OG and RDFa</title>
+<meta property="og:title" content="OG Product">
+<meta property="product:price:amount" content="50.00">
+<meta property="product:price:currency" content="INR">
+<meta property="product:availability" content="in stock">
+<meta property="product:brand" content="OG Brand">
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Name</span>
+  <span property="http://schema.org/price" content="75.00">75.00</span>
+  <span property="http://schema.org/priceCurrency" content="USD">USD</span>
+  <span property="http://schema.org/brand">RDFa Brand</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn og_takes_priority_over_rdfa() {
+        // When OG has a price, RDFa must NOT override it.
+        let o = extract_commerce_offer(HTML_OG_AND_RDFa, "https://og-rdfa.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(50.00), "OG price wins");
+        assert_eq!(d.currency.as_deref(), Some("INR"), "OG currency wins");
+        assert_eq!(d.merchant.as_deref(), Some("OG Brand"), "OG brand wins");
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
     // ── ROADMAP item 3: monetization MUST NOT affect ranking/order ────────────
     // The /shopping pipeline enriches the ALREADY-RANKED results array in place,
     // never reordering it. This test locks that invariant: with affiliate keys
@@ -18732,6 +19780,173 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!shop_arr.is_empty(), "shopping block has results even with null commerce");
         let block = serde_json::json!({ "results": shop_arr });
         assert!(block.get("results").is_some(), "shopping block present");
+    }
+
+    // ── ROADMAP item B: product image extraction ─────────────────────────
+    // The extractor must pull the product image URL from structured sources:
+    // JSON-LD `image` (string, array, or ImageObject), OpenGraph `og:image`,
+    // microdata `itemprop="image"` (content + href/src), and RDFa `property="image"`.
+    // Always from typed data — never guessed from free text.
+
+    const HTML_JSONLD_IMAGE: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Image Product",
+  "image": "https://cdn.example.com/product.jpg",
+  "offers": {
+    "@type": "Offer",
+    "price": "49.99",
+    "priceCurrency": "USD"
+  }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_image_string_url_is_extracted() {
+        let o = extract_commerce_offer(HTML_JSONLD_IMAGE, "https://img.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/product.jpg"));
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    const HTML_JSONLD_IMAGE_ARRAY: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Multi Image",
+  "image": ["https://cdn.example.com/a.jpg", "https://cdn.example.com/b.jpg"],
+  "offers": { "@type": "Offer", "price": "29.99", "priceCurrency": "EUR" }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_image_array_takes_first() {
+        let o = extract_commerce_offer(HTML_JSONLD_IMAGE_ARRAY, "https://multi.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/a.jpg"));
+    }
+
+    const HTML_JSONLD_IMAGE_OBJECT: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "ImageObject Product",
+  "image": { "@type": "ImageObject", "url": "https://cdn.example.com/imgobj.jpg" },
+  "offers": { "@type": "Offer", "price": "19.99", "priceCurrency": "GBP" }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_image_object_url_is_extracted() {
+        let o = extract_commerce_offer(HTML_JSONLD_IMAGE_OBJECT, "https://obj.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/imgobj.jpg"));
+    }
+
+    const HTML_OG_IMAGE: &str = r#"<!doctype html><html><head>
+<title>OG Image</title>
+<meta property="og:image" content="https://og.example.com/photo.jpg">
+<meta property="product:price:amount" content="99.99">
+<meta property="product:price:currency" content="INR">
+</head><body></body></html>"#;
+
+    #[test]
+    fn og_image_is_extracted() {
+        let o = extract_commerce_offer(HTML_OG_IMAGE, "https://ogimg.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://og.example.com/photo.jpg"));
+        assert_eq!(d.price, Some(99.99));
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    const HTML_MICRODATA_IMAGE_HREF: &str = r#"<!doctype html><html><head>
+<title>Microdata Link Image</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Link Image Product</span>
+  <link itemprop="image" href="https://md.example.com/photo.jpg">
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="39.99">39.99</span>
+    <span itemprop="priceCurrency" content="USD">USD</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_image_href_attribute_is_extracted() {
+        let o = extract_commerce_offer(HTML_MICRODATA_IMAGE_HREF, "https://mdhref.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://md.example.com/photo.jpg"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    const HTML_RDFa_IMAGE: &str = r#"<!doctype html><html><head>
+<title>RDFa Image</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Image Product</span>
+  <span property="image" content="https://rdfa.example.com/photo.jpg">photo</span>
+  <div property="offers" typeof="Offer">
+    <span property="price" content="59.99">59.99</span>
+    <span property="priceCurrency" content="USD">USD</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_image_content_attribute_is_extracted() {
+        let o = extract_commerce_offer(HTML_RDFa_IMAGE, "https://rdfaimg.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://rdfa.example.com/photo.jpg"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    const HTML_NO_IMAGE: &str = r#"<!doctype html><html><head>
+<title>No Image Product</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "No Image Product",
+  "offers": { "@type": "Offer", "price": "9.99", "priceCurrency": "USD" }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn product_without_image_has_null_image() {
+        let o = extract_commerce_offer(HTML_NO_IMAGE, "https://noimg.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image, None);
+        assert_eq!(d.price, Some(9.99));
+    }
+
+    const HTML_ARTICLE_NO_IMAGE: &str = r#"<!doctype html><html><head>
+<title>Article Page</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Article">
+  <span itemprop="name">How to Build a Widget</span>
+  <span itemprop="author">Jane Doe</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn non_product_page_never_extracts_image() {
+        let o = extract_commerce_offer(HTML_ARTICLE_NO_IMAGE, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image, None);
+        assert_eq!(d.price, None);
+        // merchant falls back to host
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
     }
 
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
