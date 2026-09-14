@@ -15360,6 +15360,27 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 return true;
             }
 
+            // NEGATIVE FILTER POSITIVE-OVERRIDE (2026-09-14): if a result matches
+            // ANY positive constraint, keep it — the negative term may appear in
+            // a referential/comparison context (e.g. a "static site generators"
+            // guide that mentions "nextjs" among options). The graduated penalties
+            // in constraint_score (0.02 title / 0.25 content) handle demotion;
+            // hard-dropping every result that mentions the excluded term
+            // collapses recall for "X other than Y" / "X not Y" queries from
+            // 13→1 because most relevant pages mention the excluded term in
+            // passing. This applies only when positive constraints exist —
+            // negative-only queries still use the full hard filter.
+            if !intent.structured_constraints.positive.is_empty() {
+                let pos_text = format!("{} {} {}", r.title.to_lowercase(), r.content.to_lowercase(), r.url.to_lowercase());
+                let matches_positive = intent.structured_constraints.positive.iter().any(|p| {
+                    let pl = p.to_lowercase();
+                    !pl.is_empty() && pos_text.contains(&pl)
+                });
+                if matches_positive {
+                    return true;
+                }
+            }
+
             let text = format!("{} {}", r.title, r.url);
             let text_lower = text.to_lowercase();
             let text_normalized = {
