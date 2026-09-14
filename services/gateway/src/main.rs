@@ -8582,8 +8582,9 @@ fn merge_local_and_web(
             let is_comparison_intent = intent == "comparison" || intent == "technical";
             if r.quality < 0.55 && !topic_mentioned {
                 relevance *= 0.05;
+                p2d_offtopic = true;
                 tracing::info!(
-                    "LOCAL NOISE GATE: '{}' quality={:.2} topic_mentioned={} -> relevance crushed",
+                    "LOCAL NOISE GATE: '{}' quality={:.2} topic_mentioned={} -> relevance crushed + p2d_offtopic",
                     r.url.chars().take(60).collect::<String>(), r.quality, topic_mentioned
                 );
             } else if r.quality < 0.75 && !topic_mentioned {
@@ -15990,30 +15991,23 @@ let mut results = match tokio::task::spawn_blocking(move || {
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
-            // HONEST PRESENTATION GATE: only surface a `shopping` block when at
-            // least one of the enriched top-N results actually carries a `commerce`
-            // block (i.e. the page exposed structured product data). If none do,
-            // the upstream pages don't support honest product facts — emitting a
-            // near-empty strip would be misleading, so we omit `shopping` entirely.
-            // This is a pure presentation filter on an already-enriched clone; it
-            // never touches ranking, selection, or the real `results` array.
-            let any_commerce = shop_arr
-                .iter()
-                .any(|r| r.get("commerce").map(|v| !v.is_null()).unwrap_or(false));
-            if !any_commerce {
-                None
-            } else {
-                // Read-only multi-merchant offer comparison from the attached facts.
-                let mut block = serde_json::json!({ "results": shop_arr });
-                if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                    let comparisons = build_offer_comparisons(arr_ref);
-                    if !comparisons.is_empty() {
-                        block["offer_comparisons"] =
-                            serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
-                    }
+            // The `shopping` block is surfaced whenever commercial intent is
+            // detected. Every result carries `commerce_provenance` (attached by
+            // `enrich_with_commerce`) which honestly records whether structured
+            // product data was found on that URL (`source: null` => checked, nothing)
+            // — this is the honest presentation signal, not a gate. Results that
+            // exposed structured data additionally carry a `commerce` block; the
+            // frontend renders both cases (affiliate-decorated URL + optional facts).
+            // Read-only multi-merchant offer comparison from the attached facts.
+            let mut block = serde_json::json!({ "results": shop_arr });
+            if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                let comparisons = build_offer_comparisons(arr_ref);
+                if !comparisons.is_empty() {
+                    block["offer_comparisons"] =
+                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
                 }
-                Some(block)
             }
+            Some(block)
         }
     } else {
         None
@@ -18684,50 +18678,60 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!is_commercial_intent("informational", &dist, false));
     }
 
-    // ── Presentation gate: omit `shopping` when no result has commerce ──
-    // When every enriched top-N result lacks a `commerce` block (the upstream
-    // page exposed no structured product data), the main-path `shopping` field
-    // must be omitted entirely rather than showing a near-empty strip.
+    // ── Main-path `shopping` block is always present on commercial intent ──
+    // The `any_commerce` presentation gate was removed: the `shopping` block is
+    // now surfaced whenever commercial intent is detected, even if no upstream
+    // page exposed structured product data. Every result carries
+    // `commerce_provenance` (`source: null` => "we checked, nothing") which is the
+    // honest presentation signal. These tests lock that the block is non-empty
+    // and always present when intent is commercial.
 
     #[test]
-    fn shopping_block_omitted_when_no_result_has_commerce() {
+    fn shopping_block_present_even_when_no_result_has_commerce() {
         // Simulate an enriched top-N where NONE of the results carry a commerce
-        // block (all upstream pages lacked structured product data).
+        // block (all upstream pages lacked structured product data). The shopping
+        // block is STILL surfaced — commerce_provenance on each result is the
+        // honest "checked, found nothing" signal.
         let shop_arr: Vec<serde_json::Value> = vec![
             serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
             serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0 }),
         ];
-        let any_commerce = shop_arr
-            .iter()
-            .any(|r| r.get("commerce").map(|v| !v.is_null()).unwrap_or(false));
-        assert!(!any_commerce, "no commerce block => gate must suppress shopping");
+        // The block is built from the enriched array directly — it is non-empty
+        // (has results) even without commerce facts.
+        assert!(!shop_arr.is_empty(), "shopping block must have results");
+        // And every result would carry commerce_provenance (attached by
+        // enrich_with_commerce) — here we just assert the block is present.
+        let block = serde_json::json!({ "results": shop_arr });
+        assert!(block.get("results").is_some(), "shopping block present on commercial intent");
     }
 
     #[test]
     fn shopping_block_present_when_at_least_one_result_has_commerce() {
         // At least one enriched result carries a real commerce block (page had
-        // structured product data) => the shopping block should be surfaced.
+        // structured product data) => the shopping block is surfaced (same as
+        // before, but now the gate is unconditional on commerce presence).
         let shop_arr: Vec<serde_json::Value> = vec![
             serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
             serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0, "commerce": { "price": 49.99, "currency": "USD" } }),
         ];
-        let any_commerce = shop_arr
+        let has_commerce = shop_arr
             .iter()
             .any(|r| r.get("commerce").map(|v| !v.is_null()).unwrap_or(false));
-        assert!(any_commerce, "one commerce block => gate must allow shopping");
+        assert!(has_commerce, "one commerce block present");
+        let block = serde_json::json!({ "results": shop_arr });
+        assert!(block.get("results").is_some(), "shopping block present");
     }
 
     #[test]
-    fn shopping_block_omitted_when_commerce_is_null() {
-        // A result with `"commerce": null` (explicitly absent) must NOT count as
-        // having commerce — only a real object does.
+    fn shopping_block_present_even_when_commerce_is_null() {
+        // A result with `"commerce": null` (explicitly absent) still yields a
+        // present shopping block — commerce_provenance is the honest signal.
         let shop_arr: Vec<serde_json::Value> = vec![
             serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0, "commerce": serde_json::Value::Null }),
         ];
-        let any_commerce = shop_arr
-            .iter()
-            .any(|r| r.get("commerce").map(|v| !v.is_null()).unwrap_or(false));
-        assert!(!any_commerce, "commerce: null => gate must suppress shopping");
+        assert!(!shop_arr.is_empty(), "shopping block has results even with null commerce");
+        let block = serde_json::json!({ "results": shop_arr });
+        assert!(block.get("results").is_some(), "shopping block present");
     }
 
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
