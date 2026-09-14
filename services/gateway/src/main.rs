@@ -3668,6 +3668,7 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
         && o.gtin.is_none()
         && o.rating.is_none()
         && o.rating_count.is_none()
+        && o.image.is_none()
     {
         return None;
     }
@@ -3998,6 +3999,11 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = content.parse::<u64>().ok();
                 }
             }
+            "og:image" | "product:image" => {
+                if o.image.is_none() {
+                    o.image = Some(content.clone());
+                }
+            }
             _ => {}
         }
     }
@@ -4007,6 +4013,7 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
         && o.merchant.is_none()
         && o.gtin.is_none()
         && o.rating.is_none()
+        && o.image.is_none()
     {
         return None;
     }
