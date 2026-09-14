@@ -8996,11 +8996,16 @@ fn merge_local_and_web(
                 title_lower.contains(p.as_str()) || content_lower.contains(p.as_str()) || url_lower.contains(p.as_str())
             }).count();
             let phrase_ratio = phrase_hits as f32 / phrase_entities.len() as f32;
-            // Blend the phrase ratio into relevance: a result missing every phrase entity
-            // drops to at most ~0.45 of its token-overlap relevance; full phrase coverage
-            // keeps it intact. This lets "Why Is the Sky Blue?" (title has the phrase) rank
-            // above "Sky Blue Credit" (no contiguous phrase), purely from structure.
-            relevance *= 0.45 + 0.55 * phrase_ratio;
+            // Blend the phrase ratio into relevance. Results matching MOST phrases
+            // (ratio >= 0.5) are NOT dampened — they clearly address the query's
+            // topic. Only results missing the MAJORITY of phrases (ratio < 0.5)
+            // get penalized, since they fail to cover the query's full topical
+            // structure. This avoids regressing queries like "how to train for a
+            // marathon" where a result matching 4/7 phrases is clearly relevant.
+            // The penalty is also milder (×0.6) to avoid over-crushing.
+            if phrase_ratio < 0.5 {
+                relevance *= 0.6;
+            }
         }
 
         // ── Administrative & Sitemap Demotion ──
@@ -19660,6 +19665,173 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!shop_arr.is_empty(), "shopping block has results even with null commerce");
         let block = serde_json::json!({ "results": shop_arr });
         assert!(block.get("results").is_some(), "shopping block present");
+    }
+
+    // ── ROADMAP item B: product image extraction ─────────────────────────
+    // The extractor must pull the product image URL from structured sources:
+    // JSON-LD `image` (string, array, or ImageObject), OpenGraph `og:image`,
+    // microdata `itemprop="image"` (content + href/src), and RDFa `property="image"`.
+    // Always from typed data — never guessed from free text.
+
+    const HTML_JSONLD_IMAGE: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Image Product",
+  "image": "https://cdn.example.com/product.jpg",
+  "offers": {
+    "@type": "Offer",
+    "price": "49.99",
+    "priceCurrency": "USD"
+  }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_image_string_url_is_extracted() {
+        let o = extract_commerce_offer(HTML_JSONLD_IMAGE, "https://img.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/product.jpg"));
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    const HTML_JSONLD_IMAGE_ARRAY: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Multi Image",
+  "image": ["https://cdn.example.com/a.jpg", "https://cdn.example.com/b.jpg"],
+  "offers": { "@type": "Offer", "price": "29.99", "priceCurrency": "EUR" }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_image_array_takes_first() {
+        let o = extract_commerce_offer(HTML_JSONLD_IMAGE_ARRAY, "https://multi.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/a.jpg"));
+    }
+
+    const HTML_JSONLD_IMAGE_OBJECT: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "ImageObject Product",
+  "image": { "@type": "ImageObject", "url": "https://cdn.example.com/imgobj.jpg" },
+  "offers": { "@type": "Offer", "price": "19.99", "priceCurrency": "GBP" }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_image_object_url_is_extracted() {
+        let o = extract_commerce_offer(HTML_JSONLD_IMAGE_OBJECT, "https://obj.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/imgobj.jpg"));
+    }
+
+    const HTML_OG_IMAGE: &str = r#"<!doctype html><html><head>
+<title>OG Image</title>
+<meta property="og:image" content="https://og.example.com/photo.jpg">
+<meta property="product:price:amount" content="99.99">
+<meta property="product:price:currency" content="INR">
+</head><body></body></html>"#;
+
+    #[test]
+    fn og_image_is_extracted() {
+        let o = extract_commerce_offer(HTML_OG_IMAGE, "https://ogimg.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://og.example.com/photo.jpg"));
+        assert_eq!(d.price, Some(99.99));
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    const HTML_MICRODATA_IMAGE_HREF: &str = r#"<!doctype html><html><head>
+<title>Microdata Link Image</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Link Image Product</span>
+  <link itemprop="image" href="https://md.example.com/photo.jpg">
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="39.99">39.99</span>
+    <span itemprop="priceCurrency" content="USD">USD</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_image_href_attribute_is_extracted() {
+        let o = extract_commerce_offer(HTML_MICRODATA_IMAGE_HREF, "https://mdhref.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://md.example.com/photo.jpg"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    const HTML_RDFa_IMAGE: &str = r#"<!doctype html><html><head>
+<title>RDFa Image</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Image Product</span>
+  <span property="image" content="https://rdfa.example.com/photo.jpg">photo</span>
+  <div property="offers" typeof="Offer">
+    <span property="price" content="59.99">59.99</span>
+    <span property="priceCurrency" content="USD">USD</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_image_content_attribute_is_extracted() {
+        let o = extract_commerce_offer(HTML_RDFa_IMAGE, "https://rdfaimg.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://rdfa.example.com/photo.jpg"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    const HTML_NO_IMAGE: &str = r#"<!doctype html><html><head>
+<title>No Image Product</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "No Image Product",
+  "offers": { "@type": "Offer", "price": "9.99", "priceCurrency": "USD" }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn product_without_image_has_null_image() {
+        let o = extract_commerce_offer(HTML_NO_IMAGE, "https://noimg.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image, None);
+        assert_eq!(d.price, Some(9.99));
+    }
+
+    const HTML_ARTICLE_NO_IMAGE: &str = r#"<!doctype html><html><head>
+<title>Article Page</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Article">
+  <span itemprop="name">How to Build a Widget</span>
+  <span itemprop="author">Jane Doe</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn non_product_page_never_extracts_image() {
+        let o = extract_commerce_offer(HTML_ARTICLE_NO_IMAGE, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image, None);
+        assert_eq!(d.price, None);
+        // merchant falls back to host
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
     }
 
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
