@@ -2466,8 +2466,9 @@ const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
     // questions as positive constraints and match every page, drowning topical
     // signal. E.g. "I am a frontend developer with 3 years..." → +3 years, +am,
     // +become, +experience. General English, no per-query literals.
-    "become", "becoming", "became", "experience", "experiences", "experienced",
+    "am", "become", "becoming", "became",
     "years", "year", "months", "month", "weeks", "week", "days", "day",
+    "experience", "experiences", "experienced",
     "transition", "transitioning", "transitions",
     "certifications", "certification", "certified",
     "career", "careers",
@@ -2475,9 +2476,7 @@ const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
     "change", "changes", "changing", "changed",
     "skills", "skill", "skilled",
     "role", "roles",
-    "make", "makes", "making", "made",
     "want", "wants", "wanted", "wanting",
-    "within", "without", "with",
     "need", "needs", "needed", "needing",
     "like", "likes", "liked", "liking",
     "help", "helps", "helped", "helping",
@@ -2501,17 +2500,17 @@ const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
     "sure", "certain", "clear", "obvious",
     "enough", "whole", "entire", "full", "complete",
     "main", "major", "minor", "key", "basic", "simple",
-    "specific", "general", "particular", "certain",
+    "specific", "general", "particular",
     "common", "normal", "regular", "standard", "typical",
     "usual", "ordinary", "average", "traditional",
     "modern", "current", "recent", "latest", "newest",
     "early", "late", "soon", "later", "earlier",
     "always", "never", "sometimes", "often", "usually",
     "ever", "once", "twice", "again", "further",
-    "almost", "nearly", "quite", "hardly", "barely",
+    "almost", "nearly", "hardly", "barely",
     "completely", "totally", "entirely", "fully", "partly",
     "especially", "particularly", "specifically", "mainly", "mostly",
-    "simply", "merely", "only", "alone", "merely",
+    "simply", "merely", "only", "alone",
     "however", "therefore", "thus", "hence", "accordingly",
     "moreover", "furthermore", "additionally", "besides",
     "nevertheless", "nonetheless", "otherwise", "instead",
@@ -2521,11 +2520,10 @@ const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
     "probably", "possibly", "perhaps", "maybe", "likely",
     "certainly", "definitely", "absolutely", "obviously",
     "apparently", "seemingly", "reportedly", "supposedly",
-    "fortunately", "unfortunately", "luckily", "hopefully",
+    "unfortunately", "fortunately", "luckily", "hopefully",
     "honestly", "frankly", "seriously", "literally",
-    "clearly", "evidently", "plainly", "patently",
-    "undoubtedly", "unquestionably", "undeniably",
-    "admittedly", "confessedly", "concededly",
+    "clearly", "evidently", "plainly",
+    "undoubtedly", "unquestionably",
     "regardless", "irrespective", "notwithstanding",
     "anyway", "anyhow", "anyways",
     "though", "although", "whereas", "while", "whilst",
@@ -2533,18 +2531,25 @@ const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
     "whether", "if", "provided", "assuming", "supposing",
     "except", "besides", "beyond", "despite", "regarding",
     "concerning", "considering", "following", "including",
-    "involving", "relating", "respecting", "touching",
+    "involving", "relating", "respecting",
     "according", "owing", "thanks", "due",
-    "prior", "subsequent", "previous", "following",
+    "prior", "subsequent", "previous",
     "above", "below", "under", "over", "between", "among",
     "through", "throughout", "across", "along", "around",
     "behind", "beside", "beyond", "inside", "outside",
     "upon", "onto", "into", "toward", "towards",
-    "against", "toward", "towards", "across", "along",
+    "against", "amid", "amongst", "alongside", "atop",
+    "before", "behind", "beneath", "beside", "between",
+    "beyond", "inside", "outside", "underneath", "upon",
+    "within", "without", "throughout", "notwithstanding",
+    "regarding", "concerning", "respecting",
+    "considering", "following", "including",
+    "involving", "relating",
+    "according", "owing", "thanks", "due",
     "near", "nearer", "nearest", "close", "closer", "closest",
     "far", "farther", "farthest", "further", "furthest",
     "much", "many", "more", "most", "less", "least",
-    "few", "fewer", "fewest", "little", "less", "least",
+    "few", "fewer", "fewest", "little",
     "several", "various", "numerous", "countless",
     "certain", "particular", "specific", "given",
     "individual", "separate", "single", "sole",
@@ -2588,7 +2593,7 @@ const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
     "recommendation", "proposal", "proposition", "offer",
     "opportunity", "chance", "possibility", "probability",
     "potential", "capability", "capacity", "ability",
-    "power", "strength", "force", "energy", "effort",
+    "power", "strength", "force", "energy",
     "attempt", "try", "aim", "goal", "objective",
     "purpose", "intention", "plan", "strategy", "tactic",
     "step", "stage", "phase", "period", "time",
@@ -3495,7 +3500,7 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
                 apply(&p, &v);
             } else {
                 // Text content form: extract text after the tag until the next '<'.
-                let after = &html[tag_cap.end()..];
+                let after = &html[tag_cap.get(0).unwrap().end()..];
                 if let Some(end) = after.find('<') {
                     let text = after[..end].trim();
                     if !text.is_empty() {
@@ -3535,6 +3540,9 @@ fn has_rdfa_product(html: &str) -> bool {
 
 /// Extract product facts from RDFa (property attribute with `schema:` prefix or full URI).
 /// Only fires on pages that look product-ish.
+///
+/// Handles both `content` attribute form (`<meta property="price" content="9.99">)
+/// and text content form (`<span property="brand">Acme</span>`).
 fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
     if !has_rdfa_product(html) {
         return None;
@@ -3627,8 +3635,19 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
             .captures(tag)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
-        if let (Some(p), Some(v)) = (prop, content) {
-            apply(&p, &v);
+        if let Some(p) = prop {
+            if let Some(v) = content {
+                apply(&p, &v);
+            } else {
+                // Text content form: extract text after the tag until the next '<'.
+                let after = &html[tag_cap.get(0).unwrap().end()..];
+                if let Some(end) = after.find('<') {
+                    let text = after[..end].trim();
+                    if !text.is_empty() {
+                        apply(&p, text);
+                    }
+                }
+            }
         }
     }
 
@@ -15939,6 +15958,22 @@ let mut results = match tokio::task::spawn_blocking(move || {
             text_matches_negative(&title_lower, &nt.to_lowercase())
         });
         if has_neg_in_title {
+            // POSITIVE-OVERRIDE (2026-09-14): if the result matches a positive
+            // constraint, skip the title penalty — the negative term appears in
+            // a referential/comparison context (e.g. "Static Site Generators"
+            // guide mentioning "nextjs" among options). The graduated penalties
+            // in constraint_score handle demotion; crushing score to 0.01 here
+            // pushes relevant results below junk.
+            if !intent.structured_constraints.positive.is_empty() {
+                let pos_text = format!("{} {} {}", r.title.to_lowercase(), r.content.to_lowercase(), r.url.to_lowercase());
+                let matches_positive = intent.structured_constraints.positive.iter().any(|p| {
+                    let pl = p.to_lowercase();
+                    !pl.is_empty() && pos_text.contains(&pl)
+                });
+                if matches_positive {
+                    continue;
+                }
+            }
             let alt = is_alternative_listing_page(&r.title, &r.url, &r.content);
             if alt > 0.6 {
                 // Strong alt-listing page - no title penalty needed (constraint_score
