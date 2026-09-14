@@ -2919,7 +2919,17 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             // real topical signal, so a relevant result cannot outrank grammar /
             // dictionary / orphan pages. Signal-driven: a general English
             // question-word list, no per-query literals, no tuned thresholds.
-            if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) { continue; }
+            //
+            // Multi-word form (2026-09-14): a positive like "3 years" (from "I am a
+            // frontend developer with 3 years...") won't match single-word "years", so
+            // check if ALL words are non-topical — if so, the whole phrase is junk.
+            // E.g. "3 years" → ["3", "years"] → both non-topical → drop. But
+            // "react experience" → ["react", "experience"] → "react" is topical → keep.
+            let words_pl: Vec<&str> = pl.split_whitespace().collect();
+            let all_non_topical = !words_pl.is_empty() && words_pl.iter().all(|w| {
+                NON_TOPICAL_QUERY_WORDS.contains(&w) || w.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.')
+            });
+            if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) || all_non_topical { continue; }
             // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
             // extraction (e.g. "under 15000" / "below 2000" can leave the digits
             // in `positive` as "+15000"). A purely-numeric positive carries no
@@ -3391,6 +3401,9 @@ fn has_microdata_product(html: &str) -> bool {
 /// Extract product facts from HTML microdata (itemprop/itemscope).
 /// Only fires when the page carries a Product/Offer `itemtype`, so
 /// non-product pages (Article, Event, …) never trigger it.
+///
+/// Handles both `content` attribute form (<meta itemprop="price" content="9.99">)
+/// and text content form (<span itemprop="brand">Acme</span>).
 fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
     if !has_microdata_product(html) {
         return None;
@@ -3477,8 +3490,19 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
             .captures(tag)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
-        if let (Some(p), Some(v)) = (prop, content) {
-            apply(&p, &v);
+        if let Some(p) = prop {
+            if let Some(v) = content {
+                apply(&p, &v);
+            } else {
+                // Text content form: extract text after the tag until the next '<'.
+                let after = &html[tag_cap.end()..];
+                if let Some(end) = after.find('<') {
+                    let text = after[..end].trim();
+                    if !text.is_empty() {
+                        apply(&p, text);
+                    }
+                }
+            }
         }
     }
 
@@ -8726,24 +8750,26 @@ fn merge_local_and_web(
     // "Sky Blue Credit" (a brand whose two tokens happen to be "sky"+"blue") no longer
     // rides a token-overlap bonus it didn't earn. Computed once per query, not per result.
     let phrase_entities: Vec<String> = {
+        // Extract ALL 2-3 word n-grams as phrase entities, WITHOUT filtering
+        // stop words. This captures technical phrases like "end to end encryption"
+        // where "end" and "to" are stop words but the phrase as a whole is a
+        // key matching signal. A result that contains the full phrase is a
+        // much stronger match than one that only shares scattered tokens.
+        let lower_words: Vec<String> = q_words.iter().map(|w| w.to_lowercase()).collect();
         let mut phrases = Vec::new();
-        let mut run: Vec<String> = Vec::new();
-        for w in q_words.iter() {
-            let lower = w.to_lowercase();
-            let is_content = lower.len() >= 2
-                && !stop_words.contains(lower.as_str())
-                && !lower.chars().all(|c| c.is_ascii_digit());
-            if is_content {
-                run.push(lower);
-            } else if run.len() >= 2 {
-                phrases.push(run.join(" "));
-                run.clear();
-            } else {
-                run.clear();
+        for n in 2..=3 {
+            for window in lower_words.windows(n) {
+                let phrase = window.join(" ");
+                // Skip pure stop-word phrases (e.g. "how does", "is the")
+                // that carry no topical signal. A phrase is kept if at least
+                // one of its words is a content word (not a stop word, len >= 3).
+                let has_content = window.iter().any(|w| {
+                    w.len() >= 3 && !stop_words.contains(w.as_str())
+                });
+                if has_content {
+                    phrases.push(phrase);
+                }
             }
-        }
-        if run.len() >= 2 {
-            phrases.push(run.join(" "));
         }
         phrases
     };
@@ -19209,6 +19235,218 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(o.observed_at.is_some());
         // A unix-second string is digits only.
         assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
+    }
+
+    // ── Microdata extraction ───────────────────────────────────────────
+
+    const HTML_MICRODATA_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>Microdata Product</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Microdata Widget</span>
+  <span itemprop="brand">WidgetCo</span>
+  <span itemprop="sku">MD-W-001</span>
+  <span itemprop="gtin13">9876543210987</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="29.99">29.99</span>
+    <span itemprop="priceCurrency" content="USD">USD</span>
+    <span itemprop="availability" content="https://schema.org/InStock">In Stock</span>
+    <span itemprop="itemCondition" content="https://schema.org/NewCondition">New</span>
+  </div>
+  <div itemprop="aggregateRating" itemscope itemtype="https://schema.org/AggregateRating">
+    <span itemprop="ratingValue" content="4.2">4.2</span>
+    <span itemprop="reviewCount" content="85">85</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_product_extracts_all_fields() {
+        let o = extract_commerce_offer(HTML_MICRODATA_PRODUCT, "https://md.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(29.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
+        assert_eq!(d.sku.as_deref(), Some("MD-W-001"));
+        assert_eq!(d.gtin.as_deref(), Some("9876543210987"));
+        assert_eq!(d.rating, Some(4.2));
+        assert_eq!(d.rating_count, Some(85));
+        assert_eq!(d.merchant.as_deref(), Some("WidgetCo"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    const HTML_MICRODATA_NO_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>Article Page</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Article">
+  <span itemprop="name">How to Build a Widget</span>
+  <span itemprop="author">Jane Doe</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_non_product_page_returns_null() {
+        // An Article (not Product/Offer) must NOT trigger microdata extraction.
+        let o = extract_commerce_offer(HTML_MICRODATA_NO_PRODUCT, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None);
+        assert_eq!(d.currency, None);
+        assert_eq!(d.availability, None);
+        // merchant falls back to host
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    // ── RDFa extraction ────────────────────────────────────────────────
+
+    const HTML_RDFa_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>RDFa Product</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Gadget</span>
+  <span property="brand">GadgetCo</span>
+  <span property="sku">RD-G-001</span>
+  <span property="gtin13">5554443332221</span>
+  <div property="offers" typeof="Offer">
+    <span property="price" content="149.99">149.99</span>
+    <span property="priceCurrency" content="EUR">EUR</span>
+    <span property="availability" content="https://schema.org/InStock">In Stock</span>
+    <span property="itemCondition" content="https://schema.org/NewCondition">New</span>
+  </div>
+  <div property="aggregateRating" typeof="AggregateRating">
+    <span property="ratingValue" content="4.8">4.8</span>
+    <span property="reviewCount" content="210">210</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_product_extracts_all_fields() {
+        let o = extract_commerce_offer(HTML_RDFa_PRODUCT, "https://rdfa.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(149.99));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
+        assert_eq!(d.sku.as_deref(), Some("RD-G-001"));
+        assert_eq!(d.gtin.as_deref(), Some("5554443332221"));
+        assert_eq!(d.rating, Some(4.8));
+        assert_eq!(d.rating_count, Some(210));
+        assert_eq!(d.merchant.as_deref(), Some("GadgetCo"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    const HTML_RDFa_FULL_URI: &str = r#"<!doctype html><html><head>
+<title>RDFa Full URI</title>
+</head><body>
+<div vocab="http://schema.org/" typeof="Product">
+  <span property="name">URI Product</span>
+  <span property="http://schema.org/price" content="99.99">99.99</span>
+  <span property="http://schema.org/priceCurrency" content="GBP">GBP</span>
+  <span property="http://schema.org/availability" content="http://schema.org/InStock">In Stock</span>
+  <span property="http://schema.org/brand">URI Brand</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_full_schema_org_uri_works() {
+        // RDFa properties using full http://schema.org/ URI must also resolve.
+        let o = extract_commerce_offer(HTML_RDFa_FULL_URI, "https://uri.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(99.99));
+        assert_eq!(d.currency.as_deref(), Some("GBP"));
+        assert_eq!(d.availability.as_deref(), Some("http://schema.org/InStock"));
+        assert_eq!(d.merchant.as_deref(), Some("URI Brand"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    const HTML_RDFa_NO_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>Event Page</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Event">
+  <span property="name">Tech Conference 2026</span>
+  <span property="startDate" content="2026-06-15">June 15</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_non_product_page_returns_null() {
+        // An Event (not Product/Offer) must NOT trigger RDFa extraction.
+        let o = extract_commerce_offer(HTML_RDFa_NO_PRODUCT, "https://events.example.com/conf");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None);
+        assert_eq!(d.currency, None);
+        assert_eq!(d.availability, None);
+        assert_eq!(d.merchant.as_deref(), Some("events.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    // ── Priority order: JSON-LD > OG > microdata > RDFa ─────────────────
+
+    const HTML_JSONLD_AND_MICRODATA: &str = r#"<!doctype html><html><head>
+<title>Both JSON-LD and Microdata</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Both Product",
+  "offers": {
+    "@type": "Offer",
+    "price": "100.00",
+    "priceCurrency": "USD",
+    "availability": "https://schema.org/InStock",
+    "seller": {"@type": "Organization", "name": "JSON-LD Seller"}
+  }
+}
+</script>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Microdata Name</span>
+  <span itemprop="brand">Microdata Brand</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="200.00">200.00</span>
+    <span itemprop="priceCurrency" content="EUR">EUR</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn jsonld_takes_priority_over_microdata() {
+        // When JSON-LD has a price, microdata must NOT override it.
+        let o = extract_commerce_offer(HTML_JSONLD_AND_MICRODATA, "https://both.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(100.00), "JSON-LD price wins");
+        assert_eq!(d.currency.as_deref(), Some("USD"), "JSON-LD currency wins");
+        assert_eq!(d.merchant.as_deref(), Some("JSON-LD Seller"), "JSON-LD seller wins");
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    const HTML_OG_AND_RDFa: &str = r#"<!doctype html><html><head>
+<title>OG and RDFa</title>
+<meta property="og:title" content="OG Product">
+<meta property="product:price:amount" content="50.00">
+<meta property="product:price:currency" content="INR">
+<meta property="product:availability" content="in stock">
+<meta property="product:brand" content="OG Brand">
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Name</span>
+  <span property="http://schema.org/price" content="75.00">75.00</span>
+  <span property="http://schema.org/priceCurrency" content="USD">USD</span>
+  <span property="http://schema.org/brand">RDFa Brand</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn og_takes_priority_over_rdfa() {
+        // When OG has a price, RDFa must NOT override it.
+        let o = extract_commerce_offer(HTML_OG_AND_RDFa, "https://og-rdfa.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(50.00), "OG price wins");
+        assert_eq!(d.currency.as_deref(), Some("INR"), "OG currency wins");
+        assert_eq!(d.merchant.as_deref(), Some("OG Brand"), "OG brand wins");
+        assert_eq!(o.source.as_deref(), Some("og"));
     }
 
     // ── ROADMAP item 3: monetization MUST NOT affect ranking/order ────────────
