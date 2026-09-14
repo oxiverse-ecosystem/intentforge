@@ -3978,6 +3978,43 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
     }
 }
 
+/// Extract a product image URL from a JSON-LD node. Handles the three
+/// common JSON-LD patterns: string URL, array of strings, and
+/// ImageObject with url/representativeImage/thumbnail.
+fn extract_jsonld_image(n: &serde_json::Value) -> Option<String> {
+    // Direct string: "image": "https://..."
+    if let Some(s) = n.get("image").and_then(|v| v.as_str()) {
+        return Some(s.to_string());
+    }
+    // Array: "image": ["https://..."]
+    if let Some(arr) = n.get("image").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                return Some(s.to_string());
+            }
+            // Nested ImageObject in array
+            if let Some(obj) = v.as_object() {
+                if let Some(s) = obj.get("url").and_then(|u| u.as_str()) {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    // ImageObject: "image": { "@type": "ImageObject", "url": "..." }
+    if let Some(img) = n.get("image").and_then(|v| v.as_object()) {
+        if let Some(s) = img.get("url").and_then(|u| u.as_str()) {
+            return Some(s.to_string());
+        }
+        if let Some(s) = img.get("representativeImage").and_then(|u| u.as_str()) {
+            return Some(s.to_string());
+        }
+        if let Some(s) = img.get("thumbnail").and_then(|u| u.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
 fn parse_og_product(html: &str) -> Option<OfferFacts> {
     let mut o = OfferFacts::default();
     for (prop, content) in extract_meta_tags(html) {
