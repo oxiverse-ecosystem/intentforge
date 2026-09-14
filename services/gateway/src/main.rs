@@ -3474,9 +3474,14 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
                     o.gtin = Some(val.to_string());
                 }
             }
-            "brand" | "seller" | "name" => {
+            "brand" | "seller" => {
                 if o.merchant.is_none() {
                     o.merchant = Some(val.to_string());
+                }
+            }
+            "image" => {
+                if o.image.is_none() {
+                    o.image = Some(val.to_string());
                 }
             }
             "ratingvalue" => {
@@ -3528,6 +3533,7 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
         && o.gtin.is_none()
         && o.rating.is_none()
         && o.rating_count.is_none()
+        && o.image.is_none()
     {
         return None;
     }
@@ -3614,9 +3620,14 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
                     o.gtin = Some(val.to_string());
                 }
             }
-            "brand" | "seller" | "name" => {
+            "brand" | "seller" => {
                 if o.merchant.is_none() {
                     o.merchant = Some(val.to_string());
+                }
+            }
+            "image" => {
+                if o.image.is_none() {
+                    o.image = Some(val.to_string());
                 }
             }
             "ratingvalue" => {
@@ -3911,6 +3922,20 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
                 facts.merchant =
                     seller.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
             }
+            if facts.merchant.is_none() {
+                if let Some(brand) = n.get("brand") {
+                    facts.merchant = match brand {
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        serde_json::Value::Object(o) => {
+                            o.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        }
+                        _ => None,
+                    };
+                }
+            }
+        }
+        if facts.image.is_none() {
+            facts.image = extract_jsonld_image(n);
         }
         if facts.currency.is_none() {
             facts.currency = n
