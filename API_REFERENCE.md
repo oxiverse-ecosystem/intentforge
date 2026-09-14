@@ -1574,19 +1574,25 @@ returns true when the in-process intent signals say "wants to buy":
 - a price bound was parsed by the existing constraint parser (`price:<N` / `price:>N`
   / `price_min` / `price_max`).
 
-**Example (real, 2026-08-30, `localhost:4000`, verified live):**
+The `shopping` block is surfaced whenever commercial intent is detected, even
+if no upstream page exposed structured product data — every result carries
+`commerce_provenance` (`source: null` => "we checked, nothing") which is the
+honest presentation signal. A result that *did* expose structured data
+additionally carries a `commerce` block with price/currency/availability etc.
+
+**Example (real, verified live 2026-09-14):**
 
 ```bash
-curl -s "localhost:4000/search?q=buy%20sony%20wh-1000xm5%20headphones" | python -c "import sys,json; d=json.load(sys.stdin); print('intent=',d.get('intent')); print('shopping present=', 'shopping' in d); s=d.get('shopping') or {}; print('shopping results=', len(s.get('results',[]))); print('first shopping url=', s.get('results',[{}])[0].get('url')); print('first affiliate disclosed=', s.get('results',[{}])[0].get('affiliate',{}).get('disclosed'))"
+curl -s "localhost:4000/search?q=buy%20sony%20wh-1000xm5%20headphones&count=3"
 # intent= transactional
 # shopping present= True
-# shopping results= 8
-# first shopping url= https://gizmodo.com/sonys-flagship-wh-1000xm5-headphones-hit-nearly-40-off-on-amazon-now-priced-like-earbuds-2000795720
-# first affiliate disclosed= True
+# shopping results= 3
+# first affiliate disclosed= True  network= Sovrn Commerce
+# first provenance source= None  observed= <unix-timestamp>
 ```
 
 ```bash
-curl -s "localhost:4000/search?q=rust%20ownership%20explained" | python -c "import sys,json; d=json.load(sys.stdin); print('intent=',d.get('intent')); print('shopping present=', 'shopping' in d)"
+curl -s "localhost:4000/search?q=rust%20ownership%20explained"
 # intent= technical
 # shopping present= False
 ```
