@@ -4790,10 +4790,12 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
-                        // Distance-bound guard: "within 300 kilometers" is a
-                        // range, not a price — skip this marker (let a later
-                        // price marker, if any, match instead).
-                        if is_distance_bound(rest) {
+                        // Distance/time-bound guard: "within 300 kilometers" or
+                        // "within 6 months" is a range, not a price — skip this
+                        // marker (let a later price marker, if any, match instead).
+                        // Pass text AFTER the number (like Pattern B does) so the
+                        // unit check sees "months", not "6".
+                        if is_distance_bound(&rest[m.end()..]) {
                             continue;
                         }
                         let currency = currency_words.iter().find(|c| rest.contains(*c))
@@ -7978,7 +7980,7 @@ fn keyphrase_relax_variant(query: &str) -> Option<String> {
     ];
 
     let filtered: Vec<&str> = words.into_iter()
-        .filter(|w| !STOP_WORDS.contains(w) && w.len() > 1)
+        .filter(|w| !STOP_WORDS.contains(w) && (w.len() > 1 || w.chars().any(|c| c.is_ascii_digit())))
         .collect();
 
     let orig_count = query.split_whitespace().count();
