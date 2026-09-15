@@ -6130,6 +6130,28 @@ fn normalize_indexer_url(url: &str) -> String {
 // scores above 1.0 are log-compressed into [0.95, 1.0] so the over-1.0
 // cluster (from consensus boosts, nav domain boosts) retains differentiation.
 
+/// Count the number of distinctive content terms in a query (stopword-removed,
+/// >=3 chars). Used by calibrate_scores to normalize for query length.
+fn query_content_term_count(query: &str) -> usize {
+    let stop_words: std::collections::HashSet<&str> = [
+        "the","a","an","is","are","was","were","be","been","have","has","had",
+        "do","does","did","will","would","can","may","might","shall","must","could",
+        "should","in","on","at","to","for","of","with","from","by","and","but","or",
+        "nor","not","so","yet","this","that","these","those","it","its","what","which",
+        "who","whom","when","where","why","how","all","each","every","both","few",
+        "more","most","other","some","such","no","only","own","same","than","too",
+        "very","just","about","also","any","because","before","after","during",
+        "between","through","under","over","again","then","there","here","into",
+        "upon","within","without","out","off","up","down",
+    ].iter().copied().collect();
+    query.split_whitespace()
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            lower.len() >= 3 && !stop_words.contains(lower.as_str())
+        })
+        .count()
+}
+
 /// Phase 0: per-query min-max calibration.
 /// Maps the raw [min, max] score distribution onto [0.05, 1.0], preserving
 /// the *real* relative ordering/differentiation between results instead of
@@ -6137,7 +6159,7 @@ fn normalize_indexer_url(url: &str) -> String {
 /// normalize_scores spread=0.05 behaviour). Scores become differentiable
 /// within a query but are NOT comparable across queries — acceptable, since
 /// the downstream ranking/threshold is per-query.
-fn calibrate_scores(scores: &mut [f32]) {
+fn calibrate_scores(scores: &mut [f32], query: &str) {
     if scores.is_empty() {
         return;
     }
@@ -6186,8 +6208,13 @@ fn calibrate_scores(scores: &mut [f32]) {
         let lo = 0.05f32;
         let content_terms = query_content_term_count(query);
         let hi = if content_terms > 5 {
-            let boost = 0.12 + (content_terms - 5) as f32 * 0.06;
-            boost.min(0.40)
+            // For long queries (>5 content terms), raise the ceiling
+            // proportionally: 6 terms → 0.39, 8 terms → 0.47, 10+ → 0.55.
+            // This ensures the top result lands ≥ 0.3 for long queries
+            // where partial overlap is expected, without inflating
+            // short-query weak sets (≤5 terms keep 0.12).
+            let boost = 0.15f32 + content_terms as f32 * 0.04f32;
+            boost.min(0.55f32)
         } else {
             0.12f32
         };
