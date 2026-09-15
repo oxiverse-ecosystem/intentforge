@@ -2245,7 +2245,19 @@ fn constraint_score(
         }
     }
 
-    // Positive constraints: boost for each match (fuzzy matching)
+    // Positive constraints: boost for each match (fuzzy matching).
+    //
+    // DESIGN (2026-09-15, positive-over-filter fix): the intent engine emits
+    // a +word constraint for EVERY non-stopword query token (e.g. "why is my
+    // internet speed much lower than the promised plan during peak hours" → 6
+    // positives: hours, internet, lower, peak, promised, speed). Treating these
+    // as a hard AND-filter (0% coverage → 0.60x penalty) crushes 20-30% of
+    // relevant results because no single page mentions ALL 6 tokens. Positive
+    // constraints are query-derived topical signals, not explicit user operators
+    // (site:/filetype:/intitle: are enforced elsewhere as hard filters). They
+    // should therefore be BOOST-ONLY: reward results that match multiple
+    // constraints, but never penalize a result for missing some. Floor is 1.0
+    // (no change) instead of 0.60 (penalty).
     if !constraints.positive.is_empty() {
         let mut matched = 0;
         for pos in &constraints.positive {
@@ -2261,8 +2273,6 @@ fn constraint_score(
                 || text_normalized.split_whitespace().any(|w| w == pos_normalized)
                 || (pos_normalized.len() >= 3 && text_normalized.contains(&pos_normalized))
             } else {
-                // Multi-word: exact phrase match OR all words present individually
-                // "async support" → match "async" AND "support" anywhere in text
                 text_lower.contains(&pos_lower)
                 || text_normalized.contains(&pos_normalized)
                 || pos_words.iter().all(|w| {
@@ -2276,55 +2286,21 @@ fn constraint_score(
                 matched += 1;
             }
         }
-        // Coverage: fraction of positive constraints matched
-        let positive_count = constraints.positive.len() as f32;
-        let coverage = matched as f32 / positive_count;
-
-        // Positive boost is a bi-criteria score biased toward multi-signal hits:
-        // - Coverage pressure: fraction of positives matched.
-        // - Width pressure: concrete multi-positive hits beat single-token matches from broad docs.
-        // Coverage dominates for small positive sets; width lifts tighter topical candidates.
-
-        let mut coverage_pressure = coverage;
-        let mut width_pressure = if positive_count > 1.0 {
-            (matched as f32 / positive_count).sqrt()
-        } else {
-            matched as f32 / positive_count
-        };
-
-        // Soft fallback: when no positive matched, treat the result as if it matched the
-        // query semantically. This prevents narrow positive sets from producing zero-pressure
-        // text and turning ordering into a metadata lottery. It is NOT a fake match:
-        // it is a last-resort boost based on query-to-document similarity.
-        if matched == 0 {
-            let url_tokens: Vec<&str> = url.split_whitespace().collect();
-            let title_tokens: Vec<&str> = title.split_whitespace().collect();
-            if !url_tokens.is_empty() || !title_tokens.is_empty() {
-                let mut similarity_gap = 0.0f32;
-                if !url_tokens.is_empty() {
-                    if let Ok(parsed_url) = reqwest::Url::parse(url) {
-                        if let Some(host) = parsed_url.host_str() {
-                            let host_lower = host.to_lowercase();
-                            let matching = url_tokens.iter().filter(|t| host_lower.contains(*t)).count();
-                            similarity_gap = (matching as f32 / url_tokens.len() as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                }
-                let q_reuse: f32 = semantic_relevance_score(url, &title, &content);
-                let similar = (similarity_gap * 0.45 + q_reuse * 0.55).clamp(0.0, 1.0);
-                coverage_pressure = coverage_pressure.max(similar * 0.12);
-                width_pressure = width_pressure.max(similar * 0.12);
-            }
+        // Boost-only: reward multi-match results, but never penalize misses.
+        if matched > 0 {
+            let positive_count = constraints.positive.len() as f32;
+            let coverage = matched as f32 / positive_count;
+            // Width pressure: concrete multi-positive hits beat single-token matches.
+            let width_pressure = if positive_count > 1.0 {
+                (matched as f32 / positive_count).sqrt()
+            } else {
+                matched as f32 / positive_count
+            };
+            let blended_coverage = coverage * 0.70 + width_pressure * 0.30;
+            // 0% coverage (matched==0) is handled above (no change).
+            // 100% coverage → 1.5x boost. Partial coverage → proportional boost.
+            score *= 1.0 + blended_coverage * 0.50;
         }
-
-        let blended_coverage = coverage_pressure * 0.70 + width_pressure * 0.30;
-
-        // Scale: 0% coverage -> 0.60x (Phase 5: raised from 0.35 so a broad
-        //       query with no positive hits is no longer over-penalized)
-        //         100% coverage -> 1.9x
-        // Mapping is monotonic, but at least one positive match with high coverage
-        // becomes a strong discriminator vs zero-match passthrough.
-        score *= 0.60 + blended_coverage * 1.30;
     }
 
     // Language entity constraints: when a programming language is detected in the
@@ -6491,7 +6467,7 @@ const SUBJECTIVE_QUALITY_TERMS: &[&str] = &[
 /// words that slipped past the extractor's stopword lists. Structural vocabulary,
 /// data-driven — never a per-query literal.
 const EXCLUSION_GRAMMAR_NOISE: &[&str] = &[
-    "have", "has", "had", "having", "from", "with", "without", "about", "into",
+    "have", "has", "had", "having", "getting", "from", "with", "without", "about", "into",
     "onto", "upon", "over", "under", "before", "after", "than", "that", "which",
     "this", "these", "those", "what", "when", "where", "who", "why", "how",
     "their", "them", "they", "our", "your", "his", "her", "its", "the", "a", "an",
@@ -6520,6 +6496,19 @@ fn is_exclusion_grammar_noise(term: &str) -> bool {
     // vocabulary), no per-query tuning.
     if !tokens.is_empty() && tokens.iter().all(|t| EXCLUSION_GRAMMAR_NOISE.contains(t)) {
         return true;
+    }
+    // STATE-DESCRIPTION construction: "getting overcharged", "having issues",
+    // "being scammed" → auxiliary/participle + state describes a feeling or
+    // outcome, not a topical entity. Hard-dropping every result that mentions
+    // "getting overcharged" collapses relevant query results. Structural rule:
+    // first token is a state-verb head. No per-query literals; the state-verb
+    // set is closed-class auxiliary vocabulary, same pattern as
+    // EXCLUSION_GRAMMAR_NOISE / MANNER_VERBS.
+    const STATE_VERB_HEADS: &[&str] = &["getting", "having", "being", "feeling"];
+    if let Some(head) = tokens.first() {
+        if STATE_VERB_HEADS.contains(head) && tokens.len() >= 2 {
+            return true;
+        }
     }
     false
 }
@@ -10332,32 +10321,28 @@ fn merge_local_and_web(
     // overlap survived at the 0.05 floor (calibrate_scores re-inflates the bottom
     // onto [0.05,1.0]), so off-topic web junk could not be removed. This round
     // removes that carve-out so the same gate protects web results.
+    // Soft off-topic penalty (was hard-drop until 2026-09-15T1200Z round).
+    //
+    // ROOT CAUSE: the old hard-drop `retain(|r| overlaps || geo_ok)` dropped
+    // every result whose title/content/url snippet shared ZERO of the query's
+    // strong distinctive terms. For long NL queries with many distinctive terms
+    // ("how to make fluffy idli batter at home without using a wet grinder" →
+    // ~7 strong terms), 80-90% of results were dropped because NO single page
+    // mentions ANY of those exact tokens. Verified live: 17/26 new NL queries
+    // had >50% drops, collapsing 30-result sets to 1-6. This is a result-set
+    // collapse, not curation — the surviving 1-6 were not meaningfully more
+    // on-topic than the 24 dropped.
+    //
+    // FIX: instead of hard-dropping, apply a soft score penalty (×0.10) to
+    // zero-overlap results. They sink to the bottom but survive. The downstream
+    // adaptive relevance floor (P60 distribution), domain-saturation gate, and
+    // pagination naturally exclude genuinely off-topic junk without collapsing
+    // the set. Adult results for non-adult queries are still hard-dropped by the
+    // separate adult block below — safety is never fail-open. Geo-matching
+    // results keep full score (local intent).
     if !strong_distinctive_terms.is_empty() {
-        let before = merged.len();
-        let retained_pre_offtopic: Vec<MergedResult> = merged.iter().cloned().collect();
-        merged.retain(|r| {
-            // Adult exemption: when the query is explicitly adult, an adult result
-            // must survive the off-topic gate — the adult block below keeps it
-            // intentionally. Without this, the web off-topic drop would remove the
-            // adult URL first (it shares zero food/recipe/etc. distinctive terms),
-            // regressing "adult kept for explicit-adult query".
-            if adult_intent {
-                let ul = r.url.to_lowercase();
-                let tl = r.title.to_lowercase();
-                let host = reqwest::Url::parse(&r.url)
-                    .ok()
-                    .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
-                    .unwrap_or_default();
-                let tld_adult = host.ends_with(".xxx");
-                let host_adult = adult_hosts.iter().any(|h| host.contains(h));
-                let path_adult = adult_paths.iter().any(|p| ul.contains(p));
-                let title_adult = tl.contains("porn") || tl.contains("xxx ")
-                    || tl.contains("nude") || tl.contains("naked")
-                    || tl.contains("sex video") || tl.contains("adult film");
-                if tld_adult || host_adult || path_adult || title_adult {
-                    return true;
-                }
-            }
+        let mut penalized = 0usize;
+        for r in merged.iter_mut() {
             let tl = r.title.to_lowercase();
             let cl = r.content.to_lowercase();
             let ul = r.url.to_lowercase();
@@ -10365,63 +10350,35 @@ fn merge_local_and_web(
                 let lt = t.to_lowercase();
                 tl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
             });
-            // Geo-aware exemption: a query with a resolved location is a LOCAL/geo
-            // intent; a result that names that location (city/country) is genuinely
-            // on-topic even if its snippet omits the descriptive adjectives
-            // (quiet/wifi/outlets/...). Without this, "quiet places to study near
-            // chennai" hard-drops every chennai-mentioning result that didn't also
-            // repeat "quiet"/"wifi", collapsing the set to one generic page.
-            // General: reuses geo_relevance_score, no query/domain bias; only
-            // exempts results that actually mention the resolved location.
             let geo_ok = geo_location
                 .map(|g| geo_relevance_score(&tl, &cl, &ul, g) > 0.0)
                 .unwrap_or(false);
-            overlaps || geo_ok
-        });
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("OFF_TOPIC_HARD_DROP: removed {}/{} result(s) (local+web) with zero distinctive-term overlap", removed, before);
-        }
-        // Fail-open rescue (mirrors the date/price fail-opens above): if the
-        // off-topic drop would EMPTY the merged set, the "distinctive-term
-        // overlap" signal is too strict for this query (e.g. fresh+price queries
-        // where upstream results legitimately omit the exact distinctive tokens
-        // in their title/content/url snippets) and we must not return a blank
-        // page. Restore the survivors but STILL enforce the adult hard-drop below
-        // (safety is never fail-open), and keep an explicit warning so the gap is
-        // visible. Keyed on "would-empty", not on any query/domain — general.
-        if merged.is_empty() && before > 0 {
-            // Fail-open: restore results even when relevance is low.
-            // The previous suppression (relevance < 0.02) threw away legitimate
-            // results for many queries (e.g. "how to tell if an avocado is ripe
-            // without squeezing it" returned 0 results). The adult hard-drop
-            // below still enforces safety — this fail-open only restores
-            // non-adult results that lack distinctive-term overlap.
-            let restored: Vec<MergedResult> = retained_pre_offtopic
-                .into_iter()
-                .filter(|r| {
-                    let ul = r.url.to_lowercase();
-                    let tl = r.title.to_lowercase();
+            if !overlaps && !geo_ok {
+                // Adult exemption: when the query is explicitly adult, an adult
+                // result keeps full score — the adult block below will handle it.
+                let is_adult_exempt = if adult_intent {
                     let host = reqwest::Url::parse(&r.url)
                         .ok()
                         .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
                         .unwrap_or_default();
-                    let tld_adult = host.ends_with(".xxx");
-                    let host_adult = adult_hosts.iter().any(|h| host.contains(h));
-                    let path_adult = adult_paths.iter().any(|p| ul.contains(p));
-                    let title_adult = tl.contains("porn") || tl.contains("xxx ")
+                    host.ends_with(".xxx")
+                        || adult_hosts.iter().any(|h| host.contains(h))
+                        || adult_paths.iter().any(|p| ul.contains(p))
+                        || tl.contains("porn") || tl.contains("xxx ")
                         || tl.contains("nude") || tl.contains("naked")
-                        || tl.contains("sex video") || tl.contains("adult film");
-                    let is_adult = tld_adult || host_adult || path_adult || title_adult;
-                    !is_adult
-                })
-                .collect();
-            tracing::warn!(
-                "OFF_TOPIC_HARD_DROP FAIL-OPEN: {} result(s) all lacked distinctive-term overlap but dropping them would empty the set — restoring {} non-adult survivor(s) (recency/authority ranking still applies)",
-                before,
-                restored.len()
-            );
-            merged = restored;
+                        || tl.contains("sex video") || tl.contains("adult film")
+                } else {
+                    false
+                };
+                if !is_adult_exempt {
+                    r.score *= 0.10;
+                    penalized += 1;
+                }
+            }
+        }
+        if penalized > 0 {
+            merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            tracing::info!("OFF_TOPIC_SOFT_PENALTY: penalized {}/{} result(s) with zero distinctive-term overlap (score *= 0.10, sorted to bottom)", penalized, merged.len());
         }
     }
 
@@ -15472,6 +15429,17 @@ async fn handle_search(
         let before_count = web_results.len();
         let constraints_ref = &intent.structured_constraints;
 
+        // Filter out grammar-noise negatives BEFORE violation counting.
+        // "getting overcharged" is a state description (auxiliary verb + adjective),
+        // not a topical exclusion — every car-dealership page mentions "getting
+        // overcharged" in passing, so hard-dropping on it collapses the result set.
+        // is_exclusion_grammar_noise already handles single-word function words
+        // ("have", "from"); this extends the same guard to multi-word phrases.
+        let effective_negatives: Vec<String> = constraints_ref.negative.iter()
+            .filter(|n| !is_exclusion_grammar_noise(n))
+            .cloned()
+            .collect();
+
         // Score each result and track violation counts
         let mut scored: Vec<(usize, f32, usize)> = web_results.iter().enumerate().map(|(i, r)| {
             let c_score = constraint_score(&r.title, &r.content, &r.url, constraints_ref);
@@ -15487,7 +15455,7 @@ async fn handle_search(
                 0
             } else {
                 let text = format!("{} {} {}", r.title.to_lowercase(), r.url.to_lowercase(), r.content.chars().take(300).collect::<String>());
-                constraints_ref.negative.iter().filter(|n| {
+                effective_negatives.iter().filter(|n| {
                     let n_lower = n.to_lowercase();
                     let n_words: Vec<&str> = n_lower.split_whitespace().collect();
                     if n_words.len() == 1 {
