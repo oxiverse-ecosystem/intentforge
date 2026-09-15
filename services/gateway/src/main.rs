@@ -16121,6 +16121,100 @@ let mut results = match tokio::task::spawn_blocking(move || {
         }
     };
 
+    // IFIX-A: Video dominance fix for thin out-of-vertical queries
+    // When upstream returns <3 non-video results for text queries, the P8 video
+    // cap (0.04) isn't enough because there's nothing else to replace them with.
+    // Detect via source types (invidious/video) and URL host class — no per-query
+    // literals. Two remediations:
+    //   (a) non-video < 3: crush video scores ×0.01 so any non-video outranks them
+    //   (b) non-video == 0: re-query SearXNG with categories=general to find
+    //       non-video results that the mixed-category fan-out missed
+    {
+        let non_video_top10 = results.iter()
+            .take(10)
+            .filter(|r| {
+                !r.sources.iter().any(|s| s == "invidious" || s == "video")
+                    && !is_url_video_host(&r.url)
+            })
+            .count();
+
+        if non_video_top10 < 3 && non_video_top10 > 0 && !has_video_intent(&q_trimmed) {
+            for r in results.iter_mut() {
+                let is_video = r.sources.iter().any(|s| s == "invidious" || s == "video")
+                    || is_url_video_host(&r.url);
+                if is_video {
+                    r.score *= 0.01;
+                }
+            }
+            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            tracing::info!("IFIX-A: thin result set (non_video={}) — applied ×0.01 video crush for '{}'", non_video_top10, q_trimmed);
+        }
+
+        if non_video_top10 == 0 && !has_video_intent(&q_trimmed) {
+            let general_url = searxng_url_with_categories(
+                "http://127.0.0.1:8080",
+                &q_trimmed,
+                "general",
+                geo_location.as_ref(),
+                lang,
+            );
+
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                client.get(&general_url).send()
+            ).await {
+                Ok(Ok(resp)) => {
+                    if let Some(bytes) = read_body_bounded(resp).await {
+                        let raw = String::from_utf8_lossy(&bytes).into_owned();
+                        let sanitized = sanitize_json_text(&raw);
+                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&sanitized) {
+                            if let Some(results_arr) = data.get("results").and_then(|r| r.as_array()) {
+                                let mut added = 0;
+                                for r in results_arr {
+                                    let url = r.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                                    if is_url_video_host(&url) {
+                                        continue;
+                                    }
+                                    let title = r.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                                    let content = r.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                                    let score = r.get("score").and_then(|s| s.as_f64()).unwrap_or(0.5) as f32;
+                                    results.push(MergedResult {
+                                        url,
+                                        title,
+                                        content,
+                                        score,
+                                        authority: 0.5,
+                                        sources: vec!["web".to_string()],
+                                        is_local: false,
+                                        published_date: r.get("publishedDate").and_then(|d| d.as_str()).map(|s| s.to_string()),
+                                        price: None,
+                                        currency: None,
+                                        quality: 0.5,
+                                        post_cal_cap: None,
+                                        engine_trust_mult: 1.0,
+                                        commerce: None,
+                                        commerce_provenance: None,
+                                    });
+                                    added += 1;
+                                }
+                                if added > 0 {
+                                    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                                    tracing::info!("IFIX-A: re-query added {} non-video results for '{}'", added, q_trimmed);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("IFIX-A: re-query request failed for '{}': {:?}", q_trimmed, e);
+                }
+                Err(_) => {
+                    tracing::warn!("IFIX-A: re-query timed out for '{}'", q_trimmed);
+                }
+            }
+        }
+    }
+
     // 8b. Post-merge hard negative filter: apply negative constraints to ALL results
     // (local + web). The pre-merge filter only catches web results; local index
     // results that match negative terms must also be removed here.
