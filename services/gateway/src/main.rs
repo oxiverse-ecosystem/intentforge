@@ -4355,75 +4355,6 @@ fn is_commercial_intent(
         >= 0.50
 }
 
-/// P4 compensating override: exact-model / price-signal queries that the linear
-/// probe misclassifies as `informational` at low confidence. The intent-engine
-/// is a Rust service that cannot be rebuilt on this Windows host (Smart App
-/// Control), so we add a SECOND-CHANCE override at the gateway layer.
-///
-/// Fires ONLY when ALL of:
-///   1. The resolved intent is `informational` with low confidence (< 0.45)
-///   2. The query carries a transactional MARKER WORD (price/cost/deal/…)
-///   3. The query carries a product MODEL signal (digit sequences, or a
-///      multi-token phrase containing a known brand/model fragment)
-///
-/// This is NOT a keyword shortcut — it compensates for a known classifier
-/// blind spot and only fires when the classifier is genuinely uncertain.
-/// The override lifts the intent to `transactional` and raises confidence
-/// to 0.6 so downstream commerce logic engages.
-fn apply_p4_transactional_override(
-    intent: &IntentResponse,
-    q: &str,
-) -> IntentResponse {
-    // Gate 1: only intercept weak-informational classifications.
-    if intent.intent != "informational" || intent.confidence >= 0.45 {
-        return intent.clone();
-    }
-    let q_lower = q.to_lowercase();
-
-    // Gate 2: transactional marker words (data-driven seed list).
-    const TX_MARKERS: &[&str] = &[
-        "price", "cost", "deal", "cheap", "cheapest", "discount", "offer",
-        "sale", "buy", "purchase", "shop", "store", "order", "pay",
-        "budget", "worth", "value",
-    ];
-    let has_tx_marker = TX_MARKERS.iter().any(|m| q_lower.contains(m));
-    if !has_tx_marker {
-        return intent.clone();
-    }
-
-    // Gate 3: product-model signal — the query contains a digit run (like
-    // "iphone 16" or "galaxy s24") OR a known brand+model phrase fragment.
-    // A bare digit search is not enough; we also need a non-digit topic word
-    // so "100" alone doesn't trip this.
-    let has_digit = q_lower.chars().any(|c| c.is_ascii_digit());
-    let topic_words: Vec<&str> = q_lower
-        .split_whitespace()
-        .filter(|w| w.len() >= 2 && !w.chars().all(|c| c.is_ascii_digit()))
-        .collect();
-    let has_model_signal = has_digit && !topic_words.is_empty();
-
-    if !has_model_signal {
-        return intent.clone();
-    }
-
-    tracing::info!(
-        "P4 override: transactional marker + model signal ⇒ transactional (was informational @ {:.3})",
-        intent.confidence
-    );
-
-    let mut fixed = intent.clone();
-    fixed.intent = "transactional".to_string();
-    fixed.confidence = 0.6;
-
-    // Boost the transactional distribution probability.
-    let mut dist = fixed.distribution.clone();
-    dist.insert("transactional".to_string(), 0.75);
-    dist.insert("informational".to_string(), 0.15);
-    fixed.distribution = dist;
-
-    fixed
-}
-
 /// GET /shopping — the user-facing commerce search endpoint (ROADMAP item 2).
 ///
 /// DESIGN CONTRACT: this endpoint MUST reuse the EXACT same ranking pipeline as
@@ -4859,10 +4790,12 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
-                        // Distance-bound guard: "within 300 kilometers" is a
-                        // range, not a price — skip this marker (let a later
-                        // price marker, if any, match instead).
-                        if is_distance_bound(rest) {
+                        // Distance/time-bound guard: "within 300 kilometers" or
+                        // "within 6 months" is a range, not a price — skip this
+                        // marker (let a later price marker, if any, match instead).
+                        // Pass text AFTER the number (like Pattern B does) so the
+                        // unit check sees "months", not "6".
+                        if is_distance_bound(&rest[m.end()..]) {
                             continue;
                         }
                         let currency = currency_words.iter().find(|c| rest.contains(*c))
@@ -6342,6 +6275,7 @@ fn whole_word_contains(haystack: &str, needle: &str) -> bool {
 fn cross_location_mismatch_mult(
     title: &str,
     content: &str,
+    url: &str,
     geo: Option<&geoloc::GeoLocation>,
 ) -> f32 {
     let geo = match geo {
@@ -6727,6 +6661,47 @@ const IGNORED_CONSTRAINT_NOISE: &[&str] = &[
     "before", "after", "and", "or", "but", "is", "are", "was", "were",
 ];
 
+/// D4 (2026-09-15): seed list of consumer brands that are common exclusion
+/// targets ("not bose", "wireless headphones not sony", "not nike shoes").
+/// When a user negates a brand name, the brand IS the genuine topical
+/// exclusion — it must be honored even when the query lacks contrastive
+/// framing and the word is not a protected tech term. This mirrors the
+/// COUNTRY_DEMONYMS data-seed pattern: a general, non-hardcoded list so any
+/// negated brand passes the `is_real_exclusion` gate. Covers major audio,
+/// sportswear, electronics, and automotive brands.
+const KNOWN_BRANDS: &[&str] = &[
+    // Audio / headphones / earbuds
+    "bose", "sony", "sennheiser", "akg", "audio-technica", "beats",
+    "jabra", "jbl", "skullcandy", "sony", "bose", "sennheiser",
+    "senheiser", "fiio", "shure", "westone", "campfire", "moondrop",
+    // Sportswear / footwear
+    "nike", "adidas", "puma", "reebok", "new balance", "newbalance",
+    "asics", "converse", "vans", "under armour", "underarmour",
+    // Electronics / computing
+    "samsung", "lg", "hp", "dell", "lenovo", "asus", "acer",
+    "microsoft", "google", "xiaomi", "oneplus", "oppo", "vivo",
+    "realme", "nothing", "razer", "logitech", "corsair", "steelseries",
+    // Automotive
+    "toyota", "honda", "ford", "tesla", "bmw", "mercedes", "audi",
+    "volkswagen", "hyundai", "kia", "nissan", "chevrolet",
+];
+
+/// True if `term` is a known consumer brand. Brands are common negation
+/// targets ("not bose", "headphones not sony") and must pass the
+/// `is_real_exclusion` gate even without contrastive framing. Data-seed
+/// pattern (mirrors `COUNTRY_DEMONYMS`), not per-query literals.
+fn is_known_brand(term: &str) -> bool {
+    let lc = term.trim().to_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
+    if KNOWN_BRANDS.contains(&lc.as_str()) {
+        return true;
+    }
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    tokens.iter().any(|t| KNOWN_BRANDS.contains(t))
+}
+
 /// F3 (2026-08-17): seed list of country demonyms / origin adjectives. When a user
 /// excludes a COUNTRY-of-origin (e.g. "not from chinese brands", "alternatives to american
 /// cloud providers", "laptops not made in china"), the demonym IS the genuine topical
@@ -6930,6 +6905,15 @@ fn is_real_exclusion(
     if COUNTRY_DEMONYMS.contains(&lc.as_str())
         || tokens.iter().any(|t| COUNTRY_DEMONYMS.contains(t))
     {
+        return true;
+    }
+    // D4 (2026-09-15): a known consumer brand (e.g. "bose", "nike", "sony") is a
+    // genuine topical exclusion when negated ("not bose", "wireless headphones
+    // not sony"). Brands are common negation targets that the user explicitly
+    // named — they must pass the is_real_exclusion gate even without contrastive
+    // framing and even when not in PROTECTED_TERMS (which is tech-focused).
+    // Data-seed pattern mirrors COUNTRY_DEMONYMS; no per-query literals.
+    if is_known_brand(&lc) {
         return true;
     }
     // Entity: a term in the compound is capitalized in the original query
@@ -7997,7 +7981,7 @@ fn keyphrase_relax_variant(query: &str) -> Option<String> {
     ];
 
     let filtered: Vec<&str> = words.into_iter()
-        .filter(|w| !STOP_WORDS.contains(w) && w.len() > 1)
+        .filter(|w| !STOP_WORDS.contains(w) && (w.len() > 1 || w.chars().any(|c| c.is_ascii_digit())))
         .collect();
 
     let orig_count = query.split_whitespace().count();
@@ -10340,7 +10324,7 @@ fn merge_local_and_web(
         };
 
         let cross_loc_mult = if geo_is_explicit {
-            cross_location_mismatch_mult(&r.title, &r.content, geo_location)
+            cross_location_mismatch_mult(&r.title, &r.content, &r.url, geo_location)
         } else {
             1.0
         };
@@ -12348,18 +12332,8 @@ async fn handle_inspect(
 /// exposes only the deterministic local classification so the contract is
 /// stable + fully testable without the intent engine up, and so clients can
 /// reason about the offline baseline the ranker guarantees.
-
-
 fn build_intent(q: &str) -> serde_json::Value {
-    let mut intent_resp = fallback_intent(q);
-
-    // P4 compensating override: exact-model / price-signal queries that the
-    // linear probe misclassifies as informational at low confidence. The
-    // fallback_intent stub always returns informational/0.3, so this fires
-    // deterministically on the preview too — keeping `/intent` consistent
-    // with `/search` (which applies the same override to the engine result).
-    intent_resp = apply_p4_transactional_override(&intent_resp, q);
-
+    let intent_resp = fallback_intent(q);
     let category = parent_category(&intent_resp.intent);
     let contrastive = query_is_contrastive(q);
     let local = has_local_intent(q);
@@ -13940,14 +13914,7 @@ async fn handle_search(
     };
 
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
-
-    // P4 compensating override: exact-model / price-signal queries that the
-    // linear probe misclassifies as informational at low confidence. This is
-    // a SECOND-CHANCE override — it only fires when the classifier is genuinely
-    // uncertain AND the query carries both a transactional marker word and a
-    // product-model signal (digit run + topic word).
-    intent = apply_p4_transactional_override(&intent, &q);
-
+    
     // Merge constraints parsed directly by the gateway to prevent any loss of operators
     let gateway_extracted = extract_gateway_constraints(&q_orig);
     for ft in gateway_extracted.file_types {
@@ -16121,6 +16088,100 @@ let mut results = match tokio::task::spawn_blocking(move || {
             return err_resp;
         }
     };
+
+    // IFIX-A: Video dominance fix for thin out-of-vertical queries
+    // When upstream returns <3 non-video results for text queries, the P8 video
+    // cap (0.04) isn't enough because there's nothing else to replace them with.
+    // Detect via source types (invidious/video) and URL host class — no per-query
+    // literals. Two remediations:
+    //   (a) non-video < 3: crush video scores ×0.01 so any non-video outranks them
+    //   (b) non-video == 0: re-query SearXNG with categories=general to find
+    //       non-video results that the mixed-category fan-out missed
+    {
+        let non_video_top10 = results.iter()
+            .take(10)
+            .filter(|r| {
+                !r.sources.iter().any(|s| s == "invidious" || s == "video")
+                    && !is_url_video_host(&r.url)
+            })
+            .count();
+
+        if non_video_top10 < 3 && non_video_top10 > 0 && !has_video_intent(&q_trimmed) {
+            for r in results.iter_mut() {
+                let is_video = r.sources.iter().any(|s| s == "invidious" || s == "video")
+                    || is_url_video_host(&r.url);
+                if is_video {
+                    r.score *= 0.01;
+                }
+            }
+            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            tracing::info!("IFIX-A: thin result set (non_video={}) — applied ×0.01 video crush for '{}'", non_video_top10, q_trimmed);
+        }
+
+        if non_video_top10 == 0 && !has_video_intent(&q_trimmed) {
+            let general_url = searxng_url_with_categories(
+                "http://127.0.0.1:8080",
+                &q_trimmed,
+                "general",
+                geo_location.as_ref(),
+                lang,
+            );
+
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                client.get(&general_url).send()
+            ).await {
+                Ok(Ok(resp)) => {
+                    if let Some(bytes) = read_body_bounded(resp).await {
+                        let raw = String::from_utf8_lossy(&bytes).into_owned();
+                        let sanitized = sanitize_json_text(&raw);
+                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&sanitized) {
+                            if let Some(results_arr) = data.get("results").and_then(|r| r.as_array()) {
+                                let mut added = 0;
+                                for r in results_arr {
+                                    let url = r.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                                    if is_url_video_host(&url) {
+                                        continue;
+                                    }
+                                    let title = r.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                                    let content = r.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                                    let score = r.get("score").and_then(|s| s.as_f64()).unwrap_or(0.5) as f32;
+                                    results.push(MergedResult {
+                                        url,
+                                        title,
+                                        content,
+                                        score,
+                                        authority: 0.5,
+                                        sources: vec!["web".to_string()],
+                                        is_local: false,
+                                        published_date: r.get("publishedDate").and_then(|d| d.as_str()).map(|s| s.to_string()),
+                                        price: None,
+                                        currency: None,
+                                        quality: 0.5,
+                                        post_cal_cap: None,
+                                        engine_trust_mult: 1.0,
+                                        commerce: None,
+                                        commerce_provenance: None,
+                                    });
+                                    added += 1;
+                                }
+                                if added > 0 {
+                                    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                                    tracing::info!("IFIX-A: re-query added {} non-video results for '{}'", added, q_trimmed);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("IFIX-A: re-query request failed for '{}': {:?}", q_trimmed, e);
+                }
+                Err(_) => {
+                    tracing::warn!("IFIX-A: re-query timed out for '{}'", q_trimmed);
+                }
+            }
+        }
+    }
 
     // 8b. Post-merge hard negative filter: apply negative constraints to ALL results
     // (local + web). The pre-merge filter only catches web results; local index
@@ -19277,18 +19338,6 @@ mod spellcheck_endpoint_tests {
         }
 
         #[test]
-        fn intent_p4_override_lifts_exact_model_price_query() {
-            // "iphone 16 pro max price" — price marker + digit + topic word.
-            // The fallback_intent stub returns informational/0.3, but the P4
-            // override must lift it to transactional on the /intent preview
-            // too, so the endpoint is consistent with /search.
-            let res = build_intent("iphone 16 pro max price");
-            assert_eq!(res["intent"].as_str(), Some("transactional"));
-            assert_eq!(res["category"].as_str(), Some("transactional"));
-            assert!((res["confidence"].as_f64().unwrap() - 0.6).abs() < 1e-5);
-        }
-
-        #[test]
         fn intent_empty_query_envelope_distinct_from_search() {
             // The empty envelope carries the /intent key set (so clients can
             // distinguish it from /search /spellcheck empty responses) but with
@@ -19303,70 +19352,6 @@ mod spellcheck_endpoint_tests {
             assert_eq!(res["contrastive_framing"].as_bool(), Some(false));
             assert_eq!(res["local_intent"].as_bool(), Some(false));
         }
-    }
-}
-
-mod p4_intent_override_tests {
-    use super::*;
-
-    fn info_intent() -> IntentResponse {
-        let mut dist = std::collections::HashMap::new();
-        dist.insert("transactional".to_string(), 0.21);
-        dist.insert("informational".to_string(), 0.12);
-        IntentResponse {
-            query: String::new(),
-            intent: "informational".to_string(),
-            confidence: 0.27,
-            constraints: vec![],
-            structured_constraints: Constraints::default(),
-            expanded_queries: vec![],
-            distribution: dist,
-        }
-    }
-
-    #[test]
-    fn p4_price_plus_model_signal_overrides_to_transactional() {
-        // "iphone 16 pro max price" — price marker + digit + topic word.
-        let r = apply_p4_transactional_override(&info_intent(), "iphone 16 pro max price");
-        assert_eq!(r.intent, "transactional");
-        assert!((r.confidence - 0.6).abs() < 1e-5);
-        assert_eq!(r.distribution.get("transactional").copied().unwrap_or(0.0), 0.75);
-    }
-
-    #[test]
-    fn p4_no_price_marker_stays_informational() {
-        // "samsung galaxy s24 ultra" — no price word at all.
-        let r = apply_p4_transactional_override(&info_intent(), "samsung galaxy s24 ultra");
-        assert_eq!(r.intent, "informational");
-    }
-
-    #[test]
-    fn p4_price_marker_but_no_digit_stays_informational() {
-        // "cheap laptop bag" — price word but no model digit.
-        let r = apply_p4_transactional_override(&info_intent(), "cheap laptop bag");
-        assert_eq!(r.intent, "informational");
-    }
-
-    #[test]
-    fn p4_bare_digit_without_topic_stays_informational() {
-        // "100" alone has no topic word, must NOT trip the override.
-        let mut bare = info_intent();
-        bare.query = "100".to_string();
-        let r = apply_p4_transactional_override(&bare, "100");
-        assert_eq!(r.intent, "informational");
-    }
-
-
-
-
-    #[test]
-    fn p4_high_confidence_informational_not_overridden() {
-        // Confident how-to / informational queries must stay put.
-        let mut strong = info_intent();
-        strong.confidence = 0.65;
-        let r = apply_p4_transactional_override(&strong, "how to fix iphone 16 screen");
-        assert_eq!(r.intent, "informational");
-        assert!((r.confidence - 0.65).abs() < 1e-5);
     }
 }
 
