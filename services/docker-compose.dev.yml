@@ -93,7 +93,7 @@ services:
     # Independent network — NOT behind gluetun VPN
     # Tor2 provides a separate IP path for SearXNG2
     ports:
-      - "9051:9051"
+      - "1905:9051"
       - "8081:8081"    # SearXNG2 accessible via tor2's network
     volumes:
       - ./privacy-layer/tor2/data:/var/lib/tor
