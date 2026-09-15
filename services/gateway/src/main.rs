@@ -11681,6 +11681,111 @@ fn is_pronounceable(w: &str) -> bool {
     true
 }
 
+/// Detect if a query is gibberish/nonsense based on structural signals.
+///
+/// Three independent signals, any one of which is sufficient:
+/// 1. Keyboard-row walk: ≥5 consecutive characters from a single QWERTY row
+///    (e.g., "asdfghjkl" is the home row, "qwert" is the top row).
+/// 2. No recognizable words + high character entropy: every token is absent
+///    from the dictionary AND the character distribution is unusually uniform
+///    (h > 4.5), indicating random typing rather than language.
+/// 3. Long consonant runs (≥5) in a token that is NOT a recognized dictionary
+///    word — real English words rarely exceed 4 consonants in a row; longer
+///    runs in unknown words indicate gibberish.
+fn is_gibberish_query(q: &str, spell_index: &spell::SymSpellIndex) -> bool {
+    let lower = q.to_lowercase();
+    let words: Vec<&str> = lower
+        .split_whitespace()
+        .filter(|w| w.chars().any(|c| c.is_alphabetic()))
+        .collect();
+    if words.is_empty() {
+        return false;
+    }
+
+    // Signal 1: Keyboard-row walk (≥5 consecutive chars from the same QWERTY row)
+    let row1: std::collections::HashSet<char> = "qwertyuiop".chars().collect();
+    let row2: std::collections::HashSet<char> = "asdfghjkl".chars().collect();
+    let row3: std::collections::HashSet<char> = "zxcvbnm".chars().collect();
+
+    for w in &words {
+        let chars: Vec<char> = w.chars().filter(|c| c.is_alphabetic()).collect();
+        if chars.len() < 5 {
+            continue;
+        }
+        for window in chars.windows(5) {
+            let all_row1 = window.iter().all(|c| row1.contains(c));
+            let all_row2 = window.iter().all(|c| row2.contains(c));
+            let all_row3 = window.iter().all(|c| row3.contains(c));
+            if all_row1 || all_row2 || all_row3 {
+                return true;
+            }
+        }
+    }
+
+    // Signal 2: No recognizable words + high character entropy (random typing)
+    let recognizable = words
+        .iter()
+        .filter(|w| {
+            let alpha: String = w.chars().filter(|c| c.is_alphabetic()).collect();
+            if alpha.len() < 3 {
+                return false;
+            }
+            spell_index.contains_word(&alpha) || spell::is_protected_term(&alpha)
+        })
+        .count();
+
+    if recognizable == 0 {
+        let mut freq = [0u32; 128];
+        let mut total = 0u32;
+        for ch in lower.chars() {
+            if (ch as usize) < 128 {
+                freq[ch as usize] += 1;
+                total += 1;
+            }
+        }
+        let mut h = 0.0f32;
+        if total > 0 {
+            for &f in &freq {
+                if f > 0 {
+                    let p = f as f32 / total as f32;
+                    h -= p * p.log2();
+                }
+            }
+        }
+        if h > 4.5 {
+            return true;
+        }
+    }
+
+    // Signal 3: Long consonant runs (≥5) in an unrecognized token
+    let vowels: std::collections::HashSet<char> = "aeiouy".chars().collect();
+    for w in &words {
+        let chars: Vec<char> = w.chars().filter(|c| c.is_alphabetic()).collect();
+        if chars.len() < 5 {
+            continue;
+        }
+        let alpha: String = w.chars().filter(|c| c.is_alphabetic()).collect();
+        if spell_index.contains_word(&alpha) || spell::is_protected_term(&alpha) {
+            continue;
+        }
+        let mut max_run = 0u32;
+        let mut current_run = 0u32;
+        for c in &chars {
+            if vowels.contains(c) {
+                current_run = 0;
+            } else {
+                current_run += 1;
+                max_run = max_run.max(current_run);
+            }
+        }
+        if max_run >= 5 {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f32) {
     let words: Vec<&str> = q.split_whitespace().filter(|w| w.chars().any(|c| c.is_alphabetic())).collect();
     if words.is_empty() {
@@ -12032,6 +12137,11 @@ async fn handle_search(
     let q_cleaned_spelling = clean_query_for_spelling(q_trimmed);
 
     // Phase 7: graceful degradation for gibberish / low-quality input.
+    // First, the structural gibberish detector (keyboard walks, entropy, consonant runs).
+    if is_gibberish_query(&q_cleaned_spelling, &state.spell_index) {
+        return make_error_response(q_trimmed, "invalid_query", "This query appears to be gibberish. Please try a real search.", true);
+    }
+    // Then the dictionary-based quality flag.
     let (qflag, _valid_ratio) = query_quality_flag(&q_cleaned_spelling, &state.spell_index);
     if qflag == "junk" {
         return make_error_response(q_trimmed, "invalid_query", "Query appears to be gibberish; no results returned", true);
