@@ -28,23 +28,24 @@ jobs:
           lfs: false
           fetch-depth: 1
 
-      - name: Build gateway image
-        run: cd services && docker compose -f docker-compose.dev.yml build gateway
+      - name: Build gateway image (CI compose — no VPN)
+        run: cd services && docker compose -f docker-compose.ci.yml build gateway
 
-      - name: Bring up gateway
-        run: cd services && docker compose -f docker-compose.dev.yml up -d gateway
+      - name: Bring up gateway stack
+        run: cd services && docker compose -f docker-compose.ci.yml up -d
 
       - name: Wait for gateway health
         run: |
-          for i in {1..30}; do
-            if curl -fsS http://localhost:4000/health | grep -q OK; then
+          for i in {1..60}; do
+            if curl -fsS http://localhost:4000/health 2>/dev/null | grep -q OK; then
               echo "Gateway healthy"
               exit 0
             fi
-            echo "Waiting for gateway... ($i)"
+            echo "Waiting for gateway... ($i/60)"
             sleep 2
           done
           echo "Gateway never became healthy"
+          docker compose -f services/docker-compose.ci.yml logs gateway --tail 50 || true
           exit 1
 
       - name: Set up Python

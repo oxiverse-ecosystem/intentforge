@@ -1,0 +1,112 @@
+# IntentForge v2 — CI Compose (NO VPN/Tor — direct egress for schema tests)
+# Used by GitHub Actions for schema regression. The VPN layer (gluetun/tor) is
+# intentional for privacy in dev/prod, but CI runners have no .env VPN creds.
+# SearXNG runs on direct egress; gateway is reachable on :4000.
+
+services:
+  # ══════════════════════════════════════════════════════════════════
+  # META-SEARCH ENGINE (direct egress — no VPN needed for schema tests)
+  # ══════════════════════════════════════════════════════════════════
+
+  searxng:
+    container_name: if-ci-searxng
+    image: searxng/searxng:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - GRANIAN_WORKERS=2
+      - GRANIAN_HOST=0.0.0.0
+      - INSTANCE_NAME=intentforge-ci
+      - ENABLE_METRICS=false
+    volumes:
+      - ./meta-search-engines/searxng/searxng-ci:/etc/searxng:rw
+    restart: always
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+
+  # ══════════════════════════════════════════════════════════════════
+  # INTENT ENGINE
+  # ══════════════════════════════════════════════════════════════════
+
+  intent-engine:
+    build:
+      context: ./intent-engine
+      dockerfile: Dockerfile
+    container_name: if-ci-intent-engine
+    mem_limit: 512m
+    mem_reservation: 256m
+    environment:
+      - RUST_LOG=info
+      - RAYON_NUM_THREADS=4
+    restart: always
+
+  # ══════════════════════════════════════════════════════════════════
+  # INDEXER + CRAWLER
+  # ══════════════════════════════════════════════════════════════════
+
+  indexer:
+    build:
+      context: ./indexer
+      dockerfile: Dockerfile
+    container_name: if-ci-indexer
+    mem_limit: 1024m
+    mem_reservation: 256m
+    volumes:
+      - ./indexer/index_data:/app/index_data
+    restart: always
+
+  crawler:
+    build:
+      context: ./crawler
+      dockerfile: Dockerfile
+    container_name: if-ci-crawler
+    mem_limit: 1024m
+    mem_reservation: 512m
+    environment:
+      - RUST_LOG=info,crawler=debug
+    volumes:
+      - ./crawler/queue_data:/app/queue_data
+    restart: always
+
+  # ══════════════════════════════════════════════════════════════════
+  # GATEWAY
+  # ══════════════════════════════════════════════════════════════════
+
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: if-ci-gateway
+    mem_limit: 4096m
+    mem_reservation: 1024m
+    ports:
+      - "4000:4000"
+    environment:
+      - INTENT_ENGINE_URL=http://intent-engine:3005
+      - SEARXNG_URL=http://searxng:8080
+      - CRAWLER_URL=http://crawler:5001
+      - INDEXER_URL=http://indexer:6000
+      - SOVRN_COMMERCE_KEY=dummy-test-key-do-not-use
+      - RUST_LOG=info
+    volumes:
+      - ./gateway/data/commerce:/app/data/commerce:ro
+    depends_on:
+      intent-engine:
+        condition: service_started
+      crawler:
+        condition: service_started
+      indexer:
+        condition: service_started
+      searxng:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4000/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+    restart: always
