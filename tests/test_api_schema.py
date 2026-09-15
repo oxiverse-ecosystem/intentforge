@@ -3,7 +3,7 @@ Permanent non-Goals API schema regression tests (round 2026-08-15T0830Z).
 
 Audit t_6a1017ee requirement (C): every documented endpoint must have an
 automated schema test so a future regression fails CI without a human. The
-Goals-API endpoints already have tests/test_goals_api_schema.py (5 passing).
+Goals-API endpoints already have tests/test_goals_api_schema.py (20 passing).
 This file covers the remaining NON-Goals endpoints:
 
   1. GET  /            -> 200, body == "IntentForge-v2 Gateway"
@@ -19,14 +19,15 @@ This file covers the remaining NON-Goals endpoints:
                           each result has the documented news fields
   8. GET  /spellcheck  -> 200, keys query/corrected/changed/corrections,
                           on a typo changed == True and corrections[] non-empty
+  9. negated brand transparency (applied vs ignored contradiction)
+  10. other brand negatives enforced (applied only)
 
 Each test hits the already-running dev gateway (default http://localhost:4000).
-They are intended to be run by the oxiverse-qa loop / a CI job that brings the
-stack up first. If the gateway is unreachable, the suite skips (rather than
-failing red) so it can live harmlessly in the repo when no stack is up.
+GATE SEMANTICS (matches test_goals_api_schema.py):
+  * If INTENTFORGE_REQUIRE_GATEWAY=1 and gateway is down, the suite FAILS.
+  * Otherwise, unreachable gateway -> SKIP (local/dev convenience).
 
-Run:  pytest tests/test_api_schema.py
-Env:  INTENTFORGE_BASE_URL (default http://localhost:4000)
+Run:  pytest tests/ -v       (collected by directory)
 """
 
 import os
@@ -34,27 +35,36 @@ import os
 import pytest
 import requests
 
-BASE = os.environ.get("INTENTFORGE_BASE_URL", "http://localhost:4000").rstrip("/")
+BASE = os.environ.get(
+    "INTENTFORGE_BASE_URL",
+    os.environ.get("INTENTFORGE_BASE", "http://localhost:4000"),
+).rstrip("/")
+
+_REQUIRE_GATEWAY = os.environ.get("INTENTFORGE_REQUIRE_GATEWAY") == "1"
 
 
 def _reachable() -> bool:
     try:
-        r = requests.get(f"{BASE}/health", timeout=3)
-        return r.status_code == 200
+        r = requests.get(f"{BASE}/health", timeout=5)
+        return r.status_code == 200 and r.text.strip() == "OK"
     except Exception:
         return False
 
 
 @pytest.fixture(scope="module")
 def session():
-    s = requests.Session()
-    # Smoke check — skip the whole module if the dev gateway is down.
-    try:
-        r = s.get(f"{BASE}/health", timeout=5)
-        assert r.status_code == 200, f"gateway /health -> {r.status_code}"
-    except Exception as e:
-        pytest.skip(f"IntentForge gateway not reachable at {BASE}: {e}")
-    return s
+    """Gateway guard. REQUIRE=1 + down -> FAIL; otherwise SKIP."""
+    if _reachable():
+        return requests.Session()
+    if _REQUIRE_GATEWAY:
+        pytest.fail(
+            f"Gateway at {BASE} is REQUIRED (INTENTFORGE_REQUIRE_GATEWAY=1) "
+            f"but not reachable. Schema regression cannot be green-washed."
+        )
+    pytest.skip(
+        f"IntentForge gateway not reachable at {BASE} — skipping schema "
+        f"regression (set INTENTFORGE_REQUIRE_GATEWAY=1 to FAIL when down)."
+    )
 
 
 def _require_keys(label, obj, expected):
@@ -101,12 +111,7 @@ SEARCH_KEYS = [
 
 
 def test_search_schema(session):
-    """GET /search -> 200, all 15 documented top-level keys present, confidence is numeric.
-
-    The API is allowed to include documented-optional fields (e.g. price_verified,
-    which API_REFERENCE lists as "Optionally present"), so we assert subset inclusion
-    (no *missing* documented field) rather than an exact top-level key count.
-    """
+    """GET /search -> 200, all 15 documented top-level keys present, confidence is numeric."""
     r = session.get(f"{BASE}/search", params={"q": "schema test rust systems"}, timeout=30)
     assert r.status_code == 200, f"GET /search -> {r.status_code} {r.text[:300]}"
     body = r.json()
@@ -194,11 +199,6 @@ def test_spellcheck_typo_schema(session):
 
 # 9. Negated-brand-negative transparency must not contradict applied constraints
 def _neg_terms_from_applied(applied):
-    """Extract the set of negative terms reported in applied_constraints.
-
-    applied_constraints entries look like 'not:sony' / 'site:...' / 'price:<100'.
-    Only the 'not:<term>' entries are genuine negations.
-    """
     out = set()
     for entry in applied or []:
         if entry.startswith("not:"):
@@ -207,11 +207,6 @@ def _neg_terms_from_applied(applied):
 
 
 def _neg_terms_from_ignored(ignored):
-    """Extract the set of negative terms named in ignored_constraints.
-
-    ignored_constraints entries look like
-    'not:sony — exclusion not applied (...)'. The term is the text before ' —'.
-    """
     out = set()
     for entry in ignored or []:
         if entry.startswith("not:"):
@@ -221,45 +216,30 @@ def _neg_terms_from_ignored(ignored):
 
 
 def test_negated_brand_no_applied_ignored_contradiction(session):
-    """FIX t_b6764006: a rescued protected-brand negative (e.g. 'sony') must NOT
-    appear in BOTH applied_constraints ('not:sony') AND ignored_constraints
-    ('not:sony — exclusion not applied ...'). A negation cannot be both enforced
-    and declined.
-
-    The intent engine tags 'sony' as an Exclusion non-deterministically, so we
-    loop the query several times to catch the intermittent case where the engine
-    DID tag it (which is exactly when the old code would contradict itself).
-    """
+    """A negated brand must NOT appear in BOTH applied_constraints and ignored_constraints."""
     q = "wireless headphones price:<100 not sony after:2025-01-01"
     for i in range(5):
         r = session.get(f"{BASE}/search", params={"q": q}, timeout=60)
         assert r.status_code == 200, f"GET /search -> {r.status_code} {r.text[:300]}"
         body = r.json()
-        applied = body.get("applied_constraints")
-        ignored = body.get("ignored_constraints")
-        applied_neg = _neg_terms_from_applied(applied)
-        ignored_neg = _neg_terms_from_ignored(ignored)
+        applied_neg = _neg_terms_from_applied(body.get("applied_constraints"))
+        ignored_neg = _neg_terms_from_ignored(body.get("ignored_constraints"))
         overlap = applied_neg & ignored_neg
         assert not overlap, (
             f"iteration {i}: negated term(s) {sorted(overlap)} appear in BOTH "
-            f"applied_constraints and ignored_constraints (contradiction). "
-            f"applied_neg={sorted(applied_neg)} ignored_neg={sorted(ignored_neg)}"
+            f"applied_constraints and ignored_constraints (contradiction)."
         )
 
 
 def test_other_brand_negatives_applied_only(session):
-    """Control: bose/logitech/nike negatives are enforced (applied) and must NOT
-    be surfaced as ignored (they were never in the contradiction class).
-    """
+    """bose/logitech/nike negatives are enforced (applied) and NOT ignored."""
     for brand in ("bose", "logitech", "nike"):
         q = f"wireless headphones price:<100 not {brand} after:2025-01-01"
         r = session.get(f"{BASE}/search", params={"q": q}, timeout=60)
         assert r.status_code == 200, f"GET /search -> {r.status_code} {r.text[:300]}"
         body = r.json()
-        applied = body.get("applied_constraints")
-        ignored = body.get("ignored_constraints")
-        applied_neg = _neg_terms_from_applied(applied)
-        ignored_neg = _neg_terms_from_ignored(ignored)
+        applied_neg = _neg_terms_from_applied(body.get("applied_constraints"))
+        ignored_neg = _neg_terms_from_ignored(body.get("ignored_constraints"))
         assert brand in applied_neg, (
             f"brand '{brand}' should be enforced (in applied_constraints); "
             f"got applied_neg={sorted(applied_neg)}"

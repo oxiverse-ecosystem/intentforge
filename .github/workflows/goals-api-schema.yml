@@ -1,11 +1,9 @@
 name: goals-api-schema-tests
 
-# Schema regression tests for the Goals API (round 2026-08-15T0326Z).
-# These hit a RUNNING dev gateway (default http://localhost:4000). They are
-# designed to be driven by the oxiverse-qa loop, which brings the stack up
-# first. On a bare runner with no stack, the suite self-skips (the tests
-# call pytest.skip when /health is unreachable), so this job never turns the
-# main Rust CI red on its own.
+# Schema regression tests for the Goals API + non-Goals endpoints.
+# CRITICAL: this job must NEVER silently skip its purpose (green-wash).
+# INTENTFORGE_REQUIRE_GATEWAY=1 makes an unreachable gateway a HARD FAIL,
+# so a broken stack or a missing gateway turns the check RED.
 
 on:
   push:
@@ -13,23 +11,41 @@ on:
   pull_request:
     branches: [master, main]
 
-# Cancel superseded runs (see ci.yml): the QA loop pushes many times/day.
 concurrency:
   group: goals-api-schema-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  INTENTFORGE_REQUIRE_GATEWAY: "1"
+
 jobs:
-  goals-api-schema:
-    name: Goals API schema regression (live gateway)
+  schema-regression:
+    name: API schema regression (live gateway)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          # Defense-in-depth: never pull Git-LFS in CI (no LFS files today, but a
-          # future re-tracked asset would silently re-serve + burn the quota).
-          # Shallow clone also trims per-run checkout egress + wall-clock.
           lfs: false
           fetch-depth: 1
+
+      - name: Build gateway image
+        run: cd services && docker compose -f docker-compose.dev.yml build gateway
+
+      - name: Bring up gateway
+        run: cd services && docker compose -f docker-compose.dev.yml up -d gateway
+
+      - name: Wait for gateway health
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://localhost:4000/health | grep -q OK; then
+              echo "Gateway healthy"
+              exit 0
+            fi
+            echo "Waiting for gateway... ($i)"
+            sleep 2
+          done
+          echo "Gateway never became healthy"
+          exit 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -39,29 +55,8 @@ jobs:
       - name: Install test deps
         run: pip install -r requirements-tests.txt
 
-      - name: Run Goals-API schema tests
+      - name: Run schema tests (collectable by directory, REQUIRE=1 → FAIL if down)
         env:
-          INTENTFORGE_BASE_URL: ${{ secrets.INTENTFORGE_BASE_URL || 'http://localhost:4000' }}
-        run: pytest tests/test_goals_api_schema.py -v
-
-  api-schema:
-    name: Non-Goals API schema regression (live gateway)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          lfs: false
-          fetch-depth: 1
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install test deps
-        run: pip install -r requirements-tests.txt
-
-      - name: Run non-Goals API schema tests
-        env:
-          INTENTFORGE_BASE_URL: ${{ secrets.INTENTFORGE_BASE_URL || 'http://localhost:4000' }}
-        run: pytest tests/test_api_schema.py -v
+          INTENTFORGE_REQUIRE_GATEWAY: "1"
+          INTENTFORGE_BASE_URL: "http://localhost:4000"
+        run: pytest tests/ -v
