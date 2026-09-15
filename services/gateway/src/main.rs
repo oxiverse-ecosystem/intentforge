@@ -2296,12 +2296,26 @@ fn constraint_score(
 
         let blended_coverage = coverage_pressure * 0.70 + width_pressure * 0.30;
 
-        // Scale: 0% coverage -> 0.60x (Phase 5: raised from 0.35 so a broad
-        //       query with no positive hits is no longer over-penalized)
-        //         100% coverage -> 1.9x
-        // Mapping is monotonic, but at least one positive match with high coverage
-        // becomes a strong discriminator vs zero-match passthrough.
-        score *= 0.60 + blended_coverage * 1.30;
+        // IFIX-POSBOOST: When the positive set is large (> 3 query-derived terms),
+        // switch to BOOST-ONLY semantics. The intent engine's Phase 5 extracts every
+        // non-stopword query token as a +constraint (e.g. "why is my internet speed
+        // much lower..." → +hours +internet +isp +lower +much +peak +promises +speed).
+        // With the old coverage-penalty formula (0.60 + coverage * 1.30), a result
+        // missing ANY of 6+ terms gets crushed below the junk-filter threshold, which
+        // collapses 32→2 results. The fix: for large positive sets, a result matching
+        // SOME terms is BOOSTED (no penalty for missing terms). The floor is 1.0x
+        // (never penalized) and the ceiling is ~1.9x (full coverage). Small positive
+        // sets (<= 3) keep the original formula — they provide good discrimination
+        // for queries like "rust async web framework".
+        if positive_count > 3.0 {
+            // Boost-only: 0% coverage → 1.0x, 100% coverage → 1.9x
+            // 50% coverage → 1.45x boost for a solid partial match.
+            score *= 1.0 + blended_coverage * 0.90;
+        } else {
+            // Original formula for small positive sets:
+            // 0% coverage -> 0.60x, 100% coverage -> 1.9x
+            score *= 0.60 + blended_coverage * 1.30;
+        }
     }
 
     // Language entity constraints: when a programming language is detected in the
@@ -2439,6 +2453,19 @@ const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
     "those", "my", "your", "our", "their", "me", "you", "i", "we", "they",
     "it", "its", "there", "here", "about", "into", "out", "up", "down",
     "best", "good", "great", "top", "better", "vs", "versus",
+    // NL query-intent markers: verbs/prepositions that describe the query form
+    // rather than the result content. They leak from NL phrasing ("explain how",
+    // "compare X vs Y", "recommend some", "what steps", "according to") and
+    // match every page (e.g. `+explain` → dictionary pages about "explain"),
+    // collapsing the result set or letting grammar pages outrank relevant ones.
+    // Also common English function verbs that describe an action the user wants
+    // from the RESULT (train, work, make, take, start, go, want, need, get)
+    // but that the page itself rarely contains as a literal token.
+    "am", "arent", "compare", "differs", "explain", "including", "much",
+    "recommend", "according", "them", "steps", "lessons",
+    "work", "works", "makes", "make", "take", "takes", "start", "starts",
+    "go", "goes", "want", "wants", "need", "needs", "get", "gets",
+    "train", "teach", "grow", "improve", "change", "fix",
 ];
 
 fn sanitize_constraints(c: &Constraints) -> Constraints {
@@ -7922,6 +7949,19 @@ fn merge_local_and_web(
     ].iter().copied().collect();
 
     let q_words: Vec<&str> = clean_query.split_whitespace().collect();
+
+    // Content-term counter for query-length detection (lighter filter: only pure
+    // stopwords excluded, not generic/role terms). Used by IFIX-B to decide when
+    // the query is "long enough" that partial overlap is expected. Distinctive
+    // terms below use a stricter filter for ranking; this one is purely for
+    // calibration scaling.
+    let content_term_count = q_words.iter()
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            lower.len() >= 3 && !stop_words.contains(lower.as_str())
+        })
+        .count();
+
     let distinctive_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
             let lower = w.to_lowercase();
@@ -9784,7 +9824,7 @@ fn merge_local_and_web(
 
     // 5. Calibrate scores onto [0.05, 1.0] preserving real distribution (Phase 0)
     let mut scores: Vec<f32> = merged.iter().map(|r| r.score).collect();
-    calibrate_scores(&mut scores, distinctive_terms.len());
+    calibrate_scores(&mut scores, content_term_count);
     for (i, r) in merged.iter_mut().enumerate() {
         r.score = scores[i];
     }
@@ -9976,7 +10016,7 @@ fn merge_local_and_web(
                     // ceiling is raised to 0.5. The video cap must track this so a video
                     // can reach a rankable score (>= 0.3) when it's the only survivor.
                     // Short queries keep the 0.04 cap (under the 0.05 floor).
-                    let video_cap = if distinctive_terms.len() > 5 { 0.3f32 } else { 0.04f32 };
+                    let video_cap = if content_term_count > 5 { 0.3f32 } else { 0.04f32 };
                     if r.score > video_cap {
                         tracing::info!(
                             "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source, {} terms)",
