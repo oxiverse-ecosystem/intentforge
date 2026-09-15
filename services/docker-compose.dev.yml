@@ -36,7 +36,7 @@ services:
       # one that's up. 172.19.0.0/16 is the services_default bridge subnet.
       - FIREWALL_OUTBOUND_SUBNETS=172.19.0.0/16
     ports:
-      - "8888:8888/tcp"
+      # 8888 (gluetun HTTP ctrl) not mapped to host — administrative only
       - "8388:8388/tcp"
       - "8080:8080"
       - "5000:5000"
@@ -93,7 +93,7 @@ services:
     # Independent network — NOT behind gluetun VPN
     # Tor2 provides a separate IP path for SearXNG2
     ports:
-      - "9051:9051"
+      - "9500:9051"
       - "8081:8081"    # SearXNG2 accessible via tor2's network
     volumes:
       - ./privacy-layer/tor2/data:/var/lib/tor
