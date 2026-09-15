@@ -2253,23 +2253,32 @@ fn constraint_score(
             let pos_normalized: String = pos_lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
             let pos_words: Vec<&str> = pos_lower.split_whitespace().collect();
             let found = if pos_words.len() == 1 {
+                // Whole-word match only — no substring matching. A single-word
+                // positive constraint like "make" must NOT match "Make (software)"
+                // via substring (P1 bug class: substring/brand collisions).
+                // Match against: raw word, punctuation-stripped word, and
+                // alphanumeric-normalized word.
                 text_lower.split_whitespace().any(|w| {
                     w == pos_lower
                     || w.trim_matches(|c: char| !c.is_alphanumeric()) == pos_lower
                     || w.chars().filter(|c| c.is_alphanumeric()).collect::<String>() == pos_normalized
                 })
                 || text_normalized.split_whitespace().any(|w| w == pos_normalized)
-                || (pos_normalized.len() >= 3 && text_normalized.contains(&pos_normalized))
             } else {
                 // Multi-word: exact phrase match OR all words present individually
-                // "async support" → match "async" AND "support" anywhere in text
+                // "async support" → match "async" AND "support" anywhere in text.
+                // Each word uses whole-word matching (no substring) to avoid P1
+                // collisions like "build" matching "building" or "make" matching
+                // "Make (software)".
                 text_lower.contains(&pos_lower)
                 || text_normalized.contains(&pos_normalized)
                 || pos_words.iter().all(|w| {
                     let w_clean = w.chars().filter(|c| c.is_alphanumeric()).collect::<String>();
                     text_lower.split_whitespace().any(|tw| {
-                        tw == *w || tw.trim_matches(|c: char| !c.is_alphanumeric()) == *w
-                    }) || (w_clean.len() >= 3 && text_normalized.contains(&w_clean))
+                        tw == *w
+                        || tw.trim_matches(|c: char| !c.is_alphanumeric()) == *w
+                        || tw.chars().filter(|c| c.is_alphanumeric()).collect::<String>() == w_clean
+                    })
                 })
             };
             if found {
@@ -6363,6 +6372,16 @@ fn cross_location_mismatch_mult(
             // so inclusive lists stay untouched. General.
             return 0.06;
         }
+    }
+
+    // Round 2026-09-15: for explicit city-level queries, a result that mentions
+    // NO gazetteer city at all (and didn't mention the requested city) is almost
+    // certainly not local to the requested place — e.g. "coffee shops in
+    // hyderabad" surfacing Paris cafe pages. Dampen these too (fail-soft).
+    // Country-level requests are exempt (a "india" query should not penalise a
+    // page that simply doesn't name a city).
+    if req_city.is_some() {
+        return 0.15;
     }
     1.0
 }
