@@ -4827,10 +4827,12 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
-                        // Distance-bound guard: "within 300 kilometers" is a
-                        // range, not a price — skip this marker (let a later
-                        // price marker, if any, match instead).
-                        if is_distance_bound(rest) {
+                        // Distance/time-bound guard: "within 300 kilometers" or
+                        // "within 6 months" is a range, not a price — skip this
+                        // marker (let a later price marker, if any, match instead).
+                        // Pass text AFTER the number (like Pattern B does) so the
+                        // unit check sees "months", not "6".
+                        if is_distance_bound(&rest[m.end()..]) {
                             continue;
                         }
                         let currency = currency_words.iter().find(|c| rest.contains(*c))
@@ -7952,7 +7954,7 @@ fn keyphrase_relax_variant(query: &str) -> Option<String> {
     ];
 
     let filtered: Vec<&str> = words.into_iter()
-        .filter(|w| !STOP_WORDS.contains(w) && w.len() > 1)
+        .filter(|w| !STOP_WORDS.contains(w) && (w.len() > 1 || w.chars().any(|c| c.is_ascii_digit())))
         .collect();
 
     let orig_count = query.split_whitespace().count();
@@ -13243,42 +13245,12 @@ async fn handle_search(
     let constraints = extract_gateway_constraints(&q);
     let lang = constraints.language.as_deref();
 
-    // For verbose natural-language queries (>= 4 words), the raw query contains
-    // stopwords ("how", "does", "explain", "the") that cause upstream engines
-    // to return dictionary/grammar pages instead of topical results. Use the
-    // keyphrase-relaxed variant (stopwords stripped) as the PRIMARY query when
-    // it produces a shorter query. The raw query remains as a fallback.
-    let keyphrase_primary: Option<String> = {
-        let kp = keyphrase_relax_variant(&engine_q);
-        if let Some(ref k) = kp {
-            let clean_kp = preprocess_searxng_query(k);
-            let clean_raw = preprocess_searxng_query(&engine_q);
-            if !clean_kp.is_empty() && clean_kp != clean_raw && engine_q.split_whitespace().count() >= 4 {
-                tracing::info!("KEYPHRASE PRIMARY: using relaxed query '{}' instead of raw '{}'", clean_kp, clean_raw);
-                Some(clean_kp)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
-
     for (i, base_url) in searx_base_urls.iter().enumerate() {
         let key = format!("searxng{}", i);
-        // Primary query: keyphrase-relaxed for verbose queries, raw otherwise
-        let primary_q = keyphrase_primary.as_deref().unwrap_or(&engine_q);
-        let clean_q = preprocess_searxng_query(primary_q);
+        // Raw query URL (with geolocation parameters)
+        let clean_q = preprocess_searxng_query(&engine_q);
         searx_urls.push(searxng_url(base_url, &clean_q, geo_location.as_ref(), lang));
         searx_instance_keys.push(key.clone());
-        // Fallback: raw query (with stopwords) — kept for recall diversity
-        if keyphrase_primary.is_some() {
-            let clean_raw = preprocess_searxng_query(&engine_q);
-            if !clean_raw.is_empty() && clean_raw != clean_q {
-                searx_urls.push(searxng_url(base_url, &clean_raw, geo_location.as_ref(), lang));
-                searx_instance_keys.push(key.clone());
-            }
-        }
         // Stripped query URL (same instance, runs in parallel)
         if let Some(ref stripped) = stripped_override {
             let clean_stripped = preprocess_searxng_query(stripped);
