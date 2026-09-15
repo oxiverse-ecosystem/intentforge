@@ -6321,6 +6321,7 @@ fn whole_word_contains(haystack: &str, needle: &str) -> bool {
 fn cross_location_mismatch_mult(
     title: &str,
     content: &str,
+    url: &str,
     geo: Option<&geoloc::GeoLocation>,
 ) -> f32 {
     let geo = match geo {
@@ -10334,7 +10335,7 @@ fn merge_local_and_web(
         };
 
         let cross_loc_mult = if geo_is_explicit {
-            cross_location_mismatch_mult(&r.title, &r.content, geo_location)
+            cross_location_mismatch_mult(&r.title, &r.content, &r.url, geo_location)
         } else {
             1.0
         };
