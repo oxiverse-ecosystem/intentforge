@@ -19277,6 +19277,18 @@ mod spellcheck_endpoint_tests {
         }
 
         #[test]
+        fn intent_p4_override_lifts_exact_model_price_query() {
+            // "iphone 16 pro max price" — price marker + digit + topic word.
+            // The fallback_intent stub returns informational/0.3, but the P4
+            // override must lift it to transactional on the /intent preview
+            // too, so the endpoint is consistent with /search.
+            let res = build_intent("iphone 16 pro max price");
+            assert_eq!(res["intent"].as_str(), Some("transactional"));
+            assert_eq!(res["category"].as_str(), Some("transactional"));
+            assert!((res["confidence"].as_f64().unwrap() - 0.6).abs() < 1e-5);
+        }
+
+        #[test]
         fn intent_empty_query_envelope_distinct_from_search() {
             // The empty envelope carries the /intent key set (so clients can
             // distinguish it from /search /spellcheck empty responses) but with
@@ -19343,6 +19355,9 @@ mod p4_intent_override_tests {
         let r = apply_p4_transactional_override(&bare, "100");
         assert_eq!(r.intent, "informational");
     }
+
+
+
 
     #[test]
     fn p4_high_confidence_informational_not_overridden() {
