@@ -9336,6 +9336,14 @@ fn merge_local_and_web(
             // gate and outrank genuinely on-topic web results. Requiring >= 2 matches
             // crushes partial matches while letting full-topic pages (which name
             // multiple query subjects) pass. Single-term queries are unaffected.
+            //
+            // P2f (round-2026-09-15): for queries with 3+ topic terms, a flat ">= 2"
+            // requirement is too lenient — a query with 5 topic terms lets a local page
+            // through with only 2 matches (40% coverage). E.g. "wooden standing desk
+            // from scratch" passes a local "wooden" Etsy page (matches "wooden" + "desk"
+            // only). Scale the requirement proportionally: ceil(len * 0.6). 2 terms -> 2,
+            // 3 terms -> 2, 4 terms -> 3, 5 terms -> 3, 6 terms -> 4. This preserves
+            // recall for short queries while requiring meaningful coverage for long ones.
             let topic_mentioned = if topic_anchor_terms.is_empty() {
                 true
             } else if topic_anchor_terms.len() >= 2 {
@@ -9345,7 +9353,12 @@ fn merge_local_and_web(
                     title_lower.contains(&tl) || content_lower.contains(&tl)
                         || title_lower.contains(bare) || content_lower.contains(bare)
                 }).count();
-                matched_count >= 2
+                let required = if topic_anchor_terms.len() >= 3 {
+                    ((topic_anchor_terms.len() as f32) * 0.6).ceil() as usize
+                } else {
+                    2
+                };
+                matched_count >= required
             } else {
                 topic_anchor_terms.iter().any(|t| {
                     let tl = t.to_lowercase();
