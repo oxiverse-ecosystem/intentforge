@@ -9972,17 +9972,15 @@ fn merge_local_and_web(
                 || is_url_video_host(&r.url);
             if is_video_src {
                 if !has_video_intent(query) {
-                    // 0.04 sits UNDER the calibrated article floor (0.05) so a video
-                    // is demoted *below* every genuine text result for a non-video
-                    // query (e.g. an invidious tutorial at 0.04 now ranks under the
-                    // topical article at 0.05, instead of tying it via insertion order
-                    // as the old 0.12 did). Floor preserved so videos remain present.
-                    // Signal-driven (query self-describes intent), not tuned to a query.
-                    let video_cap = 0.04f32;
+                    // IFIX-B: for long queries (>5 distinctive terms), the calibration
+                    // ceiling is raised to 0.5. The video cap must track this so a video
+                    // can reach a rankable score (>= 0.3) when it's the only survivor.
+                    // Short queries keep the 0.04 cap (under the 0.05 floor).
+                    let video_cap = if distinctive_terms.len() > 5 { 0.3f32 } else { 0.04f32 };
                     if r.score > video_cap {
                         tracing::info!(
-                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source)",
-                            video_cap, r.url.chars().take(60).collect::<String>()
+                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source, {} terms)",
+                            video_cap, r.url.chars().take(60).collect::<String>(), distinctive_terms.len()
                         );
                         r.post_cal_cap = Some(video_cap);
                         r.score = video_cap;
