@@ -6491,7 +6491,7 @@ const SUBJECTIVE_QUALITY_TERMS: &[&str] = &[
 /// words that slipped past the extractor's stopword lists. Structural vocabulary,
 /// data-driven — never a per-query literal.
 const EXCLUSION_GRAMMAR_NOISE: &[&str] = &[
-    "have", "has", "had", "having", "from", "with", "without", "about", "into",
+    "have", "has", "had", "having", "getting", "from", "with", "without", "about", "into",
     "onto", "upon", "over", "under", "before", "after", "than", "that", "which",
     "this", "these", "those", "what", "when", "where", "who", "why", "how",
     "their", "them", "they", "our", "your", "his", "her", "its", "the", "a", "an",
@@ -6520,6 +6520,19 @@ fn is_exclusion_grammar_noise(term: &str) -> bool {
     // vocabulary), no per-query tuning.
     if !tokens.is_empty() && tokens.iter().all(|t| EXCLUSION_GRAMMAR_NOISE.contains(t)) {
         return true;
+    }
+    // STATE-DESCRIPTION construction: "getting overcharged", "having issues",
+    // "being scammed" → auxiliary/participle + state describes a feeling or
+    // outcome, not a topical entity. Hard-dropping every result that mentions
+    // "getting overcharged" collapses relevant query results. Structural rule:
+    // first token is a state-verb head. No per-query literals; the state-verb
+    // set is closed-class auxiliary vocabulary, same pattern as
+    // EXCLUSION_GRAMMAR_NOISE / MANNER_VERBS.
+    const STATE_VERB_HEADS: &[&str] = &["getting", "having", "being", "feeling"];
+    if let Some(head) = tokens.first() {
+        if STATE_VERB_HEADS.contains(head) && tokens.len() >= 2 {
+            return true;
+        }
     }
     false
 }
@@ -15472,6 +15485,17 @@ async fn handle_search(
         let before_count = web_results.len();
         let constraints_ref = &intent.structured_constraints;
 
+        // Filter out grammar-noise negatives BEFORE violation counting.
+        // "getting overcharged" is a state description (auxiliary verb + adjective),
+        // not a topical exclusion — every car-dealership page mentions "getting
+        // overcharged" in passing, so hard-dropping on it collapses the result set.
+        // is_exclusion_grammar_noise already handles single-word function words
+        // ("have", "from"); this extends the same guard to multi-word phrases.
+        let effective_negatives: Vec<String> = constraints_ref.negative.iter()
+            .filter(|n| !is_exclusion_grammar_noise(n))
+            .cloned()
+            .collect();
+
         // Score each result and track violation counts
         let mut scored: Vec<(usize, f32, usize)> = web_results.iter().enumerate().map(|(i, r)| {
             let c_score = constraint_score(&r.title, &r.content, &r.url, constraints_ref);
@@ -15487,7 +15511,7 @@ async fn handle_search(
                 0
             } else {
                 let text = format!("{} {} {}", r.title.to_lowercase(), r.url.to_lowercase(), r.content.chars().take(300).collect::<String>());
-                constraints_ref.negative.iter().filter(|n| {
+                effective_negatives.iter().filter(|n| {
                     let n_lower = n.to_lowercase();
                     let n_words: Vec<&str> = n_lower.split_whitespace().collect();
                     if n_words.len() == 1 {
