@@ -2245,7 +2245,19 @@ fn constraint_score(
         }
     }
 
-    // Positive constraints: boost for each match (fuzzy matching)
+    // Positive constraints: boost for each match (fuzzy matching).
+    //
+    // DESIGN (2026-09-15, positive-over-filter fix): the intent engine emits
+    // a +word constraint for EVERY non-stopword query token (e.g. "why is my
+    // internet speed much lower than the promised plan during peak hours" → 6
+    // positives: hours, internet, lower, peak, promised, speed). Treating these
+    // as a hard AND-filter (0% coverage → 0.60x penalty) crushes 20-30% of
+    // relevant results because no single page mentions ALL 6 tokens. Positive
+    // constraints are query-derived topical signals, not explicit user operators
+    // (site:/filetype:/intitle: are enforced elsewhere as hard filters). They
+    // should therefore be BOOST-ONLY: reward results that match multiple
+    // constraints, but never penalize a result for missing some. Floor is 1.0
+    // (no change) instead of 0.60 (penalty).
     if !constraints.positive.is_empty() {
         let mut matched = 0;
         for pos in &constraints.positive {
@@ -2261,8 +2273,6 @@ fn constraint_score(
                 || text_normalized.split_whitespace().any(|w| w == pos_normalized)
                 || (pos_normalized.len() >= 3 && text_normalized.contains(&pos_normalized))
             } else {
-                // Multi-word: exact phrase match OR all words present individually
-                // "async support" → match "async" AND "support" anywhere in text
                 text_lower.contains(&pos_lower)
                 || text_normalized.contains(&pos_normalized)
                 || pos_words.iter().all(|w| {
@@ -2276,55 +2286,21 @@ fn constraint_score(
                 matched += 1;
             }
         }
-        // Coverage: fraction of positive constraints matched
-        let positive_count = constraints.positive.len() as f32;
-        let coverage = matched as f32 / positive_count;
-
-        // Positive boost is a bi-criteria score biased toward multi-signal hits:
-        // - Coverage pressure: fraction of positives matched.
-        // - Width pressure: concrete multi-positive hits beat single-token matches from broad docs.
-        // Coverage dominates for small positive sets; width lifts tighter topical candidates.
-
-        let mut coverage_pressure = coverage;
-        let mut width_pressure = if positive_count > 1.0 {
-            (matched as f32 / positive_count).sqrt()
-        } else {
-            matched as f32 / positive_count
-        };
-
-        // Soft fallback: when no positive matched, treat the result as if it matched the
-        // query semantically. This prevents narrow positive sets from producing zero-pressure
-        // text and turning ordering into a metadata lottery. It is NOT a fake match:
-        // it is a last-resort boost based on query-to-document similarity.
-        if matched == 0 {
-            let url_tokens: Vec<&str> = url.split_whitespace().collect();
-            let title_tokens: Vec<&str> = title.split_whitespace().collect();
-            if !url_tokens.is_empty() || !title_tokens.is_empty() {
-                let mut similarity_gap = 0.0f32;
-                if !url_tokens.is_empty() {
-                    if let Ok(parsed_url) = reqwest::Url::parse(url) {
-                        if let Some(host) = parsed_url.host_str() {
-                            let host_lower = host.to_lowercase();
-                            let matching = url_tokens.iter().filter(|t| host_lower.contains(*t)).count();
-                            similarity_gap = (matching as f32 / url_tokens.len() as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                }
-                let q_reuse: f32 = semantic_relevance_score(url, &title, &content);
-                let similar = (similarity_gap * 0.45 + q_reuse * 0.55).clamp(0.0, 1.0);
-                coverage_pressure = coverage_pressure.max(similar * 0.12);
-                width_pressure = width_pressure.max(similar * 0.12);
-            }
+        // Boost-only: reward multi-match results, but never penalize misses.
+        if matched > 0 {
+            let positive_count = constraints.positive.len() as f32;
+            let coverage = matched as f32 / positive_count;
+            // Width pressure: concrete multi-positive hits beat single-token matches.
+            let width_pressure = if positive_count > 1.0 {
+                (matched as f32 / positive_count).sqrt()
+            } else {
+                matched as f32 / positive_count
+            };
+            let blended_coverage = coverage * 0.70 + width_pressure * 0.30;
+            // 0% coverage (matched==0) is handled above (no change).
+            // 100% coverage → 1.5x boost. Partial coverage → proportional boost.
+            score *= 1.0 + blended_coverage * 0.50;
         }
-
-        let blended_coverage = coverage_pressure * 0.70 + width_pressure * 0.30;
-
-        // Scale: 0% coverage -> 0.60x (Phase 5: raised from 0.35 so a broad
-        //       query with no positive hits is no longer over-penalized)
-        //         100% coverage -> 1.9x
-        // Mapping is monotonic, but at least one positive match with high coverage
-        // becomes a strong discriminator vs zero-match passthrough.
-        score *= 0.60 + blended_coverage * 1.30;
     }
 
     // Language entity constraints: when a programming language is detected in the
