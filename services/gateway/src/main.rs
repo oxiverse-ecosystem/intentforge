@@ -6330,7 +6330,10 @@ fn cross_location_mismatch_mult(
     let req_city = geo.city.as_deref();
     let req_country = geo.country_name.as_deref();
     let req_cc = geo.country_code.as_deref();
-    let text = format!("{} {}", title.to_lowercase(), content.to_lowercase());
+    // Include URL in the on-topic check: a result that mentions the requested
+    // city only in the URL (e.g. ".../affordable-pg-in-hyderabad-for-working")
+    // is still on-topic and must NOT be penalised.
+    let text = format!("{} {} {}", title.to_lowercase(), content.to_lowercase(), url.to_lowercase());
 
     // On-topic for the requested location → never penalise.
     let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
@@ -6370,6 +6373,8 @@ fn cross_location_mismatch_mult(
             // below the requested-city results while keeping it present (fail-soft).
             // Pages that NAME the requested city are exempted earlier (mentions_req),
             // so inclusive lists stay untouched. General.
+            // URL is included in `text` so a result that names a different city
+            // only in the URL (e.g. ".../best-coffee-shops-in-paris") is also caught.
             return 0.06;
         }
     }
