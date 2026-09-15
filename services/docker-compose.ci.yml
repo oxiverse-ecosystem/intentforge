@@ -39,6 +39,9 @@ services:
     container_name: if-ci-intent-engine
     mem_limit: 512m
     mem_reservation: 256m
+    volumes:
+      - ./services/intent-engine/models:/app/models:ro
+      - ./services/intent-engine/config:/app/config:ro
     environment:
       - RUST_LOG=info
       - RAYON_NUM_THREADS=4

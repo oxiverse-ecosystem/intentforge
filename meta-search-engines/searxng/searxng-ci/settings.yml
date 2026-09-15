@@ -1,0 +1,121 @@
+# SearXNG CI config — direct egress (no VPN/Tor)
+# Used by docker-compose.ci.yml for schema regression tests.
+
+use_default_settings:
+  engines:
+    keep_only:
+      - bing
+      - brave
+      - wikipedia
+      - bing images
+      - google images
+      - duckduckgo images
+      - openverse
+      - bing news
+      - google news
+      - hackernews
+      - bing videos
+      - google videos
+      - duckduckgo videos
+      - google shopping
+      - ebay
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "intentforge_ci_secret_key_123456789"
+
+search:
+  safe_search: 0
+  autocomplete: "google"
+  formats:
+    - html
+    - json
+  default_lang: "en"
+
+outgoing:
+  source_ips:
+    - 0.0.0.0
+  request_timeout: 8.0
+  max_request_timeout: 12.0
+  enable_http2: true
+  pool_maxsize: 20
+  keepalive_expiry: 30
+
+engines:
+  - name: bing
+    disabled: false
+    timeout: 4.0
+
+  - name: brave
+    disabled: false
+    timeout: 4.0
+
+  - name: wikipedia
+    disabled: false
+    timeout: 4.0
+
+  - name: bing images
+    engine: bing_images
+    disabled: false
+    timeout: 4.0
+
+  - name: google images
+    engine: google_images
+    disabled: false
+    timeout: 4.0
+
+  - name: duckduckgo images
+    engine: duckduckgo_extra
+    ddg_category: images
+    shortcut: ddi
+    disabled: false
+    timeout: 4.0
+
+  - name: openverse
+    engine: openverse
+    shortcut: ovi
+    disabled: false
+    timeout: 4.0
+
+  - name: bing news
+    engine: bing_news
+    disabled: false
+    timeout: 4.0
+
+  - name: google news
+    engine: google_news
+    disabled: false
+    timeout: 4.0
+
+  - name: hackernews
+    disabled: false
+    timeout: 4.0
+    categories: news
+
+  - name: bing videos
+    engine: bing_videos
+    disabled: false
+    timeout: 4.0
+
+  - name: google videos
+    engine: google_videos
+    disabled: false
+    timeout: 4.0
+
+  - name: duckduckgo videos
+    engine: duckduckgo_extra
+    ddg_category: videos
+    shortcut: ddv
+    disabled: false
+    timeout: 4.0
+
+  - name: google shopping
+    engine: google_shopping
+    disabled: false
+    timeout: 4.0
+
+  - name: ebay
+    engine: ebay
+    disabled: false
+    timeout: 4.0
