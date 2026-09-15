@@ -6164,7 +6164,7 @@ fn calibrate_scores(scores: &mut [f32]) {
         // still destroys relative ordering when all scores sit in a narrow raw
         // band. Instead, use log-scaling: mapping x → log(1+x) stretches the
         // low end (where weak scores live) while keeping ordering intact, then
-        // remap onto [0.05, 1.0] like the normal path. This way a 2x raw
+        // remap onto [0.05, hi] like the normal path. This way a 2x raw
         // difference (e.g. 0.02 vs 0.01) still reads as a clear score gap
         // (0.64 vs 0.37) without ever inflating a weak max to 1.0.
         //
@@ -6172,11 +6172,25 @@ fn calibrate_scores(scores: &mut [f32]) {
         // construction, generalises to any weak-set shape, and has no magic
         // threshold tuned to one query. The 0.10 gate stays as a regime
         // switch (weak vs healthy) but no longer decides the output spread.
+        //
+        // QUERY-LENGTH NORMALIZATION (IFIX-B fix): for queries with many
+        // distinctive content terms (>5), the raw scores are naturally low
+        // because no single page matches all terms. Without normalization,
+        // the top result lands below 0.1 even after log-scaling. We detect
+        // query length structurally (no per-query strings) and raise the
+        // ceiling proportionally: 6 terms → 0.18, 8 → 0.30, 10+ → 0.40.
+        // Short queries (≤5 terms) keep the conservative 0.12 ceiling.
         let log_min = (raw_min + 1.0).ln();
         let log_max = (raw_max + 1.0).ln();
         let log_span = (log_max - log_min).max(1e-6);
         let lo = 0.05f32;
-        let hi = 1.0f32;
+        let content_terms = query_content_term_count(query);
+        let hi = if content_terms > 5 {
+            let boost = 0.12 + (content_terms - 5) as f32 * 0.06;
+            boost.min(0.40)
+        } else {
+            0.12f32
+        };
         let span = hi - lo;
         for score in scores.iter_mut() {
             let log_s = (*score + 1.0).ln();
@@ -10736,7 +10750,7 @@ fn merge_local_and_web(
 
     // 5. Calibrate scores onto [0.05, 1.0] preserving real distribution (Phase 0)
     let mut scores: Vec<f32> = merged.iter().map(|r| r.score).collect();
-    calibrate_scores(&mut scores);
+    calibrate_scores(&mut scores, query);
     for (i, r) in merged.iter_mut().enumerate() {
         r.score = scores[i];
     }
