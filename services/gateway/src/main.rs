@@ -6658,6 +6658,47 @@ const IGNORED_CONSTRAINT_NOISE: &[&str] = &[
     "before", "after", "and", "or", "but", "is", "are", "was", "were",
 ];
 
+/// D4 (2026-09-15): seed list of consumer brands that are common exclusion
+/// targets ("not bose", "wireless headphones not sony", "not nike shoes").
+/// When a user negates a brand name, the brand IS the genuine topical
+/// exclusion — it must be honored even when the query lacks contrastive
+/// framing and the word is not a protected tech term. This mirrors the
+/// COUNTRY_DEMONYMS data-seed pattern: a general, non-hardcoded list so any
+/// negated brand passes the `is_real_exclusion` gate. Covers major audio,
+/// sportswear, electronics, and automotive brands.
+const KNOWN_BRANDS: &[&str] = &[
+    // Audio / headphones / earbuds
+    "bose", "sony", "sennheiser", "akg", "audio-technica", "beats",
+    "jabra", "jbl", "skullcandy", "sony", "bose", "sennheiser",
+    "senheiser", "fiio", "shure", "westone", "campfire", "moondrop",
+    // Sportswear / footwear
+    "nike", "adidas", "puma", "reebok", "new balance", "newbalance",
+    "asics", "converse", "vans", "under armour", "underarmour",
+    // Electronics / computing
+    "samsung", "lg", "hp", "dell", "lenovo", "asus", "acer",
+    "microsoft", "google", "xiaomi", "oneplus", "oppo", "vivo",
+    "realme", "nothing", "razer", "logitech", "corsair", "steelseries",
+    // Automotive
+    "toyota", "honda", "ford", "tesla", "bmw", "mercedes", "audi",
+    "volkswagen", "hyundai", "kia", "nissan", "chevrolet",
+];
+
+/// True if `term` is a known consumer brand. Brands are common negation
+/// targets ("not bose", "headphones not sony") and must pass the
+/// `is_real_exclusion` gate even without contrastive framing. Data-seed
+/// pattern (mirrors `COUNTRY_DEMONYMS`), not per-query literals.
+fn is_known_brand(term: &str) -> bool {
+    let lc = term.trim().to_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
+    if KNOWN_BRANDS.contains(&lc.as_str()) {
+        return true;
+    }
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    tokens.iter().any(|t| KNOWN_BRANDS.contains(t))
+}
+
 /// F3 (2026-08-17): seed list of country demonyms / origin adjectives. When a user
 /// excludes a COUNTRY-of-origin (e.g. "not from chinese brands", "alternatives to american
 /// cloud providers", "laptops not made in china"), the demonym IS the genuine topical
@@ -6861,6 +6902,15 @@ fn is_real_exclusion(
     if COUNTRY_DEMONYMS.contains(&lc.as_str())
         || tokens.iter().any(|t| COUNTRY_DEMONYMS.contains(t))
     {
+        return true;
+    }
+    // D4 (2026-09-15): a known consumer brand (e.g. "bose", "nike", "sony") is a
+    // genuine topical exclusion when negated ("not bose", "wireless headphones
+    // not sony"). Brands are common negation targets that the user explicitly
+    // named — they must pass the is_real_exclusion gate even without contrastive
+    // framing and even when not in PROTECTED_TERMS (which is tech-focused).
+    // Data-seed pattern mirrors COUNTRY_DEMONYMS; no per-query literals.
+    if is_known_brand(&lc) {
         return true;
     }
     // Entity: a term in the compound is capitalized in the original query
