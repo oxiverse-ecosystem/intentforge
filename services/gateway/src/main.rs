@@ -4789,6 +4789,19 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
         "mile", "miles", "mi", "meter", "meters", "metre", "metres",
         "foot", "feet", "ft", "yard", "yards", "yd",
     ];
+    // Time units: a number followed by one of these is a TIME bound
+    // (e.g. "within 6 months", "up to 2 weeks"), NOT a price.
+    // Without this guard, "within 6 months" was mis-read as price:<6
+    // and the spurious price bound flipped intent to transactional.
+    let time_units = [
+        "second", "seconds", "sec", "secs", "s",
+        "minute", "minutes", "min", "mins",
+        "hour", "hours", "hr", "hrs", "h",
+        "day", "days", "d",
+        "week", "weeks", "wk", "wks",
+        "month", "months", "mo", "mos",
+        "year", "years", "yr", "yrs",
+    ];
     let is_distance_bound = |rest_after_num: &str| -> bool {
         // Extract the next token after optional whitespace
         let next_token = rest_after_num.trim_start()
@@ -4796,7 +4809,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             .next()
             .unwrap_or("");
         let next_token_lower = next_token.to_lowercase();
-        distance_units.iter().any(|u| next_token_lower == *u)
+        distance_units.iter().any(|u| next_token_lower == *u) || time_units.iter().any(|u| next_token_lower == *u)
     };
 
     // Pattern A: upper-marker then number (+ optional currency word)
