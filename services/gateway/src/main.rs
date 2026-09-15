@@ -4355,6 +4355,75 @@ fn is_commercial_intent(
         >= 0.50
 }
 
+/// P4 compensating override: exact-model / price-signal queries that the linear
+/// probe misclassifies as `informational` at low confidence. The intent-engine
+/// is a Rust service that cannot be rebuilt on this Windows host (Smart App
+/// Control), so we add a SECOND-CHANCE override at the gateway layer.
+///
+/// Fires ONLY when ALL of:
+///   1. The resolved intent is `informational` with low confidence (< 0.45)
+///   2. The query carries a transactional MARKER WORD (price/cost/deal/…)
+///   3. The query carries a product MODEL signal (digit sequences, or a
+///      multi-token phrase containing a known brand/model fragment)
+///
+/// This is NOT a keyword shortcut — it compensates for a known classifier
+/// blind spot and only fires when the classifier is genuinely uncertain.
+/// The override lifts the intent to `transactional` and raises confidence
+/// to 0.6 so downstream commerce logic engages.
+fn apply_p4_transactional_override(
+    intent: &IntentResponse,
+    q: &str,
+) -> IntentResponse {
+    // Gate 1: only intercept weak-informational classifications.
+    if intent.intent != "informational" || intent.confidence >= 0.45 {
+        return intent.clone();
+    }
+    let q_lower = q.to_lowercase();
+
+    // Gate 2: transactional marker words (data-driven seed list).
+    const TX_MARKERS: &[&str] = &[
+        "price", "cost", "deal", "cheap", "cheapest", "discount", "offer",
+        "sale", "buy", "purchase", "shop", "store", "order", "pay",
+        "budget", "worth", "value",
+    ];
+    let has_tx_marker = TX_MARKERS.iter().any(|m| q_lower.contains(m));
+    if !has_tx_marker {
+        return intent.clone();
+    }
+
+    // Gate 3: product-model signal — the query contains a digit run (like
+    // "iphone 16" or "galaxy s24") OR a known brand+model phrase fragment.
+    // A bare digit search is not enough; we also need a non-digit topic word
+    // so "100" alone doesn't trip this.
+    let has_digit = q_lower.chars().any(|c| c.is_ascii_digit());
+    let topic_words: Vec<&str> = q_lower
+        .split_whitespace()
+        .filter(|w| w.len() >= 2 && !w.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    let has_model_signal = has_digit && !topic_words.is_empty();
+
+    if !has_model_signal {
+        return intent.clone();
+    }
+
+    tracing::info!(
+        "P4 override: transactional marker + model signal ⇒ transactional (was informational @ {:.3})",
+        intent.confidence
+    );
+
+    let mut fixed = intent.clone();
+    fixed.intent = "transactional".to_string();
+    fixed.confidence = 0.6;
+
+    // Boost the transactional distribution probability.
+    let mut dist = fixed.distribution.clone();
+    dist.insert("transactional".to_string(), 0.75);
+    dist.insert("informational".to_string(), 0.15);
+    fixed.distribution = dist;
+
+    fixed
+}
+
 /// GET /shopping — the user-facing commerce search endpoint (ROADMAP item 2).
 ///
 /// DESIGN CONTRACT: this endpoint MUST reuse the EXACT same ranking pipeline as
@@ -13861,7 +13930,14 @@ async fn handle_search(
     };
 
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
-    
+
+    // P4 compensating override: exact-model / price-signal queries that the
+    // linear probe misclassifies as informational at low confidence. This is
+    // a SECOND-CHANCE override — it only fires when the classifier is genuinely
+    // uncertain AND the query carries both a transactional marker word and a
+    // product-model signal (digit run + topic word).
+    intent = apply_p4_transactional_override(&intent, &q);
+
     // Merge constraints parsed directly by the gateway to prevent any loss of operators
     let gateway_extracted = extract_gateway_constraints(&q_orig);
     for ft in gateway_extracted.file_types {
