@@ -2466,6 +2466,16 @@ const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
     "work", "works", "makes", "make", "take", "takes", "start", "starts",
     "go", "goes", "want", "wants", "need", "needs", "get", "gets",
     "train", "teach", "grow", "improve", "change", "fix",
+    // Duration units: "four years of experience", "two months" — the number +
+    // unit pair over-filters (a relevant page need not contain "four" or
+    // "years"). Units are non-topical like currency words; bare count words
+    // that quantify experience/time are non-discriminating as standalone
+    // positives. Date capture handles the real recency signal separately.
+    "year", "years", "month", "months", "week", "weeks", "day", "days",
+    "hour", "hours", "minute", "minutes",
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "fifteen", "twenty", "thirty", "forty",
+    "fifty", "hundred", "thousand", "several", "many", "numerous",
 ];
 
 fn sanitize_constraints(c: &Constraints) -> Constraints {
@@ -5362,14 +5372,16 @@ fn calibrate_scores(scores: &mut [f32], query_content_terms: usize) {
         // The off-topic sole-survivor case is already removed pre-scoring by the
         // distinctive-term hard-drop, so the only remaining weak sets are legit.
         //
-        // QUERY-LENGTH AWARE CEILING (IFIX-B): queries with >5 distinctive content
+        // QUERY-LENGTH AWARE FLOOR (IFIX-B): queries with >5 distinctive content
         // terms naturally produce weak raw scores because no single page matches all
-        // terms — the overlap is partial even for the best on-topic result. For these
-        // long queries, raising the ceiling from 0.12 to 0.5 lets the top on-topic
-        // page reach a rankable score (>= 0.3 acceptance) while keeping the weak-set
-        // defense intact (still well below 1.0, so an off-topic survivor cannot
-        // invert). Short queries (<=5 terms) keep the tight [0.05, 0.12] band.
-        let lo = 0.05f32;
+        // terms — the overlap is partial even for the best on-topic result. When
+        // the weak-set guard fires (raw_max < 0.10), the min-max map sends a
+        // collapsed raw cluster to the floor. For long queries, the floor is raised
+        // to 0.3 so the top on-topic page reaches a rankable score (>= 0.3
+        // acceptance) while keeping the weak-set defense intact (the band is
+        // [0.3, 0.5], well below 1.0, so an off-topic survivor cannot invert).
+        // Short queries (<=5 terms) keep the tight [0.05, 0.12] band.
+        let lo = if query_content_terms > 5 { 0.3f32 } else { 0.05f32 };
         let hi = if query_content_terms > 5 { 0.5f32 } else { 0.12f32 };
         let norm = (raw_max - raw_min).max(1e-6);
         for score in scores.iter_mut() {
