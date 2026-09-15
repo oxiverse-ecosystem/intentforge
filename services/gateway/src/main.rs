@@ -12348,8 +12348,18 @@ async fn handle_inspect(
 /// exposes only the deterministic local classification so the contract is
 /// stable + fully testable without the intent engine up, and so clients can
 /// reason about the offline baseline the ranker guarantees.
+
+
 fn build_intent(q: &str) -> serde_json::Value {
-    let intent_resp = fallback_intent(q);
+    let mut intent_resp = fallback_intent(q);
+
+    // P4 compensating override: exact-model / price-signal queries that the
+    // linear probe misclassifies as informational at low confidence. The
+    // fallback_intent stub always returns informational/0.3, so this fires
+    // deterministically on the preview too — keeping `/intent` consistent
+    // with `/search` (which applies the same override to the engine result).
+    intent_resp = apply_p4_transactional_override(&intent_resp, q);
+
     let category = parent_category(&intent_resp.intent);
     let contrastive = query_is_contrastive(q);
     let local = has_local_intent(q);
@@ -19281,6 +19291,67 @@ mod spellcheck_endpoint_tests {
             assert_eq!(res["contrastive_framing"].as_bool(), Some(false));
             assert_eq!(res["local_intent"].as_bool(), Some(false));
         }
+    }
+}
+
+mod p4_intent_override_tests {
+    use super::*;
+
+    fn info_intent() -> IntentResponse {
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("transactional".to_string(), 0.21);
+        dist.insert("informational".to_string(), 0.12);
+        IntentResponse {
+            query: String::new(),
+            intent: "informational".to_string(),
+            confidence: 0.27,
+            constraints: vec![],
+            structured_constraints: Constraints::default(),
+            expanded_queries: vec![],
+            distribution: dist,
+        }
+    }
+
+    #[test]
+    fn p4_price_plus_model_signal_overrides_to_transactional() {
+        // "iphone 16 pro max price" — price marker + digit + topic word.
+        let r = apply_p4_transactional_override(&info_intent(), "iphone 16 pro max price");
+        assert_eq!(r.intent, "transactional");
+        assert!((r.confidence - 0.6).abs() < 1e-5);
+        assert_eq!(r.distribution.get("transactional").copied().unwrap_or(0.0), 0.75);
+    }
+
+    #[test]
+    fn p4_no_price_marker_stays_informational() {
+        // "samsung galaxy s24 ultra" — no price word at all.
+        let r = apply_p4_transactional_override(&info_intent(), "samsung galaxy s24 ultra");
+        assert_eq!(r.intent, "informational");
+    }
+
+    #[test]
+    fn p4_price_marker_but_no_digit_stays_informational() {
+        // "cheap laptop bag" — price word but no model digit.
+        let r = apply_p4_transactional_override(&info_intent(), "cheap laptop bag");
+        assert_eq!(r.intent, "informational");
+    }
+
+    #[test]
+    fn p4_bare_digit_without_topic_stays_informational() {
+        // "100" alone has no topic word, must NOT trip the override.
+        let mut bare = info_intent();
+        bare.query = "100".to_string();
+        let r = apply_p4_transactional_override(&bare, "100");
+        assert_eq!(r.intent, "informational");
+    }
+
+    #[test]
+    fn p4_high_confidence_informational_not_overridden() {
+        // Confident how-to / informational queries must stay put.
+        let mut strong = info_intent();
+        strong.confidence = 0.65;
+        let r = apply_p4_transactional_override(&strong, "how to fix iphone 16 screen");
+        assert_eq!(r.intent, "informational");
+        assert!((r.confidence - 0.65).abs() < 1e-5);
     }
 }
 
