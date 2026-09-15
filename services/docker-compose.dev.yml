@@ -36,7 +36,7 @@ services:
       # one that's up. 172.19.0.0/16 is the services_default bridge subnet.
       - FIREWALL_OUTBOUND_SUBNETS=172.19.0.0/16
     ports:
-      - "8888:8888/tcp"
+      - "18888:8888/tcp"
       - "8388:8388/tcp"
       - "8080:8080"
       - "5000:5000"
