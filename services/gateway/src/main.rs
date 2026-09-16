@@ -2043,15 +2043,14 @@ fn constraint_score(
     // get a SINGLE flat penalty regardless of how many excluded terms they mention.
     // Regular pages get per-term multiplicative penalties.
     let alt_score = is_alternative_listing_page(title, url, content);
-    // Alt-listing exemption: a page scoring >0.3 IS an alternatives/comparison
+    // Alt-listing exemption: a page scoring >0.2 IS an alternatives/comparison
     // listing, so mentioning the excluded term is referential, not a violation.
-    // We do NOT gate on is_comparison_or_alternative_query(): for "alternative to
-    // X" the word "alternative" is consumed into the negative constraint, so that
-    // check would never fire and the alt page would be mis-penalised (c_score
-    // crushed) and then re-dropped downstream (result set collapses to 1). The
-    // pre-merge hard-drop gate uses the same pure alt_score>0.3 exemption, so all
-    // gates must agree to avoid re-drops.
-    let is_alt_page = alt_score > 0.3;
+    // Lowered from 0.3 (2026-09-16): pages with a weak alt signal (e.g. a general
+    // guide mentioning "alternatives" in the content but not the title) were being
+    // penalised for mentioning excluded terms, collapsing recall for "X other than Y"
+    // / "X not Y not Z" queries. The pre-merge hard-drop gate uses the same pure
+    // alt_score>0.2 exemption, so all gates must agree to avoid re-drops.
+    let is_alt_page = alt_score > 0.2;
     // Stricter gate for the title-dominance hard-drop below: a WEAK alt signal
     // alone (e.g. a "best "/"top " listicle title with no comparison/alternative
     // wording and no supporting URL/content evidence) must not exempt a page
@@ -2164,7 +2163,7 @@ fn constraint_score(
         // The alt_score measures how strongly this page is an alternative listing
         // (comparison vs titles, URL patterns, content patterns).
         // High alt_score → barely penalized: alt_score=0.7 → 0.175 single hit
-        // Low alt_score → moderate: alt_score=0.3 → 0.225 single hit
+        // Low alt_score → moderate: alt_score=0.2 → 0.200 single hit
         // Scale alt penalty by exclusion count: more exclusions = stricter penalty.
         // A page listing 5 excluded engines is much less relevant than one listing 1.
         let neg_exclusion_count = constraints.negative.len() as f32;
@@ -4966,7 +4965,7 @@ fn should_filter_by_constraints(
         //     title/content/url contains the term is dropped. It mirrors the
         //     `-site:`/`-filetype:` negatives handled just above — all are dropped
         //     here before the soft-penalty path (section 5) is reached. The
-        //     alt-listing exemption (alt_score > 0.3) is preserved: a comparison /
+        //     alt-listing exemption (alt_score > 0.2) is preserved: a comparison /
         //     "alternatives" page that merely *mentions* the excluded term in a
         //     referential context (e.g. "Flask" in an "alternatives to Django"
         //     listicle) must NOT be hard-dropped, consistent with every other
@@ -4975,10 +4974,10 @@ fn should_filter_by_constraints(
         //     short and user-intended (e.g. "NOT:spam" should catch "spammer").
         if !constraints.hard_exclusions.is_empty() {
             let alt_score = is_alternative_listing_page(title, url, content);
-            // Alt-listing exemption: a page scoring > 0.3 IS an alternatives /
+            // Alt-listing exemption: a page scoring > 0.2 IS an alternatives /
             // comparison listing, so mentioning the excluded term is referential,
             // not a violation — keep it.
-            if alt_score <= 0.3 {
+            if alt_score <= 0.2 {
                 let t_low = title.to_lowercase();
                 let c_low = content.to_lowercase();
                 let u_low = url.to_lowercase();
@@ -15544,7 +15543,7 @@ async fn handle_search(
             // Skip violation counting for alternative-listing pages: their mention of
             // excluded terms is referential, not topical. The soft filter would otherwise
             // drop them before the alt-aware hard filter can preserve them.
-            let violations = if alt_score > 0.3 {
+            let violations = if alt_score > 0.2 {
                 0
             } else {
                 let text = format!("{} {} {}", r.title.to_lowercase(), r.url.to_lowercase(), r.content.chars().take(300).collect::<String>());
@@ -15701,7 +15700,7 @@ async fn handle_search(
             // ("a bare word like vim/django is NOT structural ... never hard-drop").
             for r in web_results.iter() {
                 let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-                if alt_score <= 0.3 {
+                if alt_score <= 0.2 {
                     let text = format!("{} {} {}", r.title, r.url, r.content.chars().take(300).collect::<String>());
                     let text_lower = text.to_lowercase();
                     let _matched = negative_norm.iter().any(|neg| {
@@ -16323,7 +16322,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             // Use Instead of Google" for "search engine alternative to google").
             //
             // CRITICAL FIX (round 2026-08-15T0830Z): the old gate exempted anything
-            // with alt_score > 0.3. But is_alternative_listing_page() also assigns a
+            // with alt_score > 0.2. But is_alternative_listing_page() also assigns a
             // WEAK alt signal (~0.42) to generic "best/top/review" listicle titles
             // — including a brand's OWN catalog page like "Dell Laptop Computers -
             // Best Buy" or "Best Dell Laptops". Those are NOT comparison/alternative
@@ -16470,7 +16469,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             if contrastive {
                 // Entity-specific alt pages (mention excluded term AND are alt listings)
                 // are the answer — boost them, not the generic listicles.
-                if has_neg_in_title && alt_score > 0.3 {
+                if has_neg_in_title && alt_score > 0.2 {
                     r.score += 0.03;
                 }
             } else if !has_neg_in_title {
@@ -18559,7 +18558,7 @@ mod constraint_fix_tests {
     fn not_operator_keeps_alt_listing_page() {
         // Alt-listing pages that merely *mention* the excluded term in a
         // referential/comparison context must NOT be hard-dropped (consistent
-        // with every other negative hard-drop gate's alt_score>0.3 exemption).
+        // with every other negative hard-drop gate's alt_score>0.2 exemption).
         let mut c = cst();
         c.hard_exclusions = vec!["flask".to_string()];
         let kept = should_filter_by_constraints(
