@@ -4355,6 +4355,75 @@ fn is_commercial_intent(
         >= 0.50
 }
 
+/// P4 compensating override: exact-model / price-signal queries that the linear
+/// probe misclassifies as `informational` at low confidence. The intent-engine
+/// is a Rust service that cannot be rebuilt on this Windows host (Smart App
+/// Control), so we add a SECOND-CHANCE override at the gateway layer.
+///
+/// Fires ONLY when ALL of:
+///   1. The resolved intent is `informational` with low confidence (< 0.45)
+///   2. The query carries a transactional MARKER WORD (price/cost/deal/…)
+///   3. The query carries a product MODEL signal (digit sequences, or a
+///      multi-token phrase containing a known brand/model fragment)
+///
+/// This is NOT a keyword shortcut — it compensates for a known classifier
+/// blind spot and only fires when the classifier is genuinely uncertain.
+/// The override lifts the intent to `transactional` and raises confidence
+/// to 0.6 so downstream commerce logic engages.
+fn apply_p4_transactional_override(
+    intent: &IntentResponse,
+    q: &str,
+) -> IntentResponse {
+    // Gate 1: only intercept weak-informational classifications.
+    if intent.intent != "informational" || intent.confidence >= 0.45 {
+        return intent.clone();
+    }
+    let q_lower = q.to_lowercase();
+
+    // Gate 2: transactional marker words (data-driven seed list).
+    const TX_MARKERS: &[&str] = &[
+        "price", "cost", "deal", "cheap", "cheapest", "discount", "offer",
+        "sale", "buy", "purchase", "shop", "store", "order", "pay",
+        "budget", "worth", "value",
+    ];
+    let has_tx_marker = TX_MARKERS.iter().any(|m| q_lower.contains(m));
+    if !has_tx_marker {
+        return intent.clone();
+    }
+
+    // Gate 3: product-model signal — the query contains a digit run (like
+    // "iphone 16" or "galaxy s24") OR a known brand+model phrase fragment.
+    // A bare digit search is not enough; we also need a non-digit topic word
+    // so "100" alone doesn't trip this.
+    let has_digit = q_lower.chars().any(|c| c.is_ascii_digit());
+    let topic_words: Vec<&str> = q_lower
+        .split_whitespace()
+        .filter(|w| w.len() >= 2 && !w.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    let has_model_signal = has_digit && !topic_words.is_empty();
+
+    if !has_model_signal {
+        return intent.clone();
+    }
+
+    tracing::info!(
+        "P4 override: transactional marker + model signal ⇒ transactional (was informational @ {:.3})",
+        intent.confidence
+    );
+
+    let mut fixed = intent.clone();
+    fixed.intent = "transactional".to_string();
+    fixed.confidence = 0.6;
+
+    // Boost the transactional distribution probability.
+    let mut dist = fixed.distribution.clone();
+    dist.insert("transactional".to_string(), 0.75);
+    dist.insert("informational".to_string(), 0.15);
+    fixed.distribution = dist;
+
+    fixed
+}
+
 /// GET /shopping — the user-facing commerce search endpoint (ROADMAP item 2).
 ///
 /// DESIGN CONTRACT: this endpoint MUST reuse the EXACT same ranking pipeline as
@@ -6089,7 +6158,7 @@ fn normalize_indexer_url(url: &str) -> String {
 /// normalize_scores spread=0.05 behaviour). Scores become differentiable
 /// within a query but are NOT comparable across queries — acceptable, since
 /// the downstream ranking/threshold is per-query.
-fn calibrate_scores(scores: &mut [f32]) {
+fn calibrate_scores(scores: &mut [f32], distinctive_term_count: usize) {
     if scores.is_empty() {
         return;
     }
@@ -6099,7 +6168,14 @@ fn calibrate_scores(scores: &mut [f32]) {
         // Degenerate cluster — leave scores as-is (already equal).
         return;
     }
-    let floor = 0.05f32;
+    // IF-2 fix: for queries with many distinctive terms (>= 5), use a softer
+    // relevance floor (0.15 instead of 0.05). Long queries have partial overlap
+    // with any single page — a result matching 3 of 8 distinctive terms is
+    // genuinely on-topic, but the 0.05 floor + post-cal crushes flatten it to
+    // 0.03-0.04 alongside dictionary pages and videos. A 0.15 floor lets
+    // partial-match results rank clearly above off-topic junk. The floor is
+    // derived from the query's own term count — no per-query tuning.
+    let floor = if distinctive_term_count >= 5 { 0.15f32 } else { 0.05f32 };
     // WEAK-SET GUARD (round-6 D1 defense-in-depth): calibrate_scores linearly rescales
     // the whole result set onto [0.05, 1.0], which forces the MAX raw score to 1.0.
     // When the entire set is weak (best raw score < 0.10 — e.g. sparse web upstream
@@ -10638,9 +10714,11 @@ fn merge_local_and_web(
     // Deduplicate merged results by title and domain
     deduplicate_merged_results(&mut merged);
 
-    // 5. Calibrate scores onto [0.05, 1.0] preserving real distribution (Phase 0)
+    // 5. Calibrate scores onto [floor, 1.0] preserving real distribution (Phase 0)
+    // IF-2: pass distinctive_term_count so calibrate_scores can use a softer
+    // floor (0.15) for long queries with many distinctive terms.
     let mut scores: Vec<f32> = merged.iter().map(|r| r.score).collect();
-    calibrate_scores(&mut scores);
+    calibrate_scores(&mut scores, distinctive_terms.len());
     for (i, r) in merged.iter_mut().enumerate() {
         r.score = scores[i];
     }
@@ -12279,8 +12357,18 @@ async fn handle_inspect(
 /// exposes only the deterministic local classification so the contract is
 /// stable + fully testable without the intent engine up, and so clients can
 /// reason about the offline baseline the ranker guarantees.
+
+
 fn build_intent(q: &str) -> serde_json::Value {
-    let intent_resp = fallback_intent(q);
+    let mut intent_resp = fallback_intent(q);
+
+    // P4 compensating override: exact-model / price-signal queries that the
+    // linear probe misclassifies as informational at low confidence. The
+    // fallback_intent stub always returns informational/0.3, so this fires
+    // deterministically on the preview too — keeping `/intent` consistent
+    // with `/search` (which applies the same override to the engine result).
+    intent_resp = apply_p4_transactional_override(&intent_resp, q);
+
     let category = parent_category(&intent_resp.intent);
     let contrastive = query_is_contrastive(q);
     let local = has_local_intent(q);
@@ -13861,7 +13949,14 @@ async fn handle_search(
     };
 
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
-    
+
+    // P4 compensating override: exact-model / price-signal queries that the
+    // linear probe misclassifies as informational at low confidence. This is
+    // a SECOND-CHANCE override — it only fires when the classifier is genuinely
+    // uncertain AND the query carries both a transactional marker word and a
+    // product-model signal (digit run + topic word).
+    intent = apply_p4_transactional_override(&intent, &q);
+
     // Merge constraints parsed directly by the gateway to prevent any loss of operators
     let gateway_extracted = extract_gateway_constraints(&q_orig);
     for ft in gateway_extracted.file_types {
@@ -19191,6 +19286,18 @@ mod spellcheck_endpoint_tests {
         }
 
         #[test]
+        fn intent_p4_override_lifts_exact_model_price_query() {
+            // "iphone 16 pro max price" — price marker + digit + topic word.
+            // The fallback_intent stub returns informational/0.3, but the P4
+            // override must lift it to transactional on the /intent preview
+            // too, so the endpoint is consistent with /search.
+            let res = build_intent("iphone 16 pro max price");
+            assert_eq!(res["intent"].as_str(), Some("transactional"));
+            assert_eq!(res["category"].as_str(), Some("transactional"));
+            assert!((res["confidence"].as_f64().unwrap() - 0.6).abs() < 1e-5);
+        }
+
+        #[test]
         fn intent_empty_query_envelope_distinct_from_search() {
             // The empty envelope carries the /intent key set (so clients can
             // distinguish it from /search /spellcheck empty responses) but with
@@ -19205,6 +19312,70 @@ mod spellcheck_endpoint_tests {
             assert_eq!(res["contrastive_framing"].as_bool(), Some(false));
             assert_eq!(res["local_intent"].as_bool(), Some(false));
         }
+    }
+}
+
+mod p4_intent_override_tests {
+    use super::*;
+
+    fn info_intent() -> IntentResponse {
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("transactional".to_string(), 0.21);
+        dist.insert("informational".to_string(), 0.12);
+        IntentResponse {
+            query: String::new(),
+            intent: "informational".to_string(),
+            confidence: 0.27,
+            constraints: vec![],
+            structured_constraints: Constraints::default(),
+            expanded_queries: vec![],
+            distribution: dist,
+        }
+    }
+
+    #[test]
+    fn p4_price_plus_model_signal_overrides_to_transactional() {
+        // "iphone 16 pro max price" — price marker + digit + topic word.
+        let r = apply_p4_transactional_override(&info_intent(), "iphone 16 pro max price");
+        assert_eq!(r.intent, "transactional");
+        assert!((r.confidence - 0.6).abs() < 1e-5);
+        assert_eq!(r.distribution.get("transactional").copied().unwrap_or(0.0), 0.75);
+    }
+
+    #[test]
+    fn p4_no_price_marker_stays_informational() {
+        // "samsung galaxy s24 ultra" — no price word at all.
+        let r = apply_p4_transactional_override(&info_intent(), "samsung galaxy s24 ultra");
+        assert_eq!(r.intent, "informational");
+    }
+
+    #[test]
+    fn p4_price_marker_but_no_digit_stays_informational() {
+        // "cheap laptop bag" — price word but no model digit.
+        let r = apply_p4_transactional_override(&info_intent(), "cheap laptop bag");
+        assert_eq!(r.intent, "informational");
+    }
+
+    #[test]
+    fn p4_bare_digit_without_topic_stays_informational() {
+        // "100" alone has no topic word, must NOT trip the override.
+        let mut bare = info_intent();
+        bare.query = "100".to_string();
+        let r = apply_p4_transactional_override(&bare, "100");
+        assert_eq!(r.intent, "informational");
+    }
+
+
+
+
+    #[test]
+    fn p4_high_confidence_informational_not_overridden() {
+        // Confident how-to / informational queries must stay put.
+        let mut strong = info_intent();
+        strong.confidence = 0.65;
+        let r = apply_p4_transactional_override(&strong, "how to fix iphone 16 screen");
+        assert_eq!(r.intent, "informational");
+        assert!((r.confidence - 0.65).abs() < 1e-5);
     }
 }
 
