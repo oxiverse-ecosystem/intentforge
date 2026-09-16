@@ -921,6 +921,19 @@ fn q_has_word(q_lower: &str, word: &str) -> bool {
         .any(|w| w == word)
 }
 
+/// Whole-word transactional intent signal: true when any purchase/commerce
+/// keyword appears as a whole word in the query. Whole-word matching is
+/// load-bearing — substring `contains("price ")` missed end-of-query ("iphone
+/// 16 pro max price"), and bare `contains("shop")` false-fired on "shopping",
+/// `contains("under")` on "thunder", `contains("price")` on "priceless".
+fn has_transactional_keyword(q_lower: &str) -> bool {
+    const TX_KEYWORDS: &[&str] = &[
+        "buy", "price", "pricing", "cheap", "purchase", "shop", "store",
+        "discount", "coupon", "under",
+    ];
+    TX_KEYWORDS.iter().any(|k| q_has_word(q_lower, k))
+}
+
 /// D6 (2026-08-17): relation/comparison FUNCTION words that describe *how* the user
 /// wants results related, not *what* they are about. Granting the generic
 /// title-relevance boost to these lets junk pages that merely contain the word
@@ -9996,8 +10009,7 @@ fn merge_local_and_web(
             || r.sources.iter().any(|s| s == "arxiv" || s == "crossref" || s == "pubmed");
 
         let has_download = DOWNLOAD_KEYWORDS.iter().any(|k| q_lower_check.contains(k));
-        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon"];
-        let has_tx = tx_keywords.iter().any(|k| q_lower_check.contains(k));
+        let has_tx = has_transactional_keyword(&q_lower_check);
         let is_nav_or_download = intent == "navigational"
             || intent == "transactional"
             || has_download
@@ -14170,8 +14182,7 @@ async fn handle_search(
         }
 
         // Override 6: transactional keywords OR an explicit price bound -> transactional
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+        let has_tx_signal = has_transactional_keyword(&q_lower);
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -20116,5 +20127,66 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // valid "off" setting — proves the value is honored as a cap.
         let cfg = CommerceConfig { mainpath_top_n: 0 };
         assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
+    }
+
+    // ─── Transactional keyword whole-word matching ──────────────────────
+    // P4 fix: Override 6 used `contains("price ")` which missed end-of-query
+    // ("iphone 16 pro max price") and bare `contains("shop")` false-fired on
+    // "shopping". Whole-word matching via q_has_word fixes both.
+
+    #[test]
+    fn transactional_keyword_price_at_end_of_query() {
+        // The exact defect: "iphone 16 pro max price" — "price" has no
+        // trailing space, so `contains("price ")` was false.
+        assert!(has_transactional_keyword("iphone 16 pro max price"));
+        assert!(has_transactional_keyword("macbook pro m3 price"));
+    }
+
+    #[test]
+    fn transactional_keyword_buy() {
+        assert!(has_transactional_keyword("buy laptop"));
+        assert!(has_transactional_keyword("where to buy iphone"));
+    }
+
+    #[test]
+    fn transactional_keyword_under_as_budget() {
+        assert!(has_transactional_keyword("laptop under 60000"));
+        assert!(has_transactional_keyword("smartwatch under 5000"));
+    }
+
+    #[test]
+    fn transactional_keyword_discount_coupon() {
+        assert!(has_transactional_keyword("discount code"));
+        assert!(has_transactional_keyword("coupon for shoes"));
+    }
+
+    #[test]
+    fn transactional_keyword_shop_store_pricing_cheap() {
+        assert!(has_transactional_keyword("shop online"));
+        assert!(has_transactional_keyword("store near me"));
+        assert!(has_transactional_keyword("pricing for aws"));
+        assert!(has_transactional_keyword("cheap flights"));
+    }
+
+    #[test]
+    fn transactional_keyword_rejects_substring_false_positives() {
+        // "priceless" contains "price" as substring but is NOT a purchase query
+        assert!(!has_transactional_keyword("priceless art"));
+        // "shopping" contains "shop" but is NOT a purchase query
+        assert!(!has_transactional_keyword("shopping mall"));
+        // "thunder" contains "under" but is NOT a budget query
+        assert!(!has_transactional_keyword("thunder storm"));
+        // "storefront" contains "store" but is NOT a purchase query
+        assert!(!has_transactional_keyword("storefront design"));
+        // "buyer" contains "buy" but is NOT a purchase query (it's a role)
+        assert!(!has_transactional_keyword("buyer persona"));
+    }
+
+    #[test]
+    fn transactional_keyword_rejects_unrelated_queries() {
+        assert!(!has_transactional_keyword("how to build a rest api"));
+        assert!(!has_transactional_keyword("what is quantum computing"));
+        assert!(!has_transactional_keyword("react vs vue"));
+        assert!(!has_transactional_keyword("best laptop for programming"));
     }
 }
