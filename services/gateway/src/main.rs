@@ -3487,6 +3487,13 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = val.parse::<u64>().ok();
                 }
             }
+            "listprice" => {
+                if o.list_price.is_none() {
+                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
+                        o.list_price = Some(v);
+                    }
+                }
+            }
             _ => {}
         }
     };
@@ -3541,6 +3548,7 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
         && o.rating.is_none()
         && o.rating_count.is_none()
         && o.image.is_none()
+        && o.list_price.is_none()
     {
         return None;
     }
@@ -3655,6 +3663,13 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = val.parse::<u64>().ok();
                 }
             }
+            "listprice" => {
+                if o.list_price.is_none() {
+                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
+                        o.list_price = Some(v);
+                    }
+                }
+            }
             _ => {}
         }
     };
@@ -3709,6 +3724,7 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
         && o.rating.is_none()
         && o.rating_count.is_none()
         && o.image.is_none()
+        && o.list_price.is_none()
     {
         return None;
     }
@@ -4104,6 +4120,13 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
                     o.image = Some(content.clone());
                 }
             }
+            "product:list_price:amount" | "og:list_price:amount" | "product:original_price:amount" => {
+                if o.list_price.is_none() {
+                    if let Ok(v) = content.replace(',', "").parse::<f64>() {
+                        o.list_price = Some(v);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -4114,6 +4137,7 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
         && o.gtin.is_none()
         && o.rating.is_none()
         && o.image.is_none()
+        && o.list_price.is_none()
     {
         return None;
     }
@@ -20095,6 +20119,109 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // merchant falls back to host
         assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
         assert_eq!(o.source.as_deref(), None);
+    }
+
+    // ── List price (original/sale price) extraction ──────────────────
+    // The list_price field captures the original/undiscounted price when the
+    // page exposes it (JSON-LD `listPrice`, `product:list_price:amount`,
+    // `itemprop="listprice"`, `property="listPrice"`). `price` holds the
+    // current/offer price; list_price is null when not exposed.
+
+    const HTML_JSONLD_LIST_PRICE: &str = r#"<!doctype html><html><head>
+<title>JSON-LD List Price</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Widget Pro",
+  "offers": {
+    "@type": "Offer",
+    "price": "79.99",
+    "priceCurrency": "USD",
+    "listPrice": "99.99"
+  }
+}
+</script></head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_list_price_is_extracted() {
+        let o = extract_commerce_offer(HTML_JSONLD_LIST_PRICE, "https://jsonld.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(79.99));
+        assert_eq!(d.list_price, Some(99.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    const HTML_OG_LIST_PRICE: &str = r#"<!doctype html><html><head>
+<title>OG List Price</title>
+<meta property="product:price:amount" content="79.99">
+<meta property="product:price:currency" content="USD">
+<meta property="product:list_price:amount" content="99.99">
+</head><body></body></html>"#;
+
+    #[test]
+    fn og_list_price_is_extracted() {
+        let o = extract_commerce_offer(HTML_OG_LIST_PRICE, "https://og.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(79.99));
+        assert_eq!(d.list_price, Some(99.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    const HTML_MICRODATA_LIST_PRICE: &str = r#"<!doctype html><html><head>
+<title>Microdata List Price</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">MD Sale Product</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="49.99">49.99</span>
+    <span itemprop="priceCurrency" content="EUR">EUR</span>
+    <span itemprop="listprice" content="79.99">79.99</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_list_price_is_extracted() {
+        let o = extract_commerce_offer(HTML_MICRODATA_LIST_PRICE, "https://md.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.list_price, Some(79.99));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    const HTML_RDFa_LIST_PRICE: &str = r#"<!doctype html><html><head>
+<title>RDFa List Price</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Sale Product</span>
+  <div property="offers" typeof="Offer">
+    <span property="price" content="39.99">39.99</span>
+    <span property="priceCurrency" content="GBP">GBP</span>
+    <span property="listPrice" content="59.99">59.99</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_list_price_is_extracted() {
+        let o = extract_commerce_offer(HTML_RDFa_LIST_PRICE, "https://rdfa.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(39.99));
+        assert_eq!(d.list_price, Some(59.99));
+        assert_eq!(d.currency.as_deref(), Some("GBP"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    #[test]
+    fn list_price_alone_is_valid_commerce_data() {
+        // A page exposing only list_price (no current price) still returns
+        // a non-null OfferFacts — the original price alone is useful signal.
+        let o = extract_commerce_offer(HTML_RDFa_LIST_PRICE, "https://rdfa.example.com/p");
+        assert!(o.data.is_some());
     }
 
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
