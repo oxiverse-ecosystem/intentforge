@@ -2056,15 +2056,14 @@ fn constraint_score(
     // get a SINGLE flat penalty regardless of how many excluded terms they mention.
     // Regular pages get per-term multiplicative penalties.
     let alt_score = is_alternative_listing_page(title, url, content);
-    // Alt-listing exemption: a page scoring >0.3 IS an alternatives/comparison
+    // Alt-listing exemption: a page scoring >0.2 IS an alternatives/comparison
     // listing, so mentioning the excluded term is referential, not a violation.
-    // We do NOT gate on is_comparison_or_alternative_query(): for "alternative to
-    // X" the word "alternative" is consumed into the negative constraint, so that
-    // check would never fire and the alt page would be mis-penalised (c_score
-    // crushed) and then re-dropped downstream (result set collapses to 1). The
-    // pre-merge hard-drop gate uses the same pure alt_score>0.3 exemption, so all
-    // gates must agree to avoid re-drops.
-    let is_alt_page = alt_score > 0.3;
+    // Lowered from 0.3 (2026-09-16): pages with a weak alt signal (e.g. a general
+    // guide mentioning "alternatives" in the content but not the title) were being
+    // penalised for mentioning excluded terms, collapsing recall for "X other than Y"
+    // / "X not Y not Z" queries. The pre-merge hard-drop gate uses the same pure
+    // alt_score>0.2 exemption, so all gates must agree to avoid re-drops.
+    let is_alt_page = alt_score > 0.2;
     // Stricter gate for the title-dominance hard-drop below: a WEAK alt signal
     // alone (e.g. a "best "/"top " listicle title with no comparison/alternative
     // wording and no supporting URL/content evidence) must not exempt a page
@@ -2177,7 +2176,7 @@ fn constraint_score(
         // The alt_score measures how strongly this page is an alternative listing
         // (comparison vs titles, URL patterns, content patterns).
         // High alt_score → barely penalized: alt_score=0.7 → 0.175 single hit
-        // Low alt_score → moderate: alt_score=0.3 → 0.225 single hit
+        // Low alt_score → moderate: alt_score=0.2 → 0.200 single hit
         // Scale alt penalty by exclusion count: more exclusions = stricter penalty.
         // A page listing 5 excluded engines is much less relevant than one listing 1.
         let neg_exclusion_count = constraints.negative.len() as f32;
@@ -3137,6 +3136,12 @@ struct OfferFacts {
     /// Always a URL string from structured data — never guessed from free text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image: Option<String>,
+    /// The original/list price before a discount, when the page exposes it
+    /// (JSON-LD `listPrice`, `product:list_price:amount`, `itemprop="listprice"`).
+    /// `price` holds the current/offer price. When only list price is exposed,
+    /// `price` is left null — never collapse to one canonical number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    list_price: Option<f64>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3386,6 +3391,9 @@ fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
     if dst.image.is_none() {
         dst.image = src.image.clone();
     }
+    if dst.list_price.is_none() {
+        dst.list_price = src.list_price;
+    }
 }
 
 /// True when the page declares a Product or Offer via microdata `itemtype`.
@@ -3491,6 +3499,13 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = val.parse::<u64>().ok();
                 }
             }
+            "listprice" => {
+                if o.list_price.is_none() {
+                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
+                        o.list_price = Some(v);
+                    }
+                }
+            }
             _ => {}
         }
     };
@@ -3545,6 +3560,7 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
         && o.rating.is_none()
         && o.rating_count.is_none()
         && o.image.is_none()
+        && o.list_price.is_none()
     {
         return None;
     }
@@ -3659,6 +3675,13 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = val.parse::<u64>().ok();
                 }
             }
+            "listprice" => {
+                if o.list_price.is_none() {
+                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
+                        o.list_price = Some(v);
+                    }
+                }
+            }
             _ => {}
         }
     };
@@ -3713,6 +3736,7 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
         && o.rating.is_none()
         && o.rating_count.is_none()
         && o.image.is_none()
+        && o.list_price.is_none()
     {
         return None;
     }
@@ -3914,6 +3938,13 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
         if let Some(p) = node_price(n) {
             prices.push(p);
         }
+        // listPrice: the original/undiscounted price, distinct from the current
+        // offer price. Only captured when the page explicitly declares it.
+        if facts.list_price.is_none() {
+            if let Some(lp) = n.get("listPrice").and_then(json_get_f64) {
+                facts.list_price = Some(lp);
+            }
+        }
         if facts.availability.is_none() {
             facts.availability = n
                 .get("availability")
@@ -4101,6 +4132,13 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
                     o.image = Some(content.clone());
                 }
             }
+            "product:list_price:amount" | "og:list_price:amount" | "product:original_price:amount" => {
+                if o.list_price.is_none() {
+                    if let Ok(v) = content.replace(',', "").parse::<f64>() {
+                        o.list_price = Some(v);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -4111,6 +4149,7 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
         && o.gtin.is_none()
         && o.rating.is_none()
         && o.image.is_none()
+        && o.list_price.is_none()
     {
         return None;
     }
@@ -4939,7 +4978,7 @@ fn should_filter_by_constraints(
         //     title/content/url contains the term is dropped. It mirrors the
         //     `-site:`/`-filetype:` negatives handled just above — all are dropped
         //     here before the soft-penalty path (section 5) is reached. The
-        //     alt-listing exemption (alt_score > 0.3) is preserved: a comparison /
+        //     alt-listing exemption (alt_score > 0.2) is preserved: a comparison /
         //     "alternatives" page that merely *mentions* the excluded term in a
         //     referential context (e.g. "Flask" in an "alternatives to Django"
         //     listicle) must NOT be hard-dropped, consistent with every other
@@ -4948,10 +4987,10 @@ fn should_filter_by_constraints(
         //     short and user-intended (e.g. "NOT:spam" should catch "spammer").
         if !constraints.hard_exclusions.is_empty() {
             let alt_score = is_alternative_listing_page(title, url, content);
-            // Alt-listing exemption: a page scoring > 0.3 IS an alternatives /
+            // Alt-listing exemption: a page scoring > 0.2 IS an alternatives /
             // comparison listing, so mentioning the excluded term is referential,
             // not a violation — keep it.
-            if alt_score <= 0.3 {
+            if alt_score <= 0.2 {
                 let t_low = title.to_lowercase();
                 let c_low = content.to_lowercase();
                 let u_low = url.to_lowercase();
@@ -15512,7 +15551,7 @@ async fn handle_search(
             // Skip violation counting for alternative-listing pages: their mention of
             // excluded terms is referential, not topical. The soft filter would otherwise
             // drop them before the alt-aware hard filter can preserve them.
-            let violations = if alt_score > 0.3 {
+            let violations = if alt_score > 0.2 {
                 0
             } else {
                 let text = format!("{} {} {}", r.title.to_lowercase(), r.url.to_lowercase(), r.content.chars().take(300).collect::<String>());
@@ -15669,7 +15708,7 @@ async fn handle_search(
             // ("a bare word like vim/django is NOT structural ... never hard-drop").
             for r in web_results.iter() {
                 let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-                if alt_score <= 0.3 {
+                if alt_score <= 0.2 {
                     let text = format!("{} {} {}", r.title, r.url, r.content.chars().take(300).collect::<String>());
                     let text_lower = text.to_lowercase();
                     let _matched = negative_norm.iter().any(|neg| {
@@ -16291,7 +16330,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             // Use Instead of Google" for "search engine alternative to google").
             //
             // CRITICAL FIX (round 2026-08-15T0830Z): the old gate exempted anything
-            // with alt_score > 0.3. But is_alternative_listing_page() also assigns a
+            // with alt_score > 0.2. But is_alternative_listing_page() also assigns a
             // WEAK alt signal (~0.42) to generic "best/top/review" listicle titles
             // — including a brand's OWN catalog page like "Dell Laptop Computers -
             // Best Buy" or "Best Dell Laptops". Those are NOT comparison/alternative
@@ -16438,7 +16477,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             if contrastive {
                 // Entity-specific alt pages (mention excluded term AND are alt listings)
                 // are the answer — boost them, not the generic listicles.
-                if has_neg_in_title && alt_score > 0.3 {
+                if has_neg_in_title && alt_score > 0.2 {
                     r.score += 0.03;
                 }
             } else if !has_neg_in_title {
@@ -18527,7 +18566,7 @@ mod constraint_fix_tests {
     fn not_operator_keeps_alt_listing_page() {
         // Alt-listing pages that merely *mention* the excluded term in a
         // referential/comparison context must NOT be hard-dropped (consistent
-        // with every other negative hard-drop gate's alt_score>0.3 exemption).
+        // with every other negative hard-drop gate's alt_score>0.2 exemption).
         let mut c = cst();
         c.hard_exclusions = vec!["flask".to_string()];
         let kept = should_filter_by_constraints(
@@ -20087,6 +20126,109 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // merchant falls back to host
         assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
         assert_eq!(o.source.as_deref(), None);
+    }
+
+    // ── List price (original/sale price) extraction ──────────────────
+    // The list_price field captures the original/undiscounted price when the
+    // page exposes it (JSON-LD `listPrice`, `product:list_price:amount`,
+    // `itemprop="listprice"`, `property="listPrice"`). `price` holds the
+    // current/offer price; list_price is null when not exposed.
+
+    const HTML_JSONLD_LIST_PRICE: &str = r#"<!doctype html><html><head>
+<title>JSON-LD List Price</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Widget Pro",
+  "offers": {
+    "@type": "Offer",
+    "price": "79.99",
+    "priceCurrency": "USD",
+    "listPrice": "99.99"
+  }
+}
+</script></head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_list_price_is_extracted() {
+        let o = extract_commerce_offer(HTML_JSONLD_LIST_PRICE, "https://jsonld.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(79.99));
+        assert_eq!(d.list_price, Some(99.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    const HTML_OG_LIST_PRICE: &str = r#"<!doctype html><html><head>
+<title>OG List Price</title>
+<meta property="product:price:amount" content="79.99">
+<meta property="product:price:currency" content="USD">
+<meta property="product:list_price:amount" content="99.99">
+</head><body></body></html>"#;
+
+    #[test]
+    fn og_list_price_is_extracted() {
+        let o = extract_commerce_offer(HTML_OG_LIST_PRICE, "https://og.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(79.99));
+        assert_eq!(d.list_price, Some(99.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    const HTML_MICRODATA_LIST_PRICE: &str = r#"<!doctype html><html><head>
+<title>Microdata List Price</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">MD Sale Product</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="49.99">49.99</span>
+    <span itemprop="priceCurrency" content="EUR">EUR</span>
+    <span itemprop="listprice" content="79.99">79.99</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_list_price_is_extracted() {
+        let o = extract_commerce_offer(HTML_MICRODATA_LIST_PRICE, "https://md.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.list_price, Some(79.99));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    const HTML_RDFa_LIST_PRICE: &str = r#"<!doctype html><html><head>
+<title>RDFa List Price</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Sale Product</span>
+  <div property="offers" typeof="Offer">
+    <span property="price" content="39.99">39.99</span>
+    <span property="priceCurrency" content="GBP">GBP</span>
+    <span property="listPrice" content="59.99">59.99</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_list_price_is_extracted() {
+        let o = extract_commerce_offer(HTML_RDFa_LIST_PRICE, "https://rdfa.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(39.99));
+        assert_eq!(d.list_price, Some(59.99));
+        assert_eq!(d.currency.as_deref(), Some("GBP"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    #[test]
+    fn list_price_alone_is_valid_commerce_data() {
+        // A page exposing only list_price (no current price) still returns
+        // a non-null OfferFacts — the original price alone is useful signal.
+        let o = extract_commerce_offer(HTML_RDFa_LIST_PRICE, "https://rdfa.example.com/p");
+        assert!(o.data.is_some());
     }
 
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
