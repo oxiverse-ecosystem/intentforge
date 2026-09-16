@@ -3124,6 +3124,12 @@ struct OfferFacts {
     /// Always a URL string from structured data — never guessed from free text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image: Option<String>,
+    /// The original/list price before a discount, when the page exposes it
+    /// (JSON-LD `listPrice`, `product:list_price:amount`, `itemprop="listprice"`).
+    /// `price` holds the current/offer price. When only list price is exposed,
+    /// `price` is left null — never collapse to one canonical number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    list_price: Option<f64>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3372,6 +3378,9 @@ fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
     }
     if dst.image.is_none() {
         dst.image = src.image.clone();
+    }
+    if dst.list_price.is_none() {
+        dst.list_price = src.list_price;
     }
 }
 
@@ -3900,6 +3909,13 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
 
         if let Some(p) = node_price(n) {
             prices.push(p);
+        }
+        // listPrice: the original/undiscounted price, distinct from the current
+        // offer price. Only captured when the page explicitly declares it.
+        if facts.list_price.is_none() {
+            if let Some(lp) = n.get("listPrice").and_then(json_get_f64) {
+                facts.list_price = Some(lp);
+            }
         }
         if facts.availability.is_none() {
             facts.availability = n
