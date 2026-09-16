@@ -14221,10 +14221,7 @@ async fn handle_search(
             intent.confidence = intent.confidence.max(0.88);
             let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
             intent.distribution.insert("navigational".to_string(), (nav_prob + 0.60).min(0.95));
-            intent.distribution.insert("download".to_string(), 0.90);
-        }
-
-        // Override 7: weather / forecast queries → fresh
+            true
         // WHOLE-WORD match only: a naive `contains("rain")` wrongly fired inside
         // "fe**rain**al" (a rescue-cat query) and forced fresh intent on a how-to
         // question, which then re-ranked results by recency instead of relevance.

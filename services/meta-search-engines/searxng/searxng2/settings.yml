@@ -198,11 +198,13 @@ engines:
     engine: bing_videos
     disabled: false
     timeout: 4.0
+    categories: [videos]  # restrict to /videos; prevents pollution of /search
 
   - name: google videos
     engine: google_videos
     disabled: false
     timeout: 4.0
+    categories: [videos]  # restrict to /videos; prevents pollution of /search
 
   - name: duckduckgo videos
     engine: duckduckgo_extra
@@ -210,3 +212,4 @@ engines:
     shortcut: ddv
     disabled: false
     timeout: 4.0
+    categories: [videos]  # restrict to /videos; prevents pollution of /search
