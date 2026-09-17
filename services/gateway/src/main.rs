@@ -17864,10 +17864,10 @@ mod constraint_fix_tests {
             &c,
         );
         assert!(!fresh, "result dated 2025 should pass after:2024");
-            }
+    }
 
-            #[test]
-            fn fresh_small_set_date_window_is_scoring_not_filter() {
+    #[test]
+    fn fresh_small_set_date_window_is_scoring_not_filter() {
                 // FRESH-SMALL-SET FAIL-OPEN: when intent is fresh and the
                 // pre-merge set is small (< 5), the date window must NOT
                 // hard-filter results. The handle_search level clears the
