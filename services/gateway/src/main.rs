@@ -3439,6 +3439,10 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
     let src_re = SRC_RE.get_or_init(|| {
         regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
     });
+    static VALUE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let value_re = VALUE_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)value\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
 
     let mut o = OfferFacts::default();
 
@@ -3528,6 +3532,10 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
             .captures(tag)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
+        let value_attr = value_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
         if let Some(p) = prop {
             // For image, prefer href (link itemprop="image" href=...) then
             // content (meta itemprop="image" content=...) then src.
@@ -3536,6 +3544,9 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
                     apply(&p, &v);
                 }
             } else if let Some(v) = content {
+                apply(&p, &v);
+            } else if let Some(v) = value_attr {
+                // Microdata v2: <span itemprop="price" value="29.99">
                 apply(&p, &v);
             } else {
                 // Text content form: extract text after the tag until the next '<'.
@@ -3608,6 +3619,10 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
     static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let src_re = SRC_RE.get_or_init(|| {
         regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static RESOURCE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let resource_re = RESOURCE_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)resource\s*=\s*["']([^"']*)["']"#).unwrap()
     });
 
     let mut o = OfferFacts::default();
@@ -3704,11 +3719,15 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
             .captures(tag)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
+        let resource = resource_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
         if let Some(p) = prop {
             // For image, prefer href (link itemprop="image" href=...) then
-            // content (meta itemprop="image" content=...) then src.
+            // content (meta itemprop="image" content=...) then src, then resource.
             if p == "image" {
-                if let Some(v) = href.or(content).or(src) {
+                if let Some(v) = href.or(content).or(src).or(resource) {
                     apply(&p, &v);
                 }
             } else if let Some(v) = content {
@@ -7602,19 +7621,6 @@ fn preprocess_searxng_query(query: &str) -> String {
     }
 
     let neg_terms = extract_query_negative_terms(q);
-    // Expand multi-word neg terms into individual words for stripping.
-    // "drilling holes" → strip both "drilling" and "holes" from the upstream query.
-    // Without this, the word-by-word loop never matches multi-word neg terms,
-    // so "holes" stays in the query and Bing returns "Holes" movie results.
-    let mut neg_term_words: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for neg in &neg_terms {
-        for word in neg.split_whitespace() {
-            let clean: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
-            if !clean.is_empty() {
-                neg_term_words.insert(clean.to_lowercase());
-            }
-        }
-    }
     let neg_markers = ["not", "no", "without", "except", "excluding", "minus", "other", "than"];
     let neg_stopwords = [
         "from", "a", "an", "the", "of", "to", "in", "on", "at", "for", "with", "by",
@@ -7668,7 +7674,6 @@ fn preprocess_searxng_query(query: &str) -> String {
         let clean_token: String = wl.chars().filter(|c| c.is_alphanumeric()).collect();
         if neg_markers.contains(&clean_token.as_str())
             || neg_terms.contains(&clean_token)
-            || neg_term_words.contains(&clean_token)
             || (!neg_terms.is_empty() && neg_stopwords.contains(&clean_token.as_str()))
         {
             continue;
@@ -8950,6 +8955,17 @@ fn merge_local_and_web(
     // relevance. Extraction is purely derived from the query's own distinctive terms
     // minus attribute/structure vocab: no per-brand/per-entity tuning, so it
     // generalises to any comparison ("swift vs nexon", "city vs amaze", ...).
+    //
+    // NOTE: derived from `distinctive_terms` (NOT `strong_distinctive_terms`) so
+    // meaningful nouns like "car" survive. `strong_distinctive_terms` strips weak
+    // anchors — but in a comparison, "car" is an ENTITY, not noise. Without it,
+    // "jaguar the car vs the animal" sees only [jaguar, animal] and the coverage
+    // boost (frac>=0.5 of 2) fires for ANY page naming "jaguar" — letting the
+    // animal-heavy local index float to the top. With "car" included, entities =
+    // [jaguar, car, animal] and the boost requires naming >=2, so generic pages
+    // that only share "jaguar" no longer ride the lift. The structure/attribute
+    // filters below remove framing words (compare, vs, top, speed, ...); only
+    // genuine entity nouns remain.
     let comparison_query = q_words.iter().any(|w| {
         let l = w.to_lowercase();
         l == "compare" || l == "comparison" || l == "versus" || l == "vs" || l == "v"
@@ -8967,12 +8983,11 @@ fn merge_local_and_web(
         "automatic", "manual", "variant", "feature", "features", "performance",
         "efficiency", "kmpl", "review", "reviews", "launch", "model", "models", "year",
     ];
-    let comparison_entities: Vec<String> = strong_distinctive_terms
+    let comparison_entities: Vec<String> = distinctive_terms
         .iter()
         .map(|t| t.to_lowercase())
         .filter(|tl| !comparison_structure_words.contains(&tl.as_str()))
         .filter(|tl| !comparison_attribute_terms.contains(&tl.as_str()))
-        .filter(|tl| !is_weak_anchor_word(tl))
         .collect();
     let query_entity_count = comparison_entities.len();
 
@@ -17878,45 +17893,45 @@ mod constraint_fix_tests {
             &c,
         );
         assert!(!fresh, "result dated 2025 should pass after:2024");
-    }
+            }
 
-    #[test]
-    fn fresh_small_set_date_window_is_scoring_not_filter() {
-        // FRESH-SMALL-SET FAIL-OPEN: when intent is fresh and the
-        // pre-merge set is small (< 5), the date window must NOT
-        // hard-filter results. The handle_search level clears the
-        // date window when pre_filter_count < 5, so dateless
-        // results are kept and recency stays a scoring-only boost.
-        // This test verifies the should_filter_by_constraints
-        // guarantee: dateless results pass through the date filter
-        // (the structural foundation on which the FRESH-SMALL-SET
-        // rule depends).
-        let mut c = Constraints::default();
-        c.after_date = Some("2025-09-01".to_string());
-        c.before_date = Some("2025-09-08".to_string());
-        // A result with no publish date — should NOT be filtered.
-        // (should_filter_by_constraints keeps dateless results by
-        // design — the fail-open for date-less results.)
-        let nodate = should_filter_by_constraints(
-            "Chandrayaan 4 update",
-            "ISRO prepares for Chandrayaan-4 lunar sample-return mission.",
-            "https://example.com/chandrayaan4",
-            None, // no published date
-            &c,
-        );
-        assert!(!nodate, "dateless result must NOT be hard-filtered by date bounds");
-    }
+            #[test]
+            fn fresh_small_set_date_window_is_scoring_not_filter() {
+                // FRESH-SMALL-SET FAIL-OPEN: when intent is fresh and the
+                // pre-merge set is small (< 5), the date window must NOT
+                // hard-filter results. The handle_search level clears the
+                // date window when pre_filter_count < 5, so dateless
+                // results are kept and recency stays a scoring-only boost.
+                // This test verifies the should_filter_by_constraints
+                // guarantee: dateless results pass through the date filter
+                // (the structural foundation on which the FRESH-SMALL-SET
+                // rule depends).
+                let mut c = Constraints::default();
+                c.after_date = Some("2025-09-01".to_string());
+                c.before_date = Some("2025-09-08".to_string());
+                // A result with no publish date — should NOT be filtered.
+                // (should_filter_by_constraints keeps dateless results by
+                // design — the fail-open for date-less results.)
+                let nodate = should_filter_by_constraints(
+                    "Chandrayaan 4 update",
+                    "ISRO prepares for Chandrayaan-4 lunar sample-return mission.",
+                    "https://example.com/chandrayaan4",
+                    None, // no published date
+                    &c,
+                );
+                assert!(!nodate, "dateless result must NOT be hard-filtered by date bounds");
+            }
 
-    #[test]
-    fn price_extraction_broadened() {
-        assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
-        assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
-        assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
-        assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
-        assert_eq!(extract_price_from_text("no monetary value here"), None);
-        assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
-        assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
-    }
+                #[test]
+                fn price_extraction_broadened() {
+                    assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
+                    assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
+                    assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
+                    assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
+                    assert_eq!(extract_price_from_text("no monetary value here"), None);
+                    assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
+                    assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
+                }
 
     #[test]
     fn rs_signal_no_false_positives() {
@@ -19652,6 +19667,89 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // merchant falls back to host
         assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
         assert_eq!(o.source.as_deref(), None);
+    }
+
+    // ── Microdata v2: value attribute ───────────────────────────────────
+    // Microdata spec allows <span itemprop="price" value="29.99"> where the
+    // machine-readable value lives in the `value` attribute, not text content.
+
+    const HTML_MICRODATA_VALUE_ATTR: &str = r#"<!doctype html><html><head>
+<title>Microdata Value Attr</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Value Attr Widget</span>
+  <span itemprop="price" value="39.99">$39.99</span>
+  <span itemprop="priceCurrency" value="USD">USD</span>
+  <span itemprop="availability" value="https://schema.org/InStock">In Stock</span>
+  <span itemprop="brand" value="ValueBrand">ValueBrand</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_value_attribute_is_extracted() {
+        let o = extract_commerce_offer(HTML_MICRODATA_VALUE_ATTR, "https://valmd.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(39.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.merchant.as_deref(), Some("ValueBrand"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    // ── RDFa resource attribute ──────────────────────────────────────────
+    // RDFa allows <img property="image" resource="url"> or
+    // <link property="image" href="url"> — the resource attr is a valid IRI.
+
+    const HTML_RDFa_RESOURCE_IMAGE: &str = r#"<!doctype html><html><head>
+<title>RDFa Resource Image</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Resource Product</span>
+  <img property="image" resource="https://rdfa.example.com/img.jpg" alt="product">
+  <div property="offers" typeof="Offer">
+    <span property="price" content="69.99">69.99</span>
+    <span property="priceCurrency" content="USD">USD</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_resource_attribute_image_is_extracted() {
+        let o = extract_commerce_offer(HTML_RDFa_RESOURCE_IMAGE, "https://rdfares.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://rdfa.example.com/img.jpg"));
+        assert_eq!(d.price, Some(69.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    const HTML_RDFa_RESOURCE_OFFER: &str = r#"<!doctype html><html><head>
+<title>RDFa Resource Offer</title>
+<meta property="og:title" content="RDFa Offer">
+<meta property="og:image" content="https://rdfa.example.com/og.jpg">
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">Full RDFa Product</span>
+  <link property="image" href="https://rdfa.example.com/link-img.jpg">
+  <div property="offers" typeof="Offer" resource="https://rdfa.example.com/offer/1">
+    <span property="price" content="55.00">55.00</span>
+    <span property="priceCurrency" content="EUR">EUR</span>
+    <span property="availability" content="https://schema.org/InStock">In Stock</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_resource_attribute_on_offer_and_link_image() {
+        // resource= on the offers div should not break extraction; the link
+        // property="image" href= form must still yield the image URL.
+        let o = extract_commerce_offer(HTML_RDFa_RESOURCE_OFFER, "https://rdfao.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://rdfa.example.com/link-img.jpg"));
+        assert_eq!(d.price, Some(55.00));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
     }
 
     // ── RDFa extraction ────────────────────────────────────────────────
