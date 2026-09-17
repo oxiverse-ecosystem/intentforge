@@ -18619,7 +18619,7 @@ mod constraint_fix_tests {
     }
 
 
-	}
+}
 
 #[cfg(test)]
 mod hardcoding_ruling_tests {
