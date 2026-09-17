@@ -921,19 +921,6 @@ fn q_has_word(q_lower: &str, word: &str) -> bool {
         .any(|w| w == word)
 }
 
-/// Whole-word transactional intent signal: true when any purchase/commerce
-/// keyword appears as a whole word in the query. Whole-word matching is
-/// load-bearing — substring `contains("price ")` missed end-of-query ("iphone
-/// 16 pro max price"), and bare `contains("shop")` false-fired on "shopping",
-/// `contains("under")` on "thunder", `contains("price")` on "priceless".
-fn has_transactional_keyword(q_lower: &str) -> bool {
-    const TX_KEYWORDS: &[&str] = &[
-        "buy", "price", "pricing", "cheap", "purchase", "shop", "store",
-        "discount", "coupon", "under",
-    ];
-    TX_KEYWORDS.iter().any(|k| q_has_word(q_lower, k))
-}
-
 /// D6 (2026-08-17): relation/comparison FUNCTION words that describe *how* the user
 /// wants results related, not *what* they are about. Granting the generic
 /// title-relevance boost to these lets junk pages that merely contain the word
@@ -2056,14 +2043,15 @@ fn constraint_score(
     // get a SINGLE flat penalty regardless of how many excluded terms they mention.
     // Regular pages get per-term multiplicative penalties.
     let alt_score = is_alternative_listing_page(title, url, content);
-    // Alt-listing exemption: a page scoring >0.2 IS an alternatives/comparison
+    // Alt-listing exemption: a page scoring >0.3 IS an alternatives/comparison
     // listing, so mentioning the excluded term is referential, not a violation.
-    // Lowered from 0.3 (2026-09-16): pages with a weak alt signal (e.g. a general
-    // guide mentioning "alternatives" in the content but not the title) were being
-    // penalised for mentioning excluded terms, collapsing recall for "X other than Y"
-    // / "X not Y not Z" queries. The pre-merge hard-drop gate uses the same pure
-    // alt_score>0.2 exemption, so all gates must agree to avoid re-drops.
-    let is_alt_page = alt_score > 0.2;
+    // We do NOT gate on is_comparison_or_alternative_query(): for "alternative to
+    // X" the word "alternative" is consumed into the negative constraint, so that
+    // check would never fire and the alt page would be mis-penalised (c_score
+    // crushed) and then re-dropped downstream (result set collapses to 1). The
+    // pre-merge hard-drop gate uses the same pure alt_score>0.3 exemption, so all
+    // gates must agree to avoid re-drops.
+    let is_alt_page = alt_score > 0.3;
     // Stricter gate for the title-dominance hard-drop below: a WEAK alt signal
     // alone (e.g. a "best "/"top " listicle title with no comparison/alternative
     // wording and no supporting URL/content evidence) must not exempt a page
@@ -2176,7 +2164,7 @@ fn constraint_score(
         // The alt_score measures how strongly this page is an alternative listing
         // (comparison vs titles, URL patterns, content patterns).
         // High alt_score → barely penalized: alt_score=0.7 → 0.175 single hit
-        // Low alt_score → moderate: alt_score=0.2 → 0.200 single hit
+        // Low alt_score → moderate: alt_score=0.3 → 0.225 single hit
         // Scale alt penalty by exclusion count: more exclusions = stricter penalty.
         // A page listing 5 excluded engines is much less relevant than one listing 1.
         let neg_exclusion_count = constraints.negative.len() as f32;
@@ -3136,12 +3124,6 @@ struct OfferFacts {
     /// Always a URL string from structured data — never guessed from free text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image: Option<String>,
-    /// The original/list price before a discount, when the page exposes it
-    /// (JSON-LD `listPrice`, `product:list_price:amount`, `itemprop="listprice"`).
-    /// `price` holds the current/offer price. When only list price is exposed,
-    /// `price` is left null — never collapse to one canonical number.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    list_price: Option<f64>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3391,9 +3373,6 @@ fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
     if dst.image.is_none() {
         dst.image = src.image.clone();
     }
-    if dst.list_price.is_none() {
-        dst.list_price = src.list_price;
-    }
 }
 
 /// True when the page declares a Product or Offer via microdata `itemtype`.
@@ -3499,13 +3478,6 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = val.parse::<u64>().ok();
                 }
             }
-            "listprice" => {
-                if o.list_price.is_none() {
-                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
-                        o.list_price = Some(v);
-                    }
-                }
-            }
             _ => {}
         }
     };
@@ -3560,7 +3532,6 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
         && o.rating.is_none()
         && o.rating_count.is_none()
         && o.image.is_none()
-        && o.list_price.is_none()
     {
         return None;
     }
@@ -3675,13 +3646,6 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = val.parse::<u64>().ok();
                 }
             }
-            "listprice" => {
-                if o.list_price.is_none() {
-                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
-                        o.list_price = Some(v);
-                    }
-                }
-            }
             _ => {}
         }
     };
@@ -3736,7 +3700,6 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
         && o.rating.is_none()
         && o.rating_count.is_none()
         && o.image.is_none()
-        && o.list_price.is_none()
     {
         return None;
     }
@@ -3938,13 +3901,6 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
         if let Some(p) = node_price(n) {
             prices.push(p);
         }
-        // listPrice: the original/undiscounted price, distinct from the current
-        // offer price. Only captured when the page explicitly declares it.
-        if facts.list_price.is_none() {
-            if let Some(lp) = n.get("listPrice").and_then(json_get_f64) {
-                facts.list_price = Some(lp);
-            }
-        }
         if facts.availability.is_none() {
             facts.availability = n
                 .get("availability")
@@ -4132,13 +4088,6 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
                     o.image = Some(content.clone());
                 }
             }
-            "product:list_price:amount" | "og:list_price:amount" | "product:original_price:amount" => {
-                if o.list_price.is_none() {
-                    if let Ok(v) = content.replace(',', "").parse::<f64>() {
-                        o.list_price = Some(v);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -4149,7 +4098,6 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
         && o.gtin.is_none()
         && o.rating.is_none()
         && o.image.is_none()
-        && o.list_price.is_none()
     {
         return None;
     }
@@ -4842,12 +4790,10 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
-                        // Distance/time-bound guard: "within 300 kilometers" or
-                        // "within 6 months" is a range, not a price — skip this
-                        // marker (let a later price marker, if any, match instead).
-                        // Pass text AFTER the number (like Pattern B does) so the
-                        // unit check sees "months", not "6".
-                        if is_distance_bound(&rest[m.end()..]) {
+                        // Distance-bound guard: "within 300 kilometers" is a
+                        // range, not a price — skip this marker (let a later
+                        // price marker, if any, match instead).
+                        if is_distance_bound(rest) {
                             continue;
                         }
                         let currency = currency_words.iter().find(|c| rest.contains(*c))
@@ -4978,7 +4924,7 @@ fn should_filter_by_constraints(
         //     title/content/url contains the term is dropped. It mirrors the
         //     `-site:`/`-filetype:` negatives handled just above — all are dropped
         //     here before the soft-penalty path (section 5) is reached. The
-        //     alt-listing exemption (alt_score > 0.2) is preserved: a comparison /
+        //     alt-listing exemption (alt_score > 0.3) is preserved: a comparison /
         //     "alternatives" page that merely *mentions* the excluded term in a
         //     referential context (e.g. "Flask" in an "alternatives to Django"
         //     listicle) must NOT be hard-dropped, consistent with every other
@@ -4987,10 +4933,10 @@ fn should_filter_by_constraints(
         //     short and user-intended (e.g. "NOT:spam" should catch "spammer").
         if !constraints.hard_exclusions.is_empty() {
             let alt_score = is_alternative_listing_page(title, url, content);
-            // Alt-listing exemption: a page scoring > 0.2 IS an alternatives /
+            // Alt-listing exemption: a page scoring > 0.3 IS an alternatives /
             // comparison listing, so mentioning the excluded term is referential,
             // not a violation — keep it.
-            if alt_score <= 0.2 {
+            if alt_score <= 0.3 {
                 let t_low = title.to_lowercase();
                 let c_low = content.to_lowercase();
                 let u_low = url.to_lowercase();
@@ -6327,7 +6273,6 @@ fn whole_word_contains(haystack: &str, needle: &str) -> bool {
 fn cross_location_mismatch_mult(
     title: &str,
     content: &str,
-    url: &str,
     geo: Option<&geoloc::GeoLocation>,
 ) -> f32 {
     let geo = match geo {
@@ -6713,47 +6658,6 @@ const IGNORED_CONSTRAINT_NOISE: &[&str] = &[
     "before", "after", "and", "or", "but", "is", "are", "was", "were",
 ];
 
-/// D4 (2026-09-15): seed list of consumer brands that are common exclusion
-/// targets ("not bose", "wireless headphones not sony", "not nike shoes").
-/// When a user negates a brand name, the brand IS the genuine topical
-/// exclusion — it must be honored even when the query lacks contrastive
-/// framing and the word is not a protected tech term. This mirrors the
-/// COUNTRY_DEMONYMS data-seed pattern: a general, non-hardcoded list so any
-/// negated brand passes the `is_real_exclusion` gate. Covers major audio,
-/// sportswear, electronics, and automotive brands.
-const KNOWN_BRANDS: &[&str] = &[
-    // Audio / headphones / earbuds
-    "bose", "sony", "sennheiser", "akg", "audio-technica", "beats",
-    "jabra", "jbl", "skullcandy", "sony", "bose", "sennheiser",
-    "senheiser", "fiio", "shure", "westone", "campfire", "moondrop",
-    // Sportswear / footwear
-    "nike", "adidas", "puma", "reebok", "new balance", "newbalance",
-    "asics", "converse", "vans", "under armour", "underarmour",
-    // Electronics / computing
-    "samsung", "lg", "hp", "dell", "lenovo", "asus", "acer",
-    "microsoft", "google", "xiaomi", "oneplus", "oppo", "vivo",
-    "realme", "nothing", "razer", "logitech", "corsair", "steelseries",
-    // Automotive
-    "toyota", "honda", "ford", "tesla", "bmw", "mercedes", "audi",
-    "volkswagen", "hyundai", "kia", "nissan", "chevrolet",
-];
-
-/// True if `term` is a known consumer brand. Brands are common negation
-/// targets ("not bose", "headphones not sony") and must pass the
-/// `is_real_exclusion` gate even without contrastive framing. Data-seed
-/// pattern (mirrors `COUNTRY_DEMONYMS`), not per-query literals.
-fn is_known_brand(term: &str) -> bool {
-    let lc = term.trim().to_lowercase();
-    if lc.is_empty() {
-        return false;
-    }
-    if KNOWN_BRANDS.contains(&lc.as_str()) {
-        return true;
-    }
-    let tokens: Vec<&str> = lc.split_whitespace().collect();
-    tokens.iter().any(|t| KNOWN_BRANDS.contains(t))
-}
-
 /// F3 (2026-08-17): seed list of country demonyms / origin adjectives. When a user
 /// excludes a COUNTRY-of-origin (e.g. "not from chinese brands", "alternatives to american
 /// cloud providers", "laptops not made in china"), the demonym IS the genuine topical
@@ -6957,15 +6861,6 @@ fn is_real_exclusion(
     if COUNTRY_DEMONYMS.contains(&lc.as_str())
         || tokens.iter().any(|t| COUNTRY_DEMONYMS.contains(t))
     {
-        return true;
-    }
-    // D4 (2026-09-15): a known consumer brand (e.g. "bose", "nike", "sony") is a
-    // genuine topical exclusion when negated ("not bose", "wireless headphones
-    // not sony"). Brands are common negation targets that the user explicitly
-    // named — they must pass the is_real_exclusion gate even without contrastive
-    // framing and even when not in PROTECTED_TERMS (which is tech-focused).
-    // Data-seed pattern mirrors COUNTRY_DEMONYMS; no per-query literals.
-    if is_known_brand(&lc) {
         return true;
     }
     // Entity: a term in the compound is capitalized in the original query
@@ -8033,7 +7928,7 @@ fn keyphrase_relax_variant(query: &str) -> Option<String> {
     ];
 
     let filtered: Vec<&str> = words.into_iter()
-        .filter(|w| !STOP_WORDS.contains(w) && (w.len() > 1 || w.chars().any(|c| c.is_ascii_digit())))
+        .filter(|w| !STOP_WORDS.contains(w) && w.len() > 1)
         .collect();
 
     let orig_count = query.split_whitespace().count();
@@ -10101,7 +9996,8 @@ fn merge_local_and_web(
             || r.sources.iter().any(|s| s == "arxiv" || s == "crossref" || s == "pubmed");
 
         let has_download = DOWNLOAD_KEYWORDS.iter().any(|k| q_lower_check.contains(k));
-        let has_tx = has_transactional_keyword(&q_lower_check);
+        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon"];
+        let has_tx = tx_keywords.iter().any(|k| q_lower_check.contains(k));
         let is_nav_or_download = intent == "navigational"
             || intent == "transactional"
             || has_download
@@ -10375,7 +10271,7 @@ fn merge_local_and_web(
         };
 
         let cross_loc_mult = if geo_is_explicit {
-            cross_location_mismatch_mult(&r.title, &r.content, &r.url, geo_location)
+            cross_location_mismatch_mult(&r.title, &r.content, geo_location)
         } else {
             1.0
         };
@@ -14274,7 +14170,8 @@ async fn handle_search(
         }
 
         // Override 6: transactional keywords OR an explicit price bound -> transactional
-        let has_tx_signal = has_transactional_keyword(&q_lower);
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -14324,7 +14221,10 @@ async fn handle_search(
             intent.confidence = intent.confidence.max(0.88);
             let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
             intent.distribution.insert("navigational".to_string(), (nav_prob + 0.60).min(0.95));
-            true
+            intent.distribution.insert("download".to_string(), 0.90);
+        }
+
+        // Override 7: weather / forecast queries → fresh
         // WHOLE-WORD match only: a naive `contains("rain")` wrongly fired inside
         // "fe**rain**al" (a rescue-cat query) and forced fresh intent on a how-to
         // question, which then re-ranked results by recency instead of relevance.
@@ -15551,7 +15451,7 @@ async fn handle_search(
             // Skip violation counting for alternative-listing pages: their mention of
             // excluded terms is referential, not topical. The soft filter would otherwise
             // drop them before the alt-aware hard filter can preserve them.
-            let violations = if alt_score > 0.2 {
+            let violations = if alt_score > 0.3 {
                 0
             } else {
                 let text = format!("{} {} {}", r.title.to_lowercase(), r.url.to_lowercase(), r.content.chars().take(300).collect::<String>());
@@ -15708,7 +15608,7 @@ async fn handle_search(
             // ("a bare word like vim/django is NOT structural ... never hard-drop").
             for r in web_results.iter() {
                 let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-                if alt_score <= 0.2 {
+                if alt_score <= 0.3 {
                     let text = format!("{} {} {}", r.title, r.url, r.content.chars().take(300).collect::<String>());
                     let text_lower = text.to_lowercase();
                     let _matched = negative_norm.iter().any(|neg| {
@@ -16136,100 +16036,6 @@ let mut results = match tokio::task::spawn_blocking(move || {
         }
     };
 
-    // IFIX-A: Video dominance fix for thin out-of-vertical queries
-    // When upstream returns <3 non-video results for text queries, the P8 video
-    // cap (0.04) isn't enough because there's nothing else to replace them with.
-    // Detect via source types (invidious/video) and URL host class — no per-query
-    // literals. Two remediations:
-    //   (a) non-video < 3: crush video scores ×0.01 so any non-video outranks them
-    //   (b) non-video == 0: re-query SearXNG with categories=general to find
-    //       non-video results that the mixed-category fan-out missed
-    {
-        let non_video_top10 = results.iter()
-            .take(10)
-            .filter(|r| {
-                !r.sources.iter().any(|s| s == "invidious" || s == "video")
-                    && !is_url_video_host(&r.url)
-            })
-            .count();
-
-        if non_video_top10 < 3 && non_video_top10 > 0 && !has_video_intent(&q_trimmed) {
-            for r in results.iter_mut() {
-                let is_video = r.sources.iter().any(|s| s == "invidious" || s == "video")
-                    || is_url_video_host(&r.url);
-                if is_video {
-                    r.score *= 0.01;
-                }
-            }
-            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-            tracing::info!("IFIX-A: thin result set (non_video={}) — applied ×0.01 video crush for '{}'", non_video_top10, q_trimmed);
-        }
-
-        if non_video_top10 == 0 && !has_video_intent(&q_trimmed) {
-            let general_url = searxng_url_with_categories(
-                "http://127.0.0.1:8080",
-                &q_trimmed,
-                "general",
-                geo_location.as_ref(),
-                lang,
-            );
-
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                client.get(&general_url).send()
-            ).await {
-                Ok(Ok(resp)) => {
-                    if let Some(bytes) = read_body_bounded(resp).await {
-                        let raw = String::from_utf8_lossy(&bytes).into_owned();
-                        let sanitized = sanitize_json_text(&raw);
-                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&sanitized) {
-                            if let Some(results_arr) = data.get("results").and_then(|r| r.as_array()) {
-                                let mut added = 0;
-                                for r in results_arr {
-                                    let url = r.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
-                                    if is_url_video_host(&url) {
-                                        continue;
-                                    }
-                                    let title = r.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
-                                    let content = r.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
-                                    let score = r.get("score").and_then(|s| s.as_f64()).unwrap_or(0.5) as f32;
-                                    results.push(MergedResult {
-                                        url,
-                                        title,
-                                        content,
-                                        score,
-                                        authority: 0.5,
-                                        sources: vec!["web".to_string()],
-                                        is_local: false,
-                                        published_date: r.get("publishedDate").and_then(|d| d.as_str()).map(|s| s.to_string()),
-                                        price: None,
-                                        currency: None,
-                                        quality: 0.5,
-                                        post_cal_cap: None,
-                                        engine_trust_mult: 1.0,
-                                        commerce: None,
-                                        commerce_provenance: None,
-                                    });
-                                    added += 1;
-                                }
-                                if added > 0 {
-                                    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-                                    tracing::info!("IFIX-A: re-query added {} non-video results for '{}'", added, q_trimmed);
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("IFIX-A: re-query request failed for '{}': {:?}", q_trimmed, e);
-                }
-                Err(_) => {
-                    tracing::warn!("IFIX-A: re-query timed out for '{}'", q_trimmed);
-                }
-            }
-        }
-    }
-
     // 8b. Post-merge hard negative filter: apply negative constraints to ALL results
     // (local + web). The pre-merge filter only catches web results; local index
     // results that match negative terms must also be removed here.
@@ -16330,7 +16136,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             // Use Instead of Google" for "search engine alternative to google").
             //
             // CRITICAL FIX (round 2026-08-15T0830Z): the old gate exempted anything
-            // with alt_score > 0.2. But is_alternative_listing_page() also assigns a
+            // with alt_score > 0.3. But is_alternative_listing_page() also assigns a
             // WEAK alt signal (~0.42) to generic "best/top/review" listicle titles
             // — including a brand's OWN catalog page like "Dell Laptop Computers -
             // Best Buy" or "Best Dell Laptops". Those are NOT comparison/alternative
@@ -16477,7 +16283,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             if contrastive {
                 // Entity-specific alt pages (mention excluded term AND are alt listings)
                 // are the answer — boost them, not the generic listicles.
-                if has_neg_in_title && alt_score > 0.2 {
+                if has_neg_in_title && alt_score > 0.3 {
                     r.score += 0.03;
                 }
             } else if !has_neg_in_title {
@@ -18566,7 +18372,7 @@ mod constraint_fix_tests {
     fn not_operator_keeps_alt_listing_page() {
         // Alt-listing pages that merely *mention* the excluded term in a
         // referential/comparison context must NOT be hard-dropped (consistent
-        // with every other negative hard-drop gate's alt_score>0.2 exemption).
+        // with every other negative hard-drop gate's alt_score>0.3 exemption).
         let mut c = cst();
         c.hard_exclusions = vec!["flask".to_string()];
         let kept = should_filter_by_constraints(
@@ -20128,109 +19934,6 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(o.source.as_deref(), None);
     }
 
-    // ── List price (original/sale price) extraction ──────────────────
-    // The list_price field captures the original/undiscounted price when the
-    // page exposes it (JSON-LD `listPrice`, `product:list_price:amount`,
-    // `itemprop="listprice"`, `property="listPrice"`). `price` holds the
-    // current/offer price; list_price is null when not exposed.
-
-    const HTML_JSONLD_LIST_PRICE: &str = r#"<!doctype html><html><head>
-<title>JSON-LD List Price</title>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Widget Pro",
-  "offers": {
-    "@type": "Offer",
-    "price": "79.99",
-    "priceCurrency": "USD",
-    "listPrice": "99.99"
-  }
-}
-</script></head><body></body></html>"#;
-
-    #[test]
-    fn jsonld_list_price_is_extracted() {
-        let o = extract_commerce_offer(HTML_JSONLD_LIST_PRICE, "https://jsonld.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(79.99));
-        assert_eq!(d.list_price, Some(99.99));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-    }
-
-    const HTML_OG_LIST_PRICE: &str = r#"<!doctype html><html><head>
-<title>OG List Price</title>
-<meta property="product:price:amount" content="79.99">
-<meta property="product:price:currency" content="USD">
-<meta property="product:list_price:amount" content="99.99">
-</head><body></body></html>"#;
-
-    #[test]
-    fn og_list_price_is_extracted() {
-        let o = extract_commerce_offer(HTML_OG_LIST_PRICE, "https://og.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(79.99));
-        assert_eq!(d.list_price, Some(99.99));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(o.source.as_deref(), Some("og"));
-    }
-
-    const HTML_MICRODATA_LIST_PRICE: &str = r#"<!doctype html><html><head>
-<title>Microdata List Price</title>
-</head><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <span itemprop="name">MD Sale Product</span>
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price" content="49.99">49.99</span>
-    <span itemprop="priceCurrency" content="EUR">EUR</span>
-    <span itemprop="listprice" content="79.99">79.99</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn microdata_list_price_is_extracted() {
-        let o = extract_commerce_offer(HTML_MICRODATA_LIST_PRICE, "https://md.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(49.99));
-        assert_eq!(d.list_price, Some(79.99));
-        assert_eq!(d.currency.as_deref(), Some("EUR"));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    const HTML_RDFa_LIST_PRICE: &str = r#"<!doctype html><html><head>
-<title>RDFa List Price</title>
-</head><body>
-<div vocab="https://schema.org/" typeof="Product">
-  <span property="name">RDFa Sale Product</span>
-  <div property="offers" typeof="Offer">
-    <span property="price" content="39.99">39.99</span>
-    <span property="priceCurrency" content="GBP">GBP</span>
-    <span property="listPrice" content="59.99">59.99</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn rdfa_list_price_is_extracted() {
-        let o = extract_commerce_offer(HTML_RDFa_LIST_PRICE, "https://rdfa.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(39.99));
-        assert_eq!(d.list_price, Some(59.99));
-        assert_eq!(d.currency.as_deref(), Some("GBP"));
-        assert_eq!(o.source.as_deref(), Some("rdfa"));
-    }
-
-    #[test]
-    fn list_price_alone_is_valid_commerce_data() {
-        // A page exposing only list_price (no current price) still returns
-        // a non-null OfferFacts — the original price alone is useful signal.
-        let o = extract_commerce_offer(HTML_RDFa_LIST_PRICE, "https://rdfa.example.com/p");
-        assert!(o.data.is_some());
-    }
-
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
     // Honest, data-driven affiliate decoration. These tests lock the contract:
     //  * two template kinds render correctly with correct URL-encoding
@@ -20416,66 +20119,5 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // valid "off" setting — proves the value is honored as a cap.
         let cfg = CommerceConfig { mainpath_top_n: 0 };
         assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
-    }
-
-    // ─── Transactional keyword whole-word matching ──────────────────────
-    // P4 fix: Override 6 used `contains("price ")` which missed end-of-query
-    // ("iphone 16 pro max price") and bare `contains("shop")` false-fired on
-    // "shopping". Whole-word matching via q_has_word fixes both.
-
-    #[test]
-    fn transactional_keyword_price_at_end_of_query() {
-        // The exact defect: "iphone 16 pro max price" — "price" has no
-        // trailing space, so `contains("price ")` was false.
-        assert!(has_transactional_keyword("iphone 16 pro max price"));
-        assert!(has_transactional_keyword("macbook pro m3 price"));
-    }
-
-    #[test]
-    fn transactional_keyword_buy() {
-        assert!(has_transactional_keyword("buy laptop"));
-        assert!(has_transactional_keyword("where to buy iphone"));
-    }
-
-    #[test]
-    fn transactional_keyword_under_as_budget() {
-        assert!(has_transactional_keyword("laptop under 60000"));
-        assert!(has_transactional_keyword("smartwatch under 5000"));
-    }
-
-    #[test]
-    fn transactional_keyword_discount_coupon() {
-        assert!(has_transactional_keyword("discount code"));
-        assert!(has_transactional_keyword("coupon for shoes"));
-    }
-
-    #[test]
-    fn transactional_keyword_shop_store_pricing_cheap() {
-        assert!(has_transactional_keyword("shop online"));
-        assert!(has_transactional_keyword("store near me"));
-        assert!(has_transactional_keyword("pricing for aws"));
-        assert!(has_transactional_keyword("cheap flights"));
-    }
-
-    #[test]
-    fn transactional_keyword_rejects_substring_false_positives() {
-        // "priceless" contains "price" as substring but is NOT a purchase query
-        assert!(!has_transactional_keyword("priceless art"));
-        // "shopping" contains "shop" but is NOT a purchase query
-        assert!(!has_transactional_keyword("shopping mall"));
-        // "thunder" contains "under" but is NOT a budget query
-        assert!(!has_transactional_keyword("thunder storm"));
-        // "storefront" contains "store" but is NOT a purchase query
-        assert!(!has_transactional_keyword("storefront design"));
-        // "buyer" contains "buy" but is NOT a purchase query (it's a role)
-        assert!(!has_transactional_keyword("buyer persona"));
-    }
-
-    #[test]
-    fn transactional_keyword_rejects_unrelated_queries() {
-        assert!(!has_transactional_keyword("how to build a rest api"));
-        assert!(!has_transactional_keyword("what is quantum computing"));
-        assert!(!has_transactional_keyword("react vs vue"));
-        assert!(!has_transactional_keyword("best laptop for programming"));
     }
 }
