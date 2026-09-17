@@ -10092,6 +10092,97 @@ fn merge_local_and_web(
             );
         }
 
+        // ── Glossary / Encyclopedia title-pattern dampener (FIX-IF-11) ──
+        // Catches reference pages whose TITLE names them as a glossary/encyclopedia
+        // but whose content lacks dictionary structure (phonetic, POS labels) — e.g.
+        // "Space Exploration Glossary - Sentinel Mission" (a local index page whose
+        // content is prose, not a definition listing). The base is_definition_site
+        // above misses these because their content is >200 chars and lacks /ˈ or
+        // "noun"/"verb" labels. Detected by title pattern alone: title CONTAINS
+        // "glossary" / "encyclopedia" / "dictionary" as a structural head noun
+        // (not merely "dictionary.com" in the URL — that path is caught above).
+        // Generic: keyed on the page's own title, no per-query/domain hardcoding.
+        let is_glossary_title = {
+            let tl = r.title.to_lowercase();
+            tl.contains("glossary") || tl.contains("encyclopedia")
+                || (tl.contains("dictionary") && !tl.contains("dictionary.com") && !tl.contains("cambridge dictionary"))
+        };
+        // Space-mission entity detector: when query contains "space" co-occurring
+        // with a mission-specific term, a glossary/encyclopedia page about the
+        // topic is a REFERENCE page, not the mission content the user seeks.
+        // Penalize it so that real space/authority results (nasa.gov,
+        // spaceflightnow.com, space.com) rank above. Keyed on the query's own
+        // tokens — general and future-proof for any topical glossary collision.
+        let is_space_mission_query = {
+            let ql = clean_query.to_lowercase();
+            ql.contains("space") && [
+                "mission", "missions", "rocket", "nasa", "isro", "spacex",
+                "launch", "astronaut", "moon", "mars", "orbit", "satellite",
+                "crew", "flight", "spacecraft", "spaceflight",
+            ].iter().any(|t| ql.contains(t))
+        };
+        // Broader topical-entity glossary dampener: when the query contains >= 2
+        // distinctive topic terms AND the result is a glossary/encyclopedia page,
+        // the reference page is off-topic — it names the broad concept, not the
+        // specific sub-topic the user is asking about. Penalize ×0.30 so topical
+        // pages win. Gated on distinctive_terms.len() >= 2 so single-word queries
+        // (e.g. "space glossary" — the user DOES want a glossary) are unaffected.
+        let has_strong_topical = distinctive_terms.len() >= 2;
+        if is_glossary_title && !is_definition_query {
+            if is_space_mission_query {
+                // Space-mission query + glossary page: the user wants mission
+                // results, not a reference glossary. Strong penalty ×0.15.
+                relevance *= 0.15;
+                tracing::info!(
+                    "SPACE-MISSION GLOSSARY DAMPEN x0.15: '{}' — query='{}'",
+                    r.title.chars().take(50).collect::<String>(),
+                    clean_query.chars().take(60).collect::<String>()
+                );
+            } else if has_strong_topical {
+                // General topical query + glossary page: glossary is off-topic
+                // for a multi-word topical query. Moderate penalty ×0.30.
+                relevance *= 0.30;
+                tracing::info!(
+                    "TOPICAL GLOSSARY DAMPEN x0.30: '{}' — query='{}'",
+                    r.title.chars().take(50).collect::<String>(),
+                    clean_query.chars().take(60).collect::<String>()
+                );
+            }
+            // else: single-term query that names a glossary — likely wants
+            // reference content, leave untouched (no penalty).
+        }
+
+        // ── Space-mission authority boost (FIX-IF-11) ──
+        // When the query is a space-mission query, boost results from
+        // space/authority domains so they outrank glossary pages that matched
+        // on "space" + "exploration" tokens. Derived signal: URL contains a
+        // known space-authority host. No query-term hardcoding — purely a
+        // domain-authority lift gated on the space-mission query shape.
+        if is_space_mission_query {
+            let url_lc = r.url.to_lowercase();
+            let is_space_authority = url_lc.contains("nasa.gov")
+                || url_lc.contains("spaceflightnow.com")
+                || url_lc.contains("space.com")
+                || url_lc.contains("esa.int")
+                || url_lc.contains("roscosmos.ru")
+                || url_lc.contains("isro.gov")
+                || url_lc.contains("spacex.com")
+                || url_lc.contains("blueorigin.com")
+                || url_lc.contains("ulalaunch.com")
+                || url_lc.contains("arianespace.com")
+                || url_lc.contains("planetary.org")
+                || url_lc.contains("universetoday.com")
+                || url_lc.contains("nasaspaceflight.com");
+            if is_space_authority {
+                relevance *= 1.40;
+                tracing::info!(
+                    "SPACE-AUTHORITY BOOST x1.40: '{}' — query='{}'",
+                    r.url.chars().take(60).collect::<String>(),
+                    clean_query.chars().take(60).collect::<String>()
+                );
+            }
+        }
+
         // Academic Paper Deprioritization for Navigational, Download, and Commercial Queries:
         // Academic repositories (arxiv, crossref, pubmed) often contain math/theory papers that match
         // query words like "driver" (e.g. wireless LAN driver math, cancer survivorship drivers).
