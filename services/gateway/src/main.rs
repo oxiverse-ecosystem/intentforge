@@ -7602,6 +7602,19 @@ fn preprocess_searxng_query(query: &str) -> String {
     }
 
     let neg_terms = extract_query_negative_terms(q);
+    // Expand multi-word neg terms into individual words for stripping.
+    // "drilling holes" → strip both "drilling" and "holes" from the upstream query.
+    // Without this, the word-by-word loop never matches multi-word neg terms,
+    // so "holes" stays in the query and Bing returns "Holes" movie results.
+    let mut neg_term_words: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for neg in &neg_terms {
+        for word in neg.split_whitespace() {
+            let clean: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
+            if !clean.is_empty() {
+                neg_term_words.insert(clean.to_lowercase());
+            }
+        }
+    }
     let neg_markers = ["not", "no", "without", "except", "excluding", "minus", "other", "than"];
     let neg_stopwords = [
         "from", "a", "an", "the", "of", "to", "in", "on", "at", "for", "with", "by",
@@ -7655,6 +7668,7 @@ fn preprocess_searxng_query(query: &str) -> String {
         let clean_token: String = wl.chars().filter(|c| c.is_alphanumeric()).collect();
         if neg_markers.contains(&clean_token.as_str())
             || neg_terms.contains(&clean_token)
+            || neg_term_words.contains(&clean_token)
             || (!neg_terms.is_empty() && neg_stopwords.contains(&clean_token.as_str()))
         {
             continue;
@@ -17864,45 +17878,45 @@ mod constraint_fix_tests {
             &c,
         );
         assert!(!fresh, "result dated 2025 should pass after:2024");
-            }
+    }
 
-            #[test]
-            fn fresh_small_set_date_window_is_scoring_not_filter() {
-                // FRESH-SMALL-SET FAIL-OPEN: when intent is fresh and the
-                // pre-merge set is small (< 5), the date window must NOT
-                // hard-filter results. The handle_search level clears the
-                // date window when pre_filter_count < 5, so dateless
-                // results are kept and recency stays a scoring-only boost.
-                // This test verifies the should_filter_by_constraints
-                // guarantee: dateless results pass through the date filter
-                // (the structural foundation on which the FRESH-SMALL-SET
-                // rule depends).
-                let mut c = Constraints::default();
-                c.after_date = Some("2025-09-01".to_string());
-                c.before_date = Some("2025-09-08".to_string());
-                // A result with no publish date — should NOT be filtered.
-                // (should_filter_by_constraints keeps dateless results by
-                // design — the fail-open for date-less results.)
-                let nodate = should_filter_by_constraints(
-                    "Chandrayaan 4 update",
-                    "ISRO prepares for Chandrayaan-4 lunar sample-return mission.",
-                    "https://example.com/chandrayaan4",
-                    None, // no published date
-                    &c,
-                );
-                assert!(!nodate, "dateless result must NOT be hard-filtered by date bounds");
-            }
+    #[test]
+    fn fresh_small_set_date_window_is_scoring_not_filter() {
+        // FRESH-SMALL-SET FAIL-OPEN: when intent is fresh and the
+        // pre-merge set is small (< 5), the date window must NOT
+        // hard-filter results. The handle_search level clears the
+        // date window when pre_filter_count < 5, so dateless
+        // results are kept and recency stays a scoring-only boost.
+        // This test verifies the should_filter_by_constraints
+        // guarantee: dateless results pass through the date filter
+        // (the structural foundation on which the FRESH-SMALL-SET
+        // rule depends).
+        let mut c = Constraints::default();
+        c.after_date = Some("2025-09-01".to_string());
+        c.before_date = Some("2025-09-08".to_string());
+        // A result with no publish date — should NOT be filtered.
+        // (should_filter_by_constraints keeps dateless results by
+        // design — the fail-open for date-less results.)
+        let nodate = should_filter_by_constraints(
+            "Chandrayaan 4 update",
+            "ISRO prepares for Chandrayaan-4 lunar sample-return mission.",
+            "https://example.com/chandrayaan4",
+            None, // no published date
+            &c,
+        );
+        assert!(!nodate, "dateless result must NOT be hard-filtered by date bounds");
+    }
 
-                #[test]
-                fn price_extraction_broadened() {
-                    assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
-                    assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
-                    assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
-                    assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
-                    assert_eq!(extract_price_from_text("no monetary value here"), None);
-                    assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
-                    assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
-                }
+    #[test]
+    fn price_extraction_broadened() {
+        assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
+        assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
+        assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
+        assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
+        assert_eq!(extract_price_from_text("no monetary value here"), None);
+        assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
+        assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
+    }
 
     #[test]
     fn rs_signal_no_false_positives() {
