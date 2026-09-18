@@ -8940,6 +8940,10 @@ fn merge_local_and_web(
         .collect();
     let query_entity_count = comparison_entities.len();
 
+    // ── Comparison-entity co-occurrence extraction (FIX-IF-13) ──
+    // Split the comparison query into two entity groups for co-occurrence scoring.
+    let comparison_entity_groups = extract_comparison_entity_groups(query);
+
     let core_topic_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
             let lower = w.to_lowercase();
@@ -10199,6 +10203,34 @@ fn merge_local_and_web(
             let frac = named / query_entity_count as f32;
             if frac >= 0.5 {
                 relevance *= 1.12;
+            }
+        }
+        // FIX-IF-13: comparison-entity co-occurrence boost using extracted entity groups.
+        // When the query is "X vs Y" / "X compared to Y" etc., we extracted two entity groups.
+        // Results mentioning BOTH groups are genuinely comparative — boost them strongly.
+        // Results mentioning only ONE group are single-topic — demote them (unless they're
+        // explicitly comparison/listicle pages, which are already covered above).
+        if let Some((ref group_a, ref group_b)) = comparison_entity_groups {
+            let mentions_a = group_a.iter().any(|t| {
+                title_lower.contains(t.as_str()) || content_lower.contains(t.as_str())
+            });
+            let mentions_b = group_b.iter().any(|t| {
+                title_lower.contains(t.as_str()) || content_lower.contains(t.as_str())
+            });
+            if mentions_a && mentions_b {
+                // Both entities present — strong co-occurrence boost
+                relevance *= 1.5;
+            } else if mentions_a != mentions_b {
+                // Only one entity present — demote unless it's a comparison page
+                let is_comparison_page = title_lower.contains(" vs ")
+                    || title_lower.contains(" versus ")
+                    || title_lower.contains("difference between")
+                    || title_lower.contains(" compared ")
+                    || title_lower.contains("comparison")
+                    || title_lower.contains("alternative");
+                if !is_comparison_page {
+                    relevance *= 0.6;
+                }
             }
         }
         // Geo-relevance boost: boost results that mention the user's country, region, or city.
