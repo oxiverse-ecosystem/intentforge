@@ -8425,6 +8425,89 @@ fn has_video_intent(query: &str) -> bool {
     false
 }
 
+/// Extract two entity groups from a comparison query by splitting on
+/// comparison connectives ("vs", "versus", "compared to", "compare X and Y",
+/// "difference between X and Y"). Returns None when the query doesn't match
+/// a recognizable comparison pattern.
+fn extract_comparison_entity_groups(query: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let lower = query.to_lowercase();
+
+    // Pattern 1: "X vs Y" / "X versus Y"
+    for delim in &[" vs ", " versus "] {
+        if let Some(pos) = lower.find(delim) {
+            let left = lower[..pos].trim();
+            let right = lower[pos + delim.len()..].trim();
+            if !left.is_empty() && !right.is_empty() {
+                return Some((
+                    tokenize_entity_group(left),
+                    tokenize_entity_group(right),
+                ));
+            }
+        }
+    }
+
+    // Pattern 2: "compare X and Y" / "compare X to Y" / "compare X with Y"
+    if let Some(rest) = lower.strip_prefix("compare ") {
+        for delim in &[" and ", " to ", " with "] {
+            if let Some(pos) = rest.find(delim) {
+                let left = rest[..pos].trim();
+                let right = rest[pos + delim.len()..].trim();
+                if !left.is_empty() && !right.is_empty() {
+                    return Some((
+                        tokenize_entity_group(left),
+                        tokenize_entity_group(right),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Pattern 3: "difference between X and Y"
+    if let Some(rest) = lower.strip_prefix("difference between ") {
+        if let Some(pos) = rest.find(" and ") {
+            let left = rest[..pos].trim();
+            let right = rest[pos + 5..].trim();
+            if !left.is_empty() && !right.is_empty() {
+                return Some((
+                    tokenize_entity_group(left),
+                    tokenize_entity_group(right),
+                ));
+            }
+        }
+    }
+
+    // Pattern 4: "X compared to Y" / "X compared with Y"
+    for delim in &[" compared to ", " compared with "] {
+        if let Some(pos) = lower.find(delim) {
+            let left = lower[..pos].trim();
+            let right = lower[pos + delim.len()..].trim();
+            if !left.is_empty() && !right.is_empty() {
+                return Some((
+                    tokenize_entity_group(left),
+                    tokenize_entity_group(right),
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+/// Tokenize an entity group into content words (excluding pure stop words
+/// and comparison connectives).
+fn tokenize_entity_group(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|s| s.to_lowercase())
+        .filter(|s| {
+            !s.is_empty()
+                && *s != "the" && *s != "a" && *s != "an"
+                && *s != "and" && *s != "or" && *s != "to"
+                && *s != "of" && *s != "in" && *s != "on"
+                && *s != "for" && *s != "with"
+        })
+        .collect()
+}
+
 fn merge_local_and_web(
     local: Vec<IndexerResult>,
     web: Vec<SearxResult>,
