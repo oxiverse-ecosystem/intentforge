@@ -8429,8 +8429,54 @@ fn has_video_intent(query: &str) -> bool {
 /// comparison connectives ("vs", "versus", "compared to", "compare X and Y",
 /// "difference between X and Y"). Returns None when the query doesn't match
 /// a recognizable comparison pattern.
+///
+/// Each group is filtered to only distinctive content words — generic attribute
+/// terms ("top", "speed", "comparison") and structure words are removed so the
+/// co-occurrence check doesn't false-match on car pages that happen to mention
+/// "top speed". Terms shared between both groups (e.g. "jaguar" in "jaguar the
+/// car vs the animal") are also removed — they name the shared entity, not a
+/// distinguishing feature.
 fn extract_comparison_entity_groups(query: &str) -> Option<(Vec<String>, Vec<String>)> {
     let lower = query.to_lowercase();
+
+    // Helper: tokenize a group, keeping only distinctive content words.
+    let tokenize_distinctive = |text: &str| -> Vec<String> {
+        text.split_whitespace()
+            .map(|s| s.to_lowercase())
+            .filter(|s| {
+                !s.is_empty()
+                    && *s != "the" && *s != "a" && *s != "an"
+                    && *s != "and" && *s != "or" && *s != "to"
+                    && *s != "of" && *s != "in" && *s != "on"
+                    && *s != "for" && *s != "with"
+                    && *s != "vs" && *s != "versus" && *s != "compare"
+                    && *s != "compared" && *s != "comparison" && *s != "difference"
+                    && *s != "between" && *s != "top" && *s != "best"
+                    && *s != "speed" && *s != "specs" && *s != "spec"
+                    && *s != "specification" && *s != "features" && *s != "feature"
+                    && *s != "performance" && *s != "review" && *s != "reviews"
+                    && *s != "price" && *s != "cost" && *s != "mileage"
+                    && *s != "range" && *s != "power" && *s != "torque"
+                    && *s != "engine" && *s != "fuel" && *s != "petrol"
+                    && *s != "diesel" && *s != "electric" && *s != "automatic"
+                    && *s != "manual" && *s != "variant" && *s != "model"
+                    && *s != "models" && *s != "year" && *s != "launch"
+                    && *s != "boot" && *s != "space" && *s != "efficiency"
+                    && *s != "kmpl"
+            })
+            .collect()
+    };
+
+    // Helper: remove terms that appear in both groups (shared entity names).
+    let remove_shared = |mut a: Vec<String>, mut b: Vec<String>| -> (Vec<String>, Vec<String>) {
+        let shared: std::collections::HashSet<String> = a.iter().cloned().collect::<std::collections::HashSet<_>>()
+            .intersection(&b.iter().cloned().collect::<std::collections::HashSet<_>>())
+            .cloned()
+            .collect();
+        a.retain(|t| !shared.contains(t));
+        b.retain(|t| !shared.contains(t));
+        (a, b)
+    };
 
     // Pattern 1: "X vs Y" / "X versus Y"
     for delim in &[" vs ", " versus "] {
@@ -8438,10 +8484,10 @@ fn extract_comparison_entity_groups(query: &str) -> Option<(Vec<String>, Vec<Str
             let left = lower[..pos].trim();
             let right = lower[pos + delim.len()..].trim();
             if !left.is_empty() && !right.is_empty() {
-                return Some((
-                    tokenize_entity_group(left),
-                    tokenize_entity_group(right),
-                ));
+                let (a, b) = remove_shared(tokenize_distinctive(left), tokenize_distinctive(right));
+                if !a.is_empty() && !b.is_empty() {
+                    return Some((a, b));
+                }
             }
         }
     }
@@ -8453,10 +8499,10 @@ fn extract_comparison_entity_groups(query: &str) -> Option<(Vec<String>, Vec<Str
                 let left = rest[..pos].trim();
                 let right = rest[pos + delim.len()..].trim();
                 if !left.is_empty() && !right.is_empty() {
-                    return Some((
-                        tokenize_entity_group(left),
-                        tokenize_entity_group(right),
-                    ));
+                    let (a, b) = remove_shared(tokenize_distinctive(left), tokenize_distinctive(right));
+                    if !a.is_empty() && !b.is_empty() {
+                        return Some((a, b));
+                    }
                 }
             }
         }
@@ -8468,10 +8514,10 @@ fn extract_comparison_entity_groups(query: &str) -> Option<(Vec<String>, Vec<Str
             let left = rest[..pos].trim();
             let right = rest[pos + 5..].trim();
             if !left.is_empty() && !right.is_empty() {
-                return Some((
-                    tokenize_entity_group(left),
-                    tokenize_entity_group(right),
-                ));
+                let (a, b) = remove_shared(tokenize_distinctive(left), tokenize_distinctive(right));
+                if !a.is_empty() && !b.is_empty() {
+                    return Some((a, b));
+                }
             }
         }
     }
@@ -8482,30 +8528,15 @@ fn extract_comparison_entity_groups(query: &str) -> Option<(Vec<String>, Vec<Str
             let left = lower[..pos].trim();
             let right = lower[pos + delim.len()..].trim();
             if !left.is_empty() && !right.is_empty() {
-                return Some((
-                    tokenize_entity_group(left),
-                    tokenize_entity_group(right),
-                ));
+                let (a, b) = remove_shared(tokenize_distinctive(left), tokenize_distinctive(right));
+                if !a.is_empty() && !b.is_empty() {
+                    return Some((a, b));
+                }
             }
         }
     }
 
     None
-}
-
-/// Tokenize an entity group into content words (excluding pure stop words
-/// and comparison connectives).
-fn tokenize_entity_group(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .map(|s| s.to_lowercase())
-        .filter(|s| {
-            !s.is_empty()
-                && *s != "the" && *s != "a" && *s != "an"
-                && *s != "and" && *s != "or" && *s != "to"
-                && *s != "of" && *s != "in" && *s != "on"
-                && *s != "for" && *s != "with"
-        })
-        .collect()
 }
 
 fn merge_local_and_web(
