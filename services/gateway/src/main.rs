@@ -1031,11 +1031,13 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
         if version_pinned.is_match(q_lower) {
             return None;
         }
-        // Only apply the hard window when news-term co-occurrence or news domain.
-        if has_news_cooccurrence || is_news_domain {
-            return Some((format_ymd(add_days(today, -7)), today_s));
+        // "latest" is ambiguous: it can mean "most recent" (news) or "most up to
+        // date" (informational topic). Gate it on news-term co-occurrence.
+        // "recent" is unambiguous — always implies recency.
+        if q_has_word(q_lower, "latest") && !has_news_cooccurrence && !is_news_domain {
+            return None;
         }
-        return None;
+        return Some((format_ymd(add_days(today, -7)), today_s));
     }
     if q_has_word(q_lower, "fresh") && has_news_term {
         return Some((format_ymd(add_days(today, -7)), today_s));
