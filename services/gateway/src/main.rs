@@ -16395,6 +16395,17 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 r.score = cap;
             }
         }
+        // FINAL VIDEO CAP (P8, belt-and-suspenders): the post_cal_cap field may be lost
+        // if results are cloned/rebuilt during post-processing. This direct check ensures
+        // videos never outrank text results for non-video queries, regardless of what
+        // happened to the cap field. Signal-driven: checks source tags + URL host class.
+        if !has_video_intent(query) {
+            let is_video = r.sources.iter().any(|s| s == "invidious" || s == "video")
+                || is_url_video_host(&r.url);
+            if is_video && r.score > 0.04 {
+                r.score = 0.04;
+            }
+        }
         r.title = sanitize_text_content(&r.title);
         r.content = clean::clean_result_content(&sanitize_text_content(&r.content), &r.title);
     }
