@@ -1001,6 +1001,22 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
         "developments", "advances", "this week", "this month", "this year", "published",
     ];
     let has_news_term = news_terms.iter().any(|t| q_has_word(q_lower, t) || q_lower.contains(t));
+    // FIX-IF-16 (2026-09-19): Gate the recency window on news-term co-occurrence.
+    // "latest developments in lab grown meat" should NOT get a 7-day window —
+    // it's an informational topic, not a news query. Only apply the hard window
+    // when a news noun co-occurs with the temporal marker OR the query is about
+    // a known news domain.
+    let news_cooccurrence_terms = [
+        "news", "today", "update", "report", "study", "research",
+        "headline", "headlines", "breaking",
+    ];
+    let has_news_cooccurrence = news_cooccurrence_terms.iter().any(|t| q_lower.contains(t));
+    let news_domains = [
+        "politics", "political", "technology", "tech", "science",
+        "health", "world", "business", "economy", "economics",
+        "environment", "climate", "education", "sports", "entertainment",
+    ];
+    let is_news_domain = news_domains.iter().any(|d| q_lower.contains(d));
     if q_has_word(q_lower, "recent") || q_has_word(q_lower, "latest") {
         // "recent"/"latest" are almost always temporal on their own ("latest news",
         // "recent breakthroughs", "latest movies"). Keep them as recency signals.
@@ -1015,7 +1031,11 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
         if version_pinned.is_match(q_lower) {
             return None;
         }
-        return Some((format_ymd(add_days(today, -7)), today_s));
+        // Only apply the hard window when news-term co-occurrence or news domain.
+        if has_news_cooccurrence || is_news_domain {
+            return Some((format_ymd(add_days(today, -7)), today_s));
+        }
+        return None;
     }
     if q_has_word(q_lower, "fresh") && has_news_term {
         return Some((format_ymd(add_days(today, -7)), today_s));
