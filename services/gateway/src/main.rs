@@ -8397,6 +8397,74 @@ fn is_weak_anchor_word(w: &str) -> bool {
 
 /// Detects video intent in a query. Uses token-aware detection for "watch" to avoid
 /// false positives on queries like "watch battery" or "watch repair" which are about
+/// Detect product entities in a query using regex patterns.
+/// Returns a vector of detected entity strings (model numbers, product names).
+/// No hardcoded product list — purely pattern-based.
+/// Examples: "macbook air m2", "iphone 16 pro max", "sony wh-1000xm5"
+fn detect_product_entities(query: &str) -> Vec<String> {
+    let q_lower = query.to_lowercase();
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b([a-z]+(?:\s+[a-z]+)*\s+[a-z]?\d[\w\-]*(?:\s*(?:pro|max|plus|ultra|air|lite|se))?)\b").unwrap()
+    });
+    let mut entities: Vec<String> = Vec::new();
+    for cap in re.captures_iter(&q_lower) {
+        if let Some(m) = cap.get(1) {
+            let e = m.as_str().trim().to_string();
+            if e.len() >= 4 && !entities.contains(&e) {
+                entities.push(e);
+            }
+        }
+    }
+    // Deduplicate substrings: if "macbook air m2" and "macbook air" both match, keep only the longer
+    let mut deduped: Vec<String> = Vec::new();
+    for e in &entities {
+        let is_substring = entities.iter().any(|other| other != e && other.contains(e.as_str()));
+        if !is_substring {
+            deduped.push(e.clone());
+        }
+    }
+    deduped
+}
+
+/// Score how well a result matches the detected product entities.
+/// Returns a multiplier: >1.0 for strong entity matches, <1.0 for mismatches.
+fn entity_match_score(title: &str, content: &str, url: &str, entities: &[String]) -> f32 {
+    if entities.is_empty() {
+        return 1.0;
+    }
+    let t = title.to_lowercase();
+    let c = content.to_lowercase();
+    let u = url.to_lowercase();
+    let mut total_boost = 1.0f32;
+    for entity in entities {
+        let el = entity.to_lowercase();
+        let in_title = t.contains(&el);
+        let in_content = c.contains(&el);
+        let in_url = u.contains(&el);
+        if in_title {
+            total_boost *= 1.30; // strong title match
+        } else if in_content {
+            total_boost *= 1.15; // content match
+        } else if in_url {
+            total_boost *= 1.10; // URL match
+        } else {
+            // Check if at least one word from the entity appears
+            let words: Vec<&str> = el.split_whitespace().collect();
+            let matched_words: Vec<&&str> = words.iter().filter(|w| {
+                let wl = w.to_lowercase();
+                t.contains(&wl) || c.contains(&wl) || u.contains(&wl)
+            }).collect();
+            if matched_words.is_empty() {
+                total_boost *= 0.50; // entity completely missing → demote
+            } else if matched_words.len() < words.len() {
+                total_boost *= 0.75; // partial entity match
+            }
+        }
+    }
+    total_boost
+}
+
 /// timepieces, not videos. Standalone "watch" does not imply video intent; requires
 /// video-oriented phrases like "watch video" or explicit video keywords.
 fn has_video_intent(query: &str) -> bool {
@@ -8910,6 +8978,11 @@ fn merge_local_and_web(
     // penalize pages that rank purely because they contain the generic word "best".
     let superlative_terms: &[&str] = &["best", "top", "greatest", "cheapest", "finest"];
     let query_has_superlative = q_words.iter().any(|w| superlative_terms.contains(&w.to_lowercase().as_str()));
+
+    // Product entity detection (IF-15 fix): identify model-number patterns in the query
+    // e.g. "macbook air m2", "iphone 16 pro max", "sony wh-1000xm5"
+    // Used below to boost/demote results in the ranking pipeline.
+    let product_entities = detect_product_entities(query);
 
     let mut relevance_vec: Vec<f32> = Vec::with_capacity(merged.len());
 
@@ -10277,7 +10350,16 @@ fn merge_local_and_web(
         };
 
         let p2d_mult = if p2d_offtopic { 0.05 } else { 1.0 };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult;
+        // IF-15: entity-aware ranking signal for transactional queries.
+        // When a product entity is detected (e.g. "macbook air m2"), boost results
+        // that mention the entity and demote those that don't. This prevents
+        // irrelevant recipe/commercial pages from outranking actual product pages.
+        let entity_mult = if !product_entities.is_empty() {
+            entity_match_score(&r.title, &r.content, &r.url, &product_entities)
+        } else {
+            1.0
+        };
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * entity_mult;
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
@@ -10643,6 +10725,33 @@ fn merge_local_and_web(
     calibrate_scores(&mut scores);
     for (i, r) in merged.iter_mut().enumerate() {
         r.score = scores[i];
+    }
+
+    // IF-15: Calibrate guard for product entities.
+    // When a product entity is detected (e.g. "macbook air m2"), check if there's
+    // at least one strong entity match in the top results. If so, demote results
+    // that don't match the entity so they can't be remapped to 1.0 by calibrate_scores.
+    // This prevents irrelevant recipe/commercial pages from outranking product pages.
+    if !product_entities.is_empty() {
+        // Find the best entity match score
+        let best_entity_score = merged.iter()
+            .filter(|r| entity_match_score(&r.title, &r.content, &r.url, &product_entities) > 1.1)
+            .map(|r| r.score)
+            .fold(0.0f32, f32::max);
+        if best_entity_score > 0.0 {
+            for r in merged.iter_mut() {
+                let em = entity_match_score(&r.title, &r.content, &r.url, &product_entities);
+                if em < 0.8 && r.score > best_entity_score * 0.5 {
+                    // Cap entity-mismatched results below the best entity match
+                    r.score = (best_entity_score * 0.45).max(0.03);
+                    tracing::info!(
+                        "ENTITY CALIBRATE CAP: '{}' entity_match={:.2}, capped {:.3} -> {:.3} (best_entity_score={:.3})",
+                        r.title.chars().take(50).collect::<String>(),
+                        em, r.score, best_entity_score * 0.45, best_entity_score
+                    );
+                }
+            }
+        }
     }
 
     // POST-CALIBRATION OFF-TOPIC CAP (this round, D1/D2/D3).
@@ -14173,7 +14282,7 @@ async fn handle_search(
         }
 
         // Override 6: transactional keywords OR an explicit price bound -> transactional
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under ", "deal", "deals", "refurbished", "sale", "offer"];
         let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
