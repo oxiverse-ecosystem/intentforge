@@ -1116,6 +1116,18 @@ pub async fn handle_submit_answers(
     }
 }
 
+/// Pure function to derive goal status from its internal state.
+/// Used by `handle_get_goal` so the status is testable as a unit.
+fn goal_status(roadmap: Option<&Roadmap>, completed_phases: usize, total_phases: usize) -> String {
+    if roadmap.is_none() {
+        "pending_answers".to_string()
+    } else if completed_phases == total_phases && total_phases > 0 {
+        "completed".to_string()
+    } else {
+        "active".to_string()
+    }
+}
+
 /// GET /goals/{goal_id} — get goal status and roadmap
 pub async fn handle_get_goal(
     State(state): State<Arc<crate::AppState>>,
@@ -1124,13 +1136,7 @@ pub async fn handle_get_goal(
     let store = state.goals_state.lock();
     match store.get(&goal_id) {
         Some(s) => {
-            let status = if s.roadmap.is_none() {
-                "pending_answers".to_string()
-            } else if s.completed_phases == s.total_phases && s.total_phases > 0 {
-                "completed".to_string()
-            } else {
-                "active".to_string()
-            };
+            let status = goal_status(s.roadmap.as_ref(), s.completed_phases, s.total_phases);
 
             let mut resp = serde_json::json!({
                 "goal_id": s.goal_id,
@@ -1331,5 +1337,27 @@ mod tests_roadmap {
                 goal
             );
         }
+    }
+
+    // Regression: goal object must expose a `status` field. The goal response
+    // schema (API_REFERENCE.md) requires status ∈ {"pending_answers", "active", "completed"}.
+    #[test]
+    fn goal_status_pending_when_no_roadmap() {
+        assert_eq!(goal_status(None, 0, 0), "pending_answers");
+    }
+
+    #[test]
+    fn goal_status_active_when_phases_incomplete() {
+        let roadmap = generate_roadmap("Learn Rust", &[], &[]);
+        // total_phases > 0, completed_phases == 0 → "active"
+        assert_eq!(goal_status(Some(&roadmap), 0, roadmap.total_phases), "active");
+    }
+
+    #[test]
+    fn goal_status_completed_when_all_phases_done() {
+        let roadmap = generate_roadmap("Learn Rust", &[], &[]);
+        let total = roadmap.total_phases;
+        // completed == total > 0 → "completed"
+        assert_eq!(goal_status(Some(&roadmap), total, total), "completed");
     }
 }
