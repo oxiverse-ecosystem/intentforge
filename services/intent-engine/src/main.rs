@@ -782,8 +782,8 @@ fn extract_constraints(query: &str) -> Constraints {
     // top result (Google was being added as a positive/Reference entity).
     // We extract X, push it to `negative`, and remove any Reference entity /
     // positive constraint that the earlier Reference phase (Phase 1b) created.
-    let alt_neg_markers = [" alternative to ", " alternatives to ", " instead of "];
-    let alt_neg_start_markers = ["alternative to ", "alternatives to ", "instead of "];
+    let alt_neg_markers = [ " alternative to ", " alternatives to ", " instead of ", " instead " ];
+    let alt_neg_start_markers = ["alternative to ", "alternatives to ", "instead of ", "instead "];
 
     let mut alt_terms: Vec<String> = Vec::new();
     for marker in &alt_neg_start_markers {
