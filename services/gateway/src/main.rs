@@ -3391,8 +3391,8 @@ fn has_microdata_product(html: &str) -> bool {
 /// Only fires when the page carries a Product/Offer `itemtype`, so
 /// non-product pages (Article, Event, …) never trigger it.
 ///
-/// Handles both `content` attribute form (<meta itemprop="price" content="9.99">)
-/// and text content form (<span itemprop="brand">Acme</span>).
+/// Handles `content` attribute form, `value` attribute (microdata v2),
+/// and text content form.
 fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
     if !has_microdata_product(html) {
         return None;
@@ -3417,6 +3417,10 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
     static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let src_re = SRC_RE.get_or_init(|| {
         regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static VALUE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let value_re = VALUE_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)value\s*=\s*["']([^"']*)["']"#).unwrap()
     });
 
     let mut o = OfferFacts::default();
@@ -3500,6 +3504,10 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
             .captures(tag)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
+        let value_attr = value_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
         if let Some(p) = prop {
             // For image, prefer href (link itemprop="image" href=...) then
             // content (meta itemprop="image" content=...) then src.
@@ -3508,6 +3516,9 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
                     apply(&p, &v);
                 }
             } else if let Some(v) = content {
+                apply(&p, &v);
+            } else if let Some(v) = value_attr {
+                // Microdata v2: <span itemprop="price" value="29.99">
                 apply(&p, &v);
             } else {
                 // Text content form: extract text after the tag until the next '<'.
@@ -3553,8 +3564,7 @@ fn has_rdfa_product(html: &str) -> bool {
 /// Extract product facts from RDFa (property attribute with `schema:` prefix or full URI).
 /// Only fires on pages that look product-ish.
 ///
-/// Handles both `content` attribute form (`<meta property="price" content="9.99">)
-/// and text content form (`<span property="brand">Acme</span>`).
+/// Handles `content` attribute form, `resource` attribute (for images), and text content form.
 fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
     if !has_rdfa_product(html) {
         return None;
@@ -3579,6 +3589,10 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
     static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let src_re = SRC_RE.get_or_init(|| {
         regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static RESOURCE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let resource_re = RESOURCE_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)resource\s*=\s*["']([^"']*)["']"#).unwrap()
     });
 
     let mut o = OfferFacts::default();
@@ -3668,11 +3682,15 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
             .captures(tag)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
+        let resource = resource_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
         if let Some(p) = prop {
-            // For image, prefer href (link itemprop="image" href=...) then
-            // content (meta itemprop="image" content=...) then src.
+            // For image, prefer href (link property="image" href=...) then
+            // content (meta property="image" content=...) then src, then resource.
             if p == "image" {
-                if let Some(v) = href.or(content).or(src) {
+                if let Some(v) = href.or(content).or(src).or(resource) {
                     apply(&p, &v);
                 }
             } else if let Some(v) = content {
@@ -20231,5 +20249,82 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // valid "off" setting — proves the value is honored as a cap.
         let cfg = CommerceConfig { mainpath_top_n: 0 };
         assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
+    }
+
+    // ── Microdata v2: value attribute ───────────────────────────────────
+    // Microdata spec allows <span itemprop="price" value="29.99"> where the
+    // machine-readable value lives in the `value` attribute, not text content.
+
+    const HTML_MICRODATA_VALUE_ATTR: &str = r#"<!doctype html><html><head>
+<title>Microdata Value Attr</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Value Attr Widget</span>
+  <span itemprop="price" value="39.99">$39.99</span>
+  <span itemprop="priceCurrency" value="USD">USD</span>
+  <span itemprop="availability" value="https://schema.org/InStock">In Stock</span>
+  <span itemprop="brand" value="ValueBrand">ValueBrand</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_value_attribute_is_extracted() {
+        let o = extract_commerce_offer(HTML_MICRODATA_VALUE_ATTR, "https://valmd.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(39.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.merchant.as_deref(), Some("ValueBrand"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    // ── RDFa resource attribute ──────────────────────────────────────────
+    // RDFa allows <img property="image" resource="url"> or
+    // <link property="image" href="url"> — the resource attr is a valid IRI.
+
+    const HTML_RDFa_RESOURCE_IMAGE: &str = r#"<!doctype html><html><head>
+<title>RDFa Resource Image</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Resource Product</span>
+  <img property="image" resource="https://rdfa.example.com/img.jpg" alt="product">
+  <div property="offers" typeof="Offer">
+    <span property="price" content="69.99">69.99</span>
+    <span property="priceCurrency" content="USD">USD</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_resource_attribute_is_extracted() {
+        let o = extract_commerce_offer(HTML_RDFa_RESOURCE_IMAGE, "https://rdfares.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://rdfa.example.com/img.jpg"));
+        assert_eq!(d.price, Some(69.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    const HTML_RDFa_RESOURCE_OFFER: &str = r#"<!doctype html><html><head>
+<title>RDFa Resource Offer</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">Resource Offer Product</span>
+  <div property="offers" typeof="Offer" resource="https://rdfa.example.com/offer/1">
+    <span property="price" content="44.99">44.99</span>
+    <span property="availability" content="https://schema.org/InStock">In Stock</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_resource_on_non_image_property_ignored() {
+        // resource= on the offers div should not break extraction; the
+        // non-image resource is not used as a value.
+        let o = extract_commerce_offer(HTML_RDFa_RESOURCE_OFFER, "https://rdfao.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(44.99));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
     }
 }
