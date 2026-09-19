@@ -8667,6 +8667,33 @@ fn merge_local_and_web(
         }
     }
 
+    // ── FIX-IF-16: Source-diversity gate ──────────────────────────────────
+    let dominant_source: Option<String> = {
+        let mut source_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut total_src_hits = 0usize;
+        for r in &merged {
+            for s in &r.sources {
+                *source_counts.entry(s.to_lowercase()).or_insert(0) += 1;
+                total_src_hits += 1;
+            }
+        }
+        if total_src_hits > 0 {
+            source_counts
+                .iter()
+                .find(|(_, &c)| (c as f32) > 0.80 * total_src_hits as f32)
+                .map(|(s, c)| {
+                    tracing::warn!(
+                        "FIX-IF-16 SOURCE-DIVERSITY: source '{}' dominates ({}/{} = {:.0}%) — post-cal diversity penalty queued",
+                        s, c, total_src_hits, *c as f32 / total_src_hits as f32 * 100.0
+                    );
+                    s.clone()
+                })
+        } else {
+            None
+        }
+    };
+
     // 3. Apply unified ranking signals to all results
     // Use distribution-aware blending when available (intent as hint, not gate)
     let weights = match distribution {
@@ -10834,60 +10861,7 @@ fn merge_local_and_web(
 
         // Definitional-domain / structure detector (mirrors the in-loop block at ~5447
         // but is recomputed here so the cap is independent of that block's scope).
-        let is_def_site = |url: &str, title: &str, content: &str| -> bool {
-            let ul = url.to_lowercase();
-            let tl = title.to_lowercase();
-            let cl = content.to_lowercase();
-            let prefix = cl.chars().take(300).collect::<String>();
-            // Structural URL-path markers only — no curated domain allow-list.
-            // Detection is purely structural (title / path / phonetic / POS).
-            let dict_path_marker = ul.contains("/dictionary/")
-                || ul.contains("/define/")
-                || ul.contains("/meaning/");
-            let title_words: Vec<&str> = tl.split_whitespace().collect();
-            let dict_title = tl.contains("meaning & definition")
-                || tl.contains("definition & meaning")
-                || tl.contains("definition of ")
-                || tl.contains("meaning of ")
-                || tl.ends_with("- wiktionary")
-                || tl.contains("cambridge dictionary")
-                || tl.contains("merriam-webster")
-                || (title_words.len() <= 3 && (tl.contains("definition") || tl.contains("dictionary")));
-            let phonetic = prefix.contains("/ˈ") || prefix.contains("/ˌ")
-                || prefix.contains("/'") || prefix.contains("/-");
-            let pos_label = prefix.starts_with("noun") || prefix.starts_with("verb")
-                || prefix.starts_with("adjective") || prefix.starts_with("adverb")
-                || prefix.contains("1. : to ") || prefix.contains("2. : to ")
-                || prefix.contains("definition of ") || prefix.contains("meaning of ");
-            let short = cl.len() < 200;
-            // Wikipedia disambiguation stubs ("Hill - Wikipedia", "Java - Wikipedia"):
-            // a bare title with no descriptive body, just a list of links to the
-            // article's possible meanings. For a non-definition query they are
-            // off-topic junk (ranked #1 for "why is the hill blue?"-style polysemy and
-            // for "what is the difference between java the language and java the island").
-            // Detection is structural (en.wikipedia.org/wiki/<Word> with a " - Wikipedia"
-            // title and a content prefix that is just the title echoed, i.e. no
-            // encyclopedic lead) — no curated disambiguation allow-list. A definition
-            // query (handled by is_definition_query above) is exempt and keeps them.
-            // Extract the page title without the " - wikipedia" suffix for comparison.
-            let wiki_disambig = if ul.contains("en.wikipedia.org/wiki/") && tl.ends_with("- wikipedia") {
-                let page_title = tl.strip_suffix("- wikipedia").unwrap_or(&tl).trim();
-                // Strict: accept only empty/stub (content == title) or explicit "refer to" phrases
-                // or a link-list form (body starts with the bare page title, no descriptive lead).
-                // Do NOT use unrestricted title-prefix matching that would mis-classify real articles.
-                cl.trim().is_empty()
-                    || cl.trim().to_lowercase() == page_title
-                    || prefix.contains("may refer to")
-                    || prefix.contains("can refer to")
-                    || (prefix.starts_with(page_title) && prefix.len() < page_title.len() + 50)
-            } else {
-                false
-            };
-            dict_path_marker || dict_title
-                || ((phonetic || pos_label) && title_words.len() <= 3)
-                || (pos_label && short)
-                || wiki_disambig
-        };
+
 
         // Count how many DISTINCTIVE topic terms a result actually contains (excludes
         // weak framing/anchor words, so a page matching only "improve" while the query
@@ -10947,7 +10921,7 @@ fn merge_local_and_web(
             let ul = r.url.to_lowercase();
 
             // (a) definitional site for a non-definition query
-            if !is_definition_query && is_def_site(&ul, &rl, &cl) {
+            if !is_definition_query && is_dictionary_site(&ul, &rl, &cl) {
                 if r.score > dict_cap {
                     tracing::info!(
                         "POST-CAL DICT CAP -> {:.2}: '{}' (def site, non-def query)",
@@ -11046,11 +11020,161 @@ fn merge_local_and_web(
         }
     }
 
+    // ── FIX-IF-16: Post-calibration Bing-noise + diversity penalties ─────
+    // (a) SOURCE-DIVERSITY PENALTY: when >80% of pre-filter results came from
+    // a single engine source, mark it dominant. Penalize its results ×0.5.
+    if let Some(ref dom_src) = dominant_source {
+        for r in merged.iter_mut() {
+            if r.sources.iter().any(|s| s.eq_ignore_ascii_case(dom_src)) {
+                r.score *= 0.5;
+            }
+        }
+        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    // (b) BING-NOISE FILTER: structural off-topic pages (dictionary, stock,
+    // help) that match no distinctive topic term get capped at 0.03.
+    {
+        let q_lc_bing = clean_query.to_lowercase();
+        let is_def_query = q_lc_bing.starts_with("define ")
+            || q_lc_bing.starts_with("definition of ")
+            || q_lc_bing.contains("definition of ")
+            || q_lc_bing.contains(" meaning of ")
+            || q_lc_bing.contains("word meaning")
+            || (q_lc_bing.starts_with("what does ") && q_lc_bing.contains(" mean"))
+            || q_lc_bing.starts_with("what is the definition");
+
+        let is_stock_finance = |url: &str, title: &str| -> bool {
+            let ul = url.to_lowercase();
+            let tl = title.to_lowercase();
+            ul.contains("/stock/") || ul.contains("/quote/") || ul.contains("/finance/")
+                || ul.contains("/market/") || ul.contains("/ticker/")
+                || ul.contains("/stocks/")
+                || tl.contains("stock price") || tl.contains("share price")
+                || tl.contains("market cap") || tl.contains("nasdaq:")
+                || tl.contains("nyse:") || tl.contains("(otc:")
+                || tl.contains(" stock ") || tl.ends_with(" stock")
+                || (tl.contains('$') && tl.chars().filter(|c| c.is_alphabetic()).count() <= 8)
+        };
+
+        let is_generic_help = |url: &str, title: &str, content: &str| -> bool {
+            let ul = url.to_lowercase();
+            let tl = title.to_lowercase();
+            let cl = content.to_lowercase();
+            let title_words: Vec<&str> = tl.split_whitespace().collect();
+            let has_help_path = ul.contains("/help/") || ul.contains("/support/")
+                || ul.contains("/faq/") || ul.contains("/guides/");
+            let has_help_title = (tl.contains("help") || tl.contains("guide") || tl.contains("faq"))
+                && title_words.len() <= 5;
+            let short_content = cl.len() < 200;
+            (has_help_path && short_content) || (has_help_title && short_content)
+        };
+
+        if !is_def_query && !strong_distinctive_terms.is_empty() {
+            for r in merged.iter_mut() {
+                let rl = r.title.to_lowercase();
+                let cl = r.content.to_lowercase();
+                let ul = r.url.to_lowercase();
+
+                let matches_topic = strong_distinctive_terms.iter().any(|t| {
+                    let lt = t.to_lowercase();
+                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
+                });
+
+                if matches_topic {
+                    continue;
+                }
+
+                let is_bing_noise = is_dictionary_site(&ul, &rl, &cl)
+                    || is_stock_finance(&ul, &rl)
+                    || is_generic_help(&ul, &rl, &cl);
+
+                if is_bing_noise && r.score > 0.03 {
+                    r.score = 0.03;
+                }
+            }
+        }
+    }
+
+    // (c) MULTI-WORD PHRASE OVERLAP: for queries with >=3 strong topics,
+    // require >=2 matches. Single-polysemous matches capped at 0.04.
+    let strong_topics_b: Vec<&str> = strong_distinctive_terms.iter()
+        .filter(|t| !is_weak_anchor_word(&t.to_lowercase()))
+        .copied().collect();
+    if strong_topics_b.len() >= 3 {
+        let any_multi_match = merged.iter().any(|r| {
+            let rl = r.title.to_lowercase();
+            let cl = r.content.to_lowercase();
+            let ul = r.url.to_lowercase();
+            let matched = strong_topics_b.iter().filter(|t| {
+                let lt = t.to_lowercase();
+                rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
+            }).count();
+            matched >= 2
+        });
+        if any_multi_match {
+            for r in merged.iter_mut() {
+                let rl = r.title.to_lowercase();
+                let cl = r.content.to_lowercase();
+                let ul = r.url.to_lowercase();
+                let matched = strong_topics_b.iter().filter(|t| {
+                    let lt = t.to_lowercase();
+                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
+                }).count();
+                if matched < 2 && r.score > 0.04 {
+                    r.score = 0.04;
+                }
+            }
+        }
+    }
+
     // Re-sort by score descending after post-calibration caps to ensure capped
     // results (video/dict/weak-match) move below higher-scoring text results.
     merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     merged
+}
+
+/// Structural dictionary/definition-site detector (no curated domain list).
+/// Used by both the post-calibration D1 cap and the FIX-IF-16 Bing-noise filter.
+fn is_dictionary_site(url: &str, title: &str, content: &str) -> bool {
+    let ul = url.to_lowercase();
+    let tl = title.to_lowercase();
+    let cl = content.to_lowercase();
+    let prefix = cl.chars().take(300).collect::<String>();
+    let dict_path_marker = ul.contains("/dictionary/")
+        || ul.contains("/define/")
+        || ul.contains("/meaning/");
+    let title_words: Vec<&str> = tl.split_whitespace().collect();
+    let dict_title = tl.contains("meaning & definition")
+        || tl.contains("definition & meaning")
+        || tl.contains("definition of ")
+        || tl.contains("meaning of ")
+        || tl.ends_with("- wiktionary")
+        || tl.contains("cambridge dictionary")
+        || tl.contains("merriam-webster")
+        || (title_words.len() <= 3 && (tl.contains("definition") || tl.contains("dictionary")));
+    let phonetic = prefix.contains("/ˈ") || prefix.contains("/ˌ")
+        || prefix.contains("/'") || prefix.contains("/-");
+    let pos_label = prefix.starts_with("noun") || prefix.starts_with("verb")
+        || prefix.starts_with("adjective") || prefix.starts_with("adverb")
+        || prefix.contains("1. : to ") || prefix.contains("2. : to ")
+        || prefix.contains("definition of ") || prefix.contains("meaning of ");
+    let short = cl.len() < 200;
+    let wiki_disambig = if ul.contains("en.wikipedia.org/wiki/") && tl.ends_with("- wikipedia") {
+        let page_title = tl.strip_suffix("- wikipedia").unwrap_or(&tl).trim();
+        cl.trim().is_empty()
+            || cl.trim().to_lowercase() == page_title
+            || prefix.contains("may refer to")
+            || prefix.contains("can refer to")
+            || (prefix.starts_with(page_title) && prefix.len() < page_title.len() + 50)
+    } else {
+        false
+    };
+    dict_path_marker || dict_title
+        || ((phonetic || pos_label) && title_words.len() <= 3)
+        || (pos_label && short)
+        || wiki_disambig
 }
 
 // ─── Main ────────────────────────────────────────────────────────────
