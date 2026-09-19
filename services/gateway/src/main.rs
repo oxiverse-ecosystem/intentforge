@@ -1486,23 +1486,27 @@ fn negative_term_matches_token(term_clean: &str, token_clean: &str) -> bool {
     if term_clean.len() < 3 {
         return false;
     }
-    // Compound/inflection match: one side must START with the other and the
-    // shorter must dominate the longer's length (ratio >= 0.75). This catches
-    // both directions of stem mismatch:
-    //   - term is a prefix of token:  "react" ⊂ "reactjs"   (0.71 borderline)
-    //   - token is a prefix of term:  "subscribe" ⊂ "subscription" (9/12=0.75)
-    // The latter is the common "without subscription" -> page says "subscribe"
-    // case: previously the penalty never fired because only term-prefix logic
-    // existed, so the excluded-term page survived in the top results.
-    // Requiring the SHORTER to dominate >= 0.75 avoids collapsing distinct words
-    // ("java" ⊂ "javascript" = 0.4 firmly rejected).
-    let (shorter, longer) = if term_clean.len() <= token_clean.len() {
-        (term_clean, token_clean)
-    } else {
-        (token_clean, term_clean)
-    };
-    if longer.starts_with(shorter) {
-        let ratio = shorter.len() as f32 / longer.len() as f32;
+    // Compound/inflection match: one side must START with the other.
+    // We handle the two directions asymmetrically to avoid false positives:
+    //
+    // (A) Term is a prefix of token ("grind" vs "grindr"): the shorter term
+    //     is merely the leading substring of a DIFFERENT longer word — likely
+    //     a distinct term, not an inflection. Require the term to dominate
+    //     the token by ratio >= 0.85. This rejects "grind" matching "Grindr"
+    //     (5/6=0.83) or "Grinders" (5/8=0.63) while still catching genuine
+    //     prefix relationships like "react" → "reactnative" (5/11=0.45 rejected,
+    //     which is correct — that's a framework, not an inflection).
+    if term_clean.len() <= token_clean.len() && token_clean.starts_with(term_clean) {
+        let ratio = term_clean.len() as f32 / token_clean.len() as f32;
+        return ratio >= 0.85;
+    }
+    // (B) Token is a prefix of term ("subscribe" vs "subscription"): the
+    //     token is the stem and the term is a longer inflection. Use a
+    //     lenient threshold (>= 0.75) to catch "without subscription" matching
+    //     a page that says "subscribe" (9/12=0.75). This is the common and
+    //     important case for negative matching.
+    if token_clean.len() < term_clean.len() && term_clean.starts_with(token_clean) {
+        let ratio = token_clean.len() as f32 / term_clean.len() as f32;
         return ratio >= 0.75;
     }
     false
@@ -1514,9 +1518,21 @@ fn negative_term_matches_token(term_clean: &str, token_clean: &str) -> bool {
 fn text_matches_negative(text_lower: &str, term_lower: &str) -> bool {
     let term_words: Vec<&str> = term_lower.split_whitespace().collect();
     if term_words.len() > 1 {
-        // Multi-word constraint: require the full phrase (word-boundary safe
-        // enough for phrases; single-word collisions are the real hazard).
-        return text_lower.contains(term_lower);
+        // Multi-word constraint: check if ANY word in the term appears as a
+        // whole-word match in the text. This catches results that mention
+        // one of the component words without the full phrase (e.g., "urad dal"
+        // negative catches "URAD Leather Conditioner" which mentions "urad").
+        // Word-boundary matching per component word prevents false positives
+        // like "grind" matching "Grindr".
+        return term_words.iter().any(|&word| {
+            let word_clean: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
+            if word_clean.is_empty() { return false; }
+            let words: Vec<&str> = text_lower
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|s| !s.is_empty())
+                .collect();
+            words.iter().any(|w| negative_term_matches_token(&word_clean, w))
+        });
     }
     let term_clean: String = term_lower.chars().filter(|c| c.is_alphanumeric()).collect();
     let words: Vec<&str> = text_lower
@@ -3706,6 +3722,186 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
     Some(o)
 }
 
+/// True when the page declares a Microformats2 `h-product`.
+fn has_h_product(html: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)class\s*=\s*["'][^"']*h-product[^"']*["']"#).unwrap()
+    });
+    re.is_match(html)
+}
+
+/// Extract product facts from Microformats2 `h-product`.
+/// Only fires when the page carries an `h-product` class.
+///
+/// MF2 convention: `p-price` (text content or `value` attribute),
+/// `p-price-currency`, `p-brand`/`p-org`, `p-sku`, `p-identifier` (numeric GTIN),
+/// `p-photo`/`u-photo` (image src/href), `p-condition`, `p-availability`.
+fn parse_h_product(html: &str) -> Option<OfferFacts> {
+    if !has_h_product(html) {
+        return None;
+    }
+
+    static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tag_re = TAG_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)<\w+\b[^>]*class[^>]*>"#).unwrap()
+    });
+    static CLASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let class_re = CLASS_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)class\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static VALUE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let value_re = VALUE_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)value\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let src_re = SRC_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static HREF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let href_re = HREF_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)href\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+
+    let mut o = OfferFacts::default();
+    let mut saw_price = false;
+
+    for cap in tag_re.captures_iter(html) {
+        let tag = cap.get(0).unwrap().as_str();
+        let classes_str = match class_re.captures(tag).and_then(|c| c.get(1)) {
+            Some(m) => m.as_str().to_lowercase(),
+            None => continue,
+        };
+        let classes: Vec<&str> = classes_str.split_whitespace().collect();
+
+        let mut prop_name = "";
+        let mut is_known = false;
+        for &cls in &classes {
+            if cls.starts_with("p-") || cls.starts_with("u-") {
+                is_known = true;
+                prop_name = &cls[2..];
+                break;
+            }
+        }
+        if !is_known {
+            continue;
+        }
+
+        let value_attr = value_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let src = src_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let href = href_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+
+        // Helper: text content after tag until next '<'.
+        let text_content = || -> String {
+            let after = &html[cap.get(0).unwrap().end()..];
+            if let Some(end) = after.find('<') {
+                after[..end].trim().to_string()
+            } else {
+                String::new()
+            }
+        };
+
+        match prop_name {
+            "price" => {
+                if !saw_price {
+                    saw_price = true;
+                    let raw = value_attr.unwrap_or_else(text_content);
+                    // Strip currency symbols, whitespace, commas — keep digits, '.', '-'.
+                    let cleaned: String = raw
+                        .chars()
+                        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                        .collect();
+                    if let Ok(v) = cleaned.parse::<f64>() {
+                        o.price = Some(v);
+                    }
+                }
+            }
+            "price-currency" => {
+                if o.currency.is_none() {
+                    let raw = value_attr.unwrap_or_else(text_content);
+                    if !raw.is_empty() {
+                        o.currency = Some(raw);
+                    }
+                }
+            }
+            "brand" | "org" => {
+                if o.merchant.is_none() {
+                    let raw = value_attr.unwrap_or_else(text_content);
+                    if !raw.is_empty() {
+                        o.merchant = Some(raw);
+                    }
+                }
+            }
+            "sku" => {
+                if o.sku.is_none() {
+                    let raw = value_attr.unwrap_or_else(text_content);
+                    if !raw.is_empty() {
+                        o.sku = Some(raw);
+                    }
+                }
+            }
+            "identifier" => {
+                if o.gtin.is_none() {
+                    let raw = value_attr.unwrap_or_else(text_content);
+                    // Only numeric GTIN-like identifiers (8+ digits).
+                    if raw.chars().all(|c| c.is_ascii_digit()) && raw.len() >= 8 {
+                        o.gtin = Some(raw);
+                    }
+                }
+            }
+            "photo" => {
+                if o.image.is_none() {
+                    if let Some(v) = src.or(href) {
+                        o.image = Some(v);
+                    }
+                }
+            }
+            "condition" => {
+                if o.condition.is_none() {
+                    let raw = value_attr.unwrap_or_else(text_content);
+                    if !raw.is_empty() {
+                        o.condition = Some(raw);
+                    }
+                }
+            }
+            "availability" => {
+                if o.availability.is_none() {
+                    let raw = value_attr.unwrap_or_else(text_content);
+                    if !raw.is_empty() {
+                        o.availability = Some(raw);
+                    }
+                }
+            }
+            "name" | "description" | "category" | "url" | "review" | "rating" | "count" => {
+                // MF2 signals that prove a product page — no fact to extract.
+            }
+            _ => {}
+        }
+    }
+
+    if o.price.is_none()
+        && o.currency.is_none()
+        && o.availability.is_none()
+        && o.merchant.is_none()
+        && o.condition.is_none()
+        && o.sku.is_none()
+        && o.gtin.is_none()
+        && o.image.is_none()
+    {
+        return None;
+    }
+    Some(o)
+}
+
 fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     let mut facts = OfferFacts::default();
     let mut source: Option<String> = None;
@@ -3749,7 +3945,19 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         }
     }
 
-    // 5) Merchant fallback: derive a coarse host label only when no page-provided
+    // 5) Fallback: Microformats2 h-product (only when no price yet).
+    //    Used by Shopify, WooCommerce, and independent stores that mark up
+    //    products with `class="h-product"` + `p-price`, `p-brand`, etc.
+    if facts.price.is_none() && facts.price_low.is_none() {
+        if let Some(mf2) = parse_h_product(html) {
+            merge_offer_facts(&mut facts, &mf2);
+            if source.is_none() {
+                source = Some("microformats2".to_string());
+            }
+        }
+    }
+
+    // 6) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
@@ -20276,5 +20484,107 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // valid "off" setting — proves the value is honored as a cap.
         let cfg = CommerceConfig { mainpath_top_n: 0 };
         assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
+    }
+
+    // ── Microformats2 h-product extraction ───────────────────────────────
+
+    const HTML_H_PRODUCT_FULL: &str = r#"<!doctype html><html><head>
+<title>H-Product Store</title>
+</head><body>
+<article class="h-product">
+  <h2 class="p-name">Acme Widget Pro</h2>
+  <a class="p-brand u-url" href="https://acme.example">Acme</a>
+  <span class="p-sku">ACME-WP-001</span>
+  <span class="p-price">$49.99</span>
+  <span class="p-price-currency">USD</span>
+  <span class="p-identifier">9876543210987</span>
+  <img class="u-photo" src="https://cdn.example.com/widget-pro.jpg" alt="">
+  <span class="p-condition">New</span>
+  <span class="p-availability">InStock</span>
+</article>
+</body></html>"#;
+
+    #[test]
+    fn h_product_extracts_all_fields() {
+        let o = extract_commerce_offer(HTML_H_PRODUCT_FULL, "https://mf2.example.com/widget");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(49.99), "p-price text with currency symbol stripped");
+        assert_eq!(d.currency.as_deref(), Some("USD"), "p-price-currency");
+        assert_eq!(d.sku.as_deref(), Some("ACME-WP-001"), "p-sku");
+        assert_eq!(d.gtin.as_deref(), Some("9876543210987"), "p-identifier numeric");
+        assert_eq!(d.merchant.as_deref(), Some("Acme"), "p-brand");
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/widget-pro.jpg"), "u-photo");
+        assert_eq!(d.condition.as_deref(), Some("New"), "p-condition");
+        assert_eq!(d.availability.as_deref(), Some("InStock"), "p-availability");
+        assert_eq!(o.source.as_deref(), Some("microformats2"));
+    }
+
+    const HTML_H_PRODUCT_VALUE_ATTR: &str = r#"<!doctype html><html><head>
+<title>MF2 Value Attr</title>
+</head><body>
+<div class="h-product">
+  <span class="p-name">Gadget</span>
+  <span class="p-price" value="29.99">29.99</span>
+  <span class="p-price-currency" content="EUR">EUR</span>
+  <span class="p-brand" content="GadgetCo">GadgetCo</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn h_product_value_attribute_preferred_over_text() {
+        let o = extract_commerce_offer(HTML_H_PRODUCT_VALUE_ATTR, "https://mf2.example.com/gadget");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(29.99), "value attribute for p-price");
+        assert_eq!(d.currency.as_deref(), Some("EUR"), "content attribute for p-price-currency");
+        assert_eq!(d.merchant.as_deref(), Some("GadgetCo"), "content attribute for p-brand");
+    }
+
+    const HTML_NO_H_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>Article</title>
+</head><body>
+<article class="h-entry">
+  <h2 class="p-name">Blog Post</h2>
+  <p class="e-content">Some text with $19.99 mentioned</p>
+</article>
+</body></html>"#;
+
+    #[test]
+    fn h_product_non_product_class_returns_null() {
+        // An h-entry (not h-product) must NOT trigger extraction.
+        let o = extract_commerce_offer(HTML_NO_H_PRODUCT, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None, "no extraction from h-entry");
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    #[test]
+    fn h_product_photo_on_link_uses_href() {
+        let html = r#"<!doctype html><html><body>
+<div class="h-product">
+  <span class="p-name">Link Photo</span>
+  <a class="u-photo" href="https://cdn.example.com/link-photo.jpg">photo</a>
+  <span class="p-price">10.00</span>
+</div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://mf2.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/link-photo.jpg"), "u-photo href");
+    }
+
+    #[test]
+    fn h_product_identifier_short_numeric_is_rejected() {
+        // identifier must be 8+ digits to be treated as GTIN — short numbers
+        // (like a shop SKU) must not leak into the gtin field.
+        let html = r#"<!doctype html><html><body>
+<div class="h-product">
+  <span class="p-name">Short SKU</span>
+  <span class="p-identifier">12345</span>
+  <span class="p-price">5.00</span>
+</div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://mf2.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.gtin, None, "short numeric identifier must not be gtin");
     }
 }
