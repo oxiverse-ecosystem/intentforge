@@ -10504,6 +10504,80 @@ fn merge_local_and_web(
             1.0
         };
         r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * entity_mult * phrase_fidelity_mult * retailer_boost;
+
+        // ── Modifier-word demotion (P1-FIXIF08 analog) ──
+        // Common English modifier words ("possible", "effective", "traditional", "learn",
+        // "quiet") are SEARCH MODIFIERS, not the user's intended search target — the query
+        // also contains a more specific topical entity. Results that rank purely because
+        // they contain the modifier (dictionary entries, companies named after the word,
+        // thesaurus pages) must be demoted below results that name the actual topic.
+        // Same structural signal as the superlative penalty (FIX-IF-08): the result's TITLE
+        // contains the modifier word but NONE of the core topic terms. When the modifier
+        // IS the only substantive word in the query (no other topic words), the gate does
+        // not fire — "what is effective" genuinely wants the definition.
+        // Word class only — no per-query literals, no brand/domain lists.
+        let general_modifier_terms: &[&str] = &[
+            "possible", "impossible", "effective", "ineffective", "efficient", "inefficient",
+            "traditional", "untraditional", "conventional", "practical", "impractical",
+            "learn", "learning", "quiet", "loud", "fast", "slow", "easy", "difficult",
+            "hard", "simple", "complex", "cheap", "expensive", "good", "bad",
+            "better", "worse", "worst", "great", "small", "large", "big", "tiny",
+            "old", "new", "young", "hot", "cold", "warm", "cool", "safe", "unsafe",
+            "dangerous", "risky", "reliable", "unreliable", "stable", "unstable",
+            "accurate", "inaccurate", "exact", "precise", "correct", "incorrect", "wrong",
+            "right", "proper", "improper", "appropriate", "inappropriate", "relevant",
+            "irrelevant", "useful", "useless", "helpful", "powerful",
+            "powerless", "strong", "weak", "active", "inactive",
+            "passive", "busy", "occupied", "empty", "full", "complete",
+            "incomplete", "perfect", "imperfect", "ideal", "realistic", "unrealistic",
+            "reasonable", "unreasonable", "fair", "unfair", "just", "unjust", "legal",
+            "illegitimate", "invalid", "formal",
+            "informal", "official", "unofficial", "public", "private", "personal",
+            "professional", "casual", "serious", "trivial", "major", "minor", "significant",
+            "insignificant", "important", "unimportant", "necessary", "unnecessary",
+            "essential", "nonessential", "optional", "mandatory", "voluntary", "automatic",
+            "manual", "natural", "artificial", "synthetic", "organic", "inorganic",
+            "physical", "mental", "emotional", "rational", "irrational", "logical",
+            "illogical", "experimental", "empirical",
+        ];
+        let modifier_word_in_query = q_words.iter().any(|w| {
+            general_modifier_terms.contains(&w.to_lowercase().as_str())
+        });
+        // Only fire when the modifier is NOT the only topical query word — there must be
+        // at least one strong distinctive term besides the modifier itself. Otherwise we
+        // would demote definition pages for a bare "what is X" query, which is wrong.
+        let modifier_not_search_target = modifier_word_in_query
+            && !strong_distinctive_terms.is_empty()
+            && strong_distinctive_terms.iter().any(|t| {
+                !general_modifier_terms.contains(&t.to_lowercase().as_str())
+            });
+        let modifier_demotion_mult = if modifier_not_search_target {
+            let active_modifiers: Vec<&str> = q_words
+                .iter()
+                .filter(|w| general_modifier_terms.contains(&w.to_lowercase().as_str()))
+                .map(|w| *w)
+                .collect();
+            let title_has_modifier = active_modifiers.iter().any(|m| title_lower.contains(m));
+            let title_has_topic = core_topic_terms.iter().any(|t| {
+                let tl = t.to_lowercase();
+                title_lower.contains(&tl) || title_lower.contains(tl.trim_end_matches('s'))
+            });
+            if title_has_modifier && !title_has_topic {
+                0.45 // same demotion factor as the superlative penalty
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        };
+        r.score *= modifier_demotion_mult;
+        if modifier_demotion_mult < 1.0 {
+            tracing::info!(
+                "MODIFIER-WORD DEMOTION: '{}' (score ×{:.2}) — title mentions the query's modifier word but not its topic",
+                title_lower.chars().take(50).collect::<String>(),
+                modifier_demotion_mult
+            );
+        }
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
