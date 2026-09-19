@@ -10453,6 +10453,24 @@ fn merge_local_and_web(
         } else {
             1.0
         };
+        // IF-15: retailer/vendor boost for transactional queries with product entities.
+        // When intent=transactional AND a product entity is detected, boost results
+        // from known retailer/vendor domains (amazon, bestbuy, apple, etc.) that
+        // mention the exact model. This ensures product pages from reputable stores
+        // outrank generic commercial pages (recipe sites, unrelated marketplaces).
+        let retailer_boost = if !product_entities.is_empty() && intent == "transactional" {
+            if let Ok(parsed_url) = reqwest::Url::parse(&r.url) {
+                if let Some(host) = parsed_url.host_str() {
+                    if is_retailer_host(host) {
+                        // Retailer domain: additional boost on top of entity match
+                        // Strong entity match → extra boost, weak match → smaller boost
+                        if entity_mult > 1.2 { 1.30 }
+                        else if entity_mult > 0.8 { 1.15 }
+                        else { 1.0 }
+                    } else { 1.0 }
+                } else { 1.0 }
+            } else { 1.0 }
+        } else { 1.0 };
         // Phrase-fidelity gate (P12): penalize results whose title matches
         // only scattered single tokens from a multi-word phrase. A query like
         // "zero knowledge proof" should NOT match "0 - Wikipedia" just because
@@ -10469,7 +10487,7 @@ fn merge_local_and_web(
                 if run.len() < 2 { continue; }
                 // Sliding window: check if run appears contiguously in title_words
                 for window in title_words.windows(run.len()) {
-                    if window.iter().all(|w| run.contains(w)) {
+                    if window.iter().all(|w| run.iter().any(|s| s.as_str() == *w)) {
                         max_run_len = max_run_len.max(run.len());
                         break;
                     }
@@ -10485,7 +10503,7 @@ fn merge_local_and_web(
         } else {
             1.0
         };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * entity_mult * phrase_fidelity_mult;
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * entity_mult * phrase_fidelity_mult * retailer_boost;
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
