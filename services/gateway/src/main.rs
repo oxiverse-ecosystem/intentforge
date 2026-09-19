@@ -973,6 +973,18 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
         }
     }
 
+    // "this year"/"this month" only imply a date window when co-occurring with a
+    // news/recency signal term. In "certification path this year", "this year"
+    // modifies user intent, not recency — firing a 365-day window wrongly drops
+    // older but still-relevant results. Structural signal vocabulary, no per-query
+    // literals.
+    let recency_signal_terms = [
+        "news", "latest", "new", "recent", "developments", "changes",
+        "update", "updates", "this week", "breaking", "headline", "headlines",
+        "announced", "released", "launched", "today", "yesterday",
+    ];
+    let has_recency_signal = recency_signal_terms.iter().any(|t| q_lower.contains(t));
+
     let named: &[(&str, i64)] = &[
         ("this week", -7), ("past week", -7), ("last week", -7), ("current week", -7),
         ("this month", -30), ("past month", -30), ("last month", -30),
@@ -980,6 +992,14 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
     ];
     for (phrase, delta) in named {
         if q_lower.contains(*phrase) {
+            if *phrase == "this year" || *phrase == "this month" {
+                // Co-occurrence gate: only fire when a news/recency signal term
+                // is also present. Otherwise skip — do NOT emit after:/before:.
+                if has_recency_signal {
+                    return Some((format_ymd(add_days(today, *delta)), today_s));
+                }
+                continue;
+            }
             return Some((format_ymd(add_days(today, *delta)), today_s));
         }
     }
