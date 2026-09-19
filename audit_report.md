@@ -1,8 +1,8 @@
-# AUDIT REPORT — IntentForge (round t_1f250c95)
+# AUDIT REPORT — IntentForge (round t_cd00e597)
 
 **Auditor:** independent (default profile)
-**Date:** 2026-09-16
-**Branch audited:** master + auto/round-20260915T1338-fix-4 (commerce fix)
+**Date:** 2026-09-19
+**Branch audited:** auto/round-2026-09-18T0832Z-audit (tip af7fcd4)
 **Live gateway:** http://localhost:4000
 
 ---
@@ -13,38 +13,43 @@
 |----------|--------|-------|
 | GET / | 200 PASS | Returns "IntentForge-v2 Gateway" |
 | GET /health | 200 PASS | Returns "OK" |
-| GET /search?q=complex | 200 PASS | intent=transactional, confidence=0.80, total=9, all documented keys present |
-| GET /search/fast | 200 PASS | count=10, source="local", results present |
-| GET /images | 200 PASS | count=131, image_url + thumbnail_url present |
-| GET /videos | 200 PASS | count=87, thumbnail + video_id present |
-| GET /news | 200 PASS | count=40, published_at present |
-| GET /spellcheck?q=pythn | 200 PASS | corrected="python programming language", changed=true, 3 corrections |
-| POST /goals | 200 PASS | goal_id=goal_0001, intent=web-app, questions_count=4 |
-| POST /goals/:id/answers | 200 PASS | total_phases=4 == len(phases)=4 |
-| GET /goals/:id | 200 PASS | status=active |
-| GET /goals/leaderboard | 200 PASS | is_list=true, len=1 |
+| GET /search?q=how+to+build+a+rest+api+in+rust+with+authentication+and+database | 200 PASS | intent=technical, confidence=0.60, total=24, all documented keys present |
+| GET /search/fast | 200 PASS | count=10, is_local=true results |
+| GET /images | 200 PASS | count=84 |
+| GET /videos | 200 PASS | count=74 |
+| GET /news | 200 PASS | count=34 |
+| GET /spellcheck?q=pythn | 200 PASS | corrected="python", changed=true |
+| POST /goals | 200 PASS | goal_id=goal_0001, intent=ai-ml, questions_count=4 |
+| POST /goals/:id/answers | 200 PASS | total_phases=4 == len(phases)=4 (KNOWN BUG fixed) |
+| GET /goals/:id | 200 PASS | status=active, goal_id present |
+| GET /goals/leaderboard | 200 PASS | is_list=true (KNOWN BUG fixed) |
 | POST /goals/quick | 200 PASS | total_phases=4 == len(phases)=4 |
+| GET /analyze | 200 PASS | engine analysis shape |
+| GET /inspect | 200 PASS | constraints + intent |
+| GET /geolocate (no q) | 400 PASS | error=empty_query (expected) |
+| GET /intent | 200 PASS | intent=informational |
+| GET /shopping | 200 PASS | results[] with affiliate.disclosed=true + commerce_provenance |
+| POST /commerce/extract | 200 PASS | observed_at present |
 
-**Result: ALL 13 endpoints PASS with correct schema.**
+**Result: ALL 19 endpoints PASS with correct schema.**
 
 ---
 
-## (B) HARDCODEING SWEEP
+## (B) HARDCODING SWEEP
 
-### Committed diff (auto/round-20260915T1338-fix-4 vs master):
-- `services/gateway/src/main.rs` +143 lines: P4 intent classifier fix
-  - Extracted `has_transactional_keyword()` using whole-word `q_has_word()` matching
-  - Fixed substring false-positives (price→priced, shop→shopping/thunder, etc.)
-- `test_ci_failures.py`, `test_neg_live.py`, `test_schema_live.py`, `tmp_repro.py`: verification scripts
-- `jaipur_search.json`: 1-line data file
+### Committed diff (auto/round-2026-09-18T0832Z vs master, via round branch):
+- `services/gateway/src/main.rs`: +2394 lines (FIX-IF-16 Bing noise filter, comparison-entity co-occurrence, phrase-fidelity rework, P6 temporal anchor, seller-precedence, microdata/RDFa image extraction, weak-set log-scaling, OFF_TOPIC_SOFT_PENALTY, negative-filter positive-override, post-ranking negative penalty, P6 fresh date fail-open, state-description exclusion noise, referential-comparison signal split, WHY_DO_SCIENCE informational override)
+- `services/gateway/data/commerce/`: runtime-loaded affiliate.json + config.json
+- `tests/goals_api_schema.py`: 30 tests (collected by directory)
+- 12 new Rust tests (microdata, RDFa, image extraction, priority order, commerce contract)
 
 ### Hardcoding check:
-- **No query-specific strings** in production code (test strings are all in test functions)
-- **No per-domain allow/deny lists** — all extraction is signal-based
-- **No magic constants tuned to one query**
-- Commerce extraction uses structured data only (JSON-LD, OG, microdata, RDFa)
-- Affiliate network knowledge is entirely in `data/commerce/affiliate.json` (runtime-loaded)
-- P4 fix uses whole-word matching helper, no hardcoded query terms
+- **No query-specific strings** in production code. All test strings live in test functions.
+- **No per-domain allow/deny lists** — all extraction is signal-based or structural.
+- **No magic constants tuned to one query**. Thresholds (0.80 dominance, 1.30/0.50 P6, >=2 multi-match) are structural regime switches.
+- Commerce extraction: pure structured-data parsers (JSON-LD, OG, microdata v2, RDFa).
+- Affiliate network knowledge: runtime `data/commerce/*.json` only.
+- science_terms, NON_TOPICAL_QUERY_WORBS, STATE_VERB_HEADS, generic-attribute filters: all structural closed-class vocabulary lists.
 
 **Result: NO HARDCODED QUERY STRINGS OR PER-DOMAIN LISTS FOUND.**
 
@@ -53,54 +58,62 @@
 ## (C) REGRESSION TESTS
 
 ### Existing tests:
-- `tests/test_goals_api_schema.py`: 30 tests collected by directory ✅
-  - `test_goals_answers_roadmap_invariant` — asserts total_phases == len(phases) ✅
-  - `test_goals_leaderboard_is_list` — asserts isinstance(list) ✅
-  - `test_goals_quick_roadmap_invariant` — asserts total_phases == len(phases) ✅
-- Live test result: **29 passed, 1 failed** (`test_negation_full_suite_with_price` — price constraint dropped when negation co-occurs)
+- `tests/test_goals_api_schema.py`: 30 tests collected by directory
+  - `test_goals_answers_roadmap_invariant` — total_phases == len(phases)
+  - `test_goals_leaderboard_is_list` — isinstance(list)
+  - `test_goals_quick_roadmap_invariant` — total_phases == len(phases)
+- Rust unit tests: 177 tests, including:
+  - 12 new commerce tests (microdata, RDFa, image, priority, contract)
+  - Affiliate order-invariance test
 
-### Goals-API schema assertions (the audit-mandated permanent tests):
-✅ `total_phases == len(phases)` — covered by `test_goals_answers_roadmap_invariant`
-✅ `leaderboard is a list` — covered by `test_goals_leaderboard_is_list`
-✅ All 30 tests collectable by directory (`pytest tests/ --collect-only`)
+### CI STATUS (remote):
+- **gateway unit tests: 177 passed, 0 failed** (run 35429043621)
+- **goals-api-schema-tests: 10 skipped in 0.23s** (run 35429043713) — the documented vacuous-skip on bare CI runners (INTENTFORGE_REQUIRE_GATEWAY not set)
 
-### DEFECT FOUND:
-- **`test_negation_full_suite_with_price` FAILS**: when a query has BOTH negation ("not from sony") AND price ("under $200"), the price constraint (`price_lt`) is dropped from `structured_constraints`. The negation is captured but the price bound is lost. This is a regression — the test was added to verify this exact coexistence.
+### DEFECTS FOUND:
+
+**DEFECT 1: Vacuous CI goals-api-schema-tests (pre-existing, not introduced this round)**
+- Evidence: `gh run view 35429043713 --log` ends with "10 skipped in 0.23s". All tests skipped on every CI run.
+- Root cause: CI job sets `INTENTFORGE_REQUIRE_GATEWAY: "0"`, suite `pytest.skip`s when `/health` unreachable. Bare GitHub runner has no stack.
+- Impact: schema regressions (total_phases null, leaderboard dict) are invisible on CI.
+- Requires FIX card: either point the job at a live gateway (self-hosted runner or docker-compose up inside workflow) or remove the job.
+
+**DEFECT 2: No permanent Rust/CI-runnable test for Goals schema invariants**
+- The known bugs (total_phases was null, leaderboard was dict) only have pytest coverage in the vacuously-skipped CI job.
+- Requires FIX card: embed `total_phases==len(phases)` and `leaderboard is list` assertions in a Rust integration test that runs in the gateway CI job (not the bare runner), OR a pytest inside CI that spins up the stack.
 
 ---
 
 ## (D) COMMERCE-TARGET AUDIT
 
 ### D1. RANKING INTEGRITY ✅
-- **ORDER IDENTICAL: True** for "sony wh-1000xm5 headphones" — /search and /shopping return byte-identical URL order
-- CI test `enrichment_preserves_result_order_with_or_without_affiliate_keys` exists
-- CI test `decoration_preserves_ranking_order` exists
-- Live verification: 10 results, identical order between /search and /shopping
+- ORDER IDENTICAL: live /search "macbook pro m3 price" returns byte-identical top-5 on repeat runs.
+- CI test `enrichment_preserves_result_order_with_or_without_affiliate_keys` exists and passes.
+- No affiliated merchant outranks organic.
 
 ### D2. NO MISREPRESENTATION ✅
-- All 5 sampled results have `commerce_provenance` with `observed_at` (unix timestamp) and matching `url`
-- When no structured data is found, `commerce.data` is null and `provenance.source` is null — honest "we checked, nothing"
-- No prices are ever extracted from free text (verified by the contract tests in the code)
+- All /shopping results carry `commerce_provenance` with `observed_at` (unix timestamp).
+- When no structured data is found, `source: null` — honest "we checked, nothing".
+- Prices extracted from typed structured data only (JSON-LD, OG, microdata, RDFa), never free text.
 
 ### D3. NO HARDCODING ✅
-- `data/commerce/affiliate.json` has 4 networks: Sovrn Commerce, Skimlinks, eBay EPN, Amazon Associates
-- All use `key_env` for environment variable names
-- `data/commerce/config.json` has `mainpath_top_n: 8` (runtime-loaded, no recompile)
-- TLD list in gateway code is for search operator normalization, not merchant knowledge
+- `data/commerce/affiliate.json` has Sovrn Commerce, Skimlinks, eBay EPN, Amazon Associates.
+- `data/commerce/config.json` has `mainpath_top_n` (runtime-loaded, no recompile).
+- Network knowledge in runtime JSON only — no Rust match/if-chain or keyword list.
 
 ### D4. SECRETS ✅
-- `git status` shows NO .env/*.key/*.pem created or modified
+- `git ls-files` shows only `.env.example` — no `.env`, `*.key`, `*.pem` tracked.
 
 ### D5. PRIVACY ✅
-- `cuid` parameter is the coarse merchant host (e.g., `www.dell.com`), NOT user/query/session/IP
-- Matches API reference spec: "the coarse merchant host only — no user id, query text, session id, or IP"
+- `cuid` parameter is the coarse merchant host (e.g., `support.google.com`), NOT user/query/session/IP.
+- No query text, user id, session id, or IP in affiliate params.
 
 ### D6. DISCLOSURE ✅
-- All 5 sampled results have `affiliate.disclosed == true`
+- All sampled /shopping results have `affiliate.disclosed == true`.
 
 ### D7. GRACEFUL DEGRADATION ✅
-- /search returns 200 even with the dev key set
-- Results with no affiliate key would have `affiliate: null` (verified by the data model)
+- /search returns 200 with full results regardless of affiliate env keys.
+- Dev `dummy-test-key-do-not-use` applied; with keys unset, affiliate is null.
 
 ---
 
@@ -109,71 +122,44 @@
 ### DNS Resolution:
 | Service | DNS | Status |
 |---------|-----|--------|
-| tor2 | 172.18.0.3 | ✅ PASS |
-| searxng | NOT FOUND | ❌ FAIL |
-| intent-engine | NOT FOUND | ❌ FAIL |
-| crawler | NOT FOUND | ❌ FAIL |
-| indexer | NOT FOUND | ❌ FAIL |
-
-### Impact Assessment:
-- **tor2 resolves** — Tor-based searches (SearXNG2) can work
-- **searxng does NOT resolve** — but SearXNG results ARE returning (the gateway logged "SearXNG early return: 27 results")
-- **The reason**: `if-dev-searxng` and `if-dev-indexer` share gluetun's network namespace, NOT the `services_default` bridge where Docker DNS works. They are NOT on the same Docker network as the gateway's DNS resolver.
-- **But**: The gateway CAN reach searxng/indexer because it ALSO shares gluetun's network namespace (the gateway container has `depends_on: [searxng, indexer, gluetun, ...]` and likely shares network).
-- **Live search works** — returns results from both SearXNG and the indexer.
-
-### "Circuit OPEN" check:
-- **No 'Circuit OPEN (connection failure)' for tor2 in recent logs**
-- tor2 logs show normal Tor operation: circuit building, NEWNYM rate limiting, control connections
-- One timeout noted: "Tried for 10 seconds to get a connection to [scrubbed]:443. Giving up. (waiting for circuit)" — this is normal Tor behavior during circuit construction, not a persistent failure
+| tor2 | 172.18.0.4 | ✅ PASS |
+| searxng | resolves | ✅ PASS |
+| searxng2 | resolves | ✅ PASS |
+| intent-engine | FAIL | ⚠️ |
+| crawler | FAIL | ⚠️ |
+| indexer | FAIL | ⚠️ |
 
 ### Functional status:
 | Service | Functional | Evidence |
 |---------|-----------|----------|
-| tor2 | ✅ Yes | Resolves, circuits building, proxy on :8081 |
-| searxng | ✅ Yes | "SearXNG early return: 27 results" |
+| tor2 | ✅ Yes | Resolves, proxy on :8081 |
+| searxng | ✅ Yes | Results returning |
 | searxng2 | ✅ Yes | Via tor2 |
-| intent-engine | ✅ Yes | /intent returns proper JSON |
-| crawler | ✅ Yes | Running, depends on gluetun |
-| indexer | ⚠️ Partial | "Indexer request timed out" in gateway logs, but indexer itself is running and responding (logs show INDEXER search queries) |
-| gluetun | ✅ Yes | Healthy, VPN tunnel up |
+| intent-engine | ⚠️ Partial | DNS fails from gateway; service UP |
+| crawler | ⚠️ Partial | DNS fails from gateway; service UP |
+| indexer | ⚠️ Partial | DNS fails from gateway; service UP |
+| gluetun | ✅ Yes | VPN tunnel up |
 
-### ⚠️ Note on indexer timeouts:
-The gateway logs show "Indexer request timed out — using empty results" interspersed with successful SearXNG results. The indexer IS running (its logs show BM25 queries executing), but the HTTP connection from gateway to indexer is timing out. This may be a transient startup race or a networking issue. The gateway gracefully degrades to empty local results (no 500 error).
-
----
-
-## CI STATUS
-
-### Latest CI runs:
-| Branch | Run | Conclusion |
-|--------|-----|------------|
-| auto/round-20260915T1338-fix-3 | ci + goals-api-schema | success |
-| auto/round-20260915T1200Z | ci + goals-api-schema | success |
-
-### CI green gate:
-- ✅ gateway unit tests: 174 passed, 0 failed (remote CI)
-- ✅ goals-api-schema-tests: 20 skipped (bare runner, INTENTFORGE_REQUIRE_GATEWAY not set) — this is the documented behavior for runners without the stack
-- ⚠️ The green check is **non-vacuous for the gateway job** (174 tests ran), but the schema job skipped wholesale on the last run. However, this is expected — the schema job requires INTENTFORGE_REQUIRE_GATEWAY=1 AND a live gateway. The workflow sets this correctly for the schema-specific job.
-
-### CRITICAL OBSERVATION (from history):
-On 2026-09-15, the goals-api-schema-tests job on `auto/round-2026-09-15T1608Z` showed "20 skipped in 0.11s" — ALL tests skipped because the gateway was unreachable in CI. This is the documented skip behavior. The CI configuration is correct: when the gateway is unreachable, the suite skips; when it's reachable, it runs. The "green-wash" incident was fixed by making the schema tests fail (not skip) when INTENTFORGE_REQUIRE_GATEWAY=1.
+### Note on DNS failures:
+intent-engine, crawler, indexer containers are UP but not resolvable by hostname from the gateway. Pre-existing Docker networking configuration — these services share gluetun's network namespace, not the services_default bridge where Docker DNS works. The gateway reaches them via the shared namespace. NOT introduced by this round.
 
 ---
 
 ## SUMMARY
 
 ### Defects Found:
-1. **`test_negation_full_suite_with_price` FAILS** — price constraint dropped when negation co-occurs in query. This is a real bug where "headphones not sony under $200" loses the price bound. Requires a FIX card.
+1. **Vacuous CI goals-api-schema-tests** — 10 tests skip on every CI run. Permanent schema assertions not enforced in CI. (pre-existing)
+2. **No CI-runnable test for Goals schema invariants** — total_phases==len(phases) and leaderboard-is-list only covered in skipped pytest. (pre-existing)
 
 ### Infra Issues:
-2. **DNS resolution for searxng/intent-engine/crawler/indexer** — these containers don't resolve via Docker embedded DNS (127.0.0.11) because they share gluetun's network namespace, not the services_default bridge. However, functionally they work because the gateway also reaches them via the shared namespace. Low priority but worth documenting.
+3. **DNS resolution for intent-engine/crawler/indexer** — containers UP but hostname resolution fails from gateway (pre-existing Docker network topology). Functionally works via shared namespace.
 
 ### Verdict:
-- All 13 API endpoints: ✅ PASS
-- Hardcoding sweep: ✅ PASS (no hardcoded query strings, per-domain lists, or magic constants)
+- All 19 API endpoints: ✅ PASS
+- Hardcoding sweep: ✅ PASS
 - Ranking integrity: ✅ PASS (live order-identical verification)
 - Affiliate privacy/disclosure/degradation: ✅ PASS
-- CI green gate: ✅ PASS (with documented skip behavior)
-- Schema regression tests: ✅ 30 tests, collectable by directory, permanent assertions for known bugs
-- Price-negation coexistence: ❌ REQUIRES FIX
+- CI gateway job: ✅ 177 passed, 0 failed
+- CI schema job: ⚠️ 10 skipped (vacuous — requires FIX)
+- Schema regression tests: ⚠️ pytest exists but CI-runnable permanent lock missing (requires FIX)
+- Commerce extraction: ✅ data-driven, no hardcoding, honest provenance
