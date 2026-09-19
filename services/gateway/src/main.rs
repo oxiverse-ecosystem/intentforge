@@ -18,6 +18,7 @@ mod geoloc;
 mod dictionary;
 mod clean;
 mod goals;
+mod query_expansion;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
 // ─── API Types ───────────────────────────────────────────────────────
@@ -16077,16 +16078,15 @@ async fn handle_search(
     //      while still returning results about Java if that is all there is.
     //   4. Goldilocks detection: when multiple negative constraints remove everything,
     //      relax the penalty to preserve domain-relevant results.
+    //   5. Soft-match mode (for 0-result retry): never hard-drop; instead score by
+    //      constraint satisfaction count (more matches = higher rank) and fall back
+    //      to the best partial match. Never return 0 results if any partial match exists.
     if !intent.structured_constraints.negative.is_empty() {
         let before_count = web_results.len();
         let constraints_ref = &intent.structured_constraints;
+        let is_soft = constraints_ref.match_mode == MatchMode::Soft;
 
         // Filter out grammar-noise negatives BEFORE violation counting.
-        // "getting overcharged" is a state description (auxiliary verb + adjective),
-        // not a topical exclusion — every car-dealership page mentions "getting
-        // overcharged" in passing, so hard-dropping on it collapses the result set.
-        // is_exclusion_grammar_noise already handles single-word function words
-        // ("have", "from"); this extends the same guard to multi-word phrases.
         let effective_negatives: Vec<String> = constraints_ref.negative.iter()
             .filter(|n| !is_exclusion_grammar_noise(n))
             .cloned()
@@ -16095,14 +16095,7 @@ async fn handle_search(
         // Score each result and track violation counts
         let mut scored: Vec<(usize, f32, usize)> = web_results.iter().enumerate().map(|(i, r)| {
             let c_score = constraint_score(&r.title, &r.content, &r.url, constraints_ref);
-            // Check if this is an alternative-listing page (comparison, vs, alternatives)
-            // BEFORE counting violations — alt pages naturally mention excluded terms
-            // in comparative context ("Django vs FastAPI vs Flask: Which to Choose").
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-            // Count how many negative terms actually match this result content.
-            // Skip violation counting for alternative-listing pages: their mention of
-            // excluded terms is referential, not topical. The soft filter would otherwise
-            // drop them before the alt-aware hard filter can preserve them.
             let violations = if alt_score > 0.3 {
                 0
             } else {
@@ -16111,7 +16104,6 @@ async fn handle_search(
                     let n_lower = n.to_lowercase();
                     let n_words: Vec<&str> = n_lower.split_whitespace().collect();
                     if n_words.len() == 1 {
-                        // Word-boundary aware — "java" must not match "javascript".
                         text_matches_negative(&text, &n_lower)
                     } else {
                         text.contains(&n_lower)
@@ -16137,55 +16129,13 @@ async fn handle_search(
         // the negative constraints are too aggressive for this result set.
         let is_goldilocks = avg_violations > 1.5 && min_violations >= 1;
 
-        // Filter strategy:
-        // - Normal case: keep results with violations <= 1 (clean match)
-        // - Goldilocks case: keep results with violations <= max_violations / 2 (relaxed)
-        // - 3+ negatives: zero violations only (unless ALL have violations)
-        let is_only_negative = constraints_ref.positive.is_empty();
-        // A negative constraint means "exclude results that match". When there is
-        // at least one clean result (no negative match) we drop every matching
-        // result. When *all* results match (degenerate set) we fall back to the
-        // Goldilocks relaxation below so we never return an empty page. Pure
-        // negation ("-trump") and mixed queries both expect matches to be removed.
-        let violation_threshold = if is_goldilocks {
-            tracing::warn!("GOLDILOCKS: avg_violations={:.1} max={} - relaxing constraint threshold",
-                avg_violations, max_violations
-            );
-            (max_violations / 2).max(1)
-        } else if min_violations == 0 {
-            0
-        } else if is_only_negative {
-            0
-        } else {
-            0
-        };
-
-        let kept: Vec<usize> = scored.iter()
-            .filter(|(_, _, v)| *v <= violation_threshold)
-            .map(|(i, _, _)| *i)
-            .collect();
-
-        let removed = before_count.saturating_sub(kept.len());
-        if removed > 0 {
-            tracing::info!(
-                "Negative constraint hard filter: removed {}/{} web results (violations max={} min={} avg={:.1})",
-                removed, before_count, max_violations, min_violations, avg_violations
-            );
-        }
-
-        if !kept.is_empty() {
-            // Keep results in sorted order (fewest violations first, highest score within)
-            web_results = kept.iter().map(|i| web_results[*i].clone()).collect();
-        } else {
-            // Fallback: keep results sorted by violations (ascending) but do not filter
-            // This preserves ordering so results with FEWER violations rank higher.
-            tracing::warn!(
-                "Negative constraint filter removed all {} results - keeping sorted by violations",
-                before_count
-            );
+        // === SOFT-MATCH MODE ===
+        // In soft mode (used by 0-result retry logic), never hard-drop results.
+        // Instead, score each result by how many constraints are satisfied
+        // (more matches = higher rank). Graduated penalty: each violation halves
+        // the effective score. Always returns at least one result — never zero.
+        if is_soft {
             let sorted_indices: Vec<usize> = scored.iter().map(|(i, _, _)| *i).collect();
-            // Apply graduated penalty: each violation halves the effective score
-            // so results with fewer violations naturally rank higher.
             let mut scored_results: Vec<SearxResult> = sorted_indices.iter().map(|i| {
                 let mut r = web_results[*i].clone();
                 let violations = scored.iter().find(|(j, _, _)| *j == *i).map(|(_, _, v)| *v).unwrap_or(0);
@@ -16196,6 +16146,62 @@ async fn handle_search(
             // Sort by penalized score to push multi-violation results down
             scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
             web_results = scored_results;
+            tracing::info!(
+                "SOFT-MATCH: {} results, graduated penalty applied (max_violations={}, avg={:.1})",
+                web_results.len(), max_violations, avg_violations
+            );
+        } else {
+            // === HARD-MATCH MODE (default) ===
+            // Filter strategy:
+            // - Normal case: keep results with violations <= 1 (clean match)
+            // - Goldilocks case: keep results with violations <= max_violations / 2 (relaxed)
+            // - 3+ negatives: zero violations only (unless ALL have violations)
+            let is_only_negative = constraints_ref.positive.is_empty();
+            let violation_threshold = if is_goldilocks {
+                tracing::warn!("GOLDILOCKS: avg_violations={:.1} max={} - relaxing constraint threshold",
+                    avg_violations, max_violations
+                );
+                (max_violations / 2).max(1)
+            } else if min_violations == 0 {
+                0
+            } else if is_only_negative {
+                0
+            } else {
+                0
+            };
+
+            let kept: Vec<usize> = scored.iter()
+                .filter(|(_, _, v)| *v <= violation_threshold)
+                .map(|(i, _, _)| *i)
+                .collect();
+
+            let removed = before_count.saturating_sub(kept.len());
+            if removed > 0 {
+                tracing::info!(
+                    "Negative constraint hard filter: removed {}/{} web results (violations max={} min={} avg={:.1})",
+                    removed, before_count, max_violations, min_violations, avg_violations
+                );
+            }
+
+            if !kept.is_empty() {
+                // Keep results in sorted order (fewest violations first, highest score within)
+                web_results = kept.iter().map(|i| web_results[*i].clone()).collect();
+            } else {
+                // Fallback: keep results sorted by violations (ascending) but do not filter
+                tracing::warn!(
+                    "Negative constraint filter removed all {} results - keeping sorted by violations",
+                    before_count
+                );
+                let sorted_indices: Vec<usize> = scored.iter().map(|(i, _, _)| *i).collect();
+                let mut scored_results: Vec<SearxResult> = sorted_indices.iter().map(|i| {
+                    let mut r = web_results[*i].clone();
+                    let violations = scored.iter().find(|(j, _, _)| *j == *i).map(|(_, _, v)| *v).unwrap_or(0);
+                    r.score *= 0.5_f32.powi(violations as i32);
+                    r
+                }).collect();
+                scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                web_results = scored_results;
+            }
         }
     }
 
