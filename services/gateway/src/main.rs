@@ -14355,10 +14355,20 @@ async fn handle_search(
                 || q_lower.contains("cve-") || q_lower.contains("vulnerability")
                 || q_lower.contains("this week") || q_lower.contains("this month")
                 || q_lower.contains("past week") || q_lower.contains("last week");
-            let has_topic_signal = q_lower.contains("news") || q_lower.contains("update")
-                || q_lower.contains("today") || q_lower.contains("this week")
-                || q_lower.contains("2026") || q_lower.contains("2025")
-                || q_lower.contains("release") || q_lower.contains("version");
+            // FIX-IF-16 (2026-09-19): Replace generic topic signal with
+            // news-term co-occurrence. The old has_topic_signal included
+            // "2026"/"2025"/"release"/"version" which wrongly forced fresh
+            // on "latest developments in lab grown meat 2026". Now the
+            // override fires ONLY when "latest"/"recent" co-occurs with
+            // an actual news noun OR the query is about a known news domain.
+            let news_cooccurrence = ["news", "today", "update", "report",
+                "study", "research", "headline", "headlines", "breaking"];
+            let has_news_cooccurrence = news_cooccurrence.iter().any(|t| q_lower.contains(t));
+            let news_domains = ["politics", "political", "technology", "tech",
+                "science", "health", "world", "business", "economy", "economics",
+                "environment", "climate", "education", "sports", "entertainment"];
+            let is_news_domain = news_domains.iter().any(|d| q_lower.contains(d));
+            let has_topic_signal = has_news_cooccurrence || is_news_domain;
             // Don't clobber a fresh intent that the engine already set.
             if intent.intent != "fresh" && has_news_signal && has_topic_signal {
                 tracing::info!(
