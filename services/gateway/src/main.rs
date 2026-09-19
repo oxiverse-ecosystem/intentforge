@@ -15889,6 +15889,36 @@ async fn handle_search(
     // date / detectable price. These let us report applied-vs-ignored
     // constraints honestly instead of silently returning empty or unfiltered.
     let pre_filter_count = web_results.len();
+
+    // Source-diversity gate: if >80% of pre-filter results come from a single
+    // source, log a warning AND apply a diversity penalty (×0.5) to that
+    // dominant source's results. Data-driven — no hardcoded query strings.
+    {
+        let mut source_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for r in &web_results {
+            for s in &r.sources {
+                *source_counts.entry(s.to_lowercase()).or_insert(0) += 1;
+            }
+        }
+        if !source_counts.is_empty() {
+            let total = web_results.len() as f32;
+            for (source, count) in &source_counts {
+                let pct = (*count as f32) / total;
+                if pct > 0.8 {
+                    tracing::warn!(
+                        "SOURCE-DIVERSITY GATE: source '{}' dominates {}/{} results ({:.1}%) — applying ×0.5 penalty",
+                        source, count, web_results.len(), pct * 100.0
+                    );
+                    for r in web_results.iter_mut() {
+                        if r.sources.iter().any(|s| s.to_lowercase() == *source) {
+                            r.score *= 0.5;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let dated_result_count = web_results.iter().filter(|r| {
         resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
     }).count();
