@@ -8421,12 +8421,33 @@ fn is_weak_anchor_word(w: &str) -> bool {
 /// Examples: "macbook air m2", "iphone 16 pro max", "sony wh-1000xm5"
 fn detect_product_entities(query: &str) -> Vec<String> {
     let q_lower = query.to_lowercase();
+    // Words that describe a shopping intent but are NOT part of a product's
+    // identity. A query like "refurbished macbook air m2 deals" must yield
+    // the entity "macbook air m2", not "refurbished macbook air m2 deals".
+    // General commerce/condition vocabulary — no per-product literals.
+    let commerce_prefix: &[&str] = &[
+        "buy", "bought", "purchase", "purchasing", "shop", "shopping", "store",
+        "price", "prices", "pricing", "cheap", "cheapest", "sale", "sales",
+        "deal", "deals", "discount", "refurbished", "used", "new", "offer",
+        "offers", "budget", "under", "near", "where", "best", "top", "review",
+        "reviews", "cost", "costs", "affordable", "recommend", "recommended",
+        "recommendation", "compare", "comparison", "versus", "vs",
+    ];
+    // Strip leading commerce words so the regex anchors on the real product name.
+    let mut start_word = 0usize;
+    let words: Vec<&str> = q_lower.split_whitespace().collect();
+    while start_word < words.len() && commerce_prefix.contains(&words[start_word]) {
+        start_word += 1;
+    }
+    let stripped: String = words[start_word..].join(" ");
+    let search_in = if stripped.is_empty() { &q_lower } else { &stripped };
+
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
         regex::Regex::new(r"(?i)\b([a-z]+(?:\s+[a-z]+)*\s+[a-z]?\d[\w\-]*(?:\s*(?:pro|max|plus|ultra|air|lite|se))?)\b").unwrap()
     });
     let mut entities: Vec<String> = Vec::new();
-    for cap in re.captures_iter(&q_lower) {
+    for cap in re.captures_iter(search_in) {
         if let Some(m) = cap.get(1) {
             let e = m.as_str().trim().to_string();
             if e.len() >= 4 && !entities.contains(&e) {
@@ -8461,26 +8482,48 @@ fn entity_match_score(title: &str, content: &str, url: &str, entities: &[String]
         let in_content = c.contains(&el);
         let in_url = u.contains(&el);
         if in_title {
-            total_boost *= 1.30; // strong title match
+            total_boost *= 1.60; // strong title match — full entity named in headline
         } else if in_content {
-            total_boost *= 1.15; // content match
+            total_boost *= 1.30; // content match
         } else if in_url {
-            total_boost *= 1.10; // URL match
+            total_boost *= 1.20; // URL match (amazon.com/dp/...macbook-air-m2...)
         } else {
-            // Check if at least one word from the entity appears
+            // Check how many entity words appear. A result that names NONE of
+            // the entity words is almost certainly off-topic (e.g. a generic
+            // "eBay Refurbished Products" page for a "macbook air m2" query).
+            // Hard demotion so calibration can't rescale it back up.
             let words: Vec<&str> = el.split_whitespace().collect();
             let matched_words: Vec<&&str> = words.iter().filter(|w| {
                 let wl = w.to_lowercase();
                 t.contains(&wl) || c.contains(&wl) || u.contains(&wl)
             }).collect();
             if matched_words.is_empty() {
-                total_boost *= 0.50; // entity completely missing → demote
+                total_boost *= 0.25; // entity completely missing → hard demote
             } else if matched_words.len() < words.len() {
-                total_boost *= 0.75; // partial entity match
+                // Partial match: scale demotion by how many words missing.
+                // "macbook air m2" with only "macbook" matched → 0.40
+                // (one of three entity words → still mostly off-topic)
+                let coverage = matched_words.len() as f32 / words.len() as f32;
+                total_boost *= 0.30 + 0.30 * coverage; // 0.30–0.60 range
             }
         }
     }
     total_boost
+}
+
+/// Detects whether a URL host is a known retailer/vendor domain that sells
+/// physical products. General set — no per-brand literals beyond the obvious
+/// marketplace names. Used for transactional queries to boost results from
+/// stores that are likely to stock the queried product.
+fn is_retailer_host(host: &str) -> bool {
+    let h = host.to_lowercase();
+    let retailer_suffixes: &[&str] = &[
+        "amazon.", "ebay.", "bestbuy.", "walmart.", "target.", "newegg.",
+        "aliexpress.", "etsy.", "alibaba.", "rakuten.", "flipkart.",
+        "snapdeal.", "shopify.", "shop.", "store.", "stores.",
+        "apple.com", "store.apple.com",
+    ];
+    retailer_suffixes.iter().any(|s| h.ends_with(s) || h == s.trim_end_matches('.'))
 }
 
 /// timepieces, not videos. Standalone "watch" does not imply video intent; requires
@@ -8840,6 +8883,39 @@ fn merge_local_and_web(
         .copied()
         .filter(|w| !is_weak_anchor_word(&w.to_lowercase()))
         .collect();
+    // Phrase-fidelity: compute contiguous runs of 2+ strong distinctive terms
+    // in the original query order. These are multi-word phrases like
+    // "zero knowledge proof" or "computer science" that must appear as a
+    // contiguous run in the result title to avoid scattered-token false
+    // matches (e.g., "0 - Wikipedia" matching "zero" alone).
+    let query_strong_runs: Vec<Vec<String>> = {
+        let mut runs = Vec::new();
+        let mut current_run = Vec::new();
+        for w in &q_words {
+            let wl = w.to_lowercase();
+            let is_strong = wl.len() >= 3
+                && !stop_words.contains(wl.as_str())
+                && !generic_web_terms.contains(wl.as_str())
+                && !unit_terms.contains(wl.as_str())
+                && !role_descriptor_terms.contains(wl.as_str())
+                && !weak_discriminative.contains(wl.as_str())
+                && !temporal_fillers.contains(wl.as_str())
+                && !wl.chars().all(|c| c.is_ascii_digit())
+                && !is_weak_anchor_word(&wl);
+            if is_strong {
+                current_run.push(wl);
+            } else {
+                if current_run.len() >= 2 {
+                    runs.push(current_run.clone());
+                }
+                current_run.clear();
+            }
+        }
+        if current_run.len() >= 2 {
+            runs.push(current_run);
+        }
+        runs
+    };
     // P2d round-2026-08-20T1935Z: function-scope subject-term carrier so the
     // POST-CALIBRATION cap (the only place a crush survives calibrate_scores'
     // linear rescale) can re-test each local page's title against the query's
@@ -10377,7 +10453,39 @@ fn merge_local_and_web(
         } else {
             1.0
         };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * entity_mult;
+        // Phrase-fidelity gate (P12): penalize results whose title matches
+        // only scattered single tokens from a multi-word phrase. A query like
+        // "zero knowledge proof" should NOT match "0 - Wikipedia" just because
+        // "zero" is present. Compute the longest contiguous run of strong
+        // distinctive terms in the result title; if the query has a 2+ term
+        // run but the title has no 2+ contiguous run, apply a soft penalty
+        // (×0.55) so the result stays but ranks below genuine phrase matches.
+        let phrase_fidelity_mult = if !query_strong_runs.is_empty() {
+            let title_lower = r.title.to_lowercase();
+            let title_words: Vec<&str> = title_lower.split_whitespace().collect();
+            // Check if any query run appears as a contiguous subsequence
+            let mut max_run_len = 0usize;
+            for run in &query_strong_runs {
+                if run.len() < 2 { continue; }
+                // Sliding window: check if run appears contiguously in title_words
+                for window in title_words.windows(run.len()) {
+                    if window.iter().all(|w| run.contains(w)) {
+                        max_run_len = max_run_len.max(run.len());
+                        break;
+                    }
+                }
+            }
+            if max_run_len >= 2 {
+                1.0 // contiguous phrase match found — full weight
+            } else {
+                // No contiguous phrase match — penalize so scattered-token
+                // pages rank below ones that contain the actual phrase.
+                0.55
+            }
+        } else {
+            1.0
+        };
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * entity_mult * phrase_fidelity_mult;
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
