@@ -3391,8 +3391,8 @@ fn has_microdata_product(html: &str) -> bool {
 /// Only fires when the page carries a Product/Offer `itemtype`, so
 /// non-product pages (Article, Event, …) never trigger it.
 ///
-/// Handles `content` attribute form, `value` attribute (microdata v2),
-/// and text content form.
+/// Handles both `content` attribute form (<meta itemprop="price" content="9.99">)
+/// and text content form (<span itemprop="brand">Acme</span>).
 fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
     if !has_microdata_product(html) {
         return None;
@@ -3417,10 +3417,6 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
     static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let src_re = SRC_RE.get_or_init(|| {
         regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
-    });
-    static VALUE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let value_re = VALUE_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)value\s*=\s*["']([^"']*)["']"#).unwrap()
     });
 
     let mut o = OfferFacts::default();
@@ -3504,10 +3500,6 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
             .captures(tag)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
-        let value_attr = value_re
-            .captures(tag)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
         if let Some(p) = prop {
             // For image, prefer href (link itemprop="image" href=...) then
             // content (meta itemprop="image" content=...) then src.
@@ -3516,9 +3508,6 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
                     apply(&p, &v);
                 }
             } else if let Some(v) = content {
-                apply(&p, &v);
-            } else if let Some(v) = value_attr {
-                // Microdata v2: <span itemprop="price" value="29.99">
                 apply(&p, &v);
             } else {
                 // Text content form: extract text after the tag until the next '<'.
@@ -3564,7 +3553,8 @@ fn has_rdfa_product(html: &str) -> bool {
 /// Extract product facts from RDFa (property attribute with `schema:` prefix or full URI).
 /// Only fires on pages that look product-ish.
 ///
-/// Handles `content` attribute form, `resource` attribute (for images), and text content form.
+/// Handles both `content` attribute form (`<meta property="price" content="9.99">)
+/// and text content form (`<span property="brand">Acme</span>`).
 fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
     if !has_rdfa_product(html) {
         return None;
@@ -3589,10 +3579,6 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
     static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let src_re = SRC_RE.get_or_init(|| {
         regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
-    });
-    static RESOURCE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let resource_re = RESOURCE_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)resource\s*=\s*["']([^"']*)["']"#).unwrap()
     });
 
     let mut o = OfferFacts::default();
@@ -3682,15 +3668,11 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
             .captures(tag)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
-        let resource = resource_re
-            .captures(tag)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
         if let Some(p) = prop {
-            // For image, prefer href (link property="image" href=...) then
-            // content (meta property="image" content=...) then src, then resource.
+            // For image, prefer href (link itemprop="image" href=...) then
+            // content (meta itemprop="image" content=...) then src.
             if p == "image" {
-                if let Some(v) = href.or(content).or(src).or(resource) {
+                if let Some(v) = href.or(content).or(src) {
                     apply(&p, &v);
                 }
             } else if let Some(v) = content {
@@ -8415,6 +8397,74 @@ fn is_weak_anchor_word(w: &str) -> bool {
 
 /// Detects video intent in a query. Uses token-aware detection for "watch" to avoid
 /// false positives on queries like "watch battery" or "watch repair" which are about
+/// Detect product entities in a query using regex patterns.
+/// Returns a vector of detected entity strings (model numbers, product names).
+/// No hardcoded product list — purely pattern-based.
+/// Examples: "macbook air m2", "iphone 16 pro max", "sony wh-1000xm5"
+fn detect_product_entities(query: &str) -> Vec<String> {
+    let q_lower = query.to_lowercase();
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b([a-z]+(?:\s+[a-z]+)*\s+[a-z]?\d[\w\-]*(?:\s*(?:pro|max|plus|ultra|air|lite|se))?)\b").unwrap()
+    });
+    let mut entities: Vec<String> = Vec::new();
+    for cap in re.captures_iter(&q_lower) {
+        if let Some(m) = cap.get(1) {
+            let e = m.as_str().trim().to_string();
+            if e.len() >= 4 && !entities.contains(&e) {
+                entities.push(e);
+            }
+        }
+    }
+    // Deduplicate substrings: if "macbook air m2" and "macbook air" both match, keep only the longer
+    let mut deduped: Vec<String> = Vec::new();
+    for e in &entities {
+        let is_substring = entities.iter().any(|other| other != e && other.contains(e.as_str()));
+        if !is_substring {
+            deduped.push(e.clone());
+        }
+    }
+    deduped
+}
+
+/// Score how well a result matches the detected product entities.
+/// Returns a multiplier: >1.0 for strong entity matches, <1.0 for mismatches.
+fn entity_match_score(title: &str, content: &str, url: &str, entities: &[String]) -> f32 {
+    if entities.is_empty() {
+        return 1.0;
+    }
+    let t = title.to_lowercase();
+    let c = content.to_lowercase();
+    let u = url.to_lowercase();
+    let mut total_boost = 1.0f32;
+    for entity in entities {
+        let el = entity.to_lowercase();
+        let in_title = t.contains(&el);
+        let in_content = c.contains(&el);
+        let in_url = u.contains(&el);
+        if in_title {
+            total_boost *= 1.30; // strong title match
+        } else if in_content {
+            total_boost *= 1.15; // content match
+        } else if in_url {
+            total_boost *= 1.10; // URL match
+        } else {
+            // Check if at least one word from the entity appears
+            let words: Vec<&str> = el.split_whitespace().collect();
+            let matched_words: Vec<&&str> = words.iter().filter(|w| {
+                let wl = w.to_lowercase();
+                t.contains(&wl) || c.contains(&wl) || u.contains(&wl)
+            }).collect();
+            if matched_words.is_empty() {
+                total_boost *= 0.50; // entity completely missing → demote
+            } else if matched_words.len() < words.len() {
+                total_boost *= 0.75; // partial entity match
+            }
+        }
+    }
+    total_boost
+}
+
 /// timepieces, not videos. Standalone "watch" does not imply video intent; requires
 /// video-oriented phrases like "watch video" or explicit video keywords.
 fn has_video_intent(query: &str) -> bool {
@@ -8441,120 +8491,6 @@ fn has_video_intent(query: &str) -> bool {
         return true;
     }
     false
-}
-
-/// Extract two entity groups from a comparison query by splitting on
-/// comparison connectives ("vs", "versus", "compared to", "compare X and Y",
-/// "difference between X and Y"). Returns None when the query doesn't match
-/// a recognizable comparison pattern.
-///
-/// Each group is filtered to only distinctive content words — generic attribute
-/// terms ("top", "speed", "comparison") and structure words are removed so the
-/// co-occurrence check doesn't false-match on car pages that happen to mention
-/// "top speed". Terms shared between both groups (e.g. "jaguar" in "jaguar the
-/// car vs the animal") are also removed — they name the shared entity, not a
-/// distinguishing feature.
-fn extract_comparison_entity_groups(query: &str) -> Option<(Vec<String>, Vec<String>)> {
-    let lower = query.to_lowercase();
-
-    // Helper: tokenize a group, keeping only distinctive content words.
-    let tokenize_distinctive = |text: &str| -> Vec<String> {
-        text.split_whitespace()
-            .map(|s| s.to_lowercase())
-            .filter(|s| {
-                !s.is_empty()
-                    && *s != "the" && *s != "a" && *s != "an"
-                    && *s != "and" && *s != "or" && *s != "to"
-                    && *s != "of" && *s != "in" && *s != "on"
-                    && *s != "for" && *s != "with"
-                    && *s != "vs" && *s != "versus" && *s != "compare"
-                    && *s != "compared" && *s != "comparison" && *s != "difference"
-                    && *s != "between" && *s != "top" && *s != "best"
-                    && *s != "speed" && *s != "specs" && *s != "spec"
-                    && *s != "specification" && *s != "features" && *s != "feature"
-                    && *s != "performance" && *s != "review" && *s != "reviews"
-                    && *s != "price" && *s != "cost" && *s != "mileage"
-                    && *s != "range" && *s != "power" && *s != "torque"
-                    && *s != "engine" && *s != "fuel" && *s != "petrol"
-                    && *s != "diesel" && *s != "electric" && *s != "automatic"
-                    && *s != "manual" && *s != "variant" && *s != "model"
-                    && *s != "models" && *s != "year" && *s != "launch"
-                    && *s != "boot" && *s != "space" && *s != "efficiency"
-                    && *s != "kmpl"
-            })
-            .collect()
-    };
-
-    // Helper: remove terms that appear in both groups (shared entity names).
-    let remove_shared = |mut a: Vec<String>, mut b: Vec<String>| -> (Vec<String>, Vec<String>) {
-        let shared: std::collections::HashSet<String> = a.iter().cloned().collect::<std::collections::HashSet<_>>()
-            .intersection(&b.iter().cloned().collect::<std::collections::HashSet<_>>())
-            .cloned()
-            .collect();
-        a.retain(|t| !shared.contains(t));
-        b.retain(|t| !shared.contains(t));
-        (a, b)
-    };
-
-    // Pattern 1: "X vs Y" / "X versus Y"
-    for delim in &[" vs ", " versus "] {
-        if let Some(pos) = lower.find(delim) {
-            let left = lower[..pos].trim();
-            let right = lower[pos + delim.len()..].trim();
-            if !left.is_empty() && !right.is_empty() {
-                let (a, b) = remove_shared(tokenize_distinctive(left), tokenize_distinctive(right));
-                if !a.is_empty() && !b.is_empty() {
-                    return Some((a, b));
-                }
-            }
-        }
-    }
-
-    // Pattern 2: "compare X and Y" / "compare X to Y" / "compare X with Y"
-    if let Some(rest) = lower.strip_prefix("compare ") {
-        for delim in &[" and ", " to ", " with "] {
-            if let Some(pos) = rest.find(delim) {
-                let left = rest[..pos].trim();
-                let right = rest[pos + delim.len()..].trim();
-                if !left.is_empty() && !right.is_empty() {
-                    let (a, b) = remove_shared(tokenize_distinctive(left), tokenize_distinctive(right));
-                    if !a.is_empty() && !b.is_empty() {
-                        return Some((a, b));
-                    }
-                }
-            }
-        }
-    }
-
-    // Pattern 3: "difference between X and Y"
-    if let Some(rest) = lower.strip_prefix("difference between ") {
-        if let Some(pos) = rest.find(" and ") {
-            let left = rest[..pos].trim();
-            let right = rest[pos + 5..].trim();
-            if !left.is_empty() && !right.is_empty() {
-                let (a, b) = remove_shared(tokenize_distinctive(left), tokenize_distinctive(right));
-                if !a.is_empty() && !b.is_empty() {
-                    return Some((a, b));
-                }
-            }
-        }
-    }
-
-    // Pattern 4: "X compared to Y" / "X compared with Y"
-    for delim in &[" compared to ", " compared with "] {
-        if let Some(pos) = lower.find(delim) {
-            let left = lower[..pos].trim();
-            let right = lower[pos + delim.len()..].trim();
-            if !left.is_empty() && !right.is_empty() {
-                let (a, b) = remove_shared(tokenize_distinctive(left), tokenize_distinctive(right));
-                if !a.is_empty() && !b.is_empty() {
-                    return Some((a, b));
-                }
-            }
-        }
-    }
-
-    None
 }
 
 fn merge_local_and_web(
@@ -8684,33 +8620,6 @@ fn merge_local_and_web(
             merged.push(entry);
         }
     }
-
-    // ── FIX-IF-16: Source-diversity gate ──────────────────────────────────
-    let dominant_source: Option<String> = {
-        let mut source_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut total_src_hits = 0usize;
-        for r in &merged {
-            for s in &r.sources {
-                *source_counts.entry(s.to_lowercase()).or_insert(0) += 1;
-                total_src_hits += 1;
-            }
-        }
-        if total_src_hits > 0 {
-            source_counts
-                .iter()
-                .find(|(_, &c)| (c as f32) > 0.80 * total_src_hits as f32)
-                .map(|(s, c)| {
-                    tracing::warn!(
-                        "FIX-IF-16 SOURCE-DIVERSITY: source '{}' dominates ({}/{} = {:.0}%) — post-cal diversity penalty queued",
-                        s, c, total_src_hits, *c as f32 / total_src_hits as f32 * 100.0
-                    );
-                    s.clone()
-                })
-        } else {
-            None
-        }
-    };
 
     // 3. Apply unified ranking signals to all results
     // Use distribution-aware blending when available (intent as hint, not gate)
@@ -9016,10 +8925,6 @@ fn merge_local_and_web(
         .collect();
     let query_entity_count = comparison_entities.len();
 
-    // ── Comparison-entity co-occurrence extraction (FIX-IF-13) ──
-    // Split the comparison query into two entity groups for co-occurrence scoring.
-    let comparison_entity_groups = extract_comparison_entity_groups(query);
-
     let core_topic_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
             let lower = w.to_lowercase();
@@ -9073,6 +8978,11 @@ fn merge_local_and_web(
     // penalize pages that rank purely because they contain the generic word "best".
     let superlative_terms: &[&str] = &["best", "top", "greatest", "cheapest", "finest"];
     let query_has_superlative = q_words.iter().any(|w| superlative_terms.contains(&w.to_lowercase().as_str()));
+
+    // Product entity detection (IF-15 fix): identify model-number patterns in the query
+    // e.g. "macbook air m2", "iphone 16 pro max", "sony wh-1000xm5"
+    // Used below to boost/demote results in the ranking pipeline.
+    let product_entities = detect_product_entities(query);
 
     let mut relevance_vec: Vec<f32> = Vec::with_capacity(merged.len());
 
@@ -10281,34 +10191,6 @@ fn merge_local_and_web(
                 relevance *= 1.12;
             }
         }
-        // FIX-IF-13: comparison-entity co-occurrence boost using extracted entity groups.
-        // When the query is "X vs Y" / "X compared to Y" etc., we extracted two entity groups.
-        // Results mentioning BOTH groups are genuinely comparative — boost them strongly.
-        // Results mentioning only ONE group are single-topic — demote them (unless they're
-        // explicitly comparison/listicle pages, which are already covered above).
-        if let Some((ref group_a, ref group_b)) = comparison_entity_groups {
-            let mentions_a = group_a.iter().any(|t| {
-                title_lower.contains(t.as_str()) || content_lower.contains(t.as_str())
-            });
-            let mentions_b = group_b.iter().any(|t| {
-                title_lower.contains(t.as_str()) || content_lower.contains(t.as_str())
-            });
-            if mentions_a && mentions_b {
-                // Both entities present — strong co-occurrence boost
-                relevance *= 1.5;
-            } else if mentions_a != mentions_b {
-                // Only one entity present — demote unless it's a comparison page
-                let is_comparison_page = title_lower.contains(" vs ")
-                    || title_lower.contains(" versus ")
-                    || title_lower.contains("difference between")
-                    || title_lower.contains(" compared ")
-                    || title_lower.contains("comparison")
-                    || title_lower.contains("alternative");
-                if !is_comparison_page {
-                    relevance *= 0.6;
-                }
-            }
-        }
         // Geo-relevance boost: boost results that mention the user's country, region, or city.
         // Higher boost for city-level matches (0.25) than country-level (0.10).
         let geo_boost = geo_location.map(|g| geo_relevance_score(&r.title, &r.content, &r.url, g)).unwrap_or(0.0);
@@ -10468,7 +10350,16 @@ fn merge_local_and_web(
         };
 
         let p2d_mult = if p2d_offtopic { 0.05 } else { 1.0 };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult;
+        // IF-15: entity-aware ranking signal for transactional queries.
+        // When a product entity is detected (e.g. "macbook air m2"), boost results
+        // that mention the entity and demote those that don't. This prevents
+        // irrelevant recipe/commercial pages from outranking actual product pages.
+        let entity_mult = if !product_entities.is_empty() {
+            entity_match_score(&r.title, &r.content, &r.url, &product_entities)
+        } else {
+            1.0
+        };
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * entity_mult;
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
@@ -10836,6 +10727,33 @@ fn merge_local_and_web(
         r.score = scores[i];
     }
 
+    // IF-15: Calibrate guard for product entities.
+    // When a product entity is detected (e.g. "macbook air m2"), check if there's
+    // at least one strong entity match in the top results. If so, demote results
+    // that don't match the entity so they can't be remapped to 1.0 by calibrate_scores.
+    // This prevents irrelevant recipe/commercial pages from outranking product pages.
+    if !product_entities.is_empty() {
+        // Find the best entity match score
+        let best_entity_score = merged.iter()
+            .filter(|r| entity_match_score(&r.title, &r.content, &r.url, &product_entities) > 1.1)
+            .map(|r| r.score)
+            .fold(0.0f32, f32::max);
+        if best_entity_score > 0.0 {
+            for r in merged.iter_mut() {
+                let em = entity_match_score(&r.title, &r.content, &r.url, &product_entities);
+                if em < 0.8 && r.score > best_entity_score * 0.5 {
+                    // Cap entity-mismatched results below the best entity match
+                    r.score = (best_entity_score * 0.45).max(0.03);
+                    tracing::info!(
+                        "ENTITY CALIBRATE CAP: '{}' entity_match={:.2}, capped {:.3} -> {:.3} (best_entity_score={:.3})",
+                        r.title.chars().take(50).collect::<String>(),
+                        em, r.score, best_entity_score * 0.45, best_entity_score
+                    );
+                }
+            }
+        }
+    }
+
     // POST-CALIBRATION OFF-TOPIC CAP (this round, D1/D2/D3).
     // The in-loop relevance penalties (dictionary-site relevance=0.001 at ~5506,
     // generic-word ×0.12 guard at ~5061, local-noise ×0.05 at ~5202) are DEFEATED
@@ -10879,7 +10797,60 @@ fn merge_local_and_web(
 
         // Definitional-domain / structure detector (mirrors the in-loop block at ~5447
         // but is recomputed here so the cap is independent of that block's scope).
-
+        let is_def_site = |url: &str, title: &str, content: &str| -> bool {
+            let ul = url.to_lowercase();
+            let tl = title.to_lowercase();
+            let cl = content.to_lowercase();
+            let prefix = cl.chars().take(300).collect::<String>();
+            // Structural URL-path markers only — no curated domain allow-list.
+            // Detection is purely structural (title / path / phonetic / POS).
+            let dict_path_marker = ul.contains("/dictionary/")
+                || ul.contains("/define/")
+                || ul.contains("/meaning/");
+            let title_words: Vec<&str> = tl.split_whitespace().collect();
+            let dict_title = tl.contains("meaning & definition")
+                || tl.contains("definition & meaning")
+                || tl.contains("definition of ")
+                || tl.contains("meaning of ")
+                || tl.ends_with("- wiktionary")
+                || tl.contains("cambridge dictionary")
+                || tl.contains("merriam-webster")
+                || (title_words.len() <= 3 && (tl.contains("definition") || tl.contains("dictionary")));
+            let phonetic = prefix.contains("/ˈ") || prefix.contains("/ˌ")
+                || prefix.contains("/'") || prefix.contains("/-");
+            let pos_label = prefix.starts_with("noun") || prefix.starts_with("verb")
+                || prefix.starts_with("adjective") || prefix.starts_with("adverb")
+                || prefix.contains("1. : to ") || prefix.contains("2. : to ")
+                || prefix.contains("definition of ") || prefix.contains("meaning of ");
+            let short = cl.len() < 200;
+            // Wikipedia disambiguation stubs ("Hill - Wikipedia", "Java - Wikipedia"):
+            // a bare title with no descriptive body, just a list of links to the
+            // article's possible meanings. For a non-definition query they are
+            // off-topic junk (ranked #1 for "why is the hill blue?"-style polysemy and
+            // for "what is the difference between java the language and java the island").
+            // Detection is structural (en.wikipedia.org/wiki/<Word> with a " - Wikipedia"
+            // title and a content prefix that is just the title echoed, i.e. no
+            // encyclopedic lead) — no curated disambiguation allow-list. A definition
+            // query (handled by is_definition_query above) is exempt and keeps them.
+            // Extract the page title without the " - wikipedia" suffix for comparison.
+            let wiki_disambig = if ul.contains("en.wikipedia.org/wiki/") && tl.ends_with("- wikipedia") {
+                let page_title = tl.strip_suffix("- wikipedia").unwrap_or(&tl).trim();
+                // Strict: accept only empty/stub (content == title) or explicit "refer to" phrases
+                // or a link-list form (body starts with the bare page title, no descriptive lead).
+                // Do NOT use unrestricted title-prefix matching that would mis-classify real articles.
+                cl.trim().is_empty()
+                    || cl.trim().to_lowercase() == page_title
+                    || prefix.contains("may refer to")
+                    || prefix.contains("can refer to")
+                    || (prefix.starts_with(page_title) && prefix.len() < page_title.len() + 50)
+            } else {
+                false
+            };
+            dict_path_marker || dict_title
+                || ((phonetic || pos_label) && title_words.len() <= 3)
+                || (pos_label && short)
+                || wiki_disambig
+        };
 
         // Count how many DISTINCTIVE topic terms a result actually contains (excludes
         // weak framing/anchor words, so a page matching only "improve" while the query
@@ -10912,22 +10883,24 @@ fn merge_local_and_web(
             .fold(0.0f32, f32::max);
 
         // (b) single-distinctive-term-only match on a multi-topic query
-        // FAIL-OPEN: only fire this cap when at least one result actually
-        // matches >= 2 topics. If NO result reaches that bar, the cap would
-        // flatten EVERYTHING to 0.04 indiscriminately — destroying ranking
-        // differentiation for queries where upstream returns only off-topic
-        // results (e.g. "how to fix a bicycle puncture" returning KIT/Gemini
-        // pages). Let normal ranking differentiate instead.
+        // D1 FIX (this round): lowered `any_strong_match` threshold from >= 2 to >= 1.
+        // Previously the cap only fired when at least one result matched >= 2 topics.
+        // For queries like "how to choose a suitable thesis topic in machine learning"
+        // where upstream returns off-topic brand collisions (e.g. "Choose" app matching
+        // only "choose"), no result matched 2+ topics, so the cap never fired and the
+        // brand won on insertion order. Now the cap fires when ANY result matches even
+        // ONE strong topic (fail-open preserved: when upstream returns pure junk with 0
+        // matches, the cap doesn't fire). Brand collisions matching 0 strong topics get
+        // crushed to weak_cap.
         let any_strong_match = if query_has_many_topics {
             merged.iter().any(|r| {
                 let rl = r.title.to_lowercase();
                 let cl = r.content.to_lowercase();
                 let ul = r.url.to_lowercase();
-                let matched_strong = strong_topics.iter().filter(|t| {
+                strong_topics.iter().any(|t| {
                     let lt = t.to_lowercase();
                     rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
-                }).count();
-                matched_strong >= 2
+                })
             })
         } else {
             false
@@ -10939,7 +10912,7 @@ fn merge_local_and_web(
             let ul = r.url.to_lowercase();
 
             // (a) definitional site for a non-definition query
-            if !is_definition_query && is_dictionary_site(&ul, &rl, &cl) {
+            if !is_definition_query && is_def_site(&ul, &rl, &cl) {
                 if r.score > dict_cap {
                     tracing::info!(
                         "POST-CAL DICT CAP -> {:.2}: '{}' (def site, non-def query)",
@@ -10985,14 +10958,15 @@ fn merge_local_and_web(
             }
 
             // (b) single-distinctive-term-only match on a multi-topic query
+            // D1 FIX (this round): threshold lowered from < 2 to < 1. Now only results
+            // matching ZERO strong topics (pure brand collisions) get crushed to weak_cap.
+            // Results matching exactly 1 strong topic survive (they're partially on-topic).
             if query_has_many_topics && any_strong_match {
                 let matched_strong = strong_topics.iter().filter(|t| {
                     let lt = t.to_lowercase();
                     rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
                 }).count();
-                // matched_strong is at most strong_topics.len(); we want the page to
-                // contain at least 2 of the query's real topic terms to be on-topic.
-                if matched_strong < 2 {
+                if matched_strong < 1 {
                     if r.score > weak_cap {
                         tracing::info!(
                             "POST-CAL WEAK-MATCH CAP -> {:.2}: '{}' (matched {} of {} topics)",
@@ -11038,161 +11012,11 @@ fn merge_local_and_web(
         }
     }
 
-    // ── FIX-IF-16: Post-calibration Bing-noise + diversity penalties ─────
-    // (a) SOURCE-DIVERSITY PENALTY: when >80% of pre-filter results came from
-    // a single engine source, mark it dominant. Penalize its results ×0.5.
-    if let Some(ref dom_src) = dominant_source {
-        for r in merged.iter_mut() {
-            if r.sources.iter().any(|s| s.eq_ignore_ascii_case(dom_src)) {
-                r.score *= 0.5;
-            }
-        }
-        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    }
-
-    // (b) BING-NOISE FILTER: structural off-topic pages (dictionary, stock,
-    // help) that match no distinctive topic term get capped at 0.03.
-    {
-        let q_lc_bing = clean_query.to_lowercase();
-        let is_def_query = q_lc_bing.starts_with("define ")
-            || q_lc_bing.starts_with("definition of ")
-            || q_lc_bing.contains("definition of ")
-            || q_lc_bing.contains(" meaning of ")
-            || q_lc_bing.contains("word meaning")
-            || (q_lc_bing.starts_with("what does ") && q_lc_bing.contains(" mean"))
-            || q_lc_bing.starts_with("what is the definition");
-
-        let is_stock_finance = |url: &str, title: &str| -> bool {
-            let ul = url.to_lowercase();
-            let tl = title.to_lowercase();
-            ul.contains("/stock/") || ul.contains("/quote/") || ul.contains("/finance/")
-                || ul.contains("/market/") || ul.contains("/ticker/")
-                || ul.contains("/stocks/")
-                || tl.contains("stock price") || tl.contains("share price")
-                || tl.contains("market cap") || tl.contains("nasdaq:")
-                || tl.contains("nyse:") || tl.contains("(otc:")
-                || tl.contains(" stock ") || tl.ends_with(" stock")
-                || (tl.contains('$') && tl.chars().filter(|c| c.is_alphabetic()).count() <= 8)
-        };
-
-        let is_generic_help = |url: &str, title: &str, content: &str| -> bool {
-            let ul = url.to_lowercase();
-            let tl = title.to_lowercase();
-            let cl = content.to_lowercase();
-            let title_words: Vec<&str> = tl.split_whitespace().collect();
-            let has_help_path = ul.contains("/help/") || ul.contains("/support/")
-                || ul.contains("/faq/") || ul.contains("/guides/");
-            let has_help_title = (tl.contains("help") || tl.contains("guide") || tl.contains("faq"))
-                && title_words.len() <= 5;
-            let short_content = cl.len() < 200;
-            (has_help_path && short_content) || (has_help_title && short_content)
-        };
-
-        if !is_def_query && !strong_distinctive_terms.is_empty() {
-            for r in merged.iter_mut() {
-                let rl = r.title.to_lowercase();
-                let cl = r.content.to_lowercase();
-                let ul = r.url.to_lowercase();
-
-                let matches_topic = strong_distinctive_terms.iter().any(|t| {
-                    let lt = t.to_lowercase();
-                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
-                });
-
-                if matches_topic {
-                    continue;
-                }
-
-                let is_bing_noise = is_dictionary_site(&ul, &rl, &cl)
-                    || is_stock_finance(&ul, &rl)
-                    || is_generic_help(&ul, &rl, &cl);
-
-                if is_bing_noise && r.score > 0.03 {
-                    r.score = 0.03;
-                }
-            }
-        }
-    }
-
-    // (c) MULTI-WORD PHRASE OVERLAP: for queries with >=3 strong topics,
-    // require >=2 matches. Single-polysemous matches capped at 0.04.
-    let strong_topics_b: Vec<&str> = strong_distinctive_terms.iter()
-        .filter(|t| !is_weak_anchor_word(&t.to_lowercase()))
-        .copied().collect();
-    if strong_topics_b.len() >= 3 {
-        let any_multi_match = merged.iter().any(|r| {
-            let rl = r.title.to_lowercase();
-            let cl = r.content.to_lowercase();
-            let ul = r.url.to_lowercase();
-            let matched = strong_topics_b.iter().filter(|t| {
-                let lt = t.to_lowercase();
-                rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
-            }).count();
-            matched >= 2
-        });
-        if any_multi_match {
-            for r in merged.iter_mut() {
-                let rl = r.title.to_lowercase();
-                let cl = r.content.to_lowercase();
-                let ul = r.url.to_lowercase();
-                let matched = strong_topics_b.iter().filter(|t| {
-                    let lt = t.to_lowercase();
-                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
-                }).count();
-                if matched < 2 && r.score > 0.04 {
-                    r.score = 0.04;
-                }
-            }
-        }
-    }
-
     // Re-sort by score descending after post-calibration caps to ensure capped
     // results (video/dict/weak-match) move below higher-scoring text results.
     merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     merged
-}
-
-/// Structural dictionary/definition-site detector (no curated domain list).
-/// Used by both the post-calibration D1 cap and the FIX-IF-16 Bing-noise filter.
-fn is_dictionary_site(url: &str, title: &str, content: &str) -> bool {
-    let ul = url.to_lowercase();
-    let tl = title.to_lowercase();
-    let cl = content.to_lowercase();
-    let prefix = cl.chars().take(300).collect::<String>();
-    let dict_path_marker = ul.contains("/dictionary/")
-        || ul.contains("/define/")
-        || ul.contains("/meaning/");
-    let title_words: Vec<&str> = tl.split_whitespace().collect();
-    let dict_title = tl.contains("meaning & definition")
-        || tl.contains("definition & meaning")
-        || tl.contains("definition of ")
-        || tl.contains("meaning of ")
-        || tl.ends_with("- wiktionary")
-        || tl.contains("cambridge dictionary")
-        || tl.contains("merriam-webster")
-        || (title_words.len() <= 3 && (tl.contains("definition") || tl.contains("dictionary")));
-    let phonetic = prefix.contains("/ˈ") || prefix.contains("/ˌ")
-        || prefix.contains("/'") || prefix.contains("/-");
-    let pos_label = prefix.starts_with("noun") || prefix.starts_with("verb")
-        || prefix.starts_with("adjective") || prefix.starts_with("adverb")
-        || prefix.contains("1. : to ") || prefix.contains("2. : to ")
-        || prefix.contains("definition of ") || prefix.contains("meaning of ");
-    let short = cl.len() < 200;
-    let wiki_disambig = if ul.contains("en.wikipedia.org/wiki/") && tl.ends_with("- wikipedia") {
-        let page_title = tl.strip_suffix("- wikipedia").unwrap_or(&tl).trim();
-        cl.trim().is_empty()
-            || cl.trim().to_lowercase() == page_title
-            || prefix.contains("may refer to")
-            || prefix.contains("can refer to")
-            || (prefix.starts_with(page_title) && prefix.len() < page_title.len() + 50)
-    } else {
-        false
-    };
-    dict_path_marker || dict_title
-        || ((phonetic || pos_label) && title_words.len() <= 3)
-        || (pos_label && short)
-        || wiki_disambig
 }
 
 // ─── Main ────────────────────────────────────────────────────────────
@@ -14458,7 +14282,7 @@ async fn handle_search(
         }
 
         // Override 6: transactional keywords OR an explicit price bound -> transactional
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under ", "deal", "deals", "refurbished", "sale", "offer"];
         let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
@@ -20407,82 +20231,5 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // valid "off" setting — proves the value is honored as a cap.
         let cfg = CommerceConfig { mainpath_top_n: 0 };
         assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
-    }
-
-    // ── Microdata v2: value attribute ───────────────────────────────────
-    // Microdata spec allows <span itemprop="price" value="29.99"> where the
-    // machine-readable value lives in the `value` attribute, not text content.
-
-    const HTML_MICRODATA_VALUE_ATTR: &str = r#"<!doctype html><html><head>
-<title>Microdata Value Attr</title>
-</head><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <span itemprop="name">Value Attr Widget</span>
-  <span itemprop="price" value="39.99">$39.99</span>
-  <span itemprop="priceCurrency" value="USD">USD</span>
-  <span itemprop="availability" value="https://schema.org/InStock">In Stock</span>
-  <span itemprop="brand" value="ValueBrand">ValueBrand</span>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn microdata_value_attribute_is_extracted() {
-        let o = extract_commerce_offer(HTML_MICRODATA_VALUE_ATTR, "https://valmd.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(39.99));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
-        assert_eq!(d.merchant.as_deref(), Some("ValueBrand"));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    // ── RDFa resource attribute ──────────────────────────────────────────
-    // RDFa allows <img property="image" resource="url"> or
-    // <link property="image" href="url"> — the resource attr is a valid IRI.
-
-    const HTML_RDFa_RESOURCE_IMAGE: &str = r#"<!doctype html><html><head>
-<title>RDFa Resource Image</title>
-</head><body>
-<div vocab="https://schema.org/" typeof="Product">
-  <span property="name">RDFa Resource Product</span>
-  <img property="image" resource="https://rdfa.example.com/img.jpg" alt="product">
-  <div property="offers" typeof="Offer">
-    <span property="price" content="69.99">69.99</span>
-    <span property="priceCurrency" content="USD">USD</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn rdfa_resource_attribute_is_extracted() {
-        let o = extract_commerce_offer(HTML_RDFa_RESOURCE_IMAGE, "https://rdfares.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://rdfa.example.com/img.jpg"));
-        assert_eq!(d.price, Some(69.99));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(o.source.as_deref(), Some("rdfa"));
-    }
-
-    const HTML_RDFa_RESOURCE_OFFER: &str = r#"<!doctype html><html><head>
-<title>RDFa Resource Offer</title>
-</head><body>
-<div vocab="https://schema.org/" typeof="Product">
-  <span property="name">Resource Offer Product</span>
-  <div property="offers" typeof="Offer" resource="https://rdfa.example.com/offer/1">
-    <span property="price" content="44.99">44.99</span>
-    <span property="availability" content="https://schema.org/InStock">In Stock</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn rdfa_resource_on_non_image_property_ignored() {
-        // resource= on the offers div should not break extraction; the
-        // non-image resource is not used as a value.
-        let o = extract_commerce_offer(HTML_RDFa_RESOURCE_OFFER, "https://rdfao.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(44.99));
-        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
-        assert_eq!(o.source.as_deref(), Some("rdfa"));
     }
 }
