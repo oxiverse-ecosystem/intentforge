@@ -4355,6 +4355,66 @@ fn is_commercial_intent(
         >= 0.50
 }
 
+/// P4 compensating override: exact-model / price-signal queries that the
+/// linear probe misclassifies as informational at low confidence. Both the
+/// `/intent` preview and the live `/search` path apply this so they agree on
+/// the label. It is pure signal logic (no per-query literals): a weak
+/// informational classification + a transactional marker word + a digit-based
+/// product-model signal ⇒ transactional. "100" alone (digit but no topic
+/// word) and "cheap laptop bag" (marker but no digit) both stay informational.
+fn apply_p4_transactional_override(
+    intent: &IntentResponse,
+    q: &str,
+) -> IntentResponse {
+    // Gate 1: only intercept weak-informational classifications.
+    if intent.intent != "informational" || intent.confidence >= 0.45 {
+        return intent.clone();
+    }
+    let q_lower = q.to_lowercase();
+
+    // Gate 2: transactional marker words (data-driven seed list).
+    const TX_MARKERS: &[&str] = &[
+        "price", "cost", "deal", "cheap", "cheapest", "discount", "offer",
+        "sale", "buy", "purchase", "shop", "store", "order", "pay",
+        "budget", "worth", "value",
+    ];
+    let has_tx_marker = TX_MARKERS.iter().any(|m| q_lower.contains(m));
+    if !has_tx_marker {
+        return intent.clone();
+    }
+
+    // Gate 3: product-model signal — the query contains a digit run (like
+    // "iphone 16" or "galaxy s24") AND a non-digit topic word. A bare digit
+    // search ("100") without a topic word does NOT trip this.
+    let has_digit = q_lower.chars().any(|c| c.is_ascii_digit());
+    let topic_words: Vec<&str> = q_lower
+        .split_whitespace()
+        .filter(|w| w.len() >= 2 && !w.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    let has_model_signal = has_digit && !topic_words.is_empty();
+
+    if !has_model_signal {
+        return intent.clone();
+    }
+
+    tracing::info!(
+        "P4 override: transactional marker + model signal ⇒ transactional (was informational @ {:.3})",
+        intent.confidence
+    );
+
+    let mut fixed = intent.clone();
+    fixed.intent = "transactional".to_string();
+    fixed.confidence = 0.6;
+
+    // Boost the transactional distribution probability.
+    let mut dist = fixed.distribution.clone();
+    dist.insert("transactional".to_string(), 0.75);
+    dist.insert("informational".to_string(), 0.15);
+    fixed.distribution = dist;
+
+    fixed
+}
+
 /// GET /shopping — the user-facing commerce search endpoint (ROADMAP item 2).
 ///
 /// DESIGN CONTRACT: this endpoint MUST reuse the EXACT same ranking pipeline as
@@ -12280,7 +12340,15 @@ async fn handle_inspect(
 /// stable + fully testable without the intent engine up, and so clients can
 /// reason about the offline baseline the ranker guarantees.
 fn build_intent(q: &str) -> serde_json::Value {
-    let intent_resp = fallback_intent(q);
+    let mut intent_resp = fallback_intent(q);
+
+    // P4 compensating override: exact-model / price-signal queries that the
+    // linear probe misclassifies as informational at low confidence. The
+    // fallback_intent stub always returns informational/0.3, so this fires
+    // deterministically on the preview too — keeping `/intent` consistent
+    // with `/search` (which applies the same override to the engine result).
+    intent_resp = apply_p4_transactional_override(&intent_resp, q);
+
     let category = parent_category(&intent_resp.intent);
     let contrastive = query_is_contrastive(q);
     let local = has_local_intent(q);
@@ -13860,8 +13928,14 @@ async fn handle_search(
         }
     };
 
+    // P4 compensating override: exact-model / price-signal queries that the
+    // linear probe misclassifies as informational at low confidence. Applied
+    // AFTER intent is resolved so it can correct a misclassified label before
+    // the commerce/shopping pipeline consumes it. Pure signal logic.
+    intent = apply_p4_transactional_override(&intent, &q);
+
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
-    
+
     // Merge constraints parsed directly by the gateway to prevent any loss of operators
     let gateway_extracted = extract_gateway_constraints(&q_orig);
     for ft in gateway_extracted.file_types {
@@ -16399,7 +16473,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         // if results are cloned/rebuilt during post-processing. This direct check ensures
         // videos never outrank text results for non-video queries, regardless of what
         // happened to the cap field. Signal-driven: checks source tags + URL host class.
-        if !has_video_intent(query) {
+        if !has_video_intent(&q) {
             let is_video = r.sources.iter().any(|s| s == "invidious" || s == "video")
                 || is_url_video_host(&r.url);
             if is_video && r.score > 0.04 {
@@ -19216,6 +19290,78 @@ mod spellcheck_endpoint_tests {
             assert_eq!(res["contrastive_framing"].as_bool(), Some(false));
             assert_eq!(res["local_intent"].as_bool(), Some(false));
         }
+    }
+}
+
+mod p4_intent_override_tests {
+    use super::*;
+
+    fn info_intent() -> IntentResponse {
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("transactional".to_string(), 0.21);
+        dist.insert("informational".to_string(), 0.12);
+        IntentResponse {
+            query: String::new(),
+            intent: "informational".to_string(),
+            confidence: 0.27,
+            constraints: vec![],
+            structured_constraints: Constraints::default(),
+            expanded_queries: vec![],
+            distribution: dist,
+        }
+    }
+
+    #[test]
+    fn p4_price_plus_model_signal_overrides_to_transactional() {
+        // "iphone 16 pro max price" — price marker + digit + topic word.
+        let r = apply_p4_transactional_override(&info_intent(), "iphone 16 pro max price");
+        assert_eq!(r.intent, "transactional");
+        assert!((r.confidence - 0.6).abs() < 1e-5);
+        assert_eq!(r.distribution.get("transactional").copied().unwrap_or(0.0), 0.75);
+    }
+
+    #[test]
+    fn p4_no_price_marker_stays_informational() {
+        // "samsung galaxy s24 ultra" — no price word at all.
+        let r = apply_p4_transactional_override(&info_intent(), "samsung galaxy s24 ultra");
+        assert_eq!(r.intent, "informational");
+    }
+
+    #[test]
+    fn p4_price_marker_but_no_digit_stays_informational() {
+        // "cheap laptop bag" — price word but no model digit.
+        let r = apply_p4_transactional_override(&info_intent(), "cheap laptop bag");
+        assert_eq!(r.intent, "informational");
+    }
+
+    #[test]
+    fn p4_bare_digit_without_topic_stays_informational() {
+        // "100" alone has no topic word, must NOT trip the override.
+        let mut bare = info_intent();
+        bare.query = "100".to_string();
+        let r = apply_p4_transactional_override(&bare, "100");
+        assert_eq!(r.intent, "informational");
+    }
+
+    #[test]
+    fn p4_high_confidence_informational_not_overridden() {
+        // Confident how-to / informational queries must stay put.
+        let mut strong = info_intent();
+        strong.confidence = 0.65;
+        let r = apply_p4_transactional_override(&strong, "how to fix iphone 16 screen");
+        assert_eq!(r.intent, "informational");
+        assert!((r.confidence - 0.65).abs() < 1e-5);
+    }
+
+    #[test]
+    fn intent_p4_override_lifts_exact_model_price_query() {
+        // "iphone 16 pro max price" — the fallback_intent stub returns
+        // informational/0.3, but the P4 override must lift it to transactional
+        // on the /intent preview too, so the endpoint is consistent with /search.
+        let res = build_intent("iphone 16 pro max price");
+        assert_eq!(res["intent"].as_str(), Some("transactional"));
+        assert_eq!(res["category"].as_str(), Some("transactional"));
+        assert!((res["confidence"].as_f64().unwrap() - 0.6).abs() < 1e-5);
     }
 }
 
