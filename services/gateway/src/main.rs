@@ -10774,22 +10774,24 @@ fn merge_local_and_web(
             .fold(0.0f32, f32::max);
 
         // (b) single-distinctive-term-only match on a multi-topic query
-        // FAIL-OPEN: only fire this cap when at least one result actually
-        // matches >= 2 topics. If NO result reaches that bar, the cap would
-        // flatten EVERYTHING to 0.04 indiscriminately — destroying ranking
-        // differentiation for queries where upstream returns only off-topic
-        // results (e.g. "how to fix a bicycle puncture" returning KIT/Gemini
-        // pages). Let normal ranking differentiate instead.
+        // D1 FIX (this round): lowered `any_strong_match` threshold from >= 2 to >= 1.
+        // Previously the cap only fired when at least one result matched >= 2 topics.
+        // For queries like "how to choose a suitable thesis topic in machine learning"
+        // where upstream returns off-topic brand collisions (e.g. "Choose" app matching
+        // only "choose"), no result matched 2+ topics, so the cap never fired and the
+        // brand won on insertion order. Now the cap fires when ANY result matches even
+        // ONE strong topic (fail-open preserved: when upstream returns pure junk with 0
+        // matches, the cap doesn't fire). Brand collisions matching 0 strong topics get
+        // crushed to weak_cap.
         let any_strong_match = if query_has_many_topics {
             merged.iter().any(|r| {
                 let rl = r.title.to_lowercase();
                 let cl = r.content.to_lowercase();
                 let ul = r.url.to_lowercase();
-                let matched_strong = strong_topics.iter().filter(|t| {
+                strong_topics.iter().any(|t| {
                     let lt = t.to_lowercase();
                     rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
-                }).count();
-                matched_strong >= 2
+                })
             })
         } else {
             false
@@ -10847,14 +10849,15 @@ fn merge_local_and_web(
             }
 
             // (b) single-distinctive-term-only match on a multi-topic query
+            // D1 FIX (this round): threshold lowered from < 2 to < 1. Now only results
+            // matching ZERO strong topics (pure brand collisions) get crushed to weak_cap.
+            // Results matching exactly 1 strong topic survive (they're partially on-topic).
             if query_has_many_topics && any_strong_match {
                 let matched_strong = strong_topics.iter().filter(|t| {
                     let lt = t.to_lowercase();
                     rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
                 }).count();
-                // matched_strong is at most strong_topics.len(); we want the page to
-                // contain at least 2 of the query's real topic terms to be on-topic.
-                if matched_strong < 2 {
+                if matched_strong < 1 {
                     if r.score > weak_cap {
                         tracing::info!(
                             "POST-CAL WEAK-MATCH CAP -> {:.2}: '{}' (matched {} of {} topics)",
