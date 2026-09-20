@@ -214,6 +214,43 @@ fn simple_stem(word: &str) -> String {
         _ => {}
     }
 
+    // General suffix stripping
+    if w.ends_with("ing") && w.len() > 4 {
+        let base = &w[..w.len() - 3];
+        // Handle doubling: "running" → "run"
+        if base.ends_with(|c: char| c == 'n' || c == 'g' || c == 't' || c == 'd') {
+            let single = &base[..base.len() - 1];
+            if single.len() >= 2 {
+                return single.to_string();
+            }
+        }
+        return base.to_string();
+    }
+    if w.ends_with("ment") && w.len() > 4 {
+        return w[..w.len() - 4].to_string();
+    }
+    if w.ends_with("ness") && w.len() > 4 {
+        return w[..w.len() - 4].to_string();
+    }
+    if w.ends_with("able") && w.len() > 4 {
+        return w[..w.len() - 4].to_string();
+    }
+    if w.ends_with("ous") && w.len() > 3 {
+        return w[..w.len() - 3].to_string();
+    }
+    if w.ends_with("ive") && w.len() > 3 {
+        return w[..w.len() - 3].to_string();
+    }
+    if w.ends_with("er") && w.len() > 3 {
+        return w[..w.len() - 2].to_string();
+    }
+    if w.ends_with("or") && w.len() > 3 {
+        return w[..w.len() - 2].to_string();
+    }
+    if w.ends_with("s") && w.len() > 2 && !w.ends_with("ss") {
+        return w[..w.len() - 1].to_string();
+    }
+
     w
 }
 
@@ -259,9 +296,15 @@ pub fn extract_entities(query: &str) -> Vec<String> {
             continue;
         }
         
-        if !seen.contains(&stemmed) {
-            seen.insert(stemmed.clone());
-            entities.push(stemmed);
+        let canonical = if is_technical_keep_word(&stemmed) {
+            stemmed
+        } else {
+            stemmed
+        };
+        
+        if !seen.contains(&canonical) {
+            seen.insert(canonical.clone());
+            entities.push(canonical);
         }
     }
 

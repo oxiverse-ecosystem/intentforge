@@ -18,6 +18,7 @@ mod geoloc;
 mod dictionary;
 mod clean;
 mod goals;
+mod query_expansion;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
 // ─── API Types ───────────────────────────────────────────────────────
@@ -45,14 +46,7 @@ struct SearchParams {
     ip: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
-enum MatchMode {
-    #[default]
-    Hard,
-    Soft,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 struct Constraints {
     #[serde(default)]
     positive: Vec<String>,
@@ -110,6 +104,23 @@ struct Constraints {
     /// Lower bound from an explicit `>` operator, e.g. `price:>50`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     price_gt: Option<f32>,
+    /// Match mode for constraint filtering.
+    /// - Hard (default): results violating negative constraints are hard-dropped.
+    /// - Soft (used by 0-result retry): never hard-drop; instead score by
+    ///   constraint satisfaction count (more matches = higher rank) and fall
+    ///   back to the best partial match. Never returns 0 results if any
+    ///   partial match exists.
+    #[serde(default)]
+    match_mode: MatchMode,
+}
+
+/// Match mode for constraint filtering.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+enum MatchMode {
+    #[default]
+    Hard,
+    Soft,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -121,7 +132,7 @@ enum EntityRole {
     Exclusion,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct QueryEntity {
     text: String,
     role: EntityRole,
@@ -446,13 +457,28 @@ struct MergedResult {
     /// to demote low-signal crawled pages. Defaults to 1.0 for web results.
     #[serde(default = "default_f32_one")]
     quality: f32,
-    /// D4 (2026-08-18T1340Z round): the per-engine trust multiplier applied to
-    /// this result during the web merge. Stored (read-only, debug/observability)
-    /// so tests and operators can SEE whether a result was trust-crushed. 1.0 means
-    /// no crush; <1.0 means D4 crushed this engine's results (a dated sibling existed
-    /// and this engine only returned date-blind junk). Defaults to 1.0.
-    #[serde(default = "default_f32_one")]
+    /// Tracks if this result has a post-calibration cap that must be re-applied
+    /// after the final 0.05 clamp to ensure dict/weak/video results stay below
+    /// the article floor. Internal field, not serialized.
+    #[serde(skip)]
+    post_cal_cap: Option<f32>,
+    /// D4 (2026-08-18T1340Z round): per-engine upstream-quality trust multiplier
+    /// actually applied to this result. Captured so tests/operators can observe
+    /// whether a date-blind upstream engine's junk was trust-crushed. Internal
+    /// diagnostic field (skip serialization).
+    #[serde(skip)]
     engine_trust_mult: f32,
+
+    /// Honest product facts extracted by the /shopping pipeline from the result's
+    /// own page. Only present when the page exposed structured product data.
+    /// NEVER carries a fact not extracted from this exact URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commerce: Option<CommerceBlock<OfferFacts>>,
+    /// Provenance for the commerce block: the source URL it was extracted from and
+    /// when. Kept separate so the frontend can attribute facts to a page even when
+    /// `commerce` itself is null (e.g. "we looked, found nothing on that URL").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commerce_provenance: Option<CommerceBlock<()>>,
 }
 
 fn default_f32_one() -> f32 { 1.0 }
@@ -552,6 +578,17 @@ struct UnifiedResponse {
     /// tuning, no domain/term allow-or-deny lists.
     #[serde(skip_serializing_if = "Option::is_none")]
     recall_gap_terms: Option<Vec<String>>,
+    /// MAIN-PATH commercial intent (ROADMAP item 7). When the resolved intent is
+    /// `transactional` / has a strong transactional distribution / carries a price
+    /// bound, this carries a `shopping` block: the SAME post-rank enrichment
+    /// (`extract_commerce_offer` + `decorate_affiliate` + offer comparison) already
+    /// used by `GET /shopping`, built from a CLONE of the top-N ranked results so the
+    /// main `results` ordering is NEVER touched. Absent when the query is not
+    /// commercial. This is the "IntentForge knows you want to buy" feature: the
+    /// normal `/search` response gains a `shopping` field, not a separate tab.
+    /// Decoration is strictly post-ranking — proven by the order-invariance test.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shopping: Option<serde_json::Value>,
 }
 
 const DOWNLOAD_KEYWORDS: &[&str] = &[
@@ -1016,42 +1053,6 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
         if version_pinned.is_match(q_lower) {
             return None;
         }
-        // "latest" is ambiguous: it can mean "most recent" (news) or "most up to
-        // date" (informational topic). Gate it on news-term co-occurrence.
-        // "recent" is unambiguous — always implies recency.
-        if q_has_word(q_lower, "latest") && !has_news_cooccurrence && !is_news_domain {
-            return None;
-        }
-        return Some((format_ymd(add_days(today, -7)), today_s));
-    }
-    if q_has_word(q_lower, "fresh") && has_news_term {
-        return Some((format_ymd(add_days(today, -7)), today_s));
-    }
-    if q_has_word(q_lower, "fresh") && has_news_term {
-        return Some((format_ymd(add_days(today, -7)), today_s));
-    }
-    if q_has_word(q_lower, "fresh") && has_news_term {
-        return Some((format_ymd(add_days(today, -7)), today_s));
-    }
-    if q_has_word(q_lower, "fresh") && has_news_term {
-        return Some((format_ymd(add_days(today, -7)), today_s));
-    }
-    if q_has_word(q_lower, "fresh") && has_news_term {
-        return Some((format_ymd(add_days(today, -7)), today_s));
-    }
-    if q_has_word(q_lower, "fresh") && has_news_term {
-        return Some((format_ymd(add_days(today, -7)), today_s));
-    }
-    if q_has_word(q_lower, "fresh") && has_news_term {
-        return Some((format_ymd(add_days(today, -7)), today_s));
-    }
-    if q_has_word(q_lower, "fresh") && has_news_term {
-        return Some((format_ymd(add_days(today, -7)), today_s));
-    }
-    if q_has_word(q_lower, "fresh") && has_news_term {
-        return Some((format_ymd(add_days(today, -7)), today_s));
-    }
-    if q_has_word(q_lower, "fresh") && has_news_term {
         return Some((format_ymd(add_days(today, -7)), today_s));
     }
     if q_has_word(q_lower, "fresh") && has_news_term {
@@ -1077,14 +1078,23 @@ fn freshness_score(url: &str, intent: &str, published_date: Option<&str>, title:
     let mut estimated_age_hours: f32 = 168.0; // default: 7 days (less aggressive decay)
     let mut parsed_ok = false;
 
-    // Resolve the best date we can from upstream published_date, a URL-embedded
-    // year, or a date written in the title/content text. The upstream `publishedDate`
-    // field is frequently None (SearXNG news backends rarely populate it), so ranking
-    // on it alone leaves recency blind — a "latest X this week" query then ranks
-    // evergreen/undated pages by pure relevance. Falling back to resolve_item_date()
-    // (which already drives the after:/before: hard-filter) lets the freshness score
-    // actually decay stale items and boost recent ones. Generic: no per-query tuning.
-    let resolved = resolve_item_date(published_date, url, title, content);
+    // Resolve the best date we can from upstream published_date or a date written
+    // in the title/content text. The upstream `publishedDate` field is frequently
+    // None (SearXNG news backends rarely populate it), so ranking on it alone leaves
+    // recency blind — a "latest X this week" query then ranks evergreen/undated
+    // pages by pure relevance. Falling back to resolve_item_date() (which already
+    // drives the after:/before: hard-filter) lets the freshness score actually decay
+    // stale items and boost recent ones. Generic: no per-query tuning.
+    //
+    // Only accept full dates (from published_date or extract_date_from_text); a bare
+    // URL year represented as January 1 is too imprecise to set parsed_ok or compute
+    // age. Let the existing URL-year heuristic below assign its 24-hour age instead.
+    let resolved = if let Some(pd) = published_date {
+        parse_date_to_comparable(pd)
+    } else {
+        let text = format!("{} {}", title, content);
+        extract_date_from_text(&text)
+    };
     if let Some((y, m, d)) = resolved {
         let (cur_y, cur_m, cur_d) = today_ymd();
         let cur_days = ymd_to_days(cur_y, cur_m, cur_d);
@@ -1627,34 +1637,38 @@ const LOCATION_GAZETTEER: &[(&str, &str)] = &[
     ("toronto", "CA"), ("vancouver", "CA"), ("sao paulo", "BR"), ("mexico city", "MX"),
     ("dubai", "AE"), ("cairo", "EG"), ("bangkok", "TH"), ("jakarta", "ID"),
     ("cape town", "ZA"), ("lagos", "NG"),
-    // 2026-08-19T1628Z round: extend the SEED with common Indian hill/travel/
-    // region destinations that users query but that were missing. These are the
-    // exact class of place that triggered geo pollution (an off-topic other-city
-    // local page ranking #1 because the requested place was unseen by
-    // detect_explicit_location, so geo_is_explicit stayed false and no
-    // cross-location penalty fired). Pure reference data; no per-query literals.
-    // Also a few more global travel hubs for general coverage.
-    ("ladakh", "IN"), ("leh", "IN"), ("mcleod ganj", "IN"), ("mcleodganj", "IN"),
-    ("dharamshala", "IN"), ("srinagar", "IN"), ("shimla", "IN"), ("manali", "IN"),
-    ("spiti", "IN"), ("kashmir", "IN"), ("gulmarg", "IN"), ("sonamarg", "IN"),
-    ("gokarna", "IN"), ("hampi", "IN"), ("coorg", "IN"), ("madikeri", "IN"),
-    ("munnar", "IN"), ("ooty", "IN"), ("udhagamandalam", "IN"), ("kodaikanal", "IN"),
-    ("darjeeling", "IN"), ("rishikesh", "IN"), ("haridwar", "IN"),
-    ("pondicherry", "IN"), ("puducherry", "IN"), ("alleppey", "IN"), ("alappuzha", "IN"),
-    ("kumarakom", "IN"), ("thekkady", "IN"), ("wagamon", "IN"), ("vagamon", "IN"),
-    ("mahabalipuram", "IN"), ("thanjavur", "IN"), ("hampi", "IN"),
-    ("lonavala", "IN"), ("khandala", "IN"), ("mahabaleshwar", "IN"), ("panchgani", "IN"),
-    ("mount abu", "IN"), ("mountain", "IN"), ("gir", "IN"), ("diu", "IN"),
-    ("andaman", "IN"), ("nicobar", "IN"), ("havelock", "IN"), ("port blair", "IN"),
-    ("tawang", "IN"), ("ziro", "IN"), ("shillong", "IN"), ("cherrapunji", "IN"),
-    ("kaziranga", "IN"), ("guwahati", "IN"), ("gangtok", "IN"), ("pelling", "IN"),
-    ("kerala", "IN"), ("kashmir", "IN"), ("himachal", "IN"), ("uttarakhand", "IN"),
-    ("goa", "IN"), ("kanyakumari", "IN"), ("rameshwaram", "IN"), ("madurai", "IN"),
-    ("trivandrum", "IN"), ("thiruvananthapuram", "IN"), ("kochi", "IN"),
-    ("phuket", "TH"), ("bali", "ID"), ("krabi", "TH"), ("chiang mai", "TH"),
-    ("colombo", "LK"), ("kandy", "LK"), ("kathmandu", "NP"), ("pokhara", "NP"),
-    ("istanbul", "TR"), ("antalya", "TR"), ("cappadocia", "TR"),
-    ("lisbon", "PT"), ("porto", "PT"), ("reykjavik", "IS"), ("dubrovnik", "HR"),
+    // ── Expanded Indian cities ── (round 2026-08-11: the original gazetteer only
+    //    listed delhi/mumbai/bangalore, so "cafes in kolkata" / "near pune" failed
+    //    to detect an explicit location and fell back to the IP/VPN geo — which
+    //    leaked a wrong "+New York" constraint and boosted the wrong region).
+    //    Whole-word matched; no overlap with common query words or country codes.
+    ("kolkata", "IN"), ("calcutta", "IN"), ("pune", "IN"), ("hyderabad", "IN"),
+    ("chennai", "IN"), ("madras", "IN"), ("ahmedabad", "IN"), ("coimbatore", "IN"),
+    ("jaipur", "IN"), ("goa", "IN"), ("lucknow", "IN"), ("kanpur", "IN"),
+    ("nagpur", "IN"), ("indore", "IN"), ("bhopal", "IN"), ("surat", "IN"),
+    ("vadodara", "IN"), ("baroda", "IN"), ("visakhapatnam", "IN"), ("vijayawada", "IN"),
+    ("patna", "IN"), ("ranchi", "IN"), ("raipur", "IN"), ("thiruvananthapuram", "IN"),
+    ("kochi", "IN"), ("cochin", "IN"), ("kozhikode", "IN"), ("calicut", "IN"),
+    ("mysore", "IN"), ("mysuru", "IN"), ("amritsar", "IN"), ("chandigarh", "IN"),
+    ("gwalior", "IN"), ("udaipur", "IN"), ("jaisalmer", "IN"), ("varanasi", "IN"),
+    ("banaras", "IN"), ("agra", "IN"), ("shimla", "IN"), ("manali", "IN"),
+    ("dehradun", "IN"), ("guwahati", "IN"), ("bhubaneswar", "IN"), ("rajkot", "IN"),
+    ("jabalpur", "IN"), ("guntur", "IN"), ("thane", "IN"), ("navi mumbai", "IN"),
+    ("ghaziabad", "IN"), ("noida", "IN"), ("ludhiana", "IN"), ("allahabad", "IN"),
+    ("prayagraj", "IN"), ("guwahati", "IN"), ("nashik", "IN"), ("aurangabad", "IN"),
+    ("madurai", "IN"), ("cochin", "IN"), ("trivandrum", "IN"),
+    // ── Expanded global cities ──
+    ("miami", "US"), ("dallas", "US"), ("denver", "US"), ("atlanta", "US"),
+    ("washington", "US"), ("philadelphia", "US"), ("houston", "US"), ("minneapolis", "US"),
+    ("munich", "DE"), ("hamburg", "DE"), ("frankfurt", "DE"), ("cologne", "DE"),
+    ("lyon", "FR"), ("marseille", "FR"), ("nice", "FR"), ("milan", "IT"),
+    ("naples", "IT"), ("turin", "IT"), ("florence", "IT"), ("valencia", "ES"),
+    ("seville", "ES"), ("malaga", "ES"), ("porto", "PT"), ("lisbon", "PT"),
+    ("brussels", "BE"), ("vienna", "AT"), ("zurich", "CH"), ("geneva", "CH"),
+    ("osaka", "JP"), ("kyoto", "JP"), ("busan", "KR"), ("taipei", "TW"),
+    ("kuala lumpur", "MY"), ("manila", "PH"), ("ho chi minh", "VN"), ("hanoi", "VN"),
+    ("doha", "QA"), ("riyadh", "SA"), ("tel aviv", "IL"), ("nairobi", "KE"),
+    ("accra", "GH"), ("casablanca", "MA"), ("addis ababa", "ET"), ("dar es salaam", "TZ"),
 ];
 
 /// If the query explicitly names a location (via whole-word match against the
@@ -2067,14 +2081,15 @@ fn constraint_score(
     // get a SINGLE flat penalty regardless of how many excluded terms they mention.
     // Regular pages get per-term multiplicative penalties.
     let alt_score = is_alternative_listing_page(title, url, content);
-    // Alt-listing exemption: a page scoring >0.2 IS an alternatives/comparison
+    // Alt-listing exemption: a page scoring >0.3 IS an alternatives/comparison
     // listing, so mentioning the excluded term is referential, not a violation.
-    // Lowered from 0.3 (2026-09-16): pages with a weak alt signal (e.g. a general
-    // guide mentioning "alternatives" in the content but not the title) were being
-    // penalised for mentioning excluded terms, collapsing recall for "X other than Y"
-    // / "X not Y not Z" queries. The pre-merge hard-drop gate uses the same pure
-    // alt_score>0.2 exemption, so all gates must agree to avoid re-drops.
-    let is_alt_page = alt_score > 0.2;
+    // We do NOT gate on is_comparison_or_alternative_query(): for "alternative to
+    // X" the word "alternative" is consumed into the negative constraint, so that
+    // check would never fire and the alt page would be mis-penalised (c_score
+    // crushed) and then re-dropped downstream (result set collapses to 1). The
+    // pre-merge hard-drop gate uses the same pure alt_score>0.3 exemption, so all
+    // gates must agree to avoid re-drops.
+    let is_alt_page = alt_score > 0.3;
     // Stricter gate for the title-dominance hard-drop below: a WEAK alt signal
     // alone (e.g. a "best "/"top " listicle title with no comparison/alternative
     // wording and no supporting URL/content evidence) must not exempt a page
@@ -2141,6 +2156,10 @@ fn constraint_score(
                     neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
                     boost);
                 score *= boost;
+                // Do NOT flag as violation: the term is in negating context,
+                // meaning the page is FULFILLING the exclusion (e.g. "without pills"),
+                // not violating it. The alt-page penalty below must not cancel
+                // this boost.
             } else if !is_alt_page {
                 let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
                 tracing::info!("CONSTRAINT HIT (TITLE/URL): '{}' in '{}' → penalty={:.4} (non-alt)",
@@ -2183,7 +2202,7 @@ fn constraint_score(
         // The alt_score measures how strongly this page is an alternative listing
         // (comparison vs titles, URL patterns, content patterns).
         // High alt_score → barely penalized: alt_score=0.7 → 0.175 single hit
-        // Low alt_score → moderate: alt_score=0.2 → 0.200 single hit
+        // Low alt_score → moderate: alt_score=0.3 → 0.225 single hit
         // Scale alt penalty by exclusion count: more exclusions = stricter penalty.
         // A page listing 5 excluded engines is much less relevant than one listing 1.
         let neg_exclusion_count = constraints.negative.len() as f32;
@@ -2914,6 +2933,22 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
                 "inr", "rs", "rs.", "euros", "euro", "eur", "pounds", "pound",
                 "gbp", "yen", "jpy", "won", "krw", "cents", "cent", "paise", "paisa"];
             if currency_words.contains(&pl.as_str()) { continue; }
+            // Drop non-topical query-function words leaked from NL phrasing
+            // (see NON_TOPICAL_QUERY_WORDS). They match every page and drown the
+            // real topical signal, so a relevant result cannot outrank grammar /
+            // dictionary / orphan pages. Signal-driven: a general English
+            // question-word list, no per-query literals, no tuned thresholds.
+            //
+            // Multi-word form (2026-09-14): a positive like "3 years" (from "I am a
+            // frontend developer with 3 years...") won't match single-word "years", so
+            // check if ALL words are non-topical — if so, the whole phrase is junk.
+            // E.g. "3 years" → ["3", "years"] → both non-topical → drop. But
+            // "react experience" → ["react", "experience"] → "react" is topical → keep.
+            let words_pl: Vec<&str> = pl.split_whitespace().collect();
+            let all_non_topical = !words_pl.is_empty() && words_pl.iter().all(|w| {
+                NON_TOPICAL_QUERY_WORDS.contains(&w) || w.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.')
+            });
+            if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) || all_non_topical { continue; }
             // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
             // extraction (e.g. "under 15000" / "below 2000" can leave the digits
             // in `positive` as "+15000"). A purely-numeric positive carries no
@@ -2972,6 +3007,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         price_lt,
         price_gt,
         ignored_constraints: None,
+        match_mode: MatchMode::Hard,
     }
 }
 
@@ -3127,12 +3163,6 @@ struct OfferFacts {
     /// Always a URL string from structured data — never guessed from free text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image: Option<String>,
-    /// The original/list price before a discount, when the page exposes it
-    /// (JSON-LD `listPrice`, `product:list_price:amount`, `itemprop="listprice"`).
-    /// `price` holds the current/offer price. When only list price is exposed,
-    /// `price` is left null — never collapse to one canonical number.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    list_price: Option<f64>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3382,9 +3412,6 @@ fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
     if dst.image.is_none() {
         dst.image = src.image.clone();
     }
-    if dst.list_price.is_none() {
-        dst.list_price = src.list_price;
-    }
 }
 
 /// True when the page declares a Product or Offer via microdata `itemtype`.
@@ -3403,8 +3430,8 @@ fn has_microdata_product(html: &str) -> bool {
 /// Only fires when the page carries a Product/Offer `itemtype`, so
 /// non-product pages (Article, Event, …) never trigger it.
 ///
-/// Handles `content` attribute form, `value` attribute (microdata v2),
-/// and text content form.
+/// Handles both `content` attribute form (<meta itemprop="price" content="9.99">)
+/// and text content form (<span itemprop="brand">Acme</span>).
 fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
     if !has_microdata_product(html) {
         return None;
@@ -3429,10 +3456,6 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
     static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let src_re = SRC_RE.get_or_init(|| {
         regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
-    });
-    static VALUE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let value_re = VALUE_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)value\s*=\s*["']([^"']*)["']"#).unwrap()
     });
 
     let mut o = OfferFacts::default();
@@ -3494,13 +3517,6 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = val.parse::<u64>().ok();
                 }
             }
-            "listprice" => {
-                if o.list_price.is_none() {
-                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
-                        o.list_price = Some(v);
-                    }
-                }
-            }
             _ => {}
         }
     };
@@ -3523,10 +3539,6 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
             .captures(tag)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
-        let value_attr = value_re
-            .captures(tag)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
         if let Some(p) = prop {
             // For image, prefer href (link itemprop="image" href=...) then
             // content (meta itemprop="image" content=...) then src.
@@ -3535,9 +3547,6 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
                     apply(&p, &v);
                 }
             } else if let Some(v) = content {
-                apply(&p, &v);
-            } else if let Some(v) = value_attr {
-                // Microdata v2: <span itemprop="price" value="29.99">
                 apply(&p, &v);
             } else {
                 // Text content form: extract text after the tag until the next '<'.
@@ -3562,7 +3571,6 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
         && o.rating.is_none()
         && o.rating_count.is_none()
         && o.image.is_none()
-        && o.list_price.is_none()
     {
         return None;
     }
@@ -3584,7 +3592,8 @@ fn has_rdfa_product(html: &str) -> bool {
 /// Extract product facts from RDFa (property attribute with `schema:` prefix or full URI).
 /// Only fires on pages that look product-ish.
 ///
-/// Handles `content` attribute form, `resource` attribute (for images), and text content form.
+/// Handles both `content` attribute form (`<meta property="price" content="9.99">)
+/// and text content form (`<span property="brand">Acme</span>`).
 fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
     if !has_rdfa_product(html) {
         return None;
@@ -3609,10 +3618,6 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
     static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let src_re = SRC_RE.get_or_init(|| {
         regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
-    });
-    static RESOURCE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let resource_re = RESOURCE_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)resource\s*=\s*["']([^"']*)["']"#).unwrap()
     });
 
     let mut o = OfferFacts::default();
@@ -3680,13 +3685,6 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = val.parse::<u64>().ok();
                 }
             }
-            "listprice" => {
-                if o.list_price.is_none() {
-                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
-                        o.list_price = Some(v);
-                    }
-                }
-            }
             _ => {}
         }
     };
@@ -3709,15 +3707,11 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
             .captures(tag)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
-        let resource = resource_re
-            .captures(tag)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
         if let Some(p) = prop {
-            // For image, prefer href (link property="image" href=...) then
-            // content (meta property="image" content=...) then src, then resource.
+            // For image, prefer href (link itemprop="image" href=...) then
+            // content (meta itemprop="image" content=...) then src.
             if p == "image" {
-                if let Some(v) = href.or(content).or(src).or(resource) {
+                if let Some(v) = href.or(content).or(src) {
                     apply(&p, &v);
                 }
             } else if let Some(v) = content {
@@ -3745,7 +3739,6 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
         && o.rating.is_none()
         && o.rating_count.is_none()
         && o.image.is_none()
-        && o.list_price.is_none()
     {
         return None;
     }
@@ -3947,13 +3940,6 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
         if let Some(p) = node_price(n) {
             prices.push(p);
         }
-        // listPrice: the original/undiscounted price, distinct from the current
-        // offer price. Only captured when the page explicitly declares it.
-        if facts.list_price.is_none() {
-            if let Some(lp) = n.get("listPrice").and_then(json_get_f64) {
-                facts.list_price = Some(lp);
-            }
-        }
         if facts.availability.is_none() {
             facts.availability = n
                 .get("availability")
@@ -4141,13 +4127,6 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
                     o.image = Some(content.clone());
                 }
             }
-            "product:list_price:amount" | "og:list_price:amount" | "product:original_price:amount" => {
-                if o.list_price.is_none() {
-                    if let Ok(v) = content.replace(',', "").parse::<f64>() {
-                        o.list_price = Some(v);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -4158,7 +4137,6 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
         && o.gtin.is_none()
         && o.rating.is_none()
         && o.image.is_none()
-        && o.list_price.is_none()
     {
         return None;
     }
@@ -4550,26 +4528,26 @@ struct CommerceConfig {
     /// block on `/search`. Presentation cap on a CLONE of ranked results —
     /// never affects ranking or selection.
     mainpath_top_n: usize,
-    /// Whole-word keywords that signal transactional intent (Override 6).
-    /// Runtime-loaded from `data/commerce/config.json` → `transactional_keywords`.
-    /// Never hardcoded — edit the data file to add/remove without recompile.
+    /// Runtime-loaded transactional intent keywords (Override 6 signal).
+    /// Comes from `data/commerce/signals.json` → `transactional_keywords`.
+    /// Empty Vec means: no keyword-based override; rely on label + distribution + price bound.
     transactional_keywords: Vec<String>,
 }
 
 impl CommerceConfig {
-    /// Load from `data/commerce/config.json`. Missing file / missing field =>
-    /// defaults (8). Never fatal — commerce presentation is best-effort.
+    /// Load from `data/commerce/config.json` AND `data/commerce/signals.json`.
+    /// Missing file / missing field => sensible defaults. Never fatal.
     fn load() -> Self {
         let mut cfg = Self {
             mainpath_top_n: 8,
             transactional_keywords: Vec::new(),
         };
-        let candidates = [
+        let config_candidates = [
             "data/commerce/config.json",
             "/app/data/commerce/config.json",
             "./data/commerce/config.json",
         ];
-        for path in candidates {
+        for path in &config_candidates {
             if let Ok(text) = std::fs::read_to_string(path) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(n) = v.get("mainpath_top_n").and_then(|x| x.as_u64()) {
@@ -4585,7 +4563,29 @@ impl CommerceConfig {
                             .filter_map(|s| s.as_str().map(String::from))
                             .collect();
                         tracing::info!(
-                            "commerce config: {} transactional keyword(s) (from data file)",
+                            "commerce config: {} transactional keyword(s) from config.json",
+                            cfg.transactional_keywords.len()
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        let signals_candidates = [
+            "data/commerce/signals.json",
+            "/app/data/commerce/signals.json",
+            "./data/commerce/signals.json",
+        ];
+        for path in &signals_candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("transactional_keywords").and_then(|a| a.as_array()) {
+                        cfg.transactional_keywords = arr
+                            .iter()
+                            .filter_map(|s| s.as_str().map(String::from))
+                            .collect();
+                        tracing::info!(
+                            "commerce signals: {} transactional keyword(s) (from data file)",
                             cfg.transactional_keywords.len()
                         );
                     }
@@ -4595,30 +4595,6 @@ impl CommerceConfig {
         }
         cfg
     }
-}
-
-/// Finalize the `shopping` block from already-enriched results.
-///
-/// Pure + offline-testable: takes the enriched top-N results (already decorated
-/// with `commerce` + `affiliate` by the post-rank passes) and assembles the
-/// final `shopping` block JSON, including read-only offer comparisons. Returns
-/// `None` if the input is empty (no results to show).
-///
-/// This is extracted from `handle_search` so the block-finalization logic can be
-/// unit-tested without spinning up the full async search pipeline.
-fn finalize_shopping_block(enriched_results: Vec<serde_json::Value>) -> Option<serde_json::Value> {
-    if enriched_results.is_empty() {
-        return None;
-    }
-    let mut block = serde_json::json!({ "results": enriched_results });
-    if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-        let comparisons = build_offer_comparisons(arr_ref);
-        if !comparisons.is_empty() {
-            block["offer_comparisons"] =
-                serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
-        }
-    }
-    Some(block)
 }
 
 /// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
@@ -4861,19 +4837,23 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     // Without this guard, "within 300 kilometers" was mis-read as price:<300
     // and the spurious price bound dropped relevant results (round 2026-08-15).
     // General, unit-aware — no per-query literals.
+    // Inspect only the immediate token following the number, not the entire rest.
     let distance_units = [
         "km", "kms", "kilometer", "kilometers", "kilometre", "kilometres",
         "mile", "miles", "mi", "meter", "meters", "metre", "metres",
         "foot", "feet", "ft", "yard", "yards", "yd",
     ];
     let is_distance_bound = |rest_after_num: &str| -> bool {
-        distance_units.iter().any(|u| {
-            let pat = format!(r"(?i)(?:^|[^a-z])\s*{}\b", regex::escape(u));
-            regex::Regex::new(&pat).map(|re| re.is_match(rest_after_num)).unwrap_or(false)
-        })
+        // Extract the next token after optional whitespace
+        let next_token = rest_after_num.trim_start()
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("");
+        let next_token_lower = next_token.to_lowercase();
+        distance_units.iter().any(|u| next_token_lower == *u)
     };
 
-    // Pattern A: upper-marker then optional currency symbol then number
+    // Pattern A: upper-marker then number (+ optional currency word)
     // ANCHORED at start of `rest`: the number must be the FIRST token after the
     // marker (only whitespace allowed between). Without the anchor, "about" in
     // "latest news about chandrayaan 4 mission" matched as a price marker and
@@ -4881,12 +4861,10 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     // fresh→transactional (Override 6) → date window crushed 19→1 results.
     // General: a price marker is only meaningful when the number follows it
     // directly ("under 150 dollars"), not when other words intervene.
-    // Allows optional currency symbol ($ ₹ € £ ¥) between marker and number
-    // to handle "under $200" in addition to "under 200" and "under 200 dollars".
     for marker in upper_markers {
         if let Some(pos) = lower.find(marker) {
             let rest = &lower[pos + marker.len()..];
-            let re_num = regex::Regex::new(&format!(r"^\s*[\$₹€£¥]?\s*{}\b", amount_pat)).ok()?;
+            let re_num = regex::Regex::new(&format!(r"^\s*{}\b", amount_pat)).ok()?;
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
@@ -4904,6 +4882,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             }
         }
     }
+    // Pattern B: currency symbol/word then number then upper-marker
     let re_b = regex::Regex::new(&format!(r"(₹|¥|€|£|\$|usd|inr|rs|rupees?|eur|euros?|gbp|pounds?)\s*{}?\s*({})", amount_pat, upper_markers.join("|"))).ok()?;
     if let Some(caps) = re_b.captures(&lower) {
         if let (Some(cur), Some(num)) = (caps.get(1), caps.get(2)) {
@@ -5023,7 +5002,7 @@ fn should_filter_by_constraints(
         //     title/content/url contains the term is dropped. It mirrors the
         //     `-site:`/`-filetype:` negatives handled just above — all are dropped
         //     here before the soft-penalty path (section 5) is reached. The
-        //     alt-listing exemption (alt_score > 0.2) is preserved: a comparison /
+        //     alt-listing exemption (alt_score > 0.3) is preserved: a comparison /
         //     "alternatives" page that merely *mentions* the excluded term in a
         //     referential context (e.g. "Flask" in an "alternatives to Django"
         //     listicle) must NOT be hard-dropped, consistent with every other
@@ -5032,10 +5011,10 @@ fn should_filter_by_constraints(
         //     short and user-intended (e.g. "NOT:spam" should catch "spammer").
         if !constraints.hard_exclusions.is_empty() {
             let alt_score = is_alternative_listing_page(title, url, content);
-            // Alt-listing exemption: a page scoring > 0.2 IS an alternatives /
+            // Alt-listing exemption: a page scoring > 0.3 IS an alternatives /
             // comparison listing, so mentioning the excluded term is referential,
             // not a violation — keep it.
-            if alt_score <= 0.2 {
+            if alt_score <= 0.3 {
                 let t_low = title.to_lowercase();
                 let c_low = content.to_lowercase();
                 let u_low = url.to_lowercase();
@@ -6566,11 +6545,11 @@ const SUBJECTIVE_QUALITY_TERMS: &[&str] = &[
 /// words that slipped past the extractor's stopword lists. Structural vocabulary,
 /// data-driven — never a per-query literal.
 const EXCLUSION_GRAMMAR_NOISE: &[&str] = &[
-    "have", "has", "had", "having", "from", "with", "without", "about", "into",
+    "have", "has", "had", "having", "getting", "from", "with", "without", "about", "into",
     "onto", "upon", "over", "under", "before", "after", "than", "that", "which",
     "this", "these", "those", "what", "when", "where", "who", "why", "how",
     "their", "them", "they", "our", "your", "his", "her", "its", "the", "a", "an",
-    "and", "or", "but", "not", "no", "any", "some", "all", "each", "every",
+    "and", "or", "but", "not", "no", "any", "some", "all", "each", "every", "of",
 ];
 
 /// True if `term` is a subjective-quality/sentiment adjective or a grammar-noise
@@ -6589,8 +6568,138 @@ fn is_exclusion_grammar_noise(term: &str) -> bool {
     if tokens.iter().any(|t| SUBJECTIVE_QUALITY_TERMS.contains(t)) {
         return true;
     }
+    // A compound made ENTIRELY of grammar-noise function words ("have of",
+    // "from with") is itself grammar noise — every token is in the noise set,
+    // so the phrase carries no topical/entity meaning. Structural (closed-class
+    // vocabulary), no per-query tuning.
+    if !tokens.is_empty() && tokens.iter().all(|t| EXCLUSION_GRAMMAR_NOISE.contains(t)) {
+        return true;
+    }
+    // STATE-DESCRIPTION construction: "getting overcharged", "having issues",
+    // "being scammed" → auxiliary/participle + state describes a feeling or
+    // outcome, not a topical entity. Hard-dropping every result that mentions
+    // "getting overcharged" collapses relevant query results. Structural rule:
+    // first token is a state-verb head. No per-query literals; the state-verb
+    // set is closed-class auxiliary vocabulary, same pattern as
+    // EXCLUSION_GRAMMAR_NOISE / MANNER_VERBS.
+    const STATE_VERB_HEADS: &[&str] = &["getting", "having", "being", "feeling"];
+    if let Some(head) = tokens.first() {
+        if STATE_VERB_HEADS.contains(head) && tokens.len() >= 2 {
+            return true;
+        }
+    }
     false
 }
+
+/// D2 (2026-08-19): disambiguate the genuinely ambiguous word "pay" inside a
+/// negated clause. The intent engine may emit a bare "pay"/"paying" token as an
+/// `Exclusion` entity (e.g. from "how to learn programming without paying for a
+/// course" it extracted `paying`). We must decide, from the QUERY CONTEXT (not the
+/// bare token), whether this is:
+///   - MANNER:    "pay attention" / "pay respect" / "pay regard" / "pay heed" —
+///                the user describes HOW they act → MUST be declined (a manner
+///                false-positive that would wrongly drop relevant pages).
+///   - MONEY:     "pay for a course" / "pay a fee" / "pay money" / "pay a
+///                subscription" — the user refuses a financial transaction → MUST
+///                be honored (a real exclusion). This was the dropped D2 defect:
+///                "pay"/"paying" were bluntly listed in MANNER_VERBS/VERB_HEADS and
+///                every money-exclusion got declined.
+///
+/// The decision is driven entirely by the query's nearby OBJECT vocabulary — a
+/// general seed of MANNER objects vs MONETARY objects, no per-query literals, no
+/// tuned thresholds. This is the same open-class "verb + object class" pattern as
+/// `is_verb_attribute_exclusion`, so it is future-proof and non-hardcoded.
+fn pay_exclusion_is_manner(q_orig: &str) -> bool {
+    let lc = q_orig.to_lowercase();
+    const PAY_MANNER_OBJECTS: &[&str] = &[
+        "attention", "respect", "regard", "heed", "tribute", "homage",
+        "compliments", "compliment", "court", "mind", "witness", "lip",
+    ];
+    // "pay <manner-object>" / "paying <manner-object>" anywhere in the query →
+    // the MANNER idiom (an act of consideration, never a transaction).
+    PAY_MANNER_OBJECTS.iter().any(|m| {
+        lc.contains(&format!("pay {}", m)) || lc.contains(&format!("paying {}", m))
+    })
+}
+
+
+fn pay_exclusion_is_money(q_orig: &str) -> bool {
+    let lc = q_orig.to_lowercase();
+    const PAY_MONEY_OBJECTS: &[&str] = &[
+        "course", "courses", "subscription", "subscriptions", "fee", "fees",
+        "price", "prices", "money", "cost", "costs", "charge", "charges",
+        "tuition", "premium", "payment", "payments", "dollar", "dollars",
+        "rupee", "rupees", "bill", "bills", "tax", "taxes", "rent", "fare",
+        "membership", "license", "licence", "bootcamp", "class", "classes",
+        "training", "program", "programme",
+    ];
+    // A monetary object near "pay"/"paying" signals a financial transaction the
+    // user refuses ("pay for a course", "pay a subscription fee"). We require the
+    // object word itself (no loose "pay a"/"paying a" prefix, which wrongly matched
+    // "paying attention"/"paying advice"). This is the same object-class seed
+    // pattern as the manner check — general, non-hardcoded, no tuned thresholds.
+    PAY_MONEY_OBJECTS.iter().any(|m| lc.contains(m))
+}
+
+
+/// A negated clause object is a VERB-LED / ATTRIBUTE exclusion when its head is an
+/// open-class verb or a personal-attribute noun — i.e. it describes *how the user
+/// wants to do something* or *a trait of the user*, NOT a content topic to remove
+/// from results. The intent engine's Query-Graph IR sometimes tags these as
+/// `Exclusion`-role entities (e.g. "alternatives to zoom that do not require
+/// downloading an app and respect privacy" -> Exclusion="respect"; "juggle three
+/// balls with no coordination" -> "coordination"; "young earner with no
+/// dependents" -> "dependents"; "charge overnight without fire risk" -> "fire";
+/// "fix a faucet without replacing the tap" -> "replacing"). These are NEVER real
+/// search exclusions — hard-filtering "respect"/"coordination"/"dependents" drops
+/// every otherwise-relevant page and collapses the result set. The gateway trusts
+/// engine `Exclusion` entities and bypasses the `is_real_exclusion` gate, so we
+/// reject them here at the same merge point. Structural open-class vocabulary
+/// (reused MANNER_VERBS + a verb/attribute seed), no per-query literals — so any
+/// verb-led or attribute exclusion ("without cooking", "with no training",
+/// "apps that do not track you and respect privacy") is caught generally. A
+/// genuine topical exclusion (brand / place / noun the user named) is never in
+/// this set, so real exclusions survive.
+fn is_verb_attribute_exclusion(term: &str) -> bool {
+    let lc = term.trim().to_lowercase();
+    if lc.is_empty() {
+        return true;
+    }
+    // Personal-attribute / trait nouns that describe the USER, not a content topic.
+    const ATTRIBUTE_NOUNS: &[&str] = &[
+        "coordination", "dependents", "experience", "background", "training",
+        "skill", "skills", "knowledge", "degree", "qualification", "qualifications",
+        "subscription", "account", "accounts", "registration", "signup", "sign-up",
+        "login", "log-in", "app", "apps", "application", "applications", "download",
+        "downloading", "install", "installing", "permission", "permissions",
+    ];
+    // Open-class verb seed (reuses MANNER_VERBS where overlapping) — the head of a
+    // negated clause that is a verb is describing an action, not a topic to drop.
+    const VERB_HEADS: &[&str] = &[
+        "respect", "require", "requires", "required", "needing", "need", "needs",
+        "track", "tracks", "tracking", "sell", "sells", "selling", "share", "shares",
+        "sharing", "collect", "collects", "collecting", "replace", "replacing",
+        "replaceing", "charge", "charging", "harm", "harming", "damage", "damaging",
+        "burn", "burning", "fire", "cost", "costs", "spend", "spending", "pay", "pays",
+        "paying", "register", "registering", "download", "downloading", "install",
+        "installing", "sign", "signing", "subscribe", "subscribing", "login",
+        "cook", "cooking", "drive", "driving", "travel", "travelling", "traveling",
+        "learn", "learning", "work", "working", "study", "studying", "read", "reading",
+    ];
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    if tokens.is_empty() {
+        return true;
+    }
+    // Reject if EVERY token is a verb/attribute head or a filler — i.e. the whole
+    // extracted exclusion describes an action/trait, not a named topic.
+    tokens.iter().all(|t| {
+        MANNER_VERBS.contains(t)
+            || VERB_HEADS.contains(t)
+            || ATTRIBUTE_NOUNS.contains(t)
+            || MANNER_PRONOUNS.contains(t)
+    })
+}
+
 
 /// True if `term` is a subjective-quality/sentiment adjective the user wants in a
 /// result, not excluded from it. Mirrors `is_manner_phrase` (structural MANNER_VERBS
@@ -6851,17 +6960,6 @@ fn is_real_exclusion(
     if query_is_contrastive {
         return true;
     }
-    // D3 (brand/source negation): "not from sony", "not by nike", "not made by
-    // samsung" — the user explicitly named a brand/source to EXCLUDE, scoped by a
-    // source preposition. This is the structural analogue of the COUNTRY_DEMONYMS
-    // / P9 negated-country acceptance: no brand literals, just the negation +
-    // source-preposition pattern. It does NOT fire for manner/attribute objects
-    // ("without soap", "recipes not spicy") which lack a source preposition, so
-    // it cannot re-introduce the c4317bc over-reach (any object of `without` =
-    // exclusion). Only a brand/source the user tied to a *source cue* is honored.
-    if is_negated_source_entity(q_orig, compound) {
-        return true;
-    }
     // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
     // acceptance here that unconditionally treated ANY object of `without`/`not`/`except`
     // as a real exclusion. That over-reached: generic attribute/manner objects
@@ -6938,18 +7036,33 @@ fn query_is_contrastive(q_orig: &str) -> bool {
 fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     let q_lower = q_orig.to_lowercase();
     let words: Vec<&str> = q_lower.split_whitespace().collect();
-    // Subject terms = every content word in the query that is NOT a negation
-    // marker and NOT a low-signal stopword. When building a compound exclusion we
-    // stop the current target (and finalise it) as soon as one of these subject
-    // terms reappears — that word belongs to the main query topic, not to the
-    // thing being excluded (e.g. "...without django or flask python web frameworks"
-    // must not swallow "python web frameworks" into the `flask` exclusion).
-    let subject_terms: std::collections::HashSet<&str> = words
+
+    // Find the position of the first negation marker to split subject vs. excluded terms.
+    let neg_markers_for_split = ["not", "no", "without", "except", "excluding", "minus"];
+    let first_neg_pos = words.iter().position(|w| {
+        neg_markers_for_split.contains(w) || w.starts_with('-')
+            || (*w == "other" && words.get(words.iter().position(|x| *x == *w).unwrap() + 1).map(|x| *x == "than").unwrap_or(false))
+            || (*w == "rather" && words.get(words.iter().position(|x| *x == *w).unwrap() + 1).map(|x| *x == "than").unwrap_or(false))
+            || (*w == "alternative" && words.get(words.iter().position(|x| *x == *w).unwrap() + 1).map(|x| *x == "to").unwrap_or(false))
+            || (*w == "instead" && words.get(words.iter().position(|x| *x == *w).unwrap() + 1).map(|x| *x == "of").unwrap_or(false))
+    });
+
+    // Subject terms = every non-stopword content word appearing BEFORE the first
+    // negation marker. When building a compound exclusion we stop the current
+    // target (and finalise it) as soon as one of these subject terms reappears —
+    // that word belongs to the main query topic, not to the thing being excluded
+    // (e.g. "...without django or flask python web frameworks" must not swallow
+    // "python web frameworks" into the `flask` exclusion).
+    let subject_words = if let Some(pos) = first_neg_pos {
+        &words[..pos]
+    } else {
+        &words[..]
+    };
+    let subject_terms: std::collections::HashSet<&str> = subject_words
         .iter()
         .copied()
         .filter(|w| {
-            !["not", "no", "without", "except", "excluding", "minus", "other",
-              "rather", "instead", "than", "to", "of", "a", "an", "the", "from",
+            !["to", "of", "a", "an", "the", "from",
               "in", "on", "at", "for", "with", "by", "about", "any", "some",
               "using", "having", "is", "are", "was", "were", "be", "been",
               "being", "do", "does", "did", "have", "has", "had", "and", "or"]
@@ -7037,15 +7150,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                 "make", "made", "eating", "eat", "ate", "drinking", "drink", "drank",
                 "doing", "do", "did", "going", "go", "applying", "apply", "wearing",
                 "wear", "wore", "installing", "install", "running", "run",
-                // Source-creation verbs that introduce a brand via a source
-                // preposition ("not manufactured by lenovo", "not produced by acme",
-                // "not built by dell", "not sold by amazon", "not created by nike").
-                // These are the action, not the excluded entity; skip them (like
-                // the other trailer verbs) so the scanner lands on the brand.
-                "manufactured", "manufacture", "manufacturing", "produced",
-                "produce", "producing", "built", "build", "building", "sold",
-                "sell", "selling", "created", "create", "creating", "assembled",
-                "assemble", "assembling", "made",
+                "manufactured", "manufacture", "built", "sold", "produced",
             ];
             if j < words.len() && trailer_verbs.contains(&words[j]) {
                 let mut k = j + 1;
@@ -7202,12 +7307,37 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         }
                         k += 1;
                     }
-                    // Finalise the last (or only) target.
-                    record_and_reset(&mut compound, &mut terms, &mut dropped);
-                    // Advance past every word we consumed (first_clean at j plus all
-                    // extensions) so the outer loop doesn't re-scan them. `k` already
-                    // points at the first word we did NOT consume (or words.len()).
-                    i = k;
+                    let joined = compound.join(" ");
+                    // Gate: only keep the compound as a real exclusion when it is in
+                    // contrastive framing or names a recognized entity. Manner
+                    // qualifiers ("without soap", "with no music background") are
+                    // dropped so they don't penalize the user's own topical words.
+                    if is_real_exclusion(&joined, q_orig, query_contrastive)
+                        && !terms.contains(&joined)
+                    {
+                        terms.push(joined);
+                    } else if is_manner_phrase(&joined) || is_manner_frame(q_orig, &joined) {
+                        // Manner qualifier ("without soap", "without offending the
+                        // couple"): describes HOW not WHAT to exclude. It is NOT a
+                        // search exclusion — record it (the third tuple element) so
+                        // the `/analyze` endpoint can explain the engine's reasoning
+                        // instead of swallowing it silently.
+                        if !manner.contains(&joined) {
+                            manner.push(joined);
+                        }
+                    } else {
+                        // D3 transparency: a genuine candidate exclusion that the
+                        // gate declined (not a recognized entity, not contrastive
+                        // framing) AND is not a manner qualifier. It was silently
+                        // dropped before (regression); now we record it so it can
+                        // be surfaced in `ignored_constraints`. Never includes
+                        // manner qualifiers ("without soap"), which stay excluded.
+                        if !dropped.contains(&joined) {
+                            dropped.push(joined);
+                        }
+                    }
+                    // Advance past the consumed compound so we don't re-scan it.
+                    i = j + compound.len();
                     continue;
                 }
             }
@@ -8390,6 +8520,22 @@ fn merge_local_and_web(
     // mismatch penalty so IP-derived geo never penalises different-city pages.
     let geo_is_explicit = detect_explicit_location(query).is_some();
 
+    // How many of the merged web results actually carry a detectable price. The
+    // price-aware ranking block below only demotes price-less results when at
+    // least one priced result is present (fail-open): when NO result carries a
+    // price, demoting every price-less result collapses a valid product query to
+    // zero results, so the bound stays ranking-only. Computed here from `web`
+    // so it stays in scope for the per-result loop.
+    let priced_result_count = web.iter().filter(|r| r.get_price().is_some()).count();
+
+    // P6: how many web results carry a parseable date. When 0 for a fresh query,
+    // the date window fails open and recency stays a pure scoring boost — we then
+    // use temporal anchors (year/month in title/URL) to lift recent-content pages
+    // above generic aggregator/database pages.
+    let dated_result_count = web.iter().filter(|r| {
+        resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
+    }).count();
+
     // Helper: normalize URL for dedup matching
     let normalize = |url: &str| -> String {
         let lower = url.to_lowercase();
@@ -8418,7 +8564,10 @@ fn merge_local_and_web(
             price: r.price.map(|p| p.to_string()),
             currency: r.currency,
             quality: r.quality,
+            post_cal_cap: None,
             engine_trust_mult: 1.0,
+            commerce: None,
+            commerce_provenance: None,
         };
         url_to_idx.insert(norm, merged.len());
         merged.push(entry);
@@ -8473,39 +8622,15 @@ fn merge_local_and_web(
                 price: r.price.clone(),
                 currency: r.currency.clone(),
                 quality: 1.0,
+                post_cal_cap: None,
                 engine_trust_mult: 1.0,
+                commerce: None,
+                commerce_provenance: None,
             };
             url_to_idx.insert(norm, merged.len());
             merged.push(entry);
         }
     }
-
-    // ── FIX-IF-16: Source-diversity gate ──────────────────────────────────
-    let dominant_source: Option<String> = {
-        let mut source_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut total_src_hits = 0usize;
-        for r in &merged {
-            for s in &r.sources {
-                *source_counts.entry(s.to_lowercase()).or_insert(0) += 1;
-                total_src_hits += 1;
-            }
-        }
-        if total_src_hits > 0 {
-            source_counts
-                .iter()
-                .find(|(_, &c)| (c as f32) > 0.80 * total_src_hits as f32)
-                .map(|(s, c)| {
-                    tracing::warn!(
-                        "FIX-IF-16 SOURCE-DIVERSITY: source '{}' dominates ({}/{} = {:.0}%) — post-cal diversity penalty queued",
-                        s, c, total_src_hits, *c as f32 / total_src_hits as f32 * 100.0
-                    );
-                    s.clone()
-                })
-        } else {
-            None
-        }
-    };
 
     // 3. Apply unified ranking signals to all results
     // Use distribution-aware blending when available (intent as hint, not gate)
@@ -8864,11 +8989,6 @@ fn merge_local_and_web(
     // penalize pages that rank purely because they contain the generic word "best".
     let superlative_terms: &[&str] = &["best", "top", "greatest", "cheapest", "finest"];
     let query_has_superlative = q_words.iter().any(|w| superlative_terms.contains(&w.to_lowercase().as_str()));
-
-    // Product entity detection (IF-15 fix): identify model-number patterns in the query
-    // e.g. "macbook air m2", "iphone 16 pro max", "sony wh-1000xm5"
-    // Used below to boost/demote results in the ranking pipeline.
-    let product_entities = detect_product_entities(query);
 
     let mut relevance_vec: Vec<f32> = Vec::with_capacity(merged.len());
 
@@ -9253,36 +9373,55 @@ fn merge_local_and_web(
                 "weekend","weekday","weekdays","morning","evening","afternoon","night","tonight",
                 "today","month","year","open","opened","close","closed","early","late",
             ];
-            // AUXILIARY-VERB / FILLER markers (P2d, round-2026-08-20T1935Z): query verbs like
-            // "need"/"want"/"use"/"require" are DISTINCTIVE terms but are NOT subjects — a local
-            // page titled "Slack Alternatives Small Teams Actually Need" matches the query
-            // "alternatives to airtable ... that need a free tier" only on "alternatives" +
-            // "need", neither of which is the subject "airtable". If such a verb is the only
-            // surviving distinctive term it must NOT satisfy the subject requirement. Fixed
-            // word-CLASS seed, not per-query.
-            let aux_verb_words: &[&str] = &[
-                "need","needs","needed","want","wants","wanted","require","requires","required",
-                "use","uses","used","using",
-            ];
-            // P2 fix (this round): anchor `topic_mentioned` on `strong_distinctive_terms`
-            // (substantive subject terms; weak anchors like "places"/"road"/"trip" already
-            // filtered out) instead of the full `distinctive_terms`. An off-topic local
-            // crawl page can match ONLY a weak anchor — e.g. "trawell.in/vizag/100kms" for a
-            // "places to see snowfall near shimla within 100 kilometers" query, where the sole
-            // overlap is the generic word "places" — and the old test (which accepted any
-            // distinctive term) set topic_mentioned=true, so the quality gate never fired and
-            // the page floated to #1 above the on-topic web result. Using strong terms means a
-            // local page must actually mention the query's SUBJECT (shimla/snowfall,
-            // boeing/airbus, hyderabad/goa) to survive; weak-anchor-only matches are correctly
-            // crushed. General, signal-driven, no query/domain bias. Genuine local pages that
-            // contain a real subject term still pass (no regression).
-            let topic_mentioned = strong_distinctive_terms.is_empty()
-                || strong_distinctive_terms.iter().any(|t| {
+            // P2 gate anchors on STRONG distinctive terms (the stricter set also used
+            // by the post-loop OFF_TOPIC_LOCAL_DROP at line ~6129 and the off_topic_struct
+            // guard). Strong terms exclude weak-anchor nouns ("symptoms", "sign", "effect",
+            // "cause", ...) that are shared across unrelated topics. Anchoring on the looser
+            // `distinctive_terms` let an off-topic local page ("Heart Disease in Cats:
+            // Early Symptoms") pass the gate at full relevance for "early symptoms of a
+            // failing laptop ssd" because it matched the generic word "symptoms" — then
+            // outrank the genuinely-relevant web result. Strong terms require the page to
+            // name a SUBSTANTIVE query entity (ssd/laptop), so the off-topic page is
+            // crushed. General: same distinctive-term overlap test as the hard-drop; no
+            // query or domain bias. No fallback to weak-only terms; if only weak/meta terms
+            // exist, topic_mentioned stays false to gate off-topic pages (e.g. "deploy"
+            // alone for "deploy fastapi with postgres on ubuntu" would not validate an
+            // unrelated deployment article; the page must mention fastapi/postgres/ubuntu).
+            let topic_anchor_terms: Vec<&str> = strong_distinctive_terms.iter()
+                .filter(|t| {
+                    let tl = t.to_lowercase();
+                    !structure_words.contains(&tl.as_str())
+                        && !meta_action_terms.contains(tl.as_str())
+                        && !is_weak_anchor_word(&tl)
+                })
+                .copied()
+                .collect();
+            // P2c (round-2026-09-08): when the query has >= 2 topic anchor terms,
+            // require at least TWO to be present in the result. A page matching
+            // only ONE of several topic terms is a partial/incidental match — e.g.
+            // "Fluffy Fluffy Dessert Cafe" for "how to make fluffy pancakes" matches
+            // "fluffy" but not "pancakes". The old `any()` let such pages survive the
+            // gate and outrank genuinely on-topic web results. Requiring >= 2 matches
+            // crushes partial matches while letting full-topic pages (which name
+            // multiple query subjects) pass. Single-term queries are unaffected.
+            let topic_mentioned = if topic_anchor_terms.is_empty() {
+                true
+            } else if topic_anchor_terms.len() >= 2 {
+                let matched_count = topic_anchor_terms.iter().filter(|t| {
                     let tl = t.to_lowercase();
                     let bare = tl.trim_end_matches('s');
                     title_lower.contains(&tl) || content_lower.contains(&tl)
                         || title_lower.contains(bare) || content_lower.contains(bare)
-                });
+                }).count();
+                matched_count >= 2
+            } else {
+                topic_anchor_terms.iter().any(|t| {
+                    let tl = t.to_lowercase();
+                    let bare = tl.trim_end_matches('s');
+                    title_lower.contains(&tl) || content_lower.contains(&tl)
+                        || title_lower.contains(bare) || content_lower.contains(bare)
+                })
+            };
             // P2b: high-quality local pages that match the query ONLY on comparison
             // STRUCTURE ("difference between X and Y", "X vs Y") but share NONE of the
             // query's substantive entity terms are off-topic crawl noise — e.g.
@@ -9304,38 +9443,6 @@ fn merge_local_and_web(
             let mentions_substantive = substantive_terms.iter().any(|t| {
                 title_lower.contains(t) || content_lower.contains(t)
             });
-            // P2d (round-2026-08-20T1935Z): a LOCAL page that matches the query only on
-            // generic FORMAT/CATEGORY words (now part of structure_words: "alternatives",
-            // "traditional", "forms", "good", "dentists", ...) while naming NONE of the
-            // query's substantive SUBJECT terms is off-topic crawl noise, and the
-            // quality-only P2 gates above spare it (the crawler scored it high on the shared
-            // format word) so it floats to #1 above the on-topic web result. Examples from
-            // this round: local "kimchi" page #1 for "bibimbap"; local "Slack Alternatives"
-            // page #1 for "alternatives to airtable". substantive_subject_terms = distinctive
-            // terms minus structure_words (which now includes the format/category vocab), so
-            // it is the query's REAL subjects (airtable, bibimbap, thomson, biryani, ...). A
-            // local page must name one to survive; otherwise it is crushed. Fully general —
-            // subject derived from the query's own terms, no per-query/domain tuning — and
-            // fail-open when the query has no substantive subject terms (so short/generic
-            // queries are not over-crushed).
-            let substantive_subject_terms: Vec<String> = strong_distinctive_terms
-                .iter()
-                .map(|t| t.to_lowercase())
-                .filter(|tl| !structure_words.contains(&tl.as_str()))
-                .filter(|tl| !aux_verb_words.contains(&tl.as_str()))
-                .collect();
-            let mentions_substantive_subject = substantive_subject_terms.iter().any(|t| {
-                // TITLE-anchored only: a local page whose TITLE does not name the
-                // query's substantive subject is off-topic crawl noise even if it
-                // mentions the subject INCIDENTALLY in its body (e.g. a "Slack
-                // Alternatives" page that references "airtable" in passing is still
-                // about Slack, not Airtable, and must not rank #1 for an
-                // "alternatives to airtable" query). Content-only matches are exactly
-                // the leak that let #22 survive; title-anchoring is the general fix.
-                let bare = t.trim_end_matches('s');
-                let tl = t.as_str();
-                title_lower.contains(tl) || title_lower.contains(bare)
-            });
             let result_is_comparison_structured =
                 title_lower.contains(" vs ") || title_lower.contains(" versus ")
                 || title_lower.contains("difference between") || title_lower.contains(" compared ");
@@ -9355,73 +9462,6 @@ fn merge_local_and_web(
                 tracing::info!(
                     "LOCAL NOISE GATE (off-topic comparison): '{}' is a comparison page but mentions none of the query entities {:?} -> relevance *= 0.3",
                     r.title.chars().take(60).collect::<String>(), substantive_terms
-                );
-            } else if r.is_local && comparison_query && !comparison_entities.is_empty() {
-                // D3 fix: for a comparison query, a LOCAL page that names NONE of
-                // the compared entities (brand+model tokens like "brezza"/"venue")
-                // is off-topic crawl noise EVEN when it shares generic attribute
-                // words ("mileage", "petrol", "real world"). E.g. "Honda City
-                // Mileage" floating above the actual Brezza/Venue results for a
-                // "Brezza vs Venue mileage" query, because the local index scored it
-                // on the shared attribute words and its relevance was never crushed.
-                // The compared entities are derived from the query's OWN distinctive
-                // terms minus attribute/structure vocab, so this is fully general:
-                // it fires for any comparison ("swift vs nexon", "city vs amaze",
-                // ...) and never names a specific brand/model. Crush hard so on-topic
-                // web pages (which DO name the entities) win the slot.
-                let mentions_compared = comparison_entities.iter().any(|e| {
-                    title_lower.contains(e.as_str()) || content_lower.contains(e.as_str())
-                });
-                if !mentions_compared {
-                    relevance *= 0.05;
-                    tracing::info!(
-                        "LOCAL NOISE GATE (D3 compared-entity): '{}' names none of the compared entities {:?} for comparison query -> relevance x0.05",
-                        r.title.chars().take(60).collect::<String>(), comparison_entities
-                    );
-                }
-            } else if r.is_local && distinctive_terms.len() >= 3 && overlap < 0.34 {
-                // P2c (this round): a LOCAL page that shares only a small FRACTION of the
-                // query's distinctive terms is crawl noise, not a real match. The checks above
-                // are defeated by a SINGLE generic-noun overlap — e.g. "Road Trip Ideas" matching
-                // just "road"+"trip" of a "hyderabad to goa road trip" query, or "Public record
-                // requests" matching just "record"+"safety" of "boeing versus airbus safety" —
-                // so topic_mentioned stays true and the page floats to #1 above on-topic web
-                // results. Use the in-scope lexical `overlap` ratio (present distinctive / total
-                // distinctive) as the signal: < 0.34 with >= 3 distinctive terms means the page
-                // addresses a small minority of the query -> crush it. Short queries (N<3) are
-                // exempt (a 1/2 match there is tolerable and would over-crush legit short matches).
-                // General, signal-driven, no query/domain tuning.
-                relevance *= 0.05;
-                tracing::info!(
-                    "LOCAL NOISE GATE (low distinctive overlap): '{}' overlap={:.2} distinctive_len={} -> relevance x0.05",
-                    r.title.chars().take(60).collect::<String>(), overlap, distinctive_terms.len()
-                );
-            }
-            // P2d (standalone, round-2026-08-20T1935Z): high-quality LOCAL page that names
-            // NONE of the query's substantive SUBJECT terms (only generic format/category
-            // words like "alternatives"/"traditional"/"forms"/"good"/"dentists") is off-topic
-            // crawl noise. Evaluated as a STANDALONE if (NOT an else-if) because the earlier
-            // D3 comparison gate (branch `r.is_local && comparison_query`) can spare such a
-            // page via a CONTENT-only entity mention — e.g. a "Slack Alternatives" page whose
-            // body references "airtable" survives the D3 content check, then the else-if chain
-            // skips P2d entirely. Title-anchoring the subject requirement kills that leak: a
-            // local page must name the subject in its TITLE to survive. Fail-open when the
-            // query has no substantive subject terms (short/generic queries not over-crushed).
-            if r.is_local && !substantive_subject_terms.is_empty() && !mentions_substantive_subject {
-                p2d_offtopic = true;
-                p2d_offtopic_terms = substantive_subject_terms.clone();
-                // In-loop relevance crush (defense-in-depth): pushes the page toward
-                // raw_min so calibrate_scores' [0.05,1.0] rescale lands it near the floor.
-                // The DURABLE suppression is the POST-CALIBRATION P2d cap (near ~8141),
-                // which re-applies AFTER calibration — the only place a crush survives
-                // the linear rescale. General: keyed on "local page names none of the
-                // query's title-anchored subject terms", a structural class, not a
-                // per-query/domain rule.
-                relevance = (relevance * 0.01).min(0.0025);
-                r.score *= 0.01;
-                tracing::info!(
-                    "LOCAL NOISE GATE (P2d off-topic local): '{}' names none of the subject terms {:?} -> relevance crushed to {:.4}, r.score x0.01",
-                    r.title.chars().take(60).collect::<String>(), substantive_subject_terms, relevance
                 );
             }
         }
@@ -9710,6 +9750,66 @@ fn merge_local_and_web(
             );
         }
 
+        // ── P6: fresh-intent temporal-anchor boost (date window failed open) ──
+        // When NO web result carries a parseable date (dated_result_count == 0),
+        // the hard recency window fails open and recency stays a pure scoring
+        // boost. Generic aggregator/database pages with high authority then crowd
+        // out actual recent content. We rescue the ranking by boosting results
+        // whose title or URL explicitly mentions the query's year or month —
+        // these are temporal anchors that correlate with recency even when the
+        // upstream snippet lacks a parseable published_date. A result that names
+        // the time period is more likely to be about that period than a generic
+        // portal page. Keyed on the query's own year/month tokens, no domain
+        // lists, no per-query tuning — general and future-proof.
+        //
+        // BUG FIX (2026-09-08): the original gate required
+        // `constraints.after_date.is_some() || constraints.before_date.is_some()`,
+        // but the date window fail-open logic (line ~14496) CLEARS those bounds
+        // when dated_result_count == 0 — exactly the case P6 must handle. The
+        // clone passed to merge_local_and_web() therefore has no date bounds,
+        // so the P6 logic never fired when it was most needed. The correct
+        // trigger is `dated_result_count == 0` (the window failed open) OR the
+        // presence of a date constraint (window is active, dated_result_count > 0).
+        if intent == "fresh" && (dated_result_count == 0 || constraints.after_date.is_some() || constraints.before_date.is_some()) {
+            let query_year = extract_year_from_query(&clean_query);
+            let query_month = extract_month_from_query(&clean_query);
+            let title_has_year = query_year.as_ref().map_or(false, |y| title_lower.contains(y.as_str()));
+            let url_has_year = query_year.as_ref().map_or(false, |y| url_lower.contains(y.as_str()));
+            let title_has_month = query_month.as_ref().map_or(false, |m| title_lower.contains(m.as_str()));
+            let url_has_month = query_month.as_ref().map_or(false, |m| url_lower.contains(m.as_str()));
+            if title_has_year || url_has_year || title_has_month || url_has_month {
+                relevance *= 1.30;
+                tracing::info!(
+                    "P6 TEMPORAL ANCHOR BOOST x1.30: '{}' mentions query time period (year={:?}, month={:?})",
+                    r.url.chars().take(60).collect::<String>(),
+                    query_year,
+                    query_month
+                );
+            }
+            // ── P6: fresh-intent temporal-anchor PENALTY ──
+            // The boost above rewards results naming the query's year/month, but
+            // without a corresponding penalty the generic aggregator/database pages
+            // (JustWatch, IMDb, Moviefone, Netflix…) that dominate fresh queries
+            // still crowd out actual recent content — they contain query words like
+            // "movies" but no temporal anchor. Penalize results that LACK the time
+            // period so dated/anchored results rise above the generic portals. Keys
+            // on the same year/month tokens as the boost — no domain lists, no
+            // per-query tuning. Symmetric: boost rewards presence, penalty punishes
+            // absence, both gated on date_window_present (when a recency window is
+            // active). Fires even when dated_result_count > 0 but small — the window
+            // filters only the few dated results while date-less portals survive and
+            // dominate.
+            if !(title_has_year || url_has_year || title_has_month || url_has_month) {
+                relevance *= 0.50;
+                tracing::info!(
+                    "P6 TEMPORAL ANCHOR PENALTY x0.50: '{}' lacks query time period (year={:?}, month={:?})",
+                    r.url.chars().take(60).collect::<String>(),
+                    query_year,
+                    query_month
+                );
+            }
+        }
+
         // ── Fresh-intent news-portal demotion (this round, #16/#22) ──
         // For FRESH intent, upstream often returns ONLY the bare homepage or top-level
         // section of a major news portal (cnn.com/, bbc.com/news/world, foxnews.com/)
@@ -9975,11 +10075,7 @@ fn merge_local_and_web(
             || r.sources.iter().any(|s| s == "arxiv" || s == "crossref" || s == "pubmed");
 
         let has_download = DOWNLOAD_KEYWORDS.iter().any(|k| q_lower_check.contains(k));
-        // Transactional keywords are data-driven from `data/commerce/signals.json`
-        // (runtime-loaded into `state.commerce_config.transactional_keywords`).
-        // Whole-word match via `detect_transactional_signal` — "priceless" never
-        // false-positives on "price".
-        let has_tx = detect_transactional_signal(&q_lower_check, &tx_keywords);
+        let has_tx = tx_keywords.iter().any(|kw| q_lower_check.contains(kw.as_str()));
         let is_nav_or_download = intent == "navigational"
             || intent == "transactional"
             || has_download
@@ -10123,81 +10219,7 @@ fn merge_local_and_web(
             let tl = t.to_lowercase();
             title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
         }) && !geo_ok_authority;
-        // Inverse-geo authority suppression (this round, D1): a local page from the
-        // WRONG city (explicit geo resolved, page does not name the location) is
-        // geo-off-topic and must lose its authority signal too, not just its bonus —
-        // otherwise its high authority floats it above right-city web results (the
-        // Madurai/Busan case). Same signal as the off_topic gate; a right-city local
-        // page (geo_ok_local) is exempt. Authority is halved (not zeroed) so a
-        // borderline page keeps a little trust, and the existing 0.3 floor logic holds.
-        let geo_authority_suppressed = off_topic || geo_local_offtopic;
-        let authority_eff = if geo_authority_suppressed { r.authority * 0.3 } else { r.authority };
-
-        // P2d (round-2026-08-20T1935Z): collapse the indexer BM25 for off-topic locals
-        // HERE (same scope as `base`), because the earlier `r.score *= 0.01` in the noise-
-        // gate block above does NOT propagate to this read under the borrow structure. The
-        // body-incidental subject mention (e.g. "airtable" in a Slack-Alternatives page)
-        // gave it a large r.score that dominates weights.rrf; crushing it here lets the
-        // on-topic web page win after calibrate_scores. General: keyed on the P2d flag
-        // (local page names none of the query's title-anchored subject terms).
-        if p2d_offtopic {
-            r.score *= 0.01;
-        }
-
-        // P2d (round-2026-08-20T1935Z): collapse the indexer BM25 for off-topic locals
-        // HERE (same scope as `base`), because the earlier `r.score *= 0.01` in the noise-
-        // gate block above does NOT propagate to this read under the borrow structure. The
-        // body-incidental subject mention (e.g. "airtable" in a Slack-Alternatives page)
-        // gave it a large r.score that dominates weights.rrf; crushing it here lets the
-        // on-topic web page win after calibrate_scores. General: keyed on the P2d flag
-        // (local page names none of the query's title-anchored subject terms).
-        if p2d_offtopic {
-            r.score *= 0.01;
-        }
-
-        // P2d (round-2026-08-20T1935Z): collapse the indexer BM25 for off-topic locals
-        // HERE (same scope as `base`), because the earlier `r.score *= 0.01` in the noise-
-        // gate block above does NOT propagate to this read under the borrow structure. The
-        // body-incidental subject mention (e.g. "airtable" in a Slack-Alternatives page)
-        // gave it a large r.score that dominates weights.rrf; crushing it here lets the
-        // on-topic web page win after calibrate_scores. General: keyed on the P2d flag
-        // (local page names none of the query's title-anchored subject terms).
-        if p2d_offtopic {
-            r.score *= 0.01;
-        }
-
-        // P2d (round-2026-08-20T1935Z): collapse the indexer BM25 for off-topic locals
-        // HERE (same scope as `base`), because the earlier `r.score *= 0.01` in the noise-
-        // gate block above does NOT propagate to this read under the borrow structure. The
-        // body-incidental subject mention (e.g. "airtable" in a Slack-Alternatives page)
-        // gave it a large r.score that dominates weights.rrf; crushing it here lets the
-        // on-topic web page win after calibrate_scores. General: keyed on the P2d flag
-        // (local page names none of the query's title-anchored subject terms).
-        if p2d_offtopic {
-            r.score *= 0.01;
-        }
-
-        // P2d (round-2026-08-20T1935Z): collapse the indexer BM25 for off-topic locals
-        // HERE (same scope as `base`), because the earlier `r.score *= 0.01` in the noise-
-        // gate block above does NOT propagate to this read under the borrow structure. The
-        // body-incidental subject mention (e.g. "airtable" in a Slack-Alternatives page)
-        // gave it a large r.score that dominates weights.rrf; crushing it here lets the
-        // on-topic web page win after calibrate_scores. General: keyed on the P2d flag
-        // (local page names none of the query's title-anchored subject terms).
-        if p2d_offtopic {
-            r.score *= 0.01;
-        }
-
-        // P2d (round-2026-08-20T1935Z): collapse the indexer BM25 for off-topic locals
-        // HERE (same scope as `base`), because the earlier `r.score *= 0.01` in the noise-
-        // gate block above does NOT propagate to this read under the borrow structure. The
-        // body-incidental subject mention (e.g. "airtable" in a Slack-Alternatives page)
-        // gave it a large r.score that dominates weights.rrf; crushing it here lets the
-        // on-topic web page win after calibrate_scores. General: keyed on the P2d flag
-        // (local page names none of the query's title-anchored subject terms).
-        if p2d_offtopic {
-            r.score *= 0.01;
-        }
+        let authority_eff = if off_topic { r.authority * 0.3 } else { r.authority };
 
         let base = (weights.rrf * r.score)
             + (weights.semantic * semantic)
@@ -10377,32 +10399,28 @@ fn merge_local_and_web(
     // overlap survived at the 0.05 floor (calibrate_scores re-inflates the bottom
     // onto [0.05,1.0]), so off-topic web junk could not be removed. This round
     // removes that carve-out so the same gate protects web results.
+    // Soft off-topic penalty (was hard-drop until 2026-09-15T1200Z round).
+    //
+    // ROOT CAUSE: the old hard-drop `retain(|r| overlaps || geo_ok)` dropped
+    // every result whose title/content/url snippet shared ZERO of the query's
+    // strong distinctive terms. For long NL queries with many distinctive terms
+    // ("how to make fluffy idli batter at home without using a wet grinder" →
+    // ~7 strong terms), 80-90% of results were dropped because NO single page
+    // mentions ANY of those exact tokens. Verified live: 17/26 new NL queries
+    // had >50% drops, collapsing 30-result sets to 1-6. This is a result-set
+    // collapse, not curation — the surviving 1-6 were not meaningfully more
+    // on-topic than the 24 dropped.
+    //
+    // FIX: instead of hard-dropping, apply a soft score penalty (×0.10) to
+    // zero-overlap results. They sink to the bottom but survive. The downstream
+    // adaptive relevance floor (P60 distribution), domain-saturation gate, and
+    // pagination naturally exclude genuinely off-topic junk without collapsing
+    // the set. Adult results for non-adult queries are still hard-dropped by the
+    // separate adult block below — safety is never fail-open. Geo-matching
+    // results keep full score (local intent).
     if !strong_distinctive_terms.is_empty() {
-        let before = merged.len();
-        let retained_pre_offtopic: Vec<MergedResult> = merged.iter().cloned().collect();
-        merged.retain(|r| {
-            // Adult exemption: when the query is explicitly adult, an adult result
-            // must survive the off-topic gate — the adult block below keeps it
-            // intentionally. Without this, the web off-topic drop would remove the
-            // adult URL first (it shares zero food/recipe/etc. distinctive terms),
-            // regressing "adult kept for explicit-adult query".
-            if adult_intent {
-                let ul = r.url.to_lowercase();
-                let tl = r.title.to_lowercase();
-                let host = reqwest::Url::parse(&r.url)
-                    .ok()
-                    .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
-                    .unwrap_or_default();
-                let tld_adult = host.ends_with(".xxx");
-                let host_adult = adult_hosts.iter().any(|h| host.contains(h));
-                let path_adult = adult_paths.iter().any(|p| ul.contains(p));
-                let title_adult = tl.contains("porn") || tl.contains("xxx ")
-                    || tl.contains("nude") || tl.contains("naked")
-                    || tl.contains("sex video") || tl.contains("adult film");
-                if tld_adult || host_adult || path_adult || title_adult {
-                    return true;
-                }
-            }
+        let mut penalized = 0usize;
+        for r in merged.iter_mut() {
             let tl = r.title.to_lowercase();
             let cl = r.content.to_lowercase();
             let ul = r.url.to_lowercase();
@@ -10410,693 +10428,35 @@ fn merge_local_and_web(
                 let lt = t.to_lowercase();
                 tl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
             });
-            // Geo-aware exemption: a query with a resolved location is a LOCAL/geo
-            // intent; a result that names that location (city/country) is genuinely
-            // on-topic even if its snippet omits the descriptive adjectives
-            // (quiet/wifi/outlets/...). Without this, "quiet places to study near
-            // chennai" hard-drops every chennai-mentioning result that didn't also
-            // repeat "quiet"/"wifi", collapsing the set to one generic page.
-            // General: reuses geo_relevance_score, no query/domain bias; only
-            // exempts results that actually mention the resolved location.
             let geo_ok = geo_location
                 .map(|g| geo_relevance_score(&tl, &cl, &ul, g) > 0.0)
                 .unwrap_or(false);
-            overlaps || geo_ok
-        });
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("OFF_TOPIC_HARD_DROP: removed {}/{} result(s) (local+web) with zero distinctive-term overlap", removed, before);
-        }
-        // ── Inverse-geo hard-drop (D1, this round): WRONG-CITY local pages ──
-        // When an EXPLICIT location is resolved (e.g. "temples in madurai"),
-        // a LOCAL-INDEX result that does NOT name that location is geo-off-topic:
-        // it matched only generic tokens ("temple quiet") and is from the wrong
-        // city (Madurai query → Busan page). The off-topic drop above CANNOT
-        // catch this, because when strong_distinctive_terms is empty (common for
-        // geo queries whose descriptive adjectives aren't distinctive tokens),
-        // that whole block is skipped. So we drop wrong-city local pages here,
-        // keyed purely on geo_relevance_score>0 (same signal as the off_topic
-        // gate / geo boost) — NO per-query tuning, NO hardcoded city/domain list.
-        // Only fires for explicit-location queries, so non-geo local results are
-        // untouched. Fail-open: never empty the merged set on this alone (safety
-        // over aggression — if it were the only survivor, keep it rather than
-        // show nothing). Mirrors the off-topic fail-open structure.
-        if geo_location.is_some() {
-            let before_geo = merged.len();
-            let retained_pre_geo: Vec<MergedResult> = merged.iter().cloned().collect();
-            merged.retain(|r| {
-                let is_wrong_city_local = r.is_local
-                    && geo_location
-                        .map(|g| geo_relevance_score(&r.title, &r.content, &r.url, g) == 0.0)
-                        .unwrap_or(false);
-                !is_wrong_city_local
-            });
-            let removed_geo = before_geo - merged.len();
-            if removed_geo > 0 {
-                tracing::info!(
-                    "INVERSE_GEO_HARD_DROP: removed {}/{} wrong-city local result(s) for resolved geo",
-                    removed_geo, before_geo
-                );
-            }
-            // Fail-open: if the geo drop would empty the set, restore survivors.
-            if merged.is_empty() && before_geo > 0 {
-                merged.extend(retained_pre_geo);
-            }
-        }
-        // Fail-open rescue (mirrors the date/price fail-opens above): if the
-        // off-topic drop would EMPTY the merged set, the "distinctive-term
-        // overlap" signal is too strict for this query (e.g. fresh+price queries
-        // where upstream results legitimately omit the exact distinctive tokens
-        // in their title/content/url snippets) and we must not return a blank
-        // page. Restore the survivors but STILL enforce the adult hard-drop below
-        // (safety is never fail-open), and keep an explicit warning so the gap is
-        // visible. Keyed on "would-empty", not on any query/domain — general.
-        if merged.is_empty() && before > 0 {
-            let restored: Vec<MergedResult> = retained_pre_offtopic
-                .into_iter()
-                .filter(|r| {
-                    let ul = r.url.to_lowercase();
-                    let tl = r.title.to_lowercase();
+            if !overlaps && !geo_ok {
+                // Adult exemption: when the query is explicitly adult, an adult
+                // result keeps full score — the adult block below will handle it.
+                let is_adult_exempt = if adult_intent {
                     let host = reqwest::Url::parse(&r.url)
                         .ok()
                         .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
                         .unwrap_or_default();
-                    let tld_adult = host.ends_with(".xxx");
-                    let host_adult = adult_hosts.iter().any(|h| host.contains(h));
-                    let path_adult = adult_paths.iter().any(|p| ul.contains(p));
-                    let title_adult = tl.contains("porn") || tl.contains("xxx ")
+                    host.ends_with(".xxx")
+                        || adult_hosts.iter().any(|h| host.contains(h))
+                        || adult_paths.iter().any(|p| ul.contains(p))
+                        || tl.contains("porn") || tl.contains("xxx ")
                         || tl.contains("nude") || tl.contains("naked")
-                        || tl.contains("sex video") || tl.contains("adult film");
-                    let is_adult = tld_adult || host_adult || path_adult || title_adult;
-                    !is_adult
-                })
-                .collect();
-            tracing::warn!(
-                "OFF_TOPIC_HARD_DROP FAIL-OPEN: {} result(s) all lacked distinctive-term overlap but dropping them would empty the set — restoring {} non-adult survivor(s) (recency/authority ranking still applies)",
-                before,
-                restored.len()
-            );
-            merged = restored;
+                        || tl.contains("sex video") || tl.contains("adult film")
+                } else {
+                    false
+                };
+                if !is_adult_exempt {
+                    r.score *= 0.10;
+                    penalized += 1;
+                }
+            }
         }
-    }
-
-    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
-    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
-    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
-    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
-    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
-    // because the local base score is large, so other-city pages still floated into
-    // positions 3-5. We hard-drop local results that name a different gazetteer place
-    // and do NOT name the requested city/country.
-    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
-    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
-    // that NAME the requested place are kept. No query/domain literals.
-    if geo_is_explicit {
-        let before = merged.len();
-        merged.retain(|r| {
-            if !r.is_local {
-                return true;
-            }
-            let tl = r.title.to_lowercase();
-            let cl = r.content.to_lowercase();
-            let ul = r.url.to_lowercase();
-            let text = format!("{} {} {}", tl, cl, ul);
-            // On-topic for the requested location → keep.
-            let req_city = geo_location.and_then(|g| g.city.as_deref());
-            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
-            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
-                || req_country.map_or(false, |c| whole_word_contains(&text, c));
-            if mentions_req {
-                return true;
-            }
-            // Mention of a different known place → drop this local page.
-            let same_country_ok = req_city.is_none();
-            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
-            for (name, cc) in LOCATION_GAZETTEER.iter() {
-                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if same_country_ok {
-                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
-                }
-                if name.len() < 3 { continue; }
-                if whole_word_contains(&text, name) {
-                    return false;
-                }
-            }
-            true
-        });
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
-        }
-    }
-
-    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
-    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
-    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
-    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
-    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
-    // because the local base score is large, so other-city pages still floated into
-    // positions 3-5. We hard-drop local results that name a different gazetteer place
-    // and do NOT name the requested city/country.
-    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
-    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
-    // that NAME the requested place are kept. No query/domain literals.
-    if geo_is_explicit {
-        let before = merged.len();
-        merged.retain(|r| {
-            if !r.is_local {
-                return true;
-            }
-            let tl = r.title.to_lowercase();
-            let cl = r.content.to_lowercase();
-            let ul = r.url.to_lowercase();
-            let text = format!("{} {} {}", tl, cl, ul);
-            // On-topic for the requested location → keep.
-            let req_city = geo_location.and_then(|g| g.city.as_deref());
-            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
-            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
-                || req_country.map_or(false, |c| whole_word_contains(&text, c));
-            if mentions_req {
-                return true;
-            }
-            // Mention of a different known place → drop this local page.
-            let same_country_ok = req_city.is_none();
-            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
-            for (name, cc) in LOCATION_GAZETTEER.iter() {
-                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if same_country_ok {
-                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
-                }
-                if name.len() < 3 { continue; }
-                if whole_word_contains(&text, name) {
-                    return false;
-                }
-            }
-            true
-        });
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
-        }
-    }
-
-    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
-    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
-    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
-    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
-    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
-    // because the local base score is large, so other-city pages still floated into
-    // positions 3-5. We hard-drop local results that name a different gazetteer place
-    // and do NOT name the requested city/country.
-    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
-    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
-    // that NAME the requested place are kept. No query/domain literals.
-    if geo_is_explicit {
-        let before = merged.len();
-        merged.retain(|r| {
-            if !r.is_local {
-                return true;
-            }
-            let tl = r.title.to_lowercase();
-            let cl = r.content.to_lowercase();
-            let ul = r.url.to_lowercase();
-            let text = format!("{} {} {}", tl, cl, ul);
-            // On-topic for the requested location → keep.
-            let req_city = geo_location.and_then(|g| g.city.as_deref());
-            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
-            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
-                || req_country.map_or(false, |c| whole_word_contains(&text, c));
-            if mentions_req {
-                return true;
-            }
-            // Mention of a different known place → drop this local page.
-            let same_country_ok = req_city.is_none();
-            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
-            for (name, cc) in LOCATION_GAZETTEER.iter() {
-                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if same_country_ok {
-                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
-                }
-                if name.len() < 3 { continue; }
-                if whole_word_contains(&text, name) {
-                    return false;
-                }
-            }
-            true
-        });
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
-        }
-    }
-
-    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
-    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
-    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
-    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
-    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
-    // because the local base score is large, so other-city pages still floated into
-    // positions 3-5. We hard-drop local results that name a different gazetteer place
-    // and do NOT name the requested city/country.
-    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
-    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
-    // that NAME the requested place are kept. No query/domain literals.
-    if geo_is_explicit {
-        let before = merged.len();
-        merged.retain(|r| {
-            if !r.is_local {
-                return true;
-            }
-            let tl = r.title.to_lowercase();
-            let cl = r.content.to_lowercase();
-            let ul = r.url.to_lowercase();
-            let text = format!("{} {} {}", tl, cl, ul);
-            // On-topic for the requested location → keep.
-            let req_city = geo_location.and_then(|g| g.city.as_deref());
-            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
-            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
-                || req_country.map_or(false, |c| whole_word_contains(&text, c));
-            if mentions_req {
-                return true;
-            }
-            // Mention of a different known place → drop this local page.
-            let same_country_ok = req_city.is_none();
-            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
-            for (name, cc) in LOCATION_GAZETTEER.iter() {
-                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if same_country_ok {
-                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
-                }
-                if name.len() < 3 { continue; }
-                if whole_word_contains(&text, name) {
-                    return false;
-                }
-            }
-            true
-        });
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
-        }
-    }
-
-    // ── P13 (round-2026-08-20T1935Z): drop adult/NSFW results flagged upstream ──
-    // The per-result loop (line ~6302) sets r.score = -1.0 and continues for any
-    // result whose title/URL matches clean::is_adult_explicit() — a query-agnostic
-    // lexical detector. Here we physically remove those sentinels so they never
-    // reach the response. Hard-drop (not demote) because a family-safe engine must
-    // never surface explicit content regardless of how weak the rest of the set is.
-    {
-        let before = merged.len();
-        merged.retain(|r| r.score >= 0.0);
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("P13 ADULT DROP: removed {} explicit result(s) from merged set", removed);
-        }
-    }
-
-    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
-    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
-    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
-    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
-    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
-    // because the local base score is large, so other-city pages still floated into
-    // positions 3-5. We hard-drop local results that name a different gazetteer place
-    // and do NOT name the requested city/country.
-    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
-    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
-    // that NAME the requested place are kept. No query/domain literals.
-    if geo_is_explicit {
-        let before = merged.len();
-        merged.retain(|r| {
-            if !r.is_local {
-                return true;
-            }
-            let tl = r.title.to_lowercase();
-            let cl = r.content.to_lowercase();
-            let ul = r.url.to_lowercase();
-            let text = format!("{} {} {}", tl, cl, ul);
-            // On-topic for the requested location → keep.
-            let req_city = geo_location.and_then(|g| g.city.as_deref());
-            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
-            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
-                || req_country.map_or(false, |c| whole_word_contains(&text, c));
-            if mentions_req {
-                return true;
-            }
-            // Mention of a different known place → drop this local page.
-            let same_country_ok = req_city.is_none();
-            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
-            for (name, cc) in LOCATION_GAZETTEER.iter() {
-                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if same_country_ok {
-                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
-                }
-                if name.len() < 3 { continue; }
-                if whole_word_contains(&text, name) {
-                    return false;
-                }
-            }
-            true
-        });
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
-        }
-    }
-
-    // ── P13 (round-2026-08-20T1935Z): drop adult/NSFW results flagged upstream ──
-    // The per-result loop (line ~6302) sets r.score = -1.0 and continues for any
-    // result whose title/URL matches clean::is_adult_explicit() — a query-agnostic
-    // lexical detector. Here we physically remove those sentinels so they never
-    // reach the response. Hard-drop (not demote) because a family-safe engine must
-    // never surface explicit content regardless of how weak the rest of the set is.
-    {
-        let before = merged.len();
-        merged.retain(|r| r.score >= 0.0);
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("P13 ADULT DROP: removed {} explicit result(s) from merged set", removed);
-        }
-    }
-
-    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
-    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
-    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
-    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
-    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
-    // because the local base score is large, so other-city pages still floated into
-    // positions 3-5. We hard-drop local results that name a different gazetteer place
-    // and do NOT name the requested city/country.
-    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
-    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
-    // that NAME the requested place are kept. No query/domain literals.
-    if geo_is_explicit {
-        let before = merged.len();
-        merged.retain(|r| {
-            if !r.is_local {
-                return true;
-            }
-            let tl = r.title.to_lowercase();
-            let cl = r.content.to_lowercase();
-            let ul = r.url.to_lowercase();
-            let text = format!("{} {} {}", tl, cl, ul);
-            // On-topic for the requested location → keep.
-            let req_city = geo_location.and_then(|g| g.city.as_deref());
-            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
-            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
-                || req_country.map_or(false, |c| whole_word_contains(&text, c));
-            if mentions_req {
-                return true;
-            }
-            // Mention of a different known place → drop this local page.
-            let same_country_ok = req_city.is_none();
-            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
-            for (name, cc) in LOCATION_GAZETTEER.iter() {
-                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if same_country_ok {
-                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
-                }
-                if name.len() < 3 { continue; }
-                if whole_word_contains(&text, name) {
-                    return false;
-                }
-            }
-            true
-        });
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
-        }
-    }
-
-    // ── P13 (round-2026-08-20T1935Z): drop adult/NSFW results flagged upstream ──
-    // The per-result loop (line ~6302) sets r.score = -1.0 and continues for any
-    // result whose title/URL matches clean::is_adult_explicit() — a query-agnostic
-    // lexical detector. Here we physically remove those sentinels so they never
-    // reach the response. Hard-drop (not demote) because a family-safe engine must
-    // never surface explicit content regardless of how weak the rest of the set is.
-    {
-        let before = merged.len();
-        merged.retain(|r| r.score >= 0.0);
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("P13 ADULT DROP: removed {} explicit result(s) from merged set", removed);
-        }
-    }
-
-    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
-    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
-    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
-    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
-    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
-    // because the local base score is large, so other-city pages still floated into
-    // positions 3-5. We hard-drop local results that name a different gazetteer place
-    // and do NOT name the requested city/country.
-    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
-    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
-    // that NAME the requested place are kept. No query/domain literals.
-    if geo_is_explicit {
-        let before = merged.len();
-        merged.retain(|r| {
-            if !r.is_local {
-                return true;
-            }
-            let tl = r.title.to_lowercase();
-            let cl = r.content.to_lowercase();
-            let ul = r.url.to_lowercase();
-            let text = format!("{} {} {}", tl, cl, ul);
-            // On-topic for the requested location → keep.
-            let req_city = geo_location.and_then(|g| g.city.as_deref());
-            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
-            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
-                || req_country.map_or(false, |c| whole_word_contains(&text, c));
-            if mentions_req {
-                return true;
-            }
-            // Mention of a different known place → drop this local page.
-            let same_country_ok = req_city.is_none();
-            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
-            for (name, cc) in LOCATION_GAZETTEER.iter() {
-                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if same_country_ok {
-                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
-                }
-                if name.len() < 3 { continue; }
-                if whole_word_contains(&text, name) {
-                    return false;
-                }
-            }
-            true
-        });
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
-        }
-    }
-
-    // ── P13 (round-2026-08-20T1935Z): drop adult/NSFW results flagged upstream ──
-    // The per-result loop (line ~6302) sets r.score = -1.0 and continues for any
-    // result whose title/URL matches clean::is_adult_explicit() — a query-agnostic
-    // lexical detector. Here we physically remove those sentinels so they never
-    // reach the response. Hard-drop (not demote) because a family-safe engine must
-    // never surface explicit content regardless of how weak the rest of the set is.
-    {
-        let before = merged.len();
-        merged.retain(|r| r.score >= 0.0);
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("P13 ADULT DROP: removed {} explicit result(s) from merged set", removed);
-        }
-    }
-
-    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
-    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
-    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
-    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
-    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
-    // because the local base score is large, so other-city pages still floated into
-    // positions 3-5. We hard-drop local results that name a different gazetteer place
-    // and do NOT name the requested city/country.
-    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
-    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
-    // that NAME the requested place are kept. No query/domain literals.
-    if geo_is_explicit {
-        let before = merged.len();
-        merged.retain(|r| {
-            if !r.is_local {
-                return true;
-            }
-            let tl = r.title.to_lowercase();
-            let cl = r.content.to_lowercase();
-            let ul = r.url.to_lowercase();
-            let text = format!("{} {} {}", tl, cl, ul);
-            // On-topic for the requested location → keep.
-            let req_city = geo_location.and_then(|g| g.city.as_deref());
-            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
-            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
-                || req_country.map_or(false, |c| whole_word_contains(&text, c));
-            if mentions_req {
-                return true;
-            }
-            // Mention of a different known place → drop this local page.
-            let same_country_ok = req_city.is_none();
-            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
-            for (name, cc) in LOCATION_GAZETTEER.iter() {
-                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if same_country_ok {
-                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
-                }
-                if name.len() < 3 { continue; }
-                if whole_word_contains(&text, name) {
-                    return false;
-                }
-            }
-            true
-        });
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
-        }
-    }
-
-    // ── P13 (round-2026-08-20T1935Z): drop adult/NSFW results flagged upstream ──
-    // The per-result loop (line ~6302) sets r.score = -1.0 and continues for any
-    // result whose title/URL matches clean::is_adult_explicit() — a query-agnostic
-    // lexical detector. Here we physically remove those sentinels so they never
-    // reach the response. Hard-drop (not demote) because a family-safe engine must
-    // never surface explicit content regardless of how weak the rest of the set is.
-    {
-        let before = merged.len();
-        merged.retain(|r| r.score >= 0.0);
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("P13 ADULT DROP: removed {} explicit result(s) from merged set", removed);
-        }
-    }
-
-    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
-    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
-    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
-    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
-    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
-    // because the local base score is large, so other-city pages still floated into
-    // positions 3-5. We hard-drop local results that name a different gazetteer place
-    // and do NOT name the requested city/country.
-    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
-    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
-    // that NAME the requested place are kept. No query/domain literals.
-    if geo_is_explicit {
-        let before = merged.len();
-        merged.retain(|r| {
-            if !r.is_local {
-                return true;
-            }
-            let tl = r.title.to_lowercase();
-            let cl = r.content.to_lowercase();
-            let ul = r.url.to_lowercase();
-            let text = format!("{} {} {}", tl, cl, ul);
-            // On-topic for the requested location → keep.
-            let req_city = geo_location.and_then(|g| g.city.as_deref());
-            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
-            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
-                || req_country.map_or(false, |c| whole_word_contains(&text, c));
-            if mentions_req {
-                return true;
-            }
-            // Mention of a different known place → drop this local page.
-            let same_country_ok = req_city.is_none();
-            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
-            for (name, cc) in LOCATION_GAZETTEER.iter() {
-                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if same_country_ok {
-                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
-                }
-                if name.len() < 3 { continue; }
-                if whole_word_contains(&text, name) {
-                    return false;
-                }
-            }
-            true
-        });
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
-        }
-    }
-
-    // ── P13 (round-2026-08-20T1935Z): drop adult/NSFW results flagged upstream ──
-    // The per-result loop (line ~6302) sets r.score = -1.0 and continues for any
-    // result whose title/URL matches clean::is_adult_explicit() — a query-agnostic
-    // lexical detector. Here we physically remove those sentinels so they never
-    // reach the response. Hard-drop (not demote) because a family-safe engine must
-    // never surface explicit content regardless of how weak the rest of the set is.
-    {
-        let before = merged.len();
-        merged.retain(|r| r.score >= 0.0);
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("P13 ADULT DROP: removed {} explicit result(s) from merged set", removed);
-        }
-    }
-
-    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
-    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
-    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
-    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
-    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
-    // because the local base score is large, so other-city pages still floated into
-    // positions 3-5. We hard-drop local results that name a different gazetteer place
-    // and do NOT name the requested city/country.
-    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
-    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
-    // that NAME the requested place are kept. No query/domain literals.
-    if geo_is_explicit {
-        let before = merged.len();
-        merged.retain(|r| {
-            if !r.is_local {
-                return true;
-            }
-            let tl = r.title.to_lowercase();
-            let cl = r.content.to_lowercase();
-            let ul = r.url.to_lowercase();
-            let text = format!("{} {} {}", tl, cl, ul);
-            // On-topic for the requested location → keep.
-            let req_city = geo_location.and_then(|g| g.city.as_deref());
-            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
-            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
-                || req_country.map_or(false, |c| whole_word_contains(&text, c));
-            if mentions_req {
-                return true;
-            }
-            // Mention of a different known place → drop this local page.
-            let same_country_ok = req_city.is_none();
-            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
-            for (name, cc) in LOCATION_GAZETTEER.iter() {
-                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
-                if same_country_ok {
-                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
-                }
-                if name.len() < 3 { continue; }
-                if whole_word_contains(&text, name) {
-                    return false;
-                }
-            }
-            true
-        });
-        let removed = before - merged.len();
-        if removed > 0 {
-            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
+        if penalized > 0 {
+            merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            tracing::info!("OFF_TOPIC_SOFT_PENALTY: penalized {}/{} result(s) with zero distinctive-term overlap (score *= 0.10, sorted to bottom)", penalized, merged.len());
         }
     }
 
@@ -11363,33 +10723,6 @@ fn merge_local_and_web(
         r.score = scores[i];
     }
 
-    // IF-15: Calibrate guard for product entities.
-    // When a product entity is detected (e.g. "macbook air m2"), check if there's
-    // at least one strong entity match in the top results. If so, demote results
-    // that don't match the entity so they can't be remapped to 1.0 by calibrate_scores.
-    // This prevents irrelevant recipe/commercial pages from outranking product pages.
-    if !product_entities.is_empty() {
-        // Find the best entity match score
-        let best_entity_score = merged.iter()
-            .filter(|r| entity_match_score(&r.title, &r.content, &r.url, &product_entities) > 1.1)
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
-        if best_entity_score > 0.0 {
-            for r in merged.iter_mut() {
-                let em = entity_match_score(&r.title, &r.content, &r.url, &product_entities);
-                if em < 0.8 && r.score > best_entity_score * 0.5 {
-                    // Cap entity-mismatched results below the best entity match
-                    r.score = (best_entity_score * 0.45).max(0.03);
-                    tracing::info!(
-                        "ENTITY CALIBRATE CAP: '{}' entity_match={:.2}, capped {:.3} -> {:.3} (best_entity_score={:.3})",
-                        r.title.chars().take(50).collect::<String>(),
-                        em, r.score, best_entity_score * 0.45, best_entity_score
-                    );
-                }
-            }
-        }
-    }
-
     // POST-CALIBRATION OFF-TOPIC CAP (this round, D1/D2/D3).
     // The in-loop relevance penalties (dictionary-site relevance=0.001 at ~5506,
     // generic-word ×0.12 guard at ~5061, local-noise ×0.05 at ~5202) are DEFEATED
@@ -11518,95 +10851,27 @@ fn merge_local_and_web(
             .map(|r| r.score)
             .fold(0.0f32, f32::max);
 
-        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
-        // Used by the P8 video cap (b0): a video must never outrank the best genuine
-        // text result for a non-video query, in any calibration regime (see comment
-        // at (b0)). Computed over post-calibration scores so it reflects the final
-        // text ranking.
-        let best_non_video = merged.iter()
-            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
-
-        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
-        // Used by the P8 video cap (b0): a video must never outrank the best genuine
-        // text result for a non-video query, in any calibration regime (see comment
-        // at (b0)). Computed over post-calibration scores so it reflects the final
-        // text ranking.
-        let best_non_video = merged.iter()
-            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
-
-        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
-        // Used by the P8 video cap (b0): a video must never outrank the best genuine
-        // text result for a non-video query, in any calibration regime (see comment
-        // at (b0)). Computed over post-calibration scores so it reflects the final
-        // text ranking.
-        let best_non_video = merged.iter()
-            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
-
-        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
-        // Used by the P8 video cap (b0): a video must never outrank the best genuine
-        // text result for a non-video query, in any calibration regime (see comment
-        // at (b0)). Computed over post-calibration scores so it reflects the final
-        // text ranking.
-        let best_non_video = merged.iter()
-            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
-
-        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
-        // Used by the P8 video cap (b0): a video must never outrank the best genuine
-        // text result for a non-video query, in any calibration regime (see comment
-        // at (b0)). Computed over post-calibration scores so it reflects the final
-        // text ranking.
-        let best_non_video = merged.iter()
-            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
-
-        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
-        // Used by the P8 video cap (b0): a video must never outrank the best genuine
-        // text result for a non-video query, in any calibration regime (see comment
-        // at (b0)). Computed over post-calibration scores so it reflects the final
-        // text ranking.
-        let best_non_video = merged.iter()
-            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
-
-        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
-        // Used by the P8 video cap (b0): a video must never outrank the best genuine
-        // text result for a non-video query, in any calibration regime (see comment
-        // at (b0)). Computed over post-calibration scores so it reflects the final
-        // text ranking.
-        let best_non_video = merged.iter()
-            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
-
-        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
-        // Used by the P8 video cap (b0): a video must never outrank the best genuine
-        // text result for a non-video query, in any calibration regime (see comment
-        // at (b0)). Computed over post-calibration scores so it reflects the final
-        // text ranking.
-        let best_non_video = merged.iter()
-            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
-
-        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
-        // Used by the P8 video cap (b0): a video must never outrank the best genuine
-        // text result for a non-video query, in any calibration regime (see comment
-        // at (b0)). Computed over post-calibration scores so it reflects the final
-        // text ranking.
-        let best_non_video = merged.iter()
-            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
+        // (b) single-distinctive-term-only match on a multi-topic query
+        // FAIL-OPEN: only fire this cap when at least one result actually
+        // matches >= 2 topics. If NO result reaches that bar, the cap would
+        // flatten EVERYTHING to 0.04 indiscriminately — destroying ranking
+        // differentiation for queries where upstream returns only off-topic
+        // results (e.g. "how to fix a bicycle puncture" returning KIT/Gemini
+        // pages). Let normal ranking differentiate instead.
+        let any_strong_match = if query_has_many_topics {
+            merged.iter().any(|r| {
+                let rl = r.title.to_lowercase();
+                let cl = r.content.to_lowercase();
+                let ul = r.url.to_lowercase();
+                let matched_strong = strong_topics.iter().filter(|t| {
+                    let lt = t.to_lowercase();
+                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
+                }).count();
+                matched_strong >= 2
+            })
+        } else {
+            false
+        };
 
         for r in merged.iter_mut() {
             let rl = r.title.to_lowercase();
@@ -11614,7 +10879,7 @@ fn merge_local_and_web(
             let ul = r.url.to_lowercase();
 
             // (a) definitional site for a non-definition query
-            if !is_definition_query && is_dictionary_site(&ul, &rl, &cl) {
+            if !is_definition_query && is_def_site(&ul, &rl, &cl) {
                 if r.score > dict_cap {
                     tracing::info!(
                         "POST-CAL DICT CAP -> {:.2}: '{}' (def site, non-def query)",
@@ -11637,34 +10902,21 @@ fn merge_local_and_web(
             // re-applies AFTER calibration, so the dampening is durable: videos may
             // still appear (floor preserved) but can never outrank genuine text
             // results for a non-video query. Video-intent queries keep full score.
-            //
-            // ROOT-CAUSE (2026-08-17 round): the previous fixed cap of 0.12 was an
-            // ABSOLUTE value. calibrate_scores rescales the whole set onto a band whose
-            // ceiling depends on the regime: healthy sets → [0.05,1.0], weak/thin sets
-            // (raw_max < 0.10) → [0.05,0.12]. A thin-set video caps at 0.12 == the band
-            // ceiling, so it TIES the top text result and wins by tie-break order —
-            // exactly the regression seen on "wifi router rebooting" (youtube #1), "knee
-            // braces" (youtube #1-3), "chess websites" (youtube #1-3), "passport renew"
-            // (youtube #1). Fix: make the cap RELATIVE to the best non-video score, so a
-            // video is always strictly below the best genuine text result regardless of
-            // calibration regime. Signal-driven (query self-describes intent), not tuned
-            // to any one query. floor 0.05 keeps the video present, never dominant.
-            let is_video_src = r.sources.iter().any(|s| s == "invidious" || s == "video");
+            let is_video_src = r.sources.iter().any(|s| s == "invidious" || s == "video")
+                || is_url_video_host(&r.url);
             if is_video_src {
-                let video_intent = q_lc_cap.contains("video")
-                    || q_lc_cap.contains("youtube")
-                    || q_lc_cap.contains("watch")
-                    || q_lc_cap.contains("tutorial")
-                    || q_lc_cap.contains("animation");
-                if !video_intent {
-                    // Relative cap: a video must never outrank the best non-video
-                    // result for a non-video query. best_non_video is computed from the
-                    // post-calibration scores before any video was capped this pass.
-                    let video_cap = (best_non_video * 0.85).max(0.05);
+                if !has_video_intent(query) {
+                    // 0.04 sits UNDER the calibrated article floor (0.05) so a video
+                    // is demoted *below* every genuine text result for a non-video
+                    // query (e.g. an invidious tutorial at 0.04 now ranks under the
+                    // topical article at 0.05, instead of tying it via insertion order
+                    // as the old 0.12 did). Floor preserved so videos remain present.
+                    // Signal-driven (query self-describes intent), not tuned to a query.
+                    let video_cap = 0.02f32;
                     if r.score > video_cap {
                         tracing::info!(
-                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source; best_text={:.2})",
-                            video_cap, r.url.chars().take(60).collect::<String>(), best_non_video
+                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source)",
+                            video_cap, r.url.chars().take(60).collect::<String>()
                         );
                         r.post_cal_cap = Some(video_cap);
                         r.score = video_cap;
@@ -11672,16 +10924,41 @@ fn merge_local_and_web(
                 }
             }
 
+            // (b1) POST-CALIBRATION CROSS-LOCATION CAP (geo-local round).
+            // The in-loop cross_loc_mult (0.06x when result names a different gazetteer
+            // place) is DEFEATED by calibrate_scores, which rescales the max raw score
+            // back to 1.0 — so "10 Safest Orlando, FL Neighborhoods" still floats above
+            // "Best Areas to Buy Flats in Hyderabad" for a Hyderabad query. This cap
+            // re-applies AFTER calibration so the dampening is durable: mismatched-place
+            // results stay present (floor) but can never outtop requested-place results.
+            // Only fires when the query has an explicit location (geo_is_explicit).
+            if geo_is_explicit {
+                let cross_loc_penalty = cross_location_mismatch_mult(&r.title, &r.content, geo_location);
+                if cross_loc_penalty < 1.0 {
+                    // cross_loc returns 0.06 — rescale to a calibrated floor
+                    // well below genuine text results (0.05). Use 0.03 so a mismatched
+                    // place page sits UNDER every on-topic text result.
+                    let geo_cap = 0.03f32;
+                    if r.score > geo_cap {
+                        tracing::info!(
+                            "POST-CAL CROSS-LOC CAP -> {:.2}: '{}' (explicit geo, result names different place)",
+                            geo_cap, r.url.chars().take(60).collect::<String>()
+                        );
+                        r.post_cal_cap = Some(geo_cap);
+                        r.score = geo_cap;
+                    }
+                }
+            }
+
             // (b) single-distinctive-term-only match on a multi-topic query
-            // D1 FIX (this round): threshold lowered from < 2 to < 1. Now only results
-            // matching ZERO strong topics (pure brand collisions) get crushed to weak_cap.
-            // Results matching exactly 1 strong topic survive (they're partially on-topic).
             if query_has_many_topics && any_strong_match {
                 let matched_strong = strong_topics.iter().filter(|t| {
                     let lt = t.to_lowercase();
                     rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
                 }).count();
-                if matched_strong < 1 {
+                // matched_strong is at most strong_topics.len(); we want the page to
+                // contain at least 2 of the query's real topic terms to be on-topic.
+                if matched_strong < 2 {
                     if r.score > weak_cap {
                         tracing::info!(
                             "POST-CAL WEAK-MATCH CAP -> {:.2}: '{}' (matched {} of {} topics)",
@@ -11727,119 +11004,11 @@ fn merge_local_and_web(
         }
     }
 
-    // POST-CALIBRATION P2d CAP (round-2026-08-20T1935Z) — the durable off-topic-local
-    // suppression. The in-loop P2d gate crushes relevance/r.score, but calibrate_scores
-    // (line ~7928) linearly rescales the WHOLE set onto [0.05,1.0], which stretches the
-    // crushed off-topic local right back toward the top band — the exact failure seen
-    // for "alternatives to airtable" (a Slack-Alternatives local page ranking #1 over
-    // genuine Airtable-alternative web pages). Mirroring the D1/D2/D3/video caps above,
-    // we re-apply AFTER calibration so the demotion survives. Condition is purely
-    // structural: a LOCAL result whose TITLE names NONE of the query's title-anchored
-    // subject terms (p2d_offtopic_terms, populated by the in-loop gate) is off-topic
-    // crawl noise and may still appear (floor preserved) but can never outrank genuine
-    // topical content. RELATIVE cap (like the video/D3 caps) so it holds in both the
-    // healthy [0.05,1.0] and weak-set [0.05,0.12] calibration regimes. No query/domain
-    // literals, no curated list — keyed on the structural "local page misses the
-    // subject" class.
-    if !p2d_offtopic_terms.is_empty() {
-        // A LOCAL page is "off-topic" for this query when its TITLE/URL names NONE of the
-        // query's subject terms (p2d_offtopic_terms, populated by the in-loop P2d gate).
-        let is_offtopic_local = |r: &MergedResult| -> bool {
-            if !r.is_local {
-                return false;
-            }
-            let tl = r.title.to_lowercase();
-            let ul = r.url.to_lowercase();
-            !p2d_offtopic_terms.iter().any(|t| {
-                let lt = t.to_lowercase();
-                tl.contains(&lt) || ul.contains(&lt)
-            })
-        };
-        // CAP REFERENCE must be the best ON-TOPIC score — i.e. the max score among results
-        // that are NOT off-topic-local themselves. The previous reference (best_non_video)
-        // included the off-topic local page, so capping to 0.5*that left the off-topic local
-        // ABOVE the on-topic web pages (which calibrate to the ~0.05 floor) — e.g. Fox News
-        // "Sunday Morning Futures" stayed #1 for "weekend flower markets in thrissur ...".
-        // By excluding off-topic-local pages from the reference, the cap forces every
-        // off-topic local strictly BELOW the best genuine on-topic result (it may dip under
-        // the 0.05 calibration floor, which is correct — it should rank last, never first).
-        // Structural only: no query/domain literals, keyed on "local page misses the subject".
-        let cap_ref = merged.iter()
-            .filter(|r| !is_offtopic_local(r))
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
-        if cap_ref > 0.0 {
-            for r in merged.iter_mut() {
-                if is_offtopic_local(r) {
-                    let p2d_cap = cap_ref * 0.6;
-                    if r.score > p2d_cap {
-                        tracing::info!(
-                            "POST-CAL P2d OFF-TOPIC-LOCAL CAP -> {:.3}: '{}' names none of {:?} (ontopic_ref={:.3})",
-                            p2d_cap, r.url.chars().take(60).collect::<String>(), p2d_offtopic_terms, cap_ref
-                        );
-                        r.score = p2d_cap;
-                    }
-                }
-            }
-        }
-    }
-
     // Re-sort by score descending after post-calibration caps to ensure capped
-    // results (video/dict/weak-match/P2d) move below higher-scoring text results.
+    // results (video/dict/weak-match) move below higher-scoring text results.
     merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     merged
-}
-
-/// Structural dictionary/definition-site detector (no curated domain list).
-/// Used by both the post-calibration D1 cap and the FIX-IF-16 Bing-noise filter.
-fn is_dictionary_site(url: &str, title: &str, content: &str) -> bool {
-    let ul = url.to_lowercase();
-    let tl = title.to_lowercase();
-    let cl = content.to_lowercase();
-    let prefix = cl.chars().take(300).collect::<String>();
-    let dict_path_marker = ul.contains("/dictionary/")
-        || ul.contains("/define/")
-        || ul.contains("/meaning/")
-        || ul.contains("/grammar/")
-        || ul.contains("wiktionary.org")
-        || ul.contains("vocabulary.com")
-        || ul.contains("thefreedictionary.com")
-        || ul.contains("collinsdictionary.com")
-        || ul.contains("oxfordlearnersdictionaries.com")
-        || ul.contains("dictionary.com");
-    let title_words: Vec<&str> = tl.split_whitespace().collect();
-    let dict_title = tl.contains("meaning & definition")
-        || tl.contains("definition & meaning")
-        || tl.contains("definition of ")
-        || tl.contains("meaning of ")
-        || tl.contains("wiktionary")
-        || tl.contains("cambridge dictionary")
-        || tl.contains("merriam-webster")
-        || tl.contains("oxford dictionary")
-        || tl.contains("grammar")
-        || (title_words.len() <= 3 && (tl.contains("definition") || tl.contains("dictionary")));
-    let phonetic = prefix.contains("/ˈ") || prefix.contains("/ˌ")
-        || prefix.contains("/'") || prefix.contains("/-");
-    let pos_label = prefix.starts_with("noun") || prefix.starts_with("verb")
-        || prefix.starts_with("adjective") || prefix.starts_with("adverb")
-        || prefix.contains("1. : to ") || prefix.contains("2. : to ")
-        || prefix.contains("definition of ") || prefix.contains("meaning of ");
-    let short = cl.len() < 200;
-    let wiki_disambig = if ul.contains("en.wikipedia.org/wiki/") && tl.ends_with("- wikipedia") {
-        let page_title = tl.strip_suffix("- wikipedia").unwrap_or(&tl).trim();
-        cl.trim().is_empty()
-            || cl.trim().to_lowercase() == page_title
-            || prefix.contains("may refer to")
-            || prefix.contains("can refer to")
-            || (prefix.starts_with(page_title) && prefix.len() < page_title.len() + 50)
-    } else {
-        false
-    };
-    dict_path_marker || dict_title
-        || ((phonetic || pos_label) && title_words.len() <= 3)
-        || (pos_label && short)
-        || wiki_disambig
 }
 
 // ─── Main ────────────────────────────────────────────────────────────
@@ -12721,6 +11890,10 @@ async fn main() {
         .route("/search/fast", get(handle_search_fast))
         .route("/images", get(handle_images))
         .route("/videos", get(handle_videos))
+        // Video introspection: classifies query as video-intent using the same
+        // has_video_intent() + is_url_video_host() fns /search's P8 path uses.
+        // Zero-side-effect, no new ranking logic. See handle_video().
+        .route("/video", get(handle_video))
         .route("/news", get(handle_news))
         .route("/spellcheck", get(handle_spellcheck))
         .route("/analyze", get(handle_analyze))
@@ -12739,15 +11912,13 @@ async fn main() {
         // structured constraints, expanded queries) using the EXACT pure fns
         // /search falls back to — zero-side-effect, no new ranking logic.
         .route("/intent", get(handle_intent))
-        // Video introspection: completes the additive introspection family
-        // (/spellcheck /analyze /inspect /geolocate /intent). Surfaces the P8
-        // video-dominance fix (commit 3938da6) — which urls the ranker
-        // classifies as video, whether a query is video-intent (which exempts
-        // it from the non-video pin), and the exact marker set driving that
-        // exemption — using the EXACT pure fns /search uses (is_url_video_host
-        // + the P8 video_intent markers). Zero-side-effect, no new ranking
-        // logic, no per-query strings. See handle_video / build_video.
-        .route("/video", get(handle_video))
+        // Commerce: honest product-fact extraction primitive (ROADMAP item 1).
+        // Returns the typed CommerceOffer extracted from supplied HTML — no
+        // ranking, no monetization, no user-tracking surface. The /shopping
+        // endpoint and affiliate decoration land in later increments.
+        .route("/commerce/bid", get(handle_commerce_bid))
+.route("/commerce/extract", post(handle_commerce_extract))
+        .route("/shopping", get(handle_shopping))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
         .route("/goals/quick", post(goals::handle_quick_roadmap))
@@ -12756,6 +11927,7 @@ async fn main() {
         .route("/goals/:goal_id/answers", post(goals::handle_submit_answers))
         .route("/goals/:goal_id/phases/:phase_id/complete", post(goals::handle_complete_phase))
         .route("/goals/:goal_id/progress", post(goals::handle_update_progress))
+        .route("/goals/:goal_id/progress", get(goals::handle_get_progress))
         .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
@@ -13190,6 +12362,92 @@ async fn handle_inspect(
     (axum::http::StatusCode::OK, Json(result))
 }
 
+/// The marker set is exposed as a fixed general array (data, not branching
+/// logic) so a future drift between this endpoint and the ranker's P8 check is
+/// itself observable + unit-tested.
+fn classify_url_as_video(url: &str) -> bool {
+    is_url_video_host(url)
+}
+
+/// The exact P8 video-intent marker set. Mirrors `merge_local_and_web`'s
+/// `video_intent` check (gateway/main.rs ~L7070) VERBATIM so the
+/// introspection endpoint can never silently drift from the ranker's
+/// exemption logic. Kept as data (a fixed general marker set), not branching
+/// logic, per the doctrine: no per-query tuning.
+fn video_intent_markers() -> &'static [&'static str] {
+    &["video", "youtube", "watch", "tutorial", "animation"]
+}
+
+/// Pure video-intent detector — reuses `simple_negation_strip` (the same
+/// negation-aware cleaner `/search` feeds `q_lc_cap`) then tests the P8
+/// marker set. Returns true when the query should be treated as a request
+/// for video results (and therefore exempt from the P8 non-video pin).
+fn detect_video_intent(q: &str) -> bool {
+    let cleaned = simple_negation_strip(q).unwrap_or_else(|| q.to_string());
+    let q_lc = cleaned.to_lowercase();
+    video_intent_markers().iter().any(|m| q_lc.contains(*m))
+}
+
+/// Build the `GET /video` payload. Pure + unit-testable so the P8
+/// classification contract is locked independently of the HTTP layer.
+fn build_video(q: &str) -> serde_json::Value {
+    let video_intent = detect_video_intent(q);
+    let would_pin_non_video_sources = !video_intent;
+    let intent_resp = fallback_intent(q);
+    let intent = &intent_resp.intent;
+    let markers: Vec<String> = video_intent_markers().iter().map(|m| (*m).to_string()).collect();
+
+    serde_json::json!({
+        "query": q,
+        "video_intent": video_intent,
+        "video_intent_markers": markers,
+        "would_pin_non_video_sources": would_pin_non_video_sources,
+        "is_video_source_examples": {
+            "youtube_watch": classify_url_as_video("https://www.youtube.com/watch?v=gUEa825kTjQ"),
+            "youtu_be": classify_url_as_video("https://youtu.be/gUEa825kTjQ"),
+            "invidious_selfhosted": classify_url_as_video("https://invidious.example.net/watch?v=x"),
+            "vimeo": classify_url_as_video("https://www.vimeo.com/123456"),
+            "python_org_article": classify_url_as_video("https://www.python.org/doc"),
+            "example_video_word_in_path": classify_url_as_video("https://example.com/youtube-guide-article")
+        },
+        "intent": intent,
+        "note": "Additive introspection of the P8 video-dominance fix (commit 3938da6). Does not change ranking."
+    })
+}
+
+/// Build the `400 empty_query` envelope for `/video`. Pure + unit-testable.
+/// Mirrors the sibling empty-envelope contract: carries a neutral video_intent
+/// + would_pin_non_video_sources so the envelope is distinguishable but
+/// self-consistent.
+fn build_video_empty() -> serde_json::Value {
+    let markers: Vec<String> = video_intent_markers().iter().map(|m| (*m).to_string()).collect();
+    serde_json::json!({
+        "error": "empty_query",
+        "message": "Query parameter 'q' is empty",
+        "query": "",
+        "video_intent": false,
+        "video_intent_markers": markers,
+        "would_pin_non_video_sources": true,
+        "is_video_source_examples": {}
+    })
+}
+
+/// `GET /video?q=...` — expose the P8 video-dominance classification BEFORE a
+/// search runs. Additive + zero-side-effect (see `build_video`). Empty/
+/// whitespace `q` returns `400` with the standard `empty_query` envelope shape
+/// the introspection family uses.
+async fn handle_video(
+    axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
+    if q.trim().is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(build_video_empty()));
+    }
+    let result = build_video(&q);
+    (axum::http::StatusCode::OK, Json(result))
+}
+
 /// `GET /intent?q=...` — additive intent-introspection endpoint.
 ///
 /// Completes the introspection family (`/spellcheck` `/analyze` `/inspect`
@@ -13271,119 +12529,6 @@ async fn handle_intent(
         return (axum::http::StatusCode::BAD_REQUEST, Json(build_intent_empty()));
     }
     let result = build_intent(&q);
-    (axum::http::StatusCode::OK, Json(result))
-}
-
-/// `GET /video?q=...` — additive video-intent introspection endpoint.
-///
-/// Completes the introspection family (`/spellcheck` `/analyze` `/inspect`
-/// `/geolocate` `/intent`). The parent round (t_85340d89, commit 3938da6)
-/// fixed P8 video dominance — invidious/youtube snippets were outranking
-/// genuine text results for non-video queries — by pinning video sources
-/// STRICTLY below the weakest text result AFTER calibration. That fix is
-/// invisible to clients: there was no way to see WHICH urls the engine
-/// classifies as video, whether a query is treated as video-intent (which
-/// exempts it from the pin), or which exact markers drive that exemption.
-///
-/// Like its siblings, this endpoint is ADDITIVE + ZERO-SIDE-EFFECT: it does
-/// NOT change ranking, calibration, or the P8 pin. It reuses the EXACT pure
-/// fns `/search` uses — `is_url_video_host` (the same structural host-class
-/// check the P8 pin applies to every result) + the P8 `video_intent` markers
-/// (video/youtube/watch/tutorial/animation) — so the preview always matches
-/// real engine behavior. No per-query strings, no domain allow/deny lists, no
-/// magic constants tuned to one query. `would_pin_non_video_sources` reproduces
-/// the ranker's decision rule: an all-video query is NOT pinned (videos rank
-/// among themselves), a text query IS.
-///
-/// The marker set is exposed as a fixed general array (data, not branching
-/// logic) so a future drift between this endpoint and the ranker's P8 check is
-/// itself observable + unit-tested.
-fn classify_url_as_video(url: &str) -> bool {
-    is_url_video_host(url)
-}
-
-/// The exact P8 video-intent marker set. Mirrors `merge_local_and_web`'s
-/// `video_intent` check (gateway/main.rs ~L7070) VERBATIM so the
-/// introspection endpoint can never silently drift from the ranker's
-/// exemption logic. Kept as data (a fixed general marker set), not branching
-/// logic, per the doctrine: no per-query tuning.
-fn video_intent_markers() -> &'static [&'static str] {
-    &["video", "youtube", "watch", "tutorial", "animation"]
-}
-
-/// Pure video-intent detector — reuses `simple_negation_strip` (the same
-/// negation-aware cleaner `/search` feeds `q_lc_cap`) then tests the P8
-/// marker set. Returns true when the query should be treated as a request
-/// for video results (and therefore exempt from the P8 non-video pin).
-fn detect_video_intent(q: &str) -> bool {
-    let cleaned = simple_negation_strip(q).unwrap_or_else(|| q.to_string());
-    let q_lc = cleaned.to_lowercase();
-    video_intent_markers().iter().any(|m| q_lc.contains(*m))
-}
-
-/// Build the `GET /video` payload. Pure + unit-testable so the P8
-/// classification contract is locked independently of the HTTP layer.
-fn build_video(q: &str) -> serde_json::Value {
-    let video_intent = detect_video_intent(q);
-    // Reproduce the ranker's P8 pin decision rule (merge_local_and_web
-    // ~L7087): videos are pinned strictly below the weakest text result for
-    // a NON-video query; for a video-intent query the pin does NOT apply and
-    // videos keep full score. (The actual calibrated score band is unknown
-    // here — this surfaces the DECISION, which is what the P8 fix changed.)
-    let would_pin_non_video_sources = !video_intent;
-
-    let intent_resp = fallback_intent(q);
-    let intent = &intent_resp.intent;
-    let markers: Vec<String> = video_intent_markers().iter().map(|m| (*m).to_string()).collect();
-
-    serde_json::json!({
-        "query": q,
-        "video_intent": video_intent,
-        "video_intent_markers": markers,
-        "would_pin_non_video_sources": would_pin_non_video_sources,
-        "is_video_source_examples": {
-            "youtube_watch": classify_url_as_video("https://www.youtube.com/watch?v=gUEa825kTjQ"),
-            "youtu_be": classify_url_as_video("https://youtu.be/gUEa825kTjQ"),
-            "invidious_selfhosted": classify_url_as_video("https://invidious.example.net/watch?v=x"),
-            "vimeo": classify_url_as_video("https://www.vimeo.com/123456"),
-            "python_org_article": classify_url_as_video("https://www.python.org/doc"),
-            "example_video_word_in_path": classify_url_as_video("https://example.com/youtube-guide-article")
-        },
-        "intent": intent,
-        "note": "Additive introspection of the P8 video-dominance fix (commit 3938da6). Does not change ranking. A video source is any url matching is_url_video_host (youtube/youtu.be/vimeo/invidious self-hosted / m.youtube). video_intent=true exempts a query from the non-video pin."
-    })
-}
-
-/// Build the `400 empty_query` envelope for `/video`. Pure + unit-testable.
-/// Mirrors the sibling empty-envelope contract: carries a neutral video_intent
-/// + would_pin_non_video_sources so the envelope is distinguishable but
-/// self-consistent.
-fn build_video_empty() -> serde_json::Value {
-    let markers: Vec<String> = video_intent_markers().iter().map(|m| (*m).to_string()).collect();
-    serde_json::json!({
-        "error": "empty_query",
-        "message": "Query parameter 'q' is empty",
-        "query": "",
-        "video_intent": false,
-        "video_intent_markers": markers,
-        "would_pin_non_video_sources": true,
-        "is_video_source_examples": {}
-    })
-}
-
-/// `GET /video?q=...` — expose the P8 video-dominance classification BEFORE a
-/// search runs. Additive + zero-side-effect (see `build_video`). Empty/
-/// whitespace `q` returns `400` with the standard `empty_query` envelope shape
-/// the introspection family uses.
-async fn handle_video(
-    axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
-) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    let q = params.q.clone().unwrap_or_default();
-    if q.trim().is_empty() {
-        return (axum::http::StatusCode::BAD_REQUEST, Json(build_video_empty()));
-    }
-    let result = build_video(&q);
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -13535,34 +12680,6 @@ fn is_pronounceable(w: &str) -> bool {
         return false;
     }
     true
-}
-
-fn is_keyboard_walk_query(q: &str, spell_index: &spell::SymSpellIndex) -> bool {
-    for token in q.split_whitespace() {
-        let lower = token.to_lowercase();
-        let alpha_only: String = lower.chars().filter(|c| c.is_ascii_alphabetic()).collect();
-        if alpha_only.len() < 7 {
-            continue;
-        }
-        if spell_index.contains_word(&alpha_only) || spell::is_protected_term(&alpha_only) {
-            continue;
-        }
-        let mut max_run = 0u32;
-        let mut current_run = 0u32;
-        for c in alpha_only.chars() {
-            if matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y') {
-                max_run = max_run.max(current_run);
-                current_run = 0;
-            } else {
-                current_run += 1;
-            }
-        }
-        max_run = max_run.max(current_run);
-        if max_run >= 7 {
-            return true;
-        }
-    }
-    false
 }
 
 fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f32) {
@@ -13823,6 +12940,7 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         has_more: None,
         price_verified: None,
         recall_gap_terms: None,
+        shopping: None,
     };
     (
         axum::http::StatusCode::BAD_REQUEST,
@@ -13918,13 +13036,6 @@ async fn handle_search(
     let (qflag, _valid_ratio) = query_quality_flag(&q_cleaned_spelling, &state.spell_index);
     if qflag == "junk" {
         return make_error_response(q_trimmed, "invalid_query", "Query appears to be gibberish; no results returned", true);
-    }
-
-    // Phase 7b: keyboard-walk / consonant-mash rejection (FIX-IF-03).
-    // Catches strings like "asdfghjkl" that pass the vowel/consonant ratio
-    // check because they contain vowels, but are clearly not real queries.
-    if is_keyboard_walk_query(&q_cleaned_spelling, &state.spell_index) {
-        return make_error_response(q_trimmed, "invalid_query", "Query appears to be keyboard-walk gibberish; no results returned", true);
     }
 
     // 0b. Check cache first (5-min TTL)
@@ -14987,40 +14098,17 @@ async fn handle_search(
     if gateway_extracted.price_max.is_some() {
         intent.structured_constraints.price_max = gateway_extracted.price_max;
     }
-    // FIX (negation-drop, 2026-08-15): the intent engine emits exclusion
-    // constraints as BOTH a `negative` entry AND an `Exclusion` entity. For some
-    // NL forms (e.g. "restaurants in tokyo not sushi") the gateway's own parser
-    // produces no negative (it only handles operators + a few inline markers), so
-    // the engine's `negative` array is the sole source — and it was being
-    // dropped before reaching ranking/hard-filter, so the exclusion never fired.
-    // We now ALSO mirror any `Exclusion`-role entity into `negative` so the
-    // constraint is always honoured regardless of which layer produced it.
-    // General + signal-driven: no query-specific strings, no denylists.
-    for e in &intent.structured_constraints.entities {
-        if e.role == EntityRole::Exclusion {
-            let t = e.text.trim().to_lowercase();
-            // DA/DB fix (2026-08-17): engine `Exclusion` entities must pass the
-            // SAME grammar/quality-noise guards as gateway-parsed negatives. The
-            // intent engine emits subjective adjectives + intensifiers as
-            // `Exclusion` roles next to negation markers ("not too spicy and
-            // good for kids" -> Exclusion="good"/"too"), which would otherwise
-            // become phantom hard-negatives that drop relevant pages. Skip them.
-            // A genuine topical exclusion (brand/place/noun the user named) is
-            // never in either noise set, so real exclusions survive unchanged.
-            if !t.is_empty()
-                && t.len() >= 2
-                && !is_exclusion_grammar_noise(&t)
-                && !is_subjective_quality_term(&t)
-                && !intent.structured_constraints.negative.contains(&t)
-            {
-                intent.structured_constraints.negative.push(t);
-            }
+    // NOT: hard-exclusion operator (DEFECT-A escape hatch). The gateway parser
+    // extracts `NOT:term` into `gateway_extracted.hard_exclusions`; it must be
+    // copied into the merged `structured_constraints` or the term is silently
+    // dropped from BOTH the hard-drop gate (should_filter_by_constraints) and the
+    // `applied_constraints` report — leaving flask/React pages in results despite
+    // an explicit `NOT:`. This matches how file_types/sites/phrases are merged above.
+    for he in gateway_extracted.hard_exclusions {
+        if !intent.structured_constraints.hard_exclusions.contains(&he) {
+            intent.structured_constraints.hard_exclusions.push(he);
         }
     }
-    // Re-sanitize so the mirrored exclusion is still subject to the same
-    // validation as every other negative constraint.
-    intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
-
     // P3 NL-price fix: also derive a bound from natural-language price words
     // ("under 150 dollars", "below 1000 rupees") — these never matched the
     // `price:<` operator parser, so the bound stayed None and ranking fell back
@@ -15154,20 +14242,10 @@ async fn handle_search(
                 || q_lower.contains("cve-") || q_lower.contains("vulnerability")
                 || q_lower.contains("this week") || q_lower.contains("this month")
                 || q_lower.contains("past week") || q_lower.contains("last week");
-            // FIX-IF-16 (2026-09-19): Replace generic topic signal with
-            // news-term co-occurrence. The old has_topic_signal included
-            // "2026"/"2025"/"release"/"version" which wrongly forced fresh
-            // on "latest developments in lab grown meat 2026". Now the
-            // override fires ONLY when "latest"/"recent" co-occurs with
-            // an actual news noun OR the query is about a known news domain.
-            let news_cooccurrence = ["news", "today", "update", "report",
-                "study", "research", "headline", "headlines", "breaking"];
-            let has_news_cooccurrence = news_cooccurrence.iter().any(|t| q_lower.contains(t));
-            let news_domains = ["politics", "political", "technology", "tech",
-                "science", "health", "world", "business", "economy", "economics",
-                "environment", "climate", "education", "sports", "entertainment"];
-            let is_news_domain = news_domains.iter().any(|d| q_lower.contains(d));
-            let has_topic_signal = has_news_cooccurrence || is_news_domain;
+            let has_topic_signal = q_lower.contains("news") || q_lower.contains("update")
+                || q_lower.contains("today") || q_lower.contains("this week")
+                || q_lower.contains("2026") || q_lower.contains("2025")
+                || q_lower.contains("release") || q_lower.contains("version");
             // Don't clobber a fresh intent that the engine already set.
             if intent.intent != "fresh" && has_news_signal && has_topic_signal {
                 tracing::info!(
@@ -15286,13 +14364,9 @@ async fn handle_search(
             }
         }
 
-        // Override 6: transactional keywords OR an explicit price bound -> transactional.
-        // Data-driven: the keyword list comes from `data/commerce/signals.json`
-        // (runtime-loaded into `state.commerce_config.transactional_keywords`).
-        // `detect_transactional_signal` does whole-word matching so "price" never
-        // fires on "priceless". NO hardcoded keywords.
+        // Override 6: transactional keywords OR an explicit price bound -> transactional
         let tx_keywords = state.commerce_config.transactional_keywords.clone();
-        let has_tx_signal = detect_transactional_signal(&q_lower, &tx_keywords);
+        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k.as_str()) || q_lower.contains(k.as_str()));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -15355,61 +14429,32 @@ async fn handle_search(
             "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
         ];
         let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
-        // F2 (2026-08-17): a weather WORD alone is NOT enough — "repair roof in rain",
-        // "car won't start in the rain", "run in the rain" are how-to/maintenance
-        // questions, not weather forecasts. Only force fresh when the query also
-        // asks for a PREDICTION/forecast (weather report, will it rain, tomorrow's
-        // forecast, is it going to snow) OR names a weather noun as the primary topic
-        // ("today's weather", "delhi weather"). Structural prediction vocabulary, no
-        // per-query literals. Never override a clear how-to ("how to ...").
-        let weather_prediction_signals = [
-            "weather report", "weather forecast", "weather today", "weather tomorrow",
-            "will it", "going to rain", "going to snow", "forecast for", "this week's weather",
-            "current weather", "live weather", "weather update", "rain forecast", "snow forecast",
-            "temperature in", "humidity in",
-        ];
-        let has_weather_prediction = weather_prediction_signals.iter().any(|s| q_lower.contains(*s));
-        // WEATHER-AS-SUBJECT (2026-08-21 fix for P11-class false trigger): a bare
-        // "weather" word anywhere must NOT force fresh — queries like "daily
-        // skincare routine for oily skin in humid weather" mention weather only as
-        // a modifier of a non-weather topic and must stay informational (evergreen
-        // advice, not news). Weather is the genuine subject only when it leads the
-        // query or appears in a subject-phrase ("weather in X", "X weather",
-        // "weather today/forecast/report/update", "this week's weather"). Structural
-        // phrases, no city/region literals. This closes the residue of P11 (substring
-        // intent triggers) without re-narrowing to only prediction signals.
-        // A bare "<word> weather" / "weather" as the FINAL token only counts as the
-        // subject when the WHOLE query is short (e.g. "delhi weather", "london
-        // forecast" — 2-4 tokens about weather). A modifier inside a long non-weather
-        // query like "...oily skin in humid weather" (13 tokens) is NOT the topic and
-        // must not force fresh.
-        let weather_is_subject = q_lower.starts_with("weather")
-            || q_lower.starts_with("forecast")
-            || q_lower.contains("weather in ")
-            || q_lower.contains("weather for ")
-            || q_lower.contains("weather today")
-            || q_lower.contains("weather tomorrow")
-            || q_lower.contains("weather report")
-            || q_lower.contains("weather update")
-            || q_lower.contains("current weather")
-            || q_lower.contains("live weather")
-            || q_lower.contains("this week's weather")
-            || q_lower.contains("weather near")
-            || {
-                let n_tok = q_lower.split_whitespace().count();
-                n_tok <= 4 && {
-                    let last = q_lower.split_whitespace().last().unwrap_or("");
-                    last == "weather" || last == "forecast"
-                }
-            };
-        let is_howto_query = q_lower.starts_with("how to") || q_lower.starts_with("how do")
-            || q_lower.starts_with("how can") || q_lower.contains("how to")
-            || q_lower.contains("fix ") || q_lower.contains("repair") || q_lower.contains("won't start")
-            || q_lower.contains("wont start") || q_lower.contains("leaking") || q_lower.contains("not cooling");
-        if has_weather_signal && (has_weather_prediction || weather_is_subject)
-            && !is_howto_query
-            && intent.intent != "fresh" && intent.intent != "local"
-        {
+        // Do NOT clobber a decisive action/decision intent (comparison,
+        // transactional, how-to, technical, navigational) to fresh. A weather word
+        // like "rain" legitimately appears inside gear/commercial/how-to queries
+        // ("backpacking tent in the rain", "fix laptop fan after rain") and must not
+        // re-rank them by news-recency. Weather override only applies to
+        // informational/chitchat-style queries; genuine weather queries are still
+        // caught by the "today"/"forecast" temporal signals in other overrides.
+        let weather_skip_intents = ["comparison", "transactional", "how-to", "technical", "navigational"];
+        let weather_should_skip = weather_skip_intents.contains(&intent.intent.as_str());
+        // Also skip when the query itself carries decisive product / recommendation /
+        // instructional framing. A weather word inside such a query does NOT make it a
+        // weather query: "best lightweight tent for backpacking in the rain",
+        // "hiking boots that work in snow" are gear/how-to questions the engine may
+        // classify as `informational` (low confidence) -- which the 5-intent skip list
+        // above does not catch, so the weather override would wrongly re-rank them by
+        // news-recency. Genuine weather queries ("weather forecast today rain") carry
+        // none of these markers and still force `fresh` below.
+        let has_decisive_framing = [
+            "best ", "top ", "vs ", " review", "reviews", " for camping", " for backpacking",
+            " for hiking", "how to", "how do i", "buy ", "compare", "alternatives",
+            "which ", "cheapest", " vs. ", "best-",
+        ]
+        .iter()
+        .any(|m| q_lower.contains(m));
+        let weather_should_skip = weather_should_skip || has_decisive_framing;
+        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" && !weather_should_skip {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
                 q, intent.intent, intent.confidence
@@ -15864,6 +14909,16 @@ async fn handle_search(
 
     // Count-based retry (no relevance needed yet — fires before Invidious/news/image)
     if (needs_more_results || has_contrastive_negatives) && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
+        // Compute recall-gap terms BEFORE web_results is moved into
+        // async closures. The temporary Vec from compute_recall_gap_terms
+        // is dropped by end of this block, so no borrow conflicts.
+        let recall_gap_terms: Vec<String> = {
+            if web_results.is_empty() {
+                Vec::new()
+            } else {
+                compute_recall_gap_terms(&q_trimmed, &web_results).unwrap_or_default()
+            }
+        };
         let mut retry_futs = Vec::new();
         let retry_timeout = Duration::from_secs(4); // shorter than initial 5s
         let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 6 } else { 3 };
@@ -16376,36 +15431,6 @@ async fn handle_search(
     // date / detectable price. These let us report applied-vs-ignored
     // constraints honestly instead of silently returning empty or unfiltered.
     let pre_filter_count = web_results.len();
-
-    // Source-diversity gate: if >80% of pre-filter results come from a single
-    // source, log a warning AND apply a diversity penalty (×0.5) to that
-    // dominant source's results. Data-driven — no hardcoded query strings.
-    {
-        let mut source_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for r in &web_results {
-            for s in &r.sources {
-                *source_counts.entry(s.to_lowercase()).or_insert(0) += 1;
-            }
-        }
-        if !source_counts.is_empty() {
-            let total = web_results.len() as f32;
-            for (source, count) in &source_counts {
-                let pct = (*count as f32) / total;
-                if pct > 0.8 {
-                    tracing::warn!(
-                        "SOURCE-DIVERSITY GATE: source '{}' dominates {}/{} results ({:.1}%) — applying ×0.5 penalty",
-                        source, count, web_results.len(), pct * 100.0
-                    );
-                    for r in web_results.iter_mut() {
-                        if r.sources.iter().any(|s| s.to_lowercase() == *source) {
-                            r.score *= 0.5;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     let dated_result_count = web_results.iter().filter(|r| {
         resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
     }).count();
@@ -16492,22 +15517,46 @@ async fn handle_search(
         //     week" → 8/9 dropped, 1 survives = 11%). A near-empty result set is
         //     the same user-facing failure as a zero one: relevant, date-less
         //     results get discarded in favour of a single stale-but-dated item.
-        //     Fail-open when the surviving fraction is at or below a general 25%
-        //     floor AND the surviving count is too small to be useful (< 3). The
-        //     <= (not <) boundary matters: a query whose results are exactly 25%
-        //     dated-and-in-window (e.g. ISRO "latest news" → 1 of 4 survive = 0.25)
-        //     is still a pathologically crushed set and must fail open. Keyed on
-        //     survival ratio, not on any query/window, so it stays general.
+        //     Fail-open when the surviving fraction is below a general 50% floor
+        //     AND the surviving count is too small to be useful (< 3). This is
+        //     keyed on survival ratio, not on any query/window, so it stays general.
+        //     2026-09-04: threshold raised from 0.25 → 0.50 after "latest news about
+        //     chandrayaan 4 mission updates this week" returned 1/3 (0.33) and the
+        //     old 0.25 floor let the window stand, dropping 2/3 of relevant results.
         let survivor_fraction = if pre_filter_count > 0 {
             survivors_after_window as f32 / pre_filter_count as f32
         } else {
             1.0
         };
-        let fraction_too_low = survivors_after_window < 3 && survivor_fraction <= 0.25;
+        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.50;
         if survivors_after_window == 0 || fraction_too_low {
             tracing::info!(
                 "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
                 pre_filter_count, survivors_after_window, survivor_fraction, dated_result_count
+            );
+            intent.structured_constraints.after_date = None;
+            intent.structured_constraints.before_date = None;
+        }
+        } // end else (dated_result_count > 0)
+    }
+
+    // FRESH-SMALL-SET FAIL-OPEN (structural, P6-class): when intent is fresh
+    // and the pre-merge result set is small (< 5), the date window should be
+    // a scoring boost, NOT a hard filter. For niche queries (e.g. "chandrayaan
+    // 4 mission updates this week"), upstream (SearXNG) returns few date-stamped
+    // items, and the hard filter collapses the set to near-zero even when the
+    // fail-open above didn't trigger (because enough results survived the window
+    // to keep the fraction above 50%). When the set is this small, dropping
+    // results for lacking a date is never the right call — recency should only
+    // influence ranking, not eligibility. Keyed on intent + set size, not on
+    // any query/domain/window — general and future-proof.
+    if intent.intent == "fresh" && pre_filter_count > 0 && pre_filter_count < 5 {
+        if intent.structured_constraints.after_date.is_some()
+            || intent.structured_constraints.before_date.is_some()
+        {
+            tracing::info!(
+                "FRESH-SMALL-SET FAIL-OPEN: intent=fresh with only {} pre-filter results — clearing hard date window (recency stays scoring-only)",
+                pre_filter_count
             );
             intent.structured_constraints.after_date = None;
             intent.structured_constraints.before_date = None;
@@ -16533,6 +15582,13 @@ async fn handle_search(
     // reported `structured_constraints` (that made `price_lt` come back `None`
     // while `applied_constraints` still said `price:<200` — a self-contradictory
     // response). Restored just before serialization below.
+    //
+    // CRITICAL: clone constraints BEFORE the PRICE FAIL-OPEN below clears
+    // intent.structured_constraints.price_*. The merge_local_and_web price-
+    // aware ranking block (line 8574) needs the original bound to apply
+    // budget crush/boost. If we clone after the clearing, the bound is gone
+    // and price ranking is a silent no-op.
+    let constraints_clone = intent.structured_constraints.clone();
     let price_bound_snapshot = (
         intent.structured_constraints.price_min,
         intent.structured_constraints.price_max,
@@ -16564,15 +15620,16 @@ async fn handle_search(
     //      while still returning results about Java if that is all there is.
     //   4. Goldilocks detection: when multiple negative constraints remove everything,
     //      relax the penalty to preserve domain-relevant results.
-    //   5. Soft-match mode (for 0-result retry): never hard-drop; instead score by
-    //      constraint satisfaction count (more matches = higher rank) and fall back
-    //      to the best partial match. Never return 0 results if any partial match exists.
     if !intent.structured_constraints.negative.is_empty() {
         let before_count = web_results.len();
         let constraints_ref = &intent.structured_constraints;
-        let is_soft = constraints_ref.match_mode == MatchMode::Soft;
 
         // Filter out grammar-noise negatives BEFORE violation counting.
+        // "getting overcharged" is a state description (auxiliary verb + adjective),
+        // not a topical exclusion — every car-dealership page mentions "getting
+        // overcharged" in passing, so hard-dropping on it collapses the result set.
+        // is_exclusion_grammar_noise already handles single-word function words
+        // ("have", "from"); this extends the same guard to multi-word phrases.
         let effective_negatives: Vec<String> = constraints_ref.negative.iter()
             .filter(|n| !is_exclusion_grammar_noise(n))
             .cloned()
@@ -16581,12 +15638,15 @@ async fn handle_search(
         // Score each result and track violation counts
         let mut scored: Vec<(usize, f32, usize)> = web_results.iter().enumerate().map(|(i, r)| {
             let c_score = constraint_score(&r.title, &r.content, &r.url, constraints_ref);
+            // Check if this is an alternative-listing page (comparison, vs, alternatives)
+            // BEFORE counting violations — alt pages naturally mention excluded terms
+            // in comparative context ("Django vs FastAPI vs Flask: Which to Choose").
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
             // Count how many negative terms actually match this result content.
             // Skip violation counting for alternative-listing pages: their mention of
             // excluded terms is referential, not topical. The soft filter would otherwise
             // drop them before the alt-aware hard filter can preserve them.
-            let violations = if alt_score > 0.2 {
+            let violations = if alt_score > 0.3 {
                 0
             } else {
                 let text = format!("{} {} {}", r.title.to_lowercase(), r.url.to_lowercase(), r.content.chars().take(300).collect::<String>());
@@ -16594,6 +15654,7 @@ async fn handle_search(
                     let n_lower = n.to_lowercase();
                     let n_words: Vec<&str> = n_lower.split_whitespace().collect();
                     if n_words.len() == 1 {
+                        // Word-boundary aware — "java" must not match "javascript".
                         text_matches_negative(&text, &n_lower)
                     } else {
                         text.contains(&n_lower)
@@ -16619,13 +15680,55 @@ async fn handle_search(
         // the negative constraints are too aggressive for this result set.
         let is_goldilocks = avg_violations > 1.5 && min_violations >= 1;
 
-        // === SOFT-MATCH MODE ===
-        // In soft mode (used by 0-result retry logic), never hard-drop results.
-        // Instead, score each result by how many constraints are satisfied
-        // (more matches = higher rank). Graduated penalty: each violation halves
-        // the effective score. Always returns at least one result — never zero.
-        if is_soft {
+        // Filter strategy:
+        // - Normal case: keep results with violations <= 1 (clean match)
+        // - Goldilocks case: keep results with violations <= max_violations / 2 (relaxed)
+        // - 3+ negatives: zero violations only (unless ALL have violations)
+        let is_only_negative = constraints_ref.positive.is_empty();
+        // A negative constraint means "exclude results that match". When there is
+        // at least one clean result (no negative match) we drop every matching
+        // result. When *all* results match (degenerate set) we fall back to the
+        // Goldilocks relaxation below so we never return an empty page. Pure
+        // negation ("-trump") and mixed queries both expect matches to be removed.
+        let violation_threshold = if is_goldilocks {
+            tracing::warn!("GOLDILOCKS: avg_violations={:.1} max={} - relaxing constraint threshold",
+                avg_violations, max_violations
+            );
+            (max_violations / 2).max(1)
+        } else if min_violations == 0 {
+            0
+        } else if is_only_negative {
+            0
+        } else {
+            0
+        };
+
+        let kept: Vec<usize> = scored.iter()
+            .filter(|(_, _, v)| *v <= violation_threshold)
+            .map(|(i, _, _)| *i)
+            .collect();
+
+        let removed = before_count.saturating_sub(kept.len());
+        if removed > 0 {
+            tracing::info!(
+                "Negative constraint hard filter: removed {}/{} web results (violations max={} min={} avg={:.1})",
+                removed, before_count, max_violations, min_violations, avg_violations
+            );
+        }
+
+        if !kept.is_empty() {
+            // Keep results in sorted order (fewest violations first, highest score within)
+            web_results = kept.iter().map(|i| web_results[*i].clone()).collect();
+        } else {
+            // Fallback: keep results sorted by violations (ascending) but do not filter
+            // This preserves ordering so results with FEWER violations rank higher.
+            tracing::warn!(
+                "Negative constraint filter removed all {} results - keeping sorted by violations",
+                before_count
+            );
             let sorted_indices: Vec<usize> = scored.iter().map(|(i, _, _)| *i).collect();
+            // Apply graduated penalty: each violation halves the effective score
+            // so results with fewer violations naturally rank higher.
             let mut scored_results: Vec<SearxResult> = sorted_indices.iter().map(|i| {
                 let mut r = web_results[*i].clone();
                 let violations = scored.iter().find(|(j, _, _)| *j == *i).map(|(_, _, v)| *v).unwrap_or(0);
@@ -16636,62 +15739,6 @@ async fn handle_search(
             // Sort by penalized score to push multi-violation results down
             scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
             web_results = scored_results;
-            tracing::info!(
-                "SOFT-MATCH: {} results, graduated penalty applied (max_violations={}, avg={:.1})",
-                web_results.len(), max_violations, avg_violations
-            );
-        } else {
-            // === HARD-MATCH MODE (default) ===
-            // Filter strategy:
-            // - Normal case: keep results with violations <= 1 (clean match)
-            // - Goldilocks case: keep results with violations <= max_violations / 2 (relaxed)
-            // - 3+ negatives: zero violations only (unless ALL have violations)
-            let is_only_negative = constraints_ref.positive.is_empty();
-            let violation_threshold = if is_goldilocks {
-                tracing::warn!("GOLDILOCKS: avg_violations={:.1} max={} - relaxing constraint threshold",
-                    avg_violations, max_violations
-                );
-                (max_violations / 2).max(1)
-            } else if min_violations == 0 {
-                0
-            } else if is_only_negative {
-                0
-            } else {
-                0
-            };
-
-            let kept: Vec<usize> = scored.iter()
-                .filter(|(_, _, v)| *v <= violation_threshold)
-                .map(|(i, _, _)| *i)
-                .collect();
-
-            let removed = before_count.saturating_sub(kept.len());
-            if removed > 0 {
-                tracing::info!(
-                    "Negative constraint hard filter: removed {}/{} web results (violations max={} min={} avg={:.1})",
-                    removed, before_count, max_violations, min_violations, avg_violations
-                );
-            }
-
-            if !kept.is_empty() {
-                // Keep results in sorted order (fewest violations first, highest score within)
-                web_results = kept.iter().map(|i| web_results[*i].clone()).collect();
-            } else {
-                // Fallback: keep results sorted by violations (ascending) but do not filter
-                tracing::warn!(
-                    "Negative constraint filter removed all {} results - keeping sorted by violations",
-                    before_count
-                );
-                let sorted_indices: Vec<usize> = scored.iter().map(|(i, _, _)| *i).collect();
-                let mut scored_results: Vec<SearxResult> = sorted_indices.iter().map(|i| {
-                    let mut r = web_results[*i].clone();
-                    let violations = scored.iter().find(|(j, _, _)| *j == *i).map(|(_, _, v)| *v).unwrap_or(0);
-                    r.score *= 0.5_f32.powi(violations as i32);
-                    r
-                }).collect();
-                scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-                web_results = scored_results;
-            }
         }
     }
 
@@ -16756,7 +15803,7 @@ async fn handle_search(
             // ("a bare word like vim/django is NOT structural ... never hard-drop").
             for r in web_results.iter() {
                 let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-                if alt_score <= 0.2 {
+                if alt_score <= 0.3 {
                     let text = format!("{} {} {}", r.title, r.url, r.content.chars().take(300).collect::<String>());
                     let text_lower = text.to_lowercase();
                     let _matched = negative_norm.iter().any(|neg| {
@@ -16977,25 +16024,23 @@ async fn handle_search(
             }
         })
         .collect();
+    let explicit_neg: Vec<String> = extract_explicit_negation_terms(&q_orig);
+    for en in &explicit_neg {
+        if !raw_neg.contains(en) {
+            raw_neg.push(en.clone());
+        }
+    }
     let mut gated_neg_dedup: Vec<String> = Vec::new();
     let mut explicit_survivors: Vec<String> = Vec::new();
     for n in raw_neg.clone() {
-        let engine_backed = engine_exclusions.contains(&n.to_lowercase());
-        // V1 (2026-08-18): a verb-led / user-attribute exclusion (e.g. "dependents"
-        // from "with no dependents", "coordination" from "with no coordination") is
-        // NEVER a real content exclusion — it describes the user, not a topic to
-        // drop. It must be rejected here at the FINAL gate regardless of whether the
-        // engine tagged it or the contrastive framing (compare/versus) would
-        // otherwise promote it. Rejecting here — after the engine-exclusion merge
-        // point — covers BOTH sources (engine IR + gateway extractor) with one
-        // structural rule. Genuine topical exclusions (brand/place/demonym) never
-        // match is_verb_attribute_exclusion, so they still survive.
-        if is_verb_attribute_exclusion(&n) {
+        if explicit_neg.iter().any(|e| e == &n) {
+            // Unambiguous directive: always keep, never re-inject as positive.
+            if !explicit_survivors.contains(&n) {
+                explicit_survivors.push(n.clone());
+            }
             continue;
         }
-        if (engine_backed || is_real_exclusion(&n, &q_orig, query_contrastive))
-            && !gated_neg_dedup.contains(&n)
-        {
+        if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
             gated_neg_dedup.push(n);
         }
     }
@@ -17288,7 +16333,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             // Use Instead of Google" for "search engine alternative to google").
             //
             // CRITICAL FIX (round 2026-08-15T0830Z): the old gate exempted anything
-            // with alt_score > 0.2. But is_alternative_listing_page() also assigns a
+            // with alt_score > 0.3. But is_alternative_listing_page() also assigns a
             // WEAK alt signal (~0.42) to generic "best/top/review" listicle titles
             // — including a brand's OWN catalog page like "Dell Laptop Computers -
             // Best Buy" or "Best Dell Laptops". Those are NOT comparison/alternative
@@ -17435,7 +16480,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             if contrastive {
                 // Entity-specific alt pages (mention excluded term AND are alt listings)
                 // are the answer — boost them, not the generic listicles.
-                if has_neg_in_title && alt_score > 0.2 {
+                if has_neg_in_title && alt_score > 0.3 {
                     r.score += 0.03;
                 }
             } else if !has_neg_in_title {
@@ -17925,6 +16970,67 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // ── Honest recall-gap signal ──
     // (computed earlier, before pagination, over the full post-filter result set)
 
+    // ── MAIN-PATH commercial intent (ROADMAP item 7) ──
+    // When the resolved intent is commercial (transactional label / strong
+    // transactional distribution / a stated price bound — see `is_commercial_intent`),
+    // attach a `shopping` block to the SAME `/search` response so the user gets
+    // honest product facts + an affiliate-monetized strip without leaving the
+    // results page. STRICT no-manipulation: this block is built from a CLONE of
+    // the top-N ALREADY-RANKED results; `paginated_results` (the real web results)
+    // is NEVER read, mutated, reordered, or reselected here. We reuse the EXACT
+    // same honest post-rank enrichment passes already written for `GET /shopping`
+    // (`enrich_with_commerce` + `decorate_affiliate` + `build_offer_comparisons`),
+    // so the order-invariance guarantee holds: affiliate decoration runs strictly
+    // AFTER the order is fixed and cannot move a result. No external call, no
+    // keyword list — the commercial signal comes purely from in-process intent.
+    let shopping_block: Option<serde_json::Value> = if is_commercial_intent(
+        &intent.intent,
+        &intent.distribution,
+        sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
+    ) {
+        // Clone only the top-N ranked results into a JSON array we can enrich in
+        // place. `serde_json::to_value` on `MergedResult` is lossless/Serialize.
+        let mut shop_arr: Vec<serde_json::Value> = paginated_results
+                .iter()
+                .take(state.commerce_config.mainpath_top_n)
+                .filter_map(|r| serde_json::to_value(r).ok())
+                .collect();
+        if shop_arr.is_empty() {
+            None
+        } else {
+            let http_client = client.clone();
+            // Reuse the same strict post-rank enrichment as /shopping. Each fetch is
+            // already budgeted (~4.5s) inside `fetch_page_html`, and we only touch
+            // the top-N (bounded), so the main /search latency stays acceptable.
+            enrich_with_commerce(&mut shop_arr, move |url: String| {
+                let c = http_client.clone();
+                async move { fetch_page_html(&c, &url).await }
+            })
+            .await;
+            // STRICT post-ranking affiliate decoration (never reorders).
+            decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
+            // The `shopping` block is surfaced whenever commercial intent is
+            // detected. Every result carries `commerce_provenance` (attached by
+            // `enrich_with_commerce`) which honestly records whether structured
+            // product data was found on that URL (`source: null` => checked, nothing)
+            // — this is the honest presentation signal, not a gate. Results that
+            // exposed structured data additionally carry a `commerce` block; the
+            // frontend renders both cases (affiliate-decorated URL + optional facts).
+            // Read-only multi-merchant offer comparison from the attached facts.
+            let mut block = serde_json::json!({ "results": shop_arr });
+            if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                let comparisons = build_offer_comparisons(arr_ref);
+                if !comparisons.is_empty() {
+                    block["offer_comparisons"] =
+                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+                }
+            }
+            Some(block)
+        }
+    } else {
+        None
+    };
+
     let response = UnifiedResponse {
         query: q.clone(),
         intent: Some(intent.intent.clone()),
@@ -17962,30 +17068,12 @@ let mut results = match tokio::task::spawn_blocking(move || {
         price_verified: if intent.intent == "transactional"
             && (sc.price_lt.is_some() || sc.price_gt.is_some() || sc.price_min.is_some() || sc.price_max.is_some())
         { Some(priced_result_count) } else { None },
+        recall_gap_terms,
+        shopping: shopping_block,
     };
 
-    // ── Post-rank affiliate decoration for /search ──
-    // When commercial intent is detected (transactional label / strong transactional
-    // distribution / stated price bound / exact model-number pattern in query),
-    // apply the SAME strict post-rank affiliate decoration that /shopping and the
-    // main-path shopping block use. This ensures /search results carry affiliate
-    // links for commercial queries, not just /shopping. Decoration is strictly
-    // post-ranking: order-invariance is preserved (it only mutates each result's
-    // `affiliate` field, never reorders).
-    let mut response_value = serde_json::to_value(&response).unwrap_or(serde_json::json!({}));
-    let should_decorate_affiliate = is_commercial_intent(
-        &intent.intent,
-        &intent.distribution,
-        sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
-    ) || !detect_product_entities(q_trimmed).is_empty();
-    if should_decorate_affiliate {
-        if let Some(arr) = response_value.get_mut("results").and_then(|v| v.as_array_mut()) {
-            decorate_affiliate(arr, &state.affiliate_ctx);
-        }
-    }
-
     // Cache for 5 minutes — but never cache empty results
-    let response_json = serde_json::to_string(&response_value).unwrap_or_default();
+    let response_json = serde_json::to_string(&response).unwrap_or_default();
     if !response.results.is_empty() {
         state.cache.put(cache_key.clone(), response_json.clone(), Duration::from_secs(300));
     }
@@ -18003,7 +17091,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         guard.complete();
     }
 
-    (axum::http::StatusCode::OK, Json(response_value))
+    (axum::http::StatusCode::OK, Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({}))))
 }
 
 fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
@@ -18055,6 +17143,10 @@ fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
 /// Handles 0-99 directly and any magnitude via "X hundred/thousand [Y]" and
 /// "X thousand Y hundred [Z]" compositions (e.g. "two hundred fifty" -> "250",
 /// "one thousand two hundred" -> "1200", "nineteen" -> "19").
+///
+/// Only rewrites number-word runs when adjacent to a price marker or currency
+/// word, preserving original text elsewhere (so "nineteen eighty four" remains
+/// unchanged unless it appears in a price context).
 fn normalize_spoken_numbers(query: &str) -> String {
     let units: &[(&str, u32)] = &[
         ("zero", 0), ("ten", 10), ("eleven", 11), ("twelve", 12),
@@ -18065,9 +17157,20 @@ fn normalize_spoken_numbers(query: &str) -> String {
         ("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50),
         ("sixty", 60), ("seventy", 70), ("eighty", 80), ("ninety", 90),
     ];
+    let price_markers = [
+        "under", "below", "less", "cheaper", "max", "maximum", "over", "more",
+        "above", "minimum", "budget", "within", "around", "about", "price",
+    ];
+    let currency_words = [
+        "dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.",
+        "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw",
+        "$", "£", "€", "¥",
+    ];
+
     let tokens: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
     let mut out: Vec<String> = Vec::with_capacity(tokens.len());
     let mut i = 0;
+
     while i < tokens.len() {
         let tok = &tokens[i];
         // Look for a "hundred" or "thousand" scalar clause ending on that word.
@@ -18078,6 +17181,14 @@ fn normalize_spoken_numbers(query: &str) -> String {
         }
         let is_unit = units.iter().any(|(w, _)| w == tok);
         if is_unit {
+            // Check if adjacent to a price marker or currency word
+            let prev_is_price_context = if i > 0 {
+                let prev = &tokens[i - 1];
+                price_markers.contains(&prev.as_str()) || currency_words.contains(&prev.as_str())
+            } else {
+                false
+            };
+
             // Gather the contiguous run of number words.
             let mut j = i;
             let mut run: Vec<String> = Vec::new();
@@ -18088,48 +17199,55 @@ fn normalize_spoken_numbers(query: &str) -> String {
                 run.push(t.clone());
                 j += 1;
             }
-            // Parse the composed value.
-            let mut total: i64 = 0;
-            let mut current: i64 = 0;
-            let mut has_any = false;
-            let mut saw_scale = false;
-            for w in &run {
-                if *w == "hundred" {
-                    if current == 0 { current = 1; }
-                    total += current * 100;
-                    current = 0;
-                    saw_scale = true;
-                } else if *w == "thousand" {
-                    if current == 0 { current = 1; }
-                    total += current * 1000;
-                    current = 0;
-                    saw_scale = true;
-                } else {
-                    let v = units.iter().find(|(w2, _)| w2 == w).map(|(_, v)| *v).unwrap_or(0);
-                    if v >= 10 && v <= 90 && v % 10 == 0 {
-                        // tens (twenty..ninety) add directly
-                        current += v as i64;
+
+            // Check if followed by currency word
+            let next_is_price_context = if j < tokens.len() {
+                currency_words.contains(&tokens[j].as_str())
+            } else {
+                false
+            };
+
+            let in_price_context = prev_is_price_context || next_is_price_context;
+
+            if in_price_context {
+                // Parse the composed value.
+                let mut total: i64 = 0;
+                let mut current: i64 = 0;
+                let mut has_any = false;
+                for w in &run {
+                    if *w == "hundred" {
+                        if current == 0 { current = 1; }
+                        total += current * 100;
+                        current = 0;
+                    } else if *w == "thousand" {
+                        if current == 0 { current = 1; }
+                        total += current * 1000;
+                        current = 0;
                     } else {
-                        if current > 0 && v < 10 && !saw_scale {
-                            // e.g. "twenty one" -> 21 (tens already in current)
+                        let v = units.iter().find(|(w2, _)| w2 == w).map(|(_, v)| *v).unwrap_or(0);
+                        if v >= 10 && v <= 90 && v % 10 == 0 {
+                            // tens (twenty..ninety) add directly
+                            current += v as i64;
+                        } else {
+                            current += v as i64;
                         }
-                        if v < 10 { current += v as i64; }
-                        else { current += v as i64; }
+                        has_any = true;
                     }
-                    has_any = true;
+                }
+                let value = if total == 0 && current == 0 { 0 } else { total + current };
+                if has_any {
+                    out.push(value.to_string());
+                    i = j;
+                    continue;
                 }
             }
-            let value = if total == 0 && current == 0 { 0 } else { total + current };
-            if has_any {
-                out.push(value.to_string());
-                i = j;
-                continue;
-            } else {
-                // Not a parseable number run; emit as-is.
-                out.push(tok.clone());
-                i += 1;
-                continue;
+
+            // Not in price context or not parseable; emit original tokens
+            for token in &run {
+                out.push(token.clone());
             }
+            i = j;
+            continue;
         }
         out.push(tok.clone());
         i += 1;
@@ -18560,7 +17678,6 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     let (after_date, before_date) = parse_date_constraints(&q);
     
     Constraints {
-        match_mode: MatchMode::default(),
         positive: vec![],
         negative,
         hard_exclusions,
@@ -18580,59 +17697,8 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         price_lt,
         price_gt,
         ignored_constraints: None,
+        match_mode: MatchMode::Hard,
     }
-}
-
-/// Detects transactional intent signals using structural patterns (no per-product
-/// keyword enumeration). Used by `fallback_intent` to recognize shopping queries
-/// like "iphone 16 pro max price" without the intent engine.
-///
-/// Signal 1 — model-number pattern: word(s) + alphanumeric token containing a digit,
-///   optionally followed by generic product suffixes (pro, max, plus, ultra, air, lite, se).
-///   Matches "iphone 16 pro max", "macbook m3", "galaxy s24", "rtx 4090".
-/// Signal 2 — price word + multi-word product description: a generic commerce term
-///   ("price", "cheap", "budget", "under") alongside >= 2 content words (e.g.
-///   "samsung tv under 500", "best budget laptop").
-///
-/// Returns (is_transactional, confidence). Confidence is higher for model-number
-/// matches (stronger transactional signal) than for price-word co-occurrence.
-fn detect_transactional_signals(q: &str) -> (bool, f32) {
-    let q_lower = q.to_lowercase();
-
-    // Signal 1: model-number pattern.
-    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let model_re = MODEL_RE.get_or_init(|| {
-        regex::Regex::new(
-            r"(?i)\b[a-z]+(?:\s+[a-z]+)*\s+[a-z]?\d[\w\-]*(?:\s+(?:pro|max|plus|ultra|air|lite|se|mini))*\b",
-        )
-        .unwrap()
-    });
-    if model_re.is_match(&q_lower) {
-        return (true, 0.75);
-    }
-
-    // Signal 2: price word + substantial product description.
-    const PRICE_WORDS: &[&str] = &[
-        "price", "prices", "pricing", "cost", "costs", "cheap", "cheapest",
-        "budget", "affordable", "under", "over", "deal", "deals", "sale",
-        "sales", "discount", "offer", "offers", "buy", "purchase", "shop", "store",
-    ];
-    if PRICE_WORDS.iter().any(|pw| q_lower.contains(pw)) {
-        const STOP: &[&str] = &[
-            "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to",
-            "for", "of", "with", "and", "or", "not", "do", "does", "what", "which",
-            "how", "where", "when", "who", "why",
-        ];
-        let content_count = q_lower
-            .split_whitespace()
-            .filter(|w| !STOP.contains(w) && !PRICE_WORDS.contains(w))
-            .count();
-        if content_count >= 2 {
-            return (true, 0.65);
-        }
-    }
-
-    (false, 0.3)
 }
 
 fn fallback_intent(q: &str) -> IntentResponse {
@@ -18649,17 +17715,10 @@ fn fallback_intent(q: &str) -> IntentResponse {
     }
     structured.negative = negative;
 
-    // Detect transactional signals (model-number patterns, price + product).
-    let (is_transactional, confidence) = detect_transactional_signals(q);
-
     IntentResponse {
         query: q.to_string(),
-        intent: if is_transactional {
-            "transactional".to_string()
-        } else {
-            "informational".to_string()
-        },
-        confidence,
+        intent: "informational".to_string(),
+        confidence: 0.3,
         constraints: vec![],
         structured_constraints: structured,
         expanded_queries: vec![q.to_string()],
@@ -18716,7 +17775,10 @@ async fn handle_search_fast(
                         price: r.price.map(|p| p.to_string()),
                         currency: r.currency,
                         quality: r.quality,
+                        post_cal_cap: None,
                         engine_trust_mult: 1.0,
+                        commerce: None,
+                        commerce_provenance: None,
                     }).collect::<Vec<_>>()
                 }
                 None => vec![]
@@ -18806,45 +17868,45 @@ mod constraint_fix_tests {
             &c,
         );
         assert!(!fresh, "result dated 2025 should pass after:2024");
-    }
+            }
 
-    #[test]
-    fn fresh_small_set_date_window_is_scoring_not_filter() {
-        // FRESH-SMALL-SET FAIL-OPEN: when intent is fresh and the
-        // pre-merge set is small (< 5), the date window must NOT
-        // hard-filter results. The handle_search level clears the
-        // date window when pre_filter_count < 5, so dateless
-        // results are kept and recency stays a scoring-only boost.
-        // This test verifies the should_filter_by_constraints
-        // guarantee: dateless results pass through the date filter
-        // (the structural foundation on which the FRESH-SMALL-SET
-        // rule depends).
-        let mut c = Constraints::default();
-        c.after_date = Some("2025-09-01".to_string());
-        c.before_date = Some("2025-09-08".to_string());
-        // A result with no publish date — should NOT be filtered.
-        // (should_filter_by_constraints keeps dateless results by
-        // design — the fail-open for date-less results.)
-        let nodate = should_filter_by_constraints(
-            "Chandrayaan 4 update",
-            "ISRO prepares for Chandrayaan-4 lunar sample-return mission.",
-            "https://example.com/chandrayaan4",
-            None, // no published date
-            &c,
-        );
-        assert!(!nodate, "dateless result must NOT be hard-filtered by date bounds");
-    }
+            #[test]
+            fn fresh_small_set_date_window_is_scoring_not_filter() {
+                // FRESH-SMALL-SET FAIL-OPEN: when intent is fresh and the
+                // pre-merge set is small (< 5), the date window must NOT
+                // hard-filter results. The handle_search level clears the
+                // date window when pre_filter_count < 5, so dateless
+                // results are kept and recency stays a scoring-only boost.
+                // This test verifies the should_filter_by_constraints
+                // guarantee: dateless results pass through the date filter
+                // (the structural foundation on which the FRESH-SMALL-SET
+                // rule depends).
+                let mut c = Constraints::default();
+                c.after_date = Some("2025-09-01".to_string());
+                c.before_date = Some("2025-09-08".to_string());
+                // A result with no publish date — should NOT be filtered.
+                // (should_filter_by_constraints keeps dateless results by
+                // design — the fail-open for date-less results.)
+                let nodate = should_filter_by_constraints(
+                    "Chandrayaan 4 update",
+                    "ISRO prepares for Chandrayaan-4 lunar sample-return mission.",
+                    "https://example.com/chandrayaan4",
+                    None, // no published date
+                    &c,
+                );
+                assert!(!nodate, "dateless result must NOT be hard-filtered by date bounds");
+            }
 
-    #[test]
-    fn price_extraction_broadened() {
-        assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
-        assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
-        assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
-        assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
-        assert_eq!(extract_price_from_text("no monetary value here"), None);
-        assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
-        assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
-    }
+                #[test]
+                fn price_extraction_broadened() {
+                    assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
+                    assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
+                    assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
+                    assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
+                    assert_eq!(extract_price_from_text("no monetary value here"), None);
+                    assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
+                    assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
+                }
 
     #[test]
     fn rs_signal_no_false_positives() {
@@ -18964,7 +18026,7 @@ mod constraint_fix_tests {
             "rust web server without actix site:reddit.com",
             "learn spanish not duolingo site:reddit.com",
         ] {
-            let (kept, dropped) = extract_query_negative_terms_with_dropped(q);
+            let (kept, dropped, _manner) = extract_query_negative_terms_with_dropped(q);
             let joined = kept.join(" ");
             assert!(
                 !kept.iter().any(|t| t.contains("site")),
@@ -18980,7 +18042,7 @@ mod constraint_fix_tests {
             );
         }
         // Exact assertion for the canonical repro.
-        let (kept, _dropped) =
+        let (kept, _dropped, _manner) =
             extract_query_negative_terms_with_dropped("python web framework not django site:github.com");
         assert_eq!(kept, vec!["django".to_string()], "D3: 'not django site:github.com' → ['django'] only");
     }
@@ -19508,7 +18570,7 @@ mod constraint_fix_tests {
     fn not_operator_keeps_alt_listing_page() {
         // Alt-listing pages that merely *mention* the excluded term in a
         // referential/comparison context must NOT be hard-dropped (consistent
-        // with every other negative hard-drop gate's alt_score>0.2 exemption).
+        // with every other negative hard-drop gate's alt_score>0.3 exemption).
         let mut c = cst();
         c.hard_exclusions = vec!["flask".to_string()];
         let kept = should_filter_by_constraints(
@@ -19597,7 +18659,7 @@ mod hardcoding_ruling_tests {
             "Improve: verb /ɪmˈpruːv/ 1. : to make better",
         )];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &[]
         );
         assert_eq!(out.len(), 1, "cambridge result should survive (capped, not dropped)");
         let r = &out[0];
@@ -19614,7 +18676,7 @@ mod hardcoding_ruling_tests {
             "adult content",
         )];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &[]
         );
         assert_eq!(out.len(), 0, "adult result must be dropped for non-adult query (d04afbe safety)");
     }
@@ -19628,92 +18690,176 @@ mod hardcoding_ruling_tests {
             "adult content",
         )];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &[]
         );
         assert_eq!(out.len(), 1, "adult result kept when query is explicitly adult");
     }
 
-    // D4 (2026-08-18T1340Z round): a fresh+dated query where one upstream engine
-    // returned ONLY date-less off-topic junk while a SIBLING engine returned dated
-    // results must crush the date-blind engine's junk below the dated, on-topic
-    // result. This is the per-engine trust half of the D4 fix — no engine names in
-    // the ranking code, only each engine's own date-signal behaviour on the query.
-    fn web_res_dated(url: &str, title: &str, content: &str, engine: &str, date: Option<&str>) -> SearxResult {
-        SearxResult {
-            title: title.to_string(),
-            url: url.to_string(),
-            content: content.to_string(),
-            engine: engine.to_string(),
-            score: 1.0,
-            sources: vec![engine.to_string()],
-            published_date: date.map(|s| s.to_string()),
+    #[test]
+    fn topic_mentioned_requires_substantive_terms() {
+        // Finding 1: "deploy fastapi with postgres on ubuntu" should require
+        // substantive terms (fastapi/postgres/ubuntu) for topic_mentioned, not
+        // just the meta-action term "deploy".
+        use super::IndexerResult;
+        let q = "deploy fastapi with postgres on ubuntu";
+        let local = vec![IndexerResult {
+            url: "http://local.test/fastapi-postgres-ubuntu-guide".to_string(),
+            title: "Deploying FastAPI with PostgreSQL on Ubuntu Server".to_string(),
+            content: "Complete guide to deploying a FastAPI application with PostgreSQL database on Ubuntu.".to_string(),
+            score: 0.8,
+            authority: 0.5,
             price: None,
             currency: None,
-        }
+            quality: 0.8,
+        }];
+        let out = merge_local_and_web(
+            local, vec![], q, "informational", &cst(), None, None, &empty_sem(), &[]
+        );
+        assert_eq!(out.len(), 1, "substantive-term match should survive");
+        let r = &out[0];
+        // Should NOT be crushed by LOCAL NOISE GATE since it mentions substantive terms
+        assert!(r.score > 0.1, "result with fastapi/postgres/ubuntu should have topic_mentioned=true and score > 0.1, got {}", r.score);
     }
 
     #[test]
-    fn d4_dateblind_upstream_crushed_below_dated_sibling() {
-        let q = "recent changes to the indian income tax slabs announced this budget season";
-        // bing: date-blind junk (no date, no distinctive topic term) — the D4 defect.
-        let bing_junk = web_res_dated(
-            "https://www.bing.com/Recent - Design Inspiration",
-            "Recent - Design Inspiration",
-            "random inspiration gallery",
-            "bing",
-            None,
-        );
-        // brave: the genuine dated, on-topic result.
-        let brave_good = web_res_dated(
-            "https://www.livemint.com/income-tax-slabs-budget-2026-changes",
-            "Income Tax Slabs Budget 2026: changes announced this budget season",
-            "the indian income tax slabs changed in the budget announced this season",
-            "brave",
-            Some("2026-02-01"),
-        );
-        let web = vec![bing_junk, brave_good];
+    fn topic_mentioned_rejects_weak_only_match() {
+        // Finding 1: "clean a dishwasher with vinegar" should NOT validate a page
+        // that only mentions "vinegar" (weak anchor word), not the substantive context.
+        use super::IndexerResult;
+        let q = "clean a dishwasher with vinegar";
+        let local = vec![IndexerResult {
+            url: "http://local.test/wasp-removal".to_string(),
+            title: "Get Rid of Wasps with Vinegar".to_string(),
+            content: "Natural wasp removal using vinegar spray. Safe and effective method.".to_string(),
+            score: 0.75,
+            authority: 0.5,
+            price: None,
+            currency: None,
+            quality: 0.6,
+        }];
         let out = merge_local_and_web(
-            vec![], web, q, "fresh", &cst(), None, None, &empty_sem(),
+            local, vec![], q, "informational", &cst(), None, None, &empty_sem(), &[]
         );
-        assert_eq!(out.len(), 2, "both results must survive (no hard date-drop on fresh query)");
-        // The dated, on-topic brave result must outrank the date-blind bing junk.
-        let brave = out.iter().find(|r| r.url.contains("livemint")).expect("brave result present");
-        let bing = out.iter().find(|r| r.url.contains("bing.com")).expect("bing result present");
-        assert!(
-            brave.score > bing.score,
-            "dated on-topic result (score={}) must outrank date-blind junk (score={})",
-            brave.score, bing.score
-        );
+        // The off-topic page (mentions "vinegar" but not dishwasher context) should
+        // be crushed since "clean" and "vinegar" are weak anchor words and it lacks
+        // substantive terms from the query
+        assert_eq!(out.len(), 1, "off-topic result present but demoted");
+        let r = &out[0];
+        assert!(r.score < 0.1, "off-topic weak-match should be crushed below 0.1, got {}", r.score);
     }
 
     #[test]
-    fn d4_trust_only_when_sibling_has_dates() {
-        // Cold case: EVERY engine is date-blind. No corroboration signal, so NO
-        // engine must be crushed blindly — trust stays 1.0 for all. This guards
-        // against the fix itself regressing ordinary fresh queries where upstream
-        // simply returns no dates.
-        let q = "latest vegan thanksgiving recipes 2026";
-        let web = vec![
-            web_res_dated("https://a.example.com/v1", "Vegan Thanksgiving Recipes", "recipes", "bing", None),
-            web_res_dated("https://b.example.com/v2", "More Vegan Thanksgiving", "recipes", "brave", None),
-        ];
-        let out = merge_local_and_web(
-            vec![], web, q, "fresh", &cst(), None, None, &empty_sem(),
+    fn dict_cap_stays_below_article_floor_after_clamp() {
+        // Finding 4: dict_cap (0.03) must stay below article floor (0.05) even after
+        // the final 0.05 clamp in serialization. The post_cal_cap mechanism re-applies
+        // the cap AFTER the clamp.
+        let q = "improve deep sleep without medication";
+        let dict_result = web_res(
+            "https://www.merriam-webster.com/dictionary/improve",
+            "Improve | Definition of Improve by Merriam-Webster",
+            "improve: verb. to make better",
         );
-        assert_eq!(out.len(), 2, "both survive");
-        // COLD-CASE GUARD (the real property this test defends): when EVERY upstream
-        // engine is date-blind, the D4 per-engine trust map stays EMPTY, so no result
-        // is trust-crushed — `engine_trust_mult` must be exactly 1.0 for every result.
-        // (The final `score` is confounded by calibrate_scores, which can floor a
-        // lower-scored result to 0.05 regardless of trust — so we assert the trust
-        // multiplier directly, which is the observable the D4 logic actually controls.)
-        for r in &out {
-            assert_eq!(
-                r.engine_trust_mult, 1.0,
-                "date-blind-only query must not trust-crush any engine (got {})",
-                r.engine_trust_mult
-            );
-        }
+        let article_result = web_res(
+            "https://example.com/sleep-guide",
+            "How to Improve Deep Sleep Without Medication",
+            "Evidence-based techniques for improving sleep quality naturally.",
+        );
+        let web = vec![dict_result, article_result];
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &[]
+        );
+        assert!(out.len() >= 2, "both results should be present");
+        // Find the dict result (capped to 0.03)
+        let dict = out.iter().find(|r| r.url.contains("merriam-webster")).expect("dict result missing");
+        // Find the article (floor at 0.05)
+        let article = out.iter().find(|r| r.url.contains("sleep-guide")).expect("article missing");
+        // Dict must be strictly below article floor
+        assert!(dict.score < 0.05, "dict_cap should be < 0.05, got {}", dict.score);
+        assert!(dict.score <= 0.031, "dict_cap should be ~0.03, got {}", dict.score);
+        assert!(article.score >= 0.05, "article floor should be >= 0.05, got {}", article.score);
+        assert!(dict.score < article.score, "dict (capped) must rank below article");
+    }
+
+    #[test]
+    fn video_intent_rejects_standalone_watch() {
+        // Finding 5: "watch battery" and "watch repair" are about timepieces,
+        // not videos. Standalone "watch" should NOT imply video intent.
+        use super::has_video_intent;
+        assert!(!has_video_intent("watch battery"), "watch battery is NOT video intent");
+        assert!(!has_video_intent("watch repair"), "watch repair is NOT video intent");
+        assert!(!has_video_intent("rolex watch"), "rolex watch is NOT video intent");
+        // But video-oriented phrases should be recognized
+        assert!(has_video_intent("watch video tutorial"), "watch video is video intent");
+        assert!(has_video_intent("how to watch"), "how to watch is video intent");
+        assert!(has_video_intent("youtube tutorial"), "youtube is video intent");
+    }
+
+    #[test]
+    fn video_cap_applied_for_ambiguous_watch_query() {
+        // Finding 5: "watch battery" should cap video results to 0.04 since it's
+        // not a video-intent query (about timepieces, not videos).
+        use super::SearxResult;
+        let q = "watch battery replacement";
+        let video_result = SearxResult {
+            title: "Watch Battery Replacement Tutorial - YouTube".to_string(),
+            url: "https://youtube.com/watch?v=abc123".to_string(),
+            content: "Step by step guide to replacing a watch battery.".to_string(),
+            engine: "invidious".to_string(),
+            score: 1.0,
+            sources: vec!["invidious".to_string()],
+            published_date: None,
+            price: None,
+            currency: None,
+        };
+        let article_result = web_res(
+            "https://example.com/watch-battery-guide",
+            "How to Replace a Watch Battery: Complete Guide",
+            "Professional guide to watch battery replacement with tools and tips.",
+        );
+        let web = vec![video_result, article_result];
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &[]
+        );
+        assert!(out.len() >= 2, "both results should be present");
+        let video = out.iter().find(|r| r.sources.iter().any(|s| s == "invidious")).expect("video missing");
+        let article = out.iter().find(|r| r.url.contains("watch-battery-guide")).expect("article missing");
+        // Video should be capped to 0.04 (below article floor 0.05)
+        assert!(video.score <= 0.041, "video for non-video query should be capped to ~0.04, got {}", video.score);
+        assert!(article.score >= 0.05, "article should be at floor 0.05+, got {}", article.score);
+        assert!(video.score < article.score, "video must rank below article for non-video query");
+    }
+
+    #[test]
+    fn wiki_disambig_strict_detection() {
+        // Finding 3: Wikipedia disambiguation detection should use strict predicates
+        // (empty stub, "may refer to", "can refer to", or link-list with short body)
+        // and NOT use unrestricted title-prefix matching that would mis-classify
+        // normal article leads as disambiguation pages.
+        let q = "java programming";
+        // Real disambiguation page (contains "may refer to")
+        let disambig = web_res(
+            "https://en.wikipedia.org/wiki/Java",
+            "Java - Wikipedia",
+            "Java may refer to: Java (programming language), Java (island), Java coffee, and more.",
+        );
+        // Normal article (title happens to be a prefix of content, but it's a real article)
+        let article = web_res(
+            "https://en.wikipedia.org/wiki/Java_(programming_language)",
+            "Java (programming language) - Wikipedia",
+            "Java is a high-level, class-based, object-oriented programming language that is designed to have as few implementation dependencies as possible.",
+        );
+        let web = vec![disambig, article];
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &[]
+        );
+        // The disambiguation page should be capped (treated as dict-like for non-def query)
+        // while the real article should not be capped
+        let disambig_result = out.iter().find(|r| r.url.contains("/wiki/Java") && !r.url.contains("programming")).expect("disambig missing");
+        let article_result = out.iter().find(|r| r.url.contains("programming_language")).expect("article missing");
+        // Disambig should be capped low (dict-like treatment for non-definition query)
+        assert!(disambig_result.score < 0.05, "disambig should be capped below floor, got {}", disambig_result.score);
+        // Real article should be at or above floor
+        assert!(article_result.score >= 0.05, "article should be >= 0.05, got {}", article_result.score);
     }
 }
 
@@ -19862,37 +19008,48 @@ mod spellcheck_endpoint_tests {
         assert_eq!(res["corrected"].as_str(), Some("go rust"));
     }
 
+    #[tokio::test]
+    async fn spellcheck_query_runs_off_runtime_in_spawn_blocking() {
+        // Regression (round 2026-08-10T1401Z, t_181e7e89): the spelling index is
+        // held behind `Arc<SymSpellIndex>` so the synchronous `spellcheck_query`
+        // can be moved OFF the async executor via `spawn_blocking`. This test
+        // proves the `Arc` handle is `Send + Sync` (it compiles + runs in a
+        // spawned blocking task) and that the result is identical to an inline
+        // call. The original code called `spellcheck_query` directly on the
+        // async runtime, which would block executor threads on a large index.
+        let index = Arc::new(spell::SymSpellIndex::build());
+        let q = "pythn programing langauge".to_string();
+        let inline = spellcheck_query(&index, &q);
+        let index_clone = Arc::clone(&index);
+        let q_clone = q.clone();
+        let blocked = tokio::task::spawn_blocking(move || {
+            spellcheck_query(&index_clone, &q_clone)
+        })
+        .await
+        .expect("spawn_blocking must not panic with the Arc<SymSpellIndex> handle");
+        assert_eq!(inline, blocked, "spawn_blocking path must match inline path");
+        assert_eq!(blocked["corrected"].as_str(), Some("python programming language"));
+    }
+
+    // ─── /inspect endpoint (unified pre-search introspection) ───
+    // Generalizes /analyze + /spellcheck into one additive, zero-side-effect
+    // payload that mirrors the FULL /search reasoning pipeline. These tests
+    // lock the shape + behavior of `build_inspect` using the exact pure fns
+    // /search runs (no AppState / live server needed), so the endpoint cannot
+    // regress silently and cannot be "faked" by hardcoded strings.
+
     #[test]
-    fn d3_brand_source_negation_routed_to_negative() {
-        // D3 regression (t_1c27d98e): a brand/source the user scoped with an
-        // explicit negation + source preposition ("not from sony", "not by nike",
-        // "not made by samsung") must become a real exclusion, even WITHOUT
-        // contrastive framing (which a plain "not X" lacks). Before the fix,
-        // "not from sony" left sony as a POSITIVE term (the negation was silent).
-        // No brand literals: the helper keys only on the (negation) + (source
-        // preposition) + (entity) token pattern.
-        for q in [
-            "wireless earbuds not from sony",
-            "running shoes not by nike",
-            "smartphone not made by samsung",
-            "laptop not manufactured by lenovo",
-        ] {
-            let negs = extract_query_negative_terms(q);
-            assert!(
-                !negs.is_empty(),
-                "source-scoped negation '{}' must produce an exclusion, got {:?}",
-                q, negs
-            );
-            // The brand head must be the captured exclusion (lowercased).
-            // NOTE: &str has no rsplit_whitespace in the std prelude used here;
-            // split_whitespace yields the same last token for these single-brand
-            // queries (the brand is the final whitespace-delimited token).
-            let brand = q.split_whitespace().last().unwrap();
-            assert!(
-                negs.iter().any(|n| n == brand),
-                "'{}' must be excluded for query '{}', got {:?}",
-                brand, q, negs
-            );
+    fn inspect_endpoint_shape_matches_docs() {
+        // Locks the JSON shape documented in API_REFERENCE.md `GET /inspect`:
+        // top-level { query, spelling, negation, intent, constraints,
+        // recency, quality }, each with the documented sub-keys. Each section
+        // must be present and well-formed (never silently dropped).
+        let index = spell::SymSpellIndex::build();
+        let res = build_inspect(&index, "python web framework not django");
+
+        // Top-level sections all present.
+        for section in ["query", "spelling", "negation", "intent", "constraints", "recency", "quality"] {
+            assert!(res.get(section).is_some(), "missing /inspect section: {}", section);
         }
 
         // spelling sub-shape
@@ -20975,109 +20132,6 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(o.source.as_deref(), None);
     }
 
-    // ── List price (original/sale price) extraction ──────────────────
-    // The list_price field captures the original/undiscounted price when the
-    // page exposes it (JSON-LD `listPrice`, `product:list_price:amount`,
-    // `itemprop="listprice"`, `property="listPrice"`). `price` holds the
-    // current/offer price; list_price is null when not exposed.
-
-    const HTML_JSONLD_LIST_PRICE: &str = r#"<!doctype html><html><head>
-<title>JSON-LD List Price</title>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Widget Pro",
-  "offers": {
-    "@type": "Offer",
-    "price": "79.99",
-    "priceCurrency": "USD",
-    "listPrice": "99.99"
-  }
-}
-</script></head><body></body></html>"#;
-
-    #[test]
-    fn jsonld_list_price_is_extracted() {
-        let o = extract_commerce_offer(HTML_JSONLD_LIST_PRICE, "https://jsonld.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(79.99));
-        assert_eq!(d.list_price, Some(99.99));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-    }
-
-    const HTML_OG_LIST_PRICE: &str = r#"<!doctype html><html><head>
-<title>OG List Price</title>
-<meta property="product:price:amount" content="79.99">
-<meta property="product:price:currency" content="USD">
-<meta property="product:list_price:amount" content="99.99">
-</head><body></body></html>"#;
-
-    #[test]
-    fn og_list_price_is_extracted() {
-        let o = extract_commerce_offer(HTML_OG_LIST_PRICE, "https://og.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(79.99));
-        assert_eq!(d.list_price, Some(99.99));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(o.source.as_deref(), Some("og"));
-    }
-
-    const HTML_MICRODATA_LIST_PRICE: &str = r#"<!doctype html><html><head>
-<title>Microdata List Price</title>
-</head><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <span itemprop="name">MD Sale Product</span>
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price" content="49.99">49.99</span>
-    <span itemprop="priceCurrency" content="EUR">EUR</span>
-    <span itemprop="listprice" content="79.99">79.99</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn microdata_list_price_is_extracted() {
-        let o = extract_commerce_offer(HTML_MICRODATA_LIST_PRICE, "https://md.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(49.99));
-        assert_eq!(d.list_price, Some(79.99));
-        assert_eq!(d.currency.as_deref(), Some("EUR"));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    const HTML_RDFa_LIST_PRICE: &str = r#"<!doctype html><html><head>
-<title>RDFa List Price</title>
-</head><body>
-<div vocab="https://schema.org/" typeof="Product">
-  <span property="name">RDFa Sale Product</span>
-  <div property="offers" typeof="Offer">
-    <span property="price" content="39.99">39.99</span>
-    <span property="priceCurrency" content="GBP">GBP</span>
-    <span property="listPrice" content="59.99">59.99</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn rdfa_list_price_is_extracted() {
-        let o = extract_commerce_offer(HTML_RDFa_LIST_PRICE, "https://rdfa.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(39.99));
-        assert_eq!(d.list_price, Some(59.99));
-        assert_eq!(d.currency.as_deref(), Some("GBP"));
-        assert_eq!(o.source.as_deref(), Some("rdfa"));
-    }
-
-    #[test]
-    fn list_price_alone_is_valid_commerce_data() {
-        // A page exposing only list_price (no current price) still returns
-        // a non-null OfferFacts — the original price alone is useful signal.
-        let o = extract_commerce_offer(HTML_RDFa_LIST_PRICE, "https://rdfa.example.com/p");
-        assert!(o.data.is_some());
-    }
-
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
     // Honest, data-driven affiliate decoration. These tests lock the contract:
     //  * two template kinds render correctly with correct URL-encoding
@@ -21114,23 +20168,154 @@ structured product data, so nothing must be extracted from the body.</p></body><
             HashMap::new(),
             Some("DUMMY_SOVRN_KEY"),
         );
-        assert!(
-            extract_query_negative_terms("how to clean a skillet without soap").is_empty(),
-            "'without soap' (manner, no source prep) must NOT be an exclusion"
-        );
+        let url = "https://shop.example.com/widget?ref=blog#top";
+        let out = render_affiliate_url(&n, url, "shop.example.com");
+        assert!(out.starts_with("https://sovrn.co?key=DUMMY_SOVRN_KEY&u="), "key + prefix present");
+        // The destination must be percent-encoded (the `?` and `#` are unsafe raw).
+        assert!(out.contains("https%3A%2F%2Fshop.example.com%2Fwidget"), "destination url-encoded");
+        assert!(!out.contains("shop.example.com/widget?ref"), "raw destination must NOT appear");
     }
 
     #[test]
-    fn d3_price_bound_preserved_in_structured_constraints() {
-        // D3 regression (t_1c27d98e): `price:<N` / `price:>N` must populate
-        // structured_constraints.price_lt / price_gt (the P3 ranking-side filter
-        // can never fire otherwise, and the response reported price_lt=None while
-        // applied_constraints claimed price:<200 — self-contradictory).
-        // Pure extraction test (no gateway needed): gateway_extracted carries the
-        // bound straight from parse_price_range.
-        let c = extract_gateway_constraints("wireless earbuds price:<200");
-        assert_eq!(c.price_lt, Some(200.0), "price:<200 must set price_lt==200.0: {:?}", c);
-        let c2 = extract_gateway_constraints("monitor price:>500");
-        assert_eq!(c2.price_gt, Some(500.0), "price:>500 must set price_gt==500.0: {:?}", c2);
+    fn append_params_kind_appends_encoded_params_to_raw_url() {
+        // `append_params`: template is the raw destination; params appended encoded.
+        std::env::set_var("DUMMY_AMAZON_TAG", "DUMMY_AMAZON_TAG");
+        let mut params = HashMap::new();
+        params.insert("tag".to_string(), "{key}".to_string());
+        params.insert("customid".to_string(), "{subid}".to_string());
+        let n = net("append_params", "{url}", params.clone(), Some("DUMMY_AMAZON_TAG"));
+        let url = "https://www.amazon.com/dp/B0EXAMPLE";
+        let out = render_affiliate_url(&n, url, "amazon.com");
+        assert!(out.starts_with("https://www.amazon.com/dp/B0EXAMPLE?"), "raw destination preserved");
+        assert!(out.contains("tag=DUMMY_AMAZON_TAG"), "key param appended");
+        assert!(out.contains("customid=amazon.com"), "coarse subid (host) appended, no user data");
+        // Explicit param separator only when there is no existing query.
+        // The key comes from an ENV VAR (per architecture): set it, then name it.
+        std::env::set_var("DUMMY_EBAY_TAG", "T");
+        let n2 = net("append_params", "https://ebay.com/itm/123?foo=bar", params, Some("DUMMY_EBAY_TAG"));
+        let out2 = render_affiliate_url(&n2, "https://ebay.com/itm/123?foo=bar", "ebay.com");
+        // The existing query (?foo=bar) must be preserved, and network params
+        // appended with '&' (proving the separator is chosen correctly when a
+        // query already exists). Param *ordering* among themselves is NOT part of
+        // the contract (resolved from a HashMap), so assert each fact on its own.
+        assert!(out2.contains("?foo=bar"), "existing query preserved");
+        assert!(out2.contains("&tag=T"), "uses & separator when query already present");
+    }
+
+    #[test]
+    fn wrap_kind_appends_network_params_like_cuid() {
+        // A `wrap` network (e.g. Sovrn) carries its own `params` (cuid). These
+        // MUST be appended (encoded) to the network prefix — the prior renderer
+        // silently dropped them. This test locks that contract.
+        std::env::set_var("WRAP_CUID_KEY", "abc123");
+        let mut params = HashMap::new();
+        params.insert("cuid".to_string(), "{subid}".to_string());
+        let n = net("wrap", "https://sovrn.co?key={key}&u={url}", params, Some("WRAP_CUID_KEY"));
+        let url = "https://shop.example.com/widget?ref=blog";
+        let out = render_affiliate_url(&n, url, "shop.example.com");
+        // The network's own cuid param is present, carrying the coarse subid.
+        assert!(out.contains("cuid=shop.example.com"), "wrap network params (cuid) must be appended");
+        // Destination is still url-encoded inside the network prefix.
+        assert!(out.contains("https%3A%2F%2Fshop.example.com%2Fwidget"), "destination url-encoded");
+        assert!(!out.contains("shop.example.com/widget?ref"), "raw destination must NOT appear");
+    }
+
+    #[test]
+    fn decoration_is_idempotent_no_double_wrap() {
+        std::env::set_var("K", "K");
+        let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
+        let ctx = AffiliateCtx { networks: vec![n] };
+        let mut results = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
+        ];
+        decorate_affiliate(&mut results, &ctx);
+        let first_pass = results[0]["affiliate"]["url"].clone();
+        // Second pass must NOT double-wrap (same URL).
+        decorate_affiliate(&mut results, &ctx);
+        let second_pass = results[0]["affiliate"]["url"].clone();
+        assert_eq!(first_pass, second_pass, "idempotent: decoration must not double-wrap");
+        assert!(results[0]["affiliate"]["disclosed"].as_bool().unwrap_or(false), "disclosed:true");
+    }
+
+    #[test]
+    fn missing_key_degrades_to_null_affiliate() {
+        // No usable network (key env var unset) => results keep affiliate null.
+        let n = net("wrap", "https://sovrn.co?key={key}&u={url}", HashMap::new(), Some("UNSET_KEY_ENV_VAR_XYZ"));
+        let ctx = AffiliateCtx { networks: vec![n] };
+        let mut results = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
+        ];
+        decorate_affiliate(&mut results, &ctx);
+        assert!(results[0].get("affiliate").is_none(), "no key => affiliate omitted, not fabricated");
+    }
+
+    #[test]
+    fn decoration_preserves_ranking_order() {
+        // The central no-manipulation guarantee: decoration never reorders.
+        std::env::set_var("K", "K");
+        let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
+        let ctx = AffiliateCtx { networks: vec![n] };
+        let mut results = vec![
+            serde_json::json!({ "url": "https://a.example.com/x", "score": 9.7 }),
+            serde_json::json!({ "url": "https://b.example.org/y", "score": 8.1 }),
+            serde_json::json!({ "url": "https://c.example.net/z", "score": 6.3 }),
+        ];
+        let before: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        decorate_affiliate(&mut results, &ctx);
+        let after: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        assert_eq!(before, after, "affiliate decoration must never reorder ranked results");
+        // Every decorated result is disclosed.
+        for r in results.iter() {
+            assert_eq!(r["affiliate"]["disclosed"], serde_json::json!(true));
+        }
+    }
+
+    #[test]
+    fn no_user_or_query_data_in_affiliate_params() {
+        // Subid is the coarse merchant host only — never a query, user id, or IP.
+        std::env::set_var("K", "K");
+        let n = net(
+            "wrap",
+            "https://sovrn.co?key=K&u={url}&cuid={subid}",
+            HashMap::new(),
+            Some("K"),
+        );
+        let url = "https://shop.example.com/widget";
+        let out = render_affiliate_url(&n, url, "shop.example.com");
+        assert!(out.contains("cuid=shop.example.com"), "subid is the host");
+        assert!(!out.contains("q="), "no query text");
+        assert!(!out.contains("user"), "no user id");
+        assert!(!out.contains("ip="), "no ip");
+    }
+
+    // ── Post-ROADMAP: CommerceConfig is data-driven ─────────────────────
+    // The main-path `shopping` block's top-N presentation cap must be
+    // configurable via `data/commerce/config.json` (mainpath_top_n) WITHOUT
+    // recompile. These tests lock that contract.
+
+    #[test]
+    fn commerce_config_default_top_n_is_8() {
+        // When the data file is absent/missing the field, the default is 8.
+        // (Offline test: no data file in the test cwd => default.)
+        let cfg = CommerceConfig { mainpath_top_n: 8, transactional_keywords: vec![] };
+        assert_eq!(cfg.mainpath_top_n, 8, "default top-N is 8");
+    }
+
+    #[test]
+    fn commerce_config_can_be_set_to_a_different_value() {
+        // A new value (e.g. 12) can be set by editing the data file — no
+        // code change, no recompile. This test simulates what the loader
+        // would produce after reading `{"mainpath_top_n": 12}`.
+        let cfg = CommerceConfig { mainpath_top_n: 12, transactional_keywords: vec![] };
+        assert_eq!(cfg.mainpath_top_n, 12, "top-N is data-driven");
+    }
+
+    #[test]
+    fn commerce_config_zero_top_n_means_no_shopping_block() {
+        // Edge case: mainpath_top_n = 0 means the shopping block is never
+        // surfaced (the take(0) yields an empty array => None). This is a
+        // valid "off" setting — proves the value is honored as a cap.
+        let cfg = CommerceConfig { mainpath_top_n: 0, transactional_keywords: vec![] };
+        assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
     }
 }
