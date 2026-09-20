@@ -461,12 +461,10 @@ impl SymSpellIndex {
             if !word.is_ascii() {
                 continue;
             }
-            // DoubleMetaphone returns primary and alternate codes — we index both
             let primary = dmeta.encode(word);
             let alternate = dmeta.encode_alternate(word);
-            let needs_alternate = alternate != primary;
-            map.entry(primary).or_default().push(id as u32);
-            if !alternate.is_empty() && needs_alternate {
+            map.entry(primary.clone()).or_default().push(id as u32);
+            if !alternate.is_empty() && alternate != primary {
                 map.entry(alternate).or_default().push(id as u32);
             }
         }
@@ -1460,5 +1458,44 @@ mod tests {
         // a known-misspelling entry, exempt from the absent-word block.
         let index = SymSpellIndex::build();
         assert_eq!(index.correct("ngnix"), Some("nginx".to_string()));
+    }
+
+    #[test]
+    fn test_cancing_phonetic_codes_debug() {
+        use rphonetic::{Encoder, DoubleMetaphone};
+        let dmeta = DoubleMetaphone::default();
+        let code_cancing = dmeta.encode("cancing");
+        let code_cancelling = dmeta.encode("cancelling");
+        let code_cancelled = dmeta.encode("cancelled");
+        let code_cancel = dmeta.encode("cancel");
+        eprintln!("cancing   → {}", code_cancing);
+        eprintln!("cancelling → {}", code_cancelling);
+        eprintln!("cancelled  → {}", code_cancelled);
+        eprintln!("cancel     → {}", code_cancel);
+        assert_eq!(code_cancing, code_cancelling, "cancing and cancelling should have same phonetic code");
+    }
+
+    #[test]
+    fn test_cancing_corrected_to_cancelling_via_phonetic_fallback() {
+        // FIX-IF-12: "cancing" is an insertion-only typo of "cancelling"
+        // (missing 'l' after 'canci' → 'cancelling'). This is edit distance 3,
+        // beyond SymSpell/LinSpell's max of 2. The phonetic fallback using
+        // Double Metaphone should catch it because both words encode to KNSNK.
+        let index = SymSpellIndex::build();
+        let result = index.correct("cancing");
+        assert!(result.is_some(), "Should correct 'cancing' via phonetic fallback");
+        assert_eq!(result.unwrap(), "cancelling",
+            "Should correct 'cancing' to 'cancelling' (phonetic match)");
+    }
+
+    #[test]
+    fn test_cancing_in_query_context() {
+        // Full query: "budget friendly noise cancing headphones with usb c charging"
+        // The phonetic fallback should correct "cancing" → "cancelling"
+        let index = SymSpellIndex::build();
+        let (corrected, changed) = correct_query(&index, "budget friendly noise cancing headphones with usb c charging");
+        assert!(changed, "Query with 'cancing' should be spell-corrected");
+        assert!(corrected.contains("cancelling"),
+            "Corrected query should contain 'cancelling', got: {}", corrected);
     }
 }

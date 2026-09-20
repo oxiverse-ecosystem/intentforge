@@ -19,4 +19,4 @@ regex = "1"
 parking_lot = "0.12"
 maxminddb = { version = "0.29", features = ["mmap"] }
 rand = "0.8"
-rphonetic = "4.0"
+rphonetic = "3.0"
