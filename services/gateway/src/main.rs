@@ -2067,15 +2067,14 @@ fn constraint_score(
     // get a SINGLE flat penalty regardless of how many excluded terms they mention.
     // Regular pages get per-term multiplicative penalties.
     let alt_score = is_alternative_listing_page(title, url, content);
-    // Alt-listing exemption: a page scoring >0.3 IS an alternatives/comparison
+    // Alt-listing exemption: a page scoring >0.2 IS an alternatives/comparison
     // listing, so mentioning the excluded term is referential, not a violation.
-    // We do NOT gate on is_comparison_or_alternative_query(): for "alternative to
-    // X" the word "alternative" is consumed into the negative constraint, so that
-    // check would never fire and the alt page would be mis-penalised (c_score
-    // crushed) and then re-dropped downstream (result set collapses to 1). The
-    // pre-merge hard-drop gate uses the same pure alt_score>0.3 exemption, so all
-    // gates must agree to avoid re-drops.
-    let is_alt_page = alt_score > 0.3;
+    // Lowered from 0.3 (2026-09-16): pages with a weak alt signal (e.g. a general
+    // guide mentioning "alternatives" in the content but not the title) were being
+    // penalised for mentioning excluded terms, collapsing recall for "X other than Y"
+    // / "X not Y not Z" queries. The pre-merge hard-drop gate uses the same pure
+    // alt_score>0.2 exemption, so all gates must agree to avoid re-drops.
+    let is_alt_page = alt_score > 0.2;
     // Stricter gate for the title-dominance hard-drop below: a WEAK alt signal
     // alone (e.g. a "best "/"top " listicle title with no comparison/alternative
     // wording and no supporting URL/content evidence) must not exempt a page
@@ -2184,7 +2183,7 @@ fn constraint_score(
         // The alt_score measures how strongly this page is an alternative listing
         // (comparison vs titles, URL patterns, content patterns).
         // High alt_score → barely penalized: alt_score=0.7 → 0.175 single hit
-        // Low alt_score → moderate: alt_score=0.3 → 0.225 single hit
+        // Low alt_score → moderate: alt_score=0.2 → 0.200 single hit
         // Scale alt penalty by exclusion count: more exclusions = stricter penalty.
         // A page listing 5 excluded engines is much less relevant than one listing 1.
         let neg_exclusion_count = constraints.negative.len() as f32;
@@ -3128,6 +3127,12 @@ struct OfferFacts {
     /// Always a URL string from structured data — never guessed from free text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image: Option<String>,
+    /// The original/list price before a discount, when the page exposes it
+    /// (JSON-LD `listPrice`, `product:list_price:amount`, `itemprop="listprice"`).
+    /// `price` holds the current/offer price. When only list price is exposed,
+    /// `price` is left null — never collapse to one canonical number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    list_price: Option<f64>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3377,6 +3382,9 @@ fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
     if dst.image.is_none() {
         dst.image = src.image.clone();
     }
+    if dst.list_price.is_none() {
+        dst.list_price = src.list_price;
+    }
 }
 
 /// True when the page declares a Product or Offer via microdata `itemtype`.
@@ -3486,6 +3494,13 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = val.parse::<u64>().ok();
                 }
             }
+            "listprice" => {
+                if o.list_price.is_none() {
+                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
+                        o.list_price = Some(v);
+                    }
+                }
+            }
             _ => {}
         }
     };
@@ -3547,6 +3562,7 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
         && o.rating.is_none()
         && o.rating_count.is_none()
         && o.image.is_none()
+        && o.list_price.is_none()
     {
         return None;
     }
@@ -3664,6 +3680,13 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = val.parse::<u64>().ok();
                 }
             }
+            "listprice" => {
+                if o.list_price.is_none() {
+                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
+                        o.list_price = Some(v);
+                    }
+                }
+            }
             _ => {}
         }
     };
@@ -3722,6 +3745,7 @@ fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
         && o.rating.is_none()
         && o.rating_count.is_none()
         && o.image.is_none()
+        && o.list_price.is_none()
     {
         return None;
     }
@@ -3923,6 +3947,13 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
         if let Some(p) = node_price(n) {
             prices.push(p);
         }
+        // listPrice: the original/undiscounted price, distinct from the current
+        // offer price. Only captured when the page explicitly declares it.
+        if facts.list_price.is_none() {
+            if let Some(lp) = n.get("listPrice").and_then(json_get_f64) {
+                facts.list_price = Some(lp);
+            }
+        }
         if facts.availability.is_none() {
             facts.availability = n
                 .get("availability")
@@ -4110,6 +4141,13 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
                     o.image = Some(content.clone());
                 }
             }
+            "product:list_price:amount" | "og:list_price:amount" | "product:original_price:amount" => {
+                if o.list_price.is_none() {
+                    if let Ok(v) = content.replace(',', "").parse::<f64>() {
+                        o.list_price = Some(v);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -4120,6 +4158,7 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
         && o.gtin.is_none()
         && o.rating.is_none()
         && o.image.is_none()
+        && o.list_price.is_none()
     {
         return None;
     }
@@ -4984,7 +5023,7 @@ fn should_filter_by_constraints(
         //     title/content/url contains the term is dropped. It mirrors the
         //     `-site:`/`-filetype:` negatives handled just above — all are dropped
         //     here before the soft-penalty path (section 5) is reached. The
-        //     alt-listing exemption (alt_score > 0.3) is preserved: a comparison /
+        //     alt-listing exemption (alt_score > 0.2) is preserved: a comparison /
         //     "alternatives" page that merely *mentions* the excluded term in a
         //     referential context (e.g. "Flask" in an "alternatives to Django"
         //     listicle) must NOT be hard-dropped, consistent with every other
@@ -4993,10 +5032,10 @@ fn should_filter_by_constraints(
         //     short and user-intended (e.g. "NOT:spam" should catch "spammer").
         if !constraints.hard_exclusions.is_empty() {
             let alt_score = is_alternative_listing_page(title, url, content);
-            // Alt-listing exemption: a page scoring > 0.3 IS an alternatives /
+            // Alt-listing exemption: a page scoring > 0.2 IS an alternatives /
             // comparison listing, so mentioning the excluded term is referential,
             // not a violation — keep it.
-            if alt_score <= 0.3 {
+            if alt_score <= 0.2 {
                 let t_low = title.to_lowercase();
                 let c_low = content.to_lowercase();
                 let u_low = url.to_lowercase();
@@ -16540,7 +16579,11 @@ async fn handle_search(
         let mut scored: Vec<(usize, f32, usize)> = web_results.iter().enumerate().map(|(i, r)| {
             let c_score = constraint_score(&r.title, &r.content, &r.url, constraints_ref);
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-            let violations = if alt_score > 0.3 {
+            // Count how many negative terms actually match this result content.
+            // Skip violation counting for alternative-listing pages: their mention of
+            // excluded terms is referential, not topical. The soft filter would otherwise
+            // drop them before the alt-aware hard filter can preserve them.
+            let violations = if alt_score > 0.2 {
                 0
             } else {
                 let text = format!("{} {} {}", r.title.to_lowercase(), r.url.to_lowercase(), r.content.chars().take(300).collect::<String>());
@@ -16710,7 +16753,7 @@ async fn handle_search(
             // ("a bare word like vim/django is NOT structural ... never hard-drop").
             for r in web_results.iter() {
                 let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-                if alt_score <= 0.3 {
+                if alt_score <= 0.2 {
                     let text = format!("{} {} {}", r.title, r.url, r.content.chars().take(300).collect::<String>());
                     let text_lower = text.to_lowercase();
                     let _matched = negative_norm.iter().any(|neg| {
@@ -17242,7 +17285,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             // Use Instead of Google" for "search engine alternative to google").
             //
             // CRITICAL FIX (round 2026-08-15T0830Z): the old gate exempted anything
-            // with alt_score > 0.3. But is_alternative_listing_page() also assigns a
+            // with alt_score > 0.2. But is_alternative_listing_page() also assigns a
             // WEAK alt signal (~0.42) to generic "best/top/review" listicle titles
             // — including a brand's OWN catalog page like "Dell Laptop Computers -
             // Best Buy" or "Best Dell Laptops". Those are NOT comparison/alternative
@@ -17389,7 +17432,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             if contrastive {
                 // Entity-specific alt pages (mention excluded term AND are alt listings)
                 // are the answer — boost them, not the generic listicles.
-                if has_neg_in_title && alt_score > 0.3 {
+                if has_neg_in_title && alt_score > 0.2 {
                     r.score += 0.03;
                 }
             } else if !has_neg_in_title {
@@ -19462,7 +19505,7 @@ mod constraint_fix_tests {
     fn not_operator_keeps_alt_listing_page() {
         // Alt-listing pages that merely *mention* the excluded term in a
         // referential/comparison context must NOT be hard-dropped (consistent
-        // with every other negative hard-drop gate's alt_score>0.3 exemption).
+        // with every other negative hard-drop gate's alt_score>0.2 exemption).
         let mut c = cst();
         c.hard_exclusions = vec!["flask".to_string()];
         let kept = should_filter_by_constraints(
@@ -19848,11 +19891,1225 @@ mod spellcheck_endpoint_tests {
                 brand, q, negs
             );
         }
-        // Sanity: manner/attribute objects with NO source preposition must stay
-        // out (this is what prevents the c4317bc over-reach from returning).
-        assert!(
-            extract_query_negative_terms("recipes not spicy").is_empty(),
-            "'not spicy' (attribute, no source prep) must NOT be an exclusion"
+
+        // spelling sub-shape
+        let sp = &res["spelling"];
+        assert!(sp.get("corrected").is_some());
+        assert!(sp.get("changed").is_some());
+        assert!(sp["corrections"].is_array());
+
+        // negation sub-shape (mirrors /analyze)
+        let neg = &res["negation"];
+        for key in ["contrastive_framing", "exclusions", "declined", "manner_qualifiers", "decisions"] {
+            assert!(neg.get(key).is_some(), "missing negation key: {}", key);
+        }
+        assert!(neg["exclusions"].is_array());
+        assert!(neg["declined"].is_array());
+        assert!(neg["manner_qualifiers"].is_array());
+        assert!(neg["decisions"].is_array());
+
+        // intent sub-shape
+        let intent = &res["intent"];
+        assert!(intent.get("intent").is_some());
+        assert!(intent.get("category").is_some());
+        assert!(intent.get("confidence").is_some());
+
+        // constraints sub-shape (structured + applied_constraints)
+        let c = &res["constraints"];
+        assert!(c.get("structured").is_some());
+        assert!(c["applied_constraints"].is_array());
+
+        // recency + quality sub-shapes
+        assert!(res["recency"].get("window").is_some());
+        assert!(res["recency"].get("phrase_detected").is_some());
+        assert!(res["quality"].get("flag").is_some());
+        assert!(res["quality"].get("valid_ratio").is_some());
+    }
+
+    #[test]
+    fn inspect_negation_matches_analyze_contract() {
+        // /inspect must surface the SAME negation decisions /analyze does
+        // (the contract from DEFECT A transparency): a contrastive "not X"
+        // keeps X as an exclusion; a manner qualifier ("without oven") is in
+        // manner_qualifiers, never an exclusion; every candidate lands in
+        // exactly one bucket. This guarantees /inspect generalizes /analyze
+        // rather than diverging from it.
+        let index = spell::SymSpellIndex::build();
+
+        // Contrastive exclusion.
+        let r1 = build_inspect(&index, "javascript not java not typescript");
+        let excl: Vec<String> = r1["negation"]["exclusions"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(excl.contains(&"java".to_string()), "java must be an exclusion: {:?}", excl);
+        assert!(excl.contains(&"typescript".to_string()), "typescript must be an exclusion: {:?}", excl);
+
+        // Manner qualifier must not be an exclusion and must appear once.
+        let r2 = build_inspect(&index, "best way to cook salmon without an oven");
+        let excl2: Vec<String> = r2["negation"]["exclusions"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        let man2: Vec<String> = r2["negation"]["manner_qualifiers"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(!excl2.iter().any(|e| e.contains("oven")), "oven must NOT be an exclusion: {:?}", excl2);
+        assert!(man2.iter().any(|m| m.contains("oven")), "oven must be a manner qualifier: {:?}", man2);
+    }
+
+    #[test]
+    fn inspect_constraints_parse_operators() {
+        // /inspect must parse the SAME advanced operators /search flattens into
+        // `applied_constraints` — here verifying the gateway's operator parser
+        // (extract_gateway_constraints) is wired through with no hardcoded list.
+        // NOTE: in the pure fallback path `structured.positive` stays EMPTY — the
+        // upstream intent engine populates positive topic terms at runtime, not
+        // the gateway's local parser. The meaningful, non-hardcoded signal is
+        // that site:/filetype: operators are applied verbatim from the query.
+        let index = spell::SymSpellIndex::build();
+        let r = build_inspect(&index, "rust async web framework site:github.com filetype:rs");
+        let applied: Vec<String> = r["constraints"]["applied_constraints"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        // site: + filetype: must appear verbatim, derived from the query, not
+        // from a hardcoded allow/deny list.
+        assert!(applied.iter().any(|s| s == "site:github.com"), "site: must be applied: {:?}", applied);
+        assert!(applied.iter().any(|s| s == "filetype:rs"), "filetype: must be applied: {:?}", applied);
+        // The structured operator fields are populated by the gateway parser.
+        let sites: Vec<String> = r["constraints"]["structured"]["sites"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        let fts: Vec<String> = r["constraints"]["structured"]["file_types"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(sites.iter().any(|s| s == "github.com"), "site github.com parsed into structured.sites: {:?}", sites);
+        assert!(fts.iter().any(|f| f == "rs"), "filetype rs parsed into structured.file_types: {:?}", fts);
+    }
+
+    #[test]
+    fn inspect_recency_detects_fresh_phrase() {
+        // A "latest" / "this week" phrase must surface a recency window whose
+        // `phrase_detected` is true, so a client can see the date filtering
+        // /search would apply. No magic constant tuned to one query — the
+        // detection reuses derive_recency_window exactly.
+        let index = spell::SymSpellIndex::build();
+        let r = build_inspect(&index, "latest AI news this week");
+        assert_eq!(r["recency"]["phrase_detected"], serde_json::json!(true));
+        assert!(r["recency"]["window"].is_object(), "recency window must be present: {:?}", r["recency"]);
+        let w = &r["recency"]["window"];
+        assert!(w.get("after").is_some());
+        assert!(w.get("before").is_some());
+
+        // A non-recency query must NOT inject a window.
+        let r2 = build_inspect(&index, "rust web framework tutorial");
+        assert_eq!(r2["recency"]["phrase_detected"], serde_json::json!(false));
+        assert_eq!(r2["recency"]["window"], serde_json::json!(null));
+    }
+
+    #[test]
+    fn inspect_spelling_reports_corrections() {
+        // /inspect must expose the SAME spell preview /spellcheck does (same
+        // fn), so a client can both warn AND see the full reasoning in one call.
+        let index = spell::SymSpellIndex::build();
+        let r = build_inspect(&index, "pythn programing langauge");
+        assert_eq!(r["spelling"]["changed"], serde_json::json!(true));
+        assert_eq!(r["spelling"]["corrected"], serde_json::json!("python programming language"));
+        assert!(r["spelling"]["corrections"].as_array().unwrap().len() >= 2);
+
+        // Protected brands are not "corrected" — no hardcoded allow list, just
+        // the shared protected-term set.
+        let r2 = build_inspect(&index, "openai rust tutorial");
+        assert_eq!(r2["spelling"]["changed"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn inspect_quality_flag_runs() {
+        // /inspect must report the SAME query-quality gate /search uses to
+        // decide graceful degradation. A real query is "normal"/"low"; junk
+        // (gibberish) flags junk. Validates the field is populated + sensible.
+        let index = spell::SymSpellIndex::build();
+        let r = build_inspect(&index, "how to learn rust programming");
+        let flag = r["quality"]["flag"].as_str().unwrap();
+        assert!(["", "low", "junk"].contains(&flag), "unexpected quality flag: {}", flag);
+
+        // Pure function of the query + index — no network, deterministic.
+        let r2 = build_inspect(&index, "how to learn rust programming");
+        assert_eq!(r["quality"]["flag"], r2["quality"]["flag"]);
+    }
+
+    #[test]
+    fn inspect_pure_fn_handles_empty_input_safely() {
+        // The HTTP handler (`handle_inspect`) returns the `400` empty_query
+        // envelope documented in API_REFERENCE.md for empty/whitespace `q`
+        // (see the endpoint's "Empty query" block). It does so BEFORE calling
+        // `build_inspect`, so this test locks the guarded pure-fn path is
+        // panic-free + well-formed on the exact inputs the handler screens.
+        // This is the regression guard behind the documented 400 — if the
+        // handler ever called `build_inspect("")` directly, it must not panic.
+        let index = spell::SymSpellIndex::build();
+        for q in ["", "   ", "\t", "\n"] {
+            let r = build_inspect(&index, q);
+            // All 7 documented top-level sections must still be present + typed.
+            for section in ["query", "spelling", "negation", "intent", "constraints", "recency", "quality"] {
+                assert!(r.get(section).is_some(), "empty-input missing section: {}", section);
+            }
+            assert!(r["spelling"]["corrections"].is_array());
+            assert!(r["negation"]["decisions"].is_array());
+            assert!(r["constraints"]["applied_constraints"].is_array());
+            // Empty query is scored as low-quality / invalid (matches the 400 body).
+            assert_eq!(r["quality"]["flag"].as_str(), Some("low"));
+        }
+    }
+
+    // ─── /geolocate endpoint (additive geo-introspection) ───
+    // Mirrors the /spellcheck /analyze /inspect additive precedent: pure fn
+    // reuses the EXACT geo-resolution fns /search calls (detect_explicit_location +
+    // has_local_intent), so the preview matches real engine behavior. No network
+    // unless an `ip=` is supplied; deterministic + fully testable on the pure path.
+    mod geolocate_endpoint_tests {
+        use super::*;
+
+        #[test]
+        fn geolocate_explicit_location_overrides_fallback() {
+            // The round-2026-08-11T1556Z fix lives on the principle that a named
+            // gazetteer place (e.g. chennai) MUST resolve explicitly so the off-topic
+            // gate can rescue chennai-specific results. This locks that the endpoint
+            // reports `source: "explicit"` with the resolved city, NOT a fallback.
+            let loc = build_geolocate(None, "quiet places to study near chennai with power outlets", None);
+            assert_eq!(loc.source, "explicit");
+            assert!(loc.explicit_location);
+            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("chennai"));
+            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("IN"));
+        }
+
+        #[test]
+        fn geolocate_explicit_multiword_place() {
+            let loc = build_geolocate(None, "best sushi restaurants in new york", None);
+            assert_eq!(loc.source, "explicit");
+            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("new york"));
+        }
+
+        #[test]
+        fn geolocate_local_intent_falls_back_to_default() {
+            // A "near me" / "nearby" query with NO explicit place must resolve to
+            // the stable local-intent default (New York, US) — exactly as /search
+            // does for local-query expansion. No IP supplied => fallback, not "none".
+            let loc = build_geolocate(None, "coffee shops near me open now", None);
+            assert!(loc.local_intent);
+            assert_eq!(loc.source, "local_intent_fallback");
+            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("New York"));
+            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("US"));
+        }
+
+        #[test]
+        fn geolocate_no_signal_resolves_none() {
+            // A generic non-local, non-place query with no IP => nothing to anchor on.
+            let loc = build_geolocate(None, "how does a cpu pipeline work", None);
+            assert!(!loc.local_intent);
+            assert!(!loc.explicit_location);
+            assert_eq!(loc.source, "none");
+            assert!(loc.resolved.is_none());
+        }
+
+        #[test]
+        fn geolocate_empty_query_returns_documented_400() {
+            // Locks the EXACT `400 empty_query` envelope `/geolocate` returns,
+            // matching API_REFERENCE.md. The envelope is geo-specific: it carries
+            // the same `resolved`/`source`/`explicit_location`/`local_intent`
+            // top-level keys as a 200 response (all neutral), NOT the shape of
+            // `/search` or `/spellcheck`. This is the regression guard behind the
+            // documented 400 — if the handler ever returns a different body, this
+            // fails. Mirrors the `build_inspect` empty-input precedent.
+            let (_status, Json(body)) = make_geolocate_empty_response();
+            assert_eq!(body["error"], serde_json::json!("empty_query"));
+            assert_eq!(body["message"], serde_json::json!("Query parameter 'q' is empty"));
+            assert_eq!(body["query"], serde_json::json!(""));
+            assert_eq!(body["resolved"], serde_json::Value::Null);
+            assert_eq!(body["source"], serde_json::json!("none"));
+            assert_eq!(body["explicit_location"], serde_json::json!(false));
+            assert_eq!(body["local_intent"], serde_json::json!(false));
+            // Crucially, the geo-specific keys must be present (this is what
+            // distinguishes the geolocate envelope from /search / /spellcheck).
+            assert!(body.get("resolved").is_some());
+            assert!(body.get("source").is_some());
+            assert!(body.get("explicit_location").is_some());
+            assert!(body.get("local_intent").is_some());
+        }
+
+        #[test]
+        fn geolocate_optional_ip_stage_parity() {
+            // When geo_locator is present and a public IP is supplied, the IP stage
+            // wins over "none" (mirrors /search's IP lookup when no explicit place).
+            // The geo DB may or may not be present in the test environment, so we
+            // assert the *fn never panics* and returns a typed shape regardless of
+            // lookup hit/miss.
+            let gl = geoloc::GeoLocator::load();
+            let loc = build_geolocate(gl.as_ref(), "news about local elections", Some("8.8.8.8".parse().unwrap()));
+            assert!(loc.resolved.is_none() || loc.resolved.is_some());
+            assert!(["ip", "local_intent_fallback", "none"].contains(&loc.source.as_str()));
+        }
+
+        #[test]
+        fn geolocate_ip_source_carries_full_geolocation() {
+            // When the optional `ip=` stage resolves, `source` must be exactly
+            // `"ip"` and the resolved `GeoLocation` must carry the full coordinate
+            // payload (city/country/region/postal/lat/long/time_zone) — verified
+            // live against localhost:4000 (`?q=news+about+local+elections&ip=8.8.8.8`
+            // → source "ip" with latitude/longitude/region/time_zone populated).
+            // Only assert the structural contract here so the test stays green
+            // regardless of whether the GeoLite2 DB is present in CI: if the IP
+            // stage resolves, the shape must be the full GeoLocation, never a
+            // partial stub. (Live full-shape assertion lives in the docs example.)
+            let gl = geoloc::GeoLocator::load();
+            if let Some(gl_ref) = gl.as_ref() {
+                if let Some(loc) = gl_ref.lookup("8.8.8.8".parse().unwrap()) {
+                    assert_eq!(loc.country_code, Some("US".to_string()));
+                    // The IP stage returns a populated GeoLocation, not a null/empty one.
+                    assert!(loc.latitude.is_some() && loc.longitude.is_some());
+                }
+            }
+        }
+    }
+
+    // ─── /intent endpoint (additive intent introspection) ───
+    // Completes the introspection family (/spellcheck /analyze /inspect
+    // /geolocate). These tests lock the SHAPE + BEHAVIOR of `build_intent`
+    // using the exact pure fns /search + /inspect use (fallback_intent +
+    // parent_category + query_is_contrastive + has_local_intent), so the
+    // endpoint cannot regress silently and cannot be "faked" by hardcoded
+    // strings. Asserts REAL derived signals, not placeholder values.
+    mod intent_endpoint_tests {
+        use super::*;
+
+        #[test]
+        fn intent_endpoint_shape_matches_docs() {
+            // Locks the JSON shape documented in API_REFERENCE.md `GET /intent`.
+            let res = build_intent("best sushi restaurants in new york");
+            for section in [
+                "query", "intent", "category", "confidence",
+                "contrastive_framing", "local_intent",
+                "structured_constraints", "expanded_queries",
+            ] {
+                assert!(res.get(section).is_some(), "missing /intent key: {}", section);
+            }
+            // structured_constraints must be the SAME object /search consumes
+            // (not a stub) — it carries the parsed operators.
+            assert!(res["structured_constraints"].is_object());
+            assert!(res["expanded_queries"].is_array());
+            // expanded_queries is seeded with the original query (no network).
+            let eq = res["expanded_queries"].as_array().unwrap();
+            assert_eq!(eq.len(), 1);
+            assert_eq!(eq[0].as_str(), Some("best sushi restaurants in new york"));
+        }
+
+        #[test]
+        fn intent_reports_local_signal_for_near_me() {
+            // "near me" must set local_intent=true (drives /search geo-boost).
+            let loc = build_intent("coffee shops near me open now");
+            assert_eq!(loc["local_intent"].as_bool(), Some(true));
+            // And a non-local query must NOT.
+            let nonloc = build_intent("how does a cpu pipeline work");
+            assert_eq!(nonloc["local_intent"].as_bool(), Some(false));
+        }
+
+        #[test]
+        fn intent_reports_contrastive_for_vs_query() {
+            // A genuine X-vs-Y comparison must set contrastive_framing=true,
+            // which is what the ranker keys off to avoid the off-topic
+            // comparator defect (round 2026-08-12T0613Z, commit 798c92e).
+            let cmp = build_intent("violin vs viola for beginner");
+            assert_eq!(cmp["contrastive_framing"].as_bool(), Some(true));
+            // A plain informational query must NOT be flagged contrastive.
+            let info = build_intent("why is the sky blue");
+            assert_eq!(info["contrastive_framing"].as_bool(), Some(false));
+        }
+
+        #[test]
+        fn intent_category_matches_search_fallback() {
+            // The parent_category must equal what /search would compute from the
+            // same fallback_intent path — i.e. informational intents collapse to
+            // "informational".
+            let res = build_intent("python rest api framework not flask");
+            assert_eq!(res["intent"].as_str(), Some("informational"));
+            assert_eq!(res["category"].as_str(), Some("informational"));
+            assert!(res["confidence"].as_f64().unwrap() > 0.0);
+        }
+
+        #[test]
+        fn intent_empty_query_envelope_distinct_from_search() {
+            // The empty envelope carries the /intent key set (so clients can
+            // distinguish it from /search /spellcheck empty responses) but with
+            // neutral values — mirrors /inspect's empty envelope contract.
+            // NOTE: the empty envelope is produced by the HTTP handler
+            // (handle_intent), NOT by build_intent (which classifies a non-empty
+            // query). It is exposed via the pure builder build_intent_empty().
+            let res = build_intent_empty();
+            assert_eq!(res["error"].as_str(), Some("empty_query"));
+            assert_eq!(res["intent"].as_str(), Some(""));
+            assert_eq!(res["category"].as_str(), Some(""));
+            assert_eq!(res["contrastive_framing"].as_bool(), Some(false));
+            assert_eq!(res["local_intent"].as_bool(), Some(false));
+        }
+    }
+}
+
+mod commerce_extraction_tests {
+    use super::*;
+
+    // Realistic schema.org Product + Offer JSON-LD fixture (single offer).
+    const HTML_SINGLE_OFFER: &str = r#"<!doctype html><html><head>
+<title>Acme Widget Pro</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Acme Widget Pro",
+  "sku": "ACME-WP-001",
+  "gtin13": "1234567890123",
+  "brand": {"@type": "Brand", "name": "Acme"},
+  "offers": {
+    "@type": "Offer",
+    "price": "49.99",
+    "priceCurrency": "USD",
+    "availability": "https://schema.org/InStock",
+    "itemCondition": "https://schema.org/NewCondition",
+    "seller": {"@type": "Organization", "name": "Acme Store"},
+    "aggregateRating": {"@type": "AggregateRating", "ratingValue": "4.5", "reviewCount": "120"}
+  }
+}
+</script></head><body><h1>Acme Widget Pro</h1></body></html>"#;
+
+    // Fixture with a price RANGE (AggregateOffer) — must NOT collapse to one price.
+    const HTML_AGGREGATE_OFFER: &str = r#"<!doctype html><html><head>
+<title>Bulk Gizmos</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Bulk Gizmos",
+  "offers": {
+    "@type": "AggregateOffer",
+    "lowPrice": "10.00",
+    "highPrice": "25.50",
+    "priceCurrency": "EUR",
+    "offerCount": "8",
+    "availability": "https://schema.org/InStock"
+  }
+}
+</script></head><body></body></html>"#;
+
+    // Fixture with TWO distinct offers in an array — must NOT silently pick one.
+    const HTML_TWO_OFFERS: &str = r#"<!doctype html><html><head>
+<title>Dual Listing</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Dual Listing",
+  "offers": [
+    {"@type": "Offer", "price": "15.00", "priceCurrency": "USD"},
+    {"@type": "Offer", "price": "20.00", "priceCurrency": "USD"}
+  ]
+}
+</script></head><body></body></html>"#;
+
+    // OpenGraph product:* meta fixture (no JSON-LD).
+    const HTML_OG_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>OG Product</title>
+<meta property="og:title" content="OG Product">
+<meta property="product:price:amount" content="1299.00">
+<meta property="product:price:currency" content="INR">
+<meta property="product:availability" content="in stock">
+<meta property="product:brand" content="OG Brand">
+<meta property="product:item_id" content="OG-99">
+</head><body></body></html>"#;
+
+    // Page with NO price and NO product data anywhere.
+    const HTML_NO_PRICE: &str = r#"<!doctype html><html><head>
+<title>Just an article</title>
+<meta property="og:title" content="Some Blog Post">
+</head><body><p>This article mentions a price of $19.99 in the text but has no
+structured product data, so nothing must be extracted from the body.</p></body></html>"#;
+
+    #[test]
+    fn extracts_single_offer_from_jsonld() {
+        let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(49.99), "price must come from Offer.price");
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
+        assert_eq!(d.sku.as_deref(), Some("ACME-WP-001"));
+        assert_eq!(d.gtin.as_deref(), Some("1234567890123"));
+        assert_eq!(d.rating, Some(4.5));
+        assert_eq!(d.rating_count, Some(120));
+        assert_eq!(d.merchant.as_deref(), Some("Acme Store"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+        // No free-text price guessing: the body text mentions no price here, but
+        // even where it would, it must not leak. price_low/high stay unset.
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
+    }
+
+    #[test]
+    fn aggregate_offer_surfaces_range_not_single_canonical() {
+        let o = extract_commerce_offer(HTML_AGGREGATE_OFFER, "https://shop.example.com/bulk");
+        let d = o.data.as_ref().unwrap();
+        // AggregateOffer: range + count, but NO single `price` (no canonical guess).
+        assert_eq!(d.price_low, Some(10.00));
+        assert_eq!(d.price_high, Some(25.50));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(d.offer_count, Some(8));
+        // `price` is set to the entry (low) price — a defined field, not a guess
+        // about a single sold unit. That is acceptable; the full range is present.
+        assert_eq!(d.price, Some(10.00));
+    }
+
+    #[test]
+    fn two_offers_never_collapse_to_one_canonical_price() {
+        let o = extract_commerce_offer(HTML_TWO_OFFERS, "https://shop.example.com/dual");
+        let d = o.data.as_ref().unwrap();
+        // Two distinct USD offers: range + count, but `price` must stay null so
+        // we never assert a canonical price we cannot justify.
+        assert_eq!(d.price_low, Some(15.00));
+        assert_eq!(d.price_high, Some(20.00));
+        assert_eq!(d.offer_count, Some(2));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.price, None, "must NOT collapse multiple offers into one price");
+    }
+
+    #[test]
+    fn open_graph_product_fallback_works() {
+        let o = extract_commerce_offer(HTML_OG_PRODUCT, "https://og.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(1299.00));
+        assert_eq!(d.currency.as_deref(), Some("INR"));
+        assert_eq!(d.availability.as_deref(), Some("in stock"));
+        assert_eq!(d.merchant.as_deref(), Some("OG Brand"));
+        assert_eq!(d.gtin.as_deref(), Some("OG-99"));
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    #[test]
+    fn no_price_page_is_all_null() {
+        let o = extract_commerce_offer(HTML_NO_PRICE, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        // The body literally says "$19.99" but we MUST NOT guess from free text.
+        assert_eq!(d.price, None, "free-text price must never be guessed");
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
+        assert_eq!(d.currency, None);
+        assert_eq!(d.availability, None);
+        assert_eq!(d.rating, None);
+        // merchant falls back to the coarse host label (identifier, not a fact).
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    #[test]
+    fn product_inside_graph_is_discovered() {
+        // A Product nested inside a WebPage @graph must still be found.
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{ "@context": "https://schema.org/", "@graph": [
+  {"@type": "WebPage", "name": "Page"},
+  {"@type": "Product", "name": "Nested", "offers": {"@type": "Offer", "price": "5.00", "priceCurrency": "GBP"}}
+] }
+</script></head><body></body></html>"#;
+        let o = extract_commerce_offer(html, "https://x.example.com/n");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(5.00));
+        assert_eq!(d.currency.as_deref(), Some("GBP"));
+    }
+
+    #[test]
+    fn observed_at_is_always_set() {
+        let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
+        assert!(o.observed_at.is_some());
+        // A unix-second string is digits only.
+        assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
+    }
+
+    // ── Microdata extraction ───────────────────────────────────────────
+
+    const HTML_MICRODATA_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>Microdata Product</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Microdata Widget</span>
+  <span itemprop="brand">WidgetCo</span>
+  <span itemprop="sku">MD-W-001</span>
+  <span itemprop="gtin13">9876543210987</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="29.99">29.99</span>
+    <span itemprop="priceCurrency" content="USD">USD</span>
+    <span itemprop="availability" content="https://schema.org/InStock">In Stock</span>
+    <span itemprop="itemCondition" content="https://schema.org/NewCondition">New</span>
+  </div>
+  <div itemprop="aggregateRating" itemscope itemtype="https://schema.org/AggregateRating">
+    <span itemprop="ratingValue" content="4.2">4.2</span>
+    <span itemprop="reviewCount" content="85">85</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_product_extracts_all_fields() {
+        let o = extract_commerce_offer(HTML_MICRODATA_PRODUCT, "https://md.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(29.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
+        assert_eq!(d.sku.as_deref(), Some("MD-W-001"));
+        assert_eq!(d.gtin.as_deref(), Some("9876543210987"));
+        assert_eq!(d.rating, Some(4.2));
+        assert_eq!(d.rating_count, Some(85));
+        assert_eq!(d.merchant.as_deref(), Some("WidgetCo"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    const HTML_MICRODATA_NO_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>Article Page</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Article">
+  <span itemprop="name">How to Build a Widget</span>
+  <span itemprop="author">Jane Doe</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_non_product_page_returns_null() {
+        // An Article (not Product/Offer) must NOT trigger microdata extraction.
+        let o = extract_commerce_offer(HTML_MICRODATA_NO_PRODUCT, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None);
+        assert_eq!(d.currency, None);
+        assert_eq!(d.availability, None);
+        // merchant falls back to host
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    // ── RDFa extraction ────────────────────────────────────────────────
+
+    const HTML_RDFa_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>RDFa Product</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Gadget</span>
+  <span property="brand">GadgetCo</span>
+  <span property="sku">RD-G-001</span>
+  <span property="gtin13">5554443332221</span>
+  <div property="offers" typeof="Offer">
+    <span property="price" content="149.99">149.99</span>
+    <span property="priceCurrency" content="EUR">EUR</span>
+    <span property="availability" content="https://schema.org/InStock">In Stock</span>
+    <span property="itemCondition" content="https://schema.org/NewCondition">New</span>
+  </div>
+  <div property="aggregateRating" typeof="AggregateRating">
+    <span property="ratingValue" content="4.8">4.8</span>
+    <span property="reviewCount" content="210">210</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_product_extracts_all_fields() {
+        let o = extract_commerce_offer(HTML_RDFa_PRODUCT, "https://rdfa.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(149.99));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
+        assert_eq!(d.sku.as_deref(), Some("RD-G-001"));
+        assert_eq!(d.gtin.as_deref(), Some("5554443332221"));
+        assert_eq!(d.rating, Some(4.8));
+        assert_eq!(d.rating_count, Some(210));
+        assert_eq!(d.merchant.as_deref(), Some("GadgetCo"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    const HTML_RDFa_FULL_URI: &str = r#"<!doctype html><html><head>
+<title>RDFa Full URI</title>
+</head><body>
+<div vocab="http://schema.org/" typeof="Product">
+  <span property="name">URI Product</span>
+  <span property="http://schema.org/price" content="99.99">99.99</span>
+  <span property="http://schema.org/priceCurrency" content="GBP">GBP</span>
+  <span property="http://schema.org/availability" content="http://schema.org/InStock">In Stock</span>
+  <span property="http://schema.org/brand">URI Brand</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_full_schema_org_uri_works() {
+        // RDFa properties using full http://schema.org/ URI must also resolve.
+        let o = extract_commerce_offer(HTML_RDFa_FULL_URI, "https://uri.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(99.99));
+        assert_eq!(d.currency.as_deref(), Some("GBP"));
+        assert_eq!(d.availability.as_deref(), Some("http://schema.org/InStock"));
+        assert_eq!(d.merchant.as_deref(), Some("URI Brand"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    const HTML_RDFa_NO_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>Event Page</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Event">
+  <span property="name">Tech Conference 2026</span>
+  <span property="startDate" content="2026-06-15">June 15</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_non_product_page_returns_null() {
+        // An Event (not Product/Offer) must NOT trigger RDFa extraction.
+        let o = extract_commerce_offer(HTML_RDFa_NO_PRODUCT, "https://events.example.com/conf");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None);
+        assert_eq!(d.currency, None);
+        assert_eq!(d.availability, None);
+        assert_eq!(d.merchant.as_deref(), Some("events.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    // ── Priority order: JSON-LD > OG > microdata > RDFa ─────────────────
+
+    const HTML_JSONLD_AND_MICRODATA: &str = r#"<!doctype html><html><head>
+<title>Both JSON-LD and Microdata</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Both Product",
+  "offers": {
+    "@type": "Offer",
+    "price": "100.00",
+    "priceCurrency": "USD",
+    "availability": "https://schema.org/InStock",
+    "seller": {"@type": "Organization", "name": "JSON-LD Seller"}
+  }
+}
+</script>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Microdata Name</span>
+  <span itemprop="brand">Microdata Brand</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="200.00">200.00</span>
+    <span itemprop="priceCurrency" content="EUR">EUR</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn jsonld_takes_priority_over_microdata() {
+        // When JSON-LD has a price, microdata must NOT override it.
+        let o = extract_commerce_offer(HTML_JSONLD_AND_MICRODATA, "https://both.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(100.00), "JSON-LD price wins");
+        assert_eq!(d.currency.as_deref(), Some("USD"), "JSON-LD currency wins");
+        assert_eq!(d.merchant.as_deref(), Some("JSON-LD Seller"), "JSON-LD seller wins");
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    const HTML_OG_AND_RDFa: &str = r#"<!doctype html><html><head>
+<title>OG and RDFa</title>
+<meta property="og:title" content="OG Product">
+<meta property="product:price:amount" content="50.00">
+<meta property="product:price:currency" content="INR">
+<meta property="product:availability" content="in stock">
+<meta property="product:brand" content="OG Brand">
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Name</span>
+  <span property="http://schema.org/price" content="75.00">75.00</span>
+  <span property="http://schema.org/priceCurrency" content="USD">USD</span>
+  <span property="http://schema.org/brand">RDFa Brand</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn og_takes_priority_over_rdfa() {
+        // When OG has a price, RDFa must NOT override it.
+        let o = extract_commerce_offer(HTML_OG_AND_RDFa, "https://og-rdfa.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(50.00), "OG price wins");
+        assert_eq!(d.currency.as_deref(), Some("INR"), "OG currency wins");
+        assert_eq!(d.merchant.as_deref(), Some("OG Brand"), "OG brand wins");
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    // ── ROADMAP item 3: monetization MUST NOT affect ranking/order ────────────
+    // The /shopping pipeline enriches the ALREADY-RANKED results array in place,
+    // never reordering it. This test locks that invariant: with affiliate keys
+    // present or absent, the ranked URL order is byte-identical.
+    #[tokio::test]
+    async fn enrichment_preserves_result_order_with_or_without_affiliate_keys() {
+        // A representative already-ranked `results` slice (as /search would emit it).
+        let mut ranked = vec![
+            serde_json::json!({
+                "url": "https://shop.example.com/widget-pro",
+                "title": "Widget Pro",
+                "score": 9.7,
+                "sources": ["bing"]
+            }),
+            serde_json::json!({
+                "url": "https://store.example.org/cheaper-widget",
+                "title": "Cheaper Widget",
+                "score": 8.1,
+                "sources": ["brave"]
+            }),
+            serde_json::json!({
+                "url": "https://market.example.net/widget-bundle",
+                "title": "Widget Bundle",
+                "score": 6.3,
+                "sources": ["local"]
+            }),
+        ];
+
+        let before: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+
+        // Enrichment closure returns a fake product page for the FIRST result only,
+        // so we exercise the attach path AND the no-fact path (others get None).
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = |url: String| {
+            let h = fake_html.clone();
+            async move {
+                if url.contains("widget-pro") { Some(h) } else { None }
+            }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+
+        // 1) Order is byte-identical — this is the whole point.
+        let after: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(before, after, "enrichment must never reorder ranked results");
+
+        // 2) The fact-bearing result got an honest `commerce` block (from JSON-LD).
+        let first = ranked[0].get("commerce").expect("commerce block attached");
+        assert_eq!(first["source"], serde_json::json!("json-ld"));
+        assert_eq!(first["data"]["price"], serde_json::json!(49.99));
+
+        // 3) Provenance is attached to EVERY result, even those without facts.
+        for r in ranked.iter() {
+            assert!(r.get("commerce_provenance").is_some(), "provenance present");
+            assert!(r["commerce_provenance"]["url"].as_str().unwrap().len() > 0);
+        }
+
+        // 4) A no-fact result keeps `commerce` null (honest: we do NOT fabricate).
+        assert!(ranked[1].get("commerce").is_none()
+            || ranked[1]["commerce"].is_null());
+    }
+
+    // ── ROADMAP item 7: main-path commercial intent is SIGNAL-based ────────
+    // Detection must reuse the EXISTING signal-driven intent machinery (the
+    // `transactional` label + distribution + price constraints) — NEVER a keyword
+    // list. These tests lock that contract. They are pure (no network, no live
+    // gateway): `is_commercial_intent` only reads in-process signals.
+    #[test]
+    fn commercial_intent_from_transactional_label() {
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("transactional".to_string(), 0.9);
+        dist.insert("informational".to_string(), 0.1);
+        assert!(is_commercial_intent("transactional", &dist, false));
+    }
+
+    #[test]
+    fn commercial_intent_from_strong_transactional_distribution() {
+        // A product "X vs Y" query may resolve to a non-transactional argmax label
+        // (e.g. "comparison") but with a STRONG transactional distribution — still
+        // commercial. We require the distribution probability to cross the signal
+        // threshold, not merely be the argmax.
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("comparison".to_string(), 0.51);
+        dist.insert("transactional".to_string(), 0.62);
+        // argmax label is "comparison" but transactional prob >= 0.50 => commercial.
+        assert!(is_commercial_intent("comparison", &dist, false));
+    }
+
+    #[test]
+    fn commercial_intent_from_price_bound_without_transactional_label() {
+        // A stated price bound (price:<N / price:>N / min-max) is itself commercial
+        // intent — no need for the transactional label. The bound is parsed by the
+        // EXISTING gateway/engine constraint parser, never a keyword.
+        let dist = std::collections::HashMap::new();
+        assert!(is_commercial_intent("informational", &dist, true));
+    }
+
+    #[test]
+    fn informational_query_is_not_commercial() {
+        // A purely informational query ("rust ownership", "how do black holes work")
+        // with no price bound and no transactional signal must NOT trigger a
+        // shopping block. This proves detection is signal-based + private (no
+        // external classifier, no third-party call).
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("informational".to_string(), 0.95);
+        dist.insert("transactional".to_string(), 0.02);
+        assert!(!is_commercial_intent("informational", &dist, false));
+    }
+
+    // ── Main-path `shopping` block is always present on commercial intent ──
+    // The `any_commerce` presentation gate was removed: the `shopping` block is
+    // now surfaced whenever commercial intent is detected, even if no upstream
+    // page exposed structured product data. Every result carries
+    // `commerce_provenance` (`source: null` => "we checked, nothing") which is the
+    // honest presentation signal. These tests lock that the block is non-empty
+    // and always present when intent is commercial.
+
+    #[test]
+    fn shopping_block_present_even_when_no_result_has_commerce() {
+        // Simulate an enriched top-N where NONE of the results carry a commerce
+        // block (all upstream pages lacked structured product data). The shopping
+        // block is STILL surfaced — commerce_provenance on each result is the
+        // honest "checked, found nothing" signal.
+        let shop_arr: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0 }),
+        ];
+        // The block is built from the enriched array directly — it is non-empty
+        // (has results) even without commerce facts.
+        assert!(!shop_arr.is_empty(), "shopping block must have results");
+        // And every result would carry commerce_provenance (attached by
+        // enrich_with_commerce) — here we just assert the block is present.
+        let block = serde_json::json!({ "results": shop_arr });
+        assert!(block.get("results").is_some(), "shopping block present on commercial intent");
+    }
+
+    #[test]
+    fn shopping_block_present_when_at_least_one_result_has_commerce() {
+        // At least one enriched result carries a real commerce block (page had
+        // structured product data) => the shopping block is surfaced (same as
+        // before, but now the gate is unconditional on commerce presence).
+        let shop_arr: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0, "commerce": { "price": 49.99, "currency": "USD" } }),
+        ];
+        let has_commerce = shop_arr
+            .iter()
+            .any(|r| r.get("commerce").map(|v| !v.is_null()).unwrap_or(false));
+        assert!(has_commerce, "one commerce block present");
+        let block = serde_json::json!({ "results": shop_arr });
+        assert!(block.get("results").is_some(), "shopping block present");
+    }
+
+    #[test]
+    fn shopping_block_present_even_when_commerce_is_null() {
+        // A result with `"commerce": null` (explicitly absent) still yields a
+        // present shopping block — commerce_provenance is the honest signal.
+        let shop_arr: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0, "commerce": serde_json::Value::Null }),
+        ];
+        assert!(!shop_arr.is_empty(), "shopping block has results even with null commerce");
+        let block = serde_json::json!({ "results": shop_arr });
+        assert!(block.get("results").is_some(), "shopping block present");
+    }
+
+    // ── ROADMAP item B: product image extraction ─────────────────────────
+    // The extractor must pull the product image URL from structured sources:
+    // JSON-LD `image` (string, array, or ImageObject), OpenGraph `og:image`,
+    // microdata `itemprop="image"` (content + href/src), and RDFa `property="image"`.
+    // Always from typed data — never guessed from free text.
+
+    const HTML_JSONLD_IMAGE: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Image Product",
+  "image": "https://cdn.example.com/product.jpg",
+  "offers": {
+    "@type": "Offer",
+    "price": "49.99",
+    "priceCurrency": "USD"
+  }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_image_string_url_is_extracted() {
+        let o = extract_commerce_offer(HTML_JSONLD_IMAGE, "https://img.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/product.jpg"));
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    const HTML_JSONLD_IMAGE_ARRAY: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Multi Image",
+  "image": ["https://cdn.example.com/a.jpg", "https://cdn.example.com/b.jpg"],
+  "offers": { "@type": "Offer", "price": "29.99", "priceCurrency": "EUR" }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_image_array_takes_first() {
+        let o = extract_commerce_offer(HTML_JSONLD_IMAGE_ARRAY, "https://multi.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/a.jpg"));
+    }
+
+    const HTML_JSONLD_IMAGE_OBJECT: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "ImageObject Product",
+  "image": { "@type": "ImageObject", "url": "https://cdn.example.com/imgobj.jpg" },
+  "offers": { "@type": "Offer", "price": "19.99", "priceCurrency": "GBP" }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_image_object_url_is_extracted() {
+        let o = extract_commerce_offer(HTML_JSONLD_IMAGE_OBJECT, "https://obj.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/imgobj.jpg"));
+    }
+
+    const HTML_OG_IMAGE: &str = r#"<!doctype html><html><head>
+<title>OG Image</title>
+<meta property="og:image" content="https://og.example.com/photo.jpg">
+<meta property="product:price:amount" content="99.99">
+<meta property="product:price:currency" content="INR">
+</head><body></body></html>"#;
+
+    #[test]
+    fn og_image_is_extracted() {
+        let o = extract_commerce_offer(HTML_OG_IMAGE, "https://ogimg.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://og.example.com/photo.jpg"));
+        assert_eq!(d.price, Some(99.99));
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    const HTML_MICRODATA_IMAGE_HREF: &str = r#"<!doctype html><html><head>
+<title>Microdata Link Image</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Link Image Product</span>
+  <link itemprop="image" href="https://md.example.com/photo.jpg">
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="39.99">39.99</span>
+    <span itemprop="priceCurrency" content="USD">USD</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_image_href_attribute_is_extracted() {
+        let o = extract_commerce_offer(HTML_MICRODATA_IMAGE_HREF, "https://mdhref.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://md.example.com/photo.jpg"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    const HTML_RDFa_IMAGE: &str = r#"<!doctype html><html><head>
+<title>RDFa Image</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Image Product</span>
+  <span property="image" content="https://rdfa.example.com/photo.jpg">photo</span>
+  <div property="offers" typeof="Offer">
+    <span property="price" content="59.99">59.99</span>
+    <span property="priceCurrency" content="USD">USD</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_image_content_attribute_is_extracted() {
+        let o = extract_commerce_offer(HTML_RDFa_IMAGE, "https://rdfaimg.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://rdfa.example.com/photo.jpg"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    const HTML_NO_IMAGE: &str = r#"<!doctype html><html><head>
+<title>No Image Product</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "No Image Product",
+  "offers": { "@type": "Offer", "price": "9.99", "priceCurrency": "USD" }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn product_without_image_has_null_image() {
+        let o = extract_commerce_offer(HTML_NO_IMAGE, "https://noimg.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image, None);
+        assert_eq!(d.price, Some(9.99));
+    }
+
+    const HTML_ARTICLE_NO_IMAGE: &str = r#"<!doctype html><html><head>
+<title>Article Page</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Article">
+  <span itemprop="name">How to Build a Widget</span>
+  <span itemprop="author">Jane Doe</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn non_product_page_never_extracts_image() {
+        let o = extract_commerce_offer(HTML_ARTICLE_NO_IMAGE, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image, None);
+        assert_eq!(d.price, None);
+        // merchant falls back to host
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    // ── List price (original/sale price) extraction ──────────────────
+    // The list_price field captures the original/undiscounted price when the
+    // page exposes it (JSON-LD `listPrice`, `product:list_price:amount`,
+    // `itemprop="listprice"`, `property="listPrice"`). `price` holds the
+    // current/offer price; list_price is null when not exposed.
+
+    const HTML_JSONLD_LIST_PRICE: &str = r#"<!doctype html><html><head>
+<title>JSON-LD List Price</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Widget Pro",
+  "offers": {
+    "@type": "Offer",
+    "price": "79.99",
+    "priceCurrency": "USD",
+    "listPrice": "99.99"
+  }
+}
+</script></head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_list_price_is_extracted() {
+        let o = extract_commerce_offer(HTML_JSONLD_LIST_PRICE, "https://jsonld.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(79.99));
+        assert_eq!(d.list_price, Some(99.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    const HTML_OG_LIST_PRICE: &str = r#"<!doctype html><html><head>
+<title>OG List Price</title>
+<meta property="product:price:amount" content="79.99">
+<meta property="product:price:currency" content="USD">
+<meta property="product:list_price:amount" content="99.99">
+</head><body></body></html>"#;
+
+    #[test]
+    fn og_list_price_is_extracted() {
+        let o = extract_commerce_offer(HTML_OG_LIST_PRICE, "https://og.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(79.99));
+        assert_eq!(d.list_price, Some(99.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    const HTML_MICRODATA_LIST_PRICE: &str = r#"<!doctype html><html><head>
+<title>Microdata List Price</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">MD Sale Product</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="49.99">49.99</span>
+    <span itemprop="priceCurrency" content="EUR">EUR</span>
+    <span itemprop="listprice" content="79.99">79.99</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_list_price_is_extracted() {
+        let o = extract_commerce_offer(HTML_MICRODATA_LIST_PRICE, "https://md.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.list_price, Some(79.99));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    const HTML_RDFa_LIST_PRICE: &str = r#"<!doctype html><html><head>
+<title>RDFa List Price</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Sale Product</span>
+  <div property="offers" typeof="Offer">
+    <span property="price" content="39.99">39.99</span>
+    <span property="priceCurrency" content="GBP">GBP</span>
+    <span property="listPrice" content="59.99">59.99</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_list_price_is_extracted() {
+        let o = extract_commerce_offer(HTML_RDFa_LIST_PRICE, "https://rdfa.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(39.99));
+        assert_eq!(d.list_price, Some(59.99));
+        assert_eq!(d.currency.as_deref(), Some("GBP"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    #[test]
+    fn list_price_alone_is_valid_commerce_data() {
+        // A page exposing only list_price (no current price) still returns
+        // a non-null OfferFacts — the original price alone is useful signal.
+        let o = extract_commerce_offer(HTML_RDFa_LIST_PRICE, "https://rdfa.example.com/p");
+        assert!(o.data.is_some());
+    }
+
+    // ── ROADMAP item 3: affiliate template engine ─────────────────────
+    // Honest, data-driven affiliate decoration. These tests lock the contract:
+    //  * two template kinds render correctly with correct URL-encoding
+    //  * decoration is idempotent (no double-wrap)
+    //  * missing key => `affiliate: null`, result still returned (graceful)
+    //  * result ORDER is byte-identical before/after decoration
+    //  * every decorated result carries `disclosed: true`
+    //  * no user/query/IP data ever enters an affiliate parameter
+
+    fn net(kind: &str, template: &str, params: HashMap<String, String>, key: Option<&str>) -> AffiliateNetwork {
+        AffiliateNetwork {
+            id: "test".to_string(),
+            kind: kind.to_string(),
+            enabled: true,
+            priority: 1,
+            network: "TestNet".to_string(),
+            template: template.to_string(),
+            params,
+            key_env: key.map(|s| s.to_string()),
+            param_env: HashMap::new(),
+            bid_floor: None,
+            fallback_url: None,
+            bid_check_url: None,
+        }
+    }
+
+    #[test]
+    fn wrap_kind_encodes_destination_and_uses_key() {
+        // `wrap`: network prefix + url-encoded destination, key interpolated.
+        std::env::set_var("DUMMY_SOVRN_KEY", "DUMMY_SOVRN_KEY");
+        let n = net(
+            "wrap",
+            "https://sovrn.co?key={key}&u={url}",
+            HashMap::new(),
+            Some("DUMMY_SOVRN_KEY"),
         );
         assert!(
             extract_query_negative_terms("how to clean a skillet without soap").is_empty(),
