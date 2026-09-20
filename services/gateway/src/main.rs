@@ -8664,9 +8664,29 @@ fn has_video_intent(query: &str) -> bool {
 fn extract_comparison_entity_groups(query: &str) -> Option<(Vec<String>, Vec<String>)> {
     let lower = query.to_lowercase();
 
+    // Helper: truncate a group at the first preposition that introduces context.
+    // For "azure for machine learning workloads", we want "azure", not
+    // "azure for machine learning workloads". The compared entity is the
+    // noun phrase BEFORE the preposition; everything after is context.
+    let truncate_at_preposition = |text: &str| -> &str {
+        let prepositions = [" for ", " with ", " in ", " on ", " about ", " regarding ", " concerning "];
+        let mut earliest = text.len();
+        for p in &prepositions {
+            if let Some(pos) = text.find(p) {
+                if pos < earliest {
+                    earliest = pos;
+                }
+            }
+        }
+        &text[..earliest]
+    };
+
     // Helper: tokenize a group, keeping only distinctive content words.
+    // Truncates at context prepositions first so "azure for machine learning"
+    // yields ["azure"], not ["azure", "machine", "learning"].
     let tokenize_distinctive = |text: &str| -> Vec<String> {
-        text.split_whitespace()
+        let truncated = truncate_at_preposition(text);
+        truncated.split_whitespace()
             .map(|s| s.to_lowercase())
             .filter(|s| {
                 !s.is_empty()
@@ -20499,6 +20519,83 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("informational".to_string(), 0.95);
         dist.insert("transactional".to_string(), 0.02);
         assert!(!is_commercial_intent("informational", &dist, false));
+    }
+
+    // ── REGRESSION: main-path shopping block gate on /search ─────────────
+    // The main-path `shopping` block is attached to `/search` ONLY when
+    // `is_commercial_intent` returns true. These tests lock that contract so a
+    // future change cannot accidentally attach the shopping block to
+    // non-commercial queries (or fail to attach it to commercial ones).
+
+    #[test]
+    fn main_path_shopping_block_attached_for_transactional_intent() {
+        // A transactional query (e.g. "iphone 16 pro max price") must have the
+        // shopping block attached to the /search response. This is the
+        // regression test for the main-path commerce feature.
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("transactional".to_string(), 0.85);
+        dist.insert("informational".to_string(), 0.15);
+        // The gate fires on the transactional label alone
+        assert!(
+            is_commercial_intent("transactional", &dist, false),
+            "transactional intent must trigger shopping block"
+        );
+    }
+
+    #[test]
+    fn main_path_shopping_block_attached_for_price_bound_query() {
+        // A query with a price bound (e.g. "laptop under 50000") must have the
+        // shopping block attached even if the argmax label is not transactional.
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("comparison".to_string(), 0.60);
+        dist.insert("transactional".to_string(), 0.20);
+        // The gate fires on the price bound alone (has_price_bound=true)
+        assert!(
+            is_commercial_intent("comparison", &dist, true),
+            "price-bound query must trigger shopping block regardless of label"
+        );
+    }
+
+    #[test]
+    fn main_path_shopping_block_NOT_attached_for_informational_query() {
+        // A purely informational query (e.g. "what is rust programming language")
+        // must NOT have the shopping block attached. This prevents the shopping
+        // block from appearing on non-commercial queries.
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("informational".to_string(), 0.90);
+        dist.insert("transactional".to_string(), 0.05);
+        // No price bound, no transactional signal => gate does NOT fire
+        assert!(
+            !is_commercial_intent("informational", &dist, false),
+            "informational query must NOT trigger shopping block"
+        );
+    }
+
+    #[test]
+    fn main_path_shopping_block_attached_for_strong_transactional_distribution() {
+        // A query with strong transactional distribution (>= 0.50) must have the
+        // shopping block attached even if the argmax label is something else
+        // (e.g. "comparison" for "best laptop under 50000").
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("comparison".to_string(), 0.55);
+        dist.insert("transactional".to_string(), 0.65);
+        assert!(
+            is_commercial_intent("comparison", &dist, false),
+            "strong transactional distribution must trigger shopping block"
+        );
+    }
+
+    #[test]
+    fn main_path_shopping_block_NOT_attached_for_weak_transactional_distribution() {
+        // A query with weak transactional distribution (< 0.50) and no price
+        // bound must NOT have the shopping block attached.
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("informational".to_string(), 0.70);
+        dist.insert("transactional".to_string(), 0.30);
+        assert!(
+            !is_commercial_intent("informational", &dist, false),
+            "weak transactional distribution must NOT trigger shopping block"
+        );
     }
 
     // ── Main-path `shopping` block is always present on commercial intent ──
