@@ -52,7 +52,7 @@ enum MatchMode {
     Soft,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 struct Constraints {
     #[serde(default)]
     positive: Vec<String>,
@@ -124,7 +124,7 @@ enum EntityRole {
     Exclusion,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct QueryEntity {
     text: String,
     role: EntityRole,
@@ -10811,6 +10811,15 @@ fn merge_local_and_web(
             "manual", "natural", "artificial", "synthetic", "organic", "inorganic",
             "physical", "mental", "emotional", "rational", "irrational", "logical",
             "illogical", "experimental", "empirical",
+            // Superlative / comparative forms (round 2026-09-20T0348Z): without these,
+            // off-topic results named after the superlative ("MOST" museum, "FasTest"
+            // leak-test tools, "Speedtest") evade the modifier-word demotion and rank #1
+            // for "most effective strategies", "fastest way to learn go", etc.
+            "most", "more", "least", "less", "faster", "slower", "fastest", "slowest",
+            "quickest", "easiest", "hardest", "simplest", "biggest", "smallest", "largest",
+            "tiniest", "oldest", "newest", "youngest", "hottest", "coldest", "warmest",
+            "coolest", "greatest", "latest", "earliest", "first", "last", "next", "previous",
+            "best",
         ];
         let modifier_word_in_query = q_words.iter().any(|w| {
             general_modifier_terms.contains(&w.to_lowercase().as_str())
@@ -13568,6 +13577,13 @@ async fn handle_search(
     let (qflag, _valid_ratio) = query_quality_flag(&q_cleaned_spelling, &state.spell_index);
     if qflag == "junk" {
         return make_error_response(q_trimmed, "invalid_query", "Query appears to be gibberish; no results returned", true);
+    }
+
+    // Phase 7b: keyboard-walk / consonant-mash rejection (FIX-IF-03).
+    // Catches strings like "asdfghjkl" that pass the vowel/consonant ratio
+    // check because they contain vowels, but are clearly not real queries.
+    if is_keyboard_walk_query(&q_cleaned_spelling, &state.spell_index) {
+        return make_error_response(q_trimmed, "invalid_query", "Query appears to be keyboard-walk gibberish; no results returned", true);
     }
 
     // 0b. Check cache first (5-min TTL)
@@ -18255,6 +18271,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         match_mode: MatchMode::default(),
         positive: vec![],
         negative,
+        match_mode: MatchMode::default(),
         hard_exclusions,
         entities: vec![],
         language,
@@ -21071,6 +21088,53 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.price, Some(44.99));
         assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
         assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    // ── FIX-IF-03: keyboard-walk / gibberish rejection tests ─────────────
+
+    #[test]
+    fn keyboard_walk_asdfghjkl_rejected() {
+        let index = spell::SymSpellIndex::build();
+        assert!(is_keyboard_walk_query("asdfghjkl xyz123 nonsense", &index));
+    }
+
+    #[test]
+    fn keyboard_walk_zxcvbnm_rejected() {
+        let index = spell::SymSpellIndex::build();
+        assert!(is_keyboard_walk_query("zxcvbnm", &index));
+    }
+
+    #[test]
+    fn keyboard_walk_qwertyuiop_rejected() {
+        let index = spell::SymSpellIndex::build();
+        assert!(is_keyboard_walk_query("qwertyuiop", &index));
+    }
+
+    #[test]
+    fn legitimate_qwerty_keyboard_not_rejected() {
+        let index = spell::SymSpellIndex::build();
+        // "qwerty" is only 6 chars — below the 7-char threshold
+        assert!(!is_keyboard_walk_query("qwerty keyboard", &index));
+    }
+
+    #[test]
+    fn legitimate_strengths_not_rejected() {
+        let index = spell::SymSpellIndex::build();
+        // "strengths" has max consonant run of 5 (str, ngths) — below 7
+        assert!(!is_keyboard_walk_query("strengths", &index));
+    }
+
+    #[test]
+    fn legitimate_phrase_not_rejected() {
+        let index = spell::SymSpellIndex::build();
+        assert!(!is_keyboard_walk_query("how to learn programming", &index));
+    }
+
+    #[test]
+    fn short_gibberish_not_rejected() {
+        let index = spell::SymSpellIndex::build();
+        // "asdf" is only 4 chars — below the 7-char threshold
+        assert!(!is_keyboard_walk_query("asdf", &index));
     }
 }
 
