@@ -64,6 +64,13 @@ const PROTECTED_TERMS: &[&str] = &[
     "github", "gitlab", "apple", "ubuntu", "debian", "alpine", "macos",
     "android", "linux", "windows", "aws", "gcp", "azure", "vim", "neovim",
     "emacs", "json", "yaml", "toml", "grpc", "graphql", "kafka", "duckdb",
+    // Consumer brands (electronics, apparel) — negated brand exclusions
+    // (e.g. "not bose", "not nike") must survive is_real_exclusion.
+    "bose", "logitech", "nike", "sony", "samsung", "lg", "hp", "dell",
+    "lenovo", "asus", "acer", "msi", "razer", "corsair", "hyperx",
+    "steelseries", "jabra", "sennheiser", "akg", "beats", "adidas",
+    "puma", "reebok", "newbalance", "underarmour", "google", "microsoft",
+    "nvidia", "amd", "intel", "qualcomm", "broadcom", "realtek",
 ];
 
 /// Returns true if `word` is a protected brand/entity that must never be
