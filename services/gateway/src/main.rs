@@ -2140,8 +2140,34 @@ fn constraint_score(
                 }
             })
         } else {
-            title_lower.contains(&neg_lower) || title_normalized.contains(&neg_normalized)
-            || url.to_lowercase().contains(&neg_lower)
+            // Multi-word negative: exact phrase match first (strongest signal).
+            // Fallback: match any content word (non-stopword, len >= 3) of the
+            // negative. Without this, "adobe photoshop" would only penalize pages
+            // containing the full phrase, letting "Adobe Creative Cloud" / "Adobe
+            // Stock" escape entirely — the exact opposite of the user's intent for
+            // "alternatives to adobe photoshop".
+            let phrase_matched = title_lower.contains(&neg_lower)
+                || title_normalized.contains(&neg_normalized)
+                || url.to_lowercase().contains(&neg_lower);
+            if phrase_matched {
+                true
+            } else {
+                // Collect content words from the negative (skip stopwords and short tokens)
+                let content_words: Vec<&str> = neg_words.iter()
+                    .filter(|w| {
+                        let wl = w.to_lowercase();
+                        wl.len() >= 3 && !STOPWORDS.contains(&wl.as_str())
+                    })
+                    .copied()
+                    .collect();
+                // Require at least one content word to match — otherwise a purely
+                // stopword negative (shouldn't happen, but guard anyway) would match nothing.
+                !content_words.is_empty() && content_words.iter().any(|w| {
+                    let wl = w.to_lowercase();
+                    title_lower.contains(&wl) || title_normalized.contains(&wl)
+                        || url.to_lowercase().contains(&wl)
+                })
+            }
         };
 
         let content_matched = if neg_words.len() == 1 {
@@ -13567,6 +13593,13 @@ async fn handle_search(
     // Phase 7: graceful degradation for gibberish / low-quality input.
     let (qflag, _valid_ratio) = query_quality_flag(&q_cleaned_spelling, &state.spell_index);
     if qflag == "junk" {
+        return make_error_response(q_trimmed, "invalid_query", "Query appears to be gibberish; no results returned", true);
+    }
+
+    // FIX-IF-03: keyboard-walk detector — pre-gate check for pure keyboard-mashing
+    // patterns (asdfghjkl, zxcvbnm, etc.) that pass the vowel/consonant ratio check
+    // because they contain vowels.
+    if is_keyboard_walk_query(&q_cleaned_spelling, &state.spell_index) {
         return make_error_response(q_trimmed, "invalid_query", "Query appears to be gibberish; no results returned", true);
     }
 
