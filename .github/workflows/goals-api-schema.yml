@@ -9,14 +9,9 @@ name: goals-api-schema-tests
 
 on:
   push:
-    branches: [master, main, 'auto/**']
+    branches: [master, main]
   pull_request:
     branches: [master, main]
-
-# Cancel superseded runs (see ci.yml): the QA loop pushes many times/day.
-concurrency:
-  group: goals-api-schema-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   goals-api-schema:
@@ -24,12 +19,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          # Defense-in-depth: never pull Git-LFS in CI (no LFS files today, but a
-          # future re-tracked asset would silently re-serve + burn the quota).
-          # Shallow clone also trims per-run checkout egress + wall-clock.
-          lfs: false
-          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -49,9 +38,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: false
-          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5

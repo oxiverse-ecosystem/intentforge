@@ -55,6 +55,17 @@
       "params": { "tag": "{key}" },
       "key_env": "AMAZON_ASSOCIATES_TAG",
       "param_env": {}
+    },
+    {
+      "id": "rakuten_advertising",
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 60,
+      "network": "Rakuten Advertising",
+      "template": "https://click.linksynergy.com/deeplink?id={key}&mid={param:merchant_id}&murl={url}",
+      "params": {},
+      "key_env": "RAKTUEN_LINKSYNERGY_ID",
+      "param_env": { "merchant_id": "RAKTUEN_MERCHANT_ID" }
     }
   ]
 }
