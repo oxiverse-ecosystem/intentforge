@@ -46,11 +46,21 @@ struct SearchParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+enum MatchMode {
+    #[default]
+    Hard,
+    Soft,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 struct Constraints {
     #[serde(default)]
     positive: Vec<String>,
     #[serde(default)]
     negative: Vec<String>,
+    /// Match mode for constraint filtering.
+    #[serde(default)]
+    match_mode: MatchMode,
     /// Hard-exclusion terms supplied via the explicit `NOT:` advanced operator
     /// (mirrors `site:`/`filetype:`). Unlike a bare `not X` negation (which is a
     /// soft topical penalty gated on entity/contrastive recognition via
@@ -13175,6 +13185,34 @@ fn is_pronounceable(w: &str) -> bool {
     true
 }
 
+fn is_keyboard_walk_query(q: &str, spell_index: &spell::SymSpellIndex) -> bool {
+    for token in q.split_whitespace() {
+        let lower = token.to_lowercase();
+        let alpha_only: String = lower.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        if alpha_only.len() < 7 {
+            continue;
+        }
+        if spell_index.contains_word(&alpha_only) || spell::is_protected_term(&alpha_only) {
+            continue;
+        }
+        let mut max_run = 0u32;
+        let mut current_run = 0u32;
+        for c in alpha_only.chars() {
+            if matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y') {
+                max_run = max_run.max(current_run);
+                current_run = 0;
+            } else {
+                current_run += 1;
+            }
+        }
+        max_run = max_run.max(current_run);
+        if max_run >= 7 {
+            return true;
+        }
+    }
+    false
+}
+
 fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f32) {
     let words: Vec<&str> = q.split_whitespace().filter(|w| w.chars().any(|c| c.is_alphabetic())).collect();
     if words.is_empty() {
@@ -20934,7 +20972,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn commerce_config_default_top_n_is_8() {
         // When the data file is absent/missing the field, the default is 8.
         // (Offline test: no data file in the test cwd => default.)
-        let cfg = CommerceConfig { mainpath_top_n: 8 };
+        let cfg = CommerceConfig { mainpath_top_n: 8, transactional_keywords: Vec::new() };
         assert_eq!(cfg.mainpath_top_n, 8, "default top-N is 8");
     }
 
@@ -20943,7 +20981,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // A new value (e.g. 12) can be set by editing the data file — no
         // code change, no recompile. This test simulates what the loader
         // would produce after reading `{"mainpath_top_n": 12}`.
-        let cfg = CommerceConfig { mainpath_top_n: 12 };
+        let cfg = CommerceConfig { mainpath_top_n: 12, transactional_keywords: Vec::new() };
         assert_eq!(cfg.mainpath_top_n, 12, "top-N is data-driven");
     }
 
@@ -20952,7 +20990,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // Edge case: mainpath_top_n = 0 means the shopping block is never
         // surfaced (the take(0) yields an empty array => None). This is a
         // valid "off" setting — proves the value is honored as a cap.
-        let cfg = CommerceConfig { mainpath_top_n: 0 };
+        let cfg = CommerceConfig { mainpath_top_n: 0, transactional_keywords: Vec::new() };
         assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
     }
 
