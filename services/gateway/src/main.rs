@@ -4515,19 +4515,26 @@ struct CommerceConfig {
     /// block on `/search`. Presentation cap on a CLONE of ranked results —
     /// never affects ranking or selection.
     mainpath_top_n: usize,
+    /// Runtime-loaded transactional intent keywords (Override 6 signal).
+    /// Comes from `data/commerce/signals.json` → `transactional_keywords`.
+    /// Empty Vec means: no keyword-based override; rely on label + distribution + price bound.
+    transactional_keywords: Vec<String>,
 }
 
 impl CommerceConfig {
-    /// Load from `data/commerce/config.json`. Missing file / missing field =>
-    /// defaults (8). Never fatal — commerce presentation is best-effort.
+    /// Load from `data/commerce/config.json` AND `data/commerce/signals.json`.
+    /// Missing file / missing field => sensible defaults. Never fatal.
     fn load() -> Self {
-        let mut cfg = Self { mainpath_top_n: 8 };
-        let candidates = [
+        let mut cfg = Self {
+            mainpath_top_n: 8,
+            transactional_keywords: Vec::new(),
+        };
+        let config_candidates = [
             "data/commerce/config.json",
             "/app/data/commerce/config.json",
             "./data/commerce/config.json",
         ];
-        for path in candidates {
+        for path in &config_candidates {
             if let Ok(text) = std::fs::read_to_string(path) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(n) = v.get("mainpath_top_n").and_then(|x| x.as_u64()) {
@@ -4536,8 +4543,40 @@ impl CommerceConfig {
                             "commerce config: mainpath_top_n={} (from data file)",
                             cfg.mainpath_top_n
                         );
-                        break;
                     }
+                    if let Some(arr) = v.get("transactional_keywords").and_then(|a| a.as_array()) {
+                        cfg.transactional_keywords = arr
+                            .iter()
+                            .filter_map(|s| s.as_str().map(String::from))
+                            .collect();
+                        tracing::info!(
+                            "commerce config: {} transactional keyword(s) from config.json",
+                            cfg.transactional_keywords.len()
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        let signals_candidates = [
+            "data/commerce/signals.json",
+            "/app/data/commerce/signals.json",
+            "./data/commerce/signals.json",
+        ];
+        for path in &signals_candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("transactional_keywords").and_then(|a| a.as_array()) {
+                        cfg.transactional_keywords = arr
+                            .iter()
+                            .filter_map(|s| s.as_str().map(String::from))
+                            .collect();
+                        tracing::info!(
+                            "commerce signals: {} transactional keyword(s) (from data file)",
+                            cfg.transactional_keywords.len()
+                        );
+                    }
+                    break;
                 }
             }
         }
