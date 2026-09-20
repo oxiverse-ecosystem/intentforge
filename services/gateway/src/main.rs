@@ -18271,7 +18271,6 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         match_mode: MatchMode::default(),
         positive: vec![],
         negative,
-        match_mode: MatchMode::default(),
         hard_exclusions,
         entities: vec![],
         language,
