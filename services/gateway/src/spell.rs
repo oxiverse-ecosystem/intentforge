@@ -14,7 +14,7 @@
 // No external dependencies beyond the bundled dictionary.
 
 use std::collections::HashMap;
-use rphonetic::Encoder;
+use rphonetic::{Encoder, DoubleMetaphone};
 
 /// Maximum edit distance for SymSpell pre-computation
 const MAX_EDIT_DISTANCE: usize = 2;
@@ -451,16 +451,22 @@ impl SymSpellIndex {
     }
 
     /// Build phonetic code → word_ids map for phonetic fallback.
-    /// Uses rphonetic's Soundex variant to encode each dictionary word.
+    /// Uses Double Metaphone which handles double letters correctly
+    /// (e.g. "cancing" and "cancelling" both encode to KNSNK).
     fn build_phonetic_dict(words: &[String]) -> HashMap<String, Vec<u32>> {
         let mut map: HashMap<String, Vec<u32>> = HashMap::new();
+        let dmeta = DoubleMetaphone::default();
         for (id, word) in words.iter().enumerate() {
             // Only encode ASCII words; non-ASCII words are skipped to avoid panics
             if !word.is_ascii() {
                 continue;
             }
-            let code = rphonetic::Soundex::default().encode(word);
-            map.entry(code).or_default().push(id as u32);
+            // DoubleMetaphone returns (primary, alternate) — we index both
+            let (primary, alternate) = dmeta.encode(word);
+            map.entry(primary).or_default().push(id as u32);
+            if !alternate.is_empty() && alternate != primary {
+                map.entry(alternate).or_default().push(id as u32);
+            }
         }
         map
     }
