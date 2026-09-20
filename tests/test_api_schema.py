@@ -139,6 +139,7 @@ def test_images_schema(session):
     _require_keys("GET /images", body, ["count", "query", "results"])
     results = body.get("results", [])
     assert isinstance(results, list), f"GET /images 'results' must be a list, got {type(results).__name__}"
+    assert len(results) > 0, "GET /images returned zero results to assert shape against"
     for i, item in enumerate(results):
         _require_keys(f"GET /images result[{i}]", item, IMAGE_RESULT_KEYS)
 
@@ -155,6 +156,7 @@ def test_videos_schema(session):
     _require_keys("GET /videos", body, ["count", "query", "results"])
     results = body.get("results", [])
     assert isinstance(results, list), f"GET /videos 'results' must be a list, got {type(results).__name__}"
+    assert len(results) > 0, "GET /videos returned zero results to assert shape against"
     for i, item in enumerate(results):
         _require_keys(f"GET /videos result[{i}]", item, VIDEO_RESULT_KEYS)
 
@@ -171,6 +173,7 @@ def test_news_schema(session):
     _require_keys("GET /news", body, ["count", "query", "results"])
     results = body.get("results", [])
     assert isinstance(results, list), f"GET /news 'results' must be a list, got {type(results).__name__}"
+    assert len(results) > 0, "GET /news returned zero results to assert shape against"
     for i, item in enumerate(results):
         _require_keys(f"GET /news result[{i}]", item, NEWS_RESULT_KEYS)
 
@@ -190,6 +193,84 @@ def test_spellcheck_typo_schema(session):
     assert isinstance(corrections, list) and len(corrections) > 0, (
         f"GET /spellcheck on a typo should yield non-empty corrections[]; got {corrections!r}"
     )
+
+
+# 9. Negated-brand-negative transparency must not contradict applied constraints
+def _neg_terms_from_applied(applied):
+    """Extract the set of negative terms reported in applied_constraints.
+
+    applied_constraints entries look like 'not:sony' / 'site:...' / 'price:<100'.
+    Only the 'not:<term>' entries are genuine negations.
+    """
+    out = set()
+    for entry in applied or []:
+        if entry.startswith("not:"):
+            out.add(entry[len("not:"):].strip())
+    return out
+
+
+def _neg_terms_from_ignored(ignored):
+    """Extract the set of negative terms named in ignored_constraints.
+
+    ignored_constraints entries look like
+    'not:sony — exclusion not applied (...)'. The term is the text before ' —'.
+    """
+    out = set()
+    for entry in ignored or []:
+        if entry.startswith("not:"):
+            term = entry[len("not:"):].split(" —")[0].strip()
+            out.add(term)
+    return out
+
+
+def test_negated_brand_no_applied_ignored_contradiction(session):
+    """FIX t_b6764006: a rescued protected-brand negative (e.g. 'sony') must NOT
+    appear in BOTH applied_constraints ('not:sony') AND ignored_constraints
+    ('not:sony — exclusion not applied ...'). A negation cannot be both enforced
+    and declined.
+
+    The intent engine tags 'sony' as an Exclusion non-deterministically, so we
+    loop the query several times to catch the intermittent case where the engine
+    DID tag it (which is exactly when the old code would contradict itself).
+    """
+    q = "wireless headphones price:<100 not sony after:2025-01-01"
+    for i in range(5):
+        r = session.get(f"{BASE}/search", params={"q": q}, timeout=60)
+        assert r.status_code == 200, f"GET /search -> {r.status_code} {r.text[:300]}"
+        body = r.json()
+        applied = body.get("applied_constraints")
+        ignored = body.get("ignored_constraints")
+        applied_neg = _neg_terms_from_applied(applied)
+        ignored_neg = _neg_terms_from_ignored(ignored)
+        overlap = applied_neg & ignored_neg
+        assert not overlap, (
+            f"iteration {i}: negated term(s) {sorted(overlap)} appear in BOTH "
+            f"applied_constraints and ignored_constraints (contradiction). "
+            f"applied_neg={sorted(applied_neg)} ignored_neg={sorted(ignored_neg)}"
+        )
+
+
+def test_other_brand_negatives_applied_only(session):
+    """Control: bose/logitech/nike negatives are enforced (applied) and must NOT
+    be surfaced as ignored (they were never in the contradiction class).
+    """
+    for brand in ("bose", "logitech", "nike"):
+        q = f"wireless headphones price:<100 not {brand} after:2025-01-01"
+        r = session.get(f"{BASE}/search", params={"q": q}, timeout=60)
+        assert r.status_code == 200, f"GET /search -> {r.status_code} {r.text[:300]}"
+        body = r.json()
+        applied = body.get("applied_constraints")
+        ignored = body.get("ignored_constraints")
+        applied_neg = _neg_terms_from_applied(applied)
+        ignored_neg = _neg_terms_from_ignored(ignored)
+        assert brand in applied_neg, (
+            f"brand '{brand}' should be enforced (in applied_constraints); "
+            f"got applied_neg={sorted(applied_neg)}"
+        )
+        assert brand not in ignored_neg, (
+            f"brand '{brand}' must not be in ignored_constraints; "
+            f"got ignored_neg={sorted(ignored_neg)}"
+        )
 
 
 if __name__ == "__main__":

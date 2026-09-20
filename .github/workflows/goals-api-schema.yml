@@ -32,3 +32,22 @@ jobs:
         env:
           INTENTFORGE_BASE_URL: ${{ secrets.INTENTFORGE_BASE_URL || 'http://localhost:4000' }}
         run: pytest tests/test_goals_api_schema.py -v
+
+  api-schema:
+    name: Non-Goals API schema regression (live gateway)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test deps
+        run: pip install -r requirements-tests.txt
+
+      - name: Run non-Goals API schema tests
+        env:
+          INTENTFORGE_BASE_URL: ${{ secrets.INTENTFORGE_BASE_URL || 'http://localhost:4000' }}
+        run: pytest tests/test_api_schema.py -v
