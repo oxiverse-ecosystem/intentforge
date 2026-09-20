@@ -45,7 +45,7 @@ struct SearchParams {
     ip: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 enum MatchMode {
     #[default]
     Hard,
