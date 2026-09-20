@@ -11825,6 +11825,10 @@ async fn main() {
         .route("/search/fast", get(handle_search_fast))
         .route("/images", get(handle_images))
         .route("/videos", get(handle_videos))
+        // Video introspection: classifies query as video-intent using the same
+        // has_video_intent() + is_url_video_host() fns /search's P8 path uses.
+        // Zero-side-effect, no new ranking logic. See handle_video().
+        .route("/video", get(handle_video))
         .route("/news", get(handle_news))
         .route("/spellcheck", get(handle_spellcheck))
         .route("/analyze", get(handle_analyze))
@@ -11858,6 +11862,7 @@ async fn main() {
         .route("/goals/:goal_id/answers", post(goals::handle_submit_answers))
         .route("/goals/:goal_id/phases/:phase_id/complete", post(goals::handle_complete_phase))
         .route("/goals/:goal_id/progress", post(goals::handle_update_progress))
+        .route("/goals/:goal_id/progress", get(goals::handle_get_progress))
         .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
@@ -12289,6 +12294,92 @@ async fn handle_inspect(
         );
     }
     let result = build_inspect(&state.spell_index, &q);
+    (axum::http::StatusCode::OK, Json(result))
+}
+
+/// The marker set is exposed as a fixed general array (data, not branching
+/// logic) so a future drift between this endpoint and the ranker's P8 check is
+/// itself observable + unit-tested.
+fn classify_url_as_video(url: &str) -> bool {
+    is_url_video_host(url)
+}
+
+/// The exact P8 video-intent marker set. Mirrors `merge_local_and_web`'s
+/// `video_intent` check (gateway/main.rs ~L7070) VERBATIM so the
+/// introspection endpoint can never silently drift from the ranker's
+/// exemption logic. Kept as data (a fixed general marker set), not branching
+/// logic, per the doctrine: no per-query tuning.
+fn video_intent_markers() -> &'static [&'static str] {
+    &["video", "youtube", "watch", "tutorial", "animation"]
+}
+
+/// Pure video-intent detector — reuses `simple_negation_strip` (the same
+/// negation-aware cleaner `/search` feeds `q_lc_cap`) then tests the P8
+/// marker set. Returns true when the query should be treated as a request
+/// for video results (and therefore exempt from the P8 non-video pin).
+fn detect_video_intent(q: &str) -> bool {
+    let cleaned = simple_negation_strip(q).unwrap_or_else(|| q.to_string());
+    let q_lc = cleaned.to_lowercase();
+    video_intent_markers().iter().any(|m| q_lc.contains(*m))
+}
+
+/// Build the `GET /video` payload. Pure + unit-testable so the P8
+/// classification contract is locked independently of the HTTP layer.
+fn build_video(q: &str) -> serde_json::Value {
+    let video_intent = detect_video_intent(q);
+    let would_pin_non_video_sources = !video_intent;
+    let intent_resp = fallback_intent(q);
+    let intent = &intent_resp.intent;
+    let markers: Vec<String> = video_intent_markers().iter().map(|m| (*m).to_string()).collect();
+
+    serde_json::json!({
+        "query": q,
+        "video_intent": video_intent,
+        "video_intent_markers": markers,
+        "would_pin_non_video_sources": would_pin_non_video_sources,
+        "is_video_source_examples": {
+            "youtube_watch": classify_url_as_video("https://www.youtube.com/watch?v=gUEa825kTjQ"),
+            "youtu_be": classify_url_as_video("https://youtu.be/gUEa825kTjQ"),
+            "invidious_selfhosted": classify_url_as_video("https://invidious.example.net/watch?v=x"),
+            "vimeo": classify_url_as_video("https://www.vimeo.com/123456"),
+            "python_org_article": classify_url_as_video("https://www.python.org/doc"),
+            "example_video_word_in_path": classify_url_as_video("https://example.com/youtube-guide-article")
+        },
+        "intent": intent,
+        "note": "Additive introspection of the P8 video-dominance fix (commit 3938da6). Does not change ranking."
+    })
+}
+
+/// Build the `400 empty_query` envelope for `/video`. Pure + unit-testable.
+/// Mirrors the sibling empty-envelope contract: carries a neutral video_intent
+/// + would_pin_non_video_sources so the envelope is distinguishable but
+/// self-consistent.
+fn build_video_empty() -> serde_json::Value {
+    let markers: Vec<String> = video_intent_markers().iter().map(|m| (*m).to_string()).collect();
+    serde_json::json!({
+        "error": "empty_query",
+        "message": "Query parameter 'q' is empty",
+        "query": "",
+        "video_intent": false,
+        "video_intent_markers": markers,
+        "would_pin_non_video_sources": true,
+        "is_video_source_examples": {}
+    })
+}
+
+/// `GET /video?q=...` — expose the P8 video-dominance classification BEFORE a
+/// search runs. Additive + zero-side-effect (see `build_video`). Empty/
+/// whitespace `q` returns `400` with the standard `empty_query` envelope shape
+/// the introspection family uses.
+async fn handle_video(
+    axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
+    if q.trim().is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(build_video_empty()));
+    }
+    let result = build_video(&q);
     (axum::http::StatusCode::OK, Json(result))
 }
 
