@@ -6,13 +6,6 @@ on:
   pull_request:
     branches: [master, main, 'auto/round-**']
 
-# A new push to the same ref cancels the previous, still-running run. Under the
-# autonomous QA loop this repo is pushed to many times per day; cancelling
-# superseded runs avoids burning Actions compute + network egress on stale work.
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   CARGO_TERM_COLOR: always
 
