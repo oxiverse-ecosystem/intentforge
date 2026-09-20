@@ -10933,7 +10933,7 @@ fn merge_local_and_web(
             // results stay present (floor) but can never outtop requested-place results.
             // Only fires when the query has an explicit location (geo_is_explicit).
             if geo_is_explicit {
-                let cross_loc_penalty = cross_location_mismatch_mult(&r.title, &r.content, geo_location.as_ref());
+                let cross_loc_penalty = cross_location_mismatch_mult(&r.title, &r.content, geo_location);
                 if cross_loc_penalty < 1.0 {
                     // cross_loc returns 0.06 — rescale to a calibrated floor
                     // well below genuine text results (0.05). Use 0.03 so a mismatched
