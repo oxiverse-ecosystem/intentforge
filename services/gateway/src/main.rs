@@ -45,12 +45,22 @@ struct SearchParams {
     ip: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+enum MatchMode {
+    #[default]
+    Hard,
+    Soft,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 struct Constraints {
     #[serde(default)]
     positive: Vec<String>,
     #[serde(default)]
     negative: Vec<String>,
+    /// Match mode for constraint filtering.
+    #[serde(default)]
+    match_mode: MatchMode,
     /// Hard-exclusion terms supplied via the explicit `NOT:` advanced operator
     /// (mirrors `site:`/`filetype:`). Unlike a bare `not X` negation (which is a
     /// soft topical penalty gated on entity/contrastive recognition via
@@ -2994,6 +3004,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
     Constraints {
         positive,
         negative,
+        match_mode: MatchMode::default(),
         hard_exclusions,
         entities: c.entities.clone(),
         language: c.language.clone(),
@@ -4549,13 +4560,20 @@ struct CommerceConfig {
     /// block on `/search`. Presentation cap on a CLONE of ranked results —
     /// never affects ranking or selection.
     mainpath_top_n: usize,
+    /// Whole-word keywords that signal transactional intent (Override 6).
+    /// Runtime-loaded from `data/commerce/config.json` → `transactional_keywords`.
+    /// Never hardcoded — edit the data file to add/remove without recompile.
+    transactional_keywords: Vec<String>,
 }
 
 impl CommerceConfig {
     /// Load from `data/commerce/config.json`. Missing file / missing field =>
     /// defaults (8). Never fatal — commerce presentation is best-effort.
     fn load() -> Self {
-        let mut cfg = Self { mainpath_top_n: 8 };
+        let mut cfg = Self {
+            mainpath_top_n: 8,
+            transactional_keywords: Vec::new(),
+        };
         let candidates = [
             "data/commerce/config.json",
             "/app/data/commerce/config.json",
@@ -4570,13 +4588,47 @@ impl CommerceConfig {
                             "commerce config: mainpath_top_n={} (from data file)",
                             cfg.mainpath_top_n
                         );
-                        break;
                     }
+                    if let Some(arr) = v.get("transactional_keywords").and_then(|a| a.as_array()) {
+                        cfg.transactional_keywords = arr
+                            .iter()
+                            .filter_map(|s| s.as_str().map(String::from))
+                            .collect();
+                        tracing::info!(
+                            "commerce config: {} transactional keyword(s) (from data file)",
+                            cfg.transactional_keywords.len()
+                        );
+                    }
+                    break;
                 }
             }
         }
         cfg
     }
+}
+
+/// Finalize the `shopping` block from already-enriched results.
+///
+/// Pure + offline-testable: takes the enriched top-N results (already decorated
+/// with `commerce` + `affiliate` by the post-rank passes) and assembles the
+/// final `shopping` block JSON, including read-only offer comparisons. Returns
+/// `None` if the input is empty (no results to show).
+///
+/// This is extracted from `handle_search` so the block-finalization logic can be
+/// unit-tested without spinning up the full async search pipeline.
+fn finalize_shopping_block(enriched_results: Vec<serde_json::Value>) -> Option<serde_json::Value> {
+    if enriched_results.is_empty() {
+        return None;
+    }
+    let mut block = serde_json::json!({ "results": enriched_results });
+    if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+        let comparisons = build_offer_comparisons(arr_ref);
+        if !comparisons.is_empty() {
+            block["offer_comparisons"] =
+                serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+        }
+    }
+    Some(block)
 }
 
 /// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
@@ -8719,6 +8771,7 @@ fn merge_local_and_web(
     distribution: Option<&std::collections::HashMap<String, f32>>,
     geo_location: Option<&geoloc::GeoLocation>,
     web_semantic: &std::collections::HashMap<String, f32>,
+    tx_keywords: &[String],
 ) -> Vec<MergedResult> {
     let mut merged: Vec<MergedResult> = Vec::new();
     let mut url_to_idx: HashMap<String, usize> = HashMap::new();
@@ -10350,8 +10403,12 @@ fn merge_local_and_web(
             || r.sources.iter().any(|s| s == "arxiv" || s == "crossref" || s == "pubmed");
 
         let has_download = DOWNLOAD_KEYWORDS.iter().any(|k| q_lower_check.contains(k));
-        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon"];
-        let has_tx = tx_keywords.iter().any(|k| q_lower_check.contains(k));
+        // Transactional keywords are data-driven from `data/commerce/config.json` (seed data).
+        let has_tx = if !tx_keywords.is_empty() {
+            tx_keywords.iter().any(|kw| q_lower_check.contains(kw.as_str()))
+        } else {
+            false
+        };
         let is_nav_or_download = intent == "navigational"
             || intent == "transactional"
             || has_download
@@ -13129,6 +13186,34 @@ fn is_pronounceable(w: &str) -> bool {
     true
 }
 
+fn is_keyboard_walk_query(q: &str, spell_index: &spell::SymSpellIndex) -> bool {
+    for token in q.split_whitespace() {
+        let lower = token.to_lowercase();
+        let alpha_only: String = lower.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        if alpha_only.len() < 7 {
+            continue;
+        }
+        if spell_index.contains_word(&alpha_only) || spell::is_protected_term(&alpha_only) {
+            continue;
+        }
+        let mut max_run = 0u32;
+        let mut current_run = 0u32;
+        for c in alpha_only.chars() {
+            if matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y') {
+                max_run = max_run.max(current_run);
+                current_run = 0;
+            } else {
+                current_run += 1;
+            }
+        }
+        max_run = max_run.max(current_run);
+        if max_run >= 7 {
+            return true;
+        }
+    }
+    false
+}
+
 fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f32) {
     let words: Vec<&str> = q.split_whitespace().filter(|w| w.chars().any(|c| c.is_alphabetic())).collect();
     if words.is_empty() {
@@ -14821,9 +14906,14 @@ async fn handle_search(
             }
         }
 
-        // Override 6: transactional keywords OR an explicit price bound -> transactional
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under ", "deal", "deals", "refurbished", "sale", "offer"];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+        // Override 6: transactional keywords OR an explicit price bound -> transactional.
+        // Keywords are data-driven from `data/commerce/config.json` (seed data, not hardcoded).
+        let tx_kws = &state.commerce_config.transactional_keywords;
+        let has_tx_signal = if !tx_kws.is_empty() {
+            tx_kws.iter().any(|kw| q_lower.starts_with(kw.as_str()) || q_lower.contains(kw.as_str()))
+        } else {
+            false
+        };
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -15888,6 +15978,36 @@ async fn handle_search(
     // date / detectable price. These let us report applied-vs-ignored
     // constraints honestly instead of silently returning empty or unfiltered.
     let pre_filter_count = web_results.len();
+
+    // Source-diversity gate: if >80% of pre-filter results come from a single
+    // source, log a warning AND apply a diversity penalty (×0.5) to that
+    // dominant source's results. Data-driven — no hardcoded query strings.
+    {
+        let mut source_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for r in &web_results {
+            for s in &r.sources {
+                *source_counts.entry(s.to_lowercase()).or_insert(0) += 1;
+            }
+        }
+        if !source_counts.is_empty() {
+            let total = web_results.len() as f32;
+            for (source, count) in &source_counts {
+                let pct = (*count as f32) / total;
+                if pct > 0.8 {
+                    tracing::warn!(
+                        "SOURCE-DIVERSITY GATE: source '{}' dominates {}/{} results ({:.1}%) — applying ×0.5 penalty",
+                        source, count, web_results.len(), pct * 100.0
+                    );
+                    for r in web_results.iter_mut() {
+                        if r.sources.iter().any(|s| s.to_lowercase() == *source) {
+                            r.score *= 0.5;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let dated_result_count = web_results.iter().filter(|r| {
         resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
     }).count();
@@ -16077,16 +16197,15 @@ async fn handle_search(
     //      while still returning results about Java if that is all there is.
     //   4. Goldilocks detection: when multiple negative constraints remove everything,
     //      relax the penalty to preserve domain-relevant results.
+    //   5. Soft-match mode (for 0-result retry): never hard-drop; instead score by
+    //      constraint satisfaction count (more matches = higher rank) and fall back
+    //      to the best partial match. Never return 0 results if any partial match exists.
     if !intent.structured_constraints.negative.is_empty() {
         let before_count = web_results.len();
         let constraints_ref = &intent.structured_constraints;
+        let is_soft = constraints_ref.match_mode == MatchMode::Soft;
 
         // Filter out grammar-noise negatives BEFORE violation counting.
-        // "getting overcharged" is a state description (auxiliary verb + adjective),
-        // not a topical exclusion — every car-dealership page mentions "getting
-        // overcharged" in passing, so hard-dropping on it collapses the result set.
-        // is_exclusion_grammar_noise already handles single-word function words
-        // ("have", "from"); this extends the same guard to multi-word phrases.
         let effective_negatives: Vec<String> = constraints_ref.negative.iter()
             .filter(|n| !is_exclusion_grammar_noise(n))
             .cloned()
@@ -16095,14 +16214,7 @@ async fn handle_search(
         // Score each result and track violation counts
         let mut scored: Vec<(usize, f32, usize)> = web_results.iter().enumerate().map(|(i, r)| {
             let c_score = constraint_score(&r.title, &r.content, &r.url, constraints_ref);
-            // Check if this is an alternative-listing page (comparison, vs, alternatives)
-            // BEFORE counting violations — alt pages naturally mention excluded terms
-            // in comparative context ("Django vs FastAPI vs Flask: Which to Choose").
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
-            // Count how many negative terms actually match this result content.
-            // Skip violation counting for alternative-listing pages: their mention of
-            // excluded terms is referential, not topical. The soft filter would otherwise
-            // drop them before the alt-aware hard filter can preserve them.
             let violations = if alt_score > 0.3 {
                 0
             } else {
@@ -16111,7 +16223,6 @@ async fn handle_search(
                     let n_lower = n.to_lowercase();
                     let n_words: Vec<&str> = n_lower.split_whitespace().collect();
                     if n_words.len() == 1 {
-                        // Word-boundary aware — "java" must not match "javascript".
                         text_matches_negative(&text, &n_lower)
                     } else {
                         text.contains(&n_lower)
@@ -16137,55 +16248,13 @@ async fn handle_search(
         // the negative constraints are too aggressive for this result set.
         let is_goldilocks = avg_violations > 1.5 && min_violations >= 1;
 
-        // Filter strategy:
-        // - Normal case: keep results with violations <= 1 (clean match)
-        // - Goldilocks case: keep results with violations <= max_violations / 2 (relaxed)
-        // - 3+ negatives: zero violations only (unless ALL have violations)
-        let is_only_negative = constraints_ref.positive.is_empty();
-        // A negative constraint means "exclude results that match". When there is
-        // at least one clean result (no negative match) we drop every matching
-        // result. When *all* results match (degenerate set) we fall back to the
-        // Goldilocks relaxation below so we never return an empty page. Pure
-        // negation ("-trump") and mixed queries both expect matches to be removed.
-        let violation_threshold = if is_goldilocks {
-            tracing::warn!("GOLDILOCKS: avg_violations={:.1} max={} - relaxing constraint threshold",
-                avg_violations, max_violations
-            );
-            (max_violations / 2).max(1)
-        } else if min_violations == 0 {
-            0
-        } else if is_only_negative {
-            0
-        } else {
-            0
-        };
-
-        let kept: Vec<usize> = scored.iter()
-            .filter(|(_, _, v)| *v <= violation_threshold)
-            .map(|(i, _, _)| *i)
-            .collect();
-
-        let removed = before_count.saturating_sub(kept.len());
-        if removed > 0 {
-            tracing::info!(
-                "Negative constraint hard filter: removed {}/{} web results (violations max={} min={} avg={:.1})",
-                removed, before_count, max_violations, min_violations, avg_violations
-            );
-        }
-
-        if !kept.is_empty() {
-            // Keep results in sorted order (fewest violations first, highest score within)
-            web_results = kept.iter().map(|i| web_results[*i].clone()).collect();
-        } else {
-            // Fallback: keep results sorted by violations (ascending) but do not filter
-            // This preserves ordering so results with FEWER violations rank higher.
-            tracing::warn!(
-                "Negative constraint filter removed all {} results - keeping sorted by violations",
-                before_count
-            );
+        // === SOFT-MATCH MODE ===
+        // In soft mode (used by 0-result retry logic), never hard-drop results.
+        // Instead, score each result by how many constraints are satisfied
+        // (more matches = higher rank). Graduated penalty: each violation halves
+        // the effective score. Always returns at least one result — never zero.
+        if is_soft {
             let sorted_indices: Vec<usize> = scored.iter().map(|(i, _, _)| *i).collect();
-            // Apply graduated penalty: each violation halves the effective score
-            // so results with fewer violations naturally rank higher.
             let mut scored_results: Vec<SearxResult> = sorted_indices.iter().map(|i| {
                 let mut r = web_results[*i].clone();
                 let violations = scored.iter().find(|(j, _, _)| *j == *i).map(|(_, _, v)| *v).unwrap_or(0);
@@ -16196,6 +16265,62 @@ async fn handle_search(
             // Sort by penalized score to push multi-violation results down
             scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
             web_results = scored_results;
+            tracing::info!(
+                "SOFT-MATCH: {} results, graduated penalty applied (max_violations={}, avg={:.1})",
+                web_results.len(), max_violations, avg_violations
+            );
+        } else {
+            // === HARD-MATCH MODE (default) ===
+            // Filter strategy:
+            // - Normal case: keep results with violations <= 1 (clean match)
+            // - Goldilocks case: keep results with violations <= max_violations / 2 (relaxed)
+            // - 3+ negatives: zero violations only (unless ALL have violations)
+            let is_only_negative = constraints_ref.positive.is_empty();
+            let violation_threshold = if is_goldilocks {
+                tracing::warn!("GOLDILOCKS: avg_violations={:.1} max={} - relaxing constraint threshold",
+                    avg_violations, max_violations
+                );
+                (max_violations / 2).max(1)
+            } else if min_violations == 0 {
+                0
+            } else if is_only_negative {
+                0
+            } else {
+                0
+            };
+
+            let kept: Vec<usize> = scored.iter()
+                .filter(|(_, _, v)| *v <= violation_threshold)
+                .map(|(i, _, _)| *i)
+                .collect();
+
+            let removed = before_count.saturating_sub(kept.len());
+            if removed > 0 {
+                tracing::info!(
+                    "Negative constraint hard filter: removed {}/{} web results (violations max={} min={} avg={:.1})",
+                    removed, before_count, max_violations, min_violations, avg_violations
+                );
+            }
+
+            if !kept.is_empty() {
+                // Keep results in sorted order (fewest violations first, highest score within)
+                web_results = kept.iter().map(|i| web_results[*i].clone()).collect();
+            } else {
+                // Fallback: keep results sorted by violations (ascending) but do not filter
+                tracing::warn!(
+                    "Negative constraint filter removed all {} results - keeping sorted by violations",
+                    before_count
+                );
+                let sorted_indices: Vec<usize> = scored.iter().map(|(i, _, _)| *i).collect();
+                let mut scored_results: Vec<SearxResult> = sorted_indices.iter().map(|i| {
+                    let mut r = web_results[*i].clone();
+                    let violations = scored.iter().find(|(j, _, _)| *j == *i).map(|(_, _, v)| *v).unwrap_or(0);
+                    r.score *= 0.5_f32.powi(violations as i32);
+                    r
+                }).collect();
+                scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                web_results = scored_results;
+            }
         }
     }
 
@@ -16664,6 +16789,7 @@ async fn handle_search(
 // ranking falls back to the existing substring scorer (no behaviour change).
 let web_semantic = compute_web_semantic(&vector, &local_results, &web_results, &client).await;
 
+let tx_kws_for_merge = state.commerce_config.transactional_keywords.clone();
 let mut results = match tokio::task::spawn_blocking(move || {
     merge_local_and_web(
         local_results,
@@ -16674,6 +16800,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         Some(&distribution_clone),
         geo_clone.as_ref(),
         &web_semantic,
+        &tx_kws_for_merge,
     )
 }).await {
         Ok(r) => r,
@@ -17472,15 +17599,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             // exposed structured data additionally carry a `commerce` block; the
             // frontend renders both cases (affiliate-decorated URL + optional facts).
             // Read-only multi-merchant offer comparison from the attached facts.
-            let mut block = serde_json::json!({ "results": shop_arr });
-            if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                let comparisons = build_offer_comparisons(arr_ref);
-                if !comparisons.is_empty() {
-                    block["offer_comparisons"] =
-                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
-                }
-            }
-            Some(block)
+            finalize_shopping_block(shop_arr)
         }
     } else {
         None
@@ -18133,6 +18252,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     let (after_date, before_date) = parse_date_constraints(&q);
     
     Constraints {
+        match_mode: MatchMode::default(),
         positive: vec![],
         negative,
         hard_exclusions,
@@ -19113,7 +19233,7 @@ mod hardcoding_ruling_tests {
             "Improve: verb /ɪmˈpruːv/ 1. : to make better",
         )];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         assert_eq!(out.len(), 1, "cambridge result should survive (capped, not dropped)");
         let r = &out[0];
@@ -19130,7 +19250,7 @@ mod hardcoding_ruling_tests {
             "adult content",
         )];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         assert_eq!(out.len(), 0, "adult result must be dropped for non-adult query (d04afbe safety)");
     }
@@ -19144,7 +19264,7 @@ mod hardcoding_ruling_tests {
             "adult content",
         )];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         assert_eq!(out.len(), 1, "adult result kept when query is explicitly adult");
     }
@@ -19167,7 +19287,7 @@ mod hardcoding_ruling_tests {
             quality: 0.8,
         }];
         let out = merge_local_and_web(
-            local, vec![], q, "informational", &cst(), None, None, &empty_sem(),
+            local, vec![], q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         assert_eq!(out.len(), 1, "substantive-term match should survive");
         let r = &out[0];
@@ -19192,7 +19312,7 @@ mod hardcoding_ruling_tests {
             quality: 0.6,
         }];
         let out = merge_local_and_web(
-            local, vec![], q, "informational", &cst(), None, None, &empty_sem(),
+            local, vec![], q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         // The off-topic page (mentions "vinegar" but not dishwasher context) should
         // be crushed since "clean" and "vinegar" are weak anchor words and it lacks
@@ -19220,7 +19340,7 @@ mod hardcoding_ruling_tests {
         );
         let web = vec![dict_result, article_result];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         assert!(out.len() >= 2, "both results should be present");
         // Find the dict result (capped to 0.03)
@@ -19272,7 +19392,7 @@ mod hardcoding_ruling_tests {
         );
         let web = vec![video_result, article_result];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         assert!(out.len() >= 2, "both results should be present");
         let video = out.iter().find(|r| r.sources.iter().any(|s| s == "invidious")).expect("video missing");
@@ -19304,7 +19424,7 @@ mod hardcoding_ruling_tests {
         );
         let web = vec![disambig, article];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         // The disambiguation page should be capped (treated as dict-like for non-def query)
         // while the real article should not be capped
@@ -20419,6 +20539,109 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(block.get("results").is_some(), "shopping block present");
     }
 
+    // ── ROADMAP item 3: finalize_shopping_block regression tests ─────────
+    // The main-path shopping block (attached to /search on commercial intent)
+    // is finalized by this pure function. These tests lock its contract:
+    // empty input → None; non-empty → Some with results; offer_comparisons
+    // present only when ≥2 results share a gtin/sku; order preserved.
+
+    #[test]
+    fn finalize_shopping_block_returns_none_for_empty_input() {
+        let result = finalize_shopping_block(Vec::new());
+        assert!(result.is_none(), "empty enriched results => None");
+    }
+
+    #[test]
+    fn finalize_shopping_block_returns_some_with_results_for_non_empty_input() {
+        let enriched = vec![
+            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0 }),
+        ];
+        let block = finalize_shopping_block(enriched);
+        assert!(block.is_some(), "non-empty results => Some block");
+        let block = block.unwrap();
+        assert!(
+            block.get("results").is_some(),
+            "block must have results key"
+        );
+        let arr = block["results"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "both results present");
+    }
+
+    #[test]
+    fn finalize_shopping_block_includes_offer_comparisons_when_shared_gtin() {
+        // Two results with the SAME gtin => one comparison group.
+        let enriched = vec![
+            serde_json::json!({
+                "url": "https://a.example.com/p/1",
+                "commerce": { "data": { "gtin": "GTIN1", "price": 19.99, "currency": "USD" }, "observed_at": "100" }
+            }),
+            serde_json::json!({
+                "url": "https://b.example.com/p/2",
+                "commerce": { "data": { "gtin": "GTIN1", "price": 9.99, "currency": "USD" }, "observed_at": "100" }
+            }),
+        ];
+        let block = finalize_shopping_block(enriched).unwrap();
+        assert!(
+            block.get("offer_comparisons").is_some(),
+            "shared gtin must produce offer_comparisons"
+        );
+        let comps = block["offer_comparisons"].as_array().unwrap();
+        assert_eq!(comps.len(), 1, "one comparison group for shared gtin");
+    }
+
+    #[test]
+    fn finalize_shopping_block_excludes_offer_comparisons_when_no_shared_gtin() {
+        // Two results with DIFFERENT gtins => no comparison.
+        let enriched = vec![
+            serde_json::json!({
+                "url": "https://a.example.com/p/1",
+                "commerce": { "data": { "gtin": "GTIN_A", "price": 19.99, "currency": "USD" }, "observed_at": "100" }
+            }),
+            serde_json::json!({
+                "url": "https://b.example.com/p/2",
+                "commerce": { "data": { "gtin": "GTIN_B", "price": 9.99, "currency": "USD" }, "observed_at": "100" }
+            }),
+        ];
+        let block = finalize_shopping_block(enriched).unwrap();
+        assert!(
+            block.get("offer_comparisons").is_none(),
+            "no shared gtin => no offer_comparisons"
+        );
+    }
+
+    #[test]
+    fn finalize_shopping_block_preserves_result_order() {
+        // Order must be byte-identical after finalization.
+        let enriched = vec![
+            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0 }),
+            serde_json::json!({ "url": "https://c.example.com/p/3", "score": 7.0 }),
+        ];
+        let block = finalize_shopping_block(enriched).unwrap();
+        let arr = block["results"].as_array().unwrap();
+        assert_eq!(arr[0]["url"].as_str().unwrap(), "https://a.example.com/p/1");
+        assert_eq!(arr[1]["url"].as_str().unwrap(), "https://b.example.com/p/2");
+        assert_eq!(arr[2]["url"].as_str().unwrap(), "https://c.example.com/p/3");
+    }
+
+    #[test]
+    fn finalize_shopping_block_passes_through_commerce_and_affiliate_fields() {
+        // Commerce + affiliate blocks on enriched results must pass through.
+        let enriched = vec![
+            serde_json::json!({
+                "url": "https://a.example.com/p/1",
+                "commerce": { "price": 49.99, "currency": "USD", "merchant": "Example Store" },
+                "affiliate": { "url": "https://sovrn.co?key=X&u=https%3A%2F%2Fa.example.com%2Fp%2F1", "disclosed": true, "network": "Sovrn" },
+            }),
+        ];
+        let block = finalize_shopping_block(enriched).unwrap();
+        let arr = block["results"].as_array().unwrap();
+        assert_eq!(arr[0]["commerce"]["price"].as_f64().unwrap(), 49.99);
+        assert_eq!(arr[0]["affiliate"]["network"].as_str().unwrap(), "Sovrn");
+        assert_eq!(arr[0]["affiliate"]["disclosed"].as_bool().unwrap(), true);
+    }
+
     // ── ROADMAP item B: product image extraction ─────────────────────────
     // The extractor must pull the product image URL from structured sources:
     // JSON-LD `image` (string, array, or ImageObject), OpenGraph `og:image`,
@@ -20751,7 +20974,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn commerce_config_default_top_n_is_8() {
         // When the data file is absent/missing the field, the default is 8.
         // (Offline test: no data file in the test cwd => default.)
-        let cfg = CommerceConfig { mainpath_top_n: 8 };
+        let cfg = CommerceConfig { mainpath_top_n: 8, transactional_keywords: Vec::new() };
         assert_eq!(cfg.mainpath_top_n, 8, "default top-N is 8");
     }
 
@@ -20760,7 +20983,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // A new value (e.g. 12) can be set by editing the data file — no
         // code change, no recompile. This test simulates what the loader
         // would produce after reading `{"mainpath_top_n": 12}`.
-        let cfg = CommerceConfig { mainpath_top_n: 12 };
+        let cfg = CommerceConfig { mainpath_top_n: 12, transactional_keywords: Vec::new() };
         assert_eq!(cfg.mainpath_top_n, 12, "top-N is data-driven");
     }
 
@@ -20769,7 +20992,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // Edge case: mainpath_top_n = 0 means the shopping block is never
         // surfaced (the take(0) yields an empty array => None). This is a
         // valid "off" setting — proves the value is honored as a cap.
-        let cfg = CommerceConfig { mainpath_top_n: 0 };
+        let cfg = CommerceConfig { mainpath_top_n: 0, transactional_keywords: Vec::new() };
         assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
     }
 
@@ -20848,5 +21071,41 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.price, Some(44.99));
         assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
         assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+}
+
+
+#[cfg(test)]
+mod keyboard_walk_tests {
+    use super::*;
+
+    fn spell_index() -> spell::SymSpellIndex {
+        spell::SymSpellIndex::build()
+    }
+
+    #[test]
+    fn keyboard_walk_gibberish_rejected() {
+        let idx = spell_index();
+        assert!(is_keyboard_walk_query("asdfghjkl xyz123 nonsense", &idx));
+        assert!(is_keyboard_walk_query("asdfghjkl", &idx));
+        assert!(is_keyboard_walk_query("zxcvbnm", &idx));
+    }
+
+    #[test]
+    fn keyboard_walk_legitimate_queries_not_rejected() {
+        let idx = spell_index();
+        assert!(!is_keyboard_walk_query("qwerty keyboard", &idx));
+        assert!(!is_keyboard_walk_query("strengths", &idx));
+        assert!(!is_keyboard_walk_query("asdf", &idx));
+        assert!(!is_keyboard_walk_query("rust web framework", &idx));
+        assert!(!is_keyboard_walk_query("qwerty", &idx));
+    }
+
+    #[test]
+    fn keyboard_walk_edge_cases() {
+        let idx = spell_index();
+        assert!(!is_keyboard_walk_query("", &idx));
+        assert!(!is_keyboard_walk_query("12345", &idx));
+        assert!(!is_keyboard_walk_query("asd", &idx));
     }
 }
