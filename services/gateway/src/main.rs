@@ -14645,7 +14645,32 @@ async fn handle_search(
             "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
         ];
         let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
-        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" {
+        // Do NOT clobber a decisive action/decision intent (comparison,
+        // transactional, how-to, technical, navigational) to fresh. A weather word
+        // like "rain" legitimately appears inside gear/commercial/how-to queries
+        // ("backpacking tent in the rain", "fix laptop fan after rain") and must not
+        // re-rank them by news-recency. Weather override only applies to
+        // informational/chitchat-style queries; genuine weather queries are still
+        // caught by the "today"/"forecast" temporal signals in other overrides.
+        let weather_skip_intents = ["comparison", "transactional", "how-to", "technical", "navigational"];
+        let weather_should_skip = weather_skip_intents.contains(&intent.intent.as_str());
+        // Also skip when the query itself carries decisive product / recommendation /
+        // instructional framing. A weather word inside such a query does NOT make it a
+        // weather query: "best lightweight tent for backpacking in the rain",
+        // "hiking boots that work in snow" are gear/how-to questions the engine may
+        // classify as `informational` (low confidence) -- which the 5-intent skip list
+        // above does not catch, so the weather override would wrongly re-rank them by
+        // news-recency. Genuine weather queries ("weather forecast today rain") carry
+        // none of these markers and still force `fresh` below.
+        let has_decisive_framing = [
+            "best ", "top ", "vs ", " review", "reviews", " for camping", " for backpacking",
+            " for hiking", "how to", "how do i", "buy ", "compare", "alternatives",
+            "which ", "cheapest", " vs. ", "best-",
+        ]
+        .iter()
+        .any(|m| q_lower.contains(m));
+        let weather_should_skip = weather_should_skip || has_decisive_framing;
+        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" && !weather_should_skip {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
                 q, intent.intent, intent.confidence
@@ -15100,16 +15125,6 @@ async fn handle_search(
 
     // Count-based retry (no relevance needed yet — fires before Invidious/news/image)
     if (needs_more_results || has_contrastive_negatives) && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
-        // Compute recall-gap terms BEFORE web_results is moved into
-        // async closures. The temporary Vec from compute_recall_gap_terms
-        // is dropped by end of this block, so no borrow conflicts.
-        let recall_gap_terms: Vec<String> = {
-            if web_results.is_empty() {
-                Vec::new()
-            } else {
-                compute_recall_gap_terms(&q_trimmed, &web_results).unwrap_or_default()
-            }
-        };
         let mut retry_futs = Vec::new();
         let retry_timeout = Duration::from_secs(4); // shorter than initial 5s
         let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 6 } else { 3 };
