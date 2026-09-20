@@ -2009,6 +2009,8 @@ Returns a JSON array (list) of goal leaderboard entries, sorted by score (descen
 
 Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
 
+Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
+
 ```json
 [
   {

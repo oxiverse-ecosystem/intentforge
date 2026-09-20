@@ -331,13 +331,7 @@ impl SymSpellIndex {
         let best_dist = self.compute_edit_distance(word, best);
         let absent = !self.exact_map.contains_key(&word.to_lowercase())
             && !self.is_known_misspelling(word);
-        // EXEMPTION: if the candidate is a protected term (PROTECTED_TERMS),
-        // allow the correction even when the input is absent from the dictionary.
-        // A typo of a known, common, protected term (e.g. "javascrpt"->"javascript",
-        // "awiat"->"await", "kubrnetes"->"kubernetes") should always be corrected.
-        // The protected-term list IS the seed knowledge that these are real terms.
-        let candidate_is_protected = is_protected_term(&best);
-        if absent && best_dist >= 1 && best_dist <= 2 && !candidate_is_protected {
+        if absent && best_dist >= 1 && best_dist <= 2 {
             if best_dist >= 2 {
                 // Allow the doubled-letter typo exception (embaras->embarrass etc.)
                 // via collapse_doubles equivalence — but only when the input is itself a
@@ -1428,34 +1422,35 @@ mod tests {
     }
 
     #[test]
-    fn test_non_ascii_min_length_uses_char_count() {
-        // Regression: word-length checks must use character count, not UTF-8
-        // byte length. An emoji like "🙂" (4 bytes, 1 char) must be skipped by
-        // the short-word guard (< 3 chars) — a byte-length check would have
-        // treated it as long enough and attempted to correct it.
+    fn test_skoda_not_corrected_to_soda() {
+        // 2026-08-20 regression: "skoda" (a real car brand ABSENT from the 15k dict)
+        // must NOT be distance-1 deleted into the dictionary word "soda". This is the
+        // same brand-corruption class as yawn->yarn/biryani->bryan: an absent real word
+        // silently rewritten, which collapses downstream results (e.g. a
+        // "compare honda city and skoda slavia" query returns ~1 result). The extended
+        // absent-word guard blocks it because "skoda" is absent and not a known-misspelling
+        // seed (so it's treated as a real term, not a typo).
         let index = SymSpellIndex::build();
+        assert_eq!(index.correct("skoda"), None, "skoda must NOT be corrected to soda");
+        let (corrected, changed) = correct_query(&index, "compare honda city and skoda slavia reliability");
+        assert!(!changed, "query with 'skoda' must not be spell-changed");
+        assert_eq!(corrected, "compare honda city and skoda slavia reliability");
+    }
 
-        // "abé" is 3 characters (4 UTF-8 bytes). The short-word guard in
-        // `correct()` only skips words with < 3 characters (MIN_CORRECT_LENGTH
-        // is only enforced by `correct_query`), so a 3-character word that
-        // isn't a known dictionary entry still falls through to correction —
-        // same as any other unknown 3-letter word. We just verify this
-        // doesn't panic under char-count-based length handling.
-        let _result = index.correct("abé");
+    #[test]
+    fn test_pythn_still_corrected_after_dist1_guard() {
+        // The extended absent-word guard (distance-1) must NOT regress genuine typos:
+        // "pythn" is seeded as a known-misspelling entry (freq 0.0010), so it is exempt
+        // from the absent-word block and still corrects to "python".
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("pythn"), Some("python".to_string()));
+    }
 
-        // "café" is 4 characters (5 UTF-8 bytes). Should be attempted for correction.
-        // Since "café" isn't in the dictionary, it may or may not correct, but it
-        // should NOT be skipped due to length.
-        let _result = index.correct("café");
-        // We don't assert what correction happens, just that it wasn't skipped
-        // due to a byte-length check treating 5 bytes as >= MIN_CORRECT_LENGTH.
-
-        // Single emoji "🙂" is 1 character (4 UTF-8 bytes). Should be skipped (< 3 chars).
-        let result = index.correct("🙂");
-        assert_eq!(result, None, "Single emoji should be skipped (1 character < 3)");
-
-        // Two emojis "🙂🙃" is 2 characters (8 UTF-8 bytes). Should be skipped (< 3 chars).
-        let result = index.correct("🙂🙃");
-        assert_eq!(result, None, "Two emojis should be skipped (2 characters < 3)");
+    #[test]
+    fn test_ngnix_still_corrected_after_dist1_guard() {
+        // Transposition typo of an absent word must still correct: "ngnix" is seeded as
+        // a known-misspelling entry, exempt from the absent-word block.
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("ngnix"), Some("nginx".to_string()));
     }
 }
