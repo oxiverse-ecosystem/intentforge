@@ -58,9 +58,6 @@ struct Constraints {
     positive: Vec<String>,
     #[serde(default)]
     negative: Vec<String>,
-    /// Match mode for constraint filtering.
-    #[serde(default)]
-    match_mode: MatchMode,
     /// Hard-exclusion terms supplied via the explicit `NOT:` advanced operator
     /// (mirrors `site:`/`filetype:`). Unlike a bare `not X` negation (which is a
     /// soft topical penalty gated on entity/contrastive recognition via
@@ -3004,7 +3001,6 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
     Constraints {
         positive,
         negative,
-        match_mode: MatchMode::default(),
         hard_exclusions,
         entities: c.entities.clone(),
         language: c.language.clone(),
@@ -12814,6 +12810,7 @@ fn build_inspect(index: &spell::SymSpellIndex, q: &str) -> serde_json::Value {
         }
     }
     for n in &sc.negative { applied.push(format!("not:{}", n)); }
+    for he in &sc.hard_exclusions { applied.push(format!("not:{}", he)); }
 
     // 5. Recency (what a fresh/recent phrase would inject as a date window).
     let recency_window = derive_recency_window(&q.to_lowercase());
