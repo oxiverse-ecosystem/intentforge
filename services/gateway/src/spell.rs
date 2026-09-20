@@ -267,7 +267,12 @@ impl SymSpellIndex {
             }
             (Some(s), None) => s,
             (None, Some(l)) => l,
-            (None, None) => return None,
+            (None, None) => {
+                // Stage 4: Phonetic fallback — try Soundex-based correction
+                // for words that SymSpell/LinSpell couldn't fix (e.g. letter-drop
+                // typos like "cancing" → "cancelling").
+                return self.phonetic_fallback(&word_lower);
+            }
         };
 
         // Phase 1 (A1): block a single-character-substitution swap when BOTH

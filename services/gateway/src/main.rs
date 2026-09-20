@@ -11536,20 +11536,35 @@ fn merge_local_and_web(
                 let cl = r.content.to_lowercase();
                 let ul = r.url.to_lowercase();
 
-                let matches_topic = strong_distinctive_terms.iter().any(|t| {
-                    let lt = t.to_lowercase();
-                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
-                });
-
-                if matches_topic {
-                    continue;
-                }
-
                 let is_bing_noise = is_dictionary_site(&ul, &rl, &cl)
                     || is_stock_finance(&ul, &rl)
                     || is_generic_help(&ul, &rl, &cl);
 
-                if is_bing_noise && r.score > 0.03 {
+                if !is_bing_noise {
+                    continue;
+                }
+
+                let matched_count = strong_distinctive_terms.iter().filter(|t| {
+                    let lt = t.to_lowercase();
+                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
+                }).count();
+
+                // For multi-topic queries, require >=2 topic matches.
+                // A dictionary page for "quiet" matching only "quiet" in
+                // "quiet coworking spaces bangalore day pass" is noise.
+                let topic_match_sufficient = if strong_distinctive_terms.len() >= 3 {
+                    matched_count >= 2
+                } else if strong_distinctive_terms.len() == 2 {
+                    matched_count >= 2
+                } else {
+                    matched_count >= 1
+                };
+
+                if !topic_match_sufficient && r.score > 0.03 {
+                    tracing::info!(
+                        "FIX-IF-16 BING-NOISE -> {:.2}: '{}' (noise, matched {} of {} topics)",
+                        0.03, r.url.chars().take(60).collect::<String>(), matched_count, strong_distinctive_terms.len()
+                    );
                     r.score = 0.03;
                 }
             }
@@ -11604,15 +11619,24 @@ fn is_dictionary_site(url: &str, title: &str, content: &str) -> bool {
     let prefix = cl.chars().take(300).collect::<String>();
     let dict_path_marker = ul.contains("/dictionary/")
         || ul.contains("/define/")
-        || ul.contains("/meaning/");
+        || ul.contains("/meaning/")
+        || ul.contains("/grammar/")
+        || ul.contains("wiktionary.org")
+        || ul.contains("vocabulary.com")
+        || ul.contains("thefreedictionary.com")
+        || ul.contains("collinsdictionary.com")
+        || ul.contains("oxfordlearnersdictionaries.com")
+        || ul.contains("dictionary.com");
     let title_words: Vec<&str> = tl.split_whitespace().collect();
     let dict_title = tl.contains("meaning & definition")
         || tl.contains("definition & meaning")
         || tl.contains("definition of ")
         || tl.contains("meaning of ")
-        || tl.ends_with("- wiktionary")
+        || tl.contains("wiktionary")
         || tl.contains("cambridge dictionary")
         || tl.contains("merriam-webster")
+        || tl.contains("oxford dictionary")
+        || tl.contains("grammar")
         || (title_words.len() <= 3 && (tl.contains("definition") || tl.contains("dictionary")));
     let phonetic = prefix.contains("/ˈ") || prefix.contains("/ˌ")
         || prefix.contains("/'") || prefix.contains("/-");
@@ -20077,6 +20101,51 @@ mod spellcheck_endpoint_tests {
             assert_eq!(res["intent"].as_str(), Some("informational"));
             assert_eq!(res["category"].as_str(), Some("informational"));
             assert!(res["confidence"].as_f64().unwrap() > 0.0);
+        }
+
+        #[test]
+        fn intent_detects_transactional_model_number() {
+            // "iphone 16 pro max price" must resolve to transactional (model-number pattern).
+            let res = build_intent("iphone 16 pro max price");
+            assert_eq!(res["intent"].as_str(), Some("transactional"));
+            assert_eq!(res["category"].as_str(), Some("transactional"));
+            assert!(res["confidence"].as_f64().unwrap() >= 0.7);
+        }
+
+        #[test]
+        fn intent_detects_transactional_price_word() {
+            // "best budget laptop" — price word + 2 content words → transactional.
+            let res = build_intent("best budget laptop");
+            assert_eq!(res["intent"].as_str(), Some("transactional"));
+            assert!(res["confidence"].as_f64().unwrap() >= 0.6);
+        }
+
+        #[test]
+        fn intent_detects_transactional_macbook_m3() {
+            // "macbook pro m3" — model-number pattern → transactional.
+            let res = build_intent("macbook pro m3");
+            assert_eq!(res["intent"].as_str(), Some("transactional"));
+        }
+
+        #[test]
+        fn intent_detects_transactional_galaxy_s24() {
+            // "galaxy s24" — model-number pattern → transactional.
+            let res = build_intent("galaxy s24");
+            assert_eq!(res["intent"].as_str(), Some("transactional"));
+        }
+
+        #[test]
+        fn intent_informational_not_transactional() {
+            // "how does a cpu pipeline work" — no model-number, no price word → informational.
+            let res = build_intent("how does a cpu pipeline work");
+            assert_eq!(res["intent"].as_str(), Some("informational"));
+        }
+
+        #[test]
+        fn intent_informational_single_content_word() {
+            // "price of gold" — price word but only 1 content word → informational.
+            let res = build_intent("price of gold");
+            assert_eq!(res["intent"].as_str(), Some("informational"));
         }
 
         #[test]
