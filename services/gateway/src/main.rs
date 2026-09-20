@@ -20499,6 +20499,109 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(block.get("results").is_some(), "shopping block present");
     }
 
+    // ── ROADMAP item 3: finalize_shopping_block regression tests ─────────
+    // The main-path shopping block (attached to /search on commercial intent)
+    // is finalized by this pure function. These tests lock its contract:
+    // empty input → None; non-empty → Some with results; offer_comparisons
+    // present only when ≥2 results share a gtin/sku; order preserved.
+
+    #[test]
+    fn finalize_shopping_block_returns_none_for_empty_input() {
+        let result = finalize_shopping_block(Vec::new());
+        assert!(result.is_none(), "empty enriched results => None");
+    }
+
+    #[test]
+    fn finalize_shopping_block_returns_some_with_results_for_non_empty_input() {
+        let enriched = vec![
+            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0 }),
+        ];
+        let block = finalize_shopping_block(enriched);
+        assert!(block.is_some(), "non-empty results => Some block");
+        let block = block.unwrap();
+        assert!(
+            block.get("results").is_some(),
+            "block must have results key"
+        );
+        let arr = block["results"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "both results present");
+    }
+
+    #[test]
+    fn finalize_shopping_block_includes_offer_comparisons_when_shared_gtin() {
+        // Two results with the SAME gtin => one comparison group.
+        let enriched = vec![
+            serde_json::json!({
+                "url": "https://a.example.com/p/1",
+                "commerce": { "data": { "gtin": "GTIN1", "price": 19.99, "currency": "USD" }, "observed_at": "100" }
+            }),
+            serde_json::json!({
+                "url": "https://b.example.com/p/2",
+                "commerce": { "data": { "gtin": "GTIN1", "price": 9.99, "currency": "USD" }, "observed_at": "100" }
+            }),
+        ];
+        let block = finalize_shopping_block(enriched).unwrap();
+        assert!(
+            block.get("offer_comparisons").is_some(),
+            "shared gtin must produce offer_comparisons"
+        );
+        let comps = block["offer_comparisons"].as_array().unwrap();
+        assert_eq!(comps.len(), 1, "one comparison group for shared gtin");
+    }
+
+    #[test]
+    fn finalize_shopping_block_excludes_offer_comparisons_when_no_shared_gtin() {
+        // Two results with DIFFERENT gtins => no comparison.
+        let enriched = vec![
+            serde_json::json!({
+                "url": "https://a.example.com/p/1",
+                "commerce": { "data": { "gtin": "GTIN_A", "price": 19.99, "currency": "USD" }, "observed_at": "100" }
+            }),
+            serde_json::json!({
+                "url": "https://b.example.com/p/2",
+                "commerce": { "data": { "gtin": "GTIN_B", "price": 9.99, "currency": "USD" }, "observed_at": "100" }
+            }),
+        ];
+        let block = finalize_shopping_block(enriched).unwrap();
+        assert!(
+            block.get("offer_comparisons").is_none(),
+            "no shared gtin => no offer_comparisons"
+        );
+    }
+
+    #[test]
+    fn finalize_shopping_block_preserves_result_order() {
+        // Order must be byte-identical after finalization.
+        let enriched = vec![
+            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0 }),
+            serde_json::json!({ "url": "https://c.example.com/p/3", "score": 7.0 }),
+        ];
+        let block = finalize_shopping_block(enriched).unwrap();
+        let arr = block["results"].as_array().unwrap();
+        assert_eq!(arr[0]["url"].as_str().unwrap(), "https://a.example.com/p/1");
+        assert_eq!(arr[1]["url"].as_str().unwrap(), "https://b.example.com/p/2");
+        assert_eq!(arr[2]["url"].as_str().unwrap(), "https://c.example.com/p/3");
+    }
+
+    #[test]
+    fn finalize_shopping_block_passes_through_commerce_and_affiliate_fields() {
+        // Commerce + affiliate blocks on enriched results must pass through.
+        let enriched = vec![
+            serde_json::json!({
+                "url": "https://a.example.com/p/1",
+                "commerce": { "price": 49.99, "currency": "USD", "merchant": "Example Store" },
+                "affiliate": { "url": "https://sovrn.co?key=X&u=https%3A%2F%2Fa.example.com%2Fp%2F1", "disclosed": true, "network": "Sovrn" },
+            }),
+        ];
+        let block = finalize_shopping_block(enriched).unwrap();
+        let arr = block["results"].as_array().unwrap();
+        assert_eq!(arr[0]["commerce"]["price"].as_f64().unwrap(), 49.99);
+        assert_eq!(arr[0]["affiliate"]["network"].as_str().unwrap(), "Sovrn");
+        assert_eq!(arr[0]["affiliate"]["disclosed"].as_bool().unwrap(), true);
+    }
+
     // ── ROADMAP item B: product image extraction ─────────────────────────
     // The extractor must pull the product image URL from structured sources:
     // JSON-LD `image` (string, array, or ImageObject), OpenGraph `og:image`,
