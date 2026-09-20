@@ -1380,6 +1380,39 @@ pub async fn handle_update_progress(
     }
 }
 
+/// GET /goals/:id/progress — return current progress state (read-only)
+pub async fn handle_get_progress(
+    State(state): State<Arc<crate::AppState>>,
+    Path(goal_id): Path<String>,
+) -> Response {
+    let store = state.goals_state.lock();
+    match store.get(&goal_id) {
+        Some(s) => {
+            let status = if s.roadmap.is_none() {
+                "pending_answers".to_string()
+            } else if s.completed_phases == s.total_phases && s.total_phases > 0 {
+                "completed".to_string()
+            } else {
+                "active".to_string()
+            };
+
+            (StatusCode::OK, Json(serde_json::json!({
+                "goal_id": s.goal_id,
+                "goal": s.goal,
+                "status": status,
+                "completed_phases": s.completed_phases,
+                "total_phases": s.total_phases,
+                "score": s.score,
+                "roadmap": s.roadmap,
+            }))).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "not_found",
+            "message": format!("Goal '{}' not found", goal_id)
+        }))).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
