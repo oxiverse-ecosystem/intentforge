@@ -52,7 +52,7 @@ enum MatchMode {
     Soft,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 struct Constraints {
     #[serde(default)]
     positive: Vec<String>,
@@ -124,7 +124,7 @@ enum EntityRole {
     Exclusion,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct QueryEntity {
     text: String,
     role: EntityRole,
@@ -2140,34 +2140,8 @@ fn constraint_score(
                 }
             })
         } else {
-            // Multi-word negative: exact phrase match first (strongest signal).
-            // Fallback: match any content word (non-stopword, len >= 3) of the
-            // negative. Without this, "adobe photoshop" would only penalize pages
-            // containing the full phrase, letting "Adobe Creative Cloud" / "Adobe
-            // Stock" escape entirely — the exact opposite of the user's intent for
-            // "alternatives to adobe photoshop".
-            let phrase_matched = title_lower.contains(&neg_lower)
-                || title_normalized.contains(&neg_normalized)
-                || url.to_lowercase().contains(&neg_lower);
-            if phrase_matched {
-                true
-            } else {
-                // Collect content words from the negative (skip stopwords and short tokens)
-                let content_words: Vec<&str> = neg_words.iter()
-                    .filter(|w| {
-                        let wl = w.to_lowercase();
-                        wl.len() >= 3 && !STOPWORDS.contains(&wl.as_str())
-                    })
-                    .copied()
-                    .collect();
-                // Require at least one content word to match — otherwise a purely
-                // stopword negative (shouldn't happen, but guard anyway) would match nothing.
-                !content_words.is_empty() && content_words.iter().any(|w| {
-                    let wl = w.to_lowercase();
-                    title_lower.contains(&wl) || title_normalized.contains(&wl)
-                        || url.to_lowercase().contains(&wl)
-                })
-            }
+            title_lower.contains(&neg_lower) || title_normalized.contains(&neg_normalized)
+            || url.to_lowercase().contains(&neg_lower)
         };
 
         let content_matched = if neg_words.len() == 1 {
@@ -2196,15 +2170,10 @@ fn constraint_score(
                     neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
                     boost);
                 score *= boost;
-                // ALT-PAGE FIX: even when the term is in negating context,
-                // alt pages that mention the excluded term must still be
-                // penalized relative to pages that don't mention it at all.
-                // Without this, the 1.18 boost lifts Google-titled pages
-                // above non-Google pages (c_score 1.18 > 1.0), inverting
-                // the intended ranking for "alternative to X" queries.
-                if is_alt_page {
-                    any_unresolved_violation = true;
-                }
+                // Do NOT flag as violation: the term is in negating context,
+                // meaning the page is FULFILLING the exclusion (e.g. "without pills"),
+                // not violating it. The alt-page penalty below must not cancel
+                // this boost.
             } else if !is_alt_page {
                 let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
                 tracing::info!("CONSTRAINT HIT (TITLE/URL): '{}' in '{}' → penalty={:.4} (non-alt)",
@@ -4918,7 +4887,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
         distance_units.iter().any(|u| next_token_lower == *u)
     };
 
-    // Pattern A: upper-marker then number (+ optional currency word)
+    // Pattern A: upper-marker then optional currency symbol then number
     // ANCHORED at start of `rest`: the number must be the FIRST token after the
     // marker (only whitespace allowed between). Without the anchor, "about" in
     // "latest news about chandrayaan 4 mission" matched as a price marker and
@@ -4926,17 +4895,20 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     // fresh→transactional (Override 6) → date window crushed 19→1 results.
     // General: a price marker is only meaningful when the number follows it
     // directly ("under 150 dollars"), not when other words intervene.
+    // Allows optional currency symbol ($ ₹ € £ ¥) between marker and number
+    // to handle "under $200" in addition to "under 200" and "under 200 dollars".
     for marker in upper_markers {
         if let Some(pos) = lower.find(marker) {
             let rest = &lower[pos + marker.len()..];
-            let re_num = regex::Regex::new(&format!(r"^\s*{}\b", amount_pat)).ok()?;
+            let re_num = regex::Regex::new(&format!(r"^\s*[\$₹€£¥]?\s*{}\b", amount_pat)).ok()?;
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
                         // Distance-bound guard: "within 300 kilometers" is a
                         // range, not a price — skip this marker (let a later
                         // price marker, if any, match instead).
-                        if is_distance_bound(rest) {
+                        let after_num = &rest[m.end()..];
+                        if is_distance_bound(after_num) {
                             continue;
                         }
                         let currency = currency_words.iter().find(|c| rest.contains(*c))
@@ -4947,7 +4919,6 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             }
         }
     }
-    // Pattern B: currency symbol/word then number then upper-marker
     let re_b = regex::Regex::new(&format!(r"(₹|¥|€|£|\$|usd|inr|rs|rupees?|eur|euros?|gbp|pounds?)\s*{}?\s*({})", amount_pat, upper_markers.join("|"))).ok()?;
     if let Some(caps) = re_b.captures(&lower) {
         if let (Some(cur), Some(num)) = (caps.get(1), caps.get(2)) {
@@ -8693,9 +8664,29 @@ fn has_video_intent(query: &str) -> bool {
 fn extract_comparison_entity_groups(query: &str) -> Option<(Vec<String>, Vec<String>)> {
     let lower = query.to_lowercase();
 
+    // Helper: truncate a group at the first preposition that introduces context.
+    // For "azure for machine learning workloads", we want "azure", not
+    // "azure for machine learning workloads". The compared entity is the
+    // noun phrase BEFORE the preposition; everything after is context.
+    let truncate_at_preposition = |text: &str| -> String {
+        let prepositions = [" for ", " with ", " in ", " on ", " about ", " regarding ", " concerning "];
+        let mut earliest = text.len();
+        for p in &prepositions {
+            if let Some(pos) = text.find(p) {
+                if pos < earliest {
+                    earliest = pos;
+                }
+            }
+        }
+        text[..earliest].to_string()
+    };
+
     // Helper: tokenize a group, keeping only distinctive content words.
+    // Truncates at context prepositions first so "azure for machine learning"
+    // yields ["azure"], not ["azure", "machine", "learning"].
     let tokenize_distinctive = |text: &str| -> Vec<String> {
-        text.split_whitespace()
+        let truncated = truncate_at_preposition(text);
+        truncated.split_whitespace()
             .map(|s| s.to_lowercase())
             .filter(|s| {
                 !s.is_empty()
@@ -10842,6 +10833,15 @@ fn merge_local_and_web(
             "manual", "natural", "artificial", "synthetic", "organic", "inorganic",
             "physical", "mental", "emotional", "rational", "irrational", "logical",
             "illogical", "experimental", "empirical",
+            // Superlative / comparative forms (round 2026-09-20T0348Z): without these,
+            // off-topic results named after the superlative ("MOST" museum, "FasTest"
+            // leak-test tools, "Speedtest") evade the modifier-word demotion and rank #1
+            // for "most effective strategies", "fastest way to learn go", etc.
+            "most", "more", "least", "less", "faster", "slower", "fastest", "slowest",
+            "quickest", "easiest", "hardest", "simplest", "biggest", "smallest", "largest",
+            "tiniest", "oldest", "newest", "youngest", "hottest", "coldest", "warmest",
+            "coolest", "greatest", "latest", "earliest", "first", "last", "next", "previous",
+            "best",
         ];
         let modifier_word_in_query = q_words.iter().any(|w| {
             general_modifier_terms.contains(&w.to_lowercase().as_str())
@@ -11536,20 +11536,35 @@ fn merge_local_and_web(
                 let cl = r.content.to_lowercase();
                 let ul = r.url.to_lowercase();
 
-                let matches_topic = strong_distinctive_terms.iter().any(|t| {
-                    let lt = t.to_lowercase();
-                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
-                });
-
-                if matches_topic {
-                    continue;
-                }
-
                 let is_bing_noise = is_dictionary_site(&ul, &rl, &cl)
                     || is_stock_finance(&ul, &rl)
                     || is_generic_help(&ul, &rl, &cl);
 
-                if is_bing_noise && r.score > 0.03 {
+                if !is_bing_noise {
+                    continue;
+                }
+
+                let matched_count = strong_distinctive_terms.iter().filter(|t| {
+                    let lt = t.to_lowercase();
+                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
+                }).count();
+
+                // For multi-topic queries, require >=2 topic matches.
+                // A dictionary page for "quiet" matching only "quiet" in
+                // "quiet coworking spaces bangalore day pass" is noise.
+                let topic_match_sufficient = if strong_distinctive_terms.len() >= 3 {
+                    matched_count >= 2
+                } else if strong_distinctive_terms.len() == 2 {
+                    matched_count >= 2
+                } else {
+                    matched_count >= 1
+                };
+
+                if !topic_match_sufficient && r.score > 0.03 {
+                    tracing::info!(
+                        "FIX-IF-16 BING-NOISE -> {:.2}: '{}' (noise, matched {} of {} topics)",
+                        0.03, r.url.chars().take(60).collect::<String>(), matched_count, strong_distinctive_terms.len()
+                    );
                     r.score = 0.03;
                 }
             }
@@ -11604,15 +11619,24 @@ fn is_dictionary_site(url: &str, title: &str, content: &str) -> bool {
     let prefix = cl.chars().take(300).collect::<String>();
     let dict_path_marker = ul.contains("/dictionary/")
         || ul.contains("/define/")
-        || ul.contains("/meaning/");
+        || ul.contains("/meaning/")
+        || ul.contains("/grammar/")
+        || ul.contains("wiktionary.org")
+        || ul.contains("vocabulary.com")
+        || ul.contains("thefreedictionary.com")
+        || ul.contains("collinsdictionary.com")
+        || ul.contains("oxfordlearnersdictionaries.com")
+        || ul.contains("dictionary.com");
     let title_words: Vec<&str> = tl.split_whitespace().collect();
     let dict_title = tl.contains("meaning & definition")
         || tl.contains("definition & meaning")
         || tl.contains("definition of ")
         || tl.contains("meaning of ")
-        || tl.ends_with("- wiktionary")
+        || tl.contains("wiktionary")
         || tl.contains("cambridge dictionary")
         || tl.contains("merriam-webster")
+        || tl.contains("oxford dictionary")
+        || tl.contains("grammar")
         || (title_words.len() <= 3 && (tl.contains("definition") || tl.contains("dictionary")));
     let phonetic = prefix.contains("/ˈ") || prefix.contains("/ˌ")
         || prefix.contains("/'") || prefix.contains("/-");
@@ -13601,11 +13625,11 @@ async fn handle_search(
         return make_error_response(q_trimmed, "invalid_query", "Query appears to be gibberish; no results returned", true);
     }
 
-    // FIX-IF-03: keyboard-walk detector — pre-gate check for pure keyboard-mashing
-    // patterns (asdfghjkl, zxcvbnm, etc.) that pass the vowel/consonant ratio check
-    // because they contain vowels.
+    // Phase 7b: keyboard-walk / consonant-mash rejection (FIX-IF-03).
+    // Catches strings like "asdfghjkl" that pass the vowel/consonant ratio
+    // check because they contain vowels, but are clearly not real queries.
     if is_keyboard_walk_query(&q_cleaned_spelling, &state.spell_index) {
-        return make_error_response(q_trimmed, "invalid_query", "Query appears to be gibberish; no results returned", true);
+        return make_error_response(q_trimmed, "invalid_query", "Query appears to be keyboard-walk gibberish; no results returned", true);
     }
 
     // 0b. Check cache first (5-min TTL)
@@ -17684,8 +17708,28 @@ let mut results = match tokio::task::spawn_blocking(move || {
         shopping: shopping_block,
     };
 
+    // ── Post-rank affiliate decoration for /search ──
+    // When commercial intent is detected (transactional label / strong transactional
+    // distribution / stated price bound / exact model-number pattern in query),
+    // apply the SAME strict post-rank affiliate decoration that /shopping and the
+    // main-path shopping block use. This ensures /search results carry affiliate
+    // links for commercial queries, not just /shopping. Decoration is strictly
+    // post-ranking: order-invariance is preserved (it only mutates each result's
+    // `affiliate` field, never reorders).
+    let mut response_value = serde_json::to_value(&response).unwrap_or(serde_json::json!({}));
+    let should_decorate_affiliate = is_commercial_intent(
+        &intent.intent,
+        &intent.distribution,
+        sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
+    ) || !detect_product_entities(q_trimmed).is_empty();
+    if should_decorate_affiliate {
+        if let Some(arr) = response_value.get_mut("results").and_then(|v| v.as_array_mut()) {
+            decorate_affiliate(arr, &state.affiliate_ctx);
+        }
+    }
+
     // Cache for 5 minutes — but never cache empty results
-    let response_json = serde_json::to_string(&response).unwrap_or_default();
+    let response_json = serde_json::to_string(&response_value).unwrap_or_default();
     if !response.results.is_empty() {
         state.cache.put(cache_key.clone(), response_json.clone(), Duration::from_secs(300));
     }
@@ -17703,7 +17747,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         guard.complete();
     }
 
-    (axum::http::StatusCode::OK, Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({}))))
+    (axum::http::StatusCode::OK, Json(response_value))
 }
 
 fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
@@ -18313,6 +18357,58 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     }
 }
 
+/// Detects transactional intent signals using structural patterns (no per-product
+/// keyword enumeration). Used by `fallback_intent` to recognize shopping queries
+/// like "iphone 16 pro max price" without the intent engine.
+///
+/// Signal 1 — model-number pattern: word(s) + alphanumeric token containing a digit,
+///   optionally followed by generic product suffixes (pro, max, plus, ultra, air, lite, se).
+///   Matches "iphone 16 pro max", "macbook m3", "galaxy s24", "rtx 4090".
+/// Signal 2 — price word + multi-word product description: a generic commerce term
+///   ("price", "cheap", "budget", "under") alongside >= 2 content words (e.g.
+///   "samsung tv under 500", "best budget laptop").
+///
+/// Returns (is_transactional, confidence). Confidence is higher for model-number
+/// matches (stronger transactional signal) than for price-word co-occurrence.
+fn detect_transactional_signals(q: &str) -> (bool, f32) {
+    let q_lower = q.to_lowercase();
+
+    // Signal 1: model-number pattern.
+    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let model_re = MODEL_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\b[a-z]+(?:\s+[a-z]+)*\s+[a-z]?\d[\w\-]*(?:\s+(?:pro|max|plus|ultra|air|lite|se|mini))*\b",
+        )
+        .unwrap()
+    });
+    if model_re.is_match(&q_lower) {
+        return (true, 0.75);
+    }
+
+    // Signal 2: price word + substantial product description.
+    const PRICE_WORDS: &[&str] = &[
+        "price", "prices", "pricing", "cost", "costs", "cheap", "cheapest",
+        "budget", "affordable", "under", "over", "deal", "deals", "sale",
+        "sales", "discount", "offer", "offers", "buy", "purchase", "shop", "store",
+    ];
+    if PRICE_WORDS.iter().any(|pw| q_lower.contains(pw)) {
+        const STOP: &[&str] = &[
+            "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to",
+            "for", "of", "with", "and", "or", "not", "do", "does", "what", "which",
+            "how", "where", "when", "who", "why",
+        ];
+        let content_count = q_lower
+            .split_whitespace()
+            .filter(|w| !STOP.contains(w) && !PRICE_WORDS.contains(w))
+            .count();
+        if content_count >= 2 {
+            return (true, 0.65);
+        }
+    }
+
+    (false, 0.3)
+}
+
 fn fallback_intent(q: &str) -> IntentResponse {
     let mut structured = extract_gateway_constraints(q);
     let mut negative = Vec::new();
@@ -18327,10 +18423,17 @@ fn fallback_intent(q: &str) -> IntentResponse {
     }
     structured.negative = negative;
 
+    // Detect transactional signals (model-number patterns, price + product).
+    let (is_transactional, confidence) = detect_transactional_signals(q);
+
     IntentResponse {
         query: q.to_string(),
-        intent: "informational".to_string(),
-        confidence: 0.3,
+        intent: if is_transactional {
+            "transactional".to_string()
+        } else {
+            "informational".to_string()
+        },
+        confidence,
         constraints: vec![],
         structured_constraints: structured,
         expanded_queries: vec![q.to_string()],
@@ -20001,6 +20104,51 @@ mod spellcheck_endpoint_tests {
         }
 
         #[test]
+        fn intent_detects_transactional_model_number() {
+            // "iphone 16 pro max price" must resolve to transactional (model-number pattern).
+            let res = build_intent("iphone 16 pro max price");
+            assert_eq!(res["intent"].as_str(), Some("transactional"));
+            assert_eq!(res["category"].as_str(), Some("transactional"));
+            assert!(res["confidence"].as_f64().unwrap() >= 0.7);
+        }
+
+        #[test]
+        fn intent_detects_transactional_price_word() {
+            // "best budget laptop" — price word + 2 content words → transactional.
+            let res = build_intent("best budget laptop");
+            assert_eq!(res["intent"].as_str(), Some("transactional"));
+            assert!(res["confidence"].as_f64().unwrap() >= 0.6);
+        }
+
+        #[test]
+        fn intent_detects_transactional_macbook_m3() {
+            // "macbook pro m3" — model-number pattern → transactional.
+            let res = build_intent("macbook pro m3");
+            assert_eq!(res["intent"].as_str(), Some("transactional"));
+        }
+
+        #[test]
+        fn intent_detects_transactional_galaxy_s24() {
+            // "galaxy s24" — model-number pattern → transactional.
+            let res = build_intent("galaxy s24");
+            assert_eq!(res["intent"].as_str(), Some("transactional"));
+        }
+
+        #[test]
+        fn intent_informational_not_transactional() {
+            // "how does a cpu pipeline work" — no model-number, no price word → informational.
+            let res = build_intent("how does a cpu pipeline work");
+            assert_eq!(res["intent"].as_str(), Some("informational"));
+        }
+
+        #[test]
+        fn intent_informational_single_content_word() {
+            // "price of gold" — price word but only 1 content word → informational.
+            let res = build_intent("price of gold");
+            assert_eq!(res["intent"].as_str(), Some("informational"));
+        }
+
+        #[test]
         fn intent_empty_query_envelope_distinct_from_search() {
             // The empty envelope carries the /intent key set (so clients can
             // distinguish it from /search /spellcheck empty responses) but with
@@ -20519,6 +20667,83 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("informational".to_string(), 0.95);
         dist.insert("transactional".to_string(), 0.02);
         assert!(!is_commercial_intent("informational", &dist, false));
+    }
+
+    // ── REGRESSION: main-path shopping block gate on /search ─────────────
+    // The main-path `shopping` block is attached to `/search` ONLY when
+    // `is_commercial_intent` returns true. These tests lock that contract so a
+    // future change cannot accidentally attach the shopping block to
+    // non-commercial queries (or fail to attach it to commercial ones).
+
+    #[test]
+    fn main_path_shopping_block_attached_for_transactional_intent() {
+        // A transactional query (e.g. "iphone 16 pro max price") must have the
+        // shopping block attached to the /search response. This is the
+        // regression test for the main-path commerce feature.
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("transactional".to_string(), 0.85);
+        dist.insert("informational".to_string(), 0.15);
+        // The gate fires on the transactional label alone
+        assert!(
+            is_commercial_intent("transactional", &dist, false),
+            "transactional intent must trigger shopping block"
+        );
+    }
+
+    #[test]
+    fn main_path_shopping_block_attached_for_price_bound_query() {
+        // A query with a price bound (e.g. "laptop under 50000") must have the
+        // shopping block attached even if the argmax label is not transactional.
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("comparison".to_string(), 0.60);
+        dist.insert("transactional".to_string(), 0.20);
+        // The gate fires on the price bound alone (has_price_bound=true)
+        assert!(
+            is_commercial_intent("comparison", &dist, true),
+            "price-bound query must trigger shopping block regardless of label"
+        );
+    }
+
+    #[test]
+    fn main_path_shopping_block_NOT_attached_for_informational_query() {
+        // A purely informational query (e.g. "what is rust programming language")
+        // must NOT have the shopping block attached. This prevents the shopping
+        // block from appearing on non-commercial queries.
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("informational".to_string(), 0.90);
+        dist.insert("transactional".to_string(), 0.05);
+        // No price bound, no transactional signal => gate does NOT fire
+        assert!(
+            !is_commercial_intent("informational", &dist, false),
+            "informational query must NOT trigger shopping block"
+        );
+    }
+
+    #[test]
+    fn main_path_shopping_block_attached_for_strong_transactional_distribution() {
+        // A query with strong transactional distribution (>= 0.50) must have the
+        // shopping block attached even if the argmax label is something else
+        // (e.g. "comparison" for "best laptop under 50000").
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("comparison".to_string(), 0.55);
+        dist.insert("transactional".to_string(), 0.65);
+        assert!(
+            is_commercial_intent("comparison", &dist, false),
+            "strong transactional distribution must trigger shopping block"
+        );
+    }
+
+    #[test]
+    fn main_path_shopping_block_NOT_attached_for_weak_transactional_distribution() {
+        // A query with weak transactional distribution (< 0.50) and no price
+        // bound must NOT have the shopping block attached.
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("informational".to_string(), 0.70);
+        dist.insert("transactional".to_string(), 0.30);
+        assert!(
+            !is_commercial_intent("informational", &dist, false),
+            "weak transactional distribution must NOT trigger shopping block"
+        );
     }
 
     // ── Main-path `shopping` block is always present on commercial intent ──
@@ -21109,6 +21334,53 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.price, Some(44.99));
         assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
         assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    // ── FIX-IF-03: keyboard-walk / gibberish rejection tests ─────────────
+
+    #[test]
+    fn keyboard_walk_asdfghjkl_rejected() {
+        let index = spell::SymSpellIndex::build();
+        assert!(is_keyboard_walk_query("asdfghjkl xyz123 nonsense", &index));
+    }
+
+    #[test]
+    fn keyboard_walk_zxcvbnm_rejected() {
+        let index = spell::SymSpellIndex::build();
+        assert!(is_keyboard_walk_query("zxcvbnm", &index));
+    }
+
+    #[test]
+    fn keyboard_walk_qwertyuiop_rejected() {
+        let index = spell::SymSpellIndex::build();
+        assert!(is_keyboard_walk_query("qwertyuiop", &index));
+    }
+
+    #[test]
+    fn legitimate_qwerty_keyboard_not_rejected() {
+        let index = spell::SymSpellIndex::build();
+        // "qwerty" is only 6 chars — below the 7-char threshold
+        assert!(!is_keyboard_walk_query("qwerty keyboard", &index));
+    }
+
+    #[test]
+    fn legitimate_strengths_not_rejected() {
+        let index = spell::SymSpellIndex::build();
+        // "strengths" has max consonant run of 5 (str, ngths) — below 7
+        assert!(!is_keyboard_walk_query("strengths", &index));
+    }
+
+    #[test]
+    fn legitimate_phrase_not_rejected() {
+        let index = spell::SymSpellIndex::build();
+        assert!(!is_keyboard_walk_query("how to learn programming", &index));
+    }
+
+    #[test]
+    fn short_gibberish_not_rejected() {
+        let index = spell::SymSpellIndex::build();
+        // "asdf" is only 4 chars — below the 7-char threshold
+        assert!(!is_keyboard_walk_query("asdf", &index));
     }
 }
 
