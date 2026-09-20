@@ -10885,6 +10885,32 @@ fn merge_local_and_web(
                 }
             }
 
+            // (b1) POST-CALIBRATION CROSS-LOCATION CAP (geo-local round).
+            // The in-loop cross_loc_mult (0.06x when result names a different gazetteer
+            // place) is DEFEATED by calibrate_scores, which rescales the max raw score
+            // back to 1.0 — so "10 Safest Orlando, FL Neighborhoods" still floats above
+            // "Best Areas to Buy Flats in Hyderabad" for a Hyderabad query. This cap
+            // re-applies AFTER calibration so the dampening is durable: mismatched-place
+            // results stay present (floor) but can never outtop requested-place results.
+            // Only fires when the query has an explicit location (geo_is_explicit).
+            if geo_is_explicit {
+                let cross_loc_penalty = cross_location_mismatch_mult(&r.title, &r.content, geo_location.as_ref());
+                if cross_loc_penalty < 1.0 {
+                    // cross_loc returns 0.06 — rescale to a calibrated floor
+                    // well below genuine text results (0.05). Use 0.03 so a mismatched
+                    // place page sits UNDER every on-topic text result.
+                    let geo_cap = 0.03f32;
+                    if r.score > geo_cap {
+                        tracing::info!(
+                            "POST-CAL CROSS-LOC CAP -> {:.2}: '{}' (explicit geo, result names different place)",
+                            geo_cap, r.url.chars().take(60).collect::<String>()
+                        );
+                        r.post_cal_cap = Some(geo_cap);
+                        r.score = geo_cap;
+                    }
+                }
+            }
+
             // (b) single-distinctive-term-only match on a multi-topic query
             if query_has_many_topics && any_strong_match {
                 let matched_strong = strong_topics.iter().filter(|t| {
