@@ -3004,6 +3004,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
     Constraints {
         positive,
         negative,
+        match_mode: MatchMode::default(),
         hard_exclusions,
         entities: c.entities.clone(),
         language: c.language.clone(),
@@ -18251,6 +18252,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     let (after_date, before_date) = parse_date_constraints(&q);
     
     Constraints {
+        match_mode: MatchMode::default(),
         positive: vec![],
         negative,
         hard_exclusions,
@@ -21069,5 +21071,41 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.price, Some(44.99));
         assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
         assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+}
+
+
+#[cfg(test)]
+mod keyboard_walk_tests {
+    use super::*;
+
+    fn spell_index() -> spell::SymSpellIndex {
+        spell::SymSpellIndex::build()
+    }
+
+    #[test]
+    fn keyboard_walk_gibberish_rejected() {
+        let idx = spell_index();
+        assert!(is_keyboard_walk_query("asdfghjkl xyz123 nonsense", &idx));
+        assert!(is_keyboard_walk_query("asdfghjkl", &idx));
+        assert!(is_keyboard_walk_query("zxcvbnm", &idx));
+    }
+
+    #[test]
+    fn keyboard_walk_legitimate_queries_not_rejected() {
+        let idx = spell_index();
+        assert!(!is_keyboard_walk_query("qwerty keyboard", &idx));
+        assert!(!is_keyboard_walk_query("strengths", &idx));
+        assert!(!is_keyboard_walk_query("asdf", &idx));
+        assert!(!is_keyboard_walk_query("rust web framework", &idx));
+        assert!(!is_keyboard_walk_query("qwerty", &idx));
+    }
+
+    #[test]
+    fn keyboard_walk_edge_cases() {
+        let idx = spell_index();
+        assert!(!is_keyboard_walk_query("", &idx));
+        assert!(!is_keyboard_walk_query("12345", &idx));
+        assert!(!is_keyboard_walk_query("asd", &idx));
     }
 }
