@@ -226,10 +226,6 @@ fn simple_stem(word: &str) -> String {
         }
         return base.to_string();
     }
-    if w.ends_with("tion") && w.len() > 4 {
-        let base = &w[..w.len() - 4];
-        return format!("{}e", base);
-    }
     if w.ends_with("ment") && w.len() > 4 {
         return w[..w.len() - 4].to_string();
     }
