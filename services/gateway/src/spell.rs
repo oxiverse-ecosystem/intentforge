@@ -268,7 +268,7 @@ impl SymSpellIndex {
             (Some(s), None) => s,
             (None, Some(l)) => l,
             (None, None) => {
-                // Stage 4: Phonetic fallback — try Soundex-based correction
+                // Stage 4: Phonetic fallback — try Double Metaphone-based correction
                 // for words that SymSpell/LinSpell couldn't fix (e.g. letter-drop
                 // typos like "cancing" → "cancelling").
                 return self.phonetic_fallback(&word_lower);
@@ -461,8 +461,9 @@ impl SymSpellIndex {
             if !word.is_ascii() {
                 continue;
             }
-            // DoubleMetaphone returns (primary, alternate) — we index both
-            let (primary, alternate) = dmeta.encode(word);
+            // DoubleMetaphone returns primary and alternate codes — we index both
+            let primary = dmeta.encode(word);
+            let alternate = dmeta.encode_alternate(word);
             map.entry(primary).or_default().push(id as u32);
             if !alternate.is_empty() && alternate != primary {
                 map.entry(alternate).or_default().push(id as u32);
@@ -514,7 +515,7 @@ impl SymSpellIndex {
         if !word_lower.is_ascii() {
             return None;
         }
-        let input_code = rphonetic::Soundex::default().encode(&word_lower);
+        let input_code = DoubleMetaphone::default().encode(&word_lower);
         let candidate_ids = self.phonetic_dict.get(&input_code)?;
 
         let mut best: Option<(u32, f64, usize)> = None; // (word_id, freq, edit_dist)

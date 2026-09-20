@@ -9975,12 +9975,11 @@ fn merge_local_and_web(
             || r.sources.iter().any(|s| s == "arxiv" || s == "crossref" || s == "pubmed");
 
         let has_download = DOWNLOAD_KEYWORDS.iter().any(|k| q_lower_check.contains(k));
-        // Transactional keywords are data-driven from `data/commerce/config.json` (seed data).
-        let has_tx = if !tx_keywords.is_empty() {
-            tx_keywords.iter().any(|kw| q_lower_check.contains(kw.as_str()))
-        } else {
-            false
-        };
+        // Transactional keywords are data-driven from `data/commerce/signals.json`
+        // (runtime-loaded into `state.commerce_config.transactional_keywords`).
+        // Whole-word match via `detect_transactional_signal` — "priceless" never
+        // false-positives on "price".
+        let has_tx = detect_transactional_signal(&q_lower_check, &tx_keywords);
         let is_nav_or_download = intent == "navigational"
             || intent == "transactional"
             || has_download
@@ -15287,9 +15286,13 @@ async fn handle_search(
             }
         }
 
-        // Override 6: transactional keywords OR an explicit price bound -> transactional
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+        // Override 6: transactional keywords OR an explicit price bound -> transactional.
+        // Data-driven: the keyword list comes from `data/commerce/signals.json`
+        // (runtime-loaded into `state.commerce_config.transactional_keywords`).
+        // `detect_transactional_signal` does whole-word matching so "price" never
+        // fires on "priceless". NO hardcoded keywords.
+        let tx_keywords = state.commerce_config.transactional_keywords.clone();
+        let has_tx_signal = detect_transactional_signal(&q_lower, &tx_keywords);
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -18803,45 +18806,45 @@ mod constraint_fix_tests {
             &c,
         );
         assert!(!fresh, "result dated 2025 should pass after:2024");
-            }
+    }
 
-            #[test]
-            fn fresh_small_set_date_window_is_scoring_not_filter() {
-                // FRESH-SMALL-SET FAIL-OPEN: when intent is fresh and the
-                // pre-merge set is small (< 5), the date window must NOT
-                // hard-filter results. The handle_search level clears the
-                // date window when pre_filter_count < 5, so dateless
-                // results are kept and recency stays a scoring-only boost.
-                // This test verifies the should_filter_by_constraints
-                // guarantee: dateless results pass through the date filter
-                // (the structural foundation on which the FRESH-SMALL-SET
-                // rule depends).
-                let mut c = Constraints::default();
-                c.after_date = Some("2025-09-01".to_string());
-                c.before_date = Some("2025-09-08".to_string());
-                // A result with no publish date — should NOT be filtered.
-                // (should_filter_by_constraints keeps dateless results by
-                // design — the fail-open for date-less results.)
-                let nodate = should_filter_by_constraints(
-                    "Chandrayaan 4 update",
-                    "ISRO prepares for Chandrayaan-4 lunar sample-return mission.",
-                    "https://example.com/chandrayaan4",
-                    None, // no published date
-                    &c,
-                );
-                assert!(!nodate, "dateless result must NOT be hard-filtered by date bounds");
-            }
+    #[test]
+    fn fresh_small_set_date_window_is_scoring_not_filter() {
+        // FRESH-SMALL-SET FAIL-OPEN: when intent is fresh and the
+        // pre-merge set is small (< 5), the date window must NOT
+        // hard-filter results. The handle_search level clears the
+        // date window when pre_filter_count < 5, so dateless
+        // results are kept and recency stays a scoring-only boost.
+        // This test verifies the should_filter_by_constraints
+        // guarantee: dateless results pass through the date filter
+        // (the structural foundation on which the FRESH-SMALL-SET
+        // rule depends).
+        let mut c = Constraints::default();
+        c.after_date = Some("2025-09-01".to_string());
+        c.before_date = Some("2025-09-08".to_string());
+        // A result with no publish date — should NOT be filtered.
+        // (should_filter_by_constraints keeps dateless results by
+        // design — the fail-open for date-less results.)
+        let nodate = should_filter_by_constraints(
+            "Chandrayaan 4 update",
+            "ISRO prepares for Chandrayaan-4 lunar sample-return mission.",
+            "https://example.com/chandrayaan4",
+            None, // no published date
+            &c,
+        );
+        assert!(!nodate, "dateless result must NOT be hard-filtered by date bounds");
+    }
 
-                #[test]
-                fn price_extraction_broadened() {
-                    assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
-                    assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
-                    assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
-                    assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
-                    assert_eq!(extract_price_from_text("no monetary value here"), None);
-                    assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
-                    assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
-                }
+    #[test]
+    fn price_extraction_broadened() {
+        assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
+        assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
+        assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
+        assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
+        assert_eq!(extract_price_from_text("no monetary value here"), None);
+        assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
+        assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
+    }
 
     #[test]
     fn rs_signal_no_false_positives() {
