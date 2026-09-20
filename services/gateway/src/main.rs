@@ -4887,7 +4887,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
         distance_units.iter().any(|u| next_token_lower == *u)
     };
 
-    // Pattern A: upper-marker then number (+ optional currency word)
+    // Pattern A: upper-marker then optional currency symbol then number
     // ANCHORED at start of `rest`: the number must be the FIRST token after the
     // marker (only whitespace allowed between). Without the anchor, "about" in
     // "latest news about chandrayaan 4 mission" matched as a price marker and
@@ -4895,17 +4895,20 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     // fresh→transactional (Override 6) → date window crushed 19→1 results.
     // General: a price marker is only meaningful when the number follows it
     // directly ("under 150 dollars"), not when other words intervene.
+    // Allows optional currency symbol ($ ₹ € £ ¥) between marker and number
+    // to handle "under $200" in addition to "under 200" and "under 200 dollars".
     for marker in upper_markers {
         if let Some(pos) = lower.find(marker) {
             let rest = &lower[pos + marker.len()..];
-            let re_num = regex::Regex::new(&format!(r"^\s*{}\b", amount_pat)).ok()?;
+            let re_num = regex::Regex::new(&format!(r"^\s*[\$₹€£¥]?\s*{}\b", amount_pat)).ok()?;
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
                         // Distance-bound guard: "within 300 kilometers" is a
                         // range, not a price — skip this marker (let a later
                         // price marker, if any, match instead).
-                        if is_distance_bound(rest) {
+                        let after_num = &rest[m.end()..];
+                        if is_distance_bound(after_num) {
                             continue;
                         }
                         let currency = currency_words.iter().find(|c| rest.contains(*c))
@@ -4916,7 +4919,6 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             }
         }
     }
-    // Pattern B: currency symbol/word then number then upper-marker
     let re_b = regex::Regex::new(&format!(r"(₹|¥|€|£|\$|usd|inr|rs|rupees?|eur|euros?|gbp|pounds?)\s*{}?\s*({})", amount_pat, upper_markers.join("|"))).ok()?;
     if let Some(caps) = re_b.captures(&lower) {
         if let (Some(cur), Some(num)) = (caps.get(1), caps.get(2)) {
@@ -18271,7 +18273,6 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         match_mode: MatchMode::default(),
         positive: vec![],
         negative,
-        match_mode: MatchMode::default(),
         hard_exclusions,
         entities: vec![],
         language,
