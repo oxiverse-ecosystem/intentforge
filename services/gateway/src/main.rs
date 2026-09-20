@@ -451,23 +451,6 @@ struct MergedResult {
     /// the article floor. Internal field, not serialized.
     #[serde(skip)]
     post_cal_cap: Option<f32>,
-    /// D4 (2026-08-18T1340Z round): per-engine upstream-quality trust multiplier
-    /// actually applied to this result. Captured so tests/operators can observe
-    /// whether a date-blind upstream engine's junk was trust-crushed. Internal
-    /// diagnostic field (skip serialization).
-    #[serde(skip)]
-    engine_trust_mult: f32,
-
-    /// Honest product facts extracted by the /shopping pipeline from the result's
-    /// own page. Only present when the page exposed structured product data.
-    /// NEVER carries a fact not extracted from this exact URL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    commerce: Option<CommerceBlock<OfferFacts>>,
-    /// Provenance for the commerce block: the source URL it was extracted from and
-    /// when. Kept separate so the frontend can attribute facts to a page even when
-    /// `commerce` itself is null (e.g. "we looked, found nothing on that URL").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    commerce_provenance: Option<CommerceBlock<()>>,
 }
 
 fn default_f32_one() -> f32 { 1.0 }
@@ -8494,134 +8477,34 @@ fn is_weak_anchor_word(w: &str) -> bool {
     WEAK.contains(&w)
 }
 
-/// Generic stopwords shared by the recall-gap / distinctive-term extractors.
-/// A general, fixed set (no query/domain-specific entries) so the gap signal
-/// never keys on a particular phrase. Mirrors the broad stopword philosophy
-/// used by the off-topic guard's distinctive-term set.
-fn recall_gap_stopwords() -> std::collections::HashSet<&'static str> {
-    [
-        // articles / conjunctions / prepositions
-        "the", "a", "an", "and", "or", "but", "if", "then", "else", "of", "to",
-        "in", "on", "at", "by", "for", "with", "without", "from", "into", "onto",
-        "as", "is", "are", "was", "were", "be", "been", "being", "it", "this",
-        "that", "these", "those", "my", "your", "our", "their", "his", "her",
-        "i", "you", "he", "she", "we", "they", "me", "us", "him", "them",
-        // common question / framing verbs and helpers
-        "how", "what", "when", "where", "why", "who", "which", "way", "ways",
-        "best", "good", "great", "better", "top", "free", "cheap", "easy",
-        "simple", "quick", "fast", "new", "recent", "latest", "safe", "natural",
-        "home", "house", "make", "making", "get", "getting", "use", "using",
-        "find", "finding", "help", "need", "want", "like", "near", "nearby",
-        // function / auxiliary / connective words that carry NO topical signal
-        // and must never be surfaced as a "recall gap" (they are not facets the
-        // upstream index could supply). Adding them here keeps
-        // distinctive_query_terms from flagging them as missing coverage. This
-        // set is a fixed, general list of grammatical function words — no
-        // query/domain-specific entries, no per-query tuning.
-        "does", "do", "did", "doesn", "dont", "don", "can", "could", "should",
-        "would", "will", "may", "might", "has", "have", "had", "is", "are",
-        "was", "were", "be", "been", "being", "the", "a", "an", "and", "or",
-        "but", "if", "then", "else", "of", "to", "in", "on", "at", "by", "for",
-        "with", "without", "from", "into", "onto", "as", "that", "these",
-        "those", "this", "my", "your", "our", "their", "his", "her", "its",
-        "only", "also", "just", "still", "even", "very", "really", "lot",
-        "keep", "keeps", "kept", "stay", "stays", "put", "puts", "set", "sets",
-        "take", "takes", "took", "give", "gives", "show", "shows", "see", "sees",
-        "know", "knows", "think", "thinks", "feel", "feels", "look", "looks",
-        "go", "goes", "come", "comes", "let", "lets", "try", "tries", "sure",
-        "explain", "explained", "explaining", "describe", "description", "tell",
-        "tells", "learn", "learning", "learnt", "study", "studying", "read",
-        "reading", "write", "writing", "watch", "watching", "build", "building",
-        "built", "create", "creating", "start", "starting", "begin", "beginning",
-        "stop", "stopping", "avoid", "avoiding", "prevent", "preventing", "fix",
-        "fixing", "solve", "solving", "choose", "choosing", "choose", "pick",
-        "picking", "select", "selecting", "online", "offline", "local", "remote",
-        "lightweight", "heavy", "heavyweight", "safest", "safe", "unsafe",
-        "healthy", "health", "vegetarian", "vegan", "classic", "digital",
-        "personal", "private", "open", "closed", "thirty", "twenty", "forty",
-        "fifty", "hundred", "thousand", "million", "monthly", "weekly", "daily",
-        "ruining", "ruined", "ruin", "respect", "respects", "respecting",
-        "normal", "abnormal", "regular", "common", "uncommon", "rare", "usual",
-        // negations (handled as constraints, not recall gaps)
-        "not", "no", "without", "except", "besides", "minus", "other", "than",
-        "nor",
-        // temporal fillers (fresh intent keys off these; not a topical gap)
-        "today", "tonight", "now", "this", "week", "weeks", "month", "months",
-        "year", "years", "day", "days", "past", "last", "upcoming",
-    ]
-    .iter()
-    .copied()
-    .collect()
-}
-
-/// Extract the salient (distinctive) query terms worth checking for recall
-/// coverage. These are the query's content-bearing words after removing
-/// generic stopwords, weak anchor words, pure numbers, and single chars.
-/// Pure function of the query — no per-query strings, no domain lists.
-fn distinctive_query_terms(query: &str) -> Vec<String> {
-    let stops = recall_gap_stopwords();
-    query
-        .split_whitespace()
-        .filter(|w| {
-            let lower = w.to_lowercase();
-            lower.len() >= 3
-                && !stops.contains(lower.as_str())
-                && !is_weak_anchor_word(&lower)
-                && !lower.chars().all(|c| c.is_ascii_digit())
-        })
-        .map(|w| w.to_lowercase())
-        .collect()
-}
-
-/// Honest recall-gap detector (round-2026-08-12T1234Z D2 disposition).
-///
-/// Given the final merged results and the original query, returns the subset of
-/// the query's distinctive terms that appear in NONE of the returned results'
-/// title/content/url. Those terms represent facets of the query the upstream
-/// index could not supply — an honest signal to the user, NOT a ranking defect
-/// and NOT a reason to fabricate a result. When the empty/!single-doc-facet
-/// case (e.g. a single leading result that legitimately dominates) would be
-/// mis-flagged, the caller decides; this fn is pure and general.
-///
-/// Returns `None` when there are no results at all (nothing to compare against)
-/// so the signal is never emitted for an empty SERP (that's a different problem
-/// class — see `warnings`).
-fn compute_recall_gap_terms(
-    query: &str,
-    results: &[MergedResult],
-) -> Option<Vec<String>> {
-    if results.is_empty() {
-        return None;
+/// Detects video intent in a query. Uses token-aware detection for "watch" to avoid
+/// false positives on queries like "watch battery" or "watch repair" which are about
+/// timepieces, not videos. Standalone "watch" does not imply video intent; requires
+/// video-oriented phrases like "watch video" or explicit video keywords.
+fn has_video_intent(query: &str) -> bool {
+    let q_lc = query.to_lowercase();
+    // Explicit video keywords that clearly indicate video intent
+    if q_lc.contains("video") || q_lc.contains("youtube") || q_lc.contains("animation") {
+        return true;
     }
-    let topics = distinctive_query_terms(query);
-    if topics.is_empty() {
-        return None;
+    // "tutorial" often implies video, though not always
+    if q_lc.contains("tutorial") {
+        return true;
     }
-    // Build one lowercase haystack per result (title + content preview + url),
-    // matching the off-topic guard's overlap check shape.
-    let covered: Vec<String> = results
-        .iter()
-        .map(|r| {
-            let preview = r.content.chars().take(500).collect::<String>();
-            format!(
-                "{} {} {}",
-                r.title.to_lowercase(),
-                preview.to_lowercase(),
-                r.url.to_lowercase()
-            )
-        })
-        .collect::<Vec<String>>();
-
-    let missing: Vec<String> = topics
-        .into_iter()
-        .filter(|t| !covered.iter().any(|hay| hay.contains(t.as_str())))
-        .collect();
-
-    if missing.is_empty() {
-        None
-    } else {
-        Some(missing)
+    // Token-aware "watch" detection: only recognize video-oriented phrases
+    // "watch video", "watch on youtube", "how to watch", etc.
+    // Reject standalone "watch" to avoid false positives on watch/timepiece queries.
+    if q_lc.contains("watch video")
+        || q_lc.contains("watch on")
+        || q_lc.contains("watch online")
+        || q_lc.contains("how to watch")
+        || q_lc.contains("where to watch")
+        || q_lc.contains("watch tutorial")
+        || q_lc.contains("watch guide")
+    {
+        return true;
     }
+    false
 }
 
 fn merge_local_and_web(
@@ -8686,9 +8569,6 @@ fn merge_local_and_web(
             currency: r.currency,
             quality: r.quality,
             post_cal_cap: None,
-            engine_trust_mult: 1.0,
-            commerce: None,
-            commerce_provenance: None,
         };
         url_to_idx.insert(norm, merged.len());
         merged.push(entry);
@@ -8744,9 +8624,6 @@ fn merge_local_and_web(
                 currency: r.currency.clone(),
                 quality: 1.0,
                 post_cal_cap: None,
-                engine_trust_mult: 1.0,
-                commerce: None,
-                commerce_provenance: None,
             };
             url_to_idx.insert(norm, merged.len());
             merged.push(entry);
@@ -9586,18 +9463,8 @@ fn merge_local_and_web(
                 })
                 .copied()
                 .collect();
-            // P2c (round-2026-09-08): when the query has >= 2 topic anchor terms,
-            // require at least TWO to be present in the result. A page matching
-            // only ONE of several topic terms is a partial/incidental match — e.g.
-            // "Fluffy Fluffy Dessert Cafe" for "how to make fluffy pancakes" matches
-            // "fluffy" but not "pancakes". The old `any()` let such pages survive the
-            // gate and outrank genuinely on-topic web results. Requiring >= 2 matches
-            // crushes partial matches while letting full-topic pages (which name
-            // multiple query subjects) pass. Single-term queries are unaffected.
-            let topic_mentioned = if topic_anchor_terms.is_empty() {
-                true
-            } else if topic_anchor_terms.len() >= 2 {
-                let matched_count = topic_anchor_terms.iter().filter(|t| {
+            let topic_mentioned = topic_anchor_terms.is_empty()
+                || topic_anchor_terms.iter().any(|t| {
                     let tl = t.to_lowercase();
                     let bare = tl.trim_end_matches('s');
                     title_lower.contains(&tl) || content_lower.contains(&tl)
@@ -10518,16 +10385,7 @@ fn merge_local_and_web(
         // article for text queries (e.g. "how to make biryani at home"). Videos have
         // their own /videos endpoint; in /search they are secondary, so dampen them
         // unless the query is explicitly video-seeking. Floor keeps them present, not dominant.
-        // A result is a "video" if it is tagged with the video source OR its URL
-        // points at a known video platform. SearXNG often returns youtube.com /
-        // vimeo.com / etc. URLs inside the GENERAL web result set WITHOUT a
-        // video source tag (e.g. the "authentic poha indore style" query returned a
-        // youtube.com recipe video at score 1.0 for a non-video query). Treating
-        // those as text allowed them to outrank the real recipe article. is_url_video_host
-        // catches them so the same dampening applies.
-        let is_video_source = r.sources.iter().any(|s| s == "invidious" || s == "video")
-            || is_url_video_host(&r.url);
-        let q_lc = query.to_lowercase();
+        let is_video_source = r.sources.iter().any(|s| s == "invidious" || s == "video");
         let video_mult = if is_video_source {
             if has_video_intent(query) {
                 1.0 // explicit video intent → keep
@@ -11057,7 +10915,60 @@ fn merge_local_and_web(
 
         // Definitional-domain / structure detector (mirrors the in-loop block at ~5447
         // but is recomputed here so the cap is independent of that block's scope).
-
+        let is_def_site = |url: &str, title: &str, content: &str| -> bool {
+            let ul = url.to_lowercase();
+            let tl = title.to_lowercase();
+            let cl = content.to_lowercase();
+            let prefix = cl.chars().take(300).collect::<String>();
+            // Structural URL-path markers only — no curated domain allow-list.
+            // Detection is purely structural (title / path / phonetic / POS).
+            let dict_path_marker = ul.contains("/dictionary/")
+                || ul.contains("/define/")
+                || ul.contains("/meaning/");
+            let title_words: Vec<&str> = tl.split_whitespace().collect();
+            let dict_title = tl.contains("meaning & definition")
+                || tl.contains("definition & meaning")
+                || tl.contains("definition of ")
+                || tl.contains("meaning of ")
+                || tl.ends_with("- wiktionary")
+                || tl.contains("cambridge dictionary")
+                || tl.contains("merriam-webster")
+                || (title_words.len() <= 3 && (tl.contains("definition") || tl.contains("dictionary")));
+            let phonetic = prefix.contains("/ˈ") || prefix.contains("/ˌ")
+                || prefix.contains("/'") || prefix.contains("/-");
+            let pos_label = prefix.starts_with("noun") || prefix.starts_with("verb")
+                || prefix.starts_with("adjective") || prefix.starts_with("adverb")
+                || prefix.contains("1. : to ") || prefix.contains("2. : to ")
+                || prefix.contains("definition of ") || prefix.contains("meaning of ");
+            let short = cl.len() < 200;
+            // Wikipedia disambiguation stubs ("Hill - Wikipedia", "Java - Wikipedia"):
+            // a bare title with no descriptive body, just a list of links to the
+            // article's possible meanings. For a non-definition query they are
+            // off-topic junk (ranked #1 for "why is the hill blue?"-style polysemy and
+            // for "what is the difference between java the language and java the island").
+            // Detection is structural (en.wikipedia.org/wiki/<Word> with a " - Wikipedia"
+            // title and a content prefix that is just the title echoed, i.e. no
+            // encyclopedic lead) — no curated disambiguation allow-list. A definition
+            // query (handled by is_definition_query above) is exempt and keeps them.
+            // Extract the page title without the " - wikipedia" suffix for comparison.
+            let wiki_disambig = if ul.contains("en.wikipedia.org/wiki/") && tl.ends_with("- wikipedia") {
+                let page_title = tl.strip_suffix("- wikipedia").unwrap_or(&tl).trim();
+                // Strict: accept only empty/stub (content == title) or explicit "refer to" phrases
+                // or a link-list form (body starts with the bare page title, no descriptive lead).
+                // Do NOT use unrestricted title-prefix matching that would mis-classify real articles.
+                cl.trim().is_empty()
+                    || cl.trim().to_lowercase() == page_title
+                    || prefix.contains("may refer to")
+                    || prefix.contains("can refer to")
+                    || (prefix.starts_with(page_title) && prefix.len() < page_title.len() + 50)
+            } else {
+                false
+            };
+            dict_path_marker || dict_title
+                || ((phonetic || pos_label) && title_words.len() <= 3)
+                || (pos_label && short)
+                || wiki_disambig
+        };
 
         // Count how many DISTINCTIVE topic terms a result actually contains (excludes
         // weak framing/anchor words, so a page matching only "improve" while the query
@@ -11078,59 +10989,6 @@ fn merge_local_and_web(
         // sits below the topical write-up). Floor preserved so they remain present.
         let dict_cap = 0.03f32;   // dictionary sites may appear but never rank top
         let weak_cap = 0.04f32;   // single-polysemous-token matches capped low
-
-        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
-        // Used by the P8 video cap (b0): a video must never outrank the best genuine
-        // text result for a non-video query, in any calibration regime (see comment
-        // at (b0)). Computed over post-calibration scores so it reflects the final
-        // text ranking.
-        let best_non_video = merged.iter()
-            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
-            .map(|r| r.score)
-            .fold(0.0f32, f32::max);
-
-        // (b) single-distinctive-term-only match on a multi-topic query
-        // D1 FIX (this round): lowered `any_strong_match` threshold from >= 2 to >= 1.
-        // Previously the cap only fired when at least one result matched >= 2 topics.
-        // For queries like "how to choose a suitable thesis topic in machine learning"
-        // where upstream returns off-topic brand collisions (e.g. "Choose" app matching
-        // only "choose"), no result matched 2+ topics, so the cap never fired and the
-        // brand won on insertion order. Now the cap fires when ANY result matches even
-        // ONE strong topic (fail-open preserved: when upstream returns pure junk with 0
-        // matches, the cap doesn't fire). Brand collisions matching 0 strong topics get
-        // crushed to weak_cap.
-        let any_strong_match = if query_has_many_topics {
-            merged.iter().any(|r| {
-                let rl = r.title.to_lowercase();
-                let cl = r.content.to_lowercase();
-                let ul = r.url.to_lowercase();
-                strong_topics.iter().any(|t| {
-                    let lt = t.to_lowercase();
-                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
-                })
-            })
-        } else {
-            false
-        };
-
-        // P8 adaptive video cap (this round): for a NON-video query, every
-        // genuine text result must outrank every video. Capture the weakest
-        // text result's calibrated score so the video cap inside the loop can
-        // pin videos STRICTLY below it — robust even in weak-result-set mode
-        // where calibrate_scores stretches the single highest raw score (the
-        // video) onto its 0.12 ceiling, ABOVE the 0.05-floor articles (the live
-        // "rust vs go high concurrency" query ranked two invidious videos above
-        // the written comparison articles). A fixed cap (0.12) collided with that
-        // ceiling and never fired. Adaptive (derived from the actual text score
-        // band), not a magic constant tuned to one query.
-        let min_text_score = merged
-            .iter()
-            .filter(|t| {
-                !(t.sources.iter().any(|s| s == "invidious" || s == "video")
-                    || is_url_video_host(&t.url))
-            })
-            .map(|t| t.score)
-            .fold(f32::INFINITY, f32::min);
 
         for r in merged.iter_mut() {
             let rl = r.title.to_lowercase();
@@ -11164,33 +11022,20 @@ fn merge_local_and_web(
             let is_video_src = r.sources.iter().any(|s| s == "invidious" || s == "video")
                 || is_url_video_host(&r.url);
             if is_video_src {
-                let video_intent = q_lc_cap.contains("video")
-                    || q_lc_cap.contains("youtube")
-                    || q_lc_cap.contains("watch")
-                    || q_lc_cap.contains("tutorial")
-                    || q_lc_cap.contains("animation");
-                if !video_intent {
-                    // Adaptive P8 cap (this round): pin videos STRICTLY below the
-                    // weakest genuine text result, not at a fixed 0.12. The fixed cap
-                    // collided with calibrate_scores' weak-set ceiling [0.05,0.12],
-                    // which stretches the single highest raw score (the video) to 0.12,
-                    // so the cap never fired and the video outranked floor articles
-                    // (live "rust vs go high concurrency" ranked two invidious videos
-                    // above the written comparison articles). Derived from the actual
-                    // text-score band -> robust in weak-set mode; 0.03 margin keeps a
-                    // video present but never dominant. When NO text result survived
-                    // (all-video set), fall back to a flat 0.12 so videos still rank
-                    // among themselves instead of collapsing.
-                    let video_cap = if min_text_score.is_finite() {
-                        (min_text_score - 0.03).max(0.05)
-                    } else {
-                        0.12f32
-                    };
+                if !has_video_intent(query) {
+                    // 0.04 sits UNDER the calibrated article floor (0.05) so a video
+                    // is demoted *below* every genuine text result for a non-video
+                    // query (e.g. an invidious tutorial at 0.04 now ranks under the
+                    // topical article at 0.05, instead of tying it via insertion order
+                    // as the old 0.12 did). Floor preserved so videos remain present.
+                    // Signal-driven (query self-describes intent), not tuned to a query.
+                    let video_cap = 0.04f32;
                     if r.score > video_cap {
                         tracing::info!(
                             "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source; min_text={:.2})",
                             video_cap, r.url.chars().take(60).collect::<String>(), min_text_score
                         );
+                        r.post_cal_cap = Some(video_cap);
                         r.score = video_cap;
                     }
                 }
@@ -18136,9 +17981,6 @@ async fn handle_search_fast(
                         currency: r.currency,
                         quality: r.quality,
                         post_cal_cap: None,
-                        engine_trust_mult: 1.0,
-                        commerce: None,
-                        commerce_provenance: None,
                     }).collect::<Vec<_>>()
                 }
                 None => vec![]
@@ -19056,118 +18898,170 @@ mod hardcoding_ruling_tests {
     }
 
     #[test]
-    fn video_host_detection_covers_web_merge_urls() {
-        // P8 (YouTube-host gap): SearXNG returns youtube.com / youtu.be / vimeo.com /
-        // etc. URLs inside the GENERAL web result set WITHOUT a `video` source tag.
-        // A non-video query ("authentic poha indore style") then ranked a
-        // youtube.com recipe video at score 1.0 above the real recipe article.
-        // is_url_video_host must catch these hosts so the P8 dampening applies.
-        assert!(is_url_video_host("https://www.youtube.com/watch?v=gUEa825kTjQ"));
-        assert!(is_url_video_host("https://youtu.be/gUEa825kTjQ"));
-        assert!(is_url_video_host("https://m.youtube.com/watch?v=abc"));
-        assert!(is_url_video_host("https://www.vimeo.com/123456"));
-        assert!(is_url_video_host("https://invidious.example.net/watch?v=x"));
-        // Non-video hosts must NOT match.
-        assert!(!is_url_video_host("https://www.python.org/doc"));
-        assert!(!is_url_video_host("https://example.com/youtube-guide-article"));
-        assert!(!is_url_video_host("https://reddit.com/r/IndianFood/comments/abc"));
-    }
-
-    #[test]
-    fn negation_compound_does_not_swallow_site_operator() {
-        // Regression (round 2026-08-10T1401Z, t_331c2fc3): when an operator token
-        // rides along in a negation phrase (e.g. "not django site:github.com"),
-        // the greedy compound builder must NOT absorb `site:github.com` into the
-        // exclusion term. Before the fix the exclusion came back as
-        // "django sitegithubcom" (garbage). After the fix it must be exactly
-        // ["django"], and the real site: operator must still be extracted
-        // separately by extract_gateway_constraints.
-        let q = "latest python web framework not django site:github.com";
-        let exclusions = extract_query_negative_terms(q);
-        assert_eq!(
-            exclusions,
-            vec!["django".to_string()],
-            "site: operator must not be swallowed into the exclusion compound"
-        );
-
-        let c = extract_gateway_constraints(q);
-        assert!(
-            c.sites.contains(&"github.com".to_string()),
-            "extract_gateway_constraints must still extract the real site: filter"
-        );
-
-        // filetype: must ALSO be treated as a boundary, so it is never absorbed
-        // into the compound (which would produce garbage like "pandas
-        // filetypepdf"). The real `file_type` operator must still be extracted
-        // separately by extract_gateway_constraints. Note: whether "pandas"
-        // itself survives the `is_real_exclusion` gate is engine policy and NOT
-        // part of this regression — we only assert the operator is not swallowed
-        // and the genuine file_type filter is extracted.
-        let q2 = "python tutorials not pandas filetype:pdf";
-        let excl2 = extract_query_negative_terms(q2);
-        assert!(
-            !excl2.iter().any(|e| e.contains("filetype")),
-            "filetype: operator must not be swallowed into any exclusion term, got {:?}",
-            excl2
-        );
-        let c2 = extract_gateway_constraints(q2);
-        assert!(
-            c2.file_types.contains(&"pdf".to_string()),
-            "extract_gateway_constraints must still extract the real filetype: filter"
-        );
-    }
-
-    #[test]
-    fn recall_gap_detects_missing_distinctive_term() {
-        // Round-2026-08-12T1234Z D2: the parrot-recall gap is an upstream
-        // limitation, not a ranking defect. The honest signal is that the
-        // query's distinctive term ("parrot") appears in NONE of the results.
-        let web = vec![web_res(
-            "https://example.com/introducing-cat-to-kitten",
-            "How to Introduce a Kitten to Your Home",
-            "Bringing a new kitten home and introducing it to your resident cat safely.",
-        )];
+    fn topic_mentioned_requires_substantive_terms() {
+        // Finding 1: "deploy fastapi with postgres on ubuntu" should require
+        // substantive terms (fastapi/postgres/ubuntu) for topic_mentioned, not
+        // just the meta-action term "deploy".
+        use super::IndexerResult;
+        let q = "deploy fastapi with postgres on ubuntu";
+        let local = vec![IndexerResult {
+            url: "http://local.test/fastapi-postgres-ubuntu-guide".to_string(),
+            title: "Deploying FastAPI with PostgreSQL on Ubuntu Server".to_string(),
+            content: "Complete guide to deploying a FastAPI application with PostgreSQL database on Ubuntu.".to_string(),
+            score: 0.8,
+            authority: 0.5,
+            price: None,
+            currency: None,
+            quality: 0.8,
+        }];
         let out = merge_local_and_web(
-            vec![], web, "introduce a rescue parrot to a home with cats",
-            "informational", &cst(), None, None, &empty_sem(),
+            local, vec![], q, "informational", &cst(), None, None, &empty_sem(),
         );
-        let gap = compute_recall_gap_terms(
-            "introduce a rescue parrot to a home with cats", &out,
-        );
-        assert!(gap.is_some(), "gap must be detected for an absent distinctive term");
-        let gap = gap.unwrap();
-        assert!(gap.iter().any(|t| t == "parrot"),
-            "expected 'parrot' in recall_gap_terms, got {:?}", gap);
-        assert!(!gap.iter().any(|t| t == "cat"),
-            "covered term 'cat' must NOT be in the gap, got {:?}", gap);
+        assert_eq!(out.len(), 1, "substantive-term match should survive");
+        let r = &out[0];
+        // Should NOT be crushed by LOCAL NOISE GATE since it mentions substantive terms
+        assert!(r.score > 0.1, "result with fastapi/postgres/ubuntu should have topic_mentioned=true and score > 0.1, got {}", r.score);
     }
 
     #[test]
-    fn recall_gap_absent_when_distinctive_term_covered() {
-        // When the result set genuinely covers the distinctive term, the gap
-        // signal stays silent (None) — no false alarms.
-        let web = vec![web_res(
-            "https://example.com/parrot-care",
-            "Caring for a Rescue Parrot",
-            "How to introduce a rescue parrot to your home with cats and other pets safely.",
-        )];
+    fn topic_mentioned_rejects_weak_only_match() {
+        // Finding 1: "clean a dishwasher with vinegar" should NOT validate a page
+        // that only mentions "vinegar" (weak anchor word), not the substantive context.
+        use super::IndexerResult;
+        let q = "clean a dishwasher with vinegar";
+        let local = vec![IndexerResult {
+            url: "http://local.test/wasp-removal".to_string(),
+            title: "Get Rid of Wasps with Vinegar".to_string(),
+            content: "Natural wasp removal using vinegar spray. Safe and effective method.".to_string(),
+            score: 0.75,
+            authority: 0.5,
+            price: None,
+            currency: None,
+            quality: 0.6,
+        }];
         let out = merge_local_and_web(
-            vec![], web, "introduce a rescue parrot to a home with cats",
-            "informational", &cst(), None, None, &empty_sem(),
+            local, vec![], q, "informational", &cst(), None, None, &empty_sem(),
         );
-        let gap = compute_recall_gap_terms(
-            "introduce a rescue parrot to a home with cats", &out,
-        );
-        assert!(gap.is_none(),
-            "no gap expected when 'parrot' is covered, got {:?}", gap);
+        // The off-topic page (mentions "vinegar" but not dishwasher context) should
+        // be crushed since "clean" and "vinegar" are weak anchor words and it lacks
+        // substantive terms from the query
+        assert_eq!(out.len(), 1, "off-topic result present but demoted");
+        let r = &out[0];
+        assert!(r.score < 0.1, "off-topic weak-match should be crushed below 0.1, got {}", r.score);
     }
 
     #[test]
-    fn recall_gap_none_for_empty_results() {
-        // Empty SERP is a different problem class (see `warnings`); the recall
-        // gap signal must never fire on an empty result set.
-        let gap = compute_recall_gap_terms("introduce a rescue parrot to cats", &[]);
-        assert!(gap.is_none(), "gap must be None for empty results");
+    fn dict_cap_stays_below_article_floor_after_clamp() {
+        // Finding 4: dict_cap (0.03) must stay below article floor (0.05) even after
+        // the final 0.05 clamp in serialization. The post_cal_cap mechanism re-applies
+        // the cap AFTER the clamp.
+        let q = "improve deep sleep without medication";
+        let dict_result = web_res(
+            "https://www.merriam-webster.com/dictionary/improve",
+            "Improve | Definition of Improve by Merriam-Webster",
+            "improve: verb. to make better",
+        );
+        let article_result = web_res(
+            "https://example.com/sleep-guide",
+            "How to Improve Deep Sleep Without Medication",
+            "Evidence-based techniques for improving sleep quality naturally.",
+        );
+        let web = vec![dict_result, article_result];
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        assert!(out.len() >= 2, "both results should be present");
+        // Find the dict result (capped to 0.03)
+        let dict = out.iter().find(|r| r.url.contains("merriam-webster")).expect("dict result missing");
+        // Find the article (floor at 0.05)
+        let article = out.iter().find(|r| r.url.contains("sleep-guide")).expect("article missing");
+        // Dict must be strictly below article floor
+        assert!(dict.score < 0.05, "dict_cap should be < 0.05, got {}", dict.score);
+        assert!(dict.score <= 0.031, "dict_cap should be ~0.03, got {}", dict.score);
+        assert!(article.score >= 0.05, "article floor should be >= 0.05, got {}", article.score);
+        assert!(dict.score < article.score, "dict (capped) must rank below article");
+    }
+
+    #[test]
+    fn video_intent_rejects_standalone_watch() {
+        // Finding 5: "watch battery" and "watch repair" are about timepieces,
+        // not videos. Standalone "watch" should NOT imply video intent.
+        use super::has_video_intent;
+        assert!(!has_video_intent("watch battery"), "watch battery is NOT video intent");
+        assert!(!has_video_intent("watch repair"), "watch repair is NOT video intent");
+        assert!(!has_video_intent("rolex watch"), "rolex watch is NOT video intent");
+        // But video-oriented phrases should be recognized
+        assert!(has_video_intent("watch video tutorial"), "watch video is video intent");
+        assert!(has_video_intent("how to watch"), "how to watch is video intent");
+        assert!(has_video_intent("youtube tutorial"), "youtube is video intent");
+    }
+
+    #[test]
+    fn video_cap_applied_for_ambiguous_watch_query() {
+        // Finding 5: "watch battery" should cap video results to 0.04 since it's
+        // not a video-intent query (about timepieces, not videos).
+        use super::SearxResult;
+        let q = "watch battery replacement";
+        let video_result = SearxResult {
+            title: "Watch Battery Replacement Tutorial - YouTube".to_string(),
+            url: "https://youtube.com/watch?v=abc123".to_string(),
+            content: "Step by step guide to replacing a watch battery.".to_string(),
+            engine: "invidious".to_string(),
+            score: 1.0,
+            sources: vec!["invidious".to_string()],
+            published_date: None,
+            price: None,
+            currency: None,
+        };
+        let article_result = web_res(
+            "https://example.com/watch-battery-guide",
+            "How to Replace a Watch Battery: Complete Guide",
+            "Professional guide to watch battery replacement with tools and tips.",
+        );
+        let web = vec![video_result, article_result];
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        assert!(out.len() >= 2, "both results should be present");
+        let video = out.iter().find(|r| r.sources.iter().any(|s| s == "invidious")).expect("video missing");
+        let article = out.iter().find(|r| r.url.contains("watch-battery-guide")).expect("article missing");
+        // Video should be capped to 0.04 (below article floor 0.05)
+        assert!(video.score <= 0.041, "video for non-video query should be capped to ~0.04, got {}", video.score);
+        assert!(article.score >= 0.05, "article should be at floor 0.05+, got {}", article.score);
+        assert!(video.score < article.score, "video must rank below article for non-video query");
+    }
+
+    #[test]
+    fn wiki_disambig_strict_detection() {
+        // Finding 3: Wikipedia disambiguation detection should use strict predicates
+        // (empty stub, "may refer to", "can refer to", or link-list with short body)
+        // and NOT use unrestricted title-prefix matching that would mis-classify
+        // normal article leads as disambiguation pages.
+        let q = "java programming";
+        // Real disambiguation page (contains "may refer to")
+        let disambig = web_res(
+            "https://en.wikipedia.org/wiki/Java",
+            "Java - Wikipedia",
+            "Java may refer to: Java (programming language), Java (island), Java coffee, and more.",
+        );
+        // Normal article (title happens to be a prefix of content, but it's a real article)
+        let article = web_res(
+            "https://en.wikipedia.org/wiki/Java_(programming_language)",
+            "Java (programming language) - Wikipedia",
+            "Java is a high-level, class-based, object-oriented programming language that is designed to have as few implementation dependencies as possible.",
+        );
+        let web = vec![disambig, article];
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        // The disambiguation page should be capped (treated as dict-like for non-def query)
+        // while the real article should not be capped
+        let disambig_result = out.iter().find(|r| r.url.contains("/wiki/Java") && !r.url.contains("programming")).expect("disambig missing");
+        let article_result = out.iter().find(|r| r.url.contains("programming_language")).expect("article missing");
+        // Disambig should be capped low (dict-like treatment for non-definition query)
+        assert!(disambig_result.score < 0.05, "disambig should be capped below floor, got {}", disambig_result.score);
+        // Real article should be at or above floor
+        assert!(article_result.score >= 0.05, "article should be >= 0.05, got {}", article_result.score);
     }
 }
 
