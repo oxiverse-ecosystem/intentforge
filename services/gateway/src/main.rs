@@ -1030,6 +1030,9 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
     if q_has_word(q_lower, "fresh") && has_news_term {
         return Some((format_ymd(add_days(today, -7)), today_s));
     }
+    if q_has_word(q_lower, "fresh") && has_news_term {
+        return Some((format_ymd(add_days(today, -7)), today_s));
+    }
 
     None
 }
@@ -1600,38 +1603,34 @@ const LOCATION_GAZETTEER: &[(&str, &str)] = &[
     ("toronto", "CA"), ("vancouver", "CA"), ("sao paulo", "BR"), ("mexico city", "MX"),
     ("dubai", "AE"), ("cairo", "EG"), ("bangkok", "TH"), ("jakarta", "ID"),
     ("cape town", "ZA"), ("lagos", "NG"),
-    // ── Expanded Indian cities ── (round 2026-08-11: the original gazetteer only
-    //    listed delhi/mumbai/bangalore, so "cafes in kolkata" / "near pune" failed
-    //    to detect an explicit location and fell back to the IP/VPN geo — which
-    //    leaked a wrong "+New York" constraint and boosted the wrong region).
-    //    Whole-word matched; no overlap with common query words or country codes.
-    ("kolkata", "IN"), ("calcutta", "IN"), ("pune", "IN"), ("hyderabad", "IN"),
-    ("chennai", "IN"), ("madras", "IN"), ("ahmedabad", "IN"), ("coimbatore", "IN"),
-    ("jaipur", "IN"), ("goa", "IN"), ("lucknow", "IN"), ("kanpur", "IN"),
-    ("nagpur", "IN"), ("indore", "IN"), ("bhopal", "IN"), ("surat", "IN"),
-    ("vadodara", "IN"), ("baroda", "IN"), ("visakhapatnam", "IN"), ("vijayawada", "IN"),
-    ("patna", "IN"), ("ranchi", "IN"), ("raipur", "IN"), ("thiruvananthapuram", "IN"),
-    ("kochi", "IN"), ("cochin", "IN"), ("kozhikode", "IN"), ("calicut", "IN"),
-    ("mysore", "IN"), ("mysuru", "IN"), ("amritsar", "IN"), ("chandigarh", "IN"),
-    ("gwalior", "IN"), ("udaipur", "IN"), ("jaisalmer", "IN"), ("varanasi", "IN"),
-    ("banaras", "IN"), ("agra", "IN"), ("shimla", "IN"), ("manali", "IN"),
-    ("dehradun", "IN"), ("guwahati", "IN"), ("bhubaneswar", "IN"), ("rajkot", "IN"),
-    ("jabalpur", "IN"), ("guntur", "IN"), ("thane", "IN"), ("navi mumbai", "IN"),
-    ("ghaziabad", "IN"), ("noida", "IN"), ("ludhiana", "IN"), ("allahabad", "IN"),
-    ("prayagraj", "IN"), ("guwahati", "IN"), ("nashik", "IN"), ("aurangabad", "IN"),
-    ("madurai", "IN"), ("cochin", "IN"), ("trivandrum", "IN"),
-    // ── Expanded global cities ──
-    ("miami", "US"), ("dallas", "US"), ("denver", "US"), ("atlanta", "US"),
-    ("washington", "US"), ("philadelphia", "US"), ("houston", "US"), ("minneapolis", "US"),
-    ("munich", "DE"), ("hamburg", "DE"), ("frankfurt", "DE"), ("cologne", "DE"),
-    ("lyon", "FR"), ("marseille", "FR"), ("nice", "FR"), ("milan", "IT"),
-    ("naples", "IT"), ("turin", "IT"), ("florence", "IT"), ("valencia", "ES"),
-    ("seville", "ES"), ("malaga", "ES"), ("porto", "PT"), ("lisbon", "PT"),
-    ("brussels", "BE"), ("vienna", "AT"), ("zurich", "CH"), ("geneva", "CH"),
-    ("osaka", "JP"), ("kyoto", "JP"), ("busan", "KR"), ("taipei", "TW"),
-    ("kuala lumpur", "MY"), ("manila", "PH"), ("ho chi minh", "VN"), ("hanoi", "VN"),
-    ("doha", "QA"), ("riyadh", "SA"), ("tel aviv", "IL"), ("nairobi", "KE"),
-    ("accra", "GH"), ("casablanca", "MA"), ("addis ababa", "ET"), ("dar es salaam", "TZ"),
+    // 2026-08-19T1628Z round: extend the SEED with common Indian hill/travel/
+    // region destinations that users query but that were missing. These are the
+    // exact class of place that triggered geo pollution (an off-topic other-city
+    // local page ranking #1 because the requested place was unseen by
+    // detect_explicit_location, so geo_is_explicit stayed false and no
+    // cross-location penalty fired). Pure reference data; no per-query literals.
+    // Also a few more global travel hubs for general coverage.
+    ("ladakh", "IN"), ("leh", "IN"), ("mcleod ganj", "IN"), ("mcleodganj", "IN"),
+    ("dharamshala", "IN"), ("srinagar", "IN"), ("shimla", "IN"), ("manali", "IN"),
+    ("spiti", "IN"), ("kashmir", "IN"), ("gulmarg", "IN"), ("sonamarg", "IN"),
+    ("gokarna", "IN"), ("hampi", "IN"), ("coorg", "IN"), ("madikeri", "IN"),
+    ("munnar", "IN"), ("ooty", "IN"), ("udhagamandalam", "IN"), ("kodaikanal", "IN"),
+    ("darjeeling", "IN"), ("rishikesh", "IN"), ("haridwar", "IN"),
+    ("pondicherry", "IN"), ("puducherry", "IN"), ("alleppey", "IN"), ("alappuzha", "IN"),
+    ("kumarakom", "IN"), ("thekkady", "IN"), ("wagamon", "IN"), ("vagamon", "IN"),
+    ("mahabalipuram", "IN"), ("thanjavur", "IN"), ("hampi", "IN"),
+    ("lonavala", "IN"), ("khandala", "IN"), ("mahabaleshwar", "IN"), ("panchgani", "IN"),
+    ("mount abu", "IN"), ("mountain", "IN"), ("gir", "IN"), ("diu", "IN"),
+    ("andaman", "IN"), ("nicobar", "IN"), ("havelock", "IN"), ("port blair", "IN"),
+    ("tawang", "IN"), ("ziro", "IN"), ("shillong", "IN"), ("cherrapunji", "IN"),
+    ("kaziranga", "IN"), ("guwahati", "IN"), ("gangtok", "IN"), ("pelling", "IN"),
+    ("kerala", "IN"), ("kashmir", "IN"), ("himachal", "IN"), ("uttarakhand", "IN"),
+    ("goa", "IN"), ("kanyakumari", "IN"), ("rameshwaram", "IN"), ("madurai", "IN"),
+    ("trivandrum", "IN"), ("thiruvananthapuram", "IN"), ("kochi", "IN"),
+    ("phuket", "TH"), ("bali", "ID"), ("krabi", "TH"), ("chiang mai", "TH"),
+    ("colombo", "LK"), ("kandy", "LK"), ("kathmandu", "NP"), ("pokhara", "NP"),
+    ("istanbul", "TR"), ("antalya", "TR"), ("cappadocia", "TR"),
+    ("lisbon", "PT"), ("porto", "PT"), ("reykjavik", "IS"), ("dubrovnik", "HR"),
 ];
 
 /// If the query explicitly names a location (via whole-word match against the
@@ -6346,15 +6345,17 @@ fn cross_location_mismatch_mult(
             continue; // skip 2-letter codes (us/uk) to avoid false hits
         }
         if whole_word_contains(&text, name) {
-            // 2026-08-19 round: 0.4 -> 0.12. The old dampening was too weak — for a
-            // sparse upstream an authoritative other-city page (e.g. Bing
-            // "vegetarian restaurants in Ahmedabad" for a "visakhapatnam" query)
-            // kept a 0.4x-of-a-large-base score above the correct on-topic results,
-            // so geo pollution sat in positions 3-6. 0.12x crushes the mismatched
-            // page well below the requested-city results while keeping it present
-            // (fail-soft). Pages that NAME the requested city are exempted earlier
-            // (mentions_req), so inclusive lists stay untouched. General.
-            return 0.12;
+            // 2026-08-19 round: 0.4 -> 0.12. Then 2026-08-19T1628Z round: 0.12 -> 0.06.
+            // The 0.12x dampening was STILL too weak — for a "best vegetarian thali
+            // places in mysore" query the off-topic Bing page "60 Best Places to
+            // Visit in Hyderabad" (which names a different gazetteer city) kept a
+            // 0.12x-of-a-large-base score ABOVE the correct on-topic Mysore results,
+            // because authority + quality boosts lifted its base and calibrate_scores
+            // rescales the max raw score back up. 0.06x crushes the mismatched page
+            // below the requested-city results while keeping it present (fail-soft).
+            // Pages that NAME the requested city are exempted earlier (mentions_req),
+            // so inclusive lists stay untouched. General.
+            return 0.06;
         }
     }
     1.0
@@ -9114,6 +9115,103 @@ fn merge_local_and_web(
         .collect();
     let query_entity_count = comparison_entities.len();
 
+    // ── D4 (2026-08-18T1340Z round): per-engine upstream-quality trust ──
+    // The fresh-date hard window must fail-OPEN when upstream returns no dates
+    // (otherwise a fresh query collapses to 0 results). But that fail-open lets a
+    // DATE-BLIND upstream engine — one that returned ZERO date-bearing results
+    // while OTHER engines returned dated ones — keep its junk. That junk still
+    // carries a high RRF position + domain authority, so the ranking trusts it
+    // even though it is visibly off-topic for a "recent … this budget season"
+    // query. We derive a per-engine trust multiplier purely from each engine's
+    // OWN date-signal behaviour on THIS query: an engine that returned ≥1 dated
+    // result when the query is fresh+dated earns full trust; an engine that
+    // returned NONE while others did is treated as low-trust (its fresh-intent
+    // results get crushed). No engine names, no per-query literals — only the
+    // structural signal "did this engine surface any dated result for this fresh
+    // query". General & self-adapting across upstreams and time.
+    // COLD-CASE GUARD: only populated when some engine returned a date. If NO
+    // engine had any dated result (every upstream is date-blind), the map stays
+    // empty and every result keeps trust 1.0 — there is no corroboration signal
+    // to single one engine out, so we must not crush blindly. Local results are
+    // exempt (kept at 1.0) — they are not "upstream engines" and the local-index
+    // quality gates already handle them.
+    let engine_trust: std::collections::HashMap<String, f32> = {
+        let mut m = std::collections::HashMap::new();
+        if intent == "fresh" {
+            let mut per_engine_dated: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut any_engine_dated = false;
+            for r in &merged {
+                let eng = primary_engine(r);
+                if eng == "local" {
+                    continue; // local not an upstream engine for trust purposes
+                }
+                if resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some() {
+                    *per_engine_dated.entry(eng).or_insert(0) += 1;
+                    any_engine_dated = true;
+                }
+            }
+            if any_engine_dated {
+                let mut web_engines: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for r in &merged {
+                    let eng = primary_engine(r);
+                    if eng != "local" {
+                        web_engines.insert(eng);
+                    }
+                }
+                for eng in web_engines {
+                    let dated = per_engine_dated.get(&eng).copied().unwrap_or(0);
+                    if dated == 0 {
+                        m.insert(eng.clone(), 0.15);
+                        tracing::info!(
+                            "D4 ENGINE TRUST: upstream '{}' returned 0 dated results on a fresh+dated query while others did — trust=0.15 (crush)",
+                            eng
+                        );
+                    } else {
+                        m.insert(eng.clone(), 1.0);
+                    }
+                }
+            }
+        }
+        m
+    };
+
+    // ── Comparison-query compared-entity extraction (D3 fix) ──
+    // For "compare X and Y" / "X vs Y" queries, the SPECIFIC compared entities
+    // (brand+model tokens like "brezza"/"venue") are what make a result on-topic.
+    // Generic attribute words ("mileage"/"petrol"/"range") and comparison-structure
+    // words ("compare"/"vs"/"between"/"and") are NOT entities. A local page that
+    // names NONE of the compared entities is off-topic crawl noise — e.g. a "Honda
+    // City Mileage" page floating above the actual Brezza/Venue results for a
+    // "Brezza vs Venue" query — and must not earn the local_bonus or keep a high
+    // relevance. Extraction is purely derived from the query's own distinctive terms
+    // minus attribute/structure vocab: no per-brand/per-entity tuning, so it
+    // generalises to any comparison ("swift vs nexon", "city vs amaze", ...).
+    let comparison_query = q_words.iter().any(|w| {
+        let l = w.to_lowercase();
+        l == "compare" || l == "comparison" || l == "versus" || l == "vs" || l == "v"
+            || l == "between" || (l == "and" && q_words.len() >= 5) || l == "or"
+    });
+    let comparison_structure_words: &[&str] = &[
+        "compare", "comparison", "versus", "vs", "v", "between", "and", "or", "the",
+        "a", "an", "of", "to", "in", "on", "for", "with", "that", "this", "these",
+        "those", "real", "world", "which", "has", "have", "better", "best", "top",
+        "than", "then",
+    ];
+    let comparison_attribute_terms: &[&str] = &[
+        "mileage", "range", "price", "cost", "specs", "spec", "specification", "boot",
+        "space", "power", "torque", "engine", "fuel", "petrol", "diesel", "electric",
+        "automatic", "manual", "variant", "feature", "features", "performance",
+        "efficiency", "kmpl", "review", "reviews", "launch", "model", "models", "year",
+    ];
+    let comparison_entities: Vec<String> = strong_distinctive_terms
+        .iter()
+        .map(|t| t.to_lowercase())
+        .filter(|tl| !comparison_structure_words.contains(&tl.as_str()))
+        .filter(|tl| !comparison_attribute_terms.contains(&tl.as_str()))
+        .filter(|tl| !is_weak_anchor_word(tl))
+        .collect();
+    let query_entity_count = comparison_entities.len();
+
     let core_topic_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
             let lower = w.to_lowercase();
@@ -10718,6 +10816,57 @@ fn merge_local_and_web(
         }
     }
 
+    // ── Cross-location LOCAL hard-drop (2026-08-19 round, geo pollution) ──
+    // When the user NAMES an explicit city in the query, a LOCAL-index page about a
+    // *different* gazetteer city is wrong for that query (e.g. "vegetarian
+    // restaurants near visakhapatnam" surfacing dozens of Trichy/Chennai local
+    // crawl pages). The in-loop `cross_loc_mult` (0.12x) was not enough on its own
+    // because the local base score is large, so other-city pages still floated into
+    // positions 3-5. We hard-drop local results that name a different gazetteer place
+    // and do NOT name the requested city/country.
+    // General: reuses the SAME `LOCATION_GAZETTEER` + `geo_is_explicit` gating as the
+    // soft multiplier, with the identical `mentions_req` exemption so inclusive pages
+    // that NAME the requested place are kept. No query/domain literals.
+    if geo_is_explicit {
+        let before = merged.len();
+        merged.retain(|r| {
+            if !r.is_local {
+                return true;
+            }
+            let tl = r.title.to_lowercase();
+            let cl = r.content.to_lowercase();
+            let ul = r.url.to_lowercase();
+            let text = format!("{} {} {}", tl, cl, ul);
+            // On-topic for the requested location → keep.
+            let req_city = geo_location.and_then(|g| g.city.as_deref());
+            let req_country = geo_location.and_then(|g| g.country_name.as_deref());
+            let mentions_req = req_city.map_or(false, |c| whole_word_contains(&text, c))
+                || req_country.map_or(false, |c| whole_word_contains(&text, c));
+            if mentions_req {
+                return true;
+            }
+            // Mention of a different known place → drop this local page.
+            let same_country_ok = req_city.is_none();
+            let req_cc = geo_location.and_then(|g| g.country_code.as_deref());
+            for (name, cc) in LOCATION_GAZETTEER.iter() {
+                if req_city.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
+                if req_country.map_or(false, |c| c.eq_ignore_ascii_case(name)) { continue; }
+                if same_country_ok {
+                    if let Some(rc) = req_cc { if cc.eq_ignore_ascii_case(rc) { continue; } }
+                }
+                if name.len() < 3 { continue; }
+                if whole_word_contains(&text, name) {
+                    return false;
+                }
+            }
+            true
+        });
+        let removed = before - merged.len();
+        if removed > 0 {
+            tracing::info!("CROSS_LOCATION_LOCAL_DROP: removed {}/{} other-city local result(s) for explicit-geo query", removed, before);
+        }
+    }
+
     // ── Adult-content hard-drop for non-adult queries (this round, D4) ──
     // Privacy-first search must not surface pornographic/NSFW results for ordinary
     // queries. The web fan-out (SearXNG-via-VPN) returned XNXX adult forums for an
@@ -11125,6 +11274,16 @@ fn merge_local_and_web(
         // sits below the topical write-up). Floor preserved so they remain present.
         let dict_cap = 0.03f32;   // dictionary sites may appear but never rank top
         let weak_cap = 0.04f32;   // single-polysemous-token matches capped low
+
+        // Best non-video score AFTER calibration but BEFORE this pass caps any video.
+        // Used by the P8 video cap (b0): a video must never outrank the best genuine
+        // text result for a non-video query, in any calibration regime (see comment
+        // at (b0)). Computed over post-calibration scores so it reflects the final
+        // text ranking.
+        let best_non_video = merged.iter()
+            .filter(|r| !r.sources.iter().any(|s| s == "invidious" || s == "video"))
+            .map(|r| r.score)
+            .fold(0.0f32, f32::max);
 
         // Best non-video score AFTER calibration but BEFORE this pass caps any video.
         // Used by the P8 video cap (b0): a video must never outrank the best genuine
