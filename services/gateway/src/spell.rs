@@ -111,6 +111,10 @@ pub(crate) struct SymSpellIndex {
     exact_map: HashMap<String, u32>,
     /// Character bigram language model for detecting tech-like words
     char_bigram_model: CharBigramModel,
+    /// Phonetic dictionary: maps phonetic code → list of words with that code.
+    /// Built once at startup from the word frequency map. Used for phonetic
+    /// fallback when SymSpell/LinSpell fail.
+    phonetic_dict: HashMap<String, Vec<String>>,
 }
 
 impl SymSpellIndex {
@@ -186,12 +190,28 @@ impl SymSpellIndex {
             char_bigram_model.reference_perplexity
         );
 
+        // Build phonetic dictionary from word frequencies
+        let mut phonetic_dict: HashMap<String, Vec<String>> = HashMap::new();
+        let double_metaphone = rphonetic::DoubleMetaphone::default();
+        for (word, _freq) in crate::dictionary::WORD_FREQUENCIES {
+            let word_lower = word.to_lowercase();
+            // Only include ASCII words (rphonetic panics on non-ASCII)
+            if !word_lower.is_ascii() {
+                continue;
+            }
+            let code = double_metaphone.encode(&word_lower);
+            if !code.is_empty() {
+                phonetic_dict.entry(code).or_default().push(word_lower);
+            }
+        }
+
         Self {
             deletions,
             words,
             frequencies,
             exact_map,
             char_bigram_model,
+            phonetic_dict,
         }
     }
 
@@ -259,7 +279,36 @@ impl SymSpellIndex {
             }
             (Some(s), None) => s,
             (None, Some(l)) => l,
-            (None, None) => return None,
+            (None, None) => {
+                // ─── Stage 4: Phonetic fallback ──────────────────────────
+                // SymSpell/LinSpell only cover edit distance <= 2. For insertion
+                // typos beyond that (e.g. "cancing" → "cancelling", 3 insertions),
+                // fall back to a phonetic match: encode the input with Double
+                // Metaphone and look up dictionary words sharing the code.
+                //
+                // Guards (all must pass):
+                //   1. Input word is NOT in the dictionary (absent-word guard)
+                //   2. Phonetic match has edit distance <= 3
+                //   3. Phonetic match is a common word (frequency above threshold)
+                //   4. Input and candidate share the same DoubleMetaphone primary
+                //      code (exact phonetic match, not just "similar")
+                let phonetic_candidate = self.phonetic_fallback(&word_lower);
+                match phonetic_candidate {
+                    Some(p) => {
+                        let p_dist = self.compute_edit_distance(&word_lower, &p);
+                        if p_dist >= 1 && p_dist <= 3 {
+                            // Absent-word guard: only correct absent words
+                            let absent = !self.exact_map.contains_key(&word_lower)
+                                && !self.is_known_misspelling(&word_lower);
+                            if absent {
+                                return Some(p);
+                            }
+                        }
+                        return None;
+                    }
+                    None => return None,
+                }
+            }
         };
 
         // Phase 1 (A1): block a single-character-substitution swap when BOTH
@@ -695,6 +744,47 @@ impl SymSpellIndex {
                 None
             }
         })
+    }
+
+    /// Phonetic fallback: find a correction candidate via DoubleMetaphone encoding.
+    ///
+    /// Encodes the input word with DoubleMetaphone and looks up dictionary words
+    /// sharing the same primary phonetic code. Returns the most frequent
+    /// candidate (highest frequency in the dictionary).
+    ///
+    /// This handles insertion-only typos beyond edit distance 2 (e.g. "cancing"
+    /// → "cancelling") where SymSpell/LinSpell cannot reach.
+    fn phonetic_fallback(&self, word: &str) -> Option<String> {
+        let double_metaphone = rphonetic::DoubleMetaphone::default();
+        let code = double_metaphone.encode(word);
+        if code.is_empty() {
+            return None;
+        }
+
+        // Look up all dictionary words with the same phonetic code
+        let candidates = self.phonetic_dict.get(&code)?;
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Pick the most frequent candidate
+        let mut best_candidate: Option<(&String, f64)> = None;
+        for candidate in candidates {
+            let freq = self.exact_map
+                .get(candidate)
+                .map(|&id| self.frequencies[id as usize])
+                .unwrap_or(0.0);
+            match best_candidate {
+                None => best_candidate = Some((candidate, freq)),
+                Some((_, best_freq)) => {
+                    if freq > best_freq {
+                        best_candidate = Some((candidate, freq));
+                    }
+                }
+            }
+        }
+
+        best_candidate.map(|(word, _)| word.clone())
     }
 
     /// Compute Damerau-Levenshtein edit distance between two strings.
@@ -1310,6 +1400,28 @@ mod tests {
         let index = SymSpellIndex::build();
         let result = index.correct("housr");
         assert_eq!(result, Some("house".to_string()), "Should correct typo 'housr' to 'house'");
+    }
+
+    #[test]
+    fn test_cancing_corrected_to_cancelling_via_phonetic() {
+        // FIX-IF-12: "cancing" → "cancelling" is an insertion-only typo (3 edits)
+        // beyond SymSpell/LinSpell's max distance of 2. The phonetic fallback
+        // should catch this via DoubleMetaphone code matching.
+        let index = SymSpellIndex::build();
+        let result = index.correct("cancing");
+        assert!(result.is_some(), "Should correct 'cancing' via phonetic fallback");
+        assert_eq!(result.unwrap(), "cancelling",
+            "Should correct 'cancing' to 'cancelling' (insertion of 'll')");
+    }
+
+    #[test]
+    fn test_phonetic_fallback_does_not_break_biryani_guard() {
+        // The phonetic fallback must NOT re-open the biryani->bryan hole.
+        // "biryani" is absent from the dictionary and its phonetic code differs
+        // from "bryan", so the fallback should not correct it.
+        let index = SymSpellIndex::build();
+        let result = index.correct("biryani");
+        assert_eq!(result, None, "biryani must NOT be corrected even with phonetic fallback");
     }
 
     #[test]

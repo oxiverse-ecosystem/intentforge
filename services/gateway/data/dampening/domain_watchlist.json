@@ -1,0 +1,8 @@
+{
+  "domains": [
+    { "domain": "youtube.com", "is_primary_intent_source": false },
+    { "domain": "google.com", "is_primary_intent_source": true },
+    { "domain": "bing.com", "is_primary_intent_source": true },
+    { "domain": "wikipedia.org", "is_primary_intent_source": false }
+  ]
+}
