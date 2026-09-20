@@ -972,6 +972,7 @@ impl GoalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json;
 
     #[test]
     fn goal_terms_retains_short_technical_terms() {
@@ -997,6 +998,70 @@ mod tests {
         assert!(go_content.contains("go") || go_content.contains("programming"),
             "short technical term 'Go' or 'programming' must appear in phase content, got objectives: {:?}, deliverables: {:?}",
             objectives_go, deliverables_go);
+    }
+
+    #[test]
+    fn roadmap_total_phases_matches_phases_len() {
+        // Schema invariant: Roadmap.total_phases MUST equal phases.len().
+        // Regression guard for the historical bug where total_phases was null/0.
+        // We drive the REAL roadmap builder (generate_roadmap) across every
+        // timeline bucket so the guard is not tuned to one phase count. No
+        // hardcoded expected counts — we assert equality of two computed values.
+        let timelines = [
+            "1 month — Sprint project",
+            "3 months — Quarter project",
+            "6 months — Half-year project",
+            "12 months — Year-long project",
+            // Unrecognized timeline falls through to the default bucket.
+            "no-timeline-marker — falls through to default",
+        ];
+        for tl in timelines {
+            let answers = vec![
+                UserAnswer { question_id: 1, answer: serde_json::json!(tl) },
+                UserAnswer { question_id: 2, answer: serde_json::json!("5-10 hours — Part-time focus") },
+            ];
+            let roadmap = generate_roadmap("develop a privacy-first search engine", &answers, &[]);
+            assert_eq!(
+                roadmap.total_phases,
+                roadmap.phases.len(),
+                "Roadmap.total_phases ({}) != phases.len() ({}) for timeline '{}'",
+                roadmap.total_phases,
+                roadmap.phases.len(),
+                tl
+            );
+            // A valid goal must always yield a non-empty roadmap.
+            assert!(roadmap.total_phases > 0, "total_phases must be > 0 for timeline '{}'", tl);
+        }
+    }
+
+    #[test]
+    fn leaderboard_serializes_to_array() {
+        // Schema invariant: GET /goals/leaderboard MUST return a JSON ARRAY
+        // (Vec), never an object/dict. Regression guard for the historical bug
+        // where the leaderboard returned a dict. Drives the real store path
+        // (GoalStore::leaderboard) with no HTTP server.
+        let mut store = GoalStore::new();
+
+        // Empty store → empty array (still an array, the regression is a dict).
+        let empty_json = serde_json::to_value(store.leaderboard(50)).unwrap();
+        assert!(empty_json.is_array(),
+            "leaderboard() must serialize to a JSON array; got {:?}", empty_json);
+
+        // Populate a goal with a roadmap and re-check the shape.
+        let goal_id = store.insert("learn rust".to_string(), "learning".to_string(), vec![]);
+        let answers = vec![
+            UserAnswer { question_id: 1, answer: serde_json::json!("3 months — Quarter project") },
+            UserAnswer { question_id: 2, answer: serde_json::json!("5-10 hours — Part-time focus") },
+        ];
+        let roadmap = generate_roadmap("learn rust", &answers, &[]);
+        assert!(store.update_roadmap(&goal_id, roadmap), "update_roadmap failed for {}", goal_id);
+
+        let json = serde_json::to_value(store.leaderboard(50)).unwrap();
+        assert!(json.is_array(),
+            "leaderboard() with goals must serialize to a JSON array; got {:?}", json);
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "expected exactly one leaderboard entry, got {}", arr.len());
+        assert!(arr[0].is_object(), "each leaderboard entry must be a JSON object");
     }
 }
 
@@ -1172,14 +1237,6 @@ pub async fn handle_leaderboard(
 ) -> Response {
     let store = state.goals_state.lock();
     let entries = store.leaderboard(50);
-    // Returns a bare JSON ARRAY (Vec<LeaderboardEntry>) per the audit's schema
-    // assertion: the leaderboard response MUST be a list (iterable) of goal objects,
-    // not a dict wrapper. (Formerly returned `{"entries":[...],"total_entries":N}`.)
-    // Returns a BARE JSON ARRAY of leaderboard entries (score-descending, max 50).
-    // `total_entries` is intentionally dropped — it is trivially derivable client-side
-    // as the array length, and a bare list is the consistent shape for a collection
-    // endpoint. The CI schema test (tests/goals_api_schema.py::test_goals_leaderboard_is_list)
-    // and the standing audit brief both encode this list contract.
     (StatusCode::OK, Json(entries)).into_response()
 }
 

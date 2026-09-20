@@ -2003,19 +2003,18 @@ Returns all goals sorted by score (descending). Max 50 entries.
 
 Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
 
+Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
+
 ```json
 [
   {
     "goal_id": "goal_0001",
     "goal": "build a full-stack web app...",
-    "goal_id": "goal_0003",
-    "goal": "learn rust programming language",
     "user_name": "Anonymous",
     "score": 0,
     "completed_phases": 0,
     "total_phases": 4,
     "created_at": "2026-07-29T12:00:00Z"
-    "created_at": "2026-08-25T07:44:57Z"
   }
 ]
 ```

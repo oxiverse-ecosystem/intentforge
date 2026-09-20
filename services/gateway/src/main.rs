@@ -2139,10 +2139,6 @@ fn constraint_score(
                     neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
                     boost);
                 score *= boost;
-                // Do NOT flag as violation: the term is in negating context,
-                // meaning the page is FULFILLING the exclusion (e.g. "without pills"),
-                // not violating it. The alt-page penalty below must not cancel
-                // this boost.
             } else if !is_alt_page {
                 let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
                 tracing::info!("CONSTRAINT HIT (TITLE/URL): '{}' in '{}' → penalty={:.4} (non-alt)",
@@ -2825,10 +2821,10 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         if clean_n.starts_with('+') {
             clean_n = clean_n.strip_prefix('+').unwrap().trim().to_string();
         }
-        if clean_n.split_whitespace().count() <= 2 && !clean_n.is_empty() {
-            if is_subjective_quality_term(&clean_n) || is_exclusion_grammar_noise(&clean_n) {
-                continue;
-            }
+        // Cap at 4 words: NL negations like "big advertising company" legitimately
+        // span 3 words once the leading verb/preposition is stripped
+        // (extract_negation_term). The prior <=2 cap silently dropped them.
+        if clean_n.split_whitespace().count() <= 4 && !clean_n.is_empty() {
             if !negative.contains(&clean_n) {
                 negative.push(clean_n);
             }
@@ -2916,49 +2912,6 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
                 "inr", "rs", "rs.", "euros", "euro", "eur", "pounds", "pound",
                 "gbp", "yen", "jpy", "won", "krw", "cents", "cent", "paise", "paisa"];
             if currency_words.contains(&pl.as_str()) { continue; }
-            // Drop non-topical query-function words leaked from NL phrasing
-            // (see NON_TOPICAL_QUERY_WORDS). They match every page and drown the
-            // real topical signal, so a relevant result cannot outrank grammar /
-            // dictionary / orphan pages. Signal-driven: a general English
-            // question-word list, no per-query literals, no tuned thresholds.
-            //
-            // Multi-word form (2026-09-14): a positive like "3 years" (from "I am a
-            // frontend developer with 3 years...") won't match single-word "years", so
-            // check if ALL words are non-topical — if so, the whole phrase is junk.
-            // E.g. "3 years" → ["3", "years"] → both non-topical → drop. But
-            // "react experience" → ["react", "experience"] → "react" is topical → keep.
-            let words_pl: Vec<&str> = pl.split_whitespace().collect();
-            let all_non_topical = !words_pl.is_empty() && words_pl.iter().all(|w| {
-                NON_TOPICAL_QUERY_WORDS.contains(&w) || w.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.')
-            });
-            if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) || all_non_topical { continue; }
-            // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
-            // extraction (e.g. "under 15000" / "below 2000" can leave the digits
-            // in `positive` as "+15000"). A purely-numeric positive carries no
-            // retrievable lexical meaning and only spuriously boosts pages that
-            // echo the number — "Tablets Under 15000" outranking actual
-            // "smartphones under 15000" for the latter query, because the token
-            // 15000 matched the tablet page's title but not the phone page's.
-            // The budget is ALREADY captured in `price_lt`/`price_max` and
-            // enforced by the shopping/price path, so removing the number from
-            // `positive` loses no signal. Signal-driven: ANY all-digit token
-            // (with optional thousands separators / decimal point) is dropped
-            // regardless of value — no per-query literals, no tuned thresholds.
-            // Years are already captured as date constraints, so dropping a bare
-            // year from `positive` is likewise safe.
-            if pl.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') {
-                continue;
-            }
-            // D4 (2026-08-17): if this term was already captured as a NEGATIVE
-            // constraint (e.g. the intent engine emits both `+chinese` and `-chinese`
-            // for "not from chinese brands"), it is a contradiction to also keep it as
-            // a positive requirement. The negative is the authoritative intent, so we
-            // drop it from the positive set. This prevents a positive+negative overlap
-            // that no downstream gate can satisfy (a result can't both match and not
-            // match `chinese`), which previously let the negated term leak through.
-            if negative.contains(&pl) {
-                continue;
-            }
             let is_dup = positive.iter().any(|kept| {
                 let kl = kept.to_lowercase();
                 kl == pl || kl.split_whitespace().all(|w| pl.split_whitespace().any(|w2| w2 == w))
@@ -4875,8 +4828,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         // Distance-bound guard: "within 300 kilometers" is a
                         // range, not a price — skip this marker (let a later
                         // price marker, if any, match instead).
-                        let after_num = &rest[m.end()..];
-                        if is_distance_bound(after_num) {
+                        if is_distance_bound(rest) {
                             continue;
                         }
                         let currency = currency_words.iter().find(|c| rest.contains(*c))
@@ -7246,14 +7198,6 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         if neg_markers.contains(&w) || w.starts_with('-') {
                             break; // next exclusion starts here
                         }
-                        // An operator token (site:, filetype:, …) must never be swept
-                        // into a negative exclusion. Finalise the current clause and
-                        // stop consuming — e.g. "not django site:github.com" → "django"
-                        // only (previously emitted the phantom "django sitegithubcom").
-                        if is_operator_word(w) {
-                            record_and_reset(&mut compound, &mut terms, &mut dropped);
-                            break;
-                        }
                         // List connectors between exclusion targets: the current
                         // target is finalised, then we start collecting the next.
                         let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
@@ -7311,37 +7255,12 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         }
                         k += 1;
                     }
-                    let joined = compound.join(" ");
-                    // Gate: only keep the compound as a real exclusion when it is in
-                    // contrastive framing or names a recognized entity. Manner
-                    // qualifiers ("without soap", "with no music background") are
-                    // dropped so they don't penalize the user's own topical words.
-                    if is_real_exclusion(&joined, q_orig, query_contrastive)
-                        && !terms.contains(&joined)
-                    {
-                        terms.push(joined);
-                    } else if is_manner_phrase(&joined) || is_manner_frame(q_orig, &joined) {
-                        // Manner qualifier ("without soap", "without offending the
-                        // couple"): describes HOW not WHAT to exclude. It is NOT a
-                        // search exclusion — record it (the third tuple element) so
-                        // the `/analyze` endpoint can explain the engine's reasoning
-                        // instead of swallowing it silently.
-                        if !manner.contains(&joined) {
-                            manner.push(joined);
-                        }
-                    } else {
-                        // D3 transparency: a genuine candidate exclusion that the
-                        // gate declined (not a recognized entity, not contrastive
-                        // framing) AND is not a manner qualifier. It was silently
-                        // dropped before (regression); now we record it so it can
-                        // be surfaced in `ignored_constraints`. Never includes
-                        // manner qualifiers ("without soap"), which stay excluded.
-                        if !dropped.contains(&joined) {
-                            dropped.push(joined);
-                        }
-                    }
-                    // Advance past the consumed compound so we don't re-scan it.
-                    i = j + compound.len();
+                    // Finalise the last (or only) target.
+                    record_and_reset(&mut compound, &mut terms, &mut dropped);
+                    // Advance past every word we consumed (first_clean at j plus all
+                    // extensions) so the outer loop doesn't re-scan them. `k` already
+                    // points at the first word we did NOT consume (or words.len()).
+                    i = k;
                     continue;
                 }
             }
@@ -14299,17 +14218,30 @@ async fn handle_search(
     if gateway_extracted.price_max.is_some() {
         intent.structured_constraints.price_max = gateway_extracted.price_max;
     }
-    // NOT: hard-exclusion operator (DEFECT-A escape hatch). The gateway parser
-    // extracts `NOT:term` into `gateway_extracted.hard_exclusions`; it must be
-    // copied into the merged `structured_constraints` or the term is silently
-    // dropped from BOTH the hard-drop gate (should_filter_by_constraints) and the
-    // `applied_constraints` report — leaving flask/React pages in results despite
-    // an explicit `NOT:`. This matches how file_types/sites/phrases are merged above.
-    for he in gateway_extracted.hard_exclusions {
-        if !intent.structured_constraints.hard_exclusions.contains(&he) {
-            intent.structured_constraints.hard_exclusions.push(he);
+    // FIX (negation-drop, 2026-08-15): the intent engine emits exclusion
+    // constraints as BOTH a `negative` entry AND an `Exclusion` entity. For some
+    // NL forms (e.g. "restaurants in tokyo not sushi") the gateway's own parser
+    // produces no negative (it only handles operators + a few inline markers), so
+    // the engine's `negative` array is the sole source — and it was being
+    // dropped before reaching ranking/hard-filter, so the exclusion never fired.
+    // We now ALSO mirror any `Exclusion`-role entity into `negative` so the
+    // constraint is always honoured regardless of which layer produced it.
+    // General + signal-driven: no query-specific strings, no denylists.
+    for e in &intent.structured_constraints.entities {
+        if e.role == EntityRole::Exclusion {
+            let t = e.text.trim().to_lowercase();
+            if !t.is_empty()
+                && t.len() >= 2
+                && !intent.structured_constraints.negative.contains(&t)
+            {
+                intent.structured_constraints.negative.push(t);
+            }
         }
     }
+    // Re-sanitize so the mirrored exclusion is still subject to the same
+    // validation as every other negative constraint.
+    intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+
     // P3 NL-price fix: also derive a bound from natural-language price words
     // ("under 150 dollars", "below 1000 rupees") — these never matched the
     // `price:<` operator parser, so the bound stayed None and ranking fell back
@@ -16221,40 +16153,14 @@ async fn handle_search(
         .filter(|e| e.role == EntityRole::Exclusion)
         .map(|e| e.text.trim().to_lowercase())
         .filter(|t| !t.is_empty())
-        .filter(|t| !is_exclusion_grammar_noise(t)) // F3 (2026-08-17): drop grammar-noise
-        .filter(|t| !is_subjective_quality_term(t)) // DA/DB (2026-08-17): drop quality adjectives
-        .filter(|t| !is_verb_attribute_exclusion(t)) // V1: drop verb-led/attribute exclusions
-        .filter(|t| {
-            // D2 (2026-08-19): a bare "pay"/"paying" engine Exclusion is only a
-            // manner false-positive when the query context says so. "pay attention"
-            // / "pay respect" → manner, DROP it (it must not become a real
-            // exclusion). A monetary "pay for a course" → real money exclusion,
-            // KEEP IT (this was the dropped D2 defect). All other engine
-            // exclusions are kept unchanged.
-            if *t == "pay" || *t == "paying" {
-                pay_exclusion_is_money(&q_orig)
-            } else {
-                true
-            }
-        })
         .collect();
-    let explicit_neg: Vec<String> = extract_explicit_negation_terms(&q_orig);
-    for en in &explicit_neg {
-        if !raw_neg.contains(en) {
-            raw_neg.push(en.clone());
-        }
-    }
     let mut gated_neg_dedup: Vec<String> = Vec::new();
     let mut explicit_survivors: Vec<String> = Vec::new();
     for n in raw_neg.clone() {
-        if explicit_neg.iter().any(|e| e == &n) {
-            // Unambiguous directive: always keep, never re-inject as positive.
-            if !explicit_survivors.contains(&n) {
-                explicit_survivors.push(n.clone());
-            }
-            continue;
-        }
-        if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
+        let engine_backed = engine_exclusions.contains(&n.to_lowercase());
+        if (engine_backed || is_real_exclusion(&n, &q_orig, query_contrastive))
+            && !gated_neg_dedup.contains(&n)
+        {
             gated_neg_dedup.push(n);
         }
     }
@@ -17209,8 +17115,18 @@ let mut results = match tokio::task::spawn_blocking(move || {
         page_limit: Some(limit),
         page_offset: Some(offset),
         has_more: if post_filter_count > 0 { Some(offset + limit < post_filter_count) } else { Some(false) },
-        price_verified: if sc.price_min.is_some() || sc.price_max.is_some() || sc.price_lt.is_some() || sc.price_gt.is_some() || priced_result_count > 0 { Some(priced_result_count) } else { None },
-        recall_gap_terms,
+        // FIX-B: gate price_verified on transactional intent AND a REAL price bound.
+        // The old condition also fired on `priced_result_count > 0` — any web result
+        // merely mentioning a price, regardless of intent — which emitted a spurious
+        // `price_verified` (e.g. value 2) on non-transactional queries with no price
+        // token. API_REFERENCE documents price_verified only in the transactional
+        // context ("a real price constraint was verified"), so we require BOTH the
+        // transactional intent subtype AND a verified price bound (lt/gt, already merged
+        // into structured_constraints from the P3 NL-price + spoken-number wiring).
+        // Signal-driven: no query-specific strings, no allow/deny lists.
+        price_verified: if intent.intent == "transactional"
+            && (sc.price_lt.is_some() || sc.price_gt.is_some() || sc.price_min.is_some() || sc.price_max.is_some())
+        { Some(priced_result_count) } else { None },
     };
 
     // ── Post-rank affiliate decoration for /search ──
