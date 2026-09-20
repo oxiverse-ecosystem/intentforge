@@ -10873,7 +10873,7 @@ fn merge_local_and_web(
                     // topical article at 0.05, instead of tying it via insertion order
                     // as the old 0.12 did). Floor preserved so videos remain present.
                     // Signal-driven (query self-describes intent), not tuned to a query.
-                    let video_cap = 0.04f32;
+                    let video_cap = 0.02f32;
                     if r.score > video_cap {
                         tracing::info!(
                             "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source)",
