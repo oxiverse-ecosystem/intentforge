@@ -18,6 +18,7 @@ mod geoloc;
 mod dictionary;
 mod clean;
 mod goals;
+mod query_expansion;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
 // ─── API Types ───────────────────────────────────────────────────────
@@ -103,6 +104,23 @@ struct Constraints {
     /// Lower bound from an explicit `>` operator, e.g. `price:>50`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     price_gt: Option<f32>,
+    /// Match mode for constraint filtering.
+    /// - Hard (default): results violating negative constraints are hard-dropped.
+    /// - Soft (used by 0-result retry): never hard-drop; instead score by
+    ///   constraint satisfaction count (more matches = higher rank) and fall
+    ///   back to the best partial match. Never returns 0 results if any
+    ///   partial match exists.
+    #[serde(default)]
+    match_mode: MatchMode,
+}
+
+/// Match mode for constraint filtering.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+enum MatchMode {
+    #[default]
+    Hard,
+    Soft,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -973,6 +991,18 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
         }
     }
 
+    // "this year"/"this month" only imply a date window when co-occurring with a
+    // news/recency signal term. In "certification path this year", "this year"
+    // modifies user intent, not recency — firing a 365-day window wrongly drops
+    // older but still-relevant results. Structural signal vocabulary, no per-query
+    // literals.
+    let recency_signal_terms = [
+        "news", "latest", "new", "recent", "developments", "changes",
+        "update", "updates", "this week", "breaking", "headline", "headlines",
+        "announced", "released", "launched", "today", "yesterday",
+    ];
+    let has_recency_signal = recency_signal_terms.iter().any(|t| q_lower.contains(t));
+
     let named: &[(&str, i64)] = &[
         ("this week", -7), ("past week", -7), ("last week", -7), ("current week", -7),
         ("this month", -30), ("past month", -30), ("last month", -30),
@@ -980,6 +1010,14 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
     ];
     for (phrase, delta) in named {
         if q_lower.contains(*phrase) {
+            if *phrase == "this year" || *phrase == "this month" {
+                // Co-occurrence gate: only fire when a news/recency signal term
+                // is also present. Otherwise skip — do NOT emit after:/before:.
+                if has_recency_signal {
+                    return Some((format_ymd(add_days(today, *delta)), today_s));
+                }
+                continue;
+            }
             return Some((format_ymd(add_days(today, *delta)), today_s));
         }
     }
@@ -2969,6 +3007,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         price_lt,
         price_gt,
         ignored_constraints: None,
+        match_mode: MatchMode::Hard,
     }
 }
 
@@ -17658,6 +17697,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         price_lt,
         price_gt,
         ignored_constraints: None,
+        match_mode: MatchMode::Hard,
     }
 }
 
