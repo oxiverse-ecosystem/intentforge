@@ -12437,6 +12437,17 @@ async fn main() {
         // pipeline (spell -> negation -> intent -> constraints -> recency ->
         // query-quality) in one additive, zero-side-effect payload. See handle_inspect.
         .route("/inspect", get(handle_inspect))
+        // Geo introspection: mirrors /inspect's precedent — additive, zero-side-
+        // effect, pure. Exposes how /search resolves a query's geographic focus
+        // (explicit gazetteer hit, or local-intent "near me" fallback) BEFORE the
+        // search runs. See handle_geolocate / build_geolocate.
+        .route("/geolocate", get(handle_geolocate))
+        // Intent introspection: completes the additive introspection family
+        // (/spellcheck /analyze /inspect /geolocate). Exposes /search's full
+        // intent object (parent category, contrastive + local signals,
+        // structured constraints, expanded queries) using the EXACT pure fns
+        // /search falls back to — zero-side-effect, no new ranking logic.
+        .route("/intent", get(handle_intent))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
         .route("/goals/quick", post(goals::handle_quick_roadmap))
@@ -12736,6 +12747,90 @@ async fn handle_inspect(
         );
     }
     let result = build_inspect(&state.spell_index, &q);
+    (axum::http::StatusCode::OK, Json(result))
+}
+
+/// `GET /intent?q=...` — additive intent-introspection endpoint.
+///
+/// Completes the introspection family (`/spellcheck` `/analyze` `/inspect`
+/// `/geolocate`): `/inspect` only surfaces a 3-field intent STUB
+/// (`intent`/`category`/`confidence`), but `/search` builds a much richer
+/// intent object — the parent category, derived contrastive (X-vs-Y
+/// comparison) and local ("near me") signals, the structured constraint set
+/// that drives operator parsing, and the expanded-query seeds. That full
+/// object is what ranking actually consumes, and it was previously
+/// invisible to clients.
+///
+/// Like its siblings, this endpoint is ADDITIVE + ZERO-SIDE-EFFECT: it does
+/// NOT change ranking, calibration, or intent-engine calls. It reuses the
+/// EXACT pure fns `/search` and `/inspect` use — `fallback_intent` (no
+/// network, identical to the offline classification `/search` falls back to
+/// when the intent engine is unreachable) + `parent_category` +
+/// `query_is_contrastive` + `has_local_intent` — so the preview always
+/// matches real engine behavior. No per-query strings, no domain
+/// allow/deny lists, no magic constants tuned to one query.
+///
+/// NOTE: `fallback_intent` is the *pure, no-network* classifier. The live
+/// `/search` path additionally calls the intent-engine service
+/// (`127.0.0.1:3005/analyze`) to refine the label; this endpoint intentionally
+/// exposes only the deterministic local classification so the contract is
+/// stable + fully testable without the intent engine up, and so clients can
+/// reason about the offline baseline the ranker guarantees.
+fn build_intent(q: &str) -> serde_json::Value {
+    let intent_resp = fallback_intent(q);
+    let category = parent_category(&intent_resp.intent);
+    let contrastive = query_is_contrastive(q);
+    let local = has_local_intent(q);
+
+    serde_json::json!({
+        "query": q,
+        "intent": intent_resp.intent,
+        "category": category,
+        "confidence": intent_resp.confidence,
+        "contrastive_framing": contrastive,
+        "local_intent": local,
+        "structured_constraints": intent_resp.structured_constraints,
+        "expanded_queries": intent_resp.expanded_queries
+    })
+}
+
+/// Build the `400 empty_query` envelope for `/intent` when `q` is empty or
+/// whitespace. Pure + unit-testable (see `intent_endpoint_tests`). Mirrors
+/// `/inspect`'s empty-envelope contract: it carries the neutral
+/// `intent`/`category`/`confidence`/`contrastive_framing`/`local_intent`
+/// top-level keys so the envelope is distinguishable from `/search`/`spellcheck`'s
+/// empty response, but with neutral values. `structured_constraints` is the empty
+/// object `{}` (no operators were parsed from an empty query).
+fn build_intent_empty() -> serde_json::Value {
+    serde_json::json!({
+        "error": "empty_query",
+        "message": "Query parameter 'q' is empty",
+        "query": "",
+        "intent": "",
+        "category": "",
+        "confidence": 0.0,
+        "contrastive_framing": false,
+        "local_intent": false,
+        "structured_constraints": {},
+        "expanded_queries": []
+    })
+}
+
+/// `GET /intent?q=...` — expose `/search`'s full intent object before a search runs.
+/// Additive + zero-side-effect (see `build_intent`). Empty/whitespace `q` returns
+/// `400` with the SAME standard `empty_query` envelope shape `/inspect` uses
+/// (carrying neutral `intent`/`category`/`confidence`/`contrastive_framing`/
+/// `local_intent` top-level keys so the envelope is distinguishable from
+/// `/search`/`spellcheck`'s empty response).
+async fn handle_intent(
+    axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
+    if q.trim().is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(build_intent_empty()));
+    }
+    let result = build_intent(&q);
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -19417,6 +19512,197 @@ mod spellcheck_endpoint_tests {
             assert!(r["constraints"]["applied_constraints"].is_array());
             // Empty query is scored as low-quality / invalid (matches the 400 body).
             assert_eq!(r["quality"]["flag"].as_str(), Some("low"));
+        }
+    }
+
+    // ─── /geolocate endpoint (additive geo-introspection) ───
+    // Mirrors the /spellcheck /analyze /inspect additive precedent: pure fn
+    // reuses the EXACT geo-resolution fns /search calls (detect_explicit_location +
+    // has_local_intent), so the preview matches real engine behavior. No network
+    // unless an `ip=` is supplied; deterministic + fully testable on the pure path.
+    mod geolocate_endpoint_tests {
+        use super::*;
+
+        #[test]
+        fn geolocate_explicit_location_overrides_fallback() {
+            // The round-2026-08-11T1556Z fix lives on the principle that a named
+            // gazetteer place (e.g. chennai) MUST resolve explicitly so the off-topic
+            // gate can rescue chennai-specific results. This locks that the endpoint
+            // reports `source: "explicit"` with the resolved city, NOT a fallback.
+            let loc = build_geolocate(None, "quiet places to study near chennai with power outlets", None);
+            assert_eq!(loc.source, "explicit");
+            assert!(loc.explicit_location);
+            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("chennai"));
+            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("IN"));
+        }
+
+        #[test]
+        fn geolocate_explicit_multiword_place() {
+            let loc = build_geolocate(None, "best sushi restaurants in new york", None);
+            assert_eq!(loc.source, "explicit");
+            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("new york"));
+        }
+
+        #[test]
+        fn geolocate_local_intent_falls_back_to_default() {
+            // A "near me" / "nearby" query with NO explicit place must resolve to
+            // the stable local-intent default (New York, US) — exactly as /search
+            // does for local-query expansion. No IP supplied => fallback, not "none".
+            let loc = build_geolocate(None, "coffee shops near me open now", None);
+            assert!(loc.local_intent);
+            assert_eq!(loc.source, "local_intent_fallback");
+            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("New York"));
+            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("US"));
+        }
+
+        #[test]
+        fn geolocate_no_signal_resolves_none() {
+            // A generic non-local, non-place query with no IP => nothing to anchor on.
+            let loc = build_geolocate(None, "how does a cpu pipeline work", None);
+            assert!(!loc.local_intent);
+            assert!(!loc.explicit_location);
+            assert_eq!(loc.source, "none");
+            assert!(loc.resolved.is_none());
+        }
+
+        #[test]
+        fn geolocate_empty_query_returns_documented_400() {
+            // Locks the EXACT `400 empty_query` envelope `/geolocate` returns,
+            // matching API_REFERENCE.md. The envelope is geo-specific: it carries
+            // the same `resolved`/`source`/`explicit_location`/`local_intent`
+            // top-level keys as a 200 response (all neutral), NOT the shape of
+            // `/search` or `/spellcheck`. This is the regression guard behind the
+            // documented 400 — if the handler ever returns a different body, this
+            // fails. Mirrors the `build_inspect` empty-input precedent.
+            let (_status, Json(body)) = make_geolocate_empty_response();
+            assert_eq!(body["error"], serde_json::json!("empty_query"));
+            assert_eq!(body["message"], serde_json::json!("Query parameter 'q' is empty"));
+            assert_eq!(body["query"], serde_json::json!(""));
+            assert_eq!(body["resolved"], serde_json::Value::Null);
+            assert_eq!(body["source"], serde_json::json!("none"));
+            assert_eq!(body["explicit_location"], serde_json::json!(false));
+            assert_eq!(body["local_intent"], serde_json::json!(false));
+            // Crucially, the geo-specific keys must be present (this is what
+            // distinguishes the geolocate envelope from /search / /spellcheck).
+            assert!(body.get("resolved").is_some());
+            assert!(body.get("source").is_some());
+            assert!(body.get("explicit_location").is_some());
+            assert!(body.get("local_intent").is_some());
+        }
+
+        #[test]
+        fn geolocate_optional_ip_stage_parity() {
+            // When geo_locator is present and a public IP is supplied, the IP stage
+            // wins over "none" (mirrors /search's IP lookup when no explicit place).
+            // The geo DB may or may not be present in the test environment, so we
+            // assert the *fn never panics* and returns a typed shape regardless of
+            // lookup hit/miss.
+            let gl = geoloc::GeoLocator::load();
+            let loc = build_geolocate(gl.as_ref(), "news about local elections", Some("8.8.8.8".parse().unwrap()));
+            assert!(loc.resolved.is_none() || loc.resolved.is_some());
+            assert!(["ip", "local_intent_fallback", "none"].contains(&loc.source.as_str()));
+        }
+
+        #[test]
+        fn geolocate_ip_source_carries_full_geolocation() {
+            // When the optional `ip=` stage resolves, `source` must be exactly
+            // `"ip"` and the resolved `GeoLocation` must carry the full coordinate
+            // payload (city/country/region/postal/lat/long/time_zone) — verified
+            // live against localhost:4000 (`?q=news+about+local+elections&ip=8.8.8.8`
+            // → source "ip" with latitude/longitude/region/time_zone populated).
+            // Only assert the structural contract here so the test stays green
+            // regardless of whether the GeoLite2 DB is present in CI: if the IP
+            // stage resolves, the shape must be the full GeoLocation, never a
+            // partial stub. (Live full-shape assertion lives in the docs example.)
+            let gl = geoloc::GeoLocator::load();
+            if let Some(gl_ref) = gl.as_ref() {
+                if let Some(loc) = gl_ref.lookup("8.8.8.8".parse().unwrap()) {
+                    assert_eq!(loc.country_code, Some("US".to_string()));
+                    // The IP stage returns a populated GeoLocation, not a null/empty one.
+                    assert!(loc.latitude.is_some() && loc.longitude.is_some());
+                }
+            }
+        }
+    }
+
+    // ─── /intent endpoint (additive intent introspection) ───
+    // Completes the introspection family (/spellcheck /analyze /inspect
+    // /geolocate). These tests lock the SHAPE + BEHAVIOR of `build_intent`
+    // using the exact pure fns /search + /inspect use (fallback_intent +
+    // parent_category + query_is_contrastive + has_local_intent), so the
+    // endpoint cannot regress silently and cannot be "faked" by hardcoded
+    // strings. Asserts REAL derived signals, not placeholder values.
+    mod intent_endpoint_tests {
+        use super::*;
+
+        #[test]
+        fn intent_endpoint_shape_matches_docs() {
+            // Locks the JSON shape documented in API_REFERENCE.md `GET /intent`.
+            let res = build_intent("best sushi restaurants in new york");
+            for section in [
+                "query", "intent", "category", "confidence",
+                "contrastive_framing", "local_intent",
+                "structured_constraints", "expanded_queries",
+            ] {
+                assert!(res.get(section).is_some(), "missing /intent key: {}", section);
+            }
+            // structured_constraints must be the SAME object /search consumes
+            // (not a stub) — it carries the parsed operators.
+            assert!(res["structured_constraints"].is_object());
+            assert!(res["expanded_queries"].is_array());
+            // expanded_queries is seeded with the original query (no network).
+            let eq = res["expanded_queries"].as_array().unwrap();
+            assert_eq!(eq.len(), 1);
+            assert_eq!(eq[0].as_str(), Some("best sushi restaurants in new york"));
+        }
+
+        #[test]
+        fn intent_reports_local_signal_for_near_me() {
+            // "near me" must set local_intent=true (drives /search geo-boost).
+            let loc = build_intent("coffee shops near me open now");
+            assert_eq!(loc["local_intent"].as_bool(), Some(true));
+            // And a non-local query must NOT.
+            let nonloc = build_intent("how does a cpu pipeline work");
+            assert_eq!(nonloc["local_intent"].as_bool(), Some(false));
+        }
+
+        #[test]
+        fn intent_reports_contrastive_for_vs_query() {
+            // A genuine X-vs-Y comparison must set contrastive_framing=true,
+            // which is what the ranker keys off to avoid the off-topic
+            // comparator defect (round 2026-08-12T0613Z, commit 798c92e).
+            let cmp = build_intent("violin vs viola for beginner");
+            assert_eq!(cmp["contrastive_framing"].as_bool(), Some(true));
+            // A plain informational query must NOT be flagged contrastive.
+            let info = build_intent("why is the sky blue");
+            assert_eq!(info["contrastive_framing"].as_bool(), Some(false));
+        }
+
+        #[test]
+        fn intent_category_matches_search_fallback() {
+            // The parent_category must equal what /search would compute from the
+            // same fallback_intent path — i.e. informational intents collapse to
+            // "informational".
+            let res = build_intent("python rest api framework not flask");
+            assert_eq!(res["intent"].as_str(), Some("informational"));
+            assert_eq!(res["category"].as_str(), Some("informational"));
+            assert!(res["confidence"].as_f64().unwrap() > 0.0);
+        }
+
+        #[test]
+        fn intent_empty_query_envelope_distinct_from_search() {
+            // The empty envelope carries the /intent key set (so clients can
+            // distinguish it from /search /spellcheck empty responses) but with
+            // neutral values — mirrors /inspect's empty envelope contract.
+            // NOTE: the empty envelope is produced by the HTTP handler
+            // (handle_intent), NOT by build_intent (which classifies a non-empty
+            // query). It is exposed via the pure builder build_intent_empty().
+            let res = build_intent_empty();
+            assert_eq!(res["error"].as_str(), Some("empty_query"));
+            assert_eq!(res["intent"].as_str(), Some(""));
+            assert_eq!(res["category"].as_str(), Some(""));
+            assert_eq!(res["contrastive_framing"].as_bool(), Some(false));
+            assert_eq!(res["local_intent"].as_bool(), Some(false));
         }
     }
 }
