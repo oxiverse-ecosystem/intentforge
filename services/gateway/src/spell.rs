@@ -14,6 +14,7 @@
 // No external dependencies beyond the bundled dictionary.
 
 use std::collections::HashMap;
+use rphonetic::Encoder;
 
 /// Maximum edit distance for SymSpell pre-computation
 const MAX_EDIT_DISTANCE: usize = 2;
@@ -111,6 +112,8 @@ pub(crate) struct SymSpellIndex {
     exact_map: HashMap<String, u32>,
     /// Character bigram language model for detecting tech-like words
     char_bigram_model: CharBigramModel,
+    /// Phonetic code → list of word_ids (for phonetic fallback)
+    phonetic_dict: HashMap<String, Vec<u32>>,
 }
 
 impl SymSpellIndex {
@@ -179,11 +182,15 @@ impl SymSpellIndex {
         // Build character bigram model from dictionary words for tech-term detection
         let char_bigram_model = CharBigramModel::build(&words);
 
+        // Build phonetic code → word_ids map for phonetic fallback
+        let phonetic_dict = Self::build_phonetic_dict(&words);
+
         tracing::info!(
-            "SymSpell index built: {} words, {} deletion entries, char-bigram median_perp={:.2}",
+            "SymSpell index built: {} words, {} deletion entries, char-bigram median_perp={:.2}, phonetic_dict_size={}",
             words.len(),
             deletions.len(),
-            char_bigram_model.reference_perplexity
+            char_bigram_model.reference_perplexity,
+            phonetic_dict.len()
         );
 
         Self {
@@ -192,6 +199,7 @@ impl SymSpellIndex {
             frequencies,
             exact_map,
             char_bigram_model,
+            phonetic_dict,
         }
     }
 
@@ -364,9 +372,14 @@ impl SymSpellIndex {
     /// at a very low frequency below the normal threshold).
     /// Such words are explicitly there to be corrected, so the perplexity
     /// ratio guard should not block their corrections.
+    ///
+    /// The threshold is set just above the misspelling-seed frequency (0.0010)
+    /// to avoid treating real low-frequency words (e.g. "vegan" at 0.0025)
+    /// as misspellings — that incorrectly exempted them from the
+    /// single-substitution guard and allowed vegan→vegas corruption.
     fn is_known_misspelling(&self, word: &str) -> bool {
         if let Some(&word_id) = self.exact_map.get(word) {
-            self.frequencies[word_id as usize] < MIN_FREQ_THRESHOLD * 10.0
+            self.frequencies[word_id as usize] <= MIN_FREQ_THRESHOLD
         } else {
             false
         }
@@ -436,6 +449,103 @@ impl SymSpellIndex {
             }
         }
         out
+    }
+
+    /// Build phonetic code → word_ids map for phonetic fallback.
+    /// Uses rphonetic's Soundex variant to encode each dictionary word.
+    fn build_phonetic_dict(words: &[String]) -> HashMap<String, Vec<u32>> {
+        let mut map: HashMap<String, Vec<u32>> = HashMap::new();
+        for (id, word) in words.iter().enumerate() {
+            // Only encode ASCII words; non-ASCII words are skipped to avoid panics
+            if !word.is_ascii() {
+                continue;
+            }
+            let code = rphonetic::Soundex::default().encode(word);
+            map.entry(code).or_default().push(id as u32);
+        }
+        map
+    }
+
+    /// Check if `input` is a letter-drop typo of `candidate`.
+    /// A letter-drop typo is when the input can be formed by deleting one or more
+    /// characters from the candidate (e.g. "cancing" is "cancelling" with the "el" dropped).
+    /// This is the inverse of a multi-character insertion.
+    fn is_letter_drop_typo(input: &str, candidate: &str) -> bool {
+        let input_chars: Vec<char> = input.chars().collect();
+        let cand_chars: Vec<char> = candidate.chars().collect();
+        if input_chars.len() >= cand_chars.len() {
+            return false;
+        }
+        let mut i = 0;
+        let mut j = 0;
+        let mut drops = 0;
+        while i < input_chars.len() && j < cand_chars.len() {
+            if input_chars[i] == cand_chars[j] {
+                i += 1;
+                j += 1;
+            } else {
+                drops += 1;
+                j += 1;
+            }
+        }
+        // Total drops = drops during scan + remaining chars in candidate
+        drops += cand_chars.len() - j;
+        drops >= 1 && i == input_chars.len()
+    }
+
+    /// Phonetic fallback: find a correction using phonetic codes.
+    /// Called after SymSpell/LinSpell fail. Applies strict guards:
+    /// (1) input word is NOT in the dictionary (absent-word guard),
+    /// (2) best phonetic match has edit distance ≤ 3,
+    /// (3) the match is a common word (frequency above threshold),
+    /// (4) the input is a letter-drop typo of the candidate (subsequence check).
+    fn phonetic_fallback(&self, word: &str) -> Option<String> {
+        let word_lower = word.to_lowercase();
+        // Guard 1: input must be absent from the dictionary
+        if self.exact_map.contains_key(&word_lower) {
+            return None;
+        }
+        // Guard: only attempt for ASCII words (rphonetic panics on non-ASCII)
+        if !word_lower.is_ascii() {
+            return None;
+        }
+        let input_code = rphonetic::Soundex::default().encode(&word_lower);
+        let candidate_ids = self.phonetic_dict.get(&input_code)?;
+
+        let mut best: Option<(u32, f64, usize)> = None; // (word_id, freq, edit_dist)
+        for &word_id in candidate_ids {
+            let dict_word = &self.words[word_id as usize];
+            let freq = self.frequencies[word_id as usize];
+            // Guard 3: candidate must be a common word
+            if freq < MIN_FREQ_THRESHOLD * 10.0 {
+                continue;
+            }
+            let dist = self.compute_edit_distance(&word_lower, dict_word);
+            // Guard 2: edit distance must be ≤ 3
+            if dist > 3 || dist == 0 {
+                continue;
+            }
+            // Guard 4: input must be a letter-drop typo of the candidate
+            if !Self::is_letter_drop_typo(&word_lower, dict_word) {
+                continue;
+            }
+            // Guard 5: perplexity ratio must not indicate a tech-term→English swap
+            let perp_ratio = self.char_bigram_model.perplexity_ratio(&word_lower, dict_word);
+            if perp_ratio > 1.4 {
+                continue;
+            }
+            // Pick the best candidate: lowest edit distance, then highest frequency
+            match best {
+                None => best = Some((word_id, freq, dist)),
+                Some((_, best_freq, best_dist)) => {
+                    if dist < best_dist || (dist == best_dist && freq > best_freq) {
+                        best = Some((word_id, freq, dist));
+                    }
+                }
+            }
+        }
+
+        best.map(|(word_id, _, _)| self.words[word_id as usize].clone())
     }
 
     /// SymSpell O(1) lookup: generate deletions of the input word and check

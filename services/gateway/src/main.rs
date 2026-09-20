@@ -8668,7 +8668,7 @@ fn extract_comparison_entity_groups(query: &str) -> Option<(Vec<String>, Vec<Str
     // For "azure for machine learning workloads", we want "azure", not
     // "azure for machine learning workloads". The compared entity is the
     // noun phrase BEFORE the preposition; everything after is context.
-    let truncate_at_preposition = |text: &str| -> &str {
+    let truncate_at_preposition = |text: &str| -> String {
         let prepositions = [" for ", " with ", " in ", " on ", " about ", " regarding ", " concerning "];
         let mut earliest = text.len();
         for p in &prepositions {
@@ -8678,7 +8678,7 @@ fn extract_comparison_entity_groups(query: &str) -> Option<(Vec<String>, Vec<Str
                 }
             }
         }
-        &text[..earliest]
+        text[..earliest].to_string()
     };
 
     // Helper: tokenize a group, keeping only distinctive content words.
@@ -17684,8 +17684,28 @@ let mut results = match tokio::task::spawn_blocking(move || {
         shopping: shopping_block,
     };
 
+    // ── Post-rank affiliate decoration for /search ──
+    // When commercial intent is detected (transactional label / strong transactional
+    // distribution / stated price bound / exact model-number pattern in query),
+    // apply the SAME strict post-rank affiliate decoration that /shopping and the
+    // main-path shopping block use. This ensures /search results carry affiliate
+    // links for commercial queries, not just /shopping. Decoration is strictly
+    // post-ranking: order-invariance is preserved (it only mutates each result's
+    // `affiliate` field, never reorders).
+    let mut response_value = serde_json::to_value(&response).unwrap_or(serde_json::json!({}));
+    let should_decorate_affiliate = is_commercial_intent(
+        &intent.intent,
+        &intent.distribution,
+        sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
+    ) || !detect_product_entities(q_trimmed).is_empty();
+    if should_decorate_affiliate {
+        if let Some(arr) = response_value.get_mut("results").and_then(|v| v.as_array_mut()) {
+            decorate_affiliate(arr, &state.affiliate_ctx);
+        }
+    }
+
     // Cache for 5 minutes — but never cache empty results
-    let response_json = serde_json::to_string(&response).unwrap_or_default();
+    let response_json = serde_json::to_string(&response_value).unwrap_or_default();
     if !response.results.is_empty() {
         state.cache.put(cache_key.clone(), response_json.clone(), Duration::from_secs(300));
     }
@@ -17703,7 +17723,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         guard.complete();
     }
 
-    (axum::http::StatusCode::OK, Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({}))))
+    (axum::http::StatusCode::OK, Json(response_value))
 }
 
 fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
@@ -18313,6 +18333,58 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     }
 }
 
+/// Detects transactional intent signals using structural patterns (no per-product
+/// keyword enumeration). Used by `fallback_intent` to recognize shopping queries
+/// like "iphone 16 pro max price" without the intent engine.
+///
+/// Signal 1 — model-number pattern: word(s) + alphanumeric token containing a digit,
+///   optionally followed by generic product suffixes (pro, max, plus, ultra, air, lite, se).
+///   Matches "iphone 16 pro max", "macbook m3", "galaxy s24", "rtx 4090".
+/// Signal 2 — price word + multi-word product description: a generic commerce term
+///   ("price", "cheap", "budget", "under") alongside >= 2 content words (e.g.
+///   "samsung tv under 500", "best budget laptop").
+///
+/// Returns (is_transactional, confidence). Confidence is higher for model-number
+/// matches (stronger transactional signal) than for price-word co-occurrence.
+fn detect_transactional_signals(q: &str) -> (bool, f32) {
+    let q_lower = q.to_lowercase();
+
+    // Signal 1: model-number pattern.
+    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let model_re = MODEL_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\b[a-z]+(?:\s+[a-z]+)*\s+[a-z]?\d[\w\-]*(?:\s+(?:pro|max|plus|ultra|air|lite|se|mini))*\b",
+        )
+        .unwrap()
+    });
+    if model_re.is_match(&q_lower) {
+        return (true, 0.75);
+    }
+
+    // Signal 2: price word + substantial product description.
+    const PRICE_WORDS: &[&str] = &[
+        "price", "prices", "pricing", "cost", "costs", "cheap", "cheapest",
+        "budget", "affordable", "under", "over", "deal", "deals", "sale",
+        "sales", "discount", "offer", "offers", "buy", "purchase", "shop", "store",
+    ];
+    if PRICE_WORDS.iter().any(|pw| q_lower.contains(pw)) {
+        const STOP: &[&str] = &[
+            "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to",
+            "for", "of", "with", "and", "or", "not", "do", "does", "what", "which",
+            "how", "where", "when", "who", "why",
+        ];
+        let content_count = q_lower
+            .split_whitespace()
+            .filter(|w| !STOP.contains(w) && !PRICE_WORDS.contains(w))
+            .count();
+        if content_count >= 2 {
+            return (true, 0.65);
+        }
+    }
+
+    (false, 0.3)
+}
+
 fn fallback_intent(q: &str) -> IntentResponse {
     let mut structured = extract_gateway_constraints(q);
     let mut negative = Vec::new();
@@ -18327,10 +18399,17 @@ fn fallback_intent(q: &str) -> IntentResponse {
     }
     structured.negative = negative;
 
+    // Detect transactional signals (model-number patterns, price + product).
+    let (is_transactional, confidence) = detect_transactional_signals(q);
+
     IntentResponse {
         query: q.to_string(),
-        intent: "informational".to_string(),
-        confidence: 0.3,
+        intent: if is_transactional {
+            "transactional".to_string()
+        } else {
+            "informational".to_string()
+        },
+        confidence,
         constraints: vec![],
         structured_constraints: structured,
         expanded_queries: vec![q.to_string()],
