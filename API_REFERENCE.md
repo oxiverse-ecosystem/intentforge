@@ -2001,30 +2001,6 @@ Returns all goals sorted by score (descending). Max 50 entries.
 
 **Response** `200 OK` — a bare JSON **ARRAY** (not a wrapper object) of goal objects:
 
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
-Returns a JSON array (list) of goal leaderboard entries, sorted by score (descending).
-
 ```json
 [
   {
@@ -2040,9 +2016,6 @@ Returns a JSON array (list) of goal leaderboard entries, sorted by score (descen
 ```
 
 > Note: the response is the list of entries directly. There is no `{"entries": [...], "total_entries": N}` wrapper — `len(response)` gives the entry count and each element is a goal object.
-The response is a **bare JSON array** (NOT an `{"entries":[...],"total_entries":N}` wrapper). The
-above is an actual live response captured after `POST /goals` → `POST /goals/:id/answers` generated
-a roadmap. The entry count is `len(array)`. Max 50 entries, sorted by `score` descending.
 
 ---
 
