@@ -12782,6 +12782,41 @@ fn error_chain_is_dns(e: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+
+/// Detect keyboard-walk patterns (e.g. "asdfghjkl", "zxcvbnm") that slip past
+/// the vowel/consonant ratio check because they contain vowels.
+///
+/// Walks each token, strips non-alpha chars, and flags any alpha-only token
+/// with a run of 7+ consonants that is NOT a known dictionary word and NOT a
+/// protected term (e.g. abbreviations).
+fn is_keyboard_walk_query(q: &str, spell_index: &spell::SymSpellIndex) -> bool {
+    for token in q.split_whitespace() {
+        let lower = token.to_lowercase();
+        let alpha_only: String = lower.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        if alpha_only.len() < 7 {
+            continue;
+        }
+        if spell_index.contains_word(&alpha_only) || spell::is_protected_term(&alpha_only) {
+            continue;
+        }
+        let mut max_run = 0u32;
+        let mut current_run = 0u32;
+        for c in alpha_only.chars() {
+            if matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y') {
+                max_run = max_run.max(current_run);
+                current_run = 0;
+            } else {
+                current_run += 1;
+            }
+        }
+        max_run = max_run.max(current_run);
+        if max_run >= 7 {
+            return true;
+        }
+    }
+    false
+}
+
 fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bool) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let response = UnifiedResponse {
         query: query.to_string(),
