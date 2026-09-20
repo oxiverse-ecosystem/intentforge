@@ -18,7 +18,6 @@ mod geoloc;
 mod dictionary;
 mod clean;
 mod goals;
-mod query_expansion;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
 // ─── API Types ───────────────────────────────────────────────────────
@@ -4550,13 +4549,20 @@ struct CommerceConfig {
     /// block on `/search`. Presentation cap on a CLONE of ranked results —
     /// never affects ranking or selection.
     mainpath_top_n: usize,
+    /// Whole-word keywords that signal transactional intent (Override 6).
+    /// Runtime-loaded from `data/commerce/config.json` → `transactional_keywords`.
+    /// Never hardcoded — edit the data file to add/remove without recompile.
+    transactional_keywords: Vec<String>,
 }
 
 impl CommerceConfig {
     /// Load from `data/commerce/config.json`. Missing file / missing field =>
     /// defaults (8). Never fatal — commerce presentation is best-effort.
     fn load() -> Self {
-        let mut cfg = Self { mainpath_top_n: 8 };
+        let mut cfg = Self {
+            mainpath_top_n: 8,
+            transactional_keywords: Vec::new(),
+        };
         let candidates = [
             "data/commerce/config.json",
             "/app/data/commerce/config.json",
@@ -4571,13 +4577,47 @@ impl CommerceConfig {
                             "commerce config: mainpath_top_n={} (from data file)",
                             cfg.mainpath_top_n
                         );
-                        break;
                     }
+                    if let Some(arr) = v.get("transactional_keywords").and_then(|a| a.as_array()) {
+                        cfg.transactional_keywords = arr
+                            .iter()
+                            .filter_map(|s| s.as_str().map(String::from))
+                            .collect();
+                        tracing::info!(
+                            "commerce config: {} transactional keyword(s) (from data file)",
+                            cfg.transactional_keywords.len()
+                        );
+                    }
+                    break;
                 }
             }
         }
         cfg
     }
+}
+
+/// Finalize the `shopping` block from already-enriched results.
+///
+/// Pure + offline-testable: takes the enriched top-N results (already decorated
+/// with `commerce` + `affiliate` by the post-rank passes) and assembles the
+/// final `shopping` block JSON, including read-only offer comparisons. Returns
+/// `None` if the input is empty (no results to show).
+///
+/// This is extracted from `handle_search` so the block-finalization logic can be
+/// unit-tested without spinning up the full async search pipeline.
+fn finalize_shopping_block(enriched_results: Vec<serde_json::Value>) -> Option<serde_json::Value> {
+    if enriched_results.is_empty() {
+        return None;
+    }
+    let mut block = serde_json::json!({ "results": enriched_results });
+    if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+        let comparisons = build_offer_comparisons(arr_ref);
+        if !comparisons.is_empty() {
+            block["offer_comparisons"] =
+                serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+        }
+    }
+    Some(block)
 }
 
 /// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
@@ -8720,6 +8760,7 @@ fn merge_local_and_web(
     distribution: Option<&std::collections::HashMap<String, f32>>,
     geo_location: Option<&geoloc::GeoLocation>,
     web_semantic: &std::collections::HashMap<String, f32>,
+    tx_keywords: &[String],
 ) -> Vec<MergedResult> {
     let mut merged: Vec<MergedResult> = Vec::new();
     let mut url_to_idx: HashMap<String, usize> = HashMap::new();
@@ -10351,8 +10392,12 @@ fn merge_local_and_web(
             || r.sources.iter().any(|s| s == "arxiv" || s == "crossref" || s == "pubmed");
 
         let has_download = DOWNLOAD_KEYWORDS.iter().any(|k| q_lower_check.contains(k));
-        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon"];
-        let has_tx = tx_keywords.iter().any(|k| q_lower_check.contains(k));
+        // Transactional keywords are data-driven from `data/commerce/config.json` (seed data).
+        let has_tx = if !tx_keywords.is_empty() {
+            tx_keywords.iter().any(|kw| q_lower_check.contains(kw.as_str()))
+        } else {
+            false
+        };
         let is_nav_or_download = intent == "navigational"
             || intent == "transactional"
             || has_download
@@ -14822,9 +14867,14 @@ async fn handle_search(
             }
         }
 
-        // Override 6: transactional keywords OR an explicit price bound -> transactional
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under ", "deal", "deals", "refurbished", "sale", "offer"];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+        // Override 6: transactional keywords OR an explicit price bound -> transactional.
+        // Keywords are data-driven from `data/commerce/config.json` (seed data, not hardcoded).
+        let tx_kws = &state.commerce_config.transactional_keywords;
+        let has_tx_signal = if !tx_kws.is_empty() {
+            tx_kws.iter().any(|kw| q_lower.starts_with(kw.as_str()) || q_lower.contains(kw.as_str()))
+        } else {
+            false
+        };
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -16700,6 +16750,7 @@ async fn handle_search(
 // ranking falls back to the existing substring scorer (no behaviour change).
 let web_semantic = compute_web_semantic(&vector, &local_results, &web_results, &client).await;
 
+let tx_kws_for_merge = state.commerce_config.transactional_keywords.clone();
 let mut results = match tokio::task::spawn_blocking(move || {
     merge_local_and_web(
         local_results,
@@ -16710,6 +16761,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         Some(&distribution_clone),
         geo_clone.as_ref(),
         &web_semantic,
+        &tx_kws_for_merge,
     )
 }).await {
         Ok(r) => r,
@@ -17508,15 +17560,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             // exposed structured data additionally carry a `commerce` block; the
             // frontend renders both cases (affiliate-decorated URL + optional facts).
             // Read-only multi-merchant offer comparison from the attached facts.
-            let mut block = serde_json::json!({ "results": shop_arr });
-            if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                let comparisons = build_offer_comparisons(arr_ref);
-                if !comparisons.is_empty() {
-                    block["offer_comparisons"] =
-                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
-                }
-            }
-            Some(block)
+            finalize_shopping_block(shop_arr)
         }
     } else {
         None
@@ -19149,7 +19193,7 @@ mod hardcoding_ruling_tests {
             "Improve: verb /ɪmˈpruːv/ 1. : to make better",
         )];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         assert_eq!(out.len(), 1, "cambridge result should survive (capped, not dropped)");
         let r = &out[0];
@@ -19166,7 +19210,7 @@ mod hardcoding_ruling_tests {
             "adult content",
         )];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         assert_eq!(out.len(), 0, "adult result must be dropped for non-adult query (d04afbe safety)");
     }
@@ -19180,7 +19224,7 @@ mod hardcoding_ruling_tests {
             "adult content",
         )];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         assert_eq!(out.len(), 1, "adult result kept when query is explicitly adult");
     }
@@ -19203,7 +19247,7 @@ mod hardcoding_ruling_tests {
             quality: 0.8,
         }];
         let out = merge_local_and_web(
-            local, vec![], q, "informational", &cst(), None, None, &empty_sem(),
+            local, vec![], q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         assert_eq!(out.len(), 1, "substantive-term match should survive");
         let r = &out[0];
@@ -19228,7 +19272,7 @@ mod hardcoding_ruling_tests {
             quality: 0.6,
         }];
         let out = merge_local_and_web(
-            local, vec![], q, "informational", &cst(), None, None, &empty_sem(),
+            local, vec![], q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         // The off-topic page (mentions "vinegar" but not dishwasher context) should
         // be crushed since "clean" and "vinegar" are weak anchor words and it lacks
@@ -19256,7 +19300,7 @@ mod hardcoding_ruling_tests {
         );
         let web = vec![dict_result, article_result];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         assert!(out.len() >= 2, "both results should be present");
         // Find the dict result (capped to 0.03)
@@ -19308,7 +19352,7 @@ mod hardcoding_ruling_tests {
         );
         let web = vec![video_result, article_result];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         assert!(out.len() >= 2, "both results should be present");
         let video = out.iter().find(|r| r.sources.iter().any(|s| s == "invidious")).expect("video missing");
@@ -19340,7 +19384,7 @@ mod hardcoding_ruling_tests {
         );
         let web = vec![disambig, article];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &vec![],
         );
         // The disambiguation page should be capped (treated as dict-like for non-def query)
         // while the real article should not be capped
