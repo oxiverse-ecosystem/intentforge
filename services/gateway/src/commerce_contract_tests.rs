@@ -41,7 +41,6 @@ fn contract_net(
         param_env: HashMap::new(),
         bid_floor: None,
         fallback_url: None,
-        bid_check_url: None,
     }
 }
 
@@ -525,7 +524,6 @@ fn contract_net_with_bf(
         param_env: HashMap::new(),
         bid_floor: bid_floor.map(|s| s.to_string()),
         fallback_url: fallback_url.map(|s| s.to_string()),
-        bid_check_url: None,
     }
 }
 

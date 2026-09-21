@@ -18,7 +18,6 @@ mod geoloc;
 mod dictionary;
 mod clean;
 mod goals;
-mod multi_hop;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
 // ─── API Types ───────────────────────────────────────────────────────
@@ -12358,31 +12357,6 @@ async fn handle_search(
         q_trimmed.to_string()
     };
     let q_orig = q_trimmed.to_string(); // original, untouched query for intent/constraints
-
-    // 0d. Multi-hop factoid resolution: if the query requires resolving an
-    // inner question first (e.g. "capital of the country that hosted 2024
-    // olympics" → resolve "country that hosted 2024 olympics" → "France" →
-    // rewrite to "capital of France"), do it now BEFORE the main fan-out.
-    // This is a blocking call with a tight timeout — only fires on clear
-    // factoid patterns (looks_like_multi_hop fast-check).
-    if multi_hop::looks_like_multi_hop(&q) {
-        if let Some((inner_query, rewrite_fn)) = multi_hop::detect_multi_hop(&q) {
-            tracing::info!("MULTI-HOP: detected factoid query, inner: '{}'", inner_query);
-            // Use the first SearXNG instance for resolution
-            let searx_base = "http://127.0.0.1:8080";
-            match multi_hop::resolve_inner_query(searx_base, &inner_query) {
-                Some(resolved_entity) => {
-                    let rewritten = rewrite_fn(&resolved_entity);
-                    tracing::info!("MULTI-HOP: resolved '{}' → rewriting query to '{}'",
-                        resolved_entity, rewritten);
-                    q = rewritten;
-                }
-                None => {
-                    tracing::warn!("MULTI-HOP: failed to resolve inner query '{}', proceeding with original", inner_query);
-                }
-            }
-        }
-    }
 
     let q_encoded = urlencoding::encode(&q);
     let client_ip: Option<IpAddr> = headers
