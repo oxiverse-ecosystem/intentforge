@@ -379,7 +379,7 @@ impl SymSpellIndex {
     /// ratio guard should not block their corrections.
     fn is_known_misspelling(&self, word: &str) -> bool {
         if let Some(&word_id) = self.exact_map.get(word) {
-            self.frequencies[word_id as usize] < MIN_FREQ_THRESHOLD * 10.0
+            self.frequencies[word_id as usize] <= MIN_FREQ_THRESHOLD
         } else {
             false
         }
