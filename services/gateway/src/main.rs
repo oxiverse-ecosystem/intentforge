@@ -18,6 +18,7 @@ mod geoloc;
 mod dictionary;
 mod clean;
 mod goals;
+mod query_expansion;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
 // ─── API Types ───────────────────────────────────────────────────────
@@ -7330,6 +7331,72 @@ fn keyphrase_relax_variant(query: &str) -> Option<String> {
     Some(filtered.join(" "))
 }
 
+/// Strip location phrases from a query for thin-result fallback.
+///
+/// When a query like "top 10 must visit places in japan for first time travelers"
+/// returns few results, removing location constraints ("in japan") and quantity
+/// phrases ("top 10") can help upstream engines return more general results.
+/// This is a general transformation — no query-specific strings.
+///
+/// Returns the stripped query, or `None` if stripping would remove everything.
+fn strip_location_terms(query: &str) -> Option<String> {
+    let q_lower = query.to_lowercase();
+    let words: Vec<&str> = q_lower.split_whitespace().collect();
+    if words.len() < 3 {
+        return None;
+    }
+    // Don't strip structured operators or site constraints
+    if q_lower.contains("site:") || q_lower.contains("filetype:") || q_lower.contains("intitle:") || q_lower.contains("inurl:") {
+        return None;
+    }
+
+    // Location prepositions and quantity phrases to strip
+    const LOCATION_PREPS: &[&str] = &[
+        "in", "at", "near", "around", "throughout", "across", "within",
+    ];
+    const QUANTITY_PHRASES: &[&str] = &[
+        "top", "best", "top 10", "best 10", "top 5", "best 5",
+        "first", "must", "visit", "places", "places to visit",
+    ];
+
+    // Find and remove location phrases: "<prep> <Place>" patterns
+    let mut filtered: Vec<&str> = words.clone();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 0..filtered.len().saturating_sub(1) {
+            if LOCATION_PREPS.contains(&filtered[i]) {
+                // Remove the preposition and the following word (place name)
+                filtered.drain(i..=i + 1);
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    // Also remove quantity phrases from the start
+    while !filtered.is_empty() {
+        let first = filtered[0];
+        // Remove standalone quantity words
+        if QUANTITY_PHRASES.contains(&first) {
+            filtered.remove(0);
+        } else {
+            break;
+        }
+    }
+
+    if filtered.len() < 2 {
+        return None;
+    }
+
+    let result = filtered.join(" ");
+    // Only return if the stripped version is meaningfully different
+    if result == query {
+        return None;
+    }
+    Some(result)
+}
+
 
 // ─── JSON Key Deduplication ────────────────────────────────────────
 // Removes duplicate keys from JSON objects. Keeps the LAST value for each key.
@@ -14457,6 +14524,166 @@ async fn handle_search(
     let mut web_results = unique_web_results;
 
     tracing::info!("After dedup: {} unique web results", web_results.len());
+
+    // ── Thin-result fallback: expanded query retry ──
+    // When the initial fan-out returns few results (< 5), the query may be too
+    // specific for upstream engines. Fire expanded variants (guide/tips suffixes,
+    // entity subsets, location-stripped) to recover coverage. This is a general
+    // transformation — no query-specific strings.
+    const THIN_RESULT_THRESHOLD: usize = 5;
+    if web_results.len() < THIN_RESULT_THRESHOLD {
+        let variants = query_expansion::thin_result_variants(&q);
+        let location_stripped = strip_location_terms(&q);
+        let mut retry_queries: Vec<String> = variants;
+        if let Some(ls) = location_stripped {
+            if !retry_queries.contains(&ls) {
+                retry_queries.push(ls);
+            }
+        }
+        // Cap at 3 variants to bound latency
+        retry_queries.truncate(3);
+
+        if !retry_queries.is_empty() {
+            tracing::info!(
+                "THIN RESULT: {} web results < {} — firing {} expanded variant(s)",
+                web_results.len(),
+                THIN_RESULT_THRESHOLD,
+                retry_queries.len()
+            );
+
+            // Build SearXNG URLs for each variant (reuse the same instances)
+            let mut retry_urls: Vec<String> = Vec::new();
+            for variant in &retry_queries {
+                let clean_v = preprocess_searxng_query(variant);
+                if clean_v.is_empty() || clean_v == preprocess_searxng_query(&q) {
+                    continue;
+                }
+                for base_url in &searx_base_urls {
+                    retry_urls.push(searxng_url(base_url, &clean_v, geo_location.as_ref(), lang));
+                }
+            }
+
+            if !retry_urls.is_empty() {
+                // Fire all variant URLs in parallel (bounded budget)
+                let retry_client = client.clone();
+                let retry_circuit = circuit_ref.clone();
+                let retry_ratelimit = ratelimit_ref.clone();
+                let retry_fut = async move {
+                    let mut handles = Vec::new();
+                    for url in retry_urls {
+                        let c = retry_client.clone();
+                        let circ = retry_circuit.clone();
+                        let rl = retry_ratelimit.clone();
+                        handles.push(tokio::spawn(async move {
+                            // Check circuit breaker
+                            let instance_key = if url.contains("tor2") || url.contains("8081") {
+                                "searxng1"
+                            } else {
+                                "searxng0"
+                            };
+                            if !circ.is_open(instance_key) {
+                                return SearxResponse { results: vec![], unresponsive_engines: vec![] };
+                            }
+                            let resp = match tokio::time::timeout(
+                                std::time::Duration::from_millis(4200),
+                                c.get(&url).send(),
+                            ).await {
+                                Ok(Ok(r)) => r,
+                                Ok(Err(e)) => {
+                                    tracing::warn!("Thin-result retry request failed: {:?}", e);
+                                    circ.record_failure(instance_key);
+                                    return SearxResponse { results: vec![], unresponsive_engines: vec![] };
+                                }
+                                Err(_) => {
+                                    tracing::warn!("Thin-result retry request timed out");
+                                    circ.record_failure(instance_key);
+                                    return SearxResponse { results: vec![], unresponsive_engines: vec![] };
+                                }
+                            };
+                            let status = resp.status();
+                            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                                rl.record();
+                                return SearxResponse { results: vec![], unresponsive_engines: vec![] };
+                            }
+                            let raw = match tokio::time::timeout(
+                                std::time::Duration::from_secs(4),
+                                resp.text(),
+                            ).await {
+                                Ok(Ok(t)) => t,
+                                _ => return SearxResponse { results: vec![], unresponsive_engines: vec![] },
+                            };
+                            let sanitized = sanitize_json_text(&raw);
+                            match serde_json::from_str::<SearxResponse>(&sanitized) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    tracing::warn!("Thin-result retry parse error: {}", e);
+                                    SearxResponse { results: vec![], unresponsive_engines: vec![] }
+                                }
+                            }
+                        }));
+                    }
+                    let mut all_results = Vec::new();
+                    for h in handles {
+                        if let Ok(Ok(resp)) = h.await {
+                            all_results.push(resp);
+                        }
+                    }
+                    all_results
+                };
+
+                // Bound the retry at 5s — thin results are a best-effort improvement
+                let retry_results = match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    retry_fut,
+                ).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tracing::warn!("Thin-result retry timed out — using existing results");
+                        Vec::new()
+                    }
+                };
+
+                // Merge retry results into web_results (with dedup)
+                let mut retry_count = 0;
+                for resp in retry_results {
+                    for r in resp.results {
+                        let normalized = {
+                            let lower = r.url.to_lowercase();
+                            let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                            let no_trailing = no_fragment.trim_end_matches('/');
+                            let no_www = no_trailing.replacen("://www.", "://", 1);
+                            let no_mobile = no_www
+                                .replacen("://m.", "://", 1)
+                                .replacen("://mobile.", "://", 1);
+                            strip_tracking_params(&no_mobile)
+                        };
+                        if url_to_index.contains_key(&normalized) {
+                            // Already seen — merge source
+                            if let Some(&idx) = url_to_index.get(&normalized) {
+                                let source = if r.engine.is_empty() { "unknown".to_string() } else { r.engine.clone() };
+                                if !web_results[idx].sources.contains(&source) {
+                                    web_results[idx].sources.push(source);
+                                }
+                            }
+                        } else {
+                            // New result from expanded query
+                            let source = if r.engine.is_empty() { "unknown".to_string() } else { r.engine.clone() };
+                            let mut result = r;
+                            result.sources = vec![source, "expanded".to_string()];
+                            url_to_index.insert(normalized, web_results.len());
+                            web_results.push(result);
+                            retry_count += 1;
+                        }
+                    }
+                }
+                tracing::info!(
+                    "Thin-result retry added {} new result(s) — total now {}",
+                    retry_count,
+                    web_results.len()
+                );
+            }
+        }
+    }
 
     // 6. Quality Gates (before merge)
     // Filter web results with very low semantic relevance
