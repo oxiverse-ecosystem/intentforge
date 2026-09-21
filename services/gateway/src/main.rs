@@ -13966,7 +13966,7 @@ async fn handle_search(
     // (BERT-based classifier), falling back to keyword detection when confidence is low.
     let is_local_intent = intent.intent.as_str() == "local" && intent.confidence >= 0.20
         || intent.intent.as_str() != "local" && has_local_intent(&q);
-    let expanded_queries = if let Some(ref geo) = geo_location {
+    let mut expanded_queries = if let Some(ref geo) = geo_location {
         if is_local_intent {
             let mut eq = expanded_queries;
             if let Some(localized) = localize_query(&q, geo) {
@@ -13994,8 +13994,8 @@ async fn handle_search(
         if let Some(relaxed) = numeric_constraint_relaxation(&q) {
             let relaxed_clean = preprocess_searxng_query(&relaxed);
             if !relaxed_clean.is_empty() && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == relaxed_clean) {
-                expanded_queries.push(relaxed_clean);
                 tracing::info!(target:"expansion.debug", "numeric-relaxed expanded query: {:?}", relaxed_clean);
+                expanded_queries.push(relaxed_clean);
             }
         }
     }
@@ -16266,7 +16266,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         confidence: Some(intent.confidence),
         constraints: flat_constraints,
         structured_constraints: intent.structured_constraints.clone(),
-        expanded_queries: intent.expanded_queries.clone(),
+        expanded_queries: expanded_queries.clone(),
         distribution: Some(intent.distribution.clone()),
         deep_result,
         results: paginated_results,
