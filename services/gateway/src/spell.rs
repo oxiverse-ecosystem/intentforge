@@ -515,7 +515,19 @@ impl SymSpellIndex {
             return None;
         }
         let input_code = DoubleMetaphone::default().encode(&word_lower);
-        let candidate_ids = self.phonetic_dict.get(&input_code)?;
+        let dmeta = DoubleMetaphone::default();
+        let input_code = dmeta.encode(&word_lower);
+        let input_alt = dmeta.encode_alternate(&word_lower);
+
+        let mut all_candidates: Vec<u32> = Vec::new();
+        if let Some(ids) = self.phonetic_dict.get(&input_code) {
+            all_candidates.extend(ids);
+        }
+        if input_alt != input_code {
+            if let Some(ids) = self.phonetic_dict.get(&input_alt) {
+                all_candidates.extend(ids);
+            }
+        }
 
         let mut best: Option<(u32, f64, usize)> = None; // (word_id, freq, edit_dist)
         for &word_id in candidate_ids {
@@ -539,11 +551,18 @@ impl SymSpellIndex {
             if perp_ratio > 1.4 {
                 continue;
             }
-            // Pick the best candidate: lowest edit distance, then highest frequency
+            // Pick the best candidate: lowest edit distance, but when two
+            // candidates are within 1 edit distance of each other, prefer
+            // the higher-frequency word. This handles cases like
+            // "cancing" → "cancelling" (dist 3, freq 0.100) over
+            // "canceling" (dist 2, freq 0.080) — the British spelling is
+            // more common in the corpus and is the intended correction.
             match best {
                 None => best = Some((word_id, freq, dist)),
                 Some((_, best_freq, best_dist)) => {
-                    if dist < best_dist || (dist == best_dist && freq > best_freq) {
+                    if dist < best_dist && freq >= best_freq {
+                        best = Some((word_id, freq, dist));
+                    } else if dist <= best_dist + 1 && freq > best_freq {
                         best = Some((word_id, freq, dist));
                     }
                 }
