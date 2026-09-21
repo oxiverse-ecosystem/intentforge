@@ -14,6 +14,7 @@
 // No external dependencies beyond the bundled dictionary.
 
 use std::collections::HashMap;
+use rphonetic::{Encoder, DoubleMetaphone};
 
 /// Maximum edit distance for SymSpell pre-computation
 const MAX_EDIT_DISTANCE: usize = 2;
