@@ -188,6 +188,21 @@ fn normalize_currency_str(s: &str) -> String {
     }
 }
 
+fn is_model_number_price_query(q_lower: &str) -> bool {
+    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let model_re = MODEL_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+\d{1,2}").unwrap()
+    });
+    let has_model = model_re.is_match(q_lower);
+    let has_price = q_lower.contains("price") || q_lower.contains("cost")
+        || q_lower.contains("rupee") || q_lower.contains("rupees")
+        || q_lower.contains("inr") || q_lower.contains('₹')
+        || q_lower.contains("dollar") || q_lower.contains("dollars")
+        || q_lower.contains("budget") || q_lower.contains("cheap")
+        || q_lower.contains("pricing");
+    has_model && has_price
+}
+
 fn has_price_signal(title_lower: &str, content_lower: &str) -> bool {
     static RS_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let rs_re = RS_REGEX.get_or_init(|| regex::Regex::new(r"(?i)\b(rs\.?|rupee|rupees|inr)\b|₹").unwrap());
@@ -12342,9 +12357,8 @@ async fn handle_search(
         q_trimmed.to_string()
     };
     let q_orig = q_trimmed.to_string(); // original, untouched query for intent/constraints
-    let q_encoded = urlencoding::encode(&q);
 
-    // Extract client IP for geolocation (from X-Forwarded-For or X-Real-IP headers)
+    let q_encoded = urlencoding::encode(&q);
     let client_ip: Option<IpAddr> = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
@@ -13528,6 +13542,24 @@ async fn handle_search(
                         q, intent.intent, intent.confidence
                     );
                 }
+                intent.intent = "transactional".to_string();
+                intent.confidence = intent.confidence.max(0.80);
+                let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
+                intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
+            }
+        }
+
+        // Override 7: Model-number + price/cost terms → transactional
+        // The classifier misses model-number patterns ("iphone 16 pro max price",
+        // "oneplus 12 price") — the word "price" alone is weak signal. When a known
+        // brand+model pattern co-occurs with a price/cost term, the intent is
+        // decisively transactional (P10/P11 style compensation for the linear probe).
+        if is_model_number_price_query(&q_lower) {
+            if intent.intent != "transactional" || intent.confidence < 0.60 {
+                tracing::info!(
+                    "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
+                    q, intent.intent, intent.confidence
+                );
                 intent.intent = "transactional".to_string();
                 intent.confidence = intent.confidence.max(0.80);
                 let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
