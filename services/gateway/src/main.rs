@@ -14159,6 +14159,106 @@ async fn handle_search(
         }
     }
 
+    // ─── Upstream recall gap fallback (IF-1) ────────────────────────
+    // When SearXNG still returns critically few results after the retry
+    // fan-out (niche technical queries where upstream engines have poor
+    // recall), fire expanded query variations on the VPN instance and
+    // re-query the local indexer with expanded terms. Both compensate
+    // for upstream recall gaps. The expanded queries come from the
+    // intent engine (algorithmically generated, no hardcoded strings).
+    let web_results_pre_fallback = web_results.len();
+    let local_results_pre_fallback = local_results.len();
+    if web_results_pre_fallback < 5 && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
+        let fallback_budget = Duration::from_millis(2500);
+
+        // Phase A: secondary SearXNG with expanded terms (VPN instance only for speed)
+        if let Some(base_url) = searx_base_urls.get(0) {
+            let mut searx_fallback_futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<SearxResponse, reqwest::Error>> + Send>>> = Vec::new();
+            for eq in expanded_queries.iter().skip(1).take(3) {
+                let clean_eq = preprocess_searxng_query(eq);
+                if clean_eq.to_lowercase() == q.to_lowercase() { continue; }
+                if clean_eq.is_empty() { continue; }
+                let fallback_url = searxng_url(base_url, &clean_eq, geo_location.as_ref(), lang);
+                let fallback_client = client.clone();
+                searx_fallback_futs.push(Box::pin(async move {
+                    match tokio::time::timeout(Duration::from_secs(3), fallback_client.get(&fallback_url).send()).await {
+                        Ok(Ok(resp)) => {
+                            let raw = match tokio::time::timeout(Duration::from_secs(2), resp.text()).await {
+                                Ok(Ok(t)) => t,
+                                _ => return Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] }),
+                            };
+                            let sanitized = sanitize_json_text(&raw);
+                            match serde_json::from_str::<SearxResponse>(&sanitized) {
+                                Ok(data) => Ok(data),
+                                Err(_) => Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] }),
+                            }
+                        }
+                        _ => Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] }),
+                    }
+                }));
+            }
+
+            if !searx_fallback_futs.is_empty() {
+                let _ = tokio::time::timeout(fallback_budget, async {
+                    let mut pending = searx_fallback_futs;
+                    while !pending.is_empty() {
+                        let (result, _idx, remaining) = futures::future::select_all(pending).await;
+                        pending = remaining;
+                        if let Ok(data) = result {
+                            for r in data.results {
+                                web_results.push(r);
+                            }
+                        }
+                    }
+                }).await;
+            }
+        }
+
+        // Phase B: local indexer re-query with expanded terms
+        let mut indexer_fallback_tasks = Vec::new();
+        for eq in expanded_queries.iter().take(3) {
+            let indexer_q = preprocess_searxng_query(eq);
+            if indexer_q.to_lowercase() == q.to_lowercase() { continue; }
+            if indexer_q.is_empty() { continue; }
+            let indexer_q_encoded = urlencoding::encode(&indexer_q);
+            let indexer_url = format!("http://127.0.0.1:6000/search?q={}", indexer_q_encoded);
+            let indexer_http_client = client.clone();
+            indexer_fallback_tasks.push(tokio::spawn(async move {
+                match tokio::time::timeout(Duration::from_millis(1500), indexer_http_client.get(&indexer_url).send()).await {
+                    Ok(Ok(resp)) => read_json_bounded::<Vec<IndexerResult>>(resp).await,
+                    _ => None,
+                }
+            }));
+        }
+
+        for task in indexer_fallback_tasks {
+            match tokio::time::timeout(Duration::from_millis(1600), task).await {
+                Ok(Ok(Some(results))) => {
+                    let existing_urls: std::collections::HashSet<String> = local_results.iter()
+                        .map(|r| normalize_indexer_url(&r.url))
+                        .collect();
+                    for r in results {
+                        let norm = normalize_indexer_url(&r.url);
+                        if !existing_urls.contains(&norm) {
+                            local_results.push(r);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let web_results_post_fallback = web_results.len();
+        let local_results_post_fallback = local_results.len();
+        if web_results_post_fallback > web_results_pre_fallback || local_results_post_fallback > local_results_pre_fallback {
+            tracing::info!(
+                "RECALL FALLBACK (IF-1): niche query — web: {} → {}, local: {} → {}",
+                web_results_pre_fallback, web_results_post_fallback,
+                local_results_pre_fallback, local_results_post_fallback
+            );
+        }
+    }
+
     match invidious_res {
         Ok(invidious_data) => {
             let n = invidious_data.len();
