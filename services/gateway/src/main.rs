@@ -19130,4 +19130,109 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!out.contains("user"), "no user id");
         assert!(!out.contains("ip="), "no ip");
     }
+
+    #[tokio::test]
+    async fn parallel_enrichment_within_budget_and_order_invariant() {
+        // Regression test: the main /search `shopping` block was silently dropped
+        // because sequential enrichment of 8 results (~4.5s each = 36s) exceeded
+        // the 30s TimeoutLayer. This test verifies parallel enrichment completes
+        // within the time budget and preserves result order (no-manipulation).
+
+        let mut shop_arr: Vec<serde_json::Value> = (0..8)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("https://shop.example.com/p/{}", i),
+                    "score": 9.0 - i as f64 * 0.1,
+                })
+            })
+            .collect();
+
+        let before: Vec<String> = shop_arr
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+
+        // Simulate slow upstream: each "fetch" takes ~500ms. 8 sequential = 4s
+        // (too slow for 30s budget with real 4.5s fetches). 4 concurrent = ~1s.
+        let fake_html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{"@context":"https://schema.org/","@type":"Product","name":"Test Widget","offers":{"@type":"Offer","price":"29.99","priceCurrency":"USD"}}
+</script></head><body></body></html>"#;
+        let html = fake_html.to_string();
+
+        let start = std::time::Instant::now();
+        enrich_with_commerce_par(
+            &mut shop_arr,
+            COMMERCE_MAINPATH_PAR_CONCURRENT,
+            COMMERCE_MAINPATH_TIMEOUT_MS,
+            move |url: String| {
+                let h = html.clone();
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    Some(h)
+                }
+            },
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // Must complete well under the 30s TimeoutLayer (even with 8 × 500ms sequential
+        // it'd be 4s; parallel at 4-wide = ~1s). With real 4.5s fetches at 4-wide,
+        // 8 results complete in ~9-11s. Budget: 22s cap.
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "parallel enrichment took {:?}, must complete within TimeoutLayer budget",
+            elapsed
+        );
+
+        // Order preserved (no-manipulation guarantee).
+        let after: Vec<String> = shop_arr
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(before, after, "parallel enrichment must not reorder results");
+
+        // Commerce facts attached from the fake JSON-LD.
+        for r in shop_arr.iter() {
+            assert!(r.get("commerce").is_some(), "commerce block attached");
+            assert_eq!(r["commerce"]["data"]["price"], serde_json::json!(29.99));
+            assert!(r.get("commerce_provenance").is_some(), "provenance present");
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_enrichment_timeout_gracefully_attaches_provenance() {
+        // When upstream is so slow the total timeout fires, parallel enrichment
+        // must NOT panic and must attach `commerce_provenance` (with no `commerce`)
+        // to every result — proving it degrades gracefully instead of dropping
+        // the whole shopping block.
+
+        let mut shop_arr: Vec<serde_json::Value> = (0..4)
+            .map(|i| serde_json::json!({ "url": format!("https://slow.example.com/p/{}", i) }))
+            .collect();
+
+        // Each fetch takes 2s; 4 concurrent × 2s = 8s total, but we cap at 50ms
+        // so the timeout fires immediately.
+        enrich_with_commerce_par(
+            &mut shop_arr,
+            2,
+            50, // 50ms total cap
+            |url: String| async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                Some("<html></html>".to_string())
+            },
+        )
+        .await;
+
+        for r in shop_arr.iter() {
+            assert!(
+                r.get("commerce_provenance").is_some(),
+                "provenance attached even on timeout"
+            );
+            assert!(
+                r.get("commerce").is_none(),
+                "no commerce block on timeout"
+            );
+        }
+    }
 }
