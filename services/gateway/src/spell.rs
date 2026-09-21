@@ -337,6 +337,19 @@ impl SymSpellIndex {
         // "awiat"->"await", "kubrnetes"->"kubernetes") should always be corrected.
         // The protected-term list IS the seed knowledge that these are real terms.
         let candidate_is_protected = is_protected_term(&best);
+        // KNOWN-MISSPELLING SEED PROBE: seeds are explicitly in the dictionary
+        // to be corrected (e.g. "cancing" at freq 0.0010). SymSpell may find a
+        // dist-1 candidate (e.g. "dancing") that wins over a dist-3 phonetic
+        // correction (e.g. "cancelling", freq 0.100). For seeds, prefer the
+        // phonetic fallback when it returns a result — the seed was explicitly
+        // placed to guide correction.
+        if !absent && self.is_known_misspelling(word) {
+            let phonetic = self.phonetic_fallback(word);
+            if phonetic.is_some() {
+                return phonetic;
+            }
+        }
+
         // ABSENT-WORD GUARD: when an input word is absent from the dictionary and
         // not a known-misspelling seed, block corrections at distance >= 2 (they
         // are almost certainly real terms, not typos). Distance-1 corrections are
@@ -534,8 +547,10 @@ impl SymSpellIndex {
     /// (4) the input is a letter-drop typo of the candidate (subsequence check).
     fn phonetic_fallback(&self, word: &str) -> Option<String> {
         let word_lower = word.to_lowercase();
-        // Guard 1: input must be absent from the dictionary
-        if self.exact_map.contains_key(&word_lower) {
+        // Guard 1: input must be absent from the dictionary, UNLESS it's a
+        // known-misspelling seed (e.g. "cancing" at freq 0.0010) — seeds are
+        // explicitly present to be corrected to a better form.
+        if self.exact_map.contains_key(&word_lower) && !self.is_known_misspelling(word) {
             return None;
         }
         // Guard: only attempt for ASCII words (rphonetic panics on non-ASCII)
@@ -561,11 +576,7 @@ impl SymSpellIndex {
             &input_alt[..]
         };
 
-        let mut all_candidates: Vec<u32> = Vec::new();
         let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        if word_lower == "cancing" {
-            eprintln!("[DEBUG] cancing input_prefix={} alt_prefix={}", input_prefix, alt_prefix);
-        }
         for (code, ids) in &self.phonetic_dict {
             let code_prefix = if code.len() >= prefix_len {
                 &code[..prefix_len]
@@ -576,27 +587,14 @@ impl SymSpellIndex {
                 for &id in ids {
                     seen.insert(id);
                 }
-                if word_lower == "cancing" {
-                    let sample: Vec<String> = ids.iter().map(|&id| self.words[id as usize].clone()).collect();
-                    eprintln!("[DEBUG]   code={} prefix={} matches={:?}", code, code_prefix, sample);
-                }
             }
         }
-        all_candidates.extend(seen);
-        if word_lower == "cancing" {
-            eprintln!("[DEBUG] cancing candidates={}", all_candidates.len());
-            for &word_id in &all_candidates {
-                let dict_word = &self.words[word_id as usize];
-                let freq = self.frequencies[word_id as usize];
-                let dist = self.compute_edit_distance(&word_lower, dict_word);
-                let is_drop = Self::is_letter_drop_typo(&word_lower, dict_word);
-                let perp = self.char_bigram_model.perplexity_ratio(&word_lower, dict_word);
-                eprintln!("[DEBUG]   cand={} freq={:.4} dist={} is_drop={} perp={:.2}", dict_word, freq, dist, is_drop, perp);
-            }
+        if seen.is_empty() {
+            return None;
         }
 
         let mut best: Option<(u32, f64, usize)> = None;
-        for &word_id in &all_candidates {
+        for &word_id in &seen {
             let dict_word = &self.words[word_id as usize];
             let freq = self.frequencies[word_id as usize];
             // Guard 3: candidate must be a common word
