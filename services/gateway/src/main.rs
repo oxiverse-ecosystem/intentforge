@@ -14624,7 +14624,7 @@ async fn handle_search(
                     }
                     let mut all_results = Vec::new();
                     for h in handles {
-                        if let Ok(Ok(resp)) = h.await {
+                        if let Ok(resp) = h.await {
                             all_results.push(resp);
                         }
                     }
