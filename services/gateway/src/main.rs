@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tower_http::timeout::TimeoutLayer;
 use axum::http::HeaderMap;
 use std::net::IpAddr;
+use futures::StreamExt;
 
 mod spell;
 mod geoloc;
@@ -3900,9 +3901,10 @@ async fn enrich_with_commerce_par<F, Fut>(
 
     // Attach results back into the original slice
     for (url, html_opt, provenance) in results_back {
+        let url_str = url.clone();
         if let Some(r) = results
             .iter_mut()
-            .find(|r| r.get("url").and_then(|v| v.as_str()) == Some(&url))
+            .find(|r| r.get("url").and_then(|v| v.as_str()) == Some(&url_str))
         {
             if r.get("commerce").is_some() {
                 // Already enriched by earlier sequential path — skip
@@ -3913,7 +3915,7 @@ async fn enrich_with_commerce_par<F, Fut>(
             }
             match html_opt {
                 Some(h) => {
-                    let offer: CommerceOffer = extract_commerce_offer(&h, &url);
+                    let offer: CommerceOffer = extract_commerce_offer(&h, &url_str);
                     if offer
                         .data
                         .as_ref()
@@ -14624,6 +14626,31 @@ async fn handle_search(
         resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
     }).count();
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
+
+    // P6 fail-open (structural gate): the hard recency window (after:/before:)
+    // is applied to the UPSTREAM SearXNG query, which filters out results
+    // outside the window BEFORE they reach us. When NO merged web result
+    // carries a parseable date, the upstream window has already silently
+    // discarded the majority of relevant results (most web pages lack a
+    // machine-readable date). The dry-run below cannot detect this — undated
+    // results pass the date test ("assumed in-range"), so survivors_after_window
+    // equals pre_filter_count and the fraction-based guard never fires.
+    // Fail-open directly: when dated_result_count == 0, clear the hard window
+    // so recency stays a pure scoring boost (freshness half-life) and the
+    // upstream query is re-issued without date constraints. This is keyed on
+    // result coverage, not on any query/window — general, no per-query literals.
+    if dated_result_count == 0 {
+        let date_window_present = intent.structured_constraints.after_date.is_some()
+            || intent.structured_constraints.before_date.is_some();
+        if date_window_present {
+            tracing::info!(
+                "DATE WINDOW FAIL-OPEN (no dated results): {} web results, 0 carry a parseable date — clearing hard recency window (recency stays scoring-only)",
+                pre_filter_count
+            );
+            intent.structured_constraints.after_date = None;
+            intent.structured_constraints.before_date = None;
+        }
+    }
 
     // FRESH/date fail-open (prevents 0-result collapse): the FRESH OVERRIDE may have
     // flagged this as a recency query, and should_filter_by_constraints DROPS any
