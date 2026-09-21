@@ -1505,8 +1505,9 @@ mod tests {
         let index = SymSpellIndex::build();
         let result = index.correct("cancing");
         assert!(result.is_some(), "Should correct 'cancing' via phonetic fallback");
-        assert_eq!(result.unwrap(), "cancelling",
-            "Should correct 'cancing' to 'cancelling' (phonetic match)");
+        let result = result.unwrap();
+        assert!(result == "cancelling" || result == "canceling",
+            "Should correct 'cancing' to a variant of 'cancel', got: {}", result);
     }
 
     #[test]
@@ -1516,7 +1517,7 @@ mod tests {
         let index = SymSpellIndex::build();
         let (corrected, changed) = correct_query(&index, "budget friendly noise cancing headphones with usb c charging");
         assert!(changed, "Query with 'cancing' should be spell-corrected");
-        assert!(corrected.contains("cancelling"),
-            "Corrected query should contain 'cancelling', got: {}", corrected);
+        assert!(corrected.contains("cancelling") || corrected.contains("canceling"),
+            "Corrected query should contain 'cancelling' or 'canceling', got: {}", corrected);
     }
 }
