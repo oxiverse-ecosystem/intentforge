@@ -7361,6 +7361,7 @@ fn strip_location_terms(query: &str) -> Option<String> {
 
     // Find and remove location phrases: "<prep> <Place>" patterns
     let mut filtered: Vec<&str> = words.clone();
+    let mut location_stripped = false;
     let mut changed = true;
     while changed {
         changed = false;
@@ -7369,20 +7370,17 @@ fn strip_location_terms(query: &str) -> Option<String> {
                 // Remove the preposition and the following word (place name)
                 filtered.drain(i..=i + 1);
                 changed = true;
+                location_stripped = true;
                 break;
             }
         }
     }
 
-    // Also remove quantity phrases from the start
-    while !filtered.is_empty() {
-        let first = filtered[0];
-        // Remove standalone quantity words
-        if QUANTITY_PHRASES.contains(&first) {
-            filtered.remove(0);
-        } else {
-            break;
-        }
+    // Only strip quantity phrases when a location was also stripped —
+    // avoids over-stripping queries that have no location (e.g. "best practices...").
+    // Strip from anywhere in the query, not just the start.
+    if location_stripped {
+        filtered.retain(|w| !QUANTITY_PHRASES.contains(w));
     }
 
     if filtered.len() < 2 {
@@ -19462,8 +19460,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn strip_location_terms_japan_travel() {
         let query = "top 10 must visit places in japan for first time travelers";
         let stripped = strip_location_terms(query).expect("should strip location");
-        assert!(!stripped.contains("japan"), "should remove 'japan'");
-        assert!(!stripped.contains("in"), "should remove 'in' preposition");
+        assert!(!stripped.split_whitespace().any(|w| w == "japan"), "should remove 'japan'");
+        assert!(!stripped.split_whitespace().any(|w| w == "in"), "should remove 'in' preposition");
         assert!(stripped.contains("travelers") || stripped.contains("places"), "should keep topic words");
     }
 
@@ -19471,8 +19469,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn strip_location_terms_small_business() {
         let query = "how to start a small business with less than 50000 rupees in india";
         let stripped = strip_location_terms(query).expect("should strip location");
-        assert!(!stripped.contains("india"), "should remove 'india'");
-        assert!(!stripped.contains("in"), "should remove 'in' preposition");
+        assert!(!stripped.split_whitespace().any(|w| w == "india"), "should remove 'india'");
+        assert!(!stripped.split_whitespace().any(|w| w == "in"), "should remove 'in' preposition");
         assert!(stripped.contains("business"), "should keep 'business'");
     }
 
