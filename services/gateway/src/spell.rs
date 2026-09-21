@@ -351,7 +351,7 @@ impl SymSpellIndex {
             let phonetic = self.phonetic_fallback(word);
             if let Some(ref p) = phonetic {
                 let p_freq = self.exact_map.get(p).map(|&id| self.frequencies[id as usize]).unwrap_or(0.0);
-                let best_freq = self.exact_map.get(&best).map(|&id| self.frequencies[id as usize]).unwrap_or(0.0);
+                let best_freq = self.exact_map.get(best.as_str()).map(|&id| self.frequencies[id as usize]).unwrap_or(0.0);
                 if p_freq > best_freq {
                     // Accept the phonetic candidate — it's more common
                     return Some(p.clone());
