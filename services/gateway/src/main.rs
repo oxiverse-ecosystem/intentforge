@@ -12582,6 +12582,36 @@ fn is_keyboard_walk_query(q: &str, spell_index: &spell::SymSpellIndex) -> bool {
     false
 }
 
+/// Detect keyboard-walk queries like "asdfghjkl" or "qwerty"
+/// by checking for long consonant runs (>= 7) in tokens absent from the spell dictionary.
+fn is_keyboard_walk_query(q: &str, spell_index: &spell::SymSpellIndex) -> bool {
+    for token in q.split_whitespace() {
+        let lower = token.to_lowercase();
+        let alpha_only: String = lower.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        if alpha_only.len() < 7 {
+            continue;
+        }
+        if spell_index.contains_word(&alpha_only) || spell::is_protected_term(&alpha_only) {
+            continue;
+        }
+        let mut max_run = 0u32;
+        let mut current_run = 0u32;
+        for c in alpha_only.chars() {
+            if matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y') {
+                max_run = max_run.max(current_run);
+                current_run = 0;
+            } else {
+                current_run += 1;
+            }
+        }
+        max_run = max_run.max(current_run);
+        if max_run >= 7 {
+            return true;
+        }
+    }
+    false
+}
+
 fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f32) {
     let words: Vec<&str> = q.split_whitespace().filter(|w| w.chars().any(|c| c.is_alphabetic())).collect();
     if words.is_empty() {
