@@ -178,7 +178,385 @@ def test_news_schema(session):
         _require_keys(f"GET /news result[{i}]", item, NEWS_RESULT_KEYS)
 
 
-# 8. /spellcheck schema (typo path)
+# 8. /intent schema
+def test_intent_schema(session):
+    """GET /intent -> 200, keys query/intent/category/confidence/contrastive_framing/local_intent/structured_constraints/expanded_queries."""
+    r = session.get(f"{BASE}/intent", params={"q": "how to learn python"}, timeout=10)
+    assert r.status_code == 200, f"GET /intent -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    _require_keys(
+        "GET /intent",
+        body,
+        [
+            "query",
+            "intent",
+            "category",
+            "confidence",
+            "contrastive_framing",
+            "local_intent",
+            "structured_constraints",
+            "expanded_queries",
+        ],
+    )
+    assert isinstance(body.get("intent"), str) and body["intent"], (
+        f"GET /intent 'intent' must be a non-empty string; got {body.get('intent')!r}"
+    )
+    assert isinstance(body.get("category"), str) and body["category"], (
+        f"GET /intent 'category' must be a non-empty string; got {body.get('category')!r}"
+    )
+    conf = body.get("confidence")
+    assert isinstance(conf, (int, float)) and not isinstance(conf, bool), (
+        f"GET /intent 'confidence' must be a real number; got {type(conf).__name__}: {conf!r}"
+    )
+    assert isinstance(body.get("contrastive_framing"), bool), (
+        f"GET /intent 'contrastive_framing' must be a bool; got {type(body.get('contrastive_framing')).__name__}"
+    )
+    assert isinstance(body.get("local_intent"), bool), (
+        f"GET /intent 'local_intent' must be a bool; got {type(body.get('local_intent')).__name__}"
+    )
+    assert isinstance(body.get("structured_constraints"), dict), (
+        f"GET /intent 'structured_constraints' must be a dict; got {type(body.get('structured_constraints')).__name__}"
+    )
+    assert isinstance(body.get("expanded_queries"), list) and len(body["expanded_queries"]) > 0, (
+        f"GET /intent 'expanded_queries' must be a non-empty list; got {body.get('expanded_queries')!r}"
+    )
+
+
+def test_intent_contrastive_framing_signal(session):
+    """GET /intent on an X-vs-Y query -> contrastive_framing == true."""
+    r = session.get(f"{BASE}/intent", params={"q": "violin vs viola for beginner"}, timeout=10)
+    assert r.status_code == 200, f"GET /intent -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    assert body.get("contrastive_framing") is True, (
+        f"GET /intent on a vs-query should set contrastive_framing==True; got {body.get('contrastive_framing')!r}"
+    )
+
+
+# 9. /analyze schema
+def test_analyze_schema(session):
+    """GET /analyze -> 200, keys query/contrastive_framing/exclusions/declined/manner_qualifiers/decisions."""
+    r = session.get(
+        f"{BASE}/analyze",
+        params={"q": "javascript not java not typescript"},
+        timeout=10,
+    )
+    assert r.status_code == 200, f"GET /analyze -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    _require_keys(
+        "GET /analyze",
+        body,
+        ["query", "contrastive_framing", "exclusions", "declined", "manner_qualifiers", "decisions"],
+    )
+    assert isinstance(body.get("contrastive_framing"), bool), (
+        f"GET /analyze 'contrastive_framing' must be a bool; got {type(body.get('contrastive_framing')).__name__}"
+    )
+    for bucket in ("exclusions", "declined", "manner_qualifiers", "decisions"):
+        assert isinstance(body.get(bucket), list), (
+            f"GET /analyze '{bucket}' must be a list; got {type(body.get(bucket)).__name__}"
+        )
+    # Contrastive framing: every negation candidate must appear in exactly one bucket.
+    exclusions = body.get("exclusions", [])
+    declined = body.get("declined", [])
+    manner = body.get("manner_qualifiers", [])
+    seen = set(exclusions) | set(declined) | set(manner)
+    decisions = [d.get("term") for d in body.get("decisions", []) if d.get("term")]
+    assert seen == set(decisions), (
+        f"GET /analyze bucket union {sorted(seen)} != decisions terms {sorted(decisions)}"
+    )
+
+
+def test_analyze_manner_qualifiers(session):
+    """GET /analyze on a 'without X' query -> manner_qualifiers populated, exclusions empty."""
+    r = session.get(
+        f"{BASE}/analyze",
+        params={"q": "best way to cook salmon without an oven"},
+        timeout=10,
+    )
+    assert r.status_code == 200, f"GET /analyze -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    assert "oven" in body.get("manner_qualifiers", []), (
+        f"GET /analyze 'oven' should be in manner_qualifiers for 'without an oven'; got {body.get('manner_qualifiers')!r}"
+    )
+    assert "oven" not in body.get("exclusions", []), (
+        f"GET /analyze manner term 'oven' must NOT appear in exclusions; got {body.get('exclusions')!r}"
+    )
+
+
+# 10. /inspect schema
+def test_inspect_schema(session):
+    """GET /inspect -> 200, keys query/spelling/negation/intent/constraints/recency/quality;
+    constraints carries 'applied_constraints'."""
+    r = session.get(
+        f"{BASE}/inspect",
+        params={"q": "python web framework not django"},
+        timeout=10,
+    )
+    assert r.status_code == 200, f"GET /inspect -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    _require_keys(
+        "GET /inspect",
+        body,
+        ["query", "spelling", "negation", "intent", "constraints", "recency", "quality"],
+    )
+    constraints = body.get("constraints")
+    assert isinstance(constraints, dict), (
+        f"GET /inspect 'constraints' must be a dict; got {type(constraints).__name__}"
+    )
+    assert "applied_constraints" in constraints, (
+        f"GET /inspect 'constraints' missing 'applied_constraints'; have {sorted(constraints.keys())}"
+    )
+    assert isinstance(constraints["applied_constraints"], list), (
+        f"GET /inspect 'applied_constraints' must be a list; got {type(constraints['applied_constraints']).__name__}"
+    )
+    spelling = body.get("spelling", {})
+    assert isinstance(spelling, dict), (
+        f"GET /inspect 'spelling' must be a dict; got {type(spelling).__name__}"
+    )
+    assert "corrected" in spelling, "GET /inspect 'spelling' missing 'corrected'"
+    assert "changed" in spelling, "GET /inspect 'spelling' missing 'changed'"
+
+
+def test_inspect_recency_detection(session):
+    """GET /inspect on a 'latest this week' query -> recency.phrase_detected == true."""
+    r = session.get(
+        f"{BASE}/inspect",
+        params={"q": "latest AI news this week"},
+        timeout=10,
+    )
+    assert r.status_code == 200, f"GET /inspect -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    recency = body.get("recency", {})
+    assert recency.get("phrase_detected") is True, (
+        f"GET /inspect 'recency.phrase_detected' should be True for 'this week'; got {recency}"
+    )
+
+
+# 11. /geolocate schema
+def test_geolocate_schema(session):
+    """GET /geolocate -> 200, keys query/resolved/source/explicit_location/local_intent."""
+    r = session.get(
+        f"{BASE}/geolocate",
+        params={"q": "quiet places to study near chennai"},
+        timeout=10,
+    )
+    assert r.status_code == 200, f"GET /geolocate -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    _require_keys(
+        "GET /geolocate",
+        body,
+        ["query", "resolved", "source", "explicit_location", "local_intent"],
+    )
+    assert isinstance(body.get("explicit_location"), bool), (
+        f"GET /geolocate 'explicit_location' must be a bool; got {type(body.get('explicit_location')).__name__}"
+    )
+    assert isinstance(body.get("local_intent"), bool), (
+        f"GET /geolocate 'local_intent' must be a bool; got {type(body.get('local_intent')).__name__}"
+    )
+    assert body.get("source") == "explicit", (
+        f"GET /geolocate on a gazetteer place should yield source=='explicit'; got {body.get('source')!r}"
+    )
+    resolved = body.get("resolved")
+    assert isinstance(resolved, dict), (
+        f"GET /geolocate 'resolved' must be a dict when source=='explicit'; got {type(resolved).__name__}"
+    )
+    assert resolved.get("city") == "chennai", (
+        f"GET /geolocate resolved city should be 'chennai'; got {resolved.get('city')!r}"
+    )
+
+
+def test_geolocate_no_signal(session):
+    """GET /geolocate on a non-geo query -> source == 'none', resolved == null."""
+    r = session.get(
+        f"{BASE}/geolocate",
+        params={"q": "how does a cpu pipeline work"},
+        timeout=10,
+    )
+    assert r.status_code == 200, f"GET /geolocate -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    assert body.get("source") == "none", (
+        f"GET /geolocate on a non-geo query should yield source=='none'; got {body.get('source')!r}"
+    )
+    assert body.get("resolved") is None, (
+        f"GET /geolocate on a non-geo query should yield resolved==None; got {body.get('resolved')!r}"
+    )
+
+
+# 12. /video schema
+def test_video_schema(session):
+    """GET /video -> 200, keys query/video_intent/video_intent_markers/would_pin_non_video_sources/is_video_source_examples/intent/note."""
+    r = session.get(
+        f"{BASE}/video",
+        params={"q": "rust vs go high concurrency servers"},
+        timeout=10,
+    )
+    assert r.status_code == 200, f"GET /video -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    _require_keys(
+        "GET /video",
+        body,
+        [
+            "query",
+            "video_intent",
+            "video_intent_markers",
+            "would_pin_non_video_sources",
+            "is_video_source_examples",
+            "intent",
+            "note",
+        ],
+    )
+    assert isinstance(body.get("video_intent"), bool), (
+        f"GET /video 'video_intent' must be a bool; got {type(body.get('video_intent')).__name__}"
+    )
+    assert isinstance(body.get("would_pin_non_video_sources"), bool), (
+        f"GET /video 'would_pin_non_video_sources' must be a bool; got {type(body.get('would_pin_non_video_sources')).__name__}"
+    )
+    markers = body.get("video_intent_markers")
+    assert isinstance(markers, list) and len(markers) > 0, (
+        f"GET /video 'video_intent_markers' must be a non-empty list; got {markers!r}"
+    )
+    assert isinstance(body.get("is_video_source_examples"), dict), (
+        f"GET /video 'is_video_source_examples' must be a dict; got {type(body.get('is_video_source_examples')).__name__}"
+    )
+
+
+def test_video_intent_exempts_pin(session):
+    """GET /video on a video-intent query -> video_intent == true, would_pin_non_video_sources == false."""
+    r = session.get(
+        f"{BASE}/video",
+        params={"q": "best youtube tutorial for rust async"},
+        timeout=10,
+    )
+    assert r.status_code == 200, f"GET /video -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    assert body.get("video_intent") is True, (
+        f"GET /video on a video query should set video_intent==True; got {body.get('video_intent')!r}"
+    )
+    assert body.get("would_pin_non_video_sources") is False, (
+        f"GET /video on a video query should set would_pin_non_video_sources==False; got {body.get('would_pin_non_video_sources')!r}"
+    )
+
+
+# 13. /shopping schema
+def test_shopping_schema(session):
+    """GET /shopping -> 200, keys query/results; each result may carry commerce + commerce_provenance."""
+    r = session.get(
+        f"{BASE}/shopping",
+        params={"q": "best wireless earbuds under 50", "count": "3"},
+        timeout=60,
+    )
+    assert r.status_code == 200, f"GET /shopping -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    _require_keys("GET /shopping", body, ["query", "results"])
+    results = body.get("results")
+    assert isinstance(results, list), (
+        f"GET /shopping 'results' must be a list; got {type(results).__name__}"
+    )
+    assert len(results) > 0, "GET /shopping returned zero results to assert shape against"
+    # At least one result should have a commerce_provenance (honest-facts contract).
+    has_provenance = any("commerce_provenance" in item for item in results)
+    assert has_provenance, (
+        f"GET /shopping every result must carry 'commerce_provenance'; none found in {len(results)} results"
+    )
+    # commerce_provenance structure check on the first result that has one.
+    for item in results:
+        prov = item.get("commerce_provenance")
+        if isinstance(prov, dict):
+            for field in ("url", "observed_at", "source"):
+                assert field in prov, (
+                    f"GET /shopping 'commerce_provenance' missing '{field}'; have {sorted(prov.keys())}"
+                )
+            break
+
+
+# 14. /goals/:id/progress schema
+def test_goals_progress_schema(session):
+    """GET /goals/:id/progress -> 200, keys goal_id/goal/status/completed_phases/total_phases/score/roadmap."""
+    # Step 1: create a goal.
+    r_create = session.post(
+        f"{BASE}/goals",
+        json={"goal": "learn rust for systems programming in 6 months"},
+        timeout=30,
+    )
+    assert r_create.status_code == 200, f"POST /goals -> {r_create.status_code} {r_create.text[:300]}"
+    goal_id = r_create.json().get("goal_id")
+    assert isinstance(goal_id, str) and goal_id.startswith("goal_"), (
+        f"POST /goals response missing 'goal_id' starting with 'goal_'; got {goal_id!r}"
+    )
+
+    # Step 2: GET /goals/:id/progress BEFORE answers submitted -> status == "pending_answers".
+    r = session.get(f"{BASE}/goals/{goal_id}/progress", timeout=10)
+    assert r.status_code == 200, f"GET /goals/{goal_id}/progress -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    _require_keys(
+        "GET /goals/:id/progress",
+        body,
+        ["goal_id", "goal", "status", "completed_phases", "total_phases", "score", "roadmap"],
+    )
+    assert body.get("status") == "pending_answers", (
+        f"GET /goals/:id/progress before answers should yield status=='pending_answers'; got {body.get('status')!r}"
+    )
+    assert isinstance(body.get("completed_phases"), int), (
+        f"GET /goals/:id/progress 'completed_phases' must be an int; got {type(body.get('completed_phases')).__name__}"
+    )
+    assert isinstance(body.get("total_phases"), int), (
+        f"GET /goals/:id/progress 'total_phases' must be an int; got {type(body.get('total_phases')).__name__}"
+    )
+
+    # Step 3: submit answers to get a roadmap.
+    questions = r_create.json().get("questions", [])
+    answers = []
+    for q in questions:
+        if "id" not in q:
+            continue
+        opts = q.get("options") or []
+        ans = opts[0] if opts else (q.get("question") or "x")
+        answers.append({"question_id": q["id"], "answer": ans})
+    if not answers:
+        # Fallback: build a minimal answer set from the goal itself.
+        answers = [{"question_id": "q1", "answer": "6 months"}]
+
+    r_answers = session.post(
+        f"{BASE}/goals/{goal_id}/answers",
+        json={"answers": answers},
+        timeout=60,
+    )
+    assert r_answers.status_code == 200, (
+        f"POST /goals/{goal_id}/answers -> {r_answers.status_code} {r_answers.text[:300]}"
+    )
+
+    # Step 4: GET /goals/:id/progress AFTER answers submitted -> status active/completed, roadmap present.
+    r2 = session.get(f"{BASE}/goals/{goal_id}/progress", timeout=10)
+    assert r2.status_code == 200, f"GET /goals/{goal_id}/progress (post-answers) -> {r2.status_code}"
+    body2 = r2.json()
+    _require_keys(
+        "GET /goals/:id/progress (post-answers)",
+        body2,
+        ["goal_id", "goal", "status", "completed_phases", "total_phases", "score", "roadmap"],
+    )
+    assert body2.get("status") in ("active", "completed"), (
+        f"GET /goals/:id/progress after answers should be 'active' or 'completed'; got {body2.get('status')!r}"
+    )
+    roadmap2 = body2.get("roadmap")
+    assert isinstance(roadmap2, dict) and roadmap2, (
+        f"GET /goals/:id/progress 'roadmap' must be a non-empty dict after answers; got {type(roadmap2).__name__}"
+    )
+    assert "total_phases" in roadmap2, (
+        f"GET /goals/:id/progress 'roadmap' missing 'total_phases'; have {sorted(roadmap2.keys())}"
+    )
+    assert roadmap2["total_phases"] == body2.get("total_phases"), (
+        f"roadmap.total_phases ({roadmap2['total_phases']}) != body.total_phases ({body2.get('total_phases')})"
+    )
+
+
+def test_goals_progress_not_found(session):
+    """GET /goals/:id/progress on a nonexistent id -> 404."""
+    r = session.get(f"{BASE}/goals/goal_does_not_exist_xyz/progress", timeout=10)
+    assert r.status_code == 404, (
+        f"GET /goals/nonexistent/progress should return 404; got {r.status_code} {r.text[:300]}"
+    )
+
+
+# 15. /spellcheck schema (typo path)
 def test_spellcheck_typo_schema(session):
     """GET /spellcheck -> 200, keys query/corrected/changed/corrections;
     on a typo (pythn) changed==True and corrections[] non-empty."""

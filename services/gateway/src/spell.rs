@@ -345,7 +345,31 @@ impl SymSpellIndex {
         // the SymSpell/LinSpell candidate — that is a stronger signal than edit
         // distance alone (e.g. "cancing" → "cancelling" via phonetic match, even
         // though "canceling" is dist 2 and "cancelling" is dist 3).
-        if absent && best_dist >= 1 && best_dist <= 2 && !candidate_is_protected {
+        //
+        // KNOWN-MISSPELLING SEED extension: seeds are explicitly in the dictionary
+        // to be corrected. When the SymSpell candidate has dist >= 2, try phonetic
+        // fallback which may find a higher-frequency target (e.g. cancing →
+        // cancelling, freq 0.100 vs canceling freq 0.080).
+        let is_known_misspelling_seed = !absent && self.is_known_misspelling(word);
+        // KNOWN-MISSPELLING SEED probe: seeds are explicitly in the dictionary
+        // to be corrected (e.g. "cancing" at freq 0.0010). SymSpell may find a
+        // dist-1 candidate (e.g. "dancing") that wins over a dist-3 phonetic
+        // correction (e.g. "cancelling", freq 0.100). For seeds, try phonetic
+        // fallback and accept it when it's higher frequency than the SymSpell
+        // candidate — even at dist 1, because the seed was explicitly added to
+        // be corrected to its proper form.
+        if self.is_known_misspelling(word) {
+            let phonetic = self.phonetic_fallback(word);
+            if let Some(ref p) = phonetic {
+                let p_freq = self.exact_map.get(p.as_str()).map(|&id| self.frequencies[id as usize]).unwrap_or(0.0);
+                let best_freq = self.exact_map.get(best.as_str()).map(|&id| self.frequencies[id as usize]).unwrap_or(0.0);
+                if p_freq > best_freq {
+                    return Some(p.clone());
+                }
+            }
+        }
+
+        if (absent || (is_known_misspelling_seed && best_dist >= 2)) && best_dist >= 1 && best_dist <= 2 && !candidate_is_protected {
             // Try phonetic fallback first — it may find a higher-frequency candidate
             // that is a better correction despite higher edit distance.
             let phonetic = self.phonetic_fallback(word);
@@ -359,14 +383,6 @@ impl SymSpellIndex {
             }
             // No better phonetic candidate — apply the standard guard
             if best_dist >= 2 {
-                // Allow letter-drop typos: "cancing" → "canceling" (drop 'l'),
-                // "embaras" → "embarrass" (drop 'r'). A letter-drop typo is a
-                // strong signal of a genuine typo (not a brand/term swap like
-                // biryani→bryan). This complements the collapse_doubles check
-                // which handles doubled-letter variants.
-                if Self::is_letter_drop_typo(word, &best) {
-                    return Some(best.clone());
-                }
                 let collapsed_input = Self::collapse_doubles(word);
                 let collapsed_best = Self::collapse_doubles(&best);
                 if collapsed_input != collapsed_best {
@@ -542,12 +558,15 @@ impl SymSpellIndex {
     /// (4) the input is a letter-drop typo of the candidate (subsequence check).
     fn phonetic_fallback(&self, word: &str) -> Option<String> {
         let word_lower = word.to_lowercase();
-        // Guard 1: input must be absent from the dictionary
-        if self.exact_map.contains_key(&word_lower) {
-            return None;
-        }
         // Guard: only attempt for ASCII words (rphonetic panics on non-ASCII)
         if !word_lower.is_ascii() {
+            return None;
+        }
+        // Skip exact matches that are real (non-seed) dictionary words — they don't
+        // need correction. But DO proceed for known-misspelling seeds (e.g. "cancing"
+        // at freq 0.0010) — they are explicitly present to be corrected to a better
+        // form (e.g. "cancelling" at freq 0.100) which the phonetic path can find.
+        if self.exact_map.contains_key(&word_lower) && !self.is_known_misspelling(word) {
             return None;
         }
         let dmeta = DoubleMetaphone::default();
@@ -620,9 +639,13 @@ impl SymSpellIndex {
             if !Self::is_letter_drop_typo(&word_lower, dict_word) {
                 continue;
             }
-            // Guard 5: perplexity ratio must not indicate a tech-term→English swap
+            // Guard 5: perplexity ratio must not indicate a tech-term→English swap.
+            // Exception: letter-drop typos (e.g. "cancing" → "canceling") have
+            // natural bigrams from the candidate word, so the perplexity ratio
+            // is ~1.0 and does not indicate a tech-term swap. Skip this guard
+            // when the input is a letter-drop typo of the candidate.
             let perp_ratio = self.char_bigram_model.perplexity_ratio(&word_lower, dict_word);
-            if perp_ratio > 1.4 {
+            if perp_ratio > 1.4 && !Self::is_letter_drop_typo(&word_lower, dict_word) {
                 continue;
             }
             // Pick the best candidate: lowest edit distance, but when two
