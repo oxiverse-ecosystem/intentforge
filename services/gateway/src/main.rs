@@ -5854,7 +5854,7 @@ fn is_url_video_host(url: &str) -> bool {
 }
 
 /// Video-intent markers: words/phrases that signal a query is seeking video content.
-/// This is the EXACT data set the P8 video-dominance fix keys off -- shared with
+/// This is the EXACT data set the P8 video-dominance fix keys off — shared with
 /// /search so the /video preview always matches real engine behavior. No per-query
 /// literals, no magic constants.
 const VIDEO_INTENT_MARKERS: &[&str] = &["video", "youtube", "watch", "tutorial", "animation"];
@@ -18530,7 +18530,7 @@ mod spellcheck_endpoint_tests {
         fn video_watch_phrase_triggers_video_intent() {
             // "watch video" / "watch tutorial" must be detected as video intent
             // (has_video_intent checks for these phrases, matching live /search).
-            let stripped = simple_negation_strip("watch video tutorial").unwrap_or_else(|| "watch video tutorial".to_string());
+            let stripped = simple_negation_strip("watch video tutorial").unwrap_or("watch video tutorial");
             assert!(has_video_intent(&stripped));
         }
     }
