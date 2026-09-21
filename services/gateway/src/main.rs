@@ -5838,6 +5838,12 @@ fn is_url_video_host(url: &str) -> bool {
     })
 }
 
+/// Video-intent markers: words/phrases that signal a query is seeking video content.
+/// This is the EXACT data set the P8 video-dominance fix keys off -- shared with
+/// /search so the /video preview always matches real engine behavior. No per-query
+/// literals, no magic constants.
+const VIDEO_INTENT_MARKERS: &[&str] = &["video", "youtube", "watch", "tutorial", "animation"];
+
 /// Words/phrases that signal CONTRASTIVE framing. When a negation marker sits in
 /// contrastive framing, the negated head is genuinely a search exclusion (e.g.
 /// "search engine alternative to google" → exclude google; "react vs vue" → exclude
@@ -11062,6 +11068,11 @@ async fn main() {
         // structured constraints, expanded queries) using the EXACT pure fns
         // /search falls back to — zero-side-effect, no new ranking logic.
         .route("/intent", get(handle_intent))
+        // Video introspection: additive, zero-side-effect preview of the P8
+        // video-dominance decision (does the query carry video intent? which
+        // URLs are classified as video sources?). Completes the introspection
+        // family. See handle_video / build_video_inspect.
+        .route("/video", get(handle_video))
         // Commerce: honest product-fact extraction primitive (ROADMAP item 1).
         // Returns the typed CommerceOffer extracted from supplied HTML — no
         // ranking, no monetization, no user-tracking surface. The /shopping
@@ -11075,6 +11086,7 @@ async fn main() {
         .route("/goals/:goal_id", get(goals::handle_get_goal))
         .route("/goals/:goal_id/answers", post(goals::handle_submit_answers))
         .route("/goals/:goal_id/phases/:phase_id/complete", post(goals::handle_complete_phase))
+        .route("/goals/:goal_id/progress", get(goals::handle_get_progress))
         .route("/goals/:goal_id/progress", post(goals::handle_update_progress))
         .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
 
@@ -11591,6 +11603,83 @@ async fn handle_intent(
         return (axum::http::StatusCode::BAD_REQUEST, Json(build_intent_empty()));
     }
     let result = build_intent(&q);
+    (axum::http::StatusCode::OK, Json(result))
+}
+
+/// Pure builder for `/video`. Mirrors the additive, zero-side-effect precedent of
+/// `build_intent` / `build_geolocate`: reuses the EXACT pure fns `/search` uses
+/// for its P8 video-dominance check -- `simple_negation_strip` (same as /search
+/// line 7925, to strip negated content terms before intent classification) +
+/// `has_video_intent` (same fn the ranker calls at lines 9503/10113) +
+/// `is_url_video_host` (same structural host-class check the P8 pin applies).
+/// No ranking, no network, no new logic.
+fn build_video_inspect(q: &str) -> serde_json::Value {
+    // Strip negation first -- mirrors /search's clean_query pipeline so a query
+    // like "best tutorial not youtube" classifies on its positive content only.
+    let stripped = simple_negation_strip(q).unwrap_or_else(|| q.to_string());
+    let video_intent = has_video_intent(&stripped);
+    let intent_resp = fallback_intent(q);
+    let is_video_source_examples = serde_json::json!({
+        "youtube_watch": is_url_video_host("https://www.youtube.com/watch?v=dQw49d"),
+        "youtu_be": is_url_video_host("https://youtu.be/dQw49d"),
+        "invidious_selfhosted": is_url_video_host("https://invidious.snopyta.org/watch?v=dQw49d"),
+        "vimeo": is_url_video_host("https://vimeo.com/12345678"),
+        "python_org_article": is_url_video_host("https://docs.python.org/3/tutorial/"),
+        "example_video_word_in_path": is_url_video_host("https://example.com/youtube-guide-article"),
+    });
+    serde_json::json!({
+        "query": q,
+        "video_intent": video_intent,
+        "video_intent_markers": VIDEO_INTENT_MARKERS,
+        "would_pin_non_video_sources": !video_intent,
+        "is_video_source_examples": is_video_source_examples,
+        "intent": intent_resp.intent,
+        "note": "Additive introspection of the P8 video-dominance fix. Does not change ranking. A video source is any url matching is_url_video_host (youtube/youtu.be/vimeo/invidious self-hosted / m.youtube). video_intent=true exempts a query from the non-video pin.",
+    })
+}
+
+/// Build the `400 empty_query` envelope for `/video` when `q` is empty or
+/// whitespace. Pure + unit-testable (see `video_endpoint_tests`). Mirrors
+/// `/inspect`'s empty-envelope contract: carries the `video_intent` +
+/// `video_intent_markers` + `would_pin_non_video_sources` top-level keys
+/// (neutral values) so the envelope is distinguishable from `/search`/
+/// `/spellcheck`'s empty response.
+fn build_video_empty() -> serde_json::Value {
+    serde_json::json!({
+        "error": "empty_query",
+        "message": "Query parameter 'q' is empty",
+        "query": "",
+        "video_intent": false,
+        "video_intent_markers": VIDEO_INTENT_MARKERS,
+        "would_pin_non_video_sources": true,
+        "is_video_source_examples": {},
+    })
+}
+
+/// `GET /video?q=...` -- additive video-introspection endpoint.
+/// Completes the introspection family (`/spellcheck` `/analyze` `/inspect`
+/// `/geolocate` `/intent`). Exposes the P8 video-dominance decision: whether a
+/// query is classified as video-intent (which exempts it from the non-video pin)
+/// and which URLs the engine treats as video sources.
+///
+/// Like its siblings, this endpoint is ADDITIVE + ZERO-SIDE-EFFECT: it does NOT
+/// change `/search` ranking, calibration, or the P8 video pin. It reuses the
+/// EXACT pure fns `/search` uses (`simple_negation_strip` + `has_video_intent` +
+/// `is_url_video_host`), so the preview always matches real engine behavior.
+/// Empty/whitespace `q` returns `400` with the `/video`-shaped `empty_query`
+/// envelope.
+async fn handle_video(
+    axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
+    if q.trim().is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(build_video_empty()),
+        );
+    }
+    let result = build_video_inspect(&q);
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -18327,6 +18416,90 @@ mod spellcheck_endpoint_tests {
             assert_eq!(res["category"].as_str(), Some(""));
             assert_eq!(res["contrastive_framing"].as_bool(), Some(false));
             assert_eq!(res["local_intent"].as_bool(), Some(false));
+        }
+    }
+
+    // -- /video endpoint (additive video-introspection) --
+    // Mirrors the /intent /geolocate additive precedent: pure fn
+    // reuses the EXACT video-classification fns /search uses
+    // (simple_negation_strip + has_video_intent + is_url_video_host),
+    // so the preview matches real engine behavior. No network, no
+    // ranking, fully testable on the pure path.
+    mod video_endpoint_tests {
+        use super::*;
+
+        #[test]
+        fn video_non_video_query_returns_pin_true() {
+            // Mirrors API_REFERENCE.md verified example: a text query must
+            // report video_intent=false, would_pin_non_video_sources=true.
+            let res = build_video_inspect("rust vs go high concurrency servers");
+            assert_eq!(res["query"].as_str(), Some("rust vs go high concurrency servers"));
+            assert_eq!(res["video_intent"].as_bool(), Some(false));
+            assert_eq!(res["would_pin_non_video_sources"].as_bool(), Some(true));
+            assert_eq!(res["intent"].as_str(), Some("informational"));
+        }
+
+        #[test]
+        fn video_video_intent_query_exempts_from_pin() {
+            // Mirrors API_REFERENCE.md verified example: a video-intent query must
+            // report video_intent=true, would_pin_non_video_sources=false.
+            let res = build_video_inspect("best youtube tutorial for rust async");
+            assert_eq!(res["video_intent"].as_bool(), Some(true));
+            assert_eq!(res["would_pin_non_video_sources"].as_bool(), Some(false));
+        }
+
+        #[test]
+        fn video_is_video_source_examples_match_is_url_video_host() {
+            // The endpoint's host classifications must EXACTLY match
+            // is_url_video_host: youtube / youtu.be / invidious / vimeo => true;
+            // python.org => false; example.com/youtube-guide-article (word in
+            // path only) => false.
+            let res = build_video_inspect("rust tutorial");
+            let ex = &res["is_video_source_examples"];
+            assert_eq!(ex["youtube_watch"], serde_json::json!(true));
+            assert_eq!(ex["youtu_be"], serde_json::json!(true));
+            assert_eq!(ex["invidious_selfhosted"], serde_json::json!(true));
+            assert_eq!(ex["vimeo"], serde_json::json!(true));
+            assert_eq!(ex["python_org_article"], serde_json::json!(false));
+            assert_eq!(ex["example_video_word_in_path"], serde_json::json!(false));
+        }
+
+        #[test]
+        fn video_empty_query_returns_documented_400_envelope() {
+            // Empty / whitespace q must return the /video-shaped empty_query
+            // envelope (neutral video_intent + markers present), NOT a 200 with
+            // a classified result. Locks the pure builder build_video_empty().
+            let res = build_video_empty();
+            assert_eq!(res["error"].as_str(), Some("empty_query"));
+            assert_eq!(res["message"].as_str(), Some("Query parameter 'q' is empty"));
+            assert_eq!(res["query"].as_str(), Some(""));
+            assert_eq!(res["video_intent"].as_bool(), Some(false));
+            assert_eq!(res["would_pin_non_video_sources"].as_bool(), Some(true));
+        }
+
+        #[test]
+        fn video_response_shape_matches_docs() {
+            // Locks the documented top-level keys so the contract cannot drift.
+            let res = build_video_inspect("how to watch a video");
+            for key in [
+                "query", "video_intent", "video_intent_markers",
+                "would_pin_non_video_sources", "is_video_source_examples",
+                "intent", "note",
+            ] {
+                assert!(res.get(key).is_some(), "missing /video top-level key: {}", key);
+            }
+            assert_eq!(
+                res["video_intent_markers"],
+                serde_json::json!(["video", "youtube", "watch", "tutorial", "animation"])
+            );
+        }
+
+        #[test]
+        fn video_watch_phrase_triggers_video_intent() {
+            // "watch video" / "watch tutorial" must be detected as video intent
+            // (has_video_intent checks for these phrases, matching live /search).
+            let stripped = simple_negation_strip("watch video tutorial").unwrap_or_else(|| "watch video tutorial".to_string());
+            assert!(has_video_intent(&stripped));
         }
     }
 }

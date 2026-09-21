@@ -464,8 +464,9 @@ impl SymSpellIndex {
             // DoubleMetaphone returns primary and alternate codes — we index both
             let primary = dmeta.encode(word);
             let alternate = dmeta.encode_alternate(word);
+            let needs_alternate = alternate != primary;
             map.entry(primary).or_default().push(id as u32);
-            if !alternate.is_empty() && alternate != primary {
+            if !alternate.is_empty() && needs_alternate {
                 map.entry(alternate).or_default().push(id as u32);
             }
         }
