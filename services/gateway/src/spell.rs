@@ -584,11 +584,7 @@ impl SymSpellIndex {
             &input_alt[..]
         };
 
-        let mut all_candidates: Vec<u32> = Vec::new();
         let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        if word_lower == "cancing" {
-            eprintln!("[DEBUG] cancing input_prefix={} alt_prefix={}", input_prefix, alt_prefix);
-        }
         for (code, ids) in &self.phonetic_dict {
             let code_prefix = if code.len() >= prefix_len {
                 &code[..prefix_len]
@@ -599,27 +595,14 @@ impl SymSpellIndex {
                 for &id in ids {
                     seen.insert(id);
                 }
-                if word_lower == "cancing" {
-                    let sample: Vec<String> = ids.iter().map(|&id| self.words[id as usize].clone()).collect();
-                    eprintln!("[DEBUG]   code={} prefix={} matches={:?}", code, code_prefix, sample);
-                }
             }
         }
-        all_candidates.extend(seen);
-        if word_lower == "cancing" {
-            eprintln!("[DEBUG] cancing candidates={}", all_candidates.len());
-            for &word_id in &all_candidates {
-                let dict_word = &self.words[word_id as usize];
-                let freq = self.frequencies[word_id as usize];
-                let dist = self.compute_edit_distance(&word_lower, dict_word);
-                let is_drop = Self::is_letter_drop_typo(&word_lower, dict_word);
-                let perp = self.char_bigram_model.perplexity_ratio(&word_lower, dict_word);
-                eprintln!("[DEBUG]   cand={} freq={:.4} dist={} is_drop={} perp={:.2}", dict_word, freq, dist, is_drop, perp);
-            }
+        if seen.is_empty() {
+            return None;
         }
 
         let mut best: Option<(u32, f64, usize)> = None;
-        for &word_id in &all_candidates {
+        for &word_id in seen.iter() {
             let dict_word = &self.words[word_id as usize];
             let freq = self.frequencies[word_id as usize];
             // Guard 3: candidate must be a common word
@@ -636,12 +619,9 @@ impl SymSpellIndex {
                 continue;
             }
             // Guard 5: perplexity ratio must not indicate a tech-term→English swap.
-            // Exception: letter-drop typos (e.g. "cancing" → "canceling") have
-            // natural bigrams from the candidate word, so the perplexity ratio
-            // is ~1.0 and does not indicate a tech-term swap. Skip this guard
-            // when the input is a letter-drop typo of the candidate.
+            // Guard 4 already confirmed letter-drop, so skip this guard for them.
             let perp_ratio = self.char_bigram_model.perplexity_ratio(&word_lower, dict_word);
-            if perp_ratio > 1.4 && !Self::is_letter_drop_typo(&word_lower, dict_word) {
+            if perp_ratio > 1.4 {
                 continue;
             }
             // Pick the best candidate: lowest edit distance, but when two
