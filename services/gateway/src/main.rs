@@ -6799,7 +6799,12 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     break;
                 }
                 // Greedily collect the entity, stopping at a price op / new lead-in /
-                // trailing stopword once we already have a head.
+                // trailing stopword once we already have a head. Split on "or"/"and"
+                // list connectors so each target becomes its own exclusion — the same
+                // compound-splitting pattern as extract_query_negative_terms_with_dropped.
+                // Without this, "without oven or microwave" yielded the single compound
+                // "oven or microwave", which substring-matches no page title/content and
+                // silently let "Best Microwaves" rank #1.
                 let mut ent: Vec<String> = Vec::new();
                 while idx < words.len() && ent.len() < 5 {
                     let w = words[idx];
@@ -6815,6 +6820,18 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     }
                     if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
                         break; // trailing stopword ends the entity
+                    }
+                    // List connector ("or"/"and"/",") between exclusion targets: the
+                    // current target is finalised and pushed, then we start a new one.
+                    let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
+                    if !ent.is_empty() && (bare == "or" || bare == "and") {
+                        let entity = ent.join(" ");
+                        if !out.contains(&entity) {
+                            out.push(entity);
+                        }
+                        ent.clear();
+                        idx += 1;
+                        continue;
                     }
                     ent.push(wc);
                     idx += 1;
