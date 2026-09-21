@@ -532,7 +532,7 @@ impl SymSpellIndex {
             }
         }
         if word_lower == "cancing" {
-            eprintln!("[DEBUG] cancing candidates={} best={:?}", all_candidates.len(), best);
+            eprintln!("[DEBUG] cancing candidates={}", all_candidates.len());
             for &word_id in &all_candidates {
                 let dict_word = &self.words[word_id as usize];
                 let freq = self.frequencies[word_id as usize];
