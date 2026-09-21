@@ -517,6 +517,9 @@ impl SymSpellIndex {
         let dmeta = DoubleMetaphone::default();
         let input_code = dmeta.encode(&word_lower);
         let input_alt = dmeta.encode_alternate(&word_lower);
+        if word_lower == "cancing" {
+            eprintln!("[DEBUG] cancing primary={} alternate={}", input_code, input_alt);
+        }
 
         let mut all_candidates: Vec<u32> = Vec::new();
         if let Some(ids) = self.phonetic_dict.get(&input_code) {
@@ -525,6 +528,17 @@ impl SymSpellIndex {
         if input_alt != input_code {
             if let Some(ids) = self.phonetic_dict.get(&input_alt) {
                 all_candidates.extend(ids);
+            }
+        }
+        if word_lower == "cancing" {
+            eprintln!("[DEBUG] cancing candidates={} best={:?}", all_candidates.len(), best);
+            for &word_id in &all_candidates {
+                let dict_word = &self.words[word_id as usize];
+                let freq = self.frequencies[word_id as usize];
+                let dist = self.compute_edit_distance(&word_lower, dict_word);
+                let is_drop = Self::is_letter_drop_typo(&word_lower, dict_word);
+                let perp = self.char_bigram_model.perplexity_ratio(&word_lower, dict_word);
+                eprintln!("[DEBUG]   cand={} freq={:.4} dist={} is_drop={} perp={:.2}", dict_word, freq, dist, is_drop, perp);
             }
         }
 
