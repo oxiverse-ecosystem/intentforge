@@ -3824,6 +3824,116 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.rating.is_some()
 }
 
+/// Parallel enrichment variant: runs up to `N` fetches concurrently so the main
+/// `/search` path can complete within the global TimeoutLayer budget (30s).
+/// With sequential enrichment, 8 results at ~4.5s each = 36s > 30s, which silently
+/// drops the entire `shopping` block. Bounded parallelism (4 at a time, 22s total
+/// cap) brings worst-case to ~9-11s.
+///
+/// Same order-invariance contract: operates on a mutable slice of ranked results,
+/// attaches `commerce`/`commerce_provenance` in place. Order is preserved.
+async fn enrich_with_commerce_par<F, Fut>(
+    results: &mut [serde_json::Value],
+    max_concurrent: usize,
+    total_timeout_ms: u64,
+    fetch: F,
+) where
+    F: Fn(String) -> Fut + Clone,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    let fetches: Vec<_> = results
+        .iter_mut()
+        .filter(|r| r.is_object() && r.get("commerce").is_none())
+        .map(|r| {
+            let url = r
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let provenance = serde_json::json!({
+                "url": url,
+                "observed_at": now_unix_string(),
+                "source": null,
+                "data": null,
+            });
+            (url, provenance, fetch.clone())
+        })
+        .collect();
+
+    if fetches.is_empty() {
+        return;
+    }
+
+    let stream = futures::stream::iter(fetches.into_iter().map(
+        |(url, provenance, fetch_clone)| async move {
+            let html = fetch_clone(url.clone()).await;
+            (url, html, provenance)
+        },
+    ))
+    .buffer_unordered(max_concurrent);
+
+    let capped = tokio::time::timeout(
+        std::time::Duration::from_millis(total_timeout_ms),
+        stream.collect::<Vec<_>>(),
+    )
+    .await;
+
+    let results_back = match capped {
+        Ok(v) => v,
+        Err(_) => {
+            // Timeout: attach provenance (no commerce) to remaining and return
+            for r in results.iter_mut() {
+                if r.is_object() && r.get("commerce_provenance").is_none() {
+                    if let Some(url) = r.get("url").and_then(|v| v.as_str()) {
+                        r["commerce_provenance"] = serde_json::json!({
+                            "url": url,
+                            "observed_at": now_unix_string(),
+                            "source": null,
+                            "data": null,
+                        });
+                    }
+                }
+            }
+            return;
+        }
+    };
+
+    // Attach results back into the original slice
+    for (url, html_opt, provenance) in results_back {
+        if let Some(r) = results
+            .iter_mut()
+            .find(|r| r.get("url").and_then(|v| v.as_str()) == Some(&url))
+        {
+            if r.get("commerce").is_some() {
+                // Already enriched by earlier sequential path — skip
+                if r.get("commerce_provenance").is_none() {
+                    r["commerce_provenance"] = provenance;
+                }
+                continue;
+            }
+            match html_opt {
+                Some(h) => {
+                    let offer: CommerceOffer = extract_commerce_offer(&h, &url);
+                    if offer
+                        .data
+                        .as_ref()
+                        .map(|d| data_has_fact(d))
+                        .unwrap_or(false)
+                    {
+                        if let Ok(v) = serde_json::to_value(&offer) {
+                            r["commerce"] = v;
+                        }
+                    }
+                    r["commerce_provenance"] = provenance;
+                }
+                None => {
+                    r["commerce_provenance"] = provenance;
+                }
+            }
+        }
+    }
+}
+
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
 /// page exposed structured product data, attached by `enrich_with_commerce`).
 /// Powers the main-path `shopping` gate: the strip is only surfaced when at
@@ -3839,6 +3949,15 @@ fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
 /// touched, so this number cannot affect ranking or selection. Data-free: tuning
 /// it only changes how many enriched shopping cards show, never their order.
 const COMMERCE_MAINPATH_TOP_N: usize = 8;
+
+/// Parallelism for the main-path shopping enrichment. With 4 concurrent fetches
+/// and ~4.5s per fetch, 8 results complete in ~9-11s worst-case, well under
+/// the 30s TimeoutLayer. Bounded so we don't saturate the upstream HTTP client.
+const COMMERCE_MAINPATH_PAR_CONCURRENT: usize = 4;
+/// Hard cap on total wall-time for the parallel enrichment pass. The
+/// TimeoutLayer is 30s; we must finish well before it so the rest of the
+/// response (affiliate decoration, offer comparison) still runs.
+const COMMERCE_MAINPATH_TIMEOUT_MS: u64 = 22000;
 
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
@@ -15913,13 +16032,18 @@ let mut results = match tokio::task::spawn_blocking(move || {
             None
         } else {
             let http_client = client.clone();
-            // Reuse the same strict post-rank enrichment as /shopping. Each fetch is
-            // already budgeted (~4.5s) inside `fetch_page_html`, and we only touch
-            // the top-N (bounded), so the main /search latency stays acceptable.
-            enrich_with_commerce(&mut shop_arr, move |url: String| {
-                let c = http_client.clone();
-                async move { fetch_page_html(&c, &url).await }
-            })
+            // Parallel enrichment: 4 concurrent fetches with a 22s wall-time cap.
+            // Sequential enrichment (8 results × ~4.5s each = 36s) exceeded the 30s
+            // TimeoutLayer and silently dropped the entire `shopping` block.
+            enrich_with_commerce_par(
+                &mut shop_arr,
+                COMMERCE_MAINPATH_PAR_CONCURRENT,
+                COMMERCE_MAINPATH_TIMEOUT_MS,
+                move |url: String| {
+                    let c = http_client.clone();
+                    async move { fetch_page_html(&c, &url).await }
+                },
+            )
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
