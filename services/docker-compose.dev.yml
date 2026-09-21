@@ -44,6 +44,8 @@ services:
       - "4000:4000"
       - "6000:6000"
     restart: always
+    mem_limit: 512m
+    mem_reservation: 256m
     healthcheck:
       test: ["CMD", "/gluetun-entrypoint", "healthcheck"]
       interval: 20s
@@ -69,6 +71,8 @@ services:
         condition: service_healthy
     network_mode: "service:gluetun"
     restart: always
+    mem_limit: 128m
+    mem_reservation: 64m
 
   tor:
     build: ./privacy-layer/tor
@@ -81,6 +85,8 @@ services:
       - ./privacy-layer/tor/data:/var/lib/tor
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
     restart: always
+    mem_limit: 128m
+    mem_reservation: 64m
     logging:
       driver: "json-file"
       options:
@@ -98,6 +104,8 @@ services:
     volumes:
       - ./privacy-layer/tor2/data:/var/lib/tor
     restart: always
+    mem_limit: 128m
+    mem_reservation: 64m
     logging:
       driver: "json-file"
       options:
@@ -118,12 +126,14 @@ services:
       tor:
         condition: service_started
     environment:
-      - GRANIAN_WORKERS=4
+      - GRANIAN_WORKERS=2
       - GRANIAN_HOST=0.0.0.0
     volumes:
       - ./meta-search-engines/searxng/searxng:/etc/searxng:rw
       - ./shared-signals/resolv-searxng-host.conf:/etc/resolv.conf:ro
     restart: always
+    mem_limit: 768m
+    mem_reservation: 256m
     cap_drop:
       - ALL
     cap_add:
@@ -145,12 +155,14 @@ services:
     depends_on:
       - tor2
     environment:
-      - GRANIAN_WORKERS=4
+      - GRANIAN_WORKERS=2
       - SEARXNG_PORT=8081
       - GRANIAN_HOST=0.0.0.0
     volumes:
       - ./meta-search-engines/searxng/searxng2:/etc/searxng:rw
     restart: always
+    mem_limit: 768m
+    mem_reservation: 256m
     cap_drop:
       - ALL
     cap_add:
@@ -167,6 +179,8 @@ services:
     container_name: if-dev-invidious-db
     image: postgres:14-alpine
     restart: always
+    mem_limit: 256m
+    mem_reservation: 128m
     environment:
       - POSTGRES_DB=invidious
       - POSTGRES_USER=kemal
@@ -177,6 +191,8 @@ services:
   invidious:
     container_name: if-dev-invidious
     image: quay.io/invidious/invidious:latest
+    mem_limit: 512m
+    mem_reservation: 256m
     depends_on:
       - invidious-db
     environment:
@@ -214,7 +230,7 @@ services:
       context: ./crawler
       dockerfile: Dockerfile
     container_name: if-dev-crawler
-    mem_limit: 1024m
+    mem_limit: 2048m
     mem_reservation: 512m
     environment:
       # crawler=debug surfaces the per-page "Content length: raw= truncated= cap="
@@ -265,14 +281,16 @@ services:
         - /var/run/docker.sock:/var/run/docker.sock:ro
         - geolite2-data:/data
       restart: always
+      mem_limit: 256m
+      mem_reservation: 128m
 
   gateway:
     build:
       context: ./gateway
       dockerfile: Dockerfile
     container_name: if-dev-gateway
-    mem_limit: 4096m
-    mem_reservation: 1024m
+    mem_limit: 1024m
+    mem_reservation: 512m
     environment:
       - INTENT_ENGINE_URL=http://localhost:3005
       - SEARXNG_URL=http://localhost:8080
