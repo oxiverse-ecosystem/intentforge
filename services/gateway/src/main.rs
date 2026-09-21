@@ -18857,7 +18857,7 @@ mod spellcheck_endpoint_tests {
         fn video_watch_phrase_triggers_video_intent() {
             // "watch video" / "watch tutorial" must be detected as video intent
             // (has_video_intent checks for these phrases, matching live /search).
-            let stripped = simple_negation_strip("watch video tutorial").unwrap_or("watch video tutorial");
+            let stripped = simple_negation_strip("watch video tutorial").unwrap_or("watch video tutorial".to_string());
             assert!(has_video_intent(&stripped));
         }
     }
