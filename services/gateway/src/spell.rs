@@ -337,19 +337,34 @@ impl SymSpellIndex {
         // "awiat"->"await", "kubrnetes"->"kubernetes") should always be corrected.
         // The protected-term list IS the seed knowledge that these are real terms.
         let candidate_is_protected = is_protected_term(&best);
+        // ABSENT-WORD GUARD: when an input word is absent from the dictionary and
+        // not a known-misspelling seed, block corrections at distance >= 2 (they
+        // are almost certainly real terms, not typos). Distance-1 corrections are
+        // permitted only when they carry a phonotactic scar (genuine typo signal).
+        // EXCEPTION: a phonetic-fallback candidate that is HIGHER frequency than
+        // the SymSpell/LinSpell candidate — that is a stronger signal than edit
+        // distance alone (e.g. "cancing" → "cancelling" via phonetic match, even
+        // though "canceling" is dist 2 and "cancelling" is dist 3).
         if absent && best_dist >= 1 && best_dist <= 2 && !candidate_is_protected {
+            // Try phonetic fallback first — it may find a higher-frequency candidate
+            // that is a better correction despite higher edit distance.
+            let phonetic = self.phonetic_fallback(word);
+            if let Some(ref p) = phonetic {
+                let p_freq = self.exact_map.get(p).map(|&id| self.frequencies[id as usize]).unwrap_or(0.0);
+                let best_freq = self.exact_map.get(&best).map(|&id| self.frequencies[id as usize]).unwrap_or(0.0);
+                if p_freq > best_freq {
+                    // Accept the phonetic candidate — it's more common
+                    return Some(p.clone());
+                }
+            }
+            // No better phonetic candidate — apply the standard guard
             if best_dist >= 2 {
-                // Allow the doubled-letter typo exception (embaras->embarrass etc.)
-                // via collapse_doubles equivalence — but only when the input is itself a
-                // known-misspelling seed (otherwise the absent-word guard above already
-                // returned None before reaching here).
                 let collapsed_input = Self::collapse_doubles(word);
                 let collapsed_best = Self::collapse_doubles(&best);
                 if collapsed_input != collapsed_best {
                     return None;
                 }
             } else {
-                // distance-1: block ONLY when the correction is NOT a genuine
                 // typo. An absent word with natural bigrams (skoda->soda,
                 // yawn->yarn, biryani->bryan, ramen->raven) is a real
                 // brand/term, not a typo -> block. A genuine single-edit typo
@@ -499,6 +514,13 @@ impl SymSpellIndex {
         drops >= 1 && i == input_chars.len()
     }
 
+    /// Length of the phonetic code prefix used for matching.
+    /// Double Metaphone codes are 4 chars; matching on the first 3 captures
+    /// near-identical pronunciations (e.g. "cancing"→KNSN vs "cancelling"→KNSL
+    /// share KNS) while the later guards (edit distance, letter-drop, perplexity)
+    /// filter out true false-positives.
+    const PHONETIC_PREFIX_LEN: usize = 3;
+
     /// Phonetic fallback: find a correction using phonetic codes.
     /// Called after SymSpell/LinSpell fail. Applies strict guards:
     /// (1) input word is NOT in the dictionary (absent-word guard),
@@ -518,19 +540,44 @@ impl SymSpellIndex {
         let dmeta = DoubleMetaphone::default();
         let input_code = dmeta.encode(&word_lower);
         let input_alt = dmeta.encode_alternate(&word_lower);
-        if word_lower == "cancing" {
-            eprintln!("[DEBUG] cancing primary={} alternate={}", input_code, input_alt);
-        }
+
+        // Match on phonetic prefix: near-identical pronunciations often differ
+        // in the last character (KNSN vs KNSL). Iterate all phonetic_dict
+        // entries and collect word_ids whose code shares the same prefix.
+        let prefix_len = Self::PHONETIC_PREFIX_LEN;
+        let input_prefix = if input_code.len() >= prefix_len {
+            &input_code[..prefix_len]
+        } else {
+            &input_code[..]
+        };
+        let alt_prefix = if input_alt.len() >= prefix_len {
+            &input_alt[..prefix_len]
+        } else {
+            &input_alt[..]
+        };
 
         let mut all_candidates: Vec<u32> = Vec::new();
-        if let Some(ids) = self.phonetic_dict.get(&input_code) {
-            all_candidates.extend(ids);
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        if word_lower == "cancing" {
+            eprintln!("[DEBUG] cancing input_prefix={} alt_prefix={}", input_prefix, alt_prefix);
         }
-        if input_alt != input_code {
-            if let Some(ids) = self.phonetic_dict.get(&input_alt) {
-                all_candidates.extend(ids);
+        for (code, ids) in &self.phonetic_dict {
+            let code_prefix = if code.len() >= prefix_len {
+                &code[..prefix_len]
+            } else {
+                &code[..]
+            };
+            if code_prefix == input_prefix || code_prefix == alt_prefix {
+                for &id in ids {
+                    seen.insert(id);
+                }
+                if word_lower == "cancing" {
+                    let sample: Vec<String> = ids.iter().map(|&id| self.words[id as usize].clone()).collect();
+                    eprintln!("[DEBUG]   code={} prefix={} matches={:?}", code, code_prefix, sample);
+                }
             }
         }
+        all_candidates.extend(seen);
         if word_lower == "cancing" {
             eprintln!("[DEBUG] cancing candidates={}", all_candidates.len());
             for &word_id in &all_candidates {
