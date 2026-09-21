@@ -55,22 +55,15 @@ jobs:
     # This job asserts the documented JSON contracts for EVERY endpoint in
     # API_REFERENCE.md (incl. the Goals API). It needs a RUNNING gateway.
     #
-    # IMPORTANT: a bare runner has no IntentForge stack, so the suite is designed
-    # to SKIP cleanly there (no green-washing of a real failure). To make it a
-    # real guard, bring the stack up (docker compose) and set
-    # INTENTFORGE_REQUIRE_GATEWAY=1 so an unreachable/contract-drifted gateway
-    # FAILS the run. The QA loop already does this locally/where the stack runs.
+    # FIX-6: previously INTENTFORGE_REQUIRE_GATEWAY was "0", so on a bare runner
+    # the entire suite skipped (15 skipped in 0.10s) and CI was green while
+    # asserting nothing. Now set to "1" and bring the stack up — an
+    # unreachable/contract-drifted gateway FAILS the run. No more green-washing.
     #
-    # Example (when the stack is brought up in this job):
-    #   - name: Bring up IntentForge stack
-    #     run: (cd services && docker compose -f docker-compose.dev.yml up -d gateway indexer ...)
-    #   - name: Wait for gateway health
-    #     run: for i in $(seq 1 30); do curl -sf localhost:4000/health && break; sleep 5; done
-    #   - name: Run schema regression (must fail if gateway missing)
-    #     env:
-    #       INTENTFORGE_BASE: http://localhost:4000
-    #       INTENTFORGE_REQUIRE_GATEWAY: "1"
-    #     run: pytest tests/goals_api_schema.py -v
+    # The full stack needs VPN creds (gluetun -> ../.env) which are NOT available
+    # in CI, so docker compose will fail to bring up gluetun-dependent services.
+    # That is CORRECT: CI goes RED, not green-washed. The QA loop runs these
+    # tests locally where the real stack is up.
     steps:
       - uses: actions/checkout@v4
 
@@ -82,10 +75,28 @@ jobs:
       - name: Install pytest
         run: pip install -r tests/requirements.txt
 
-      - name: Run API schema regression
+      - name: Bring up IntentForge stack
+        run: |
+          cd services
+          docker compose -f docker-compose.dev.yml up -d --build 2>&1 || true
+          echo "--- stack status ---"
+          docker compose -f docker-compose.dev.yml ps 2>&1 || true
+
+      - name: Wait for gateway health (fail fast if stack is down)
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:4000/health >/dev/null 2>&1; then
+              echo "Gateway healthy after ${i} attempts"
+              exit 0
+            fi
+            echo "Attempt $i: gateway not ready, waiting 5s..."
+            sleep 5
+          done
+          echo "ERROR: gateway never became healthy"
+          exit 1
+
+      - name: Run API schema regression (must fail if gateway missing)
         env:
-          # Default: skip cleanly if no gateway (bare runner). The QA loop and
-          # any job that brings the stack up should set this to "1".
-          INTENTFORGE_REQUIRE_GATEWAY: "0"
+          INTENTFORGE_REQUIRE_GATEWAY: "1"
           INTENTFORGE_BASE: http://localhost:4000
-        run: pytest tests/goals_api_schema.py -v
+        run: pytest tests/goals_api_schema.py -v"
