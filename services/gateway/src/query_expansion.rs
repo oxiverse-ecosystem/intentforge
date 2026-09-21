@@ -367,6 +367,34 @@ pub fn expand_capped(query: &str, max: usize) -> Vec<String> {
         .collect()
 }
 
+/// Generate expanded query variants for thin-result fallback.
+///
+/// When a query returns few results, the gateway retries with expanded
+/// variants. This function produces a general, non-hardcoded set of variants:
+/// 1. The query with "guide" and "tips" suffixes (structural — any query
+///    can be made more guide-like).
+/// 2. Entity subsets from `expand()` (existing logic).
+///
+/// Returns variants ordered by specificity (most specific first).
+/// No query-specific strings — all transformations are structural.
+pub fn thin_result_variants(query: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+
+    // 1. Add "guide" and "tips" suffix variants
+    // (structural: any query can be made more guide-like)
+    variants.push(format!("{} guide", query));
+    variants.push(format!("{} tips", query));
+
+    // 2. Entity subsets (existing expand function)
+    for v in expand(query) {
+        if !variants.contains(&v) {
+            variants.push(v);
+        }
+    }
+
+    variants
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +483,48 @@ mod tests {
         assert_eq!(simple_stem("securing"), "security");
         assert_eq!(simple_stem("running"), "run");
         assert_eq!(simple_stem("testing"), "testing");
+    }
+
+    #[test]
+    fn test_thin_result_variants_basic() {
+        let query = "top 10 must visit places in japan for first time travelers";
+        let variants = thin_result_variants(query);
+        assert!(!variants.is_empty(), "should produce at least one variant");
+        // Should include guide and tips suffixes
+        assert!(variants.iter().any(|v| v.contains("guide")), "should include guide suffix");
+        assert!(variants.iter().any(|v| v.contains("tips")), "should include tips suffix");
+    }
+
+    #[test]
+    fn test_thin_result_variants_small_business() {
+        let query = "how to start a small business with less than 50000 rupees in india";
+        let variants = thin_result_variants(query);
+        assert!(!variants.is_empty(), "should produce at least one variant");
+        // Should include entity subsets
+        assert!(variants.iter().any(|v| v.contains("business")), "should include business entity");
+    }
+
+    #[test]
+    fn test_thin_result_variants_no_duplicates() {
+        let query = "best practices for securing a postgresql database";
+        let variants = thin_result_variants(query);
+        let mut seen = std::collections::HashSet::new();
+        for v in &variants {
+            assert!(seen.insert(v.clone()), "duplicate variant: {}", v);
+        }
+    }
+
+    #[test]
+    fn test_thin_result_variants_ordering() {
+        let query = "top 10 must visit places in japan for first time travelers";
+        let variants = thin_result_variants(query);
+        // Most specific first (guide/tips suffixes before entity subsets)
+        if variants.len() >= 2 {
+            assert!(
+                variants[0].contains("guide") || variants[0].contains("tips"),
+                "first variant should be a suffix variant, got: {}",
+                variants[0]
+            );
+        }
     }
 }

@@ -19457,4 +19457,55 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!out.contains("user"), "no user id");
         assert!(!out.contains("ip="), "no ip");
     }
+
+    #[test]
+    fn strip_location_terms_japan_travel() {
+        let query = "top 10 must visit places in japan for first time travelers";
+        let stripped = strip_location_terms(query).expect("should strip location");
+        assert!(!stripped.contains("japan"), "should remove 'japan'");
+        assert!(!stripped.contains("in"), "should remove 'in' preposition");
+        assert!(stripped.contains("travelers") || stripped.contains("places"), "should keep topic words");
+    }
+
+    #[test]
+    fn strip_location_terms_small_business() {
+        let query = "how to start a small business with less than 50000 rupees in india";
+        let stripped = strip_location_terms(query).expect("should strip location");
+        assert!(!stripped.contains("india"), "should remove 'india'");
+        assert!(!stripped.contains("in"), "should remove 'in' preposition");
+        assert!(stripped.contains("business"), "should keep 'business'");
+    }
+
+    #[test]
+    fn strip_location_terms_no_location() {
+        let query = "best practices for securing a postgresql database";
+        // No location preposition to strip — should return None or same query
+        let result = strip_location_terms(query);
+        // Either None or the same query (no change)
+        if let Some(s) = result {
+            assert_eq!(s, query, "no location to strip => unchanged");
+        }
+    }
+
+    #[test]
+    fn strip_location_terms_too_short() {
+        let query = "rust programming";
+        assert!(strip_location_terms(query).is_none(), "too short to strip");
+    }
+
+    #[test]
+    fn strip_location_terms_with_site_operator() {
+        let query = "best practices for securing a site:postgresql.org database";
+        // Should NOT strip when site: operator is present
+        assert!(strip_location_terms(query).is_none(), "should not strip site: queries");
+    }
+
+    #[test]
+    fn strip_location_terms_quantity_phrases() {
+        let query = "top 10 best places to visit in japan";
+        let stripped = strip_location_terms(query).expect("should strip");
+        assert!(!stripped.contains("japan"), "should remove location");
+        assert!(!stripped.contains("top"), "should remove 'top'");
+        assert!(!stripped.contains("best"), "should remove 'best'");
+    }
 }
