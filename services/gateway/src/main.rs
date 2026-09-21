@@ -11972,9 +11972,18 @@ fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f
             || w.contains('_') || w.contains('-') || w.contains('.')
     });
 
+    // Keyboard-gibberish-dominated query: if half or more tokens are keyboard
+    // row runs (asdfghjkl, zxcvbnm, qwerty, etc.), the query is junk regardless
+    // of other signals. This catches "asdfghjkl qwerty zxcvbnm" and similar.
+    let kb_gibberish_count = words.iter().filter(|w| is_keyboard_gibberish(w)).count();
+    let kb_gibberish_ratio = kb_gibberish_count as f32 / words.len() as f32;
+    let dominated_by_kb_gibberish = kb_gibberish_ratio >= 0.5;
+
     if valid_ratio == 0.0 && !has_european_word && !all_pronounceable && !has_technical_token {
         ("junk".to_string(), valid_ratio)
     } else if valid_ratio < 0.25 && !has_european_word && !all_pronounceable && (h < 2.5 || h > 6.5) && !has_technical_token {
+        ("junk".to_string(), valid_ratio)
+    } else if dominated_by_kb_gibberish && !has_technical_token && valid_ratio < 0.5 {
         ("junk".to_string(), valid_ratio)
     } else if valid_ratio < 0.5 && !has_european_word && !has_technical_token {
         ("low".to_string(), valid_ratio)
