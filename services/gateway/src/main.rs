@@ -18,7 +18,6 @@ mod geoloc;
 mod dictionary;
 mod clean;
 mod goals;
-mod query_expansion;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
 // ─── API Types ───────────────────────────────────────────────────────
@@ -104,23 +103,6 @@ struct Constraints {
     /// Lower bound from an explicit `>` operator, e.g. `price:>50`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     price_gt: Option<f32>,
-    /// Match mode for constraint filtering.
-    /// - Hard (default): results violating negative constraints are hard-dropped.
-    /// - Soft (used by 0-result retry): never hard-drop; instead score by
-    ///   constraint satisfaction count (more matches = higher rank) and fall
-    ///   back to the best partial match. Never returns 0 results if any
-    ///   partial match exists.
-    #[serde(default)]
-    match_mode: MatchMode,
-}
-
-/// Match mode for constraint filtering.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
-#[serde(rename_all = "snake_case")]
-enum MatchMode {
-    #[default]
-    Hard,
-    Soft,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -847,25 +829,6 @@ fn month_num(s: &str) -> Option<i32> {
     months.iter().find(|(n, _)| s.starts_with(n)).map(|(_, m)| *m)
 }
 
-/// Extract a 4-digit year from a query string, if present.
-/// Used by the P6 temporal anchor fix to match results that explicitly mention
-/// the query's time period.
-fn extract_year_from_query(query: &str) -> Option<String> {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"\b(\d{4})\b").unwrap());
-    re.captures(query).map(|c| c.get(1).unwrap().as_str().to_string())
-}
-
-/// Extract a month name from a query string, if present.
-/// Used by the P6 temporal anchor fix to match results that explicitly mention
-/// the query's time period.
-fn extract_month_from_query(query: &str) -> Option<String> {
-    let months = ["january", "february", "march", "april", "may", "june",
-                  "july", "august", "september", "october", "november", "december"];
-    let q_lower = query.to_lowercase();
-    months.iter().find(|m| q_lower.contains(**m)).map(|m| m.to_string())
-}
-
 /// Extract a calendar date from free text (title/content snippet).
 fn extract_date_from_text(text: &str) -> Option<(i32, i32, i32)> {
     // Numeric YYYY-MM-DD / YYYY/MM/DD first (precise).
@@ -991,18 +954,6 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
         }
     }
 
-    // "this year"/"this month" only imply a date window when co-occurring with a
-    // news/recency signal term. In "certification path this year", "this year"
-    // modifies user intent, not recency — firing a 365-day window wrongly drops
-    // older but still-relevant results. Structural signal vocabulary, no per-query
-    // literals.
-    let recency_signal_terms = [
-        "news", "latest", "new", "recent", "developments", "changes",
-        "update", "updates", "this week", "breaking", "headline", "headlines",
-        "announced", "released", "launched", "today", "yesterday",
-    ];
-    let has_recency_signal = recency_signal_terms.iter().any(|t| q_lower.contains(t));
-
     let named: &[(&str, i64)] = &[
         ("this week", -7), ("past week", -7), ("last week", -7), ("current week", -7),
         ("this month", -30), ("past month", -30), ("last month", -30),
@@ -1010,14 +961,6 @@ fn derive_recency_window(q_lower: &str) -> Option<(String, String)> {
     ];
     for (phrase, delta) in named {
         if q_lower.contains(*phrase) {
-            if *phrase == "this year" || *phrase == "this month" {
-                // Co-occurrence gate: only fire when a news/recency signal term
-                // is also present. Otherwise skip — do NOT emit after:/before:.
-                if has_recency_signal {
-                    return Some((format_ymd(add_days(today, *delta)), today_s));
-                }
-                continue;
-            }
             return Some((format_ymd(add_days(today, *delta)), today_s));
         }
     }
@@ -2156,10 +2099,6 @@ fn constraint_score(
                     neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
                     boost);
                 score *= boost;
-                // Do NOT flag as violation: the term is in negating context,
-                // meaning the page is FULFILLING the exclusion (e.g. "without pills"),
-                // not violating it. The alt-page penalty below must not cancel
-                // this boost.
             } else if !is_alt_page {
                 let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
                 tracing::info!("CONSTRAINT HIT (TITLE/URL): '{}' in '{}' → penalty={:.4} (non-alt)",
@@ -2283,19 +2222,7 @@ fn constraint_score(
         }
     }
 
-    // Positive constraints: boost for each match (fuzzy matching).
-    //
-    // DESIGN (2026-09-15, positive-over-filter fix): the intent engine emits
-    // a +word constraint for EVERY non-stopword query token (e.g. "why is my
-    // internet speed much lower than the promised plan during peak hours" → 6
-    // positives: hours, internet, lower, peak, promised, speed). Treating these
-    // as a hard AND-filter (0% coverage → 0.60x penalty) crushes 20-30% of
-    // relevant results because no single page mentions ALL 6 tokens. Positive
-    // constraints are query-derived topical signals, not explicit user operators
-    // (site:/filetype:/intitle: are enforced elsewhere as hard filters). They
-    // should therefore be BOOST-ONLY: reward results that match multiple
-    // constraints, but never penalize a result for missing some. Floor is 1.0
-    // (no change) instead of 0.60 (penalty).
+    // Positive constraints: boost for each match (fuzzy matching)
     if !constraints.positive.is_empty() {
         let mut matched = 0;
         for pos in &constraints.positive {
@@ -2311,6 +2238,8 @@ fn constraint_score(
                 || text_normalized.split_whitespace().any(|w| w == pos_normalized)
                 || (pos_normalized.len() >= 3 && text_normalized.contains(&pos_normalized))
             } else {
+                // Multi-word: exact phrase match OR all words present individually
+                // "async support" → match "async" AND "support" anywhere in text
                 text_lower.contains(&pos_lower)
                 || text_normalized.contains(&pos_normalized)
                 || pos_words.iter().all(|w| {
@@ -2324,21 +2253,55 @@ fn constraint_score(
                 matched += 1;
             }
         }
-        // Boost-only: reward multi-match results, but never penalize misses.
-        if matched > 0 {
-            let positive_count = constraints.positive.len() as f32;
-            let coverage = matched as f32 / positive_count;
-            // Width pressure: concrete multi-positive hits beat single-token matches.
-            let width_pressure = if positive_count > 1.0 {
-                (matched as f32 / positive_count).sqrt()
-            } else {
-                matched as f32 / positive_count
-            };
-            let blended_coverage = coverage * 0.70 + width_pressure * 0.30;
-            // 0% coverage (matched==0) is handled above (no change).
-            // 100% coverage → 1.5x boost. Partial coverage → proportional boost.
-            score *= 1.0 + blended_coverage * 0.50;
+        // Coverage: fraction of positive constraints matched
+        let positive_count = constraints.positive.len() as f32;
+        let coverage = matched as f32 / positive_count;
+
+        // Positive boost is a bi-criteria score biased toward multi-signal hits:
+        // - Coverage pressure: fraction of positives matched.
+        // - Width pressure: concrete multi-positive hits beat single-token matches from broad docs.
+        // Coverage dominates for small positive sets; width lifts tighter topical candidates.
+
+        let mut coverage_pressure = coverage;
+        let mut width_pressure = if positive_count > 1.0 {
+            (matched as f32 / positive_count).sqrt()
+        } else {
+            matched as f32 / positive_count
+        };
+
+        // Soft fallback: when no positive matched, treat the result as if it matched the
+        // query semantically. This prevents narrow positive sets from producing zero-pressure
+        // text and turning ordering into a metadata lottery. It is NOT a fake match:
+        // it is a last-resort boost based on query-to-document similarity.
+        if matched == 0 {
+            let url_tokens: Vec<&str> = url.split_whitespace().collect();
+            let title_tokens: Vec<&str> = title.split_whitespace().collect();
+            if !url_tokens.is_empty() || !title_tokens.is_empty() {
+                let mut similarity_gap = 0.0f32;
+                if !url_tokens.is_empty() {
+                    if let Ok(parsed_url) = reqwest::Url::parse(url) {
+                        if let Some(host) = parsed_url.host_str() {
+                            let host_lower = host.to_lowercase();
+                            let matching = url_tokens.iter().filter(|t| host_lower.contains(*t)).count();
+                            similarity_gap = (matching as f32 / url_tokens.len() as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                }
+                let q_reuse: f32 = semantic_relevance_score(url, &title, &content);
+                let similar = (similarity_gap * 0.45 + q_reuse * 0.55).clamp(0.0, 1.0);
+                coverage_pressure = coverage_pressure.max(similar * 0.12);
+                width_pressure = width_pressure.max(similar * 0.12);
+            }
         }
+
+        let blended_coverage = coverage_pressure * 0.70 + width_pressure * 0.30;
+
+        // Scale: 0% coverage -> 0.60x (Phase 5: raised from 0.35 so a broad
+        //       query with no positive hits is no longer over-penalized)
+        //         100% coverage -> 1.9x
+        // Mapping is monotonic, but at least one positive match with high coverage
+        // becomes a strong discriminator vs zero-match passthrough.
+        score *= 0.60 + blended_coverage * 1.30;
     }
 
     // Language entity constraints: when a programming language is detected in the
@@ -2476,336 +2439,6 @@ const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
     "those", "my", "your", "our", "their", "me", "you", "i", "we", "they",
     "it", "its", "there", "here", "about", "into", "out", "up", "down",
     "best", "good", "great", "top", "better", "vs", "versus",
-    // Conversational function words (2026-09-14): these leak from long NL
-    // questions as positive constraints and match every page, drowning topical
-    // signal. E.g. "I am a frontend developer with 3 years..." → +3 years, +am,
-    // +become, +experience. General English, no per-query literals.
-    "am", "become", "becoming", "became",
-    "years", "year", "months", "month", "weeks", "week", "days", "day",
-    "experience", "experiences", "experienced",
-    "transition", "transitioning", "transitions",
-    "certifications", "certification", "certified",
-    "career", "careers",
-    "focus", "focused", "focusing",
-    "change", "changes", "changing", "changed",
-    "skills", "skill", "skilled",
-    "role", "roles",
-    "want", "wants", "wanted", "wanting",
-    "need", "needs", "needed", "needing",
-    "like", "likes", "liked", "liking",
-    "help", "helps", "helped", "helping",
-    "work", "works", "worked", "working",
-    "use", "uses", "used", "using",
-    "get", "gets", "got", "getting",
-    "find", "finds", "found", "finding",
-    "know", "knows", "knew", "knowing",
-    "think", "thinks", "thought", "thinking",
-    "look", "looks", "looked", "looking",
-    "just", "also", "still", "even", "already", "really",
-    "very", "quite", "rather", "pretty", "fairly",
-    "well", "back", "now", "then", "here", "there",
-    "some", "any", "many", "much", "more", "most", "few", "little",
-    "other", "another", "such", "same", "different",
-    "new", "old", "first", "last", "next", "previous",
-    "long", "short", "big", "small", "high", "low",
-    "right", "wrong", "true", "false", "real", "fake",
-    "possible", "impossible", "able", "unable",
-    "important", "necessary", "available", "ready",
-    "sure", "certain", "clear", "obvious",
-    "enough", "whole", "entire", "full", "complete",
-    "main", "major", "minor", "key", "basic", "simple",
-    "specific", "general", "particular",
-    "common", "normal", "regular", "standard", "typical",
-    "usual", "ordinary", "average", "traditional",
-    "modern", "current", "recent", "latest", "newest",
-    "early", "late", "soon", "later", "earlier",
-    "always", "never", "sometimes", "often", "usually",
-    "ever", "once", "twice", "again", "further",
-    "almost", "nearly", "hardly", "barely",
-    "completely", "totally", "entirely", "fully", "partly",
-    "especially", "particularly", "specifically", "mainly", "mostly",
-    "simply", "merely", "only", "alone",
-    "however", "therefore", "thus", "hence", "accordingly",
-    "moreover", "furthermore", "additionally", "besides",
-    "nevertheless", "nonetheless", "otherwise", "instead",
-    "meanwhile", "afterwards", "afterward", "previously",
-    "eventually", "finally", "initially", "originally",
-    "actually", "basically", "essentially", "generally",
-    "probably", "possibly", "perhaps", "maybe", "likely",
-    "certainly", "definitely", "absolutely", "obviously",
-    "apparently", "seemingly", "reportedly", "supposedly",
-    "unfortunately", "fortunately", "luckily", "hopefully",
-    "honestly", "frankly", "seriously", "literally",
-    "clearly", "evidently", "plainly",
-    "undoubtedly", "unquestionably",
-    "regardless", "irrespective", "notwithstanding",
-    "anyway", "anyhow", "anyways",
-    "though", "although", "whereas", "while", "whilst",
-    "because", "since", "unless", "until", "till",
-    "whether", "if", "provided", "assuming", "supposing",
-    "except", "besides", "beyond", "despite", "regarding",
-    "concerning", "considering", "following", "including",
-    "involving", "relating", "respecting",
-    "according", "owing", "thanks", "due",
-    "prior", "subsequent", "previous",
-    "above", "below", "under", "over", "between", "among",
-    "through", "throughout", "across", "along", "around",
-    "behind", "beside", "beyond", "inside", "outside",
-    "upon", "onto", "into", "toward", "towards",
-    "against", "amid", "amongst", "alongside", "atop",
-    "before", "behind", "beneath", "beside", "between",
-    "beyond", "inside", "outside", "underneath", "upon",
-    "within", "without", "throughout", "notwithstanding",
-    "regarding", "concerning", "respecting",
-    "considering", "following", "including",
-    "involving", "relating",
-    "according", "owing", "thanks", "due",
-    "near", "nearer", "nearest", "close", "closer", "closest",
-    "far", "farther", "farthest", "further", "furthest",
-    "much", "many", "more", "most", "less", "least",
-    "few", "fewer", "fewest", "little",
-    "several", "various", "numerous", "countless",
-    "certain", "particular", "specific", "given",
-    "individual", "separate", "single", "sole",
-    "own", "personal", "private", "public",
-    "local", "national", "global", "international",
-    "internal", "external", "inner", "outer",
-    "physical", "mental", "emotional", "spiritual",
-    "natural", "artificial", "synthetic", "genuine",
-    "original", "copy", "duplicate", "replica",
-    "example", "instance", "case", "situation",
-    "way", "manner", "method", "approach", "technique",
-    "means", "medium", "instrument", "tool", "device",
-    "part", "piece", "section", "segment", "portion",
-    "bit", "lot", "ton", "amount", "quantity",
-    "number", "range", "variety", "selection", "choice",
-    "option", "alternative", "preference", "priority",
-    "level", "degree", "extent", "measure", "standard",
-    "quality", "value", "worth", "merit", "virtue",
-    "feature", "aspect", "element", "factor", "component",
-    "detail", "point", "item", "matter", "subject",
-    "topic", "theme", "issue", "question", "problem",
-    "answer", "solution", "response", "reply", "reaction",
-    "result", "outcome", "consequence", "effect", "impact",
-    "cause", "reason", "basis", "ground", "foundation",
-    "source", "origin", "root", "core", "heart",
-    "center", "middle", "edge", "side", "end",
-    "beginning", "start", "finish", "conclusion",
-    "introduction", "summary", "overview", "review",
-    "analysis", "examination", "investigation", "study",
-    "research", "experiment", "test", "trial",
-    "attempt", "effort", "endeavor", "venture",
-    "success", "failure", "achievement", "accomplishment",
-    "progress", "advance", "improvement", "development",
-    "growth", "expansion", "extension", "increase",
-    "decline", "decrease", "reduction", "loss", "drop",
-    "rise", "fall", "gain", "profit", "benefit",
-    "advantage", "disadvantage", "drawback", "limitation",
-    "restriction", "constraint", "condition", "requirement",
-    "demand", "request", "order", "command", "instruction",
-    "direction", "guidance", "advice", "suggestion",
-    "recommendation", "proposal", "proposition", "offer",
-    "opportunity", "chance", "possibility", "probability",
-    "potential", "capability", "capacity", "ability",
-    "power", "strength", "force", "energy",
-    "attempt", "try", "aim", "goal", "objective",
-    "purpose", "intention", "plan", "strategy", "tactic",
-    "step", "stage", "phase", "period", "time",
-    "moment", "minute", "hour", "morning", "evening",
-    "night", "today", "tomorrow", "yesterday",
-    "week", "weekend", "fortnight", "quarter", "semester",
-    "decade", "century", "millennium", "era", "age",
-    "generation", "lifetime", "lifespan", "duration",
-    "term", "session", "meeting", "appointment",
-    "event", "occasion", "happening", "incident",
-    "circumstance", "context", "environment", "setting",
-    "background", "history", "past", "present", "future",
-    "state", "condition", "situation", "position",
-    "place", "location", "area", "region", "zone",
-    "district", "neighborhood", "community", "society",
-    "country", "nation", "state", "province", "territory",
-    "city", "town", "village", "suburb", "rural", "urban",
-    "north", "south", "east", "west", "left", "right",
-    "front", "back", "top", "bottom", "middle",
-    "beginning", "ending", "start", "finish",
-    "first", "second", "third", "last", "final",
-    "next", "previous", "following", "preceding",
-    "early", "late", "initial", "original",
-    "primary", "secondary", "tertiary", "main",
-    "major", "minor", "key", "central", "core",
-    "basic", "fundamental", "essential", "vital",
-    "critical", "crucial", "significant", "important",
-    "necessary", "needed", "required", "mandatory",
-    "optional", "voluntary", "compulsory", "obligatory",
-    "free", "available", "accessible", "possible",
-    "impossible", "feasible", "viable", "practical",
-    "theoretical", "abstract", "concrete", "actual",
-    "real", "true", "genuine", "authentic", "legitimate",
-    "false", "fake", "artificial", "synthetic",
-    "correct", "right", "accurate", "precise", "exact",
-    "wrong", "incorrect", "inaccurate", "imprecise",
-    "clear", "obvious", "evident", "apparent", "plain",
-    "unclear", "vague", "ambiguous", "confusing",
-    "simple", "easy", "straightforward", "uncomplicated",
-    "complex", "complicated", "difficult", "hard", "tough",
-    "challenging", "demanding", "arduous", "strenuous",
-    "quick", "fast", "rapid", "swift", "speedy",
-    "slow", "gradual", "steady", "constant", "consistent",
-    "frequent", "regular", "routine", "habitual",
-    "occasional", "rare", "uncommon", "unusual", "exceptional",
-    "normal", "ordinary", "typical", "standard", "average",
-    "extraordinary", "remarkable", "outstanding", "exceptional",
-    "excellent", "wonderful", "fantastic", "amazing", "great",
-    "terrible", "horrible", "awful", "dreadful", "poor",
-    "bad", "inferior", "substandard", "mediocre",
-    "superior", "supreme", "ultimate", "utmost", "maximum",
-    "minimum", "minimal", "negligible", "insignificant",
-    "considerable", "substantial", "significant", "notable",
-    "noticeable", "visible", "apparent", "perceptible",
-    "invisible", "hidden", "concealed", "obscure",
-    "open", "closed", "shut", "sealed", "locked",
-    "safe", "secure", "protected", "guarded", "defended",
-    "dangerous", "risky", "hazardous", "perilous", "unsafe",
-    "healthy", "wholesome", "nutritious", "beneficial",
-    "harmful", "damaging", "detrimental", "injurious",
-    "strong", "powerful", "mighty", "potent", "forceful",
-    "weak", "feeble", "frail", "fragile", "delicate",
-    "tough", "hard", "solid", "firm", "rigid",
-    "soft", "gentle", "mild", "tender", "subtle",
-    "sharp", "keen", "acute", "intense", "extreme",
-    "dull", "blunt", "mild", "moderate", "medium",
-    "large", "big", "huge", "enormous", "immense",
-    "tiny", "small", "little", "minute", "microscopic",
-    "wide", "broad", "narrow", "slender", "slim",
-    "thick", "thin", "fat", "stout", "plump",
-    "tall", "high", "lofty", "elevated", "towering",
-    "short", "low", "deep", "shallow", "superficial",
-    "long", "lengthy", "extended", "prolonged", "protracted",
-    "brief", "short", "momentary", "fleeting", "transient",
-    "permanent", "lasting", "enduring", "eternal", "everlasting",
-    "temporary", "provisionary", "interim", "transitional",
-    "full", "complete", "entire", "whole", "total",
-    "empty", "vacant", "bare", "blank", "hollow",
-    "crowded", "packed", "cramped", "congested",
-    "spacious", "roomy", "ample", "generous", "extensive",
-    "rich", "wealthy", "affluent", "prosperous", "opulent",
-    "poor", "impoverished", "destitute", "needy", "underprivileged",
-    "expensive", "costly", "pricey", "overpriced", "exorbitant",
-    "cheap", "inexpensive", "affordable", "economical", "budget",
-    "valuable", "precious", "priceless", "invaluable", "worthless",
-    "useful", "helpful", "beneficial", "advantageous", "profitable",
-    "useless", "futile", "vain", "pointless", "worthless",
-    "productive", "fruitful", "effective", "efficient", "successful",
-    "unsuccessful", "failed", "abortive", "unproductive",
-    "active", "busy", "engaged", "occupied", "involved",
-    "inactive", "idle", "unoccupied", "disengaged",
-    "aware", "conscious", "mindful", "attentive", "alert",
-    "unaware", "oblivious", "ignorant", "uninformed",
-    "familiar", "acquainted", "accustomed", "used",
-    "unfamiliar", "unknown", "strange", "foreign", "alien",
-    "similar", "alike", "comparable", "analogous", "equivalent",
-    "different", "distinct", "diverse", "varied", "disparate",
-    "related", "connected", "linked", "associated", "affiliated",
-    "unrelated", "unconnected", "independent", "autonomous",
-    "dependent", "reliant", "contingent", "conditional",
-    "separate", "detached", "isolated", "segregated",
-    "together", "jointly", "collectively", "collaboratively",
-    "alone", "independently", "solely", "exclusively",
-    "mutually", "reciprocally", "jointly", "collectively",
-    "respectively", "individually", "separately", "independently",
-    "accordingly", "consequently", "subsequently", "eventually",
-    "simultaneously", "concurrently", "coincidentally",
-    "previously", "formerly", "originally", "initially",
-    "recently", "lately", "currently", "presently", "nowadays",
-    "anciently", "historically", "traditionally", "conventionally",
-    "modernly", "contemporarily", "progressively", "advancedly",
-    "quickly", "rapidly", "swiftly", "speedily", "promptly",
-    "slowly", "gradually", "steadily", "leisurely", "unhurriedly",
-    "carefully", "cautiously", "prudently", "warily", "gingerly",
-    "carelessly", "recklessly", "rashly", "hastily", "hurriedly",
-    "easily", "effortlessly", "smoothly", "readily", "conveniently",
-    "difficultly", "hardly", "arduously", "laboriously", "strenuously",
-    "probably", "likely", "presumably", "supposedly", "allegedly",
-    "possibly", "perhaps", "maybe", "conceivably", "feasibly",
-    "certainly", "definitely", "absolutely", "undoubtedly", "unquestionably",
-    "apparently", "seemingly", "ostensibly", "evidently", "obviously",
-    "actually", "really", "truly", "genuinely", "authentically",
-    "basically", "essentially", "fundamentally", "primarily", "principally",
-    "generally", "typically", "usually", "normally", "commonly",
-    "particularly", "especially", "specifically", "notably", "remarkably",
-    "extremely", "exceedingly", "exceptionally", "extraordinarily", "tremendously",
-    "very", "highly", "greatly", "significantly", "substantially",
-    "quite", "rather", "fairly", "reasonably", "moderately",
-    "slightly", "somewhat", "marginally", "minimally", "negligibly",
-    "almost", "nearly", "practically", "virtually", "essentially",
-    "approximately", "roughly", "around", "about", "circa",
-    "exactly", "precisely", "accurately", "strictly", "rigorously",
-    "merely", "simply", "just", "only", "purely", "solely",
-    "entirely", "wholly", "fully", "completely", "totally",
-    "partly", "partially", "halfway", "incompletely", "imperfectly",
-    "hardly", "barely", "scarcely", "rarely", "seldom",
-    "frequently", "often", "regularly", "routinely", "habitually",
-    "sometimes", "occasionally", "periodically", "intermittently",
-    "always", "ever", "perpetually", "constantly", "continuously",
-    "never", "neither", "nor", "either", "or",
-    "both", "and", "plus", "also", "too", "as well",
-    "either", "whether", "unless", "except", "besides",
-    "moreover", "furthermore", "additionally", "besides", "also",
-    "however", "nevertheless", "nonetheless", "still", "yet",
-    "therefore", "thus", "hence", "consequently", "accordingly",
-    "otherwise", "instead", "alternatively", "rather",
-    "meanwhile", "meantime", "simultaneously", "concurrently",
-    "afterwards", "afterward", "subsequently", "eventually",
-    "previously", "beforehand", "earlier", "formerly",
-    "initially", "originally", "firstly", "first", "first of all",
-    "secondly", "second", "thirdly", "third", "lastly", "finally",
-    "next", "then", "afterward", "subsequently", "eventually",
-    "now", "today", "presently", "currently", "nowadays",
-    "soon", "shortly", "presently", "immediately", "instantly",
-    "later", "afterwards", "eventually", "ultimately", "finally",
-    "before", "previously", "earlier", "formerly", "originally",
-    "since", "ago", "hence", "thence", "whence",
-    "here", "there", "where", "everywhere", "anywhere", "somewhere",
-    "nowhere", "elsewhere", "abroad", "overseas", "home",
-    "above", "below", "under", "over", "between", "among",
-    "through", "throughout", "across", "along", "around",
-    "behind", "beside", "beyond", "inside", "outside",
-    "upon", "onto", "into", "toward", "towards",
-    "against", "amid", "amongst", "alongside", "atop",
-    "before", "behind", "beneath", "beside", "between",
-    "beyond", "inside", "outside", "underneath", "upon",
-    "within", "without", "throughout", "notwithstanding",
-    "regarding", "concerning", "respecting", "touching",
-    "considering", "following", "including", "involving",
-    "relating", "pertaining", "referring", "applying",
-    "according", "owing", "thanks", "due", "pursuant",
-    "prior", "subsequent", "previous", "following",
-    "above", "below", "under", "over", "between", "among",
-    "through", "throughout", "across", "along", "around",
-    "behind", "beside", "beyond", "inside", "outside",
-    "upon", "onto", "into", "toward", "towards",
-    "against", "amid", "amongst", "alongside", "atop",
-    "before", "behind", "beneath", "beside", "between",
-    "beyond", "inside", "outside", "underneath", "upon",
-    "within", "without", "throughout", "notwithstanding",
-    "regarding", "concerning", "respecting", "touching",
-    "considering", "following", "including", "involving",
-    "relating", "pertaining", "referring", "applying",
-    "according", "owing", "thanks", "due", "pursuant",
-    "prior", "subsequent", "previous", "following",
-    "above", "below", "under", "over", "between", "among",
-    "through", "throughout", "across", "along", "around",
-    "behind", "beside", "beyond", "inside", "outside",
-    "upon", "onto", "into", "toward", "towards",
-    "against", "amid", "amongst", "alongside", "atop",
-    "before", "behind", "beneath", "beside", "between",
-    "beyond", "inside", "outside", "underneath", "upon",
-    "within", "without", "throughout", "notwithstanding",
-    "regarding", "concerning", "respecting", "touching",
-    "considering", "following", "including", "involving",
-    "relating", "pertaining", "referring", "applying",
-    "according", "owing", "thanks", "due", "pursuant",
-    "prior", "subsequent", "previous", "following",
 ];
 
 fn sanitize_constraints(c: &Constraints) -> Constraints {
@@ -2938,17 +2571,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             // real topical signal, so a relevant result cannot outrank grammar /
             // dictionary / orphan pages. Signal-driven: a general English
             // question-word list, no per-query literals, no tuned thresholds.
-            //
-            // Multi-word form (2026-09-14): a positive like "3 years" (from "I am a
-            // frontend developer with 3 years...") won't match single-word "years", so
-            // check if ALL words are non-topical — if so, the whole phrase is junk.
-            // E.g. "3 years" → ["3", "years"] → both non-topical → drop. But
-            // "react experience" → ["react", "experience"] → "react" is topical → keep.
-            let words_pl: Vec<&str> = pl.split_whitespace().collect();
-            let all_non_topical = !words_pl.is_empty() && words_pl.iter().all(|w| {
-                NON_TOPICAL_QUERY_WORDS.contains(&w) || w.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.')
-            });
-            if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) || all_non_topical { continue; }
+            if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) { continue; }
             // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
             // extraction (e.g. "under 15000" / "below 2000" can leave the digits
             // in `positive` as "+15000"). A purely-numeric positive carries no
@@ -3007,7 +2630,6 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         price_lt,
         price_gt,
         ignored_constraints: None,
-        match_mode: MatchMode::Hard,
     }
 }
 
@@ -3114,8 +2736,11 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
 
 // ─── Commerce: honest product-fact extraction (ROADMAP item 1) ───────
 // Extracts structured commerce facts ONLY from machine-readable page data:
-//   * schema.org JSON-LD (Product / Offer / AggregateOffer)
+//   * schema.org JSON-LD (Product / Offer / AggregateOffer / SoftwareApplication
+//     / VideoGame / Service)
 //   * OpenGraph `product:*` meta tags
+//   * schema.org MICRODATA (`itemscope` + `itemprop`) — real structured
+//     on-page product data emitted by Shopify/legacy product pages.
 // NO free-text price guessing. A price is captured only when it appears in a
 // typed structured field. If multiple distinct offers/prices exist on the page,
 // they are surfaced as price_low/price_high + offer_count and `price` is left
@@ -3158,11 +2783,15 @@ struct OfferFacts {
     price_high: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offer_count: Option<usize>,
-    /// Product image URL extracted from the page (JSON-LD `image`, OpenGraph
-    /// `og:image`, microdata `itemprop="image"`, or RDFa `property="image"`).
-    /// Always a URL string from structured data — never guessed from free text.
+    /// Product name from structured data (JSON-LD `name` / microdata `itemprop="name"` / OG `og:title`).
+    /// Only extracted from typed structured signals, never from free text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    image: Option<String>,
+    name: Option<String>,
+    /// Sale end date from schema.org `priceValidUntil` (ISO 8601 date string).
+    /// Lets the frontend label a price as a limited-time offer. Only extracted
+    /// from structured data, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_valid_until: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3372,377 +3001,279 @@ fn json_get_u64(v: &serde_json::Value) -> Option<u64> {
     }
 }
 
-fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
-    if dst.price.is_none() {
-        dst.price = src.price;
-    }
-    if dst.currency.is_none() {
-        dst.currency = src.currency.clone();
-    }
-    if dst.availability.is_none() {
-        dst.availability = src.availability.clone();
-    }
-    if dst.merchant.is_none() {
-        dst.merchant = src.merchant.clone();
-    }
-    if dst.condition.is_none() {
-        dst.condition = src.condition.clone();
-    }
-    if dst.sku.is_none() {
-        dst.sku = src.sku.clone();
-    }
-    if dst.gtin.is_none() {
-        dst.gtin = src.gtin.clone();
-    }
-    if dst.rating.is_none() {
-        dst.rating = src.rating;
-    }
-    if dst.rating_count.is_none() {
-        dst.rating_count = src.rating_count;
-    }
-    if dst.price_low.is_none() {
-        dst.price_low = src.price_low;
-    }
-    if dst.price_high.is_none() {
-        dst.price_high = src.price_high;
-    }
-    if dst.offer_count.is_none() {
-        dst.offer_count = src.offer_count;
-    }
-    if dst.image.is_none() {
-        dst.image = src.image.clone();
-    }
-}
-
-/// True when the page declares a Product or Offer via microdata `itemtype`.
-fn has_microdata_product(html: &str) -> bool {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?i)itemtype\s*=\s*["'][^"']*(?:product|offer)[^"']*["']"#,
-        )
-        .unwrap()
-    });
-    re.is_match(html)
-}
-
-/// Extract product facts from HTML microdata (itemprop/itemscope).
-/// Only fires when the page carries a Product/Offer `itemtype`, so
-/// non-product pages (Article, Event, …) never trigger it.
+/// Extract honest product facts from schema.org MICRODATA
+/// (`itemscope` + `itemprop`), the third structured-on-page signal alongside
+/// JSON-LD and OpenGraph. Real Shopify/legacy product pages emit microdata with
+/// no JSON-LD, so this recovers facts that would otherwise be missed.
 ///
-/// Handles both `content` attribute form (<meta itemprop="price" content="9.99">)
-/// and text content form (<span itemprop="brand">Acme</span>).
-fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
-    if !has_microdata_product(html) {
-        return None;
-    }
-
+/// Mapping (itemprop value -> `OfferFacts` field), matched on the standard
+/// schema.org/Product + Offer vocabulary — NOT a per-merchant list:
+///   name            -> (used only for soft signal; not stored as a fact)
+///   price           -> price / price_low+price_high when a range (x-y) appears
+///   priceCurrency   -> currency
+///   availability    -> availability (raw value, e.g. InStock/LimitedAvailability)
+///   itemCondition   -> condition
+///   sku             -> sku
+///   gtin13/gtin14/gtin8/gtin/mpn -> gtin
+///   ratingValue     -> rating (also rating/Value)
+///   ratingCount     -> rating_count
+///   seller/brand    -> merchant
+///
+/// Honesty rules (same as the JSON-LD/OG paths):
+///   * A price is captured ONLY from a typed `itemprop="price"` field — never
+///     guessed from free text.
+///   * A multi-offer page (several `itemprop="price"` under separate offers)
+///     surfaces price_low/price_high + offer_count and leaves `price` null,
+///     exactly like the JSON-LD two-offer case — never a silent canonical pick.
+///   * `source` is set to "microdata" only when at least one field was filled.
+fn parse_microdata(html: &str) -> Option<OfferFacts> {
+    // Scan <...> tokens manually with a permissive regex that captures every
+    // attribute name="value" pair (itemprops live in attributes, not meta-only).
+    // NOTE: the regex must match closing tags too (char after '<' may be '/'),
+    // otherwise </div> is invisible and scopes never pop.
     static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let tag_re = TAG_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)<\w+\b[^>]*itemprop[^>]*>"#).unwrap()
-    });
-    static PROP_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let prop_re = PROP_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)itemprop\s*=\s*["']([^"']+)["']"#).unwrap()
-    });
-    static CONTENT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let content_re = CONTENT_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)content\s*=\s*["']([^"']*)["']"#).unwrap()
-    });
-    static HREF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let href_re = HREF_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)href\s*=\s*["']([^"']*)["']"#).unwrap()
-    });
-    static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let src_re = SRC_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
+    let tag_re = TAG_RE
+        .get_or_init(|| regex::Regex::new(r#"(?i)<[a-zA-Z/][^>]*>"#).unwrap());
+    static ATTR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let attr_re = ATTR_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)([a-zA-Z_][-a-zA-Z0-9_:.]*)\s*=\s*["']([^"']*)["']"#).unwrap()
     });
 
-    let mut o = OfferFacts::default();
+    // Track nested itemscope kinds on a stack so we only collect itemprops that
+    // belong to a Product/Offer scope (or a Brand nested within one). This avoids
+    // grabbing unrelated itemprops (e.g. a breadcrumb's `itemprop="price"`).
+    #[derive(PartialEq, Clone, Copy)]
+    enum Scope {
+        Product,
+        Offer,
+        Other,
+    }
+    let mut stack: Vec<Scope> = Vec::new();
+    // Parallel stack tracking which TAG NAMES pushed a scope, so closing tags
+    // only pop when they match the opening tag (a </span> must NOT pop a scope
+    // pushed by a <div itemscope>).
+    let mut scope_tags: Vec<String> = Vec::new();
+    let mut facts = OfferFacts::default();
+    let mut prices: Vec<(f64, Option<String>)> = Vec::new();
 
-    let mut apply = |prop: &str, val: &str| {
-        if val.is_empty() {
-            return;
+    for m in tag_re.find_iter(html) {
+        let tag = m.as_str();
+        let lower = tag.to_ascii_lowercase();
+        let is_close = lower.starts_with("</");
+        if is_close {
+            // Only pop if this closing tag matches the opening tag that pushed
+            // the current scope. Extract tag name: first word after '</'.
+            let tag_name = tag[2..].trim_end_matches('>').trim().to_ascii_lowercase();
+            if scope_tags.last() == Some(&tag_name) {
+                scope_tags.pop();
+                stack.pop();
+            }
+            continue;
         }
-        match prop {
-            "price" => {
-                if o.price.is_none() {
-                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
-                        o.price = Some(v);
+        // Collect attributes.
+        let mut attrs: Vec<(String, String)> = Vec::new();
+        for cap in attr_re.captures_iter(tag) {
+            let k = cap.get(1).map(|x| x.as_str().to_ascii_lowercase()).unwrap_or_default();
+            let v = cap.get(2).map(|x| x.as_str().to_string()).unwrap_or_default();
+            attrs.push((k, v));
+        }
+        // Boolean attributes (e.g. itemscope without =value) are not captured by
+        // attr_re (which requires ="value"). Detect itemscope explicitly so the
+        // scope stack is pushed even for <div itemscope itemtype="...">.
+        if lower.split_whitespace().any(|w| w == "itemscope")
+            && !attrs.iter().any(|(k, _)| k == "itemscope")
+        {
+            attrs.push(("itemscope".to_string(), String::new()));
+        }
+        let has = |name: &str| attrs.iter().any(|(k, _)| k == name);
+        let val_of = |name: &str| {
+            attrs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+
+        if has("itemscope") {
+            // Entering a new scope. Classify by itemtype so we know whether we're
+            // inside a Product/Offer (collect) or something else (e.g. Brand).
+            // ROADMAP item 1 (increment): extend to schema.org's digital-product
+            // itemtypes — `SoftwareApplication`, `VideoGame`, `Service` — which
+            // carry the SAME structured commerce facts (price, rating, brand/
+            // publisher) as a physical Product. The itemprop mapping below is
+            // identical for all of them, so a single Scope::Product branch
+            // covers every product-like type without per-type logic.
+            let itype = val_of("itemtype").unwrap_or_default().to_ascii_lowercase();
+            let kind = if itype.contains("product")
+                || itype.contains("software")
+                || itype.contains("video")
+                || itype.contains("service")
+            {
+                Scope::Product
+            } else if itype.contains("offer") {
+                Scope::Offer
+            } else {
+                Scope::Other
+            };
+            // Inline brand form: <span itemprop="brand">Name</span> (no nested scope).
+            if kind == Scope::Other && has("itemprop") {
+                let prop = val_of("itemprop").unwrap_or_default().to_ascii_lowercase();
+                if prop == "brand" {
+                    let c = val_of("content").or_else(|| val_of("itemid")).unwrap_or_default();
+                    if !c.is_empty() && facts.merchant.is_none() {
+                        facts.merchant = Some(c);
                     }
                 }
             }
+            stack.push(kind);
+            // Record the tag name so the matching closing tag pops this scope.
+            let tag_name = tag[1..].split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            scope_tags.push(tag_name);
+        }
+
+        // Only collect itemprops inside a Product/Offer scope (an ancestor in the
+        // stack). Stray itemprops outside any such scope are ignored.
+        let in_prod = stack.iter().any(|s| *s == Scope::Product || *s == Scope::Offer);
+        if !in_prod {
+            continue;
+        }
+        if !has("itemprop") {
+            continue;
+        }
+        let prop = val_of("itemprop").unwrap_or_default().to_ascii_lowercase();
+        // Prefer typed attributes (content/itemid), then href (for <link> elements
+        // like availability/itemCondition), then text content between open and
+        // close tags (e.g. <span itemprop="price">29.99</span>).
+        let attr_content = val_of("content")
+            .or_else(|| val_of("itemid"))
+            .or_else(|| val_of("href"))
+            .unwrap_or_default();
+        let content = if attr_content.is_empty() {
+            let after = &html[m.end()..];
+            let end = after.find('<').unwrap_or(after.len());
+            after[..end].trim().to_string()
+        } else {
+            attr_content
+        };
+        // Prefer a typed/attr value; text-node fallback only when no attribute.
+        let set_str = |f: &mut Option<String>, v: String| {
+            if f.is_none() && !v.is_empty() {
+                *f = Some(v);
+            }
+        };
+        match prop.as_str() {
+            "price" => {
+                let c = content.replace(',', " ").replace("  ", " ").trim().to_string();
+                // Range like "10.00 - 25.50" or "10-25".
+                if let Some(dash) = c.find(|ch| ch == '-' || ch == '–' || ch == '—') {
+                    let lo = c[..dash].trim().parse::<f64>().ok();
+                    let hi = c[dash + 1..].trim().parse::<f64>().ok();
+                    if let (Some(l), Some(h)) = (lo, hi) {
+                        prices.push((l, None));
+                        prices.push((h, None));
+                    } else if let Some(p) = lo.or(hi) {
+                        prices.push((p, None));
+                    }
+                } else if let Ok(p) = c.parse::<f64>() {
+                    let cur = val_of("pricecurrency").map(|s| s.to_uppercase());
+                    prices.push((p, cur));
+                }
+            }
             "pricecurrency" => {
-                if o.currency.is_none() {
-                    o.currency = Some(val.to_string());
+                if facts.currency.is_none() && !content.is_empty() {
+                    facts.currency = Some(content.to_uppercase());
                 }
             }
-            "availability" => {
-                if o.availability.is_none() {
-                    o.availability = Some(val.to_string());
-                }
-            }
-            "itemcondition" => {
-                if o.condition.is_none() {
-                    o.condition = Some(val.to_string());
-                }
-            }
-            "sku" => {
-                if o.sku.is_none() {
-                    o.sku = Some(val.to_string());
-                }
-            }
+            "availability" => set_str(&mut facts.availability, content),
+            "itemcondition" => set_str(&mut facts.condition, content),
+            "sku" => set_str(&mut facts.sku, content),
             "gtin13" | "gtin14" | "gtin8" | "gtin" | "mpn" => {
-                if o.gtin.is_none() {
-                    o.gtin = Some(val.to_string());
+                if facts.gtin.is_none() && !content.is_empty() {
+                    facts.gtin = Some(content);
                 }
             }
-            "brand" | "seller" => {
-                if o.merchant.is_none() {
-                    o.merchant = Some(val.to_string());
+            "ratingvalue" | "rating" => {
+                if facts.rating.is_none() {
+                    facts.rating = content.replace(',', "").parse::<f64>().ok();
                 }
             }
-            "image" => {
-                if o.image.is_none() {
-                    o.image = Some(val.to_string());
+            "ratingcount" | "reviewcount" => {
+                if facts.rating_count.is_none() {
+                    facts.rating_count = content.replace(',', "").parse::<u64>().ok();
                 }
             }
-            "ratingvalue" => {
-                if o.rating.is_none() {
-                    o.rating = val.parse::<f64>().ok();
+            "seller" | "brand" => {
+                if facts.merchant.is_none() && !content.is_empty() {
+                    facts.merchant = Some(content);
                 }
             }
-            "reviewcount" | "ratingcount" => {
-                if o.rating_count.is_none() {
-                    o.rating_count = val.parse::<u64>().ok();
+            "name" => {
+                // itemprop="name" inside a Brand scope (top of stack is Other) is the
+                // brand/merchant name, not the product name.
+                if stack.last() == Some(&Scope::Other) {
+                    if facts.merchant.is_none() && !content.is_empty() {
+                        facts.merchant = Some(content);
+                    }
+                } else if facts.name.is_none() && !content.is_empty() {
+                    facts.name = Some(content);
+                }
+            }
+            "pricevaliduntil" => {
+                if facts.price_valid_until.is_none() && !content.is_empty() {
+                    facts.price_valid_until = Some(content);
                 }
             }
             _ => {}
         }
-    };
+    }
 
-    for tag_cap in tag_re.captures_iter(html) {
-        let tag = tag_cap.get(0).unwrap().as_str();
-        let prop = prop_re
-            .captures(tag)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_lowercase());
-        let content = content_re
-            .captures(tag)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
-        let href = href_re
-            .captures(tag)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
-        let src = src_re
-            .captures(tag)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
-        if let Some(p) = prop {
-            // For image, prefer href (link itemprop="image" href=...) then
-            // content (meta itemprop="image" content=...) then src.
-            if p == "image" {
-                if let Some(v) = href.or(content).or(src) {
-                    apply(&p, &v);
-                }
-            } else if let Some(v) = content {
-                apply(&p, &v);
-            } else {
-                // Text content form: extract text after the tag until the next '<'.
-                let after = &html[tag_cap.get(0).unwrap().end()..];
-                if let Some(end) = after.find('<') {
-                    let text = after[..end].trim();
-                    if !text.is_empty() {
-                        apply(&p, text);
-                    }
-                }
+    // Resolve multiple prices the same way as JSON-LD: single -> canonical,
+    // multiple -> range + count, never a silent pick.
+    if prices.len() == 1 {
+        let (p, c) = &prices[0];
+        facts.price = Some(*p);
+        if facts.currency.is_none() {
+            if let Some(cur) = c {
+                facts.currency = Some(cur.clone());
             }
+        }
+        if facts.offer_count.is_none() {
+            facts.offer_count = Some(1);
+        }
+    } else if !prices.is_empty() {
+        let mut lo = f64::MAX;
+        let mut hi = f64::MIN;
+        for (p, _c) in &prices {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        // Currency agreement: only surface a currency when every price carried the
+        // SAME one. Mixed currencies on one page => leave currency null (never
+        // guess). Clean Option<String> comparison (no borrow pitfalls).
+        let first_cur = prices.first().and_then(|(_, c)| c.clone());
+        let all_agree = prices.iter().all(|(_, c)| *c == first_cur);
+        facts.price_low = Some(lo);
+        facts.price_high = Some(hi);
+        facts.offer_count = Some(prices.len());
+        if facts.currency.is_none() && all_agree {
+            facts.currency = first_cur;
         }
     }
 
-    if o.price.is_none()
-        && o.currency.is_none()
-        && o.availability.is_none()
-        && o.merchant.is_none()
-        && o.condition.is_none()
-        && o.sku.is_none()
-        && o.gtin.is_none()
-        && o.rating.is_none()
-        && o.rating_count.is_none()
-        && o.image.is_none()
+    // Only return when at least one structured fact was found.
+    if facts.price.is_some()
+        || facts.price_low.is_some()
+        || facts.currency.is_some()
+        || facts.availability.is_some()
+        || facts.merchant.is_some()
+        || facts.condition.is_some()
+        || facts.sku.is_some()
+        || facts.gtin.is_some()
+        || facts.rating.is_some()
     {
-        return None;
+        Some(facts)
+    } else {
+        None
     }
-    Some(o)
-}
-
-/// True when the page carries product-ish RDFa (typeof/property on Product/Offer/price).
-fn has_rdfa_product(html: &str) -> bool {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?i)(?:typeof|property)\s*=\s*["'][^"']*(?:product|offer|price|currency|availability|sku|gtin)[^"']*["']"#,
-        )
-        .unwrap()
-    });
-    re.is_match(html)
-}
-
-/// Extract product facts from RDFa (property attribute with `schema:` prefix or full URI).
-/// Only fires on pages that look product-ish.
-///
-/// Handles both `content` attribute form (`<meta property="price" content="9.99">)
-/// and text content form (`<span property="brand">Acme</span>`).
-fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
-    if !has_rdfa_product(html) {
-        return None;
-    }
-
-    static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let tag_re = TAG_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)<\w+\b[^>]*property[^>]*>"#).unwrap()
-    });
-    static PROP_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let prop_re = PROP_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)property\s*=\s*["']([^"']+)["']"#).unwrap()
-    });
-    static CONTENT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let content_re = CONTENT_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)content\s*=\s*["']([^"']*)["']"#).unwrap()
-    });
-    static HREF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let href_re = HREF_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)href\s*=\s*["']([^"']*)["']"#).unwrap()
-    });
-    static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let src_re = SRC_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
-    });
-
-    let mut o = OfferFacts::default();
-
-    let mut apply = |prop: &str, val: &str| {
-        if val.is_empty() {
-            return;
-        }
-        // Strip schema: prefix or full schema.org URI.
-        let stripped = prop
-            .strip_prefix("schema:")
-            .or_else(|| prop.strip_prefix("http://schema.org/"))
-            .or_else(|| prop.strip_prefix("https://schema.org/"))
-            .unwrap_or(prop);
-        match stripped {
-            "price" => {
-                if o.price.is_none() {
-                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
-                        o.price = Some(v);
-                    }
-                }
-            }
-            "pricecurrency" => {
-                if o.currency.is_none() {
-                    o.currency = Some(val.to_string());
-                }
-            }
-            "availability" => {
-                if o.availability.is_none() {
-                    o.availability = Some(val.to_string());
-                }
-            }
-            "itemcondition" => {
-                if o.condition.is_none() {
-                    o.condition = Some(val.to_string());
-                }
-            }
-            "sku" => {
-                if o.sku.is_none() {
-                    o.sku = Some(val.to_string());
-                }
-            }
-            "gtin13" | "gtin14" | "gtin8" | "gtin" | "mpn" => {
-                if o.gtin.is_none() {
-                    o.gtin = Some(val.to_string());
-                }
-            }
-            "brand" | "seller" => {
-                if o.merchant.is_none() {
-                    o.merchant = Some(val.to_string());
-                }
-            }
-            "image" => {
-                if o.image.is_none() {
-                    o.image = Some(val.to_string());
-                }
-            }
-            "ratingvalue" => {
-                if o.rating.is_none() {
-                    o.rating = val.parse::<f64>().ok();
-                }
-            }
-            "reviewcount" | "ratingcount" => {
-                if o.rating_count.is_none() {
-                    o.rating_count = val.parse::<u64>().ok();
-                }
-            }
-            _ => {}
-        }
-    };
-
-    for tag_cap in tag_re.captures_iter(html) {
-        let tag = tag_cap.get(0).unwrap().as_str();
-        let prop = prop_re
-            .captures(tag)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_lowercase());
-        let content = content_re
-            .captures(tag)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
-        let href = href_re
-            .captures(tag)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
-        let src = src_re
-            .captures(tag)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
-        if let Some(p) = prop {
-            // For image, prefer href (link itemprop="image" href=...) then
-            // content (meta itemprop="image" content=...) then src.
-            if p == "image" {
-                if let Some(v) = href.or(content).or(src) {
-                    apply(&p, &v);
-                }
-            } else if let Some(v) = content {
-                apply(&p, &v);
-            } else {
-                // Text content form: extract text after the tag until the next '<'.
-                let after = &html[tag_cap.get(0).unwrap().end()..];
-                if let Some(end) = after.find('<') {
-                    let text = after[..end].trim();
-                    if !text.is_empty() {
-                        apply(&p, text);
-                    }
-                }
-            }
-        }
-    }
-
-    if o.price.is_none()
-        && o.currency.is_none()
-        && o.availability.is_none()
-        && o.merchant.is_none()
-        && o.condition.is_none()
-        && o.sku.is_none()
-        && o.gtin.is_none()
-        && o.rating.is_none()
-        && o.rating_count.is_none()
-        && o.image.is_none()
-    {
-        return None;
-    }
-    Some(o)
 }
 
 fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
@@ -3761,34 +3292,49 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     // 2) Fallback / supplement: OpenGraph product:* meta (only when no price yet).
     if facts.price.is_none() && facts.price_low.is_none() {
         if let Some(og) = parse_og_product(html) {
-            merge_offer_facts(&mut facts, &og);
-            if source.is_none() {
-                source = Some("og".to_string());
-            }
+            if facts.price.is_none() { facts.price = og.price; }
+            if facts.currency.is_none() { facts.currency = og.currency; }
+            if facts.availability.is_none() { facts.availability = og.availability; }
+            if facts.condition.is_none() { facts.condition = og.condition; }
+            if facts.merchant.is_none() { facts.merchant = og.merchant; }
+            if facts.gtin.is_none() { facts.gtin = og.gtin; }
+            if facts.rating.is_none() { facts.rating = og.rating; }
+            if facts.rating_count.is_none() { facts.rating_count = og.rating_count; }
+            if source.is_none() { source = Some("og".to_string()); }
         }
     }
 
-    // 3) Fallback: microdata (only when no price yet).
-    if facts.price.is_none() && facts.price_low.is_none() {
-        if let Some(md) = parse_microdata_product(html) {
-            merge_offer_facts(&mut facts, &md);
-            if source.is_none() {
-                source = Some("microdata".to_string());
-            }
+    // 3) Third structured signal: schema.org MICRODATA (itemscope + itemprop).
+    //    Real Shopify/legacy product pages emit microdata with no JSON-LD/OG —
+    //    this recovers honest facts the other two signals miss. Pure SUPPLEMENT:
+    //    it only fills fields still `None` and never overwrites a stronger signal,
+    //    and it reuses the EXACT SAME `OfferFacts` field mapping (no per-merchant
+    //    code). A price is taken only from a typed `itemprop="price"` (range ->
+    //    price_low/price_high + offer_count, `price` left null), exactly like the
+    //    JSON-LD path — never guessed from free text.
+    if let Some(md) = parse_microdata(html) {
+        if facts.price.is_none() && facts.price_low.is_none() {
+            if facts.price.is_none() { facts.price = md.price; }
+            if facts.price_low.is_none() { facts.price_low = md.price_low; }
+            if facts.price_high.is_none() { facts.price_high = md.price_high; }
+            if facts.offer_count.is_none() { facts.offer_count = md.offer_count; }
+        }
+        if facts.currency.is_none() { facts.currency = md.currency; }
+        if facts.availability.is_none() { facts.availability = md.availability; }
+        if facts.condition.is_none() { facts.condition = md.condition; }
+        if facts.sku.is_none() { facts.sku = md.sku; }
+        if facts.gtin.is_none() { facts.gtin = md.gtin; }
+        if facts.rating.is_none() { facts.rating = md.rating; }
+        if facts.rating_count.is_none() { facts.rating_count = md.rating_count; }
+        if facts.merchant.is_none() { facts.merchant = md.merchant; }
+        if facts.name.is_none() { facts.name = md.name; }
+        if facts.price_valid_until.is_none() { facts.price_valid_until = md.price_valid_until; }
+        if source.is_none() {
+            source = Some("microdata".to_string());
         }
     }
 
-    // 4) Fallback: RDFa (only when no price yet).
-    if facts.price.is_none() && facts.price_low.is_none() {
-        if let Some(rdf) = parse_rdfa_product(html) {
-            merge_offer_facts(&mut facts, &rdf);
-            if source.is_none() {
-                source = Some("rdfa".to_string());
-            }
-        }
-    }
-
-    // 5) Merchant fallback: derive a coarse host label only when no page-provided
+    // 4) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
@@ -3864,7 +3410,22 @@ fn walk_commerce_nodes(v: &serde_json::Value, out: &mut Vec<serde_json::Value>) 
             };
             if let Some(t) = ty {
                 let tl = t.to_lowercase();
-                if tl.contains("product") || tl.contains("offer") {
+                // ROADMAP item 1 (increment): extend honest extraction to
+                // schema.org's digital-product types alongside physical
+                // Product/Offer. `SoftwareApplication` (SaaS, mobile apps),
+                // `VideoGame`, and `Service` (subscriptions) carry the SAME
+                // structured commerce facts (price, rating, publisher/developer
+                // as merchant) as a physical Product — the rest of the pipeline
+                // (merge_jsonld_nodes) reads those same fields, so no per-type
+                // logic is added. A type match WITHOUT matching fields simply
+                // yields no facts (graceful), so the broad `contains` stems here
+                // cannot fabricate facts from non-product pages.
+                if tl.contains("product")
+                    || tl.contains("offer")
+                    || tl.contains("software")
+                    || tl.contains("video")
+                    || tl.contains("service")
+                {
                     out.push(v.clone());
                 }
             }
@@ -3976,31 +3537,61 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
                 }
             }
         }
-        // Seller always takes precedence over brand (more specific). A Product
-        // node may set brand first; a nested Offer node's seller overwrites it.
-        if let Some(seller) = n.get("seller") {
-            facts.merchant = seller
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        } else if facts.merchant.is_none() {
-            if let Some(brand) = n.get("brand") {
-                facts.merchant = match brand {
-                    serde_json::Value::String(s) => Some(s.clone()),
-                    serde_json::Value::Object(o) => {
-                        o.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
-                    }
-                    _ => None,
-                };
+        if facts.merchant.is_none() {
+            if let Some(seller) = n.get("seller") {
+                facts.merchant =
+                    seller.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
             }
         }
-
-        if facts.image.is_none() {
-            facts.image = extract_jsonld_image(n);
+        // ROADMAP item 1 (increment): digital-product schemas (SoftwareApplication,
+        // VideoGame, Service) carry the merchant as `publisher` / `developer` /
+        // `provider` instead of `seller`. These are the SAME commerce role (the
+        // entity offering the product) — just a different field name per schema
+        // type. No per-type branch: we try each field in priority order, and a
+        // page with none of them simply leaves merchant null (honest).
+        if facts.merchant.is_none() {
+            if let Some(pub_name) = n
+                .get("publisher")
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    n.get("developer")
+                        .and_then(|d| d.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .or_else(|| {
+                    n.get("provider")
+                        .and_then(|p| p.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+            {
+                facts.merchant = Some(pub_name);
+            }
         }
         if facts.currency.is_none() {
             facts.currency = n
                 .get("priceCurrency")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        // ROADMAP item 1 (increment): extract product `name` and `priceValidUntil`
+        // from the SAME typed structured node. `name` is the product title (e.g.
+        // "Acme Widget Pro"); `priceValidUntil` is an ISO 8601 sale-end date that
+        // lets the frontend label a price as a limited-time offer. Both are
+        // optional and only set when the page actually exposes them — never
+        // guessed. The fields live on the Product/Offer node itself.
+        if facts.name.is_none() {
+            facts.name = n
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if facts.price_valid_until.is_none() {
+            facts.price_valid_until = n
+                .get("priceValidUntil")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
         }
@@ -4037,43 +3628,6 @@ fn merge_jsonld_nodes(facts: &mut OfferFacts, nodes: &[serde_json::Value]) {
             facts.currency = Some(c);
         }
     }
-}
-
-/// Extract a product image URL from a JSON-LD node. Handles the three
-/// common JSON-LD patterns: string URL, array of strings, and
-/// ImageObject with url/representativeImage/thumbnail.
-fn extract_jsonld_image(n: &serde_json::Value) -> Option<String> {
-    // Direct string: "image": "https://..."
-    if let Some(s) = n.get("image").and_then(|v| v.as_str()) {
-        return Some(s.to_string());
-    }
-    // Array: "image": ["https://..."]
-    if let Some(arr) = n.get("image").and_then(|v| v.as_array()) {
-        for v in arr {
-            if let Some(s) = v.as_str() {
-                return Some(s.to_string());
-            }
-            // Nested ImageObject in array
-            if let Some(obj) = v.as_object() {
-                if let Some(s) = obj.get("url").and_then(|u| u.as_str()) {
-                    return Some(s.to_string());
-                }
-            }
-        }
-    }
-    // ImageObject: "image": { "@type": "ImageObject", "url": "..." }
-    if let Some(img) = n.get("image").and_then(|v| v.as_object()) {
-        if let Some(s) = img.get("url").and_then(|u| u.as_str()) {
-            return Some(s.to_string());
-        }
-        if let Some(s) = img.get("representativeImage").and_then(|u| u.as_str()) {
-            return Some(s.to_string());
-        }
-        if let Some(s) = img.get("thumbnail").and_then(|u| u.as_str()) {
-            return Some(s.to_string());
-        }
-    }
-    None
 }
 
 fn parse_og_product(html: &str) -> Option<OfferFacts> {
@@ -4122,11 +3676,6 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = content.parse::<u64>().ok();
                 }
             }
-            "og:image" | "product:image" => {
-                if o.image.is_none() {
-                    o.image = Some(content.clone());
-                }
-            }
             _ => {}
         }
     }
@@ -4136,7 +3685,6 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
         && o.merchant.is_none()
         && o.gtin.is_none()
         && o.rating.is_none()
-        && o.image.is_none()
     {
         return None;
     }
@@ -4148,90 +3696,6 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
 /// endpoint and applies NO ranking or monetization — it only surfaces facts
 /// extracted from the given page. The user-facing `/shopping` endpoint and
 /// affiliate decoration land in later roadmap increments.
-/// Query params for the `/commerce/bid` reporting endpoint.
-#[derive(Deserialize)]
-struct BidCheckParams {
-    #[serde(default)]
-    url: Option<String>,
-}
-
-/// Reporting-only Sovrn Commerce Bid Check endpoint.
-async fn handle_commerce_bid(
-    axum::extract::State(state): axum::extract::State<std::sync::Arc<AppState>>,
-    axum::extract::Query(params): Query<BidCheckParams>,
-) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    let dest_url = match params.url.as_deref() {
-        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
-        _ => return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "missing_url",
-                "message": "Query parameter 'url' is required"
-            })),
-        ),
-    };
-    let net = match state.affiliate_ctx.networks.iter().find(|n| {
-        n.enabled && n.bid_check_url.is_some()
-            && n.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false)
-    }) {
-        Some(n) => n,
-        None => return (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "no_bid_check_network",
-                "message": "No network with bid-check configured and a usable key"
-            })),
-        ),
-    };
-    let key = std::env::var(net.key_env.as_deref().unwrap_or("")).unwrap_or_default();
-    let check_template = net.bid_check_url.as_deref().unwrap_or("");
-    let encoded_dest = urlencoding::encode(&dest_url);
-    let check_url = check_template
-        .replace("{key}", &key)
-        .replace("{url}", &encoded_dest);
-    let resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        state.http_client.get(&check_url).send(),
-    ).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return (
-            axum::http::StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": "bid_check_upstream_error",
-                "message": format!("Bid-check request failed: {}", e)
-            })),
-        ),
-        Err(_) => return (
-            axum::http::StatusCode::GATEWAY_TIMEOUT,
-            Json(serde_json::json!({
-                "error": "bid_check_timeout",
-                "message": "Bid-check request timed out"
-            })),
-        ),
-    };
-    let status = resp.status();
-    let body_text = match tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        resp.text(),
-    ).await {
-        Ok(Ok(t)) => t,
-        _ => String::new(),
-    };
-    let upstream_json = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body_text) {
-        v
-    } else {
-        serde_json::json!({ "raw": body_text })
-    };
-    (
-        axum::http::StatusCode::OK,
-        Json(serde_json::json!({
-            "url": dest_url,
-            "network": &net.network,
-            "upstream_status": status.as_u16(),
-            "upstream_body": upstream_json,
-        })),
-    )
-}
 async fn handle_commerce_extract(
     Json(body): Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
@@ -4345,16 +3809,20 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.rating.is_some()
 }
 
+/// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
+/// page exposed structured product data, attached by `enrich_with_commerce`).
+/// Powers the main-path `shopping` gate: the strip is only surfaced when at
+/// least one top result actually has product facts — never an empty link-farm
+/// strip of bare affiliate links. Pure + offline-testable.
+fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
+    results.iter().any(|r| r.get("commerce").is_some())
+}
+
 /// How many of the ALREADY-RANKED top results feed the main-path `shopping`
 /// block on `/search` (ROADMAP item 7). This is a presentation cap on a CLONE of
 /// the ranked results, NOT a ranking change — the real `results` array is never
 /// touched, so this number cannot affect ranking or selection. Data-free: tuning
 /// it only changes how many enriched shopping cards show, never their order.
-/// 
-/// NOW DATA-DRIVEN: loaded from `data/commerce/config.json` → `mainpath_top_n`.
-/// This const is no longer used; the value comes from `CommerceConfig::load()`.
-/// Kept as a fallback default for the config loader.
-#[allow(dead_code)]
 const COMMERCE_MAINPATH_TOP_N: usize = 8;
 
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
@@ -4504,12 +3972,6 @@ struct AffiliateNetwork {
     /// url-encoded as a query param. DATA-ONLY.
     #[serde(default)]
     fallback_url: Option<String>,
-    /// Bid-check endpoint template for Sovrn's reporting API
-    /// (`/api/bid?key=...&out=...&ip=...&userAgent=...`). Used by the
-    /// `/commerce/bid` reporting endpoint ONLY — never for ranking. DATA-ONLY:
-    /// the URL template comes from the data file; the key comes from env.
-    #[serde(default)]
-    bid_check_url: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -4517,84 +3979,6 @@ fn default_true() -> bool {
 }
 fn default_priority() -> i64 {
     0
-}
-
-/// Runtime-resolved commerce presentation config (post-ROADMAP increment).
-/// Loaded from `data/commerce/config.json`; all values can be changed WITHOUT
-/// recompile. An empty/missing file falls back to defaults — never fatal.
-#[derive(Clone, Debug, Default)]
-struct CommerceConfig {
-    /// How many of the ALREADY-RANKED top results feed the main-path `shopping`
-    /// block on `/search`. Presentation cap on a CLONE of ranked results —
-    /// never affects ranking or selection.
-    mainpath_top_n: usize,
-    /// Runtime-loaded transactional intent keywords (Override 6 signal).
-    /// Comes from `data/commerce/signals.json` → `transactional_keywords`.
-    /// Empty Vec means: no keyword-based override; rely on label + distribution + price bound.
-    transactional_keywords: Vec<String>,
-}
-
-impl CommerceConfig {
-    /// Load from `data/commerce/config.json` AND `data/commerce/signals.json`.
-    /// Missing file / missing field => sensible defaults. Never fatal.
-    fn load() -> Self {
-        let mut cfg = Self {
-            mainpath_top_n: 8,
-            transactional_keywords: Vec::new(),
-        };
-        let config_candidates = [
-            "data/commerce/config.json",
-            "/app/data/commerce/config.json",
-            "./data/commerce/config.json",
-        ];
-        for path in &config_candidates {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(n) = v.get("mainpath_top_n").and_then(|x| x.as_u64()) {
-                        cfg.mainpath_top_n = n as usize;
-                        tracing::info!(
-                            "commerce config: mainpath_top_n={} (from data file)",
-                            cfg.mainpath_top_n
-                        );
-                    }
-                    if let Some(arr) = v.get("transactional_keywords").and_then(|a| a.as_array()) {
-                        cfg.transactional_keywords = arr
-                            .iter()
-                            .filter_map(|s| s.as_str().map(String::from))
-                            .collect();
-                        tracing::info!(
-                            "commerce config: {} transactional keyword(s) from config.json",
-                            cfg.transactional_keywords.len()
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-        let signals_candidates = [
-            "data/commerce/signals.json",
-            "/app/data/commerce/signals.json",
-            "./data/commerce/signals.json",
-        ];
-        for path in &signals_candidates {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(arr) = v.get("transactional_keywords").and_then(|a| a.as_array()) {
-                        cfg.transactional_keywords = arr
-                            .iter()
-                            .filter_map(|s| s.as_str().map(String::from))
-                            .collect();
-                        tracing::info!(
-                            "commerce signals: {} transactional keyword(s) (from data file)",
-                            cfg.transactional_keywords.len()
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-        cfg
-    }
 }
 
 /// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
@@ -4854,17 +4238,10 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     };
 
     // Pattern A: upper-marker then number (+ optional currency word)
-    // ANCHORED at start of `rest`: the number must be the FIRST token after the
-    // marker (only whitespace allowed between). Without the anchor, "about" in
-    // "latest news about chandrayaan 4 mission" matched as a price marker and
-    // "4" (two tokens later) as the amount → spurious price:<4 → intent flipped
-    // fresh→transactional (Override 6) → date window crushed 19→1 results.
-    // General: a price marker is only meaningful when the number follows it
-    // directly ("under 150 dollars"), not when other words intervene.
     for marker in upper_markers {
         if let Some(pos) = lower.find(marker) {
             let rest = &lower[pos + marker.len()..];
-            let re_num = regex::Regex::new(&format!(r"^\s*{}\b", amount_pat)).ok()?;
+            let re_num = regex::Regex::new(&format!(r"\s*{}\b", amount_pat)).ok()?;
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
@@ -6187,31 +5564,28 @@ fn calibrate_scores(scores: &mut [f32]) {
     // relevance fold) and only lift the floor. On-topic queries with a healthy result
     // have raw_max >= 0.10, so the standard [0.05,1.0] remap runs unchanged (no regression).
     if raw_max < 0.10 {
-        // WEAK-SET LOG-SCALE (IF-2 fix): the original guard compressed every
-        // weak set onto [0.05, 0.12] — a 7-point band that collapsed the
-        // relevance fold's separation so off-topic survivors tied with on-topic
-        // pages and won by insertion order (IF-2). A linear remap, even widened,
-        // still destroys relative ordering when all scores sit in a narrow raw
-        // band. Instead, use log-scaling: mapping x → log(1+x) stretches the
-        // low end (where weak scores live) while keeping ordering intact, then
-        // remap onto [0.05, 1.0] like the normal path. This way a 2x raw
-        // difference (e.g. 0.02 vs 0.01) still reads as a clear score gap
-        // (0.64 vs 0.37) without ever inflating a weak max to 1.0.
-        //
-        // Log-scaling is monotonic and unbounded — it preserves rank order by
-        // construction, generalises to any weak-set shape, and has no magic
-        // threshold tuned to one query. The 0.10 gate stays as a regime
-        // switch (weak vs healthy) but no longer decides the output spread.
-        let log_min = (raw_min + 1.0).ln();
-        let log_max = (raw_max + 1.0).ln();
-        let log_span = (log_max - log_min).max(1e-6);
+        // WEAK-SET SPREAD (round-7 fix): the original guard pinned every score to
+        // the 0.05 floor whenever the best raw score was < 0.10. That regime is
+        // NORMAL for web queries: RRF contributions for top positions are ~0.05-0.08
+        // and authority/semantic weights are small, so base scores land at
+        // 0.005-0.02. Pinning to floor destroyed the ranker's ordering, so a leaked
+        // off-topic page (e.g. a Vale earnings release for "noise cancelling
+        // earbuds", thesaurus.com/"biggest" for "cybersecurity breaches", a Zomato
+        // "Thai Restaurants in Jaipur" for "vegetarian thali ... jaipur") tied with
+        // the genuinely on-topic page at 0.05 and won by insertion order.
+        // Instead, rescale the weak set onto a CONSTRAINED low sub-range
+        // [0.05, 0.12] that preserves the raw relative order. This keeps the round-6
+        // off-topic defense (no weak result is stretched to ~1.0, so an off-topic
+        // survivor cannot invert the ranking — on-topic pages have higher raw base
+        // and stay above) while differentiating on-topic pages from leaked ones.
+        // The off-topic sole-survivor case is already removed pre-scoring by the
+        // distinctive-term hard-drop, so the only remaining weak sets are legit.
         let lo = 0.05f32;
-        let hi = 1.0f32;
-        let span = hi - lo;
+        let hi = 0.12f32;
+        let norm = (raw_max - raw_min).max(1e-6);
         for score in scores.iter_mut() {
-            let log_s = (*score + 1.0).ln();
-            let t = ((log_s - log_min) / log_span).clamp(0.0, 1.0);
-            *score = lo + t * span;
+            let t = ((*score - raw_min) / norm).clamp(0.0, 1.0);
+            *score = lo + t * (hi - lo);
         }
         return;
     }
@@ -6545,7 +5919,7 @@ const SUBJECTIVE_QUALITY_TERMS: &[&str] = &[
 /// words that slipped past the extractor's stopword lists. Structural vocabulary,
 /// data-driven — never a per-query literal.
 const EXCLUSION_GRAMMAR_NOISE: &[&str] = &[
-    "have", "has", "had", "having", "getting", "from", "with", "without", "about", "into",
+    "have", "has", "had", "having", "from", "with", "without", "about", "into",
     "onto", "upon", "over", "under", "before", "after", "than", "that", "which",
     "this", "these", "those", "what", "when", "where", "who", "why", "how",
     "their", "them", "they", "our", "your", "his", "her", "its", "the", "a", "an",
@@ -6574,19 +5948,6 @@ fn is_exclusion_grammar_noise(term: &str) -> bool {
     // vocabulary), no per-query tuning.
     if !tokens.is_empty() && tokens.iter().all(|t| EXCLUSION_GRAMMAR_NOISE.contains(t)) {
         return true;
-    }
-    // STATE-DESCRIPTION construction: "getting overcharged", "having issues",
-    // "being scammed" → auxiliary/participle + state describes a feeling or
-    // outcome, not a topical entity. Hard-dropping every result that mentions
-    // "getting overcharged" collapses relevant query results. Structural rule:
-    // first token is a state-verb head. No per-query literals; the state-verb
-    // set is closed-class auxiliary vocabulary, same pattern as
-    // EXCLUSION_GRAMMAR_NOISE / MANNER_VERBS.
-    const STATE_VERB_HEADS: &[&str] = &["getting", "having", "being", "feeling"];
-    if let Some(head) = tokens.first() {
-        if STATE_VERB_HEADS.contains(head) && tokens.len() >= 2 {
-            return true;
-        }
     }
     false
 }
@@ -7308,11 +6669,18 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         k += 1;
                     }
                     let joined = compound.join(" ");
-                    // Gate: only keep the compound as a real exclusion when it is in
-                    // contrastive framing or names a recognized entity. Manner
-                    // qualifiers ("without soap", "with no music background") are
-                    // dropped so they don't penalize the user's own topical words.
-                    if is_real_exclusion(&joined, q_orig, query_contrastive)
+                    // GUARD (2026-08-31 round): never emit an EMPTY exclusion term.
+                    // A compound finalised via a list connector ("and"/"or") inside
+                    // the loop above is now empty; if we still ran the gate on it,
+                    // `is_real_exclusion("")` returns true for any contrastive query
+                    // (a query containing "no"/"without" is contrastive), pushing ""
+                    // as a negative. An empty `not:` substring-matches EVERY title
+                    // ("" is present everywhere), so the hard-drop would delete ALL
+                    // retrieved results and collapse the query to 0 hits — exactly
+                    // the catastrophic failure seen for "no dairy and no gelatin".
+                    // General + structural: an empty exclusion is never meaningful.
+                    if !joined.is_empty()
+                        && is_real_exclusion(&joined, q_orig, query_contrastive)
                         && !terms.contains(&joined)
                     {
                         terms.push(joined);
@@ -7724,15 +7092,6 @@ fn preprocess_searxng_query(query: &str) -> String {
         }
     }
     
-    // Strip "show me / show us" prefixes
-    let show_triggers = ["show me ", "show us "];
-    for prefix in &show_triggers {
-        if let Some(rest) = cleaned.strip_prefix(prefix) {
-            cleaned = rest.to_string();
-            break;
-        }
-    }
-    
     // Action verbs that trigger dictionary/definition results on Bing/Google
     let action_verbs: std::collections::HashSet<&str> = [
         "deploy", "implement", "configure", "setup", "install", "migrate",
@@ -7915,73 +7274,6 @@ fn filetype_relax_variant(query: &str) -> Option<String> {
 
 /// Extract core keyphrases by removing natural-language filler/stop words
 /// from verbose queries (e.g. "construct a warp drive using exotic matter" → "warp drive exotic matter").
-/// Generic-verb drop variant: when recall-gap terms exist, detect that the
-/// result set is off-topic (the distinctive noun is absent from ALL results)
-/// and produce a reformulated query that drops generic verbs and keeps only
-/// the distinctive nouns. Structural — no per-query literals.
-///
-/// Example: "remove curry stains from white shirt" with recall_gap=["curry"]
-/// → Some("curry stains white shirt")
-fn generic_verb_drop_variant(query: &str, recall_gap_terms: &[String]) -> Option<String> {
-    if recall_gap_terms.is_empty() {
-        return None;
-    }
-    // Check: at least one recall-gap term is a distinctive noun (len >= 3,
-    // not a stopword, not a weak anchor). This is the signal that the
-    // generic verbs in the query are polluting the upstream results.
-    let stops = recall_gap_stopwords();
-    let has_distinctive_gap = recall_gap_terms.iter().any(|t| {
-        t.len() >= 3
-            && !stops.contains(t.as_str())
-            && !is_weak_anchor_word(t)
-    });
-    if !has_distinctive_gap {
-        return None;
-    }
-    // Identify which recall-gap terms are distinctive nouns (real content words).
-    let distinctive_gaps: Vec<&str> = recall_gap_terms
-        .iter()
-        .filter(|t| {
-            t.len() >= 3
-                && !stops.contains(t.as_str())
-                && !is_weak_anchor_word(t)
-        })
-        .map(|t| t.as_str())
-        .collect();
-    if distinctive_gaps.is_empty() {
-        return None;
-    }
-    // Drop generic verbs/function words from the query, keeping only
-    // distinctive nouns + the distinctive recall-gap terms.
-    // Generic words = words that appear in recall_gap_stopwords OR
-    // is_weak_anchor_word AND are NOT one of the distinctive gap terms.
-    let filtered: Vec<String> = query
-        .split_whitespace()
-        .filter(|w| {
-            let lower = w.to_lowercase();
-            let is_gap_term = distinctive_gaps.iter().any(|g| g == &lower);
-            // Keep: distinctive gap terms (the actual topic words)
-            if is_gap_term { return true; }
-            // Drop: generic stopwords and weak-anchor words (they pollute results)
-            stops.contains(lower.as_str()) || is_weak_anchor_word(&lower)
-        })
-        .map(|w| w.to_string())
-        .collect();
-    if filtered.len() < 2 {
-        return None;
-    }
-    // Ensure we kept at least one distinctive gap term
-    let kept_gaps: Vec<String> = filtered.iter()
-        .map(|w| w.to_lowercase())
-        .filter(|w| distinctive_gaps.iter().any(|g| *g == w.as_str()))
-        .collect();
-    if kept_gaps.is_empty() {
-        return None;
-    }
-    Some(filtered.join(" "))
-}
-
-
 /// Fires in parallel during the initial fan-out to ensure upstream engines return
 /// relevant hits even when verbose natural-language framing yields 0 exact matches.
 fn keyphrase_relax_variant(query: &str) -> Option<String> {
@@ -8512,7 +7804,6 @@ fn merge_local_and_web(
     distribution: Option<&std::collections::HashMap<String, f32>>,
     geo_location: Option<&geoloc::GeoLocation>,
     web_semantic: &std::collections::HashMap<String, f32>,
-    tx_keywords: &[String],
 ) -> Vec<MergedResult> {
     let mut merged: Vec<MergedResult> = Vec::new();
     let mut url_to_idx: HashMap<String, usize> = HashMap::new();
@@ -8527,14 +7818,6 @@ fn merge_local_and_web(
     // zero results, so the bound stays ranking-only. Computed here from `web`
     // so it stays in scope for the per-result loop.
     let priced_result_count = web.iter().filter(|r| r.get_price().is_some()).count();
-
-    // P6: how many web results carry a parseable date. When 0 for a fresh query,
-    // the date window fails open and recency stays a pure scoring boost — we then
-    // use temporal anchors (year/month in title/URL) to lift recent-content pages
-    // above generic aggregator/database pages.
-    let dated_result_count = web.iter().filter(|r| {
-        resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
-    }).count();
 
     // Helper: normalize URL for dedup matching
     let normalize = |url: &str| -> String {
@@ -8960,26 +8243,24 @@ fn merge_local_and_web(
     // "Sky Blue Credit" (a brand whose two tokens happen to be "sky"+"blue") no longer
     // rides a token-overlap bonus it didn't earn. Computed once per query, not per result.
     let phrase_entities: Vec<String> = {
-        // Extract ALL 2-3 word n-grams as phrase entities, WITHOUT filtering
-        // stop words. This captures technical phrases like "end to end encryption"
-        // where "end" and "to" are stop words but the phrase as a whole is a
-        // key matching signal. A result that contains the full phrase is a
-        // much stronger match than one that only shares scattered tokens.
-        let lower_words: Vec<String> = q_words.iter().map(|w| w.to_lowercase()).collect();
         let mut phrases = Vec::new();
-        for n in 2..=3 {
-            for window in lower_words.windows(n) {
-                let phrase = window.join(" ");
-                // Skip pure stop-word phrases (e.g. "how does", "is the")
-                // that carry no topical signal. A phrase is kept if at least
-                // one of its words is a content word (not a stop word, len >= 3).
-                let has_content = window.iter().any(|w| {
-                    w.len() >= 3 && !stop_words.contains(w.as_str())
-                });
-                if has_content {
-                    phrases.push(phrase);
-                }
+        let mut run: Vec<String> = Vec::new();
+        for w in q_words.iter() {
+            let lower = w.to_lowercase();
+            let is_content = lower.len() >= 2
+                && !stop_words.contains(lower.as_str())
+                && !lower.chars().all(|c| c.is_ascii_digit());
+            if is_content {
+                run.push(lower);
+            } else if run.len() >= 2 {
+                phrases.push(run.join(" "));
+                run.clear();
+            } else {
+                run.clear();
             }
+        }
+        if run.len() >= 2 {
+            phrases.push(run.join(" "));
         }
         phrases
     };
@@ -9179,16 +8460,11 @@ fn merge_local_and_web(
                 title_lower.contains(p.as_str()) || content_lower.contains(p.as_str()) || url_lower.contains(p.as_str())
             }).count();
             let phrase_ratio = phrase_hits as f32 / phrase_entities.len() as f32;
-            // Blend the phrase ratio into relevance. Results matching MOST phrases
-            // (ratio >= 0.5) are NOT dampened — they clearly address the query's
-            // topic. Only results missing the MAJORITY of phrases (ratio < 0.5)
-            // get penalized, since they fail to cover the query's full topical
-            // structure. This avoids regressing queries like "how to train for a
-            // marathon" where a result matching 4/7 phrases is clearly relevant.
-            // The penalty is also milder (×0.6) to avoid over-crushing.
-            if phrase_ratio < 0.5 {
-                relevance *= 0.6;
-            }
+            // Blend the phrase ratio into relevance: a result missing every phrase entity
+            // drops to at most ~0.45 of its token-overlap relevance; full phrase coverage
+            // keeps it intact. This lets "Why Is the Sky Blue?" (title has the phrase) rank
+            // above "Sky Blue Credit" (no contiguous phrase), purely from structure.
+            relevance *= 0.45 + 0.55 * phrase_ratio;
         }
 
         // ── Administrative & Sitemap Demotion ──
@@ -9396,32 +8672,13 @@ fn merge_local_and_web(
                 })
                 .copied()
                 .collect();
-            // P2c (round-2026-09-08): when the query has >= 2 topic anchor terms,
-            // require at least TWO to be present in the result. A page matching
-            // only ONE of several topic terms is a partial/incidental match — e.g.
-            // "Fluffy Fluffy Dessert Cafe" for "how to make fluffy pancakes" matches
-            // "fluffy" but not "pancakes". The old `any()` let such pages survive the
-            // gate and outrank genuinely on-topic web results. Requiring >= 2 matches
-            // crushes partial matches while letting full-topic pages (which name
-            // multiple query subjects) pass. Single-term queries are unaffected.
-            let topic_mentioned = if topic_anchor_terms.is_empty() {
-                true
-            } else if topic_anchor_terms.len() >= 2 {
-                let matched_count = topic_anchor_terms.iter().filter(|t| {
+            let topic_mentioned = topic_anchor_terms.is_empty()
+                || topic_anchor_terms.iter().any(|t| {
                     let tl = t.to_lowercase();
                     let bare = tl.trim_end_matches('s');
                     title_lower.contains(&tl) || content_lower.contains(&tl)
                         || title_lower.contains(bare) || content_lower.contains(bare)
-                }).count();
-                matched_count >= 2
-            } else {
-                topic_anchor_terms.iter().any(|t| {
-                    let tl = t.to_lowercase();
-                    let bare = tl.trim_end_matches('s');
-                    title_lower.contains(&tl) || content_lower.contains(&tl)
-                        || title_lower.contains(bare) || content_lower.contains(bare)
-                })
-            };
+                });
             // P2b: high-quality local pages that match the query ONLY on comparison
             // STRUCTURE ("difference between X and Y", "X vs Y") but share NONE of the
             // query's substantive entity terms are off-topic crawl noise — e.g.
@@ -9449,9 +8706,8 @@ fn merge_local_and_web(
             let is_comparison_intent = intent == "comparison" || intent == "technical";
             if r.quality < 0.55 && !topic_mentioned {
                 relevance *= 0.05;
-                p2d_offtopic = true;
                 tracing::info!(
-                    "LOCAL NOISE GATE: '{}' quality={:.2} topic_mentioned={} -> relevance crushed + p2d_offtopic",
+                    "LOCAL NOISE GATE: '{}' quality={:.2} topic_mentioned={} -> relevance crushed",
                     r.url.chars().take(60).collect::<String>(), r.quality, topic_mentioned
                 );
             } else if r.quality < 0.75 && !topic_mentioned {
@@ -9476,8 +8732,8 @@ fn merge_local_and_web(
         //     in-budget -> small boost "this is the product");
         //   • if NO price is stated AND the query is a transactional-product query (price
         //     bound present) AND the result shows no price/product lexical signal, demote
-        //     it (×0.5) — almost certainly not the priced product asked for. Generic; no
-        //     hardcoded merchants or domains.
+        //     it — almost certainly not the priced product asked for. Generic; no hardcoded
+        //     merchants or domains.
         let price_bound = constraints.price_max.or(constraints.price_lt)
             .or_else(|| constraints.price_min.or(constraints.price_gt));
         if let Some(_bound) = price_bound {
@@ -9495,15 +8751,19 @@ fn merge_local_and_web(
                     relevance *= 1.10;
                 }
             } else if !price_signal {
-                // Demote price-less results for transactional queries with a price
-                // bound. They might still be relevant (e.g., a product category
-                // page), but the user asked for products within a budget and this
-                // result shows no price. Gentle demotion (×0.5) — never hard-drop.
-                // Applied regardless of priced_result_count: even when NO result
-                // carries a parseable price, price-less pages rank below any that
-                // do mention a price/price-signal, which is the correct semantic
-                // for a transactional-product query.
-                relevance *= 0.5;
+                // Fail-open: only demote price-less results when at least one merged
+                // result actually carries a detectable price. When NO result has a
+                // price (the normal web-snippet case), demoting every price-less
+                // result would collapse a valid product query to zero results — so
+                // the bound stays ranking-only and the gap is reported via
+                // `ignored_constraints`. This replaces the old PRICE FAIL-OPEN branch
+                // that MUTATED `structured_constraints` (deleting the user's stated
+                // price bound), which misrepresented the query to downstream
+                // consumers (notably commerce/shopping). Extraction truth is now
+                // preserved regardless of upstream price availability.
+                if priced_result_count > 0 {
+                    relevance *= 0.45;
+                }
             }
         }
 
@@ -9748,66 +9008,6 @@ fn merge_local_and_web(
                 "D4 FRESH OFF-TOPIC CRUSH x0.12: '{}' shares no distinctive topic term and has no date signal (fresh intent, date window failed open)",
                 r.url.chars().take(60).collect::<String>()
             );
-        }
-
-        // ── P6: fresh-intent temporal-anchor boost (date window failed open) ──
-        // When NO web result carries a parseable date (dated_result_count == 0),
-        // the hard recency window fails open and recency stays a pure scoring
-        // boost. Generic aggregator/database pages with high authority then crowd
-        // out actual recent content. We rescue the ranking by boosting results
-        // whose title or URL explicitly mentions the query's year or month —
-        // these are temporal anchors that correlate with recency even when the
-        // upstream snippet lacks a parseable published_date. A result that names
-        // the time period is more likely to be about that period than a generic
-        // portal page. Keyed on the query's own year/month tokens, no domain
-        // lists, no per-query tuning — general and future-proof.
-        //
-        // BUG FIX (2026-09-08): the original gate required
-        // `constraints.after_date.is_some() || constraints.before_date.is_some()`,
-        // but the date window fail-open logic (line ~14496) CLEARS those bounds
-        // when dated_result_count == 0 — exactly the case P6 must handle. The
-        // clone passed to merge_local_and_web() therefore has no date bounds,
-        // so the P6 logic never fired when it was most needed. The correct
-        // trigger is `dated_result_count == 0` (the window failed open) OR the
-        // presence of a date constraint (window is active, dated_result_count > 0).
-        if intent == "fresh" && (dated_result_count == 0 || constraints.after_date.is_some() || constraints.before_date.is_some()) {
-            let query_year = extract_year_from_query(&clean_query);
-            let query_month = extract_month_from_query(&clean_query);
-            let title_has_year = query_year.as_ref().map_or(false, |y| title_lower.contains(y.as_str()));
-            let url_has_year = query_year.as_ref().map_or(false, |y| url_lower.contains(y.as_str()));
-            let title_has_month = query_month.as_ref().map_or(false, |m| title_lower.contains(m.as_str()));
-            let url_has_month = query_month.as_ref().map_or(false, |m| url_lower.contains(m.as_str()));
-            if title_has_year || url_has_year || title_has_month || url_has_month {
-                relevance *= 1.30;
-                tracing::info!(
-                    "P6 TEMPORAL ANCHOR BOOST x1.30: '{}' mentions query time period (year={:?}, month={:?})",
-                    r.url.chars().take(60).collect::<String>(),
-                    query_year,
-                    query_month
-                );
-            }
-            // ── P6: fresh-intent temporal-anchor PENALTY ──
-            // The boost above rewards results naming the query's year/month, but
-            // without a corresponding penalty the generic aggregator/database pages
-            // (JustWatch, IMDb, Moviefone, Netflix…) that dominate fresh queries
-            // still crowd out actual recent content — they contain query words like
-            // "movies" but no temporal anchor. Penalize results that LACK the time
-            // period so dated/anchored results rise above the generic portals. Keys
-            // on the same year/month tokens as the boost — no domain lists, no
-            // per-query tuning. Symmetric: boost rewards presence, penalty punishes
-            // absence, both gated on date_window_present (when a recency window is
-            // active). Fires even when dated_result_count > 0 but small — the window
-            // filters only the few dated results while date-less portals survive and
-            // dominate.
-            if !(title_has_year || url_has_year || title_has_month || url_has_month) {
-                relevance *= 0.50;
-                tracing::info!(
-                    "P6 TEMPORAL ANCHOR PENALTY x0.50: '{}' lacks query time period (year={:?}, month={:?})",
-                    r.url.chars().take(60).collect::<String>(),
-                    query_year,
-                    query_month
-                );
-            }
         }
 
         // ── Fresh-intent news-portal demotion (this round, #16/#22) ──
@@ -10075,7 +9275,8 @@ fn merge_local_and_web(
             || r.sources.iter().any(|s| s == "arxiv" || s == "crossref" || s == "pubmed");
 
         let has_download = DOWNLOAD_KEYWORDS.iter().any(|k| q_lower_check.contains(k));
-        let has_tx = tx_keywords.iter().any(|kw| q_lower_check.contains(kw.as_str()));
+        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon"];
+        let has_tx = tx_keywords.iter().any(|k| q_lower_check.contains(k));
         let is_nav_or_download = intent == "navigational"
             || intent == "transactional"
             || has_download
@@ -10399,28 +9600,32 @@ fn merge_local_and_web(
     // overlap survived at the 0.05 floor (calibrate_scores re-inflates the bottom
     // onto [0.05,1.0]), so off-topic web junk could not be removed. This round
     // removes that carve-out so the same gate protects web results.
-    // Soft off-topic penalty (was hard-drop until 2026-09-15T1200Z round).
-    //
-    // ROOT CAUSE: the old hard-drop `retain(|r| overlaps || geo_ok)` dropped
-    // every result whose title/content/url snippet shared ZERO of the query's
-    // strong distinctive terms. For long NL queries with many distinctive terms
-    // ("how to make fluffy idli batter at home without using a wet grinder" →
-    // ~7 strong terms), 80-90% of results were dropped because NO single page
-    // mentions ANY of those exact tokens. Verified live: 17/26 new NL queries
-    // had >50% drops, collapsing 30-result sets to 1-6. This is a result-set
-    // collapse, not curation — the surviving 1-6 were not meaningfully more
-    // on-topic than the 24 dropped.
-    //
-    // FIX: instead of hard-dropping, apply a soft score penalty (×0.10) to
-    // zero-overlap results. They sink to the bottom but survive. The downstream
-    // adaptive relevance floor (P60 distribution), domain-saturation gate, and
-    // pagination naturally exclude genuinely off-topic junk without collapsing
-    // the set. Adult results for non-adult queries are still hard-dropped by the
-    // separate adult block below — safety is never fail-open. Geo-matching
-    // results keep full score (local intent).
     if !strong_distinctive_terms.is_empty() {
-        let mut penalized = 0usize;
-        for r in merged.iter_mut() {
+        let before = merged.len();
+        let retained_pre_offtopic: Vec<MergedResult> = merged.iter().cloned().collect();
+        merged.retain(|r| {
+            // Adult exemption: when the query is explicitly adult, an adult result
+            // must survive the off-topic gate — the adult block below keeps it
+            // intentionally. Without this, the web off-topic drop would remove the
+            // adult URL first (it shares zero food/recipe/etc. distinctive terms),
+            // regressing "adult kept for explicit-adult query".
+            if adult_intent {
+                let ul = r.url.to_lowercase();
+                let tl = r.title.to_lowercase();
+                let host = reqwest::Url::parse(&r.url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                    .unwrap_or_default();
+                let tld_adult = host.ends_with(".xxx");
+                let host_adult = adult_hosts.iter().any(|h| host.contains(h));
+                let path_adult = adult_paths.iter().any(|p| ul.contains(p));
+                let title_adult = tl.contains("porn") || tl.contains("xxx ")
+                    || tl.contains("nude") || tl.contains("naked")
+                    || tl.contains("sex video") || tl.contains("adult film");
+                if tld_adult || host_adult || path_adult || title_adult {
+                    return true;
+                }
+            }
             let tl = r.title.to_lowercase();
             let cl = r.content.to_lowercase();
             let ul = r.url.to_lowercase();
@@ -10428,35 +9633,57 @@ fn merge_local_and_web(
                 let lt = t.to_lowercase();
                 tl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
             });
+            // Geo-aware exemption: a query with a resolved location is a LOCAL/geo
+            // intent; a result that names that location (city/country) is genuinely
+            // on-topic even if its snippet omits the descriptive adjectives
+            // (quiet/wifi/outlets/...). Without this, "quiet places to study near
+            // chennai" hard-drops every chennai-mentioning result that didn't also
+            // repeat "quiet"/"wifi", collapsing the set to one generic page.
+            // General: reuses geo_relevance_score, no query/domain bias; only
+            // exempts results that actually mention the resolved location.
             let geo_ok = geo_location
                 .map(|g| geo_relevance_score(&tl, &cl, &ul, g) > 0.0)
                 .unwrap_or(false);
-            if !overlaps && !geo_ok {
-                // Adult exemption: when the query is explicitly adult, an adult
-                // result keeps full score — the adult block below will handle it.
-                let is_adult_exempt = if adult_intent {
+            overlaps || geo_ok
+        });
+        let removed = before - merged.len();
+        if removed > 0 {
+            tracing::info!("OFF_TOPIC_HARD_DROP: removed {}/{} result(s) (local+web) with zero distinctive-term overlap", removed, before);
+        }
+        // Fail-open rescue (mirrors the date/price fail-opens above): if the
+        // off-topic drop would EMPTY the merged set, the "distinctive-term
+        // overlap" signal is too strict for this query (e.g. fresh+price queries
+        // where upstream results legitimately omit the exact distinctive tokens
+        // in their title/content/url snippets) and we must not return a blank
+        // page. Restore the survivors but STILL enforce the adult hard-drop below
+        // (safety is never fail-open), and keep an explicit warning so the gap is
+        // visible. Keyed on "would-empty", not on any query/domain — general.
+        if merged.is_empty() && before > 0 {
+            let restored: Vec<MergedResult> = retained_pre_offtopic
+                .into_iter()
+                .filter(|r| {
+                    let ul = r.url.to_lowercase();
+                    let tl = r.title.to_lowercase();
                     let host = reqwest::Url::parse(&r.url)
                         .ok()
                         .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
                         .unwrap_or_default();
-                    host.ends_with(".xxx")
-                        || adult_hosts.iter().any(|h| host.contains(h))
-                        || adult_paths.iter().any(|p| ul.contains(p))
-                        || tl.contains("porn") || tl.contains("xxx ")
+                    let tld_adult = host.ends_with(".xxx");
+                    let host_adult = adult_hosts.iter().any(|h| host.contains(h));
+                    let path_adult = adult_paths.iter().any(|p| ul.contains(p));
+                    let title_adult = tl.contains("porn") || tl.contains("xxx ")
                         || tl.contains("nude") || tl.contains("naked")
-                        || tl.contains("sex video") || tl.contains("adult film")
-                } else {
-                    false
-                };
-                if !is_adult_exempt {
-                    r.score *= 0.10;
-                    penalized += 1;
-                }
-            }
-        }
-        if penalized > 0 {
-            merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-            tracing::info!("OFF_TOPIC_SOFT_PENALTY: penalized {}/{} result(s) with zero distinctive-term overlap (score *= 0.10, sorted to bottom)", penalized, merged.len());
+                        || tl.contains("sex video") || tl.contains("adult film");
+                    let is_adult = tld_adult || host_adult || path_adult || title_adult;
+                    !is_adult
+                })
+                .collect();
+            tracing::warn!(
+                "OFF_TOPIC_HARD_DROP FAIL-OPEN: {} result(s) all lacked distinctive-term overlap but dropping them would empty the set — restoring {} non-adult survivor(s) (recency/authority ranking still applies)",
+                before,
+                restored.len()
+            );
+            merged = restored;
         }
     }
 
@@ -10851,28 +10078,6 @@ fn merge_local_and_web(
             .map(|r| r.score)
             .fold(0.0f32, f32::max);
 
-        // (b) single-distinctive-term-only match on a multi-topic query
-        // FAIL-OPEN: only fire this cap when at least one result actually
-        // matches >= 2 topics. If NO result reaches that bar, the cap would
-        // flatten EVERYTHING to 0.04 indiscriminately — destroying ranking
-        // differentiation for queries where upstream returns only off-topic
-        // results (e.g. "how to fix a bicycle puncture" returning KIT/Gemini
-        // pages). Let normal ranking differentiate instead.
-        let any_strong_match = if query_has_many_topics {
-            merged.iter().any(|r| {
-                let rl = r.title.to_lowercase();
-                let cl = r.content.to_lowercase();
-                let ul = r.url.to_lowercase();
-                let matched_strong = strong_topics.iter().filter(|t| {
-                    let lt = t.to_lowercase();
-                    rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
-                }).count();
-                matched_strong >= 2
-            })
-        } else {
-            false
-        };
-
         for r in merged.iter_mut() {
             let rl = r.title.to_lowercase();
             let cl = r.content.to_lowercase();
@@ -10912,7 +10117,7 @@ fn merge_local_and_web(
                     // topical article at 0.05, instead of tying it via insertion order
                     // as the old 0.12 did). Floor preserved so videos remain present.
                     // Signal-driven (query self-describes intent), not tuned to a query.
-                    let video_cap = 0.02f32;
+                    let video_cap = 0.04f32;
                     if r.score > video_cap {
                         tracing::info!(
                             "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source)",
@@ -10924,34 +10129,8 @@ fn merge_local_and_web(
                 }
             }
 
-            // (b1) POST-CALIBRATION CROSS-LOCATION CAP (geo-local round).
-            // The in-loop cross_loc_mult (0.06x when result names a different gazetteer
-            // place) is DEFEATED by calibrate_scores, which rescales the max raw score
-            // back to 1.0 — so "10 Safest Orlando, FL Neighborhoods" still floats above
-            // "Best Areas to Buy Flats in Hyderabad" for a Hyderabad query. This cap
-            // re-applies AFTER calibration so the dampening is durable: mismatched-place
-            // results stay present (floor) but can never outtop requested-place results.
-            // Only fires when the query has an explicit location (geo_is_explicit).
-            if geo_is_explicit {
-                let cross_loc_penalty = cross_location_mismatch_mult(&r.title, &r.content, geo_location);
-                if cross_loc_penalty < 1.0 {
-                    // cross_loc returns 0.06 — rescale to a calibrated floor
-                    // well below genuine text results (0.05). Use 0.03 so a mismatched
-                    // place page sits UNDER every on-topic text result.
-                    let geo_cap = 0.03f32;
-                    if r.score > geo_cap {
-                        tracing::info!(
-                            "POST-CAL CROSS-LOC CAP -> {:.2}: '{}' (explicit geo, result names different place)",
-                            geo_cap, r.url.chars().take(60).collect::<String>()
-                        );
-                        r.post_cal_cap = Some(geo_cap);
-                        r.score = geo_cap;
-                    }
-                }
-            }
-
             // (b) single-distinctive-term-only match on a multi-topic query
-            if query_has_many_topics && any_strong_match {
+            if query_has_many_topics {
                 let matched_strong = strong_topics.iter().filter(|t| {
                     let lt = t.to_lowercase();
                     rl.contains(&lt) || cl.contains(&lt) || ul.contains(&lt)
@@ -11162,9 +10341,6 @@ struct AppState {
     /// knowledge is data, never code. Used only as a strict post-rank decoration
     /// pass — never affects ranking/order.
     affiliate_ctx: AffiliateCtx,
-    /// Commerce presentation config (post-ROADMAP increment). Loaded from
-    /// `data/commerce/config.json`; all values can be changed WITHOUT recompile.
-    commerce_config: CommerceConfig,
 }
 
 async fn handle_images(
@@ -11713,29 +10889,9 @@ fn distinctive_query_terms(query: &str) -> Vec<String> {
 /// Returns `None` when there are no results at all (nothing to compare against)
 /// so the signal is never emitted for an empty SERP (that's a different problem
 /// class — see `warnings`).
-/// Trait for types that can provide the fields needed for recall-gap computation.
-/// Implemented by both MergedResult (post-merge) and SearxResult (pre-merge).
-trait RecallGapSource {
-    fn title(&self) -> &str;
-    fn content(&self) -> &str;
-    fn url(&self) -> &str;
-}
-
-impl RecallGapSource for MergedResult {
-    fn title(&self) -> &str { &self.title }
-    fn content(&self) -> &str { &self.content }
-    fn url(&self) -> &str { &self.url }
-}
-
-impl RecallGapSource for SearxResult {
-    fn title(&self) -> &str { &self.title }
-    fn content(&self) -> &str { &self.content }
-    fn url(&self) -> &str { &self.url }
-}
-
-fn compute_recall_gap_terms<T: RecallGapSource>(
+fn compute_recall_gap_terms(
     query: &str,
-    results: &[T],
+    results: &[MergedResult],
 ) -> Option<Vec<String>> {
     if results.is_empty() {
         return None;
@@ -11749,12 +10905,12 @@ fn compute_recall_gap_terms<T: RecallGapSource>(
     let covered: std::collections::HashSet<String> = results
         .iter()
         .map(|r| {
-            let preview = r.content().chars().take(500).collect::<String>();
+            let preview = r.content.chars().take(500).collect::<String>();
             format!(
                 "{} {} {}",
-                r.title().to_lowercase(),
+                r.title.to_lowercase(),
                 preview.to_lowercase(),
-                r.url().to_lowercase()
+                r.url.to_lowercase()
             )
         })
         .collect::<std::collections::HashSet<String>>();
@@ -11818,8 +10974,6 @@ async fn main() {
         search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         // Affiliate template engine config (ROADMAP item 3) — loaded from data.
         affiliate_ctx: AffiliateCtx::load(),
-        // Commerce presentation config (post-ROADMAP increment) — loaded from data.
-        commerce_config: CommerceConfig::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -11890,10 +11044,6 @@ async fn main() {
         .route("/search/fast", get(handle_search_fast))
         .route("/images", get(handle_images))
         .route("/videos", get(handle_videos))
-        // Video introspection: classifies query as video-intent using the same
-        // has_video_intent() + is_url_video_host() fns /search's P8 path uses.
-        // Zero-side-effect, no new ranking logic. See handle_video().
-        .route("/video", get(handle_video))
         .route("/news", get(handle_news))
         .route("/spellcheck", get(handle_spellcheck))
         .route("/analyze", get(handle_analyze))
@@ -11916,8 +11066,7 @@ async fn main() {
         // Returns the typed CommerceOffer extracted from supplied HTML — no
         // ranking, no monetization, no user-tracking surface. The /shopping
         // endpoint and affiliate decoration land in later increments.
-        .route("/commerce/bid", get(handle_commerce_bid))
-.route("/commerce/extract", post(handle_commerce_extract))
+        .route("/commerce/extract", post(handle_commerce_extract))
         .route("/shopping", get(handle_shopping))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
@@ -11927,7 +11076,6 @@ async fn main() {
         .route("/goals/:goal_id/answers", post(goals::handle_submit_answers))
         .route("/goals/:goal_id/phases/:phase_id/complete", post(goals::handle_complete_phase))
         .route("/goals/:goal_id/progress", post(goals::handle_update_progress))
-        .route("/goals/:goal_id/progress", get(goals::handle_get_progress))
         .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
@@ -12359,92 +11507,6 @@ async fn handle_inspect(
         );
     }
     let result = build_inspect(&state.spell_index, &q);
-    (axum::http::StatusCode::OK, Json(result))
-}
-
-/// The marker set is exposed as a fixed general array (data, not branching
-/// logic) so a future drift between this endpoint and the ranker's P8 check is
-/// itself observable + unit-tested.
-fn classify_url_as_video(url: &str) -> bool {
-    is_url_video_host(url)
-}
-
-/// The exact P8 video-intent marker set. Mirrors `merge_local_and_web`'s
-/// `video_intent` check (gateway/main.rs ~L7070) VERBATIM so the
-/// introspection endpoint can never silently drift from the ranker's
-/// exemption logic. Kept as data (a fixed general marker set), not branching
-/// logic, per the doctrine: no per-query tuning.
-fn video_intent_markers() -> &'static [&'static str] {
-    &["video", "youtube", "watch", "tutorial", "animation"]
-}
-
-/// Pure video-intent detector — reuses `simple_negation_strip` (the same
-/// negation-aware cleaner `/search` feeds `q_lc_cap`) then tests the P8
-/// marker set. Returns true when the query should be treated as a request
-/// for video results (and therefore exempt from the P8 non-video pin).
-fn detect_video_intent(q: &str) -> bool {
-    let cleaned = simple_negation_strip(q).unwrap_or_else(|| q.to_string());
-    let q_lc = cleaned.to_lowercase();
-    video_intent_markers().iter().any(|m| q_lc.contains(*m))
-}
-
-/// Build the `GET /video` payload. Pure + unit-testable so the P8
-/// classification contract is locked independently of the HTTP layer.
-fn build_video(q: &str) -> serde_json::Value {
-    let video_intent = detect_video_intent(q);
-    let would_pin_non_video_sources = !video_intent;
-    let intent_resp = fallback_intent(q);
-    let intent = &intent_resp.intent;
-    let markers: Vec<String> = video_intent_markers().iter().map(|m| (*m).to_string()).collect();
-
-    serde_json::json!({
-        "query": q,
-        "video_intent": video_intent,
-        "video_intent_markers": markers,
-        "would_pin_non_video_sources": would_pin_non_video_sources,
-        "is_video_source_examples": {
-            "youtube_watch": classify_url_as_video("https://www.youtube.com/watch?v=gUEa825kTjQ"),
-            "youtu_be": classify_url_as_video("https://youtu.be/gUEa825kTjQ"),
-            "invidious_selfhosted": classify_url_as_video("https://invidious.example.net/watch?v=x"),
-            "vimeo": classify_url_as_video("https://www.vimeo.com/123456"),
-            "python_org_article": classify_url_as_video("https://www.python.org/doc"),
-            "example_video_word_in_path": classify_url_as_video("https://example.com/youtube-guide-article")
-        },
-        "intent": intent,
-        "note": "Additive introspection of the P8 video-dominance fix (commit 3938da6). Does not change ranking."
-    })
-}
-
-/// Build the `400 empty_query` envelope for `/video`. Pure + unit-testable.
-/// Mirrors the sibling empty-envelope contract: carries a neutral video_intent
-/// + would_pin_non_video_sources so the envelope is distinguishable but
-/// self-consistent.
-fn build_video_empty() -> serde_json::Value {
-    let markers: Vec<String> = video_intent_markers().iter().map(|m| (*m).to_string()).collect();
-    serde_json::json!({
-        "error": "empty_query",
-        "message": "Query parameter 'q' is empty",
-        "query": "",
-        "video_intent": false,
-        "video_intent_markers": markers,
-        "would_pin_non_video_sources": true,
-        "is_video_source_examples": {}
-    })
-}
-
-/// `GET /video?q=...` — expose the P8 video-dominance classification BEFORE a
-/// search runs. Additive + zero-side-effect (see `build_video`). Empty/
-/// whitespace `q` returns `400` with the standard `empty_query` envelope shape
-/// the introspection family uses.
-async fn handle_video(
-    axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
-) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    let q = params.q.clone().unwrap_or_default();
-    if q.trim().is_empty() {
-        return (axum::http::StatusCode::BAD_REQUEST, Json(build_video_empty()));
-    }
-    let result = build_video(&q);
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -14319,12 +13381,6 @@ async fn handle_search(
 
         // Override 5: Comparison & Alternatives signals (H2 fix)
         // e.g. "alternatives to adobe photoshop that are free", "best budget smartphones under 30000 rupees"
-        // Skip when the query is a how-to/explanation question — "how does X work" +
-        // "apps like X" is referential, not a comparison request. The "apps like"/"tools like"
-        // signals are legitimately comparative in isolation but NOT when the query opens with
-        // a how-to frame (the user is asking for an explanation of a category, not "which is better").
-        let is_howto_question = q_lower.starts_with("how ") || q_lower.starts_with("what is ") || q_lower.starts_with("what are ")
-            || q_lower.starts_with("why ") || q_lower.starts_with("explain ") || q_lower.starts_with("can you explain ");
         let comp_signals = [
             "alternatives to", "alternative to", "alternatives for", "alternative for",
             "similar to", "apps like", "tools like", "software like", "sites like",
@@ -14332,22 +13388,11 @@ async fn handle_search(
             "best budget", "best ... under", "top ... under", "compared to", "difference between",
             "which is better", "comparison", "compare "
         ];
-        // Referential signals ("apps like X in how does X work") — these only signal
-        // comparison when NOT inside a how-to/explanation question.
-        let referential_signals = ["apps like", "tools like", "software like", "sites like",
-                                   "similar to", "equivalent to", "replacement for",
-                                   "competing with", "best budget", "best ... under",
-                                   "top ... under"];
         let has_comp_signal = comp_signals.iter().any(|s| {
             if s.contains("...") {
                 let parts: Vec<&str> = s.split("...").collect();
                 parts.len() == 2 && q_lower.contains(parts[0].trim()) && q_lower.contains(parts[1].trim())
             } else {
-                // In a how-to question, skip referential signals — they're category
-                // membership markers ("encryption in apps like signal"), not comparison requests.
-                if is_howto_question && referential_signals.contains(s) {
-                    return false;
-                }
                 q_lower.contains(s)
             }
         });
@@ -14365,8 +13410,8 @@ async fn handle_search(
         }
 
         // Override 6: transactional keywords OR an explicit price bound -> transactional
-        let tx_keywords = state.commerce_config.transactional_keywords.clone();
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k.as_str()) || q_lower.contains(k.as_str()));
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -14515,42 +13560,6 @@ async fn handle_search(
             let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
             intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
         }
-
-        // Override 10: "why do" + scientific/natural-phenomenon term → informational
-        // Backfill fix IF-1: "why do we see lightning before hearing thunder"
-        // is clearly informational (explanation sought), but the intent-engine
-        // misclassifies it as transactional (0.80). This is a structural pattern,
-        // not a per-query literal: any "why do" query naming a natural phenomenon
-        // gets forced to informational regardless of what the engine returns.
-        // Regression guard: "why do I need a new laptop" has no science term →
-        // stays transactional (the how-to/study/research overrides don't fire on it).
-        let why_do_prefix = q_lower.starts_with("why do");
-        if why_do_prefix {
-            let science_terms = [
-                "lightning", "thunder", "rain", "snow", "wind", "storm", "hurricane",
-                "tornado", "earthquake", "volcano", "flood", "tsunami", "eclipse",
-                "comet", "meteor", "gravity", "magnet", "electricity", "photosynthesis",
-                "evolution", "atom", "molecule", "cell", "dna", "protein",
-                "tide", "wave", "spectrum", "particle", "radiation", "magnetic",
-                "atmosphere", "ocean", "climate", "geology", "ecology", "biology",
-                "physics", "chemistry", "astronomy", "weather", "temperature",
-            ];
-            let has_science_term = science_terms.iter().any(|t| q_has_word(&q_lower, t));
-            if has_science_term && intent.intent == "transactional" {
-                tracing::info!(
-                    "INTENT OVERRIDE (WHY_INQUIRY): science '{}' was '{}' (conf={:.3}) → informational",
-                    q, intent.intent, intent.confidence
-                );
-                intent.intent = "informational".to_string();
-                intent.confidence = intent.confidence.max(0.60);
-                let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-                let current_top = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-                intent.distribution.insert("informational".to_string(), (info_prob + current_top * 0.4).min(0.85));
-                let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
-                intent.distribution.insert("transactional".to_string(), tx_prob * 0.3);
-            }
-        }
-
     }
 
     let vector: Option<Vec<f32>> = match embed_res {
@@ -14660,35 +13669,6 @@ async fn handle_search(
                 eq.push(localized);
             }
             eq
-        } else {
-            expanded_queries
-        }
-    } else {
-        expanded_queries
-    };
-    // "show me" prefix strip for fresh-intent queries: when the query starts
-    // with "show me" and intent is fresh, the word "show" confuses upstream
-    // (SearXNG returns dictionary/definition pages for "Show"). Seed the
-    // expanded query set with the stripped variant so the retry fan-out
-    // fetches with clean terms (structural reformulation, not per-query literal).
-    let expanded_queries = if intent.intent == "fresh" {
-        let q_lc = q.to_lowercase();
-        let stripped = if let Some(rest) = q_lc.strip_prefix("show me ") {
-            Some(rest.trim().to_string())
-        } else if let Some(rest) = q_lc.strip_prefix("show us ") {
-            Some(rest.trim().to_string())
-        } else {
-            None
-        };
-        if let Some(s) = stripped {
-            if !s.is_empty() && !expanded_queries.iter().any(|eq| eq.eq_ignore_ascii_case(&s)) {
-                tracing::info!("FRESH SHOW-ME STRIP: '{}' -> '{}' (added to retry fan-out)", q, s);
-                let mut eq = expanded_queries;
-                eq.push(s);
-                eq
-            } else {
-                expanded_queries
-            }
         } else {
             expanded_queries
         }
@@ -14909,16 +13889,6 @@ async fn handle_search(
 
     // Count-based retry (no relevance needed yet — fires before Invidious/news/image)
     if (needs_more_results || has_contrastive_negatives) && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
-        // Compute recall-gap terms BEFORE web_results is moved into
-        // async closures. The temporary Vec from compute_recall_gap_terms
-        // is dropped by end of this block, so no borrow conflicts.
-        let recall_gap_terms: Vec<String> = {
-            if web_results.is_empty() {
-                Vec::new()
-            } else {
-                compute_recall_gap_terms(&q_trimmed, &web_results).unwrap_or_default()
-            }
-        };
         let mut retry_futs = Vec::new();
         let retry_timeout = Duration::from_secs(4); // shorter than initial 5s
         let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 6 } else { 3 };
@@ -14933,28 +13903,7 @@ async fn handle_search(
                 // For normal queries, only use VPN instance (SearXNG1) for speed.
                 if !only_negative && intent.structured_constraints.negative.is_empty() && inst_idx > 0 { continue; }
                 if circuit_ref.is_open(&retry_key) { continue; }
-                // Generic-verb drop: when recall_gap_terms contains a
-                // distinctive noun absent from ALL results, the query's
-                // generic verbs (e.g. "remove", "clean", "get") are
-                // polluting the upstream results. Drop them and re-fetch
-                // with only distinctive nouns so the engine returns the
-                // right pages instead of off-topic generic results.
-                let recall_gap = recall_gap_terms.clone();
-                let retry_eq = if !recall_gap.is_empty() {
-                    if let Some(dropped) = generic_verb_drop_variant(eq, &recall_gap) {
-                        if dropped.to_lowercase() != eq.to_lowercase() {
-                            tracing::info!("GENERIC_VERB_DROP: '{}' -> '{}' (recall_gap={:?})", eq, dropped, recall_gap);
-                            dropped
-                        } else {
-                            eq.clone()
-                        }
-                    } else {
-                        eq.clone()
-                    }
-                } else {
-                    eq.clone()
-                };
-                let retry_url = searxng_url(base_url, &preprocess_searxng_query(&retry_eq), geo_location.as_ref(), lang);
+                let retry_url = searxng_url(base_url, &clean_eq, geo_location.as_ref(), lang);
                 let client = client.clone();
                 let key = retry_key.clone();
                 let url_for_log = retry_url[..retry_url.find('?').unwrap_or(retry_url.len())].to_string();
@@ -15436,27 +14385,6 @@ async fn handle_search(
     }).count();
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
 
-    // P6 FRESH DATE FAIL-OPEN (gate at dated_result_count site): when NO
-    // merged web result carries a parseable date, the hard recency window
-    // can't meaningfully filter anything — clear it so recency stays a pure
-    // scoring boost (freshness half-life) and all results survive. Without
-    // this, a narrow window (e.g. "today" → single-day) combined with
-    // date-less upstream results drops dated-but-out-of-range items while
-    // the fail-open below (which counts dateless results as survivors)
-    // never triggers because dateless results always pass the window check.
-    // Keyed on dated_result_count == 0, not on any query/domain/window.
-    if intent.intent == "fresh" && dated_result_count == 0 {
-        if intent.structured_constraints.after_date.is_some()
-            || intent.structured_constraints.before_date.is_some()
-        {
-            tracing::info!(
-                "P6 FRESH DATE FAIL-OPEN: intent=fresh with 0 dated results — clearing hard recency window (recency stays scoring-only)"
-            );
-            intent.structured_constraints.after_date = None;
-            intent.structured_constraints.before_date = None;
-        }
-    }
-
     // FRESH/date fail-open (prevents 0-result collapse): the FRESH OVERRIDE may have
     // flagged this as a recency query, and should_filter_by_constraints DROPS any
     // result without a parseable date OR with a date outside the hard window.
@@ -15475,22 +14403,7 @@ async fn handle_search(
     let date_window_present = intent.structured_constraints.after_date.is_some()
         || intent.structured_constraints.before_date.is_some();
     if date_window_present && pre_filter_count > 0 {
-        // Fail-open case (A): NO merged web result carries a parseable date.
-        // The dry-run below counts date-less results as "surviving" (because
-        // should_filter_by_constraints keeps them), so when ALL results are
-        // date-less the survivor fraction is 1.0 and the window never clears.
-        // But a date window that cannot filter anything is structurally useless
-        // — recency should stay a pure scoring boost. Fail open immediately.
-        if dated_result_count == 0 {
-            tracing::info!(
-                "DATE WINDOW FAIL-OPEN (no dated results): {} web results, 0 carry a parseable date — clearing hard recency window (recency stays scoring-only)",
-                pre_filter_count
-            );
-            intent.structured_constraints.after_date = None;
-            intent.structured_constraints.before_date = None;
-        }
         // Dry-run the same date test should_filter_by_constraints applies.
-        else {
         let survivors_after_window = web_results.iter().filter(|r| {
             let mut ok = true;
             if let Some(ref ad) = intent.structured_constraints.after_date {
@@ -15517,46 +14430,19 @@ async fn handle_search(
         //     week" → 8/9 dropped, 1 survives = 11%). A near-empty result set is
         //     the same user-facing failure as a zero one: relevant, date-less
         //     results get discarded in favour of a single stale-but-dated item.
-        //     Fail-open when the surviving fraction is below a general 50% floor
+        //     Fail-open when the surviving fraction is below a general 25% floor
         //     AND the surviving count is too small to be useful (< 3). This is
         //     keyed on survival ratio, not on any query/window, so it stays general.
-        //     2026-09-04: threshold raised from 0.25 → 0.50 after "latest news about
-        //     chandrayaan 4 mission updates this week" returned 1/3 (0.33) and the
-        //     old 0.25 floor let the window stand, dropping 2/3 of relevant results.
         let survivor_fraction = if pre_filter_count > 0 {
             survivors_after_window as f32 / pre_filter_count as f32
         } else {
             1.0
         };
-        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.50;
+        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.25;
         if survivors_after_window == 0 || fraction_too_low {
             tracing::info!(
                 "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
                 pre_filter_count, survivors_after_window, survivor_fraction, dated_result_count
-            );
-            intent.structured_constraints.after_date = None;
-            intent.structured_constraints.before_date = None;
-        }
-        } // end else (dated_result_count > 0)
-    }
-
-    // FRESH-SMALL-SET FAIL-OPEN (structural, P6-class): when intent is fresh
-    // and the pre-merge result set is small (< 5), the date window should be
-    // a scoring boost, NOT a hard filter. For niche queries (e.g. "chandrayaan
-    // 4 mission updates this week"), upstream (SearXNG) returns few date-stamped
-    // items, and the hard filter collapses the set to near-zero even when the
-    // fail-open above didn't trigger (because enough results survived the window
-    // to keep the fraction above 50%). When the set is this small, dropping
-    // results for lacking a date is never the right call — recency should only
-    // influence ranking, not eligibility. Keyed on intent + set size, not on
-    // any query/domain/window — general and future-proof.
-    if intent.intent == "fresh" && pre_filter_count > 0 && pre_filter_count < 5 {
-        if intent.structured_constraints.after_date.is_some()
-            || intent.structured_constraints.before_date.is_some()
-        {
-            tracing::info!(
-                "FRESH-SMALL-SET FAIL-OPEN: intent=fresh with only {} pre-filter results — clearing hard date window (recency stays scoring-only)",
-                pre_filter_count
             );
             intent.structured_constraints.after_date = None;
             intent.structured_constraints.before_date = None;
@@ -15582,13 +14468,6 @@ async fn handle_search(
     // reported `structured_constraints` (that made `price_lt` come back `None`
     // while `applied_constraints` still said `price:<200` — a self-contradictory
     // response). Restored just before serialization below.
-    //
-    // CRITICAL: clone constraints BEFORE the PRICE FAIL-OPEN below clears
-    // intent.structured_constraints.price_*. The merge_local_and_web price-
-    // aware ranking block (line 8574) needs the original bound to apply
-    // budget crush/boost. If we clone after the clearing, the bound is gone
-    // and price ranking is a silent no-op.
-    let constraints_clone = intent.structured_constraints.clone();
     let price_bound_snapshot = (
         intent.structured_constraints.price_min,
         intent.structured_constraints.price_max,
@@ -15624,17 +14503,6 @@ async fn handle_search(
         let before_count = web_results.len();
         let constraints_ref = &intent.structured_constraints;
 
-        // Filter out grammar-noise negatives BEFORE violation counting.
-        // "getting overcharged" is a state description (auxiliary verb + adjective),
-        // not a topical exclusion — every car-dealership page mentions "getting
-        // overcharged" in passing, so hard-dropping on it collapses the result set.
-        // is_exclusion_grammar_noise already handles single-word function words
-        // ("have", "from"); this extends the same guard to multi-word phrases.
-        let effective_negatives: Vec<String> = constraints_ref.negative.iter()
-            .filter(|n| !is_exclusion_grammar_noise(n))
-            .cloned()
-            .collect();
-
         // Score each result and track violation counts
         let mut scored: Vec<(usize, f32, usize)> = web_results.iter().enumerate().map(|(i, r)| {
             let c_score = constraint_score(&r.title, &r.content, &r.url, constraints_ref);
@@ -15650,7 +14518,7 @@ async fn handle_search(
                 0
             } else {
                 let text = format!("{} {} {}", r.title.to_lowercase(), r.url.to_lowercase(), r.content.chars().take(300).collect::<String>());
-                effective_negatives.iter().filter(|n| {
+                constraints_ref.negative.iter().filter(|n| {
                     let n_lower = n.to_lowercase();
                     let n_words: Vec<&str> = n_lower.split_whitespace().collect();
                     if n_words.len() == 1 {
@@ -15956,6 +14824,7 @@ async fn handle_search(
     // Clone data for CPU-intensive scoring on blocking thread
     let q_clone = q.clone();
     let intent_clone = intent.intent.clone();
+    let constraints_clone = intent.structured_constraints.clone();
     let distribution_clone = intent.distribution.clone();
     let geo_clone = geo_location.clone();
     
@@ -16207,7 +15076,6 @@ async fn handle_search(
 // ranking falls back to the existing substring scorer (no behaviour change).
 let web_semantic = compute_web_semantic(&vector, &local_results, &web_results, &client).await;
 
-let tx_kws_for_merge = state.commerce_config.transactional_keywords.clone();
 let mut results = match tokio::task::spawn_blocking(move || {
     merge_local_and_web(
         local_results,
@@ -16218,7 +15086,6 @@ let mut results = match tokio::task::spawn_blocking(move || {
         Some(&distribution_clone),
         geo_clone.as_ref(),
         &web_semantic,
-        &tx_kws_for_merge,
     )
 }).await {
         Ok(r) => r,
@@ -16268,22 +15135,6 @@ let mut results = match tokio::task::spawn_blocking(move || {
             text_matches_negative(&title_lower, &nt.to_lowercase())
         });
         if has_neg_in_title {
-            // POSITIVE-OVERRIDE (2026-09-14): if the result matches a positive
-            // constraint, skip the title penalty — the negative term appears in
-            // a referential/comparison context (e.g. "Static Site Generators"
-            // guide mentioning "nextjs" among options). The graduated penalties
-            // in constraint_score handle demotion; crushing score to 0.01 here
-            // pushes relevant results below junk.
-            if !intent.structured_constraints.positive.is_empty() {
-                let pos_text = format!("{} {} {}", r.title.to_lowercase(), r.content.to_lowercase(), r.url.to_lowercase());
-                let matches_positive = intent.structured_constraints.positive.iter().any(|p| {
-                    let pl = p.to_lowercase();
-                    !pl.is_empty() && pos_text.contains(&pl)
-                });
-                if matches_positive {
-                    continue;
-                }
-            }
             let alt = is_alternative_listing_page(&r.title, &r.url, &r.content);
             if alt > 0.6 {
                 // Strong alt-listing page - no title penalty needed (constraint_score
@@ -16355,27 +15206,6 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 || title_lower.contains("migrate from");
             if genuine_alt {
                 return true;
-            }
-
-            // NEGATIVE FILTER POSITIVE-OVERRIDE (2026-09-14): if a result matches
-            // ANY positive constraint, keep it — the negative term may appear in
-            // a referential/comparison context (e.g. a "static site generators"
-            // guide that mentions "nextjs" among options). The graduated penalties
-            // in constraint_score (0.02 title / 0.25 content) handle demotion;
-            // hard-dropping every result that mentions the excluded term
-            // collapses recall for "X other than Y" / "X not Y" queries from
-            // 13→1 because most relevant pages mention the excluded term in
-            // passing. This applies only when positive constraints exist —
-            // negative-only queries still use the full hard filter.
-            if !intent.structured_constraints.positive.is_empty() {
-                let pos_text = format!("{} {} {}", r.title.to_lowercase(), r.content.to_lowercase(), r.url.to_lowercase());
-                let matches_positive = intent.structured_constraints.positive.iter().any(|p| {
-                    let pl = p.to_lowercase();
-                    !pl.is_empty() && pos_text.contains(&pl)
-                });
-                if matches_positive {
-                    return true;
-                }
             }
 
             let text = format!("{} {}", r.title, r.url);
@@ -16536,43 +15366,6 @@ let mut results = match tokio::task::spawn_blocking(move || {
             r.score += constraint_boost(&r.title, &r.content, &r.url, &intent.structured_constraints);
         }
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    }
-
-    // POST-RANKING NEGATIVE PENALTY: demote results whose title contains a
-    // negated term. After all scoring is complete, multiply the score of any
-    // result mentioning an excluded term by 0.3 so clean results (no negated
-    // term in title) outrank them. This is a pure presentation decoration —
-    // it does not affect relevance scoring, only final order. Without this,
-    // "alternative to google" surfaces Google-titled pages at #1 because
-    // they're about the topic, even though the user excluded the term.
-    if !intent.structured_constraints.negative.is_empty() && !results.is_empty() {
-        let neg_refs: Vec<&str> = intent.structured_constraints.negative
-            .iter().map(|s| s.as_str()).collect();
-        let mut any_demoted = false;
-        for r in results.iter_mut() {
-            let title_lower = r.title.to_lowercase();
-            let has_neg_in_title = neg_refs.iter().any(|n| {
-                let n_lower = n.to_lowercase();
-                let n_words: Vec<&str> = n_lower.split_whitespace().collect();
-                if n_words.len() == 1 {
-                    title_lower.split_whitespace().any(|tw| {
-                        let tw_clean: String = tw.chars().filter(|c| c.is_alphanumeric()).collect();
-                        let n_clean: String = n_lower.chars().filter(|c| c.is_alphanumeric()).collect();
-                        tw_clean == n_clean || tw_clean.starts_with(&n_clean)
-                    })
-                } else {
-                    let joined = n_words.join(" ");
-                    title_lower.contains(&joined)
-                }
-            });
-            if has_neg_in_title {
-                r.score *= 0.3;
-                any_demoted = true;
-            }
-        }
-        if any_demoted {
-            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        }
     }
 
     // Sanitize content and clamp final score for safe JSON serialization and API spec conformance.
@@ -16991,10 +15784,10 @@ let mut results = match tokio::task::spawn_blocking(move || {
         // Clone only the top-N ranked results into a JSON array we can enrich in
         // place. `serde_json::to_value` on `MergedResult` is lossless/Serialize.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
-                .iter()
-                .take(state.commerce_config.mainpath_top_n)
-                .filter_map(|r| serde_json::to_value(r).ok())
-                .collect();
+            .iter()
+            .take(COMMERCE_MAINPATH_TOP_N)
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect();
         if shop_arr.is_empty() {
             None
         } else {
@@ -17009,23 +15802,30 @@ let mut results = match tokio::task::spawn_blocking(move || {
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
-            // The `shopping` block is surfaced whenever commercial intent is
-            // detected. Every result carries `commerce_provenance` (attached by
-            // `enrich_with_commerce`) which honestly records whether structured
-            // product data was found on that URL (`source: null` => checked, nothing)
-            // — this is the honest presentation signal, not a gate. Results that
-            // exposed structured data additionally carry a `commerce` block; the
-            // frontend renders both cases (affiliate-decorated URL + optional facts).
-            // Read-only multi-merchant offer comparison from the attached facts.
-            let mut block = serde_json::json!({ "results": shop_arr });
-            if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                let comparisons = build_offer_comparisons(arr_ref);
-                if !comparisons.is_empty() {
-                    block["offer_comparisons"] =
-                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+            // ROADMAP item 7 (refinement): only surface the main-path `shopping`
+            // strip when at least one of the top-N ranked results actually exposed
+            // structured product data (a `commerce` block). A commercial-intent
+            // query whose top results are articles/reviews/guides with no product
+            // schema would otherwise render an empty strip of cards carrying only
+            // affiliate links — a low-value, link-farm-like surface that invites
+            // misuse of the affiliate thesis. Gating on a REAL `commerce` block
+            // keeps the block honest: it appears only when we have product facts to
+            // show. Pure post-enrichment signal, no query-specific logic, and the
+            // `results` ordering is untouched either way (no-manipulation holds).
+            if !shop_arr.iter().any(|r| r.get("commerce").is_some()) {
+                None
+            } else {
+                // Read-only multi-merchant offer comparison from the attached facts.
+                let mut block = serde_json::json!({ "results": shop_arr });
+                if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                    let comparisons = build_offer_comparisons(arr_ref);
+                    if !comparisons.is_empty() {
+                        block["offer_comparisons"] =
+                            serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+                    }
                 }
+                Some(block)
             }
-            Some(block)
         }
     } else {
         None
@@ -17697,7 +16497,6 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         price_lt,
         price_gt,
         ignored_constraints: None,
-        match_mode: MatchMode::Hard,
     }
 }
 
@@ -17868,45 +16667,18 @@ mod constraint_fix_tests {
             &c,
         );
         assert!(!fresh, "result dated 2025 should pass after:2024");
-            }
+    }
 
-            #[test]
-            fn fresh_small_set_date_window_is_scoring_not_filter() {
-                // FRESH-SMALL-SET FAIL-OPEN: when intent is fresh and the
-                // pre-merge set is small (< 5), the date window must NOT
-                // hard-filter results. The handle_search level clears the
-                // date window when pre_filter_count < 5, so dateless
-                // results are kept and recency stays a scoring-only boost.
-                // This test verifies the should_filter_by_constraints
-                // guarantee: dateless results pass through the date filter
-                // (the structural foundation on which the FRESH-SMALL-SET
-                // rule depends).
-                let mut c = Constraints::default();
-                c.after_date = Some("2025-09-01".to_string());
-                c.before_date = Some("2025-09-08".to_string());
-                // A result with no publish date — should NOT be filtered.
-                // (should_filter_by_constraints keeps dateless results by
-                // design — the fail-open for date-less results.)
-                let nodate = should_filter_by_constraints(
-                    "Chandrayaan 4 update",
-                    "ISRO prepares for Chandrayaan-4 lunar sample-return mission.",
-                    "https://example.com/chandrayaan4",
-                    None, // no published date
-                    &c,
-                );
-                assert!(!nodate, "dateless result must NOT be hard-filtered by date bounds");
-            }
-
-                #[test]
-                fn price_extraction_broadened() {
-                    assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
-                    assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
-                    assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
-                    assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
-                    assert_eq!(extract_price_from_text("no monetary value here"), None);
-                    assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
-                    assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
-                }
+    #[test]
+    fn price_extraction_broadened() {
+        assert_eq!(extract_price_from_text("Only $99 today"), Some(PriceInfo { amount: 99.0, currency: "USD".to_string() }));
+        assert_eq!(extract_price_from_text("Cost is €149.99"), Some(PriceInfo { amount: 149.99, currency: "EUR".to_string() }));
+        assert_eq!(extract_price_from_text("from 250 dollars"), Some(PriceInfo { amount: 250.0, currency: "USD".to_string() }));
+        assert_eq!(extract_price_from_text("price: 49"), Some(PriceInfo { amount: 49.0, currency: "USD".to_string() }));
+        assert_eq!(extract_price_from_text("no monetary value here"), None);
+        assert_eq!(extract_price_from_text("₹2,000 only"), Some(PriceInfo { amount: 2000.0, currency: "INR".to_string() }));
+        assert_eq!(extract_price_from_text("$10 - $20"), Some(PriceInfo { amount: 10.0, currency: "USD".to_string() }));
+    }
 
     #[test]
     fn rs_signal_no_false_positives() {
@@ -18232,6 +17004,41 @@ mod constraint_fix_tests {
         let oven_in_manner = omanner.iter().any(|t| t.contains("oven"));
         let oven_buckets = [oven_in_excl, oven_in_decl, oven_in_manner].iter().filter(|b| **b).count();
         assert_eq!(oven_buckets, 1, "oven must surface in exactly ONE bucket (transparency), got kept={:?} declined={:?} manner={:?}", okept, odeclined, omanner);
+    }
+
+    #[test]
+    fn negation_never_emits_empty_exclusion_on_compound_no_and_no() {
+        // REGRESSION (round 2026-08-31T1132Z): a no X and no Y / without X or Y
+        // compound finalised via a list connector (and/or) inside the collection
+        // loop leaves an EMPTY trailing compound; the post-loop finalise must NOT
+        // push an empty string as an exclusion. An empty not: substring-matches
+        // EVERY title, hard-drops ALL retrieved results, and collapses the query
+        // to 0 hits. General defect (any no A and no B phrasing), not a fluke.
+        for q in [
+            "how do I make a vegan chocolate mousse that uses no dairy and no gelatin",
+            "recipes with no nuts and no dairy",
+            "shoes without laces or without velcro",
+        ] {
+            let (kept, _declined, _manner) = extract_query_negative_terms_with_dropped(q);
+            assert!(
+                !kept.iter().any(|t| t.trim().is_empty()),
+                "empty exclusion must never be emitted (collapses query to 0): q={:?} kept={:?}",
+                q, kept
+            );
+            let joined = kept.join(" ");
+            match q {
+                "how do I make a vegan chocolate mousse that uses no dairy and no gelatin" => {
+                    assert!(joined.contains("dairy") && joined.contains("gelatin"), "legitimate exclusions must survive: q={:?} kept={:?}", q, kept);
+                }
+                "recipes with no nuts and no dairy" => {
+                    assert!(joined.contains("nuts") && joined.contains("dairy"), "legitimate exclusions must survive: q={:?} kept={:?}", q, kept);
+                }
+                "shoes without laces or without velcro" => {
+                    assert!(joined.contains("laces") && joined.contains("velcro"), "legitimate exclusions must survive: q={:?} kept={:?}", q, kept);
+                }
+                _ => {}
+            }
+        }
     }
 
     #[test]
@@ -18659,7 +17466,7 @@ mod hardcoding_ruling_tests {
             "Improve: verb /ɪmˈpruːv/ 1. : to make better",
         )];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &[]
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
         assert_eq!(out.len(), 1, "cambridge result should survive (capped, not dropped)");
         let r = &out[0];
@@ -18676,7 +17483,7 @@ mod hardcoding_ruling_tests {
             "adult content",
         )];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &[]
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
         assert_eq!(out.len(), 0, "adult result must be dropped for non-adult query (d04afbe safety)");
     }
@@ -18690,7 +17497,7 @@ mod hardcoding_ruling_tests {
             "adult content",
         )];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &[]
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
         assert_eq!(out.len(), 1, "adult result kept when query is explicitly adult");
     }
@@ -18713,7 +17520,7 @@ mod hardcoding_ruling_tests {
             quality: 0.8,
         }];
         let out = merge_local_and_web(
-            local, vec![], q, "informational", &cst(), None, None, &empty_sem(), &[]
+            local, vec![], q, "informational", &cst(), None, None, &empty_sem(),
         );
         assert_eq!(out.len(), 1, "substantive-term match should survive");
         let r = &out[0];
@@ -18738,7 +17545,7 @@ mod hardcoding_ruling_tests {
             quality: 0.6,
         }];
         let out = merge_local_and_web(
-            local, vec![], q, "informational", &cst(), None, None, &empty_sem(), &[]
+            local, vec![], q, "informational", &cst(), None, None, &empty_sem(),
         );
         // The off-topic page (mentions "vinegar" but not dishwasher context) should
         // be crushed since "clean" and "vinegar" are weak anchor words and it lacks
@@ -18766,7 +17573,7 @@ mod hardcoding_ruling_tests {
         );
         let web = vec![dict_result, article_result];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &[]
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
         assert!(out.len() >= 2, "both results should be present");
         // Find the dict result (capped to 0.03)
@@ -18818,7 +17625,7 @@ mod hardcoding_ruling_tests {
         );
         let web = vec![video_result, article_result];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &[]
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
         assert!(out.len() >= 2, "both results should be present");
         let video = out.iter().find(|r| r.sources.iter().any(|s| s == "invidious")).expect("video missing");
@@ -18850,7 +17657,7 @@ mod hardcoding_ruling_tests {
         );
         let web = vec![disambig, article];
         let out = merge_local_and_web(
-            vec![], web, q, "informational", &cst(), None, None, &empty_sem(), &[]
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
         // The disambiguation page should be capped (treated as dict-like for non-def query)
         // while the real article should not be capped
@@ -19355,6 +18162,124 @@ mod spellcheck_endpoint_tests {
             assert_eq!(eq[0].as_str(), Some("best sushi restaurants in new york"));
         }
 
+    // ── ROADMAP item 1 (increment): schema.org MICRODATA extraction ─────
+    // Third structured signal alongside JSON-LD and OpenGraph. Real Shopify/
+    // legacy product pages emit microdata with no JSON-LD — these tests prove
+    // honest facts are extracted from it, that a price range is never collapsed,
+    // and that a page with no product microdata yields all-null (no guessing).
+
+    // Realistic Shopify-style Product microdata fixture.
+    const HTML_MICRODATA: &str = r#"<!doctype html><html><head><title>Micro Widget</title></head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Micro Widget</span>
+  <span itemprop="sku">MW-007</span>
+  <span itemprop="gtin13">9876543210123</span>
+  <div itemprop="brand" itemscope itemtype="https://schema.org/Brand">
+    <span itemprop="name">MicroBrand</span>
+  </div>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">29.99</span>
+    <meta itemprop="priceCurrency" content="USD">
+    <link itemprop="availability" href="https://schema.org/InStock">
+    <link itemprop="itemCondition" href="https://schema.org/NewCondition">
+    <div itemprop="aggregateRating" itemscope itemtype="https://schema.org/AggregateRating">
+      <span itemprop="ratingValue">4.7</span>
+      <span itemprop="ratingCount">88</span>
+    </div>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_extracts_product_facts() {
+        let o = extract_commerce_offer(HTML_MICRODATA, "https://shop.example.com/mw");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(29.99), "price from itemprop=price");
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
+        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
+        assert_eq!(d.sku.as_deref(), Some("MW-007"));
+        assert_eq!(d.gtin.as_deref(), Some("9876543210123"));
+        assert_eq!(d.merchant.as_deref(), Some("MicroBrand"));
+        assert_eq!(d.rating, Some(4.7));
+        assert_eq!(d.rating_count, Some(88));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    // Multi-offer microdata (two prices) must surface range + count, never a
+    // silent single canonical price.
+    const HTML_MICRODATA_TWO: &str = r#"<!doctype html><html><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">15.00</span><meta itemprop="priceCurrency" content="USD">
+  </div>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">20.00</span><meta itemprop="priceCurrency" content="USD">
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_two_offers_surfaces_range_not_canonical() {
+        let o = extract_commerce_offer(HTML_MICRODATA_TWO, "https://shop.example.com/dual");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price_low, Some(15.00));
+        assert_eq!(d.price_high, Some(20.00));
+        assert_eq!(d.offer_count, Some(2));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(d.price, None, "must NOT collapse multiple microdata prices");
+    }
+
+    // A page with breadcrumb/structural microdata but NO product scope must not
+    // extract any product facts (no false positives from unrelated itemprops).
+    const HTML_MICRODATA_NO_PRODUCT: &str = r#"<!doctype html><html><body>
+<nav itemscope itemtype="https://schema.org/BreadcrumbList">
+  <span itemprop="name">Home</span>
+  <span itemprop="price">9.99</span>
+</nav>
+<p>This article mentions a price of $49.99 in body text but exposes no product microdata.</p>
+</body></html>"#;
+
+    #[test]
+    fn microdata_no_product_scope_is_all_null() {
+        let o = extract_commerce_offer(HTML_MICRODATA_NO_PRODUCT, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        // price inside a BreadcrumbList scope must NOT be treated as a product price.
+        assert_eq!(d.price, None);
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
+        assert_eq!(d.currency, None);
+        assert_eq!(d.sku, None);
+        assert_eq!(d.gtin, None);
+        // merchant falls back to the coarse host label (identifier, not a fact).
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    // Microdata must supplement but NOT overwrite a stronger JSON-LD signal.
+    #[test]
+    fn microdata_supplements_without_overwriting_jsonld() {
+        // Self-contained JSON-LD single-offer page (no dependency on the
+        // commerce_extraction_tests fixtures, since this block lives in an
+        // outer module). price = 49.99 USD.
+        let jsonld = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{ "@context": "https://schema.org/", "@type": "Product",
+  "name": "Acme Widget Pro",
+  "offers": { "@type": "Offer", "price": "49.99", "priceCurrency": "USD" } }
+</script></head><body></body></html>"#;
+        let html = format!("{}\n{}", jsonld, HTML_MICRODATA_TWO);
+        let o = extract_commerce_offer(&html, "https://shop.example.com/mix");
+        let d = o.data.as_ref().unwrap();
+        // JSON-LD is the primary signal and wins where it sets a field.
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+        // Fields JSON-LD left unset stay null (microdata prices were 15/20, but
+        // JSON-LD already set price=49.99 so microdata must NOT overwrite).
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
+    }
+
         #[test]
         fn intent_reports_local_signal_for_near_me() {
             // "near me" must set local_intent=true (drives /search geo-boost).
@@ -19583,216 +18508,129 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
     }
 
-    // ── Microdata extraction ───────────────────────────────────────────
-
-    const HTML_MICRODATA_PRODUCT: &str = r#"<!doctype html><html><head>
-<title>Microdata Product</title>
-</head><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <span itemprop="name">Microdata Widget</span>
-  <span itemprop="brand">WidgetCo</span>
-  <span itemprop="sku">MD-W-001</span>
-  <span itemprop="gtin13">9876543210987</span>
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price" content="29.99">29.99</span>
-    <span itemprop="priceCurrency" content="USD">USD</span>
-    <span itemprop="availability" content="https://schema.org/InStock">In Stock</span>
-    <span itemprop="itemCondition" content="https://schema.org/NewCondition">New</span>
-  </div>
-  <div itemprop="aggregateRating" itemscope itemtype="https://schema.org/AggregateRating">
-    <span itemprop="ratingValue" content="4.2">4.2</span>
-    <span itemprop="reviewCount" content="85">85</span>
-  </div>
-</div>
-</body></html>"#;
-
     #[test]
-    fn microdata_product_extracts_all_fields() {
-        let o = extract_commerce_offer(HTML_MICRODATA_PRODUCT, "https://md.example.com/p/1");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(29.99));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
-        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
-        assert_eq!(d.sku.as_deref(), Some("MD-W-001"));
-        assert_eq!(d.gtin.as_deref(), Some("9876543210987"));
-        assert_eq!(d.rating, Some(4.2));
-        assert_eq!(d.rating_count, Some(85));
-        assert_eq!(d.merchant.as_deref(), Some("WidgetCo"));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    const HTML_MICRODATA_NO_PRODUCT: &str = r#"<!doctype html><html><head>
-<title>Article Page</title>
-</head><body>
-<div itemscope itemtype="https://schema.org/Article">
-  <span itemprop="name">How to Build a Widget</span>
-  <span itemprop="author">Jane Doe</span>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn microdata_non_product_page_returns_null() {
-        // An Article (not Product/Offer) must NOT trigger microdata extraction.
-        let o = extract_commerce_offer(HTML_MICRODATA_NO_PRODUCT, "https://blog.example.com/post");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, None);
-        assert_eq!(d.currency, None);
-        assert_eq!(d.availability, None);
-        // merchant falls back to host
-        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
-        assert_eq!(o.source.as_deref(), None);
-    }
-
-    // ── RDFa extraction ────────────────────────────────────────────────
-
-    const HTML_RDFa_PRODUCT: &str = r#"<!doctype html><html><head>
-<title>RDFa Product</title>
-</head><body>
-<div vocab="https://schema.org/" typeof="Product">
-  <span property="name">RDFa Gadget</span>
-  <span property="brand">GadgetCo</span>
-  <span property="sku">RD-G-001</span>
-  <span property="gtin13">5554443332221</span>
-  <div property="offers" typeof="Offer">
-    <span property="price" content="149.99">149.99</span>
-    <span property="priceCurrency" content="EUR">EUR</span>
-    <span property="availability" content="https://schema.org/InStock">In Stock</span>
-    <span property="itemCondition" content="https://schema.org/NewCondition">New</span>
-  </div>
-  <div property="aggregateRating" typeof="AggregateRating">
-    <span property="ratingValue" content="4.8">4.8</span>
-    <span property="reviewCount" content="210">210</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn rdfa_product_extracts_all_fields() {
-        let o = extract_commerce_offer(HTML_RDFa_PRODUCT, "https://rdfa.example.com/p/1");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(149.99));
-        assert_eq!(d.currency.as_deref(), Some("EUR"));
-        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
-        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
-        assert_eq!(d.sku.as_deref(), Some("RD-G-001"));
-        assert_eq!(d.gtin.as_deref(), Some("5554443332221"));
-        assert_eq!(d.rating, Some(4.8));
-        assert_eq!(d.rating_count, Some(210));
-        assert_eq!(d.merchant.as_deref(), Some("GadgetCo"));
-        assert_eq!(o.source.as_deref(), Some("rdfa"));
-    }
-
-    const HTML_RDFa_FULL_URI: &str = r#"<!doctype html><html><head>
-<title>RDFa Full URI</title>
-</head><body>
-<div vocab="http://schema.org/" typeof="Product">
-  <span property="name">URI Product</span>
-  <span property="http://schema.org/price" content="99.99">99.99</span>
-  <span property="http://schema.org/priceCurrency" content="GBP">GBP</span>
-  <span property="http://schema.org/availability" content="http://schema.org/InStock">In Stock</span>
-  <span property="http://schema.org/brand">URI Brand</span>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn rdfa_full_schema_org_uri_works() {
-        // RDFa properties using full http://schema.org/ URI must also resolve.
-        let o = extract_commerce_offer(HTML_RDFa_FULL_URI, "https://uri.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(99.99));
-        assert_eq!(d.currency.as_deref(), Some("GBP"));
-        assert_eq!(d.availability.as_deref(), Some("http://schema.org/InStock"));
-        assert_eq!(d.merchant.as_deref(), Some("URI Brand"));
-        assert_eq!(o.source.as_deref(), Some("rdfa"));
-    }
-
-    const HTML_RDFa_NO_PRODUCT: &str = r#"<!doctype html><html><head>
-<title>Event Page</title>
-</head><body>
-<div vocab="https://schema.org/" typeof="Event">
-  <span property="name">Tech Conference 2026</span>
-  <span property="startDate" content="2026-06-15">June 15</span>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn rdfa_non_product_page_returns_null() {
-        // An Event (not Product/Offer) must NOT trigger RDFa extraction.
-        let o = extract_commerce_offer(HTML_RDFa_NO_PRODUCT, "https://events.example.com/conf");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, None);
-        assert_eq!(d.currency, None);
-        assert_eq!(d.availability, None);
-        assert_eq!(d.merchant.as_deref(), Some("events.example.com"));
-        assert_eq!(o.source.as_deref(), None);
-    }
-
-    // ── Priority order: JSON-LD > OG > microdata > RDFa ─────────────────
-
-    const HTML_JSONLD_AND_MICRODATA: &str = r#"<!doctype html><html><head>
-<title>Both JSON-LD and Microdata</title>
+    fn jsonld_extracts_product_name_and_sale_end_date() {
+        // ROADMAP item 1 (increment): the product `name` (e.g. "Acme Widget Pro")
+        // and the offer's `priceValidUntil` (ISO 8601 sale-end date) are extracted
+        // from the SAME typed structured node. Both must be present when the page
+        // exposes them and null when absent — never guessed from free text.
+        let html = r#"<!doctype html><html><head>
 <script type="application/ld+json">
 {
   "@context": "https://schema.org/",
   "@type": "Product",
-  "name": "Both Product",
+  "name": "Acme Widget Pro",
   "offers": {
     "@type": "Offer",
-    "price": "100.00",
+    "price": "49.99",
     "priceCurrency": "USD",
-    "availability": "https://schema.org/InStock",
-    "seller": {"@type": "Organization", "name": "JSON-LD Seller"}
+    "priceValidUntil": "2026-12-31"
   }
 }
-</script>
-</head><body>
+</script></head><body><h1>Acme Widget Pro</h1></body></html>"#;
+        let o = extract_commerce_offer(html, "https://store.example.com/p/1");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.name.as_deref(), Some("Acme Widget Pro"), "product name from JSON-LD");
+        assert_eq!(d.price_valid_until.as_deref(), Some("2026-12-31"), "sale end date from JSON-LD");
+        // Existing fields still extract correctly alongside new ones.
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+    }
+
+    #[test]
+    fn jsonld_missing_name_and_sale_date_stay_null() {
+        // A product page that exposes NO `name` and NO `priceValidUntil` must
+        // leave both null — we never guess them from any other field.
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "offers": {
+    "@type": "Offer",
+    "price": "9.99",
+    "priceCurrency": "USD"
+  }
+}
+</script></head><body><body></html>"#;
+        let o = extract_commerce_offer(html, "https://store.example.com/no-name");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.name, None, "no name in structured data => null");
+        assert_eq!(d.price_valid_until, None, "no priceValidUntil => null");
+        assert_eq!(d.price, Some(9.99));
+    }
+
+    #[test]
+    fn microdata_extracts_product_name_and_sale_end_date() {
+        // ROADMAP item 1 (increment): schema.org microdata `itemprop="name"` and
+        // `itemprop="priceValidUntil"` are extracted alongside the existing price/
+        // rating/sku fields. This exercises the parse_microdata path.
+        let html = r#"<!doctype html><html><head><title>Microdata Product</title></head><body>
 <div itemscope itemtype="https://schema.org/Product">
-  <span itemprop="name">Microdata Name</span>
-  <span itemprop="brand">Microdata Brand</span>
+  <span itemprop="name">Microdata Widget</span>
   <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price" content="200.00">200.00</span>
-    <span itemprop="priceCurrency" content="EUR">EUR</span>
+    <span itemprop="price">29.99</span>
+    <span itemprop="priceCurrency">EUR</span>
+    <time itemprop="priceValidUntil" datetime="2026-11-30">2026-11-30</time>
   </div>
 </div>
 </body></html>"#;
-
-    #[test]
-    fn jsonld_takes_priority_over_microdata() {
-        // When JSON-LD has a price, microdata must NOT override it.
-        let o = extract_commerce_offer(HTML_JSONLD_AND_MICRODATA, "https://both.example.com/p");
+        let o = extract_commerce_offer(html, "https://shop.example.com/md");
         let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(100.00), "JSON-LD price wins");
-        assert_eq!(d.currency.as_deref(), Some("USD"), "JSON-LD currency wins");
-        assert_eq!(d.merchant.as_deref(), Some("JSON-LD Seller"), "JSON-LD seller wins");
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
+        assert_eq!(d.name.as_deref(), Some("Microdata Widget"), "name from microdata");
+        assert_eq!(d.price_valid_until.as_deref(), Some("2026-11-30"), "sale end date from microdata");
+        assert_eq!(d.price, Some(29.99));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
     }
 
-    const HTML_OG_AND_RDFa: &str = r#"<!doctype html><html><head>
-<title>OG and RDFa</title>
-<meta property="og:title" content="OG Product">
-<meta property="product:price:amount" content="50.00">
-<meta property="product:price:currency" content="INR">
-<meta property="product:availability" content="in stock">
-<meta property="product:brand" content="OG Brand">
-</head><body>
-<div vocab="https://schema.org/" typeof="Product">
-  <span property="name">RDFa Name</span>
-  <span property="http://schema.org/price" content="75.00">75.00</span>
-  <span property="http://schema.org/priceCurrency" content="USD">USD</span>
-  <span property="http://schema.org/brand">RDFa Brand</span>
+    #[test]
+    fn microdata_missing_name_and_sale_date_stay_null() {
+        // A microdata product page with NO `itemprop="name"` and NO
+        // `itemprop="priceValidUntil"` leaves both null.
+        let html = r#"<!doctype html><html><head></head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">14.99</span>
+  </div>
 </div>
 </body></html>"#;
-
-    #[test]
-    fn og_takes_priority_over_rdfa() {
-        // When OG has a price, RDFa must NOT override it.
-        let o = extract_commerce_offer(HTML_OG_AND_RDFa, "https://og-rdfa.example.com/p");
+        let o = extract_commerce_offer(html, "https://shop.example.com/md-no-name");
         let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(50.00), "OG price wins");
-        assert_eq!(d.currency.as_deref(), Some("INR"), "OG currency wins");
-        assert_eq!(d.merchant.as_deref(), Some("OG Brand"), "OG brand wins");
-        assert_eq!(o.source.as_deref(), Some("og"));
+        assert_eq!(d.name, None);
+        assert_eq!(d.price_valid_until, None);
+        assert_eq!(d.price, Some(14.99));
+    }
+
+    #[tokio::test]
+    async fn name_and_sale_date_preserved_in_enrichment_order_invariance() {
+        // The mandatory order-invariance test must still pass after adding the
+        // new fields: enrichment with the new fields populated never reorders
+        // ranked results (the whole no-manipulation guarantee).
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://a.example.com/x", "score": 9.0 }),
+        ];
+        let fake_html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Widget",
+  "offers": {"@type": "Offer", "price": "10.00", "priceValidUntil": "2026-12-31"}
+}
+</script></head><body></body></html>"#;
+        let h = fake_html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        assert_eq!(r["url"], "https://a.example.com/x", "order preserved");
+        let c = r.get("commerce").expect("commerce block attached");
+        assert_eq!(c["data"]["name"], "Widget");
+        assert_eq!(c["data"]["price_valid_until"], "2026-12-31");
+        assert_eq!(c["data"]["price"], 10.00);
     }
 
     // ── ROADMAP item 3: monetization MUST NOT affect ranking/order ────────────
@@ -19909,227 +18747,28 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!is_commercial_intent("informational", &dist, false));
     }
 
-    // ── Main-path `shopping` block is always present on commercial intent ──
-    // The `any_commerce` presentation gate was removed: the `shopping` block is
-    // now surfaced whenever commercial intent is detected, even if no upstream
-    // page exposed structured product data. Every result carries
-    // `commerce_provenance` (`source: null` => "we checked, nothing") which is the
-    // honest presentation signal. These tests lock that the block is non-empty
-    // and always present when intent is commercial.
-
     #[test]
-    fn shopping_block_present_even_when_no_result_has_commerce() {
-        // Simulate an enriched top-N where NONE of the results carry a commerce
-        // block (all upstream pages lacked structured product data). The shopping
-        // block is STILL surfaced — commerce_provenance on each result is the
-        // honest "checked, found nothing" signal.
-        let shop_arr: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
-            serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0 }),
+    fn has_any_commerce_block_gates_on_real_facts() {
+        // ROADMAP item 7 refinement: the main-path /search `shopping` strip must
+        // only surface when at least one top result actually carries a REAL
+        // `commerce` block (a page that exposed structured product data). A strip
+        // of pure affiliate links over article/review results is a low-value,
+        // link-farm-like surface that misuses the affiliate thesis. This test
+        // locks the gate predicate itself (the live path also exercises it via
+        // the order-invariance + no-query-leak contract tests).
+        let with_fact = vec![
+            serde_json::json!({ "url": "https://store.example/p/1", "commerce": { "data": { "merchant": "Example" }, "source": "json-ld", "observed_at": "1", "url": "https://store.example/p/1" } }),
+            serde_json::json!({ "url": "https://review.example/a", "commerce_provenance": { "url": "https://review.example/a", "observed_at": "1", "source": null, "data": null } }),
         ];
-        // The block is built from the enriched array directly — it is non-empty
-        // (has results) even without commerce facts.
-        assert!(!shop_arr.is_empty(), "shopping block must have results");
-        // And every result would carry commerce_provenance (attached by
-        // enrich_with_commerce) — here we just assert the block is present.
-        let block = serde_json::json!({ "results": shop_arr });
-        assert!(block.get("results").is_some(), "shopping block present on commercial intent");
-    }
+        assert!(has_any_commerce_block(&with_fact));
 
-    #[test]
-    fn shopping_block_present_when_at_least_one_result_has_commerce() {
-        // At least one enriched result carries a real commerce block (page had
-        // structured product data) => the shopping block is surfaced (same as
-        // before, but now the gate is unconditional on commerce presence).
-        let shop_arr: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
-            serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0, "commerce": { "price": 49.99, "currency": "USD" } }),
+        // No `commerce` key anywhere => no strip, even though commerce_provenance
+        // (which is always attached) is present.
+        let without_fact = vec![
+            serde_json::json!({ "url": "https://guide.example/how-to" }),
+            serde_json::json!({ "url": "https://review.example/a", "commerce_provenance": { "url": "https://review.example/a", "observed_at": "1", "source": null, "data": null } }),
         ];
-        let has_commerce = shop_arr
-            .iter()
-            .any(|r| r.get("commerce").map(|v| !v.is_null()).unwrap_or(false));
-        assert!(has_commerce, "one commerce block present");
-        let block = serde_json::json!({ "results": shop_arr });
-        assert!(block.get("results").is_some(), "shopping block present");
-    }
-
-    #[test]
-    fn shopping_block_present_even_when_commerce_is_null() {
-        // A result with `"commerce": null` (explicitly absent) still yields a
-        // present shopping block — commerce_provenance is the honest signal.
-        let shop_arr: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0, "commerce": serde_json::Value::Null }),
-        ];
-        assert!(!shop_arr.is_empty(), "shopping block has results even with null commerce");
-        let block = serde_json::json!({ "results": shop_arr });
-        assert!(block.get("results").is_some(), "shopping block present");
-    }
-
-    // ── ROADMAP item B: product image extraction ─────────────────────────
-    // The extractor must pull the product image URL from structured sources:
-    // JSON-LD `image` (string, array, or ImageObject), OpenGraph `og:image`,
-    // microdata `itemprop="image"` (content + href/src), and RDFa `property="image"`.
-    // Always from typed data — never guessed from free text.
-
-    const HTML_JSONLD_IMAGE: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Image Product",
-  "image": "https://cdn.example.com/product.jpg",
-  "offers": {
-    "@type": "Offer",
-    "price": "49.99",
-    "priceCurrency": "USD"
-  }
-}
-</script>
-</head><body></body></html>"#;
-
-    #[test]
-    fn jsonld_image_string_url_is_extracted() {
-        let o = extract_commerce_offer(HTML_JSONLD_IMAGE, "https://img.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/product.jpg"));
-        assert_eq!(d.price, Some(49.99));
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-    }
-
-    const HTML_JSONLD_IMAGE_ARRAY: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Multi Image",
-  "image": ["https://cdn.example.com/a.jpg", "https://cdn.example.com/b.jpg"],
-  "offers": { "@type": "Offer", "price": "29.99", "priceCurrency": "EUR" }
-}
-</script>
-</head><body></body></html>"#;
-
-    #[test]
-    fn jsonld_image_array_takes_first() {
-        let o = extract_commerce_offer(HTML_JSONLD_IMAGE_ARRAY, "https://multi.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/a.jpg"));
-    }
-
-    const HTML_JSONLD_IMAGE_OBJECT: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "ImageObject Product",
-  "image": { "@type": "ImageObject", "url": "https://cdn.example.com/imgobj.jpg" },
-  "offers": { "@type": "Offer", "price": "19.99", "priceCurrency": "GBP" }
-}
-</script>
-</head><body></body></html>"#;
-
-    #[test]
-    fn jsonld_image_object_url_is_extracted() {
-        let o = extract_commerce_offer(HTML_JSONLD_IMAGE_OBJECT, "https://obj.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/imgobj.jpg"));
-    }
-
-    const HTML_OG_IMAGE: &str = r#"<!doctype html><html><head>
-<title>OG Image</title>
-<meta property="og:image" content="https://og.example.com/photo.jpg">
-<meta property="product:price:amount" content="99.99">
-<meta property="product:price:currency" content="INR">
-</head><body></body></html>"#;
-
-    #[test]
-    fn og_image_is_extracted() {
-        let o = extract_commerce_offer(HTML_OG_IMAGE, "https://ogimg.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://og.example.com/photo.jpg"));
-        assert_eq!(d.price, Some(99.99));
-        assert_eq!(o.source.as_deref(), Some("og"));
-    }
-
-    const HTML_MICRODATA_IMAGE_HREF: &str = r#"<!doctype html><html><head>
-<title>Microdata Link Image</title>
-</head><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <span itemprop="name">Link Image Product</span>
-  <link itemprop="image" href="https://md.example.com/photo.jpg">
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price" content="39.99">39.99</span>
-    <span itemprop="priceCurrency" content="USD">USD</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn microdata_image_href_attribute_is_extracted() {
-        let o = extract_commerce_offer(HTML_MICRODATA_IMAGE_HREF, "https://mdhref.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://md.example.com/photo.jpg"));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    const HTML_RDFa_IMAGE: &str = r#"<!doctype html><html><head>
-<title>RDFa Image</title>
-</head><body>
-<div vocab="https://schema.org/" typeof="Product">
-  <span property="name">RDFa Image Product</span>
-  <span property="image" content="https://rdfa.example.com/photo.jpg">photo</span>
-  <div property="offers" typeof="Offer">
-    <span property="price" content="59.99">59.99</span>
-    <span property="priceCurrency" content="USD">USD</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn rdfa_image_content_attribute_is_extracted() {
-        let o = extract_commerce_offer(HTML_RDFa_IMAGE, "https://rdfaimg.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://rdfa.example.com/photo.jpg"));
-        assert_eq!(o.source.as_deref(), Some("rdfa"));
-    }
-
-    const HTML_NO_IMAGE: &str = r#"<!doctype html><html><head>
-<title>No Image Product</title>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "No Image Product",
-  "offers": { "@type": "Offer", "price": "9.99", "priceCurrency": "USD" }
-}
-</script>
-</head><body></body></html>"#;
-
-    #[test]
-    fn product_without_image_has_null_image() {
-        let o = extract_commerce_offer(HTML_NO_IMAGE, "https://noimg.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image, None);
-        assert_eq!(d.price, Some(9.99));
-    }
-
-    const HTML_ARTICLE_NO_IMAGE: &str = r#"<!doctype html><html><head>
-<title>Article Page</title>
-</head><body>
-<div itemscope itemtype="https://schema.org/Article">
-  <span itemprop="name">How to Build a Widget</span>
-  <span itemprop="author">Jane Doe</span>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn non_product_page_never_extracts_image() {
-        let o = extract_commerce_offer(HTML_ARTICLE_NO_IMAGE, "https://blog.example.com/post");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image, None);
-        assert_eq!(d.price, None);
-        // merchant falls back to host
-        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
-        assert_eq!(o.source.as_deref(), None);
+        assert!(!has_any_commerce_block(&without_fact));
     }
 
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
@@ -20154,7 +18793,6 @@ structured product data, so nothing must be extracted from the body.</p></body><
             param_env: HashMap::new(),
             bid_floor: None,
             fallback_url: None,
-            bid_check_url: None,
         }
     }
 
@@ -20286,36 +18924,5 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!out.contains("q="), "no query text");
         assert!(!out.contains("user"), "no user id");
         assert!(!out.contains("ip="), "no ip");
-    }
-
-    // ── Post-ROADMAP: CommerceConfig is data-driven ─────────────────────
-    // The main-path `shopping` block's top-N presentation cap must be
-    // configurable via `data/commerce/config.json` (mainpath_top_n) WITHOUT
-    // recompile. These tests lock that contract.
-
-    #[test]
-    fn commerce_config_default_top_n_is_8() {
-        // When the data file is absent/missing the field, the default is 8.
-        // (Offline test: no data file in the test cwd => default.)
-        let cfg = CommerceConfig { mainpath_top_n: 8, transactional_keywords: vec![] };
-        assert_eq!(cfg.mainpath_top_n, 8, "default top-N is 8");
-    }
-
-    #[test]
-    fn commerce_config_can_be_set_to_a_different_value() {
-        // A new value (e.g. 12) can be set by editing the data file — no
-        // code change, no recompile. This test simulates what the loader
-        // would produce after reading `{"mainpath_top_n": 12}`.
-        let cfg = CommerceConfig { mainpath_top_n: 12, transactional_keywords: vec![] };
-        assert_eq!(cfg.mainpath_top_n, 12, "top-N is data-driven");
-    }
-
-    #[test]
-    fn commerce_config_zero_top_n_means_no_shopping_block() {
-        // Edge case: mainpath_top_n = 0 means the shopping block is never
-        // surfaced (the take(0) yields an empty array => None). This is a
-        // valid "off" setting — proves the value is honored as a cap.
-        let cfg = CommerceConfig { mainpath_top_n: 0, transactional_keywords: vec![] };
-        assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
     }
 }
