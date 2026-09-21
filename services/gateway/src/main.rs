@@ -20146,7 +20146,10 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn commerce_config_default_top_n_is_8() {
         // When the data file is absent/missing the field, the default is 8.
         // (Offline test: no data file in the test cwd => default.)
-        let cfg = CommerceConfig { mainpath_top_n: 8 };
+        let cfg = CommerceConfig {
+            mainpath_top_n: 8,
+            transactional_keywords: Vec::new(),
+        };
         assert_eq!(cfg.mainpath_top_n, 8, "default top-N is 8");
     }
 
@@ -20155,7 +20158,10 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // A new value (e.g. 12) can be set by editing the data file — no
         // code change, no recompile. This test simulates what the loader
         // would produce after reading `{"mainpath_top_n": 12}`.
-        let cfg = CommerceConfig { mainpath_top_n: 12 };
+        let cfg = CommerceConfig {
+            mainpath_top_n: 12,
+            transactional_keywords: Vec::new(),
+        };
         assert_eq!(cfg.mainpath_top_n, 12, "top-N is data-driven");
     }
 
@@ -20164,7 +20170,10 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // Edge case: mainpath_top_n = 0 means the shopping block is never
         // surfaced (the take(0) yields an empty array => None). This is a
         // valid "off" setting — proves the value is honored as a cap.
-        let cfg = CommerceConfig { mainpath_top_n: 0 };
+        let cfg = CommerceConfig {
+            mainpath_top_n: 0,
+            transactional_keywords: Vec::new(),
+        };
         assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
     }
 }
