@@ -515,7 +515,6 @@ impl SymSpellIndex {
         if !word_lower.is_ascii() {
             return None;
         }
-        let input_code = DoubleMetaphone::default().encode(&word_lower);
         let dmeta = DoubleMetaphone::default();
         let input_code = dmeta.encode(&word_lower);
         let input_alt = dmeta.encode_alternate(&word_lower);
@@ -530,8 +529,8 @@ impl SymSpellIndex {
             }
         }
 
-        let mut best: Option<(u32, f64, usize)> = None; // (word_id, freq, edit_dist)
-        for &word_id in candidate_ids {
+        let mut best: Option<(u32, f64, usize)> = None;
+        for &word_id in &all_candidates {
             let dict_word = &self.words[word_id as usize];
             let freq = self.frequencies[word_id as usize];
             // Guard 3: candidate must be a common word
