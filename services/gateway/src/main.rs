@@ -18,6 +18,7 @@ mod geoloc;
 mod dictionary;
 mod clean;
 mod goals;
+mod multi_hop;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
 // ─── API Types ───────────────────────────────────────────────────────
@@ -186,6 +187,21 @@ fn normalize_currency_str(s: &str) -> String {
     } else {
         "USD".to_string()
     }
+}
+
+fn is_model_number_price_query(q_lower: &str) -> bool {
+    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let model_re = MODEL_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+\d{1,2}").unwrap()
+    });
+    let has_model = model_re.is_match(q_lower);
+    let has_price = q_lower.contains("price") || q_lower.contains("cost")
+        || q_lower.contains("rupee") || q_lower.contains("rupees")
+        || q_lower.contains("inr") || q_lower.contains('₹')
+        || q_lower.contains("dollar") || q_lower.contains("dollars")
+        || q_lower.contains("budget") || q_lower.contains("cheap")
+        || q_lower.contains("pricing");
+    has_model && has_price
 }
 
 fn has_price_signal(title_lower: &str, content_lower: &str) -> bool {
@@ -12342,9 +12358,33 @@ async fn handle_search(
         q_trimmed.to_string()
     };
     let q_orig = q_trimmed.to_string(); // original, untouched query for intent/constraints
-    let q_encoded = urlencoding::encode(&q);
 
-    // Extract client IP for geolocation (from X-Forwarded-For or X-Real-IP headers)
+    // 0d. Multi-hop factoid resolution: if the query requires resolving an
+    // inner question first (e.g. "capital of the country that hosted 2024
+    // olympics" → resolve "country that hosted 2024 olympics" → "France" →
+    // rewrite to "capital of France"), do it now BEFORE the main fan-out.
+    // This is a blocking call with a tight timeout — only fires on clear
+    // factoid patterns (looks_like_multi_hop fast-check).
+    if multi_hop::looks_like_multi_hop(&q) {
+        if let Some((inner_query, rewrite_fn)) = multi_hop::detect_multi_hop(&q) {
+            tracing::info!("MULTI-HOP: detected factoid query, inner: '{}'", inner_query);
+            // Use the first SearXNG instance for resolution
+            let searx_base = "http://127.0.0.1:8080";
+            match multi_hop::resolve_inner_query(searx_base, &inner_query) {
+                Some(resolved_entity) => {
+                    let rewritten = rewrite_fn(&resolved_entity);
+                    tracing::info!("MULTI-HOP: resolved '{}' → rewriting query to '{}'",
+                        resolved_entity, rewritten);
+                    q = rewritten;
+                }
+                None => {
+                    tracing::warn!("MULTI-HOP: failed to resolve inner query '{}', proceeding with original", inner_query);
+                }
+            }
+        }
+    }
+
+    let q_encoded = urlencoding::encode(&q);
     let client_ip: Option<IpAddr> = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
@@ -13528,6 +13568,24 @@ async fn handle_search(
                         q, intent.intent, intent.confidence
                     );
                 }
+                intent.intent = "transactional".to_string();
+                intent.confidence = intent.confidence.max(0.80);
+                let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
+                intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
+            }
+        }
+
+        // Override 7: Model-number + price/cost terms → transactional
+        // The classifier misses model-number patterns ("iphone 16 pro max price",
+        // "oneplus 12 price") — the word "price" alone is weak signal. When a known
+        // brand+model pattern co-occurs with a price/cost term, the intent is
+        // decisively transactional (P10/P11 style compensation for the linear probe).
+        if is_model_number_price_query(&q_lower) {
+            if intent.intent != "transactional" || intent.confidence < 0.60 {
+                tracing::info!(
+                    "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
+                    q, intent.intent, intent.confidence
+                );
                 intent.intent = "transactional".to_string();
                 intent.confidence = intent.confidence.max(0.80);
                 let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
