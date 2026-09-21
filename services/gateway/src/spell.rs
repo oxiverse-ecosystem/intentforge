@@ -354,18 +354,14 @@ impl SymSpellIndex {
         // KNOWN-MISSPELLING SEED probe: seeds are explicitly in the dictionary
         // to be corrected (e.g. "cancing" at freq 0.0010). SymSpell may find a
         // dist-1 candidate (e.g. "dancing") that wins over a dist-3 phonetic
-        // correction (e.g. "cancelling", freq 0.100). For seeds, try phonetic
-        // fallback and accept it when it's higher frequency than the SymSpell
-        // candidate — even at dist 1, because the seed was explicitly added to
-        // be corrected to its proper form.
-        if self.is_known_misspelling(word) {
+        // correction (e.g. "cancelling", freq 0.100). For seeds, prefer the
+        // phonetic fallback when it returns a result — the seed was explicitly
+        // placed to guide correction, and the phonetic path uses pronunciation
+        // matching which is more accurate than edit-distance spelling matching.
+        if is_known_misspelling_seed {
             let phonetic = self.phonetic_fallback(word);
-            if let Some(ref p) = phonetic {
-                let p_freq = self.exact_map.get(p.as_str()).map(|&id| self.frequencies[id as usize]).unwrap_or(0.0);
-                let best_freq = self.exact_map.get(best.as_str()).map(|&id| self.frequencies[id as usize]).unwrap_or(0.0);
-                if p_freq > best_freq {
-                    return Some(p.clone());
-                }
+            if phonetic.is_some() {
+                return phonetic;
             }
         }
 
