@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use tower_http::timeout::TimeoutLayer;
 use axum::http::HeaderMap;
 use std::net::IpAddr;
-use futures::StreamExt;
 
 mod spell;
 mod geoloc;
@@ -544,10 +543,6 @@ struct UnifiedResponse {
     /// Human-readable diagnostics (empty result set, upstream flakiness hints, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     warnings: Option<Vec<String>>,
-    /// FIX-IF-03: when upstream was flaky/timeout and we surfaced partial results
-    /// from a numeric-relaxed fallback query, this flag tells the client to retry.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    partial_results: bool,
     /// Web result count before any constraint filtering.
     #[serde(skip_serializing_if = "Option::is_none")]
     results_before_filter: Option<usize>,
@@ -3829,117 +3824,6 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.rating.is_some()
 }
 
-/// Parallel enrichment variant: runs up to `N` fetches concurrently so the main
-/// `/search` path can complete within the global TimeoutLayer budget (30s).
-/// With sequential enrichment, 8 results at ~4.5s each = 36s > 30s, which silently
-/// drops the entire `shopping` block. Bounded parallelism (4 at a time, 22s total
-/// cap) brings worst-case to ~9-11s.
-///
-/// Same order-invariance contract: operates on a mutable slice of ranked results,
-/// attaches `commerce`/`commerce_provenance` in place. Order is preserved.
-async fn enrich_with_commerce_par<F, Fut>(
-    results: &mut [serde_json::Value],
-    max_concurrent: usize,
-    total_timeout_ms: u64,
-    fetch: F,
-) where
-    F: Fn(String) -> Fut + Clone,
-    Fut: std::future::Future<Output = Option<String>>,
-{
-    let fetches: Vec<_> = results
-        .iter_mut()
-        .filter(|r| r.is_object() && r.get("commerce").is_none())
-        .map(|r| {
-            let url = r
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let provenance = serde_json::json!({
-                "url": url,
-                "observed_at": now_unix_string(),
-                "source": null,
-                "data": null,
-            });
-            (url, provenance, fetch.clone())
-        })
-        .collect();
-
-    if fetches.is_empty() {
-        return;
-    }
-
-    let stream = futures::stream::iter(fetches.into_iter().map(
-        |(url, provenance, fetch_clone)| async move {
-            let html = fetch_clone(url.clone()).await;
-            (url, html, provenance)
-        },
-    ))
-    .buffer_unordered(max_concurrent);
-
-    let capped = tokio::time::timeout(
-        std::time::Duration::from_millis(total_timeout_ms),
-        stream.collect::<Vec<_>>(),
-    )
-    .await;
-
-    let results_back = match capped {
-        Ok(v) => v,
-        Err(_) => {
-            // Timeout: attach provenance (no commerce) to remaining and return
-            for r in results.iter_mut() {
-                if r.is_object() && r.get("commerce_provenance").is_none() {
-                    if let Some(url) = r.get("url").and_then(|v| v.as_str()) {
-                        r["commerce_provenance"] = serde_json::json!({
-                            "url": url,
-                            "observed_at": now_unix_string(),
-                            "source": null,
-                            "data": null,
-                        });
-                    }
-                }
-            }
-            return;
-        }
-    };
-
-    // Attach results back into the original slice
-    for (url, html_opt, provenance) in results_back {
-        let url_str = url.clone();
-        if let Some(r) = results
-            .iter_mut()
-            .find(|r| r.get("url").and_then(|v| v.as_str()) == Some(&url_str))
-        {
-            if r.get("commerce").is_some() {
-                // Already enriched by earlier sequential path — skip
-                if r.get("commerce_provenance").is_none() {
-                    r["commerce_provenance"] = provenance;
-                }
-                continue;
-            }
-            match html_opt {
-                Some(h) => {
-                    let offer: CommerceOffer = extract_commerce_offer(&h, &url_str);
-                    if offer
-                        .data
-                        .as_ref()
-                        .map(|d| data_has_fact(d))
-                        .unwrap_or(false)
-                    {
-                        if let Ok(v) = serde_json::to_value(&offer) {
-                            r["commerce"] = v;
-                        }
-                    }
-                    r["commerce_provenance"] = provenance;
-                }
-                None => {
-                    r["commerce_provenance"] = provenance;
-                }
-            }
-        }
-    }
-}
-
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
 /// page exposed structured product data, attached by `enrich_with_commerce`).
 /// Powers the main-path `shopping` gate: the strip is only surfaced when at
@@ -3955,15 +3839,6 @@ fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
 /// touched, so this number cannot affect ranking or selection. Data-free: tuning
 /// it only changes how many enriched shopping cards show, never their order.
 const COMMERCE_MAINPATH_TOP_N: usize = 8;
-
-/// Parallelism for the main-path shopping enrichment. With 4 concurrent fetches
-/// and ~4.5s per fetch, 8 results complete in ~9-11s worst-case, well under
-/// the 30s TimeoutLayer. Bounded so we don't saturate the upstream HTTP client.
-const COMMERCE_MAINPATH_PAR_CONCURRENT: usize = 4;
-/// Hard cap on total wall-time for the parallel enrichment pass. The
-/// TimeoutLayer is 30s; we must finish well before it so the rest of the
-/// response (affiliate decoration, offer comparison) still runs.
-const COMMERCE_MAINPATH_TIMEOUT_MS: u64 = 22000;
 
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
@@ -6924,7 +6799,12 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     break;
                 }
                 // Greedily collect the entity, stopping at a price op / new lead-in /
-                // trailing stopword once we already have a head.
+                // trailing stopword once we already have a head. Split on "or"/"and"
+                // list connectors so each target becomes its own exclusion — the same
+                // compound-splitting pattern as extract_query_negative_terms_with_dropped.
+                // Without this, "without oven or microwave" yielded the single compound
+                // "oven or microwave", which substring-matches no page title/content and
+                // silently let "Best Microwaves" rank #1.
                 let mut ent: Vec<String> = Vec::new();
                 while idx < words.len() && ent.len() < 5 {
                     let w = words[idx];
@@ -6940,6 +6820,18 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     }
                     if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
                         break; // trailing stopword ends the entity
+                    }
+                    // List connector ("or"/"and"/",") between exclusion targets: the
+                    // current target is finalised and pushed, then we start a new one.
+                    let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
+                    if !ent.is_empty() && (bare == "or" || bare == "and") {
+                        let entity = ent.join(" ");
+                        if !out.contains(&entity) {
+                            out.push(entity);
+                        }
+                        ent.clear();
+                        idx += 1;
+                        continue;
                     }
                     ent.push(wc);
                     idx += 1;
@@ -7453,65 +7345,6 @@ fn keyphrase_relax_variant(query: &str) -> Option<String> {
     }
 
     Some(filtered.join(" "))
-}
-
-
-// ─── Numeric Constraint Relaxation ─────────────────────────────────
-/// Strip numeric budget/amount constraints from a query to boost recall.
-/// Queries like "how to start a small business with less than 50000 rupees in india"
-/// often return 0-3 results because the numeric constraint over-narrows upstream.
-/// This function strips numeric tokens, comparison words, and currency terms while
-/// preserving the topical core. Data-driven — no per-query literals.
-fn numeric_constraint_relaxation(query: &str) -> Option<String> {
-    let q_lower = query.to_lowercase();
-    if !q_lower.split_whitespace().any(|w| w.chars().any(|c| c.is_ascii_digit())) {
-        return None;
-    }
-    if q_lower.contains("site:") || q_lower.contains("filetype:") || q_lower.contains("price:") {
-        return None;
-    }
-    const NUMERIC_SIGNAL_WORDS: &[&str] = &[
-        "less", "more", "under", "over", "above", "below", "between",
-        "than", "from", "about", "around", "approximately", "nearly",
-        "almost", "least", "most", "only", "up", "to", "and", "or",
-        "rs", "rs.", "rupee", "rupees", "inr", "dollar", "dollars",
-        "usd", "euro", "euros", "eur", "pound", "pounds", "gbp",
-        "yen", "jpy", "lakh", "lakhs", "crore", "crores",
-    ];
-    let words: Vec<&str> = query.split_whitespace().collect();
-    let filtered: Vec<&str> = words.iter()
-        .filter(|w| {
-            let wl = w.to_lowercase();
-            if w.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') {
-                return false;
-            }
-            if w.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-                return false;
-            }
-            if NUMERIC_SIGNAL_WORDS.contains(&wl.as_str()) {
-                return false;
-            }
-            if wl == "₹" || wl == "$" || wl == "€" || wl == "£" || wl == "¥" {
-                return false;
-            }
-            true
-        })
-        .copied()
-        .collect();
-    if filtered.len() < 2 || filtered.len() == words.len() {
-        return None;
-    }
-    let relaxed = filtered.join(" ");
-    if relaxed.trim().len() < 3 {
-        return None;
-    }
-    Some(relaxed)
-}
-
-/// True if the query carries a numeric constraint that may over-narrow recall.
-fn has_numeric_constraint(query: &str) -> bool {
-    let q_lower = query.to_lowercase();
-    q_lower.split_whitespace().any(|w| w.chars().any(|c| c.is_ascii_digit()))
 }
 
 
@@ -12282,7 +12115,6 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         applied_constraints: None,
         ignored_constraints: None,
         warnings: None,
-        partial_results: false,
         results_before_filter: None,
         results_after_filter: None,
         total: None,
@@ -13966,7 +13798,7 @@ async fn handle_search(
     // (BERT-based classifier), falling back to keyword detection when confidence is low.
     let is_local_intent = intent.intent.as_str() == "local" && intent.confidence >= 0.20
         || intent.intent.as_str() != "local" && has_local_intent(&q);
-    let mut expanded_queries = if let Some(ref geo) = geo_location {
+    let expanded_queries = if let Some(ref geo) = geo_location {
         if is_local_intent {
             let mut eq = expanded_queries;
             if let Some(localized) = localize_query(&q, geo) {
@@ -13981,29 +13813,12 @@ async fn handle_search(
     } else {
         expanded_queries
     };
-
-
     tracing::info!(target:"expansion.debug", expanded=?expanded_queries.iter().take(3).collect::<Vec<_>>(), query=%q, "primary expanded queries");
-
-    // FIX-IF-03: Inject numeric-constraint relaxation into expanded_queries.
-    // Queries like "how to start a small business with less than 50000 rupees in india"
-    // over-narrow upstream recall. The relaxation strips numeric/currency tokens and
-    // comparison words, leaving the topical core. Injected as a NEW expanded variant
-    // so it participates in the parallel retry fan-out below.
-    if has_numeric_constraint(&q) {
-        if let Some(relaxed) = numeric_constraint_relaxation(&q) {
-            let relaxed_clean = preprocess_searxng_query(&relaxed);
-            if !relaxed_clean.is_empty() && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == relaxed_clean) {
-                tracing::info!(target:"expansion.debug", "numeric-relaxed expanded query: {:?}", relaxed_clean);
-                // INSERT at position 1 so it fires in the first retry batch (indices 1..=max_variations=3)
-                let insert_pos = 1.min(expanded_queries.len());
-                expanded_queries.insert(insert_pos, relaxed_clean);
-            }
-        }
-    }
 
     // TODO: Secondary fan-out with expanded queries if searx_results are sparse
     // For now, scoring uses intent-based weighting on the raw query results
+
+    // 4. Process Local Results
     // indexer_res is Result<Result<Vec<IndexerResult>, reqwest::Error>, JoinError>:
     // outer = join-timeout/budget, inner = the spawned task's own outcome (which
     // itself returns Ok(vec) on success OR on timeout, Err only on hard failure).
@@ -14361,83 +14176,6 @@ async fn handle_search(
         }
     }
 
-    // FIX-IF-03: Thin-result fallback — if the initial + retry still returned
-    // fewer than 5 results, fire a final numeric-relaxed query with a hard 8s
-    // timeout guard. If SearXNG doesn't respond within 8s, return whatever
-    // partial results exist with a flag rather than timing out entirely.
-    let mut partial_results = false;
-    let final_total = web_results.len();
-    if final_total < 5 && has_numeric_constraint(&q) && !searx_base_urls.is_empty() {
-        if let Some(relaxed) = numeric_constraint_relaxation(&q) {
-            let relaxed_clean = preprocess_searxng_query(&relaxed);
-            if !relaxed_clean.is_empty() {
-                let fallback_timeout = Duration::from_secs(8);
-                for (inst_idx, base_url) in searx_base_urls.iter().enumerate() {
-                    if inst_idx > 0 { break; } // VPN instance only for fallback speed
-                    let fb_key = format!("searxng{}", inst_idx);
-                    if circuit_ref.is_open(&fb_key) { continue; }
-                    let fb_url = searxng_url(base_url, &relaxed_clean, geo_location.as_ref(), lang);
-                    let fb_client = client.clone();
-                    let fb_circuit = circuit_ref.clone();
-                    let fb_result = tokio::time::timeout(fallback_timeout, async move {
-                        match fb_client.get(&fb_url).send().await {
-                            Ok(resp) => {
-                                match tokio::time::timeout(Duration::from_secs(3), resp.text()).await {
-                                    Ok(Ok(text)) => {
-                                        let sanitized = sanitize_json_text(&text);
-                                        match serde_json::from_str::<SearxResponse>(&sanitized) {
-                                            Ok(data) => Some(data),
-                                            Err(_) => None,
-                                        }
-                                    }
-                                    _ => None,
-                                }
-                            }
-                            Err(_) => None,
-                        }
-                    }).await;
-
-                    match fb_result {
-                        Ok(Some(data)) if !data.results.is_empty() => {
-                            tracing::info!("THIN-RESULT FALLBACK: relaxed query returned {} results", data.results.len());
-                            partial_results = true;
-                            fb_circuit.record_success(&fb_key);
-                            for (pos, result) in data.results.into_iter().enumerate() {
-                                let engine_weight = fb_circuit.weight(&result.engine);
-                                let normalized = {
-                                    let lower = result.url.to_lowercase();
-                                    let no_fragment = lower.split('#').next().unwrap_or(&lower);
-                                    let no_trailing = no_fragment.trim_end_matches('/');
-                                    let no_www = no_trailing.replacen("://www.", "://", 1);
-                                    let no_mobile = no_www.replacen("://m.", "://", 1).replacen("://mobile.", "://", 1);
-                                    strip_tracking_params(&no_mobile)
-                                };
-                                if !url_rrf_contributions.contains_key(&normalized) {
-                                    let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
-                                    *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
-                                    let mut instance_tagged = result;
-                                    let instance_tag = format!("instance_{}", fb_key.trim_start_matches("searxng"));
-                                    if !instance_tagged.sources.contains(&instance_tag) {
-                                        instance_tagged.sources.push(instance_tag);
-                                    }
-                                    web_results.push(instance_tagged);
-                                }
-                            }
-                        }
-                        Ok(_) => {
-                            tracing::warn!("THIN-RESULT FALLBACK: relaxed query returned 0 results");
-                            fb_circuit.record_success(&fb_key);
-                        }
-                        Err(_) => {
-                            tracing::warn!("THIN-RESULT FALLBACK: relaxed query timed out after 8s");
-                            // Don't record failure — timeout is expected for slow upstream
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     match invidious_res {
         Ok(invidious_data) => {
             let n = invidious_data.len();
@@ -14784,31 +14522,6 @@ async fn handle_search(
         resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
     }).count();
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
-
-    // P6 fail-open (structural gate): the hard recency window (after:/before:)
-    // is applied to the UPSTREAM SearXNG query, which filters out results
-    // outside the window BEFORE they reach us. When NO merged web result
-    // carries a parseable date, the upstream window has already silently
-    // discarded the majority of relevant results (most web pages lack a
-    // machine-readable date). The dry-run below cannot detect this — undated
-    // results pass the date test ("assumed in-range"), so survivors_after_window
-    // equals pre_filter_count and the fraction-based guard never fires.
-    // Fail-open directly: when dated_result_count == 0, clear the hard window
-    // so recency stays a pure scoring boost (freshness half-life) and the
-    // upstream query is re-issued without date constraints. This is keyed on
-    // result coverage, not on any query/window — general, no per-query literals.
-    if dated_result_count == 0 {
-        let date_window_present = intent.structured_constraints.after_date.is_some()
-            || intent.structured_constraints.before_date.is_some();
-        if date_window_present {
-            tracing::info!(
-                "DATE WINDOW FAIL-OPEN (no dated results): {} web results, 0 carry a parseable date — clearing hard recency window (recency stays scoring-only)",
-                pre_filter_count
-            );
-            intent.structured_constraints.after_date = None;
-            intent.structured_constraints.before_date = None;
-        }
-    }
 
     // FRESH/date fail-open (prevents 0-result collapse): the FRESH OVERRIDE may have
     // flagged this as a recency query, and should_filter_by_constraints DROPS any
@@ -16217,18 +15930,13 @@ let mut results = match tokio::task::spawn_blocking(move || {
             None
         } else {
             let http_client = client.clone();
-            // Parallel enrichment: 4 concurrent fetches with a 22s wall-time cap.
-            // Sequential enrichment (8 results × ~4.5s each = 36s) exceeded the 30s
-            // TimeoutLayer and silently dropped the entire `shopping` block.
-            enrich_with_commerce_par(
-                &mut shop_arr,
-                COMMERCE_MAINPATH_PAR_CONCURRENT,
-                COMMERCE_MAINPATH_TIMEOUT_MS,
-                move |url: String| {
-                    let c = http_client.clone();
-                    async move { fetch_page_html(&c, &url).await }
-                },
-            )
+            // Reuse the same strict post-rank enrichment as /shopping. Each fetch is
+            // already budgeted (~4.5s) inside `fetch_page_html`, and we only touch
+            // the top-N (bounded), so the main /search latency stays acceptable.
+            enrich_with_commerce(&mut shop_arr, move |url: String| {
+                let c = http_client.clone();
+                async move { fetch_page_html(&c, &url).await }
+            })
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
@@ -16268,7 +15976,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         confidence: Some(intent.confidence),
         constraints: flat_constraints,
         structured_constraints: intent.structured_constraints.clone(),
-        expanded_queries: expanded_queries.clone(),
+        expanded_queries: intent.expanded_queries.clone(),
         distribution: Some(intent.distribution.clone()),
         deep_result,
         results: paginated_results,
@@ -16280,7 +15988,6 @@ let mut results = match tokio::task::spawn_blocking(move || {
         applied_constraints: if applied.is_empty() { None } else { Some(applied) },
         ignored_constraints: if ignored.is_empty() { None } else { Some(ignored) },
         warnings: if warnings.is_empty() { None } else { Some(warnings) },
-        partial_results,
         results_before_filter: Some(pre_filter_count.max(post_filter_count)),
         results_after_filter: Some(post_filter_count),
         total: Some(post_filter_count),
@@ -18840,7 +18547,7 @@ mod spellcheck_endpoint_tests {
         fn video_watch_phrase_triggers_video_intent() {
             // "watch video" / "watch tutorial" must be detected as video intent
             // (has_video_intent checks for these phrases, matching live /search).
-            let stripped = simple_negation_strip("watch video tutorial").unwrap_or("watch video tutorial".to_string());
+            let stripped = simple_negation_strip("watch video tutorial").unwrap_or("watch video tutorial");
             assert!(has_video_intent(&stripped));
         }
     }
@@ -19439,110 +19146,5 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!out.contains("q="), "no query text");
         assert!(!out.contains("user"), "no user id");
         assert!(!out.contains("ip="), "no ip");
-    }
-
-    #[tokio::test]
-    async fn parallel_enrichment_within_budget_and_order_invariant() {
-        // Regression test: the main /search `shopping` block was silently dropped
-        // because sequential enrichment of 8 results (~4.5s each = 36s) exceeded
-        // the 30s TimeoutLayer. This test verifies parallel enrichment completes
-        // within the time budget and preserves result order (no-manipulation).
-
-        let mut shop_arr: Vec<serde_json::Value> = (0..8)
-            .map(|i| {
-                serde_json::json!({
-                    "url": format!("https://shop.example.com/p/{}", i),
-                    "score": 9.0 - i as f64 * 0.1,
-                })
-            })
-            .collect();
-
-        let before: Vec<String> = shop_arr
-            .iter()
-            .map(|r| r["url"].as_str().unwrap().to_string())
-            .collect();
-
-        // Simulate slow upstream: each "fetch" takes ~500ms. 8 sequential = 4s
-        // (too slow for 30s budget with real 4.5s fetches). 4 concurrent = ~1s.
-        let fake_html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{"@context":"https://schema.org/","@type":"Product","name":"Test Widget","offers":{"@type":"Offer","price":"29.99","priceCurrency":"USD"}}
-</script></head><body></body></html>"#;
-        let html = fake_html.to_string();
-
-        let start = std::time::Instant::now();
-        enrich_with_commerce_par(
-            &mut shop_arr,
-            COMMERCE_MAINPATH_PAR_CONCURRENT,
-            COMMERCE_MAINPATH_TIMEOUT_MS,
-            move |url: String| {
-                let h = html.clone();
-                async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    Some(h)
-                }
-            },
-        )
-        .await;
-        let elapsed = start.elapsed();
-
-        // Must complete well under the 30s TimeoutLayer (even with 8 × 500ms sequential
-        // it'd be 4s; parallel at 4-wide = ~1s). With real 4.5s fetches at 4-wide,
-        // 8 results complete in ~9-11s. Budget: 22s cap.
-        assert!(
-            elapsed < std::time::Duration::from_secs(15),
-            "parallel enrichment took {:?}, must complete within TimeoutLayer budget",
-            elapsed
-        );
-
-        // Order preserved (no-manipulation guarantee).
-        let after: Vec<String> = shop_arr
-            .iter()
-            .map(|r| r["url"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(before, after, "parallel enrichment must not reorder results");
-
-        // Commerce facts attached from the fake JSON-LD.
-        for r in shop_arr.iter() {
-            assert!(r.get("commerce").is_some(), "commerce block attached");
-            assert_eq!(r["commerce"]["data"]["price"], serde_json::json!(29.99));
-            assert!(r.get("commerce_provenance").is_some(), "provenance present");
-        }
-    }
-
-    #[tokio::test]
-    async fn parallel_enrichment_timeout_gracefully_attaches_provenance() {
-        // When upstream is so slow the total timeout fires, parallel enrichment
-        // must NOT panic and must attach `commerce_provenance` (with no `commerce`)
-        // to every result — proving it degrades gracefully instead of dropping
-        // the whole shopping block.
-
-        let mut shop_arr: Vec<serde_json::Value> = (0..4)
-            .map(|i| serde_json::json!({ "url": format!("https://slow.example.com/p/{}", i) }))
-            .collect();
-
-        // Each fetch takes 2s; 4 concurrent × 2s = 8s total, but we cap at 50ms
-        // so the timeout fires immediately.
-        enrich_with_commerce_par(
-            &mut shop_arr,
-            2,
-            50, // 50ms total cap
-            |url: String| async move {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                Some("<html></html>".to_string())
-            },
-        )
-        .await;
-
-        for r in shop_arr.iter() {
-            assert!(
-                r.get("commerce_provenance").is_some(),
-                "provenance attached even on timeout"
-            );
-            assert!(
-                r.get("commerce").is_none(),
-                "no commerce block on timeout"
-            );
-        }
     }
 }
