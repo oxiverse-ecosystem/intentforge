@@ -350,7 +350,7 @@ impl SymSpellIndex {
             // that is a better correction despite higher edit distance.
             let phonetic = self.phonetic_fallback(word);
             if let Some(ref p) = phonetic {
-                let p_freq = self.exact_map.get(p).map(|&id| self.frequencies[id as usize]).unwrap_or(0.0);
+                let p_freq = self.exact_map.get(p.as_str()).map(|&id| self.frequencies[id as usize]).unwrap_or(0.0);
                 let best_freq = self.exact_map.get(best.as_str()).map(|&id| self.frequencies[id as usize]).unwrap_or(0.0);
                 if p_freq > best_freq {
                     // Accept the phonetic candidate — it's more common
@@ -558,9 +558,6 @@ impl SymSpellIndex {
 
         let mut all_candidates: Vec<u32> = Vec::new();
         let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        if word_lower == "cancing" {
-            eprintln!("[DEBUG] cancing input_prefix={} alt_prefix={}", input_prefix, alt_prefix);
-        }
         for (code, ids) in &self.phonetic_dict {
             let code_prefix = if code.len() >= prefix_len {
                 &code[..prefix_len]
@@ -571,24 +568,9 @@ impl SymSpellIndex {
                 for &id in ids {
                     seen.insert(id);
                 }
-                if word_lower == "cancing" {
-                    let sample: Vec<String> = ids.iter().map(|&id| self.words[id as usize].clone()).collect();
-                    eprintln!("[DEBUG]   code={} prefix={} matches={:?}", code, code_prefix, sample);
-                }
             }
         }
         all_candidates.extend(seen);
-        if word_lower == "cancing" {
-            eprintln!("[DEBUG] cancing candidates={}", all_candidates.len());
-            for &word_id in &all_candidates {
-                let dict_word = &self.words[word_id as usize];
-                let freq = self.frequencies[word_id as usize];
-                let dist = self.compute_edit_distance(&word_lower, dict_word);
-                let is_drop = Self::is_letter_drop_typo(&word_lower, dict_word);
-                let perp = self.char_bigram_model.perplexity_ratio(&word_lower, dict_word);
-                eprintln!("[DEBUG]   cand={} freq={:.4} dist={} is_drop={} perp={:.2}", dict_word, freq, dist, is_drop, perp);
-            }
-        }
 
         let mut best: Option<(u32, f64, usize)> = None;
         for &word_id in &all_candidates {
