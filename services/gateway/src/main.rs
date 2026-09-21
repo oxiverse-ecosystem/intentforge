@@ -12582,6 +12582,7 @@ fn is_keyboard_walk_query(q: &str, spell_index: &spell::SymSpellIndex) -> bool {
     false
 }
 
+
 fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f32) {
     let words: Vec<&str> = q.split_whitespace().filter(|w| w.chars().any(|c| c.is_alphabetic())).collect();
     if words.is_empty() {
