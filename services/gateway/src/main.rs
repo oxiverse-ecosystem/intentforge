@@ -13995,7 +13995,9 @@ async fn handle_search(
             let relaxed_clean = preprocess_searxng_query(&relaxed);
             if !relaxed_clean.is_empty() && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == relaxed_clean) {
                 tracing::info!(target:"expansion.debug", "numeric-relaxed expanded query: {:?}", relaxed_clean);
-                expanded_queries.push(relaxed_clean);
+                // INSERT at position 1 so it fires in the first retry batch (indices 1..=max_variations=3)
+                let insert_pos = 1.min(expanded_queries.len());
+                expanded_queries.insert(insert_pos, relaxed_clean);
             }
         }
     }
