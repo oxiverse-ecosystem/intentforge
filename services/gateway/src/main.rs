@@ -544,6 +544,10 @@ struct UnifiedResponse {
     /// Human-readable diagnostics (empty result set, upstream flakiness hints, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     warnings: Option<Vec<String>>,
+    /// FIX-IF-03: when upstream was flaky/timeout and we surfaced partial results
+    /// from a numeric-relaxed fallback query, this flag tells the client to retry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    partial_results: bool,
     /// Web result count before any constraint filtering.
     #[serde(skip_serializing_if = "Option::is_none")]
     results_before_filter: Option<usize>,
@@ -7452,6 +7456,65 @@ fn keyphrase_relax_variant(query: &str) -> Option<String> {
 }
 
 
+// ─── Numeric Constraint Relaxation ─────────────────────────────────
+/// Strip numeric budget/amount constraints from a query to boost recall.
+/// Queries like "how to start a small business with less than 50000 rupees in india"
+/// often return 0-3 results because the numeric constraint over-narrows upstream.
+/// This function strips numeric tokens, comparison words, and currency terms while
+/// preserving the topical core. Data-driven — no per-query literals.
+fn numeric_constraint_relaxation(query: &str) -> Option<String> {
+    let q_lower = query.to_lowercase();
+    if !q_lower.split_whitespace().any(|w| w.chars().any(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    if q_lower.contains("site:") || q_lower.contains("filetype:") || q_lower.contains("price:") {
+        return None;
+    }
+    const NUMERIC_SIGNAL_WORDS: &[&str] = &[
+        "less", "more", "under", "over", "above", "below", "between",
+        "than", "from", "about", "around", "approximately", "nearly",
+        "almost", "least", "most", "only", "up", "to", "and", "or",
+        "rs", "rs.", "rupee", "rupees", "inr", "dollar", "dollars",
+        "usd", "euro", "euros", "eur", "pound", "pounds", "gbp",
+        "yen", "jpy", "lakh", "lakhs", "crore", "crores",
+    ];
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let filtered: Vec<&str> = words.iter()
+        .filter(|w| {
+            let wl = w.to_lowercase();
+            if w.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') {
+                return false;
+            }
+            if w.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                return false;
+            }
+            if NUMERIC_SIGNAL_WORDS.contains(&wl.as_str()) {
+                return false;
+            }
+            if wl == "₹" || wl == "$" || wl == "€" || wl == "£" || wl == "¥" {
+                return false;
+            }
+            true
+        })
+        .copied()
+        .collect();
+    if filtered.len() < 2 || filtered.len() == words.len() {
+        return None;
+    }
+    let relaxed = filtered.join(" ");
+    if relaxed.trim().len() < 3 {
+        return None;
+    }
+    Some(relaxed)
+}
+
+/// True if the query carries a numeric constraint that may over-narrow recall.
+fn has_numeric_constraint(query: &str) -> bool {
+    let q_lower = query.to_lowercase();
+    q_lower.split_whitespace().any(|w| w.chars().any(|c| c.is_ascii_digit()))
+}
+
+
 // ─── JSON Key Deduplication ────────────────────────────────────────
 // Removes duplicate keys from JSON objects. Keeps the LAST value for each key.
 // Handles nested objects and arrays. Algorithmic — no hardcoded key lists.
@@ -12219,6 +12282,7 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         applied_constraints: None,
         ignored_constraints: None,
         warnings: None,
+        partial_results: false,
         results_before_filter: None,
         results_after_filter: None,
         total: None,
@@ -13917,12 +13981,27 @@ async fn handle_search(
     } else {
         expanded_queries
     };
+
+
     tracing::info!(target:"expansion.debug", expanded=?expanded_queries.iter().take(3).collect::<Vec<_>>(), query=%q, "primary expanded queries");
+
+    // FIX-IF-03: Inject numeric-constraint relaxation into expanded_queries.
+    // Queries like "how to start a small business with less than 50000 rupees in india"
+    // over-narrow upstream recall. The relaxation strips numeric/currency tokens and
+    // comparison words, leaving the topical core. Injected as a NEW expanded variant
+    // so it participates in the parallel retry fan-out below.
+    if has_numeric_constraint(&q) {
+        if let Some(relaxed) = numeric_constraint_relaxation(&q) {
+            let relaxed_clean = preprocess_searxng_query(&relaxed);
+            if !relaxed_clean.is_empty() && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == relaxed_clean) {
+                expanded_queries.push(relaxed_clean);
+                tracing::info!(target:"expansion.debug", "numeric-relaxed expanded query: {:?}", relaxed_clean);
+            }
+        }
+    }
 
     // TODO: Secondary fan-out with expanded queries if searx_results are sparse
     // For now, scoring uses intent-based weighting on the raw query results
-
-    // 4. Process Local Results
     // indexer_res is Result<Result<Vec<IndexerResult>, reqwest::Error>, JoinError>:
     // outer = join-timeout/budget, inner = the spawned task's own outcome (which
     // itself returns Ok(vec) on success OR on timeout, Err only on hard failure).
@@ -14276,6 +14355,83 @@ async fn handle_search(
                     }
                 }
                 tracing::info!("Parallel retry collected {} new unique results", final_retry_count);
+            }
+        }
+    }
+
+    // FIX-IF-03: Thin-result fallback — if the initial + retry still returned
+    // fewer than 5 results, fire a final numeric-relaxed query with a hard 8s
+    // timeout guard. If SearXNG doesn't respond within 8s, return whatever
+    // partial results exist with a flag rather than timing out entirely.
+    let mut partial_results = false;
+    let final_total = web_results.len();
+    if final_total < 5 && has_numeric_constraint(&q) && !searx_base_urls.is_empty() {
+        if let Some(relaxed) = numeric_constraint_relaxation(&q) {
+            let relaxed_clean = preprocess_searxng_query(&relaxed);
+            if !relaxed_clean.is_empty() {
+                let fallback_timeout = Duration::from_secs(8);
+                for (inst_idx, base_url) in searx_base_urls.iter().enumerate() {
+                    if inst_idx > 0 { break; } // VPN instance only for fallback speed
+                    let fb_key = format!("searxng{}", inst_idx);
+                    if circuit_ref.is_open(&fb_key) { continue; }
+                    let fb_url = searxng_url(base_url, &relaxed_clean, geo_location.as_ref(), lang);
+                    let fb_client = client.clone();
+                    let fb_circuit = circuit_ref.clone();
+                    let fb_result = tokio::time::timeout(fallback_timeout, async move {
+                        match fb_client.get(&fb_url).send().await {
+                            Ok(resp) => {
+                                match tokio::time::timeout(Duration::from_secs(3), resp.text()).await {
+                                    Ok(Ok(text)) => {
+                                        let sanitized = sanitize_json_text(&text);
+                                        match serde_json::from_str::<SearxResponse>(&sanitized) {
+                                            Ok(data) => Some(data),
+                                            Err(_) => None,
+                                        }
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            Err(_) => None,
+                        }
+                    }).await;
+
+                    match fb_result {
+                        Ok(Some(data)) if !data.results.is_empty() => {
+                            tracing::info!("THIN-RESULT FALLBACK: relaxed query returned {} results", data.results.len());
+                            partial_results = true;
+                            fb_circuit.record_success(&fb_key);
+                            for (pos, result) in data.results.into_iter().enumerate() {
+                                let engine_weight = fb_circuit.weight(&result.engine);
+                                let normalized = {
+                                    let lower = result.url.to_lowercase();
+                                    let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                                    let no_trailing = no_fragment.trim_end_matches('/');
+                                    let no_www = no_trailing.replacen("://www.", "://", 1);
+                                    let no_mobile = no_www.replacen("://m.", "://", 1).replacen("://mobile.", "://", 1);
+                                    strip_tracking_params(&no_mobile)
+                                };
+                                if !url_rrf_contributions.contains_key(&normalized) {
+                                    let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
+                                    *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
+                                    let mut instance_tagged = result;
+                                    let instance_tag = format!("instance_{}", fb_key.trim_start_matches("searxng"));
+                                    if !instance_tagged.sources.contains(&instance_tag) {
+                                        instance_tagged.sources.push(instance_tag);
+                                    }
+                                    web_results.push(instance_tagged);
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            tracing::warn!("THIN-RESULT FALLBACK: relaxed query returned 0 results");
+                            fb_circuit.record_success(&fb_key);
+                        }
+                        Err(_) => {
+                            tracing::warn!("THIN-RESULT FALLBACK: relaxed query timed out after 8s");
+                            // Don't record failure — timeout is expected for slow upstream
+                        }
+                    }
+                }
             }
         }
     }
@@ -16122,6 +16278,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         applied_constraints: if applied.is_empty() { None } else { Some(applied) },
         ignored_constraints: if ignored.is_empty() { None } else { Some(ignored) },
         warnings: if warnings.is_empty() { None } else { Some(warnings) },
+        partial_results,
         results_before_filter: Some(pre_filter_count.max(post_filter_count)),
         results_after_filter: Some(post_filter_count),
         total: Some(post_filter_count),
