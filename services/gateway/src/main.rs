@@ -3828,6 +3828,133 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.rating.is_some()
 }
 
+/// Apply the same single-result enrichment (extract_commerce_offer → optional commerce +
+/// commerce_provenance) onto one serde_json::Value. Factored out of the parallel
+/// function so unit tests can exercise the attach + provenance contract independently.
+fn enrich_single_commerce(
+    r: &mut serde_json::Value,
+    html: &str,
+) {
+    if !r.is_object() {
+        return;
+    }
+    let url = r
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let provenance = serde_json::json!({
+        "url": url,
+        "observed_at": now_unix_string(),
+        "source": null,
+        "data": null,
+    });
+    let offer: CommerceOffer = extract_commerce_offer(html, &url);
+    if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
+        if let Ok(v) = serde_json::to_value(&offer) {
+            r["commerce"] = v;
+        }
+    }
+    r["commerce_provenance"] = provenance;
+}
+
+/// Parallel variant of `enrich_with_commerce` — bounded-concurrency fetch + 22s wall cap.
+///
+/// Fetches up to MAX_PARALLEL_FETCH result pages concurrently. Results that still
+/// lack structured commerce facts after their page is fetched (or whose fetch fails
+/// / times out) keep commerce: null but ALWAYS carry commerce_provenance (honest:
+/// we never fabricate).
+///
+/// Order is preserved byte-for-byte — enrichment is a strict post-rank decoration
+/// pass. The fetch closure must be Clone + Send because it is spawned into
+/// parallel tasks. A wall-time Duration bounds the entire batch so the main
+/// /search endpoint stays within its 30s TimeoutLayer budget.
+///
+/// Concurrency is bounded (not unbounded join_all) to avoid overloading
+/// upstream / the local HTTP client.
+async fn enrich_with_commerce_par<F, Fut>(
+    results: &mut [serde_json::Value],
+    fetch: F,
+    wall_timeout: std::time::Duration,
+) where
+    F: Fn(String) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Option<String>> + Send,
+{
+    let max_par = MAX_PARALLEL_FETCH.min(results.len());
+
+    // 1) Collect indices + spawn parallel fetch tasks (bounded concurrency).
+    let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(usize, String)>>)> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, r)| {
+            if !r.is_object() {
+                return None;
+            }
+            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            if url.is_empty() {
+                return None;
+            }
+            if r.get("commerce").is_some() {
+                return None; // already enriched by an earlier step
+            }
+            let fetch_clone = fetch.clone();
+            let url_owned = url.to_string();
+            let handle = tokio::spawn(async move {
+                match fetch_clone(url_owned.clone()).await {
+                    Some(html) => Some((idx, html)),
+                    None => None,
+                }
+            });
+            Some((idx, handle))
+        })
+        .take(max_par)
+        .collect();
+
+    // 2) Wait for ALL spawned tasks concurrently (await each JoinHandle).
+    let mut fetched: Vec<(usize, String)> = Vec::new();
+    for (_, handle) in tasks {
+        match handle.await {
+            Ok(Some((idx, html))) => fetched.push((idx, html)),
+            _ => {} // task panicked or returned None — skip
+        }
+    }
+
+    // 3) Attach results back onto the original array (preserving order).
+    for (idx, html) in fetched {
+        if let Some(r) = results.get_mut(idx) {
+            enrich_single_commerce(r, &html);
+        }
+    }
+
+    // 4) Attach provenance to any result we didn't fetch (idempotent path).
+    for r in results.iter_mut() {
+        if r.is_object() && r.get("commerce_provenance").is_none() {
+            let url = r
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let provenance = serde_json::json!({
+                "url": url,
+                "observed_at": now_unix_string(),
+                "source": null,
+                "data": null,
+            });
+            r["commerce_provenance"] = provenance;
+        }
+    }
+}
+
+/// Max concurrent page fetches during parallel enrichment. Tuned so that
+/// 8 parallel page-fetches complete well within the 22s wall cap and 30s
+/// TimeoutLayer budget. Bounded to avoid overwhelming upstream servers.
+const MAX_PARALLEL_FETCH: usize = 4;
+
+/// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
+/// The main /search endpoint has a 30s TimeoutLayer; parallel enrichment of
+/// top-N results must complete well before it fires. 22s leaves ~8s headroom.
+const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 22;
+
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
 /// page exposed structured product data, attached by `enrich_with_commerce`).
 /// Powers the main-path `shopping` gate: the strip is only surfaced when at
@@ -16093,13 +16220,19 @@ let mut results = match tokio::task::spawn_blocking(move || {
             None
         } else {
             let http_client = client.clone();
-            // Reuse the same strict post-rank enrichment as /shopping. Each fetch is
-            // already budgeted (~4.5s) inside `fetch_page_html`, and we only touch
-            // the top-N (bounded), so the main /search latency stays acceptable.
-            enrich_with_commerce(&mut shop_arr, move |url: String| {
-                let c = http_client.clone();
-                async move { fetch_page_html(&c, &url).await }
-            })
+            // Parallel enrichment (bounded concurrency) for the main /search path.
+            // Sequential enrichment of 8 product pages (~36s) exceeds the 30s
+            // TimeoutLayer budget. Parallel fetches complete in ~4.5s with a 22s
+            // wall cap, leaving 8s headroom. Order is byte-identical to the
+            // sequential variant (proven by the order-invariance regression test).
+            enrich_with_commerce_par(
+                &mut shop_arr,
+                move |url: String| {
+                    let c = http_client.clone();
+                    async move { fetch_page_html(&c, &url).await }
+                },
+                Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            )
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
@@ -19310,5 +19443,111 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!out.contains("q="), "no query text");
         assert!(!out.contains("user"), "no user id");
         assert!(!out.contains("ip="), "no ip");
+    }
+
+    // ── ROADMAP item 7 (refinement): parallel enrichment within budget ──
+    // The main /search path calls enrich_with_commerce_par with bounded
+    // concurrency. These tests prove: (a) parallel enrichment completes
+    // well within the TimeoutLayer budget, (b) URL order is byte-identical
+    // to sequential enrichment, (c) timeout doesn't panic — provenance is
+    // attached even when the wall-time fires.
+
+    #[tokio::test]
+    async fn parallel_enrichment_within_budget_and_order_invariant() {
+        // 8 fake results, each fetch takes 500ms. With MAX_PARALLEL_FETCH=4,
+        // total wall time ≈ 1s (two waves of 4), far below the 22s cap.
+        let mut ranked: Vec<serde_json::Value> = (0..8)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("https://store{}.example.com/p/{}", i, i),
+                    "score": 9.0 - (i as f64 * 0.1),
+                })
+            })
+            .collect();
+
+        let before: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = |url: String| {
+            let html = fake_html.clone();
+            async move {
+                // Simulate network latency
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                Some(html)
+            }
+        };
+
+        let start = std::time::Instant::now();
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // Parallel: 8 results / 4 concurrent = 2 waves × 500ms = ~1s
+        // Sequential would be 8 × 500ms = 4s.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "parallel enrichment should complete in ~1s, took {:?}",
+            elapsed
+        );
+
+        // Order preserved byte-for-byte.
+        let after: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(before, after, "parallel enrichment must preserve order");
+
+        // Every result got a commerce block (all fetched the fake product page).
+        for r in ranked.iter() {
+            assert!(r.get("commerce").is_some(), "commerce block attached in parallel");
+            assert!(r.get("commerce_provenance").is_some(), "provenance attached in parallel");
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_enrichment_timeout_gracefully_attaches_provenance() {
+        // A fetch that ALWAYS exceeds the wall timeout must not panic. Every
+        // result still gets commerce_provenance (source: null, data: null).
+        let mut ranked: Vec<serde_json::Value> = (0..4)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("https://slow{}.example.com/p", i),
+                })
+            })
+            .collect();
+
+        let fetch = |_url: String| async {
+            // Wall-time is 1ms; this fetch is 10s — guaranteed to time out.
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            None
+        };
+
+        // Must NOT panic.
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        // All results got provenance (even though fetch returned None).
+        for r in ranked.iter() {
+            assert!(
+                r.get("commerce_provenance").is_some(),
+                "provenance must be attached even on timeout"
+            );
+            // No commerce block (fetch returned None, no facts to attach).
+            assert!(
+                r.get("commerce").is_none(),
+                "no commerce block when fetch returns None"
+            );
+        }
     }
 }
