@@ -2903,20 +2903,21 @@ fn extract_price_from_html_patterns(html: &str) -> Option<(f64, String)> {
         }
     }
 
-    // 4. Price near product-title context: e.g. "iPhone 16 Pro Max $1,199" or
-    //    "<h1>Product Name</h1>... <span>₹1,19,900</span>"
-    //    Only match currency symbol directly adjacent to digits, avoiding false
-    //    positives from unrelated body text.
-    static CURR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let curr_re = CURR_RE.get_or_init(|| {
+    // 4. Price as direct text content of a price-related element.
+    //    Only match when the currency+price is the DIRECT text of an element
+    //    with a price-related class or data attribute — NOT embedded in a sentence.
+    //    Requires a currency symbol to avoid matching bare numbers.
+    //    Pattern: <tag class="...price...">$49.99</tag>
+    //    or: <tag class="...price..."><span>$49.99</span></tag>
+    //    NOTE: excludes itemprop (handled by structured microdata parser) to
+    //    avoid false positives like <span itemprop="price">9.99</span>.
+    static PRICE_TEXT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let price_text_re = PRICE_TEXT_RE.get_or_init(|| {
         regex::Regex::new(
-            r#"(?i)(?:Rs\.?|INR|₹|\$|€|£|¥|USD|EUR|GBP)\s*([\d,]+(?:\.\d{1,2})?)"#
+            r#"(?i)<[^>]*(?:class|data-(?:price|amount|sale))\s*=\s*["'][^"']*(?:price|amount|sale|offer|current|selling|deal)[^"']*["'][^>]*>\s*(?:<[^>]*>\s*)?(?:\$|€|£|¥|₹|Rs\.?|INR|USD|EUR|GBP)\s*([\d,]+\.?\d*)\s*(?:</[^>]*>\s*)?</[^>]*>"#
         ).unwrap()
     });
-    // Find the first match within the first 8KB of HTML (where product titles
-    // and prices typically appear, before reviews/recommendations)
-    let scan_window = if html.len() > 8192 { &html[..8192] } else { html };
-    if let Some(caps) = curr_re.captures(scan_window) {
+    if let Some(caps) = price_text_re.captures(html) {
         let raw = caps.get(1)?.as_str().replace(',', "");
         if let Ok(v) = raw.parse::<f64>() {
             if v > 0.0 && v < 10_000_000.0 {
