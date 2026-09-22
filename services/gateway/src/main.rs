@@ -3960,7 +3960,7 @@ fn parse_h_product(html: &str) -> Option<OfferFacts> {
 
     static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let tag_re = TAG_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)<\w+\b[^>]*class[^>]*>"#).unwrap()
+        regex::Regex::new(r#"(?i)<w+b[^>]*class[^>]*>"#).unwrap()
     });
     static CLASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let class_re = CLASS_RE.get_or_init(|| {
