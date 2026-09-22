@@ -18989,6 +18989,138 @@ mod spellcheck_endpoint_tests {
         assert_eq!(d.price_high, None);
     }
 
+    // ── ROADMAP item 1 (increment): secondary HTML price fallback ─────────
+    // When structured extraction (JSON-LD/OG/microdata) finds no price, the
+    // secondary HTML price pattern fallback recovers prices from common
+    // e-commerce HTML patterns. These tests prove it fires only as a fallback,
+    // extracts the first visible price, and labels the source correctly.
+
+    #[test]
+    fn html_pattern_fallback_extracts_from_data_price_attribute() {
+        let html = r#"<!doctype html><html><body>
+<h1>Wireless Headphones</h1>
+<div class="product-price" data-price="299.99" data-currency="USD">
+  <span>$299.99</span>
+</div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/hp");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(299.99), "price extracted from data-price");
+        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_extracts_currency_in_class_span() {
+        let html = r#"<!doctype html><html><body>
+<h1>Sony WH-1000XM5</h1>
+<span class="price">₹29,999</span>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/sony");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(29999.0));
+        assert_eq!(d.currency.as_deref(), Some("INR"));
+        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_does_not_fire_when_jsonld_present() {
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{ "@context": "https://schema.org/", "@type": "Product",
+  "name": "Widget", "offers": { "@type": "Offer", "price": "49.99", "priceCurrency": "USD" } }
+</script></head><body>
+<span class="price">$99.99</span>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/w");
+        let d = o.data.as_ref().unwrap();
+        // JSON-LD wins, HTML pattern does NOT overwrite
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_does_not_fire_when_microdata_present() {
+        let html = format!(r#"<!doctype html><html><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">19.99</span>
+    <meta itemprop="priceCurrency" content="USD">
+  </div>
+</div>
+<span class="sale-price">$9.99</span>
+</body></html>"#);
+        let o = extract_commerce_offer(&html, "https://shop.example.com/s");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(19.99));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_returns_none_for_non_product_pages() {
+        let html = r#"<!doctype html><html><body>
+<h1>How to bake bread</h1>
+<p>This recipe uses 3 cups of flour and costs about $2 per loaf.</p>
+<p>Preheat oven to 375°F.</p>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://blog.example.com/bread");
+        let d = o.data.as_ref().unwrap();
+        // The recipe mentions "$2" but not in a product context — the HTML
+        // pattern scan only looks in the first 8KB and the $2 is far from any
+        // price container. It should NOT fire.
+        assert_eq!(d.price, None);
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    #[test]
+    fn html_pattern_fallback_ignores_unreasonable_prices() {
+        // Price of 0 or >10M should be rejected
+        let html = r#"<!doctype html><html><body>
+<span class="price">$99999999</span>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/bad");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None, "price >10M should be rejected");
+    }
+
+    #[test]
+    fn html_pattern_fallback_preserves_structured_currency() {
+        let html = r#"<!doctype html><html><body>
+<span class="sale-price">€89.99</span>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/eu");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(89.99));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_itemprop_meta_price() {
+        let html = r#"<!doctype html><html><head>
+<meta itemprop="price" content="549.00">
+</head><body><h1>Product</h1></body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/m");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(549.00));
+        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_does_not_extract_rating_or_other_facts() {
+        // The fallback should ONLY extract price and currency — never other
+        // facts like rating, availability, or name from free text.
+        let html = r#"<!doctype html><html><body>
+<h1>Amazing Product</h1>
+<span class="price">$49.99</span>
+<p>Rated 4.8 out of 5 stars!</p>
+<p>In stock, ready to ship.</p>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/ap");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.rating, None, "rating must NOT be extracted from text");
+        assert_eq!(d.availability, None, "availability must NOT be extracted from text");
+    }
+
         #[test]
         fn intent_reports_local_signal_for_near_me() {
             // "near me" must set local_intent=true (drives /search geo-boost).
