@@ -2908,13 +2908,12 @@ fn extract_price_from_html_patterns(html: &str) -> Option<(f64, String)> {
     //    with a price-related class or data attribute — NOT embedded in a sentence.
     //    Requires a currency symbol to avoid matching bare numbers.
     //    Pattern: <tag class="...price...">$49.99</tag>
-    //    or: <tag class="...price..."><span>$49.99</span></tag>
-    //    NOTE: excludes itemprop (handled by structured microdata parser) to
-    //    avoid false positives like <span itemprop="price">9.99</span>.
+    //    NOTE: excludes itemprop (microdata parser handles those) and uses
+    //    strict single-line matching (no cross-tag matching).
     static PRICE_TEXT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let price_text_re = PRICE_TEXT_RE.get_or_init(|| {
         regex::Regex::new(
-            r#"(?i)<[^>]*(?:class|data-(?:price|amount|sale))\s*=\s*["'][^"']*(?:price|amount|sale|offer|current|selling|deal)[^"']*["'][^>]*>\s*(?:<[^>]*>\s*)?(?:\$|€|£|¥|₹|Rs\.?|INR|USD|EUR|GBP)\s*([\d,]+\.?\d*)\s*(?:</[^>]*>\s*)?</[^>]*>"#
+            r#"(?i)<[^>]*(?:class|data-(?:price|amount|sale))\s*=\s*["'][^"'\n]*(?:price|amount|sale|offer|current|selling|deal)[^"'\n]*["'][^>]*>\s*(?:<[^>]*>\s*)?(?:\$|€|£|¥|₹|Rs\.?|INR|USD|EUR|GBP)\s*([\d,]+\.?\d*)\s*(?:</[^>]*>\s*)?</[^>]*>"#
         ).unwrap()
     });
     if let Some(caps) = price_text_re.captures(html) {
