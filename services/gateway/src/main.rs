@@ -543,6 +543,10 @@ struct UnifiedResponse {
     /// Human-readable diagnostics (empty result set, upstream flakiness hints, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     warnings: Option<Vec<String>>,
+    /// FIX-IF-03: when upstream was flaky/timeout and we surfaced partial results
+    /// from a numeric-relaxed fallback query, this flag tells the client to retry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    partial_results: bool,
     /// Web result count before any constraint filtering.
     #[serde(skip_serializing_if = "Option::is_none")]
     results_before_filter: Option<usize>,
@@ -3824,6 +3828,162 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.rating.is_some()
 }
 
+/// Apply the same single-result enrichment (extract_commerce_offer → optional commerce +
+/// commerce_provenance) onto one serde_json::Value. Factored out of the parallel
+/// function so unit tests can exercise the attach + provenance contract independently.
+fn enrich_single_commerce(
+    r: &mut serde_json::Value,
+    html: &str,
+) {
+    if !r.is_object() {
+        return;
+    }
+    let url = r
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let provenance = serde_json::json!({
+        "url": url,
+        "observed_at": now_unix_string(),
+        "source": null,
+        "data": null,
+    });
+    let offer: CommerceOffer = extract_commerce_offer(html, &url);
+    if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
+        if let Ok(v) = serde_json::to_value(&offer) {
+            r["commerce"] = v;
+        }
+    }
+    r["commerce_provenance"] = provenance;
+}
+
+/// Parallel variant of `enrich_with_commerce` — bounded-concurrency fetch + 22s wall cap.
+///
+/// Fetches up to MAX_PARALLEL_FETCH result pages concurrently. Results that still
+/// lack structured commerce facts after their page is fetched (or whose fetch fails
+/// / times out) keep commerce: null but ALWAYS carry commerce_provenance (honest:
+/// we never fabricate).
+///
+/// Order is preserved byte-for-byte — enrichment is a strict post-rank decoration
+/// pass. The fetch closure must be Clone + Send because it is spawned into
+/// parallel tasks. A wall-time Duration bounds the entire batch so the main
+/// /search endpoint stays within its 30s TimeoutLayer budget.
+///
+/// Concurrency is bounded (not unbounded join_all) to avoid overloading
+/// upstream / the local HTTP client.
+async fn enrich_with_commerce_par<F, Fut>(
+    results: &mut [serde_json::Value],
+    fetch: F,
+    wall_timeout: std::time::Duration,
+) where
+    F: Fn(String) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Option<String>> + Send,
+{
+    let max_par = MAX_PARALLEL_FETCH.min(results.len());
+
+    // 1) Collect indices eligible for enrichment: object results with a URL
+    //    that don't already carry a commerce block from an earlier step.
+    let eligible: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.is_object()
+                && !r.get("url").and_then(|v| v.as_str()).unwrap_or("").is_empty()
+                && r.get("commerce").is_none()
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+
+    // 2) Fetch in bounded-concurrency WAVES of max_par: every eligible result
+    //    is eventually fetched (`.take(max_par)` would silently drop the tail
+    //    beyond the first wave), while at most max_par fetches are in flight.
+    //    `.max(1)` keeps `chunks` non-zero when `results` is empty.
+    //    The whole batch is bounded by `wall_timeout` (documented contract:
+    //    /search must stay inside its 30s TimeoutLayer budget) — on expiry the
+    //    remaining fetches are abandoned and those results keep commerce: null
+    //    but still receive provenance in step 4 (honest, never fabricated).
+    let deadline = std::time::Instant::now() + wall_timeout;
+    let mut fetched: Vec<(usize, String)> = Vec::new();
+    for wave in eligible.chunks(max_par.max(1)) {
+        let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(usize, String)>>)> = wave
+            .iter()
+            .map(|&idx| {
+                let fetch_clone = fetch.clone();
+                let url_owned = results[idx]
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let handle = tokio::spawn(async move {
+                    match fetch_clone(url_owned.clone()).await {
+                        Some(html) => Some((idx, html)),
+                        None => None,
+                    }
+                });
+                (idx, handle)
+            })
+            .collect();
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            // Budget exhausted — abandon pending waves (handles are dropped;
+            // tokio detaches the tasks, matching the pre-existing semantics
+            // where a slow fetch could never block the response past the cap).
+            break;
+        }
+        match tokio::time::timeout(remaining, async {
+            let mut wave_results = Vec::new();
+            for (_, handle) in tasks {
+                match handle.await {
+                    Ok(Some((idx, html))) => wave_results.push((idx, html)),
+                    _ => {} // task panicked or returned None — skip
+                }
+            }
+            wave_results
+        })
+        .await
+        {
+            Ok(wave_results) => fetched.extend(wave_results),
+            Err(_) => break, // wall clock expired mid-wave — stop fetching
+        }
+    }
+
+    // 3) Attach results back onto the original array (preserving order).
+    for (idx, html) in fetched {
+        if let Some(r) = results.get_mut(idx) {
+            enrich_single_commerce(r, &html);
+        }
+    }
+
+    // 4) Attach provenance to any result we didn't fetch (idempotent path).
+    for r in results.iter_mut() {
+        if r.is_object() && r.get("commerce_provenance").is_none() {
+            let url = r
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let provenance = serde_json::json!({
+                "url": url,
+                "observed_at": now_unix_string(),
+                "source": null,
+                "data": null,
+            });
+            r["commerce_provenance"] = provenance;
+        }
+    }
+}
+
+/// Max concurrent page fetches during parallel enrichment. Tuned so that
+/// 8 parallel page-fetches complete well within the 22s wall cap and 30s
+/// TimeoutLayer budget. Bounded to avoid overwhelming upstream servers.
+const MAX_PARALLEL_FETCH: usize = 4;
+
+/// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
+/// The main /search endpoint has a 30s TimeoutLayer; parallel enrichment of
+/// top-N results must complete well before it fires. 22s leaves ~8s headroom.
+const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 22;
+
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
 /// page exposed structured product data, attached by `enrich_with_commerce`).
 /// Powers the main-path `shopping` gate: the strip is only surfaced when at
@@ -6799,7 +6959,12 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     break;
                 }
                 // Greedily collect the entity, stopping at a price op / new lead-in /
-                // trailing stopword once we already have a head.
+                // trailing stopword once we already have a head. Split on "or"/"and"
+                // list connectors so each target becomes its own exclusion — the same
+                // compound-splitting pattern as extract_query_negative_terms_with_dropped.
+                // Without this, "without oven or microwave" yielded the single compound
+                // "oven or microwave", which substring-matches no page title/content and
+                // silently let "Best Microwaves" rank #1.
                 let mut ent: Vec<String> = Vec::new();
                 while idx < words.len() && ent.len() < 5 {
                     let w = words[idx];
@@ -6815,6 +6980,18 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     }
                     if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
                         break; // trailing stopword ends the entity
+                    }
+                    // List connector ("or"/"and"/",") between exclusion targets: the
+                    // current target is finalised and pushed, then we start a new one.
+                    let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
+                    if !ent.is_empty() && (bare == "or" || bare == "and") {
+                        let entity = ent.join(" ");
+                        if !out.contains(&entity) {
+                            out.push(entity);
+                        }
+                        ent.clear();
+                        idx += 1;
+                        continue;
                     }
                     ent.push(wc);
                     idx += 1;
@@ -7328,6 +7505,65 @@ fn keyphrase_relax_variant(query: &str) -> Option<String> {
     }
 
     Some(filtered.join(" "))
+}
+
+
+// ─── Numeric Constraint Relaxation ─────────────────────────────────
+/// Strip numeric budget/amount constraints from a query to boost recall.
+/// Queries like "how to start a small business with less than 50000 rupees in india"
+/// often return 0-3 results because the numeric constraint over-narrows upstream.
+/// This function strips numeric tokens, comparison words, and currency terms while
+/// preserving the topical core. Data-driven — no per-query literals.
+fn numeric_constraint_relaxation(query: &str) -> Option<String> {
+    let q_lower = query.to_lowercase();
+    if !q_lower.split_whitespace().any(|w| w.chars().any(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    if q_lower.contains("site:") || q_lower.contains("filetype:") || q_lower.contains("price:") {
+        return None;
+    }
+    const NUMERIC_SIGNAL_WORDS: &[&str] = &[
+        "less", "more", "under", "over", "above", "below", "between",
+        "than", "from", "about", "around", "approximately", "nearly",
+        "almost", "least", "most", "only", "up", "to", "and", "or",
+        "rs", "rs.", "rupee", "rupees", "inr", "dollar", "dollars",
+        "usd", "euro", "euros", "eur", "pound", "pounds", "gbp",
+        "yen", "jpy", "lakh", "lakhs", "crore", "crores",
+    ];
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let filtered: Vec<&str> = words.iter()
+        .filter(|w| {
+            let wl = w.to_lowercase();
+            if w.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') {
+                return false;
+            }
+            if w.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                return false;
+            }
+            if NUMERIC_SIGNAL_WORDS.contains(&wl.as_str()) {
+                return false;
+            }
+            if wl == "₹" || wl == "$" || wl == "€" || wl == "£" || wl == "¥" {
+                return false;
+            }
+            true
+        })
+        .copied()
+        .collect();
+    if filtered.len() < 2 || filtered.len() == words.len() {
+        return None;
+    }
+    let relaxed = filtered.join(" ");
+    if relaxed.trim().len() < 3 {
+        return None;
+    }
+    Some(relaxed)
+}
+
+/// True if the query carries a numeric constraint that may over-narrow recall.
+fn has_numeric_constraint(query: &str) -> bool {
+    let q_lower = query.to_lowercase();
+    q_lower.split_whitespace().any(|w| w.chars().any(|c| c.is_ascii_digit()))
 }
 
 
@@ -11822,6 +12058,33 @@ fn build_inspect(index: &spell::SymSpellIndex, q: &str) -> serde_json::Value {
     })
 }
 
+/// True if a word is a keyboard-row run (asdfghjkl, zxcvbnm, qwerty, etc.).
+/// These are Gibberish tokens — consecutive letters from a single QWERTY row.
+fn is_keyboard_gibberish(w: &str) -> bool {
+    let w_lower = w.to_lowercase();
+    if w_lower.len() < 4 {
+        return false;
+    }
+    let chars: Vec<char> = w_lower.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    if chars.len() < 4 {
+        return false;
+    }
+    // QWERTY rows
+    let row1: std::collections::HashSet<char> = "qwertyuiop".chars().collect();
+    let row2: std::collections::HashSet<char> = "asdfghjkl".chars().collect();
+    let row3: std::collections::HashSet<char> = "zxcvbnm".chars().collect();
+
+    // A token is keyboard gibberish if >= 80% of its chars come from ONE row.
+    // This catches "asdfghjkl", "zxcvbnm", "qwerty" but not "hello" (h,e,l,o span rows).
+    for row in [&row1, &row2, &row3] {
+        let in_row = chars.iter().filter(|c| row.contains(c)).count();
+        if in_row >= chars.len() * 4 / 5 && in_row >= 3 {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_pronounceable(w: &str) -> bool {
     let lower = w.to_lowercase();
     if lower.len() < 3 {
@@ -11847,6 +12110,7 @@ fn is_pronounceable(w: &str) -> bool {
     }
     true
 }
+
 
 fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f32) {
     let words: Vec<&str> = q.split_whitespace().filter(|w| w.chars().any(|c| c.is_alphabetic())).collect();
@@ -11886,15 +12150,29 @@ fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f
     // identifier/version (http3, tls1.3, x86_64, k8s, arm64, c++) — these
     // are never gibberish even if absent from the spell dictionary. Treat their
     // presence as legitimizing the query (structural rule, not a hardcoded list).
+    // Length-gate on the digit check: a digit in a SHORT alphanumeric token is
+    // a real identifier (rtx4090, s25, 5g); a digit appended to a long
+    // alphabetic run (e.g. "randomgibberish1234567890") is NOT — it's gibberish
+    // with digits and must not legitimize the query. 12 chars covers every
+    // real product/model identifier while excluding padded garbage.
     let has_technical_token = words.iter().any(|w| {
-        w.chars().any(|c| c.is_numeric())
-            || w.chars().any(|c| c.is_uppercase()) && w.chars().any(|c| c.is_lowercase())
+        (w.chars().any(|c| c.is_numeric()) && w.len() <= 12)
+            || (w.chars().any(|c| c.is_uppercase()) && w.chars().any(|c| c.is_lowercase()))
             || w.contains('_') || w.contains('-') || w.contains('.')
     });
+
+    // Keyboard-gibberish-dominated query: if half or more tokens are keyboard
+    // row runs (asdfghjkl, zxcvbnm, qwerty, etc.), the query is junk regardless
+    // of other signals. This catches "asdfghjkl qwerty zxcvbnm" and similar.
+    let kb_gibberish_count = words.iter().filter(|w| is_keyboard_gibberish(w)).count();
+    let kb_gibberish_ratio = kb_gibberish_count as f32 / words.len() as f32;
+    let dominated_by_kb_gibberish = kb_gibberish_ratio >= 0.5;
 
     if valid_ratio == 0.0 && !has_european_word && !all_pronounceable && !has_technical_token {
         ("junk".to_string(), valid_ratio)
     } else if valid_ratio < 0.25 && !has_european_word && !all_pronounceable && (h < 2.5 || h > 6.5) && !has_technical_token {
+        ("junk".to_string(), valid_ratio)
+    } else if dominated_by_kb_gibberish && !has_technical_token && valid_ratio < 0.5 {
         ("junk".to_string(), valid_ratio)
     } else if valid_ratio < 0.5 && !has_european_word && !has_technical_token {
         ("low".to_string(), valid_ratio)
@@ -12098,6 +12376,7 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         applied_constraints: None,
         ignored_constraints: None,
         warnings: None,
+        partial_results: false,
         results_before_filter: None,
         results_after_filter: None,
         total: None,
@@ -13781,7 +14060,7 @@ async fn handle_search(
     // (BERT-based classifier), falling back to keyword detection when confidence is low.
     let is_local_intent = intent.intent.as_str() == "local" && intent.confidence >= 0.20
         || intent.intent.as_str() != "local" && has_local_intent(&q);
-    let expanded_queries = if let Some(ref geo) = geo_location {
+    let mut expanded_queries = if let Some(ref geo) = geo_location {
         if is_local_intent {
             let mut eq = expanded_queries;
             if let Some(localized) = localize_query(&q, geo) {
@@ -13797,6 +14076,18 @@ async fn handle_search(
         expanded_queries
     };
     tracing::info!(target:"expansion.debug", expanded=?expanded_queries.iter().take(3).collect::<Vec<_>>(), query=%q, "primary expanded queries");
+
+    // FIX-IF-03: Inject numeric-constraint relaxation into expanded_queries.
+    if has_numeric_constraint(&q) {
+        if let Some(relaxed) = numeric_constraint_relaxation(&q) {
+            let relaxed_clean = preprocess_searxng_query(&relaxed);
+            if !relaxed_clean.is_empty() && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == relaxed_clean) {
+                tracing::info!(target:"expansion.debug", "numeric-relaxed expanded query: {:?}", relaxed_clean);
+                let insert_pos = 1.min(expanded_queries.len());
+                expanded_queries.insert(insert_pos, relaxed_clean);
+            }
+        }
+    }
 
     // TODO: Secondary fan-out with expanded queries if searx_results are sparse
     // For now, scoring uses intent-based weighting on the raw query results
@@ -14155,6 +14446,84 @@ async fn handle_search(
                     }
                 }
                 tracing::info!("Parallel retry collected {} new unique results", final_retry_count);
+            }
+        }
+    }
+
+    // FIX-IF-03: Thin-result fallback — if the initial + retry still returned
+    // fewer than 5 results, fire a final numeric-relaxed query with a hard 8s
+    // timeout guard. If SearXNG doesn't respond within 8s, return whatever
+    // partial results exist with a flag rather than timing out entirely.
+    let mut partial_results = false;
+    let final_total = web_results.len();
+    if final_total < 5 && has_numeric_constraint(&q) && !searx_base_urls.is_empty() {
+        if let Some(relaxed) = numeric_constraint_relaxation(&q) {
+            let relaxed_clean = preprocess_searxng_query(&relaxed);
+            if !relaxed_clean.is_empty() {
+                let fallback_timeout = Duration::from_secs(8);
+                for (inst_idx, base_url) in searx_base_urls.iter().enumerate() {
+                    if inst_idx > 0 { break; }
+                    let fb_key = format!("searxng{}", inst_idx);
+                    if circuit_ref.is_open(&fb_key) { continue; }
+                    let fb_url = searxng_url(base_url, &relaxed_clean, geo_location.as_ref(), lang);
+                    let fb_client = client.clone();
+                    let fb_circuit = circuit_ref.clone();
+                    let fb_result = tokio::time::timeout(fallback_timeout, async move {
+                        match fb_client.get(&fb_url).send().await {
+                            Ok(resp) => {
+                                match tokio::time::timeout(Duration::from_secs(3), resp.text()).await {
+                                    Ok(Ok(text)) => {
+                                        let sanitized = sanitize_json_text(&text);
+                                        match serde_json::from_str::<SearxResponse>(&sanitized) {
+                                            Ok(data) => Some(data),
+                                            Err(_) => None,
+                                        }
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            Err(_) => None,
+                        }
+                    }).await;
+
+                    match fb_result {
+                        Ok(Some(data)) if !data.results.is_empty() => {
+                            tracing::info!("THIN-RESULT FALLBACK: relaxed query returned {} results", data.results.len());
+                            partial_results = true;
+                            fb_circuit.record_success(&fb_key);
+                            for (pos, result) in data.results.into_iter().enumerate() {
+                                let engine_weight = fb_circuit.weight(&result.engine);
+                                let normalized = {
+                                    let lower = result.url.to_lowercase();
+                                    let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                                    let no_trailing = no_fragment.trim_end_matches('/');
+                                    let no_www = no_trailing.replacen("://www.", "://", 1);
+                                    let no_mobile = no_www.replacen("://m.", "://", 1).replacen("://mobile.", "://", 1);
+                                    strip_tracking_params(&no_mobile)
+                                };
+                                if !url_rrf_contributions.contains_key(&normalized) {
+                                    let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
+                                    *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
+                                    let mut instance_tagged = result;
+                                    let instance_tag = format!("instance_{}", fb_key.trim_start_matches("searxng"));
+                                    if !instance_tagged.sources.contains(&instance_tag) {
+                                        instance_tagged.sources.push(instance_tag);
+                                    }
+                                    web_results.push(instance_tagged);
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            tracing::warn!("THIN-RESULT FALLBACK: relaxed query returned 0 results");
+                            partial_results = true;
+                            fb_circuit.record_success(&fb_key);
+                        }
+                        Err(_) => {
+                            tracing::warn!("THIN-RESULT FALLBACK: relaxed query timed out after 8s");
+                            partial_results = true;
+                        }
+                    }
+                }
             }
         }
     }
@@ -15913,13 +16282,19 @@ let mut results = match tokio::task::spawn_blocking(move || {
             None
         } else {
             let http_client = client.clone();
-            // Reuse the same strict post-rank enrichment as /shopping. Each fetch is
-            // already budgeted (~4.5s) inside `fetch_page_html`, and we only touch
-            // the top-N (bounded), so the main /search latency stays acceptable.
-            enrich_with_commerce(&mut shop_arr, move |url: String| {
-                let c = http_client.clone();
-                async move { fetch_page_html(&c, &url).await }
-            })
+            // Parallel enrichment (bounded concurrency) for the main /search path.
+            // Sequential enrichment of 8 product pages (~36s) exceeds the 30s
+            // TimeoutLayer budget. Parallel fetches complete in ~4.5s with a 22s
+            // wall cap, leaving 8s headroom. Order is byte-identical to the
+            // sequential variant (proven by the order-invariance regression test).
+            enrich_with_commerce_par(
+                &mut shop_arr,
+                move |url: String| {
+                    let c = http_client.clone();
+                    async move { fetch_page_html(&c, &url).await }
+                },
+                Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            )
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
@@ -15959,7 +16334,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         confidence: Some(intent.confidence),
         constraints: flat_constraints,
         structured_constraints: intent.structured_constraints.clone(),
-        expanded_queries: intent.expanded_queries.clone(),
+        expanded_queries: expanded_queries.clone(),
         distribution: Some(intent.distribution.clone()),
         deep_result,
         results: paginated_results,
@@ -15971,6 +16346,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         applied_constraints: if applied.is_empty() { None } else { Some(applied) },
         ignored_constraints: if ignored.is_empty() { None } else { Some(ignored) },
         warnings: if warnings.is_empty() { None } else { Some(warnings) },
+        partial_results,
         results_before_filter: Some(pre_filter_count.max(post_filter_count)),
         results_after_filter: Some(post_filter_count),
         total: Some(post_filter_count),
@@ -18530,7 +18906,7 @@ mod spellcheck_endpoint_tests {
         fn video_watch_phrase_triggers_video_intent() {
             // "watch video" / "watch tutorial" must be detected as video intent
             // (has_video_intent checks for these phrases, matching live /search).
-            let stripped = simple_negation_strip("watch video tutorial").unwrap_or("watch video tutorial");
+            let stripped = simple_negation_strip("watch video tutorial").unwrap_or_else(|| "watch video tutorial".to_string());
             assert!(has_video_intent(&stripped));
         }
     }
@@ -19129,5 +19505,111 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!out.contains("q="), "no query text");
         assert!(!out.contains("user"), "no user id");
         assert!(!out.contains("ip="), "no ip");
+    }
+
+    // ── ROADMAP item 7 (refinement): parallel enrichment within budget ──
+    // The main /search path calls enrich_with_commerce_par with bounded
+    // concurrency. These tests prove: (a) parallel enrichment completes
+    // well within the TimeoutLayer budget, (b) URL order is byte-identical
+    // to sequential enrichment, (c) timeout doesn't panic — provenance is
+    // attached even when the wall-time fires.
+
+    #[tokio::test]
+    async fn parallel_enrichment_within_budget_and_order_invariant() {
+        // 8 fake results, each fetch takes 500ms. With MAX_PARALLEL_FETCH=4,
+        // total wall time ≈ 1s (two waves of 4), far below the 22s cap.
+        let mut ranked: Vec<serde_json::Value> = (0..8)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("https://store{}.example.com/p/{}", i, i),
+                    "score": 9.0 - (i as f64 * 0.1),
+                })
+            })
+            .collect();
+
+        let before: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |url: String| {
+            let html = fake_html.clone();
+            async move {
+                // Simulate network latency
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                Some(html)
+            }
+        };
+
+        let start = std::time::Instant::now();
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // Parallel: 8 results / 4 concurrent = 2 waves × 500ms = ~1s
+        // Sequential would be 8 × 500ms = 4s.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "parallel enrichment should complete in ~1s, took {:?}",
+            elapsed
+        );
+
+        // Order preserved byte-for-byte.
+        let after: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(before, after, "parallel enrichment must preserve order");
+
+        // Every result got a commerce block (all fetched the fake product page).
+        for r in ranked.iter() {
+            assert!(r.get("commerce").is_some(), "commerce block attached in parallel");
+            assert!(r.get("commerce_provenance").is_some(), "provenance attached in parallel");
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_enrichment_timeout_gracefully_attaches_provenance() {
+        // A fetch that ALWAYS exceeds the wall timeout must not panic. Every
+        // result still gets commerce_provenance (source: null, data: null).
+        let mut ranked: Vec<serde_json::Value> = (0..4)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("https://slow{}.example.com/p", i),
+                })
+            })
+            .collect();
+
+        let fetch = |_url: String| async {
+            // Wall-time is 1ms; this fetch is 10s — guaranteed to time out.
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            None
+        };
+
+        // Must NOT panic.
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        // All results got provenance (even though fetch returned None).
+        for r in ranked.iter() {
+            assert!(
+                r.get("commerce_provenance").is_some(),
+                "provenance must be attached even on timeout"
+            );
+            // No commerce block (fetch returned None, no facts to attach).
+            assert!(
+                r.get("commerce").is_none(),
+                "no commerce block when fetch returns None"
+            );
+        }
     }
 }
