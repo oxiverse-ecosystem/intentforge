@@ -6191,11 +6191,11 @@ fn has_local_intent(query: &str) -> bool {
         || {
             let parts: Vec<&str> = lower.split(" in ").collect();
             if let Some(after_in) = parts.last() {
+                let after_in = *after_in;  // deref &&str -> &str
                 LOCATION_GAZETTEER.iter().any(|(name, _)| {
                     let name_lower = name.to_lowercase();
                     whole_word_contains(after_in, &name_lower)
-                        || after_in.starts_with(&name_lower)
-                        || after_in == name_lower
+                        || after_in.starts_with(name_lower.as_str())
                 })
             } else {
                 false
