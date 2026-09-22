@@ -12139,31 +12139,50 @@ fn build_inspect(index: &spell::SymSpellIndex, q: &str) -> serde_json::Value {
     })
 }
 
-/// True if a word is a keyboard-row run (asdfghjkl, zxcvbnm, qwerty, etc.).
-/// These are Gibberish tokens — consecutive letters from a single QWERTY row.
+/// True if a word is a keyboard-row run (asdfghjkl, zxcvbnm, qwerty, hjkl...).
+/// A run WALKS adjacent keys along ONE QWERTY row: the token's letters, with
+/// non-letters stripped, must appear as a CONTIGUOUS substring of one of the
+/// three row strings. Mere row membership (>=80% of letters ON one row) is
+/// NOT enough: real words like "poetry", "typewriter", "poodle", "power",
+/// "your", "type" scatter across a single row and were wrongly flagged by the
+/// old >=80% rule (verified live: "typewriter" and "poodle" alone returned
+/// junk). Contiguity is the structural signature of an actual key walk.
 fn is_keyboard_gibberish(w: &str) -> bool {
-    let w_lower = w.to_lowercase();
-    if w_lower.len() < 4 {
+    const ROWS: [&str; 3] = ["qwertyuiop", "asdfghjkl", "zxcvbnm"];
+    let letters: String = w
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .collect();
+    if letters.len() < 4 {
         return false;
     }
-    let chars: Vec<char> = w_lower.chars().filter(|c| c.is_ascii_alphabetic()).collect();
-    if chars.len() < 4 {
-        return false;
-    }
-    // QWERTY rows
-    let row1: std::collections::HashSet<char> = "qwertyuiop".chars().collect();
-    let row2: std::collections::HashSet<char> = "asdfghjkl".chars().collect();
-    let row3: std::collections::HashSet<char> = "zxcvbnm".chars().collect();
+    ROWS.iter().any(|row| row.contains(&letters))
+}
 
-    // A token is keyboard gibberish if >= 80% of its chars come from ONE row.
-    // This catches "asdfghjkl", "zxcvbnm", "qwerty" but not "hello" (h,e,l,o span rows).
-    for row in [&row1, &row2, &row3] {
-        let in_row = chars.iter().filter(|c| row.contains(c)).count();
-        if in_row >= chars.len() * 4 / 5 && in_row >= 3 {
-            return true;
-        }
+/// True if a token is alphanumeric garbage — the "xyz123"/"abc123"
+/// test-sequence signature: it mixes digits and letters, is >=5 chars, and
+/// its letter part contains no vowel (a/e/i/o/u; `y` is NOT counted as a
+/// vowel here because filler sequences like "xyz123" ride on y). Short
+/// technical identifiers (5g, mp3, k8s, ps5, x86, gpt4, s25) are excluded by
+/// the length floor. Accepted boundary: a longer digit-bearing vowel-less
+/// identifier (rtx4090, html5) matches this shape — it only matters when the
+/// SAME query also contains a keyboard-row run (see the mixed rule in
+/// `query_quality_flag`), which in practice is mash, not a product query.
+fn is_alnum_garbage(w: &str) -> bool {
+    let chars: Vec<char> = w.chars().collect();
+    if chars.len() < 5 {
+        return false;
     }
-    false
+    let has_digit = chars.iter().any(|c| c.is_ascii_digit());
+    if !has_digit {
+        return false;
+    }
+    let letters: Vec<char> = chars.iter().copied().filter(|c| c.is_ascii_alphabetic()).collect();
+    if letters.len() < 2 {
+        return false;
+    }
+    !letters.iter().any(|c| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u'))
 }
 
 fn is_pronounceable(w: &str) -> bool {
@@ -12249,11 +12268,26 @@ fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f
     let kb_gibberish_ratio = kb_gibberish_count as f32 / words.len() as f32;
     let dominated_by_kb_gibberish = kb_gibberish_ratio >= 0.5;
 
+    // MIXED junk: a keyboard-row run ONE token among others (e.g.
+    // "asdfghjkl xyz123 nonsense") escapes both the dominated fast path
+    // (ratio 1/3 < 0.5) and the technical-token shield ("xyz123" is a short
+    // digit token). The structural signature of mash is the CO-OCCURRENCE of
+    // a keyboard-row run with alphanumeric garbage (digits + vowel-less
+    // letters, e.g. "xyz123"). Legit queries never carry both: a real
+    // product/tech query ("rtx4090 price", "qwerty 5g phones") pairs its
+    // identifier with ordinary words, not with a key walk. This rule
+    // deliberately IGNORES has_technical_token — a short digit token is
+    // exactly how this junk class escaped detection.
+    let has_alnum_garbage = words.iter().any(|w| is_alnum_garbage(w));
+    let mixed_kb_and_garbage = kb_gibberish_count >= 1 && has_alnum_garbage;
+
     if valid_ratio == 0.0 && !has_european_word && !all_pronounceable && !has_technical_token {
         ("junk".to_string(), valid_ratio)
     } else if valid_ratio < 0.25 && !has_european_word && !all_pronounceable && (h < 2.5 || h > 6.5) && !has_technical_token {
         ("junk".to_string(), valid_ratio)
     } else if dominated_by_kb_gibberish && !has_technical_token && valid_ratio < 0.5 {
+        ("junk".to_string(), valid_ratio)
+    } else if mixed_kb_and_garbage {
         ("junk".to_string(), valid_ratio)
     } else if valid_ratio < 0.5 && !has_european_word && !has_technical_token {
         ("low".to_string(), valid_ratio)
@@ -19710,5 +19744,85 @@ structured product data, so nothing must be extracted from the body.</p></body><
                 "no commerce block when fetch returns None"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod kb_gibberish_mixed_tests {
+    use super::*;
+
+    fn idx() -> spell::SymSpellIndex {
+        spell::SymSpellIndex::build()
+    }
+
+    // ── Detector precision: a keyboard-row RUN is contiguous along one row ──
+
+    #[test]
+    fn kb_run_contiguous_along_row_detected() {
+        for w in ["asdfghjkl", "qwerty", "zxcvbnm", "asdf", "hjkl", "wert", "sdfg", "qwer", "erty"] {
+            assert!(is_keyboard_gibberish(w), "expected kb-run: {}", w);
+        }
+    }
+
+    #[test]
+    fn real_words_not_kb_gibberish() {
+        // Real English words whose letters merely SCATTER on one row must NOT match.
+        for w in ["poetry", "typewriter", "poodle", "tree", "power", "your", "type", "rust", "free", "hello"] {
+            assert!(!is_keyboard_gibberish(w), "real word must not be kb-run: {}", w);
+        }
+    }
+
+    #[test]
+    fn mixed_kb_and_digit_garbage_is_junk() {
+        let index = idx();
+        // The card's failing case: kb run + alphanumeric garbage + a real word.
+        let (flag, _) = query_quality_flag("asdfghjkl xyz123 nonsense", &index);
+        assert_eq!(flag, "junk", "mixed kb-run + digit garbage must be junk");
+        // Two-token core: kb run + digit garbage alone.
+        let (flag2, _) = query_quality_flag("asdfghjkl xyz123", &index);
+        assert_eq!(flag2, "junk");
+        // Letter+digit mash token: kb run + mash.
+        let (flag3, _) = query_quality_flag("zxcvbnm123456 hello", &index);
+        assert_eq!(flag3, "junk");
+    }
+
+    #[test]
+    fn dominated_kb_path_still_fires() {
+        let index = idx();
+        // Fast path retained: >=50% kb runs (existing behavior, must not regress).
+        let (flag, _) = query_quality_flag("asdfghjkl qwerty zxcvbnm randomgibberish1234567890", &index);
+        assert_eq!(flag, "junk");
+        let (flag2, _) = query_quality_flag("qwerty 1234567890 randomgibberish", &index);
+        assert_eq!(flag2, "junk");
+    }
+
+    #[test]
+    fn legit_queries_not_junked() {
+        let index = idx();
+        for q in [
+            "rust async web framework",
+            "rust x509 certificate",
+            "type mp3 converter",
+            "free ps5 games",
+            "qwerty vs dvorak",
+            "typewriter repair",
+            "poetry write",
+            "power tower your typing",
+            "asdf movie",
+            "qwerty 5g phones",
+        ] {
+            let (flag, _) = query_quality_flag(q, &index);
+            assert_ne!(flag, "junk", "legit query must not be junk: {}", q);
+        }
+    }
+
+    #[test]
+    fn single_kb_word_alone_not_junk_by_mixed_rule() {
+        let index = idx();
+        // "qwerty" alone: existing behavior flags junk via the zero-valid-ratio
+        // branch (not via mixed rule). The mixed rule requires BOTH a kb run AND
+        // digit garbage; a lone kb run with a real word must stay searchable.
+        let (flag, _) = query_quality_flag("qwerty vs dvorak", &index);
+        assert_ne!(flag, "junk");
     }
 }
