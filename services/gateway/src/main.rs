@@ -4616,11 +4616,28 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
                         // Distance-bound guard: "within 300 kilometers" is a
                         // range, not a price — skip this marker (let a later
-                        // price marker, if any, match instead).
+                        // price marker, if any) match instead).
                         if is_distance_bound(rest) {
                             continue;
                         }
-                        let currency = currency_words.iter().find(|c| rest.contains(*c))
+                        // Currency-proximity guard: Pattern A is "<marker> <number>",
+                        // but a discourse marker like "about" can be followed by an
+                        // unrelated number that is NOT a price (e.g. "gpt 5",
+                        // "chapter 3", "version 2"). Require a currency word to
+                        // appear IMMEDIATELY after the number (within 20 chars),
+                        // not anywhere in the rest of the query. Without a nearby
+                        // currency word, this is not a price bound — skip and try
+                        // the next marker. General guard; no per-query literals.
+                        let after_num = &rest[m.end()..];
+                        let near_currency = currency_words.iter().any(|c| {
+                            after_num.len() >= c.len() && after_num[..c.len()].starts_with(c)
+                                || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
+                                || after_num[..after_num.len().min(20)].contains(c)
+                        });
+                        if !near_currency {
+                            continue;
+                        }
+                        let currency = currency_words.iter().find(|c| after_num[..after_num.len().min(20)].contains(*c))
                             .map(|c| normalize_currency_str(c)).unwrap_or_else(|| "usd".to_string());
                         return Some((v, currency));
                     }
@@ -6166,6 +6183,24 @@ fn has_local_intent(query: &str) -> bool {
             || lower.ends_with(" neighbourhood")
             || lower.ends_with(" neighborhood")
         )
+        // Detect "X in <gazetteer_city>" patterns (e.g. "restaurants in bangalore",
+        // "hotels in paris"). When " in " is followed by a known place from the
+        // LOCATION_GAZETTEER, the query has explicit local intent. General guard —
+        // no per-query literals, reuses the same gazetteer reference data as geo
+        // detection (line 1542) so the policy is consistent and future-proof.
+        || {
+            let parts: Vec<&str> = lower.split(" in ").collect();
+            if let Some(after_in) = parts.last() {
+                let after_in = *after_in;  // deref &&str -> &str
+                LOCATION_GAZETTEER.iter().any(|(name, _)| {
+                    let name_lower = name.to_lowercase();
+                    whole_word_contains(after_in, &name_lower)
+                        || after_in.starts_with(name_lower.as_str())
+                })
+            } else {
+                false
+            }
+        }
 }
 
 /// Known video-hosting domains. Used by the P8 video dampening so that videos
@@ -13974,9 +14009,10 @@ async fn handle_search(
         }
 
         // Override 4: local intent signals → force local intent
-        let has_local_keywords = q_lower.contains(" near me") || q_lower.starts_with("near me")
-            || q_lower.contains("nearby") || q_lower.contains(" close to")
-            || q_lower.starts_with("close to") || q_lower.contains("coffee shop");
+        // Delegates to `has_local_intent` so the keyword list stays in ONE
+        // place. This covers "near me", "nearby", "coffee shop", AND
+        // gazetteer-city patterns like "restaurants in bangalore".
+        let has_local_keywords = has_local_intent(&q_lower);
         if has_local_keywords && intent.intent != "local" {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): local query '{}' was '{}' (conf={:.3}) -> local",
