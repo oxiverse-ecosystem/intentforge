@@ -4616,11 +4616,28 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
                         // Distance-bound guard: "within 300 kilometers" is a
                         // range, not a price — skip this marker (let a later
-                        // price marker, if any, match instead).
+                        // price marker, if any) match instead).
                         if is_distance_bound(rest) {
                             continue;
                         }
-                        let currency = currency_words.iter().find(|c| rest.contains(*c))
+                        // Currency-proximity guard: Pattern A is "<marker> <number>",
+                        // but a discourse marker like "about" can be followed by an
+                        // unrelated number that is NOT a price (e.g. "gpt 5",
+                        // "chapter 3", "version 2"). Require a currency word to
+                        // appear IMMEDIATELY after the number (within 20 chars),
+                        // not anywhere in the rest of the query. Without a nearby
+                        // currency word, this is not a price bound — skip and try
+                        // the next marker. General guard; no per-query literals.
+                        let after_num = &rest[m.end()..];
+                        let near_currency = currency_words.iter().any(|c| {
+                            after_num.len() >= c.len() && after_num[..c.len()].starts_with(c)
+                                || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
+                                || after_num[..after_num.len().min(20)].contains(c)
+                        });
+                        if !near_currency {
+                            continue;
+                        }
+                        let currency = currency_words.iter().find(|c| after_num[..after_num.len().min(20)].contains(*c))
                             .map(|c| normalize_currency_str(c)).unwrap_or_else(|| "usd".to_string());
                         return Some((v, currency));
                     }
