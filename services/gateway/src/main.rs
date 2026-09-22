@@ -2988,6 +2988,11 @@ struct OfferFacts {
     /// from structured data, never guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     price_valid_until: Option<String>,
+    /// Product image URL from structured data (JSON-LD `image`, OG `og:image`,
+    /// microdata `itemprop="image"`, MF2 `u-photo`). Only extracted from typed
+    /// structured signals, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3472,6 +3477,30 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
     }
 }
 
+/// Merge structured product facts from a secondary signal into the primary
+/// `OfferFacts`. Only fills fields that are still `None` — never overwrites a
+/// stronger signal (JSON-LD > OG > microdata > MF2 > HTML patterns). This is
+/// what keeps the supplement pipeline honest: a later signal can only ADD
+/// facts the earlier ones never provided, never rewrite what a stronger
+/// source already asserted.
+fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
+    if dst.price.is_none() { dst.price = src.price; }
+    if dst.price_low.is_none() { dst.price_low = src.price_low; }
+    if dst.price_high.is_none() { dst.price_high = src.price_high; }
+    if dst.offer_count.is_none() { dst.offer_count = src.offer_count; }
+    if dst.currency.is_none() { dst.currency = src.currency.clone(); }
+    if dst.availability.is_none() { dst.availability = src.availability.clone(); }
+    if dst.merchant.is_none() { dst.merchant = src.merchant.clone(); }
+    if dst.condition.is_none() { dst.condition = src.condition.clone(); }
+    if dst.sku.is_none() { dst.sku = src.sku.clone(); }
+    if dst.gtin.is_none() { dst.gtin = src.gtin.clone(); }
+    if dst.rating.is_none() { dst.rating = src.rating; }
+    if dst.rating_count.is_none() { dst.rating_count = src.rating_count; }
+    if dst.name.is_none() { dst.name = src.name.clone(); }
+    if dst.price_valid_until.is_none() { dst.price_valid_until = src.price_valid_until.clone(); }
+    if dst.image.is_none() { dst.image = src.image.clone(); }
+}
+
 fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     let mut facts = OfferFacts::default();
     let mut source: Option<String> = None;
@@ -3488,14 +3517,7 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     // 2) Fallback / supplement: OpenGraph product:* meta (only when no price yet).
     if facts.price.is_none() && facts.price_low.is_none() {
         if let Some(og) = parse_og_product(html) {
-            if facts.price.is_none() { facts.price = og.price; }
-            if facts.currency.is_none() { facts.currency = og.currency; }
-            if facts.availability.is_none() { facts.availability = og.availability; }
-            if facts.condition.is_none() { facts.condition = og.condition; }
-            if facts.merchant.is_none() { facts.merchant = og.merchant; }
-            if facts.gtin.is_none() { facts.gtin = og.gtin; }
-            if facts.rating.is_none() { facts.rating = og.rating; }
-            if facts.rating_count.is_none() { facts.rating_count = og.rating_count; }
+            merge_offer_facts(&mut facts, &og);
             if source.is_none() { source = Some("og".to_string()); }
         }
     }
@@ -3509,22 +3531,7 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     //    price_low/price_high + offer_count, `price` left null), exactly like the
     //    JSON-LD path — never guessed from free text.
     if let Some(md) = parse_microdata(html) {
-        if facts.price.is_none() && facts.price_low.is_none() {
-            if facts.price.is_none() { facts.price = md.price; }
-            if facts.price_low.is_none() { facts.price_low = md.price_low; }
-            if facts.price_high.is_none() { facts.price_high = md.price_high; }
-            if facts.offer_count.is_none() { facts.offer_count = md.offer_count; }
-        }
-        if facts.currency.is_none() { facts.currency = md.currency; }
-        if facts.availability.is_none() { facts.availability = md.availability; }
-        if facts.condition.is_none() { facts.condition = md.condition; }
-        if facts.sku.is_none() { facts.sku = md.sku; }
-        if facts.gtin.is_none() { facts.gtin = md.gtin; }
-        if facts.rating.is_none() { facts.rating = md.rating; }
-        if facts.rating_count.is_none() { facts.rating_count = md.rating_count; }
-        if facts.merchant.is_none() { facts.merchant = md.merchant; }
-        if facts.name.is_none() { facts.name = md.name; }
-        if facts.price_valid_until.is_none() { facts.price_valid_until = md.price_valid_until; }
+        merge_offer_facts(&mut facts, &md);
         if source.is_none() {
             source = Some("microdata".to_string());
         }
@@ -3547,7 +3554,22 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         }
     }
 
-    // 5) Merchant fallback: derive a coarse host label only when no page-provided
+    // 5) Fallback: Microformats2 h-product (only when no price yet).
+    //    Used by Shopify, WooCommerce, and independent stores that mark up
+    //    products with `class="h-product"` + `p-price`, `p-brand`, etc.
+    //    Pure supplement — never overwrites a stronger signal, fires only on
+    //    pages carrying an explicit `h-product` class (no false positives from
+    //    unrelated microformats like h-entry/h-card).
+    if facts.price.is_none() && facts.price_low.is_none() {
+        if let Some(mf2) = parse_h_product(html) {
+            merge_offer_facts(&mut facts, &mf2);
+            if source.is_none() {
+                source = Some("microformats2".to_string());
+            }
+        }
+    }
+
+    // 6) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
@@ -3904,6 +3926,198 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
     Some(o)
 }
 
+/// True when the page declares a Microformats2 `h-product`.
+fn has_h_product(html: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)class\s*=\s*["'][^"']*h-product[^"']*["']"#).unwrap()
+    });
+    re.is_match(html)
+}
+
+/// Extract product facts from Microformats2 `h-product`.
+/// Only fires when the page carries an `h-product` class.
+///
+/// MF2 convention: `p-price` (text content or `value` attribute),
+/// `p-price-currency`, `p-brand`/`p-org`, `p-sku`, `p-identifier` (numeric GTIN),
+/// `p-photo`/`u-photo` (image src/href), `p-condition`, `p-availability`.
+///
+/// No hardcoding: all extraction is over MF2 class conventions (p-*/u-*).
+/// Only fields still `None` are filled; stronger signals (JSON-LD, OG, microdata)
+/// are never overwritten.
+fn parse_h_product(html: &str) -> Option<OfferFacts> {
+    if !has_h_product(html) {
+        return None;
+    }
+
+    static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tag_re = TAG_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)<\w+\b[^>]*class[^>]*>"#).unwrap()
+    });
+    static CLASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let class_re = CLASS_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)class\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static VALUE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let value_re = VALUE_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)value\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static CONTENT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let content_re = CONTENT_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)content\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let src_re = SRC_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static HREF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let href_re = HREF_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)href\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+
+    let mut o = OfferFacts::default();
+    let mut saw_price = false;
+
+    for cap in tag_re.captures_iter(html) {
+        let tag = cap.get(0).unwrap().as_str();
+        let classes_str = match class_re.captures(tag).and_then(|c| c.get(1)) {
+            Some(m) => m.as_str().to_lowercase(),
+            None => continue,
+        };
+        let classes: Vec<&str> = classes_str.split_whitespace().collect();
+
+        let mut prop_name = "";
+        let mut is_known = false;
+        for &cls in &classes {
+            if cls.starts_with("p-") || cls.starts_with("u-") {
+                is_known = true;
+                prop_name = &cls[2..];
+                break;
+            }
+        }
+        if !is_known {
+            continue;
+        }
+
+        let value_attr = value_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let content_attr = content_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let src = src_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let href = href_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+
+        // Helper: text content after tag until next '<'.
+        let text_content = || -> String {
+            let after = &html[cap.get(0).unwrap().end()..];
+            if let Some(end) = after.find('<') {
+                after[..end].trim().to_string()
+            } else {
+                String::new()
+            }
+        };
+
+        match prop_name {
+            "price" => {
+                if !saw_price {
+                    saw_price = true;
+                    let raw = value_attr.unwrap_or_else(text_content);
+                    // Strip currency symbols, whitespace, commas — keep digits, '.', '-'.
+                    let cleaned: String = raw
+                        .chars()
+                        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                        .collect();
+                    if let Ok(v) = cleaned.parse::<f64>() {
+                        o.price = Some(v);
+                    }
+                }
+            }
+            "price-currency" => {
+                if o.currency.is_none() {
+                    let raw = value_attr.or(content_attr).unwrap_or_else(text_content);
+                    if !raw.is_empty() {
+                        o.currency = Some(raw);
+                    }
+                }
+            }
+            "brand" | "org" => {
+                if o.merchant.is_none() {
+                    let raw = value_attr.or(content_attr).unwrap_or_else(text_content);
+                    if !raw.is_empty() {
+                        o.merchant = Some(raw);
+                    }
+                }
+            }
+            "sku" => {
+                if o.sku.is_none() {
+                    let raw = value_attr.unwrap_or_else(text_content);
+                    if !raw.is_empty() {
+                        o.sku = Some(raw);
+                    }
+                }
+            }
+            "identifier" => {
+                if o.gtin.is_none() {
+                    let raw = value_attr.unwrap_or_else(text_content);
+                    // Only numeric GTIN-like identifiers (8+ digits).
+                    if raw.chars().all(|c| c.is_ascii_digit()) && raw.len() >= 8 {
+                        o.gtin = Some(raw);
+                    }
+                }
+            }
+            "photo" => {
+                if o.image.is_none() {
+                    if let Some(v) = src.or(href) {
+                        o.image = Some(v);
+                    }
+                }
+            }
+            "condition" => {
+                if o.condition.is_none() {
+                    let raw = value_attr.unwrap_or_else(text_content);
+                    if !raw.is_empty() {
+                        o.condition = Some(raw);
+                    }
+                }
+            }
+            "availability" => {
+                if o.availability.is_none() {
+                    let raw = value_attr.unwrap_or_else(text_content);
+                    if !raw.is_empty() {
+                        o.availability = Some(raw);
+                    }
+                }
+            }
+            "name" | "description" | "category" | "url" | "review" | "rating" | "count" => {
+                // MF2 signals that prove a product page — no fact to extract.
+            }
+            _ => {}
+        }
+    }
+
+    if o.price.is_none()
+        && o.currency.is_none()
+        && o.availability.is_none()
+        && o.merchant.is_none()
+        && o.condition.is_none()
+        && o.sku.is_none()
+        && o.gtin.is_none()
+        && o.image.is_none()
+    {
+        return None;
+    }
+    Some(o)
+}
+
 /// Developer/verification primitive: runs the honest commerce extractor on
 /// supplied HTML and returns the typed CommerceOffer. This is NOT a search
 /// endpoint and applies NO ranking or monetization — it only surfaces facts
@@ -4020,6 +4234,7 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.sku.is_some()
         || d.gtin.is_some()
         || d.rating.is_some()
+        || d.image.is_some()
 }
 
 /// Apply the same single-result enrichment (extract_commerce_offer → optional commerce +
@@ -20025,6 +20240,136 @@ structured product data, so nothing must be extracted from the body.</p></body><
                 "no commerce block when fetch returns None"
             );
         }
+    }
+
+    // ── Microformats2 h-product extraction ───────────────────────────────
+    // ROADMAP item 1 (increment): extend the honest commerce extractor to
+    // pages that mark up products with Microformats2 `h-product` classes.
+    // Many Shopify, WooCommerce, and independent stores emit MF2 markup with
+    // no JSON-LD/OG/microdata — these tests prove the new parser recovers
+    // honest facts the other signals miss, and that it does NOT fire on
+    // unrelated microformats (h-entry, h-card, etc.).
+
+    const HTML_H_PRODUCT_FULL: &str = r#"<!doctype html><html><head>
+<title>H-Product Store</title>
+</head><body>
+<article class="h-product">
+  <h2 class="p-name">Acme Widget Pro</h2>
+  <a class="p-brand u-url" href="https://acme.example">Acme</a>
+  <span class="p-sku">ACME-WP-001</span>
+  <span class="p-price">$49.99</span>
+  <span class="p-price-currency">USD</span>
+  <span class="p-identifier">9876543210987</span>
+  <img class="u-photo" src="https://cdn.example.com/widget-pro.jpg" alt="">
+  <span class="p-condition">New</span>
+  <span class="p-availability">InStock</span>
+</article>
+</body></html>"#;
+
+    #[test]
+    fn h_product_extracts_all_fields() {
+        let o = extract_commerce_offer(HTML_H_PRODUCT_FULL, "https://mf2.example.com/widget");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(49.99), "p-price text with currency symbol stripped");
+        assert_eq!(d.currency.as_deref(), Some("USD"), "p-price-currency");
+        assert_eq!(d.sku.as_deref(), Some("ACME-WP-001"), "p-sku");
+        assert_eq!(d.gtin.as_deref(), Some("9876543210987"), "p-identifier numeric");
+        assert_eq!(d.merchant.as_deref(), Some("Acme"), "p-brand");
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/widget-pro.jpg"), "u-photo");
+        assert_eq!(d.condition.as_deref(), Some("New"), "p-condition");
+        assert_eq!(d.availability.as_deref(), Some("InStock"), "p-availability");
+        assert_eq!(o.source.as_deref(), Some("microformats2"));
+    }
+
+    const HTML_H_PRODUCT_VALUE_ATTR: &str = r#"<!doctype html><html><head>
+<title>MF2 Value Attr</title>
+</head><body>
+<div class="h-product">
+  <span class="p-name">Gadget</span>
+  <span class="p-price" value="29.99">29.99</span>
+  <span class="p-price-currency" content="EUR">EUR</span>
+  <span class="p-brand" content="GadgetCo">GadgetCo</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn h_product_value_attribute_preferred_over_text() {
+        let o = extract_commerce_offer(HTML_H_PRODUCT_VALUE_ATTR, "https://mf2.example.com/gadget");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(29.99), "value attribute for p-price");
+        assert_eq!(d.currency.as_deref(), Some("EUR"), "content attribute for p-price-currency");
+        assert_eq!(d.merchant.as_deref(), Some("GadgetCo"), "content attribute for p-brand");
+    }
+
+    const HTML_NO_H_PRODUCT: &str = r#"<!doctype html><html><head>
+<title>Article</title>
+</head><body>
+<article class="h-entry">
+  <h2 class="p-name">Blog Post</h2>
+  <p class="e-content">Some text with $19.99 mentioned</p>
+</article>
+</body></html>"#;
+
+    #[test]
+    fn h_product_non_product_class_returns_null() {
+        // An h-entry (not h-product) must NOT trigger extraction.
+        let o = extract_commerce_offer(HTML_NO_H_PRODUCT, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None, "no extraction from h-entry");
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    #[test]
+    fn h_product_photo_on_link_uses_href() {
+        let html = r#"<!doctype html><html><body>
+<div class="h-product">
+  <span class="p-name">Link Photo</span>
+  <a class="u-photo" href="https://cdn.example.com/link-photo.jpg">photo</a>
+  <span class="p-price">10.00</span>
+</div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://mf2.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/link-photo.jpg"), "u-photo href");
+    }
+
+    #[test]
+    fn h_product_identifier_short_numeric_is_rejected() {
+        // identifier must be 8+ digits to be treated as GTIN — short numbers
+        // (like a shop SKU) must not leak into the gtin field.
+        let html = r#"<!doctype html><html><body>
+<div class="h-product">
+  <span class="p-name">Short SKU</span>
+  <span class="p-identifier">12345</span>
+  <span class="p-price">5.00</span>
+</div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://mf2.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.gtin, None, "short numeric identifier must not be gtin");
+    }
+
+    #[test]
+    fn h_product_does_not_overwrite_stronger_jsonld_signal() {
+        // MF2 is a supplement — it must NOT overwrite a stronger JSON-LD signal.
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{ "@context": "https://schema.org/", "@type": "Product",
+  "name": "Acme Widget Pro",
+  "offers": { "@type": "Offer", "price": "49.99", "priceCurrency": "USD" } }
+</script></head><body>
+<div class="h-product">
+  <span class="p-price">9.99</span>
+  <span class="p-price-currency">EUR</span>
+</div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/mix");
+        let d = o.data.as_ref().unwrap();
+        // JSON-LD is the primary signal and wins where it sets a field.
+        assert_eq!(d.price, Some(49.99), "JSON-LD price must not be overwritten by MF2");
+        assert_eq!(d.currency.as_deref(), Some("USD"), "JSON-LD currency must not be overwritten");
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
     }
 }
 
