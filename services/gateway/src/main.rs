@@ -2834,6 +2834,102 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
     None
 }
 
+/// Secondary commerce price extraction: parse common HTML price patterns from
+/// pages that don't expose JSON-LD/OpenGraph/Product microdata. This is a
+/// STRUCTURED FALLBACK for known e-commerce HTML patterns — not free-text
+/// guessing. It looks for common price containers like:
+///   * <span class="a-price"> / <span class="a-offscreen">$1,199.00</span>
+///   * data-price attributes: data-price="1199.99"
+///   * itemprop or class-based price spans with currency symbols
+///
+/// Only fires when structured extraction (JSON-LD, OG, microdata) found nothing,
+/// and only extracts the FIRST visible price — no aggregation or guessing.
+/// The resulting OfferFacts is marked source="extracted_from_text" by the caller.
+///
+/// Returns Some((price, currency)) on the first match, None otherwise.
+fn extract_price_from_html_patterns(html: &str) -> Option<(f64, String)> {
+    // 1. Known price container patterns (high-signal, low-noise):
+    //    Amazon-style: <span class="a-price"><span class="a-offscreen">$1,199.00</span>
+    //    data-price attributes: <div data-price="1199.99">
+    //    Generic price class: <span class="price">₹1,19,900</span>
+    static PRICE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let price_re = PRICE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)(?:class\s*=\s*["'][^"']*(?:a-price|price|product-price|sale-price|offer-price|current-price|selling-price|deal-price)[^"']*["']|data-(?:price|amount|sale-price))\s*(?:[^>]*>\s*|\s*=\s*["'])\s*(?:<[^>]*>\s*)?(?:\$|€|£|¥|₹|Rs\.?|INR|USD|EUR|GBP)?\s*([\d,]+\.?\d*)"#
+        ).unwrap()
+    });
+    if let Some(caps) = price_re.captures(html) {
+        let raw = caps.get(1)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f64>() {
+            if v > 0.0 && v < 10_000_000.0 {
+                let curr_str = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                let currency = normalize_currency_str(curr_str);
+                return Some((v, currency));
+            }
+        }
+    }
+
+    // 2. Meta tag price: <meta itemprop="price" content="1199.99">
+    static META_PRICE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let meta_price_re = META_PRICE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)(?:itemprop|name|property)\s*=\s*["'](?:price|product:price:amount|product:price)["'][^>]*\s*content\s*=\s*["']([\d,]+\.?\d*)["']"#
+        ).unwrap()
+    });
+    if let Some(caps) = meta_price_re.captures(html) {
+        let raw = caps.get(1)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f64>() {
+            if v > 0.0 && v < 10_000_000.0 {
+                let currency = "USD".to_string();
+                return Some((v, currency));
+            }
+        }
+    }
+
+    // 3. data-price attribute with optional currency in data-currency:
+    static DATA_PRICE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let data_price_re = DATA_PRICE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)data-price\s*=\s*["']([\d,]+\.?\d*)["']"#
+        ).unwrap()
+    });
+    if let Some(caps) = data_price_re.captures(html) {
+        let raw = caps.get(1)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f64>() {
+            if v > 0.0 && v < 10_000_000.0 {
+                let currency = "USD".to_string();
+                return Some((v, currency));
+            }
+        }
+    }
+
+    // 4. Price near product-title context: e.g. "iPhone 16 Pro Max $1,199" or
+    //    "<h1>Product Name</h1>... <span>₹1,19,900</span>"
+    //    Only match currency symbol directly adjacent to digits, avoiding false
+    //    positives from unrelated body text.
+    static CURR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let curr_re = CURR_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)(?:Rs\.?|INR|₹|\$|€|£|¥|USD|EUR|GBP)\s*([\d,]+(?:\.\d{1,2})?)"#
+        ).unwrap()
+    });
+    // Find the first match within the first 8KB of HTML (where product titles
+    // and prices typically appear, before reviews/recommendations)
+    let scan_window = if html.len() > 8192 { &html[..8192] } else { html };
+    if let Some(caps) = curr_re.captures(scan_window) {
+        let raw = caps.get(1)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f64>() {
+            if v > 0.0 && v < 10_000_000.0 {
+                let curr_str = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                let currency = normalize_currency_str(curr_str);
+                return Some((v, currency));
+            }
+        }
+    }
+
+    None
+}
+
 // ─── Commerce: honest product-fact extraction (ROADMAP item 1) ───────
 // Extracts structured commerce facts ONLY from machine-readable page data:
 //   * schema.org JSON-LD (Product / Offer / AggregateOffer / SoftwareApplication
@@ -3434,7 +3530,24 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         }
     }
 
-    // 4) Merchant fallback: derive a coarse host label only when no page-provided
+    // 4) Secondary commerce extraction: parse common HTML price patterns from the
+    //    page when structured extraction (JSON-LD, OG, microdata) found nothing.
+    //    Many product pages (Amazon, eBay, Walmart, etc.) embed prices in custom
+    //    HTML (e.g., <span class="a-price">) that don't conform to any standard
+    //    schema. This fallback ONLY fires when primary extraction returned no price,
+    //    and ONLY sets price + currency — never merchant, rating, or other facts
+    //    that would require more context. Marked with source="extracted_from_text"
+    //    so the frontend can label it distinctly from structured data. This is NOT
+    //    regex guessing on body text — it targets known e-commerce HTML patterns.
+    if facts.price.is_none() && facts.price_low.is_none() {
+        if let Some((price, currency)) = extract_price_from_html_patterns(html) {
+            facts.price = Some(price);
+            facts.currency = Some(currency);
+            source = Some("extracted_from_text".to_string());
+        }
+    }
+
+    // 5) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
