@@ -63,6 +63,12 @@ struct Constraints {
     /// per-query tuning.
     #[serde(default)]
     hard_exclusions: Vec<String>,
+    /// Soft-negative terms: generic-noun exclusions the `is_real_exclusion` gate
+    /// declined but that are not manner qualifiers. Demoted in scoring (×0.3)
+    /// but never hard-dropped — preserves conservative intent while still
+    /// pushing down off-topic pages about the negated generic noun.
+    #[serde(default)]
+    soft_negatives: Vec<String>,
     /// Declined (non-manner) candidate exclusions the `is_real_exclusion` gate did
     /// not apply, surfaced for transparency (D3) so they are not silently dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -15391,6 +15397,7 @@ async fn handle_search(
     }
     let mut gated_neg_dedup: Vec<String> = Vec::new();
     let mut explicit_survivors: Vec<String> = Vec::new();
+    let mut soft_negatives: Vec<String> = Vec::new();
     for n in raw_neg.clone() {
         if explicit_neg.iter().any(|e| e == &n) {
             // Unambiguous directive: always keep, never re-inject as positive.
@@ -15401,6 +15408,17 @@ async fn handle_search(
         }
         if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
             gated_neg_dedup.push(n);
+        } else if !is_manner_phrase(&n) && !is_manner_frame(&q_orig, &n) && !soft_negatives.contains(&n) {
+            // Soft negative: generic noun the gate declined but not a manner qualifier.
+            // Demoted in scoring (×0.3), never hard-dropped.
+            soft_negatives.push(n);
+        }
+    }
+    // query_neg_dropped: compounds the extractor already classified as non-manner
+    // declined candidates — these are soft negatives by definition.
+    for d in &query_neg_dropped {
+        if !soft_negatives.contains(d) {
+            soft_negatives.push(d.clone());
         }
     }
     gated_neg_dedup.extend(explicit_survivors.clone());
@@ -15451,13 +15469,17 @@ async fn handle_search(
         }
     }
     let mut ignored_vec: Vec<String> = Vec::new();
-    for n in declined {
+    for n in &declined {
         // Explicit NL-negation directives are honored (survive the gate above as
         // `gated_neg_dedup`), so they must NOT be surfaced as "exclusion not applied".
-        if explicit_neg.iter().any(|e| e == &n) {
+        if explicit_neg.iter().any(|e| e == n) {
             continue;
         }
-        if is_manner_phrase(&n) || is_manner_frame(&q_orig, &n) {
+        if is_manner_phrase(n) || is_manner_frame(&q_orig, n) {
+            continue;
+        }
+        // Soft negatives are applied (demoted in scoring), not ignored — don't surface them.
+        if soft_negatives.contains(n) {
             continue;
         }
         // Skip grammar/preposition noise the intent engine may emit as a negative
@@ -15476,6 +15498,7 @@ async fn handle_search(
     intent.structured_constraints.ignored_constraints =
         if ignored_vec.is_empty() { None } else { Some(ignored_vec) };
     intent.structured_constraints.negative = gated_neg_dedup.clone();
+    intent.structured_constraints.soft_negatives = soft_negatives.clone();
 
     // D4b (2026-08-17): a term that became a REAL negative exclusion must not also
     // remain a positive requirement — that is a contradiction no downstream gate can
