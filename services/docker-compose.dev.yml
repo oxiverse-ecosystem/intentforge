@@ -11,6 +11,7 @@ services:
   gluetun:
     image: qmcgaw/gluetun:v3.39.0
     container_name: if-dev-gluetun
+    mem_limit: 512m
     cap_add:
       - NET_ADMIN
     devices:
@@ -59,6 +60,7 @@ services:
   vpn-rotator:
     image: alpine:latest
     container_name: if-dev-vpn-rotator
+    mem_limit: 64m
     volumes:
       - ./privacy-layer/vpn-rotator.sh:/vpn-rotator.sh:ro
       - ./shared-signals:/tmp/vpn-signals
@@ -73,6 +75,7 @@ services:
   tor:
     build: ./privacy-layer/tor
     container_name: if-dev-tor
+    mem_limit: 256m
     depends_on:
       gluetun:
         condition: service_healthy
@@ -90,6 +93,7 @@ services:
   tor2:
     build: ./privacy-layer/tor2
     container_name: if-dev-tor2
+    mem_limit: 256m
     # Independent network — NOT behind gluetun VPN
     # Tor2 provides a separate IP path for SearXNG2
     ports:
@@ -110,6 +114,7 @@ services:
 
   searxng:
     container_name: if-dev-searxng
+    mem_limit: 1536m
     image: searxng/searxng:latest
     network_mode: "service:gluetun"
     depends_on:
@@ -138,6 +143,7 @@ services:
 
   searxng2:
     container_name: if-dev-searxng2
+    mem_limit: 1024m
     build:
       context: ./meta-search-engines/searxng
       dockerfile: Dockerfile.searxng2
@@ -165,6 +171,7 @@ services:
 
   invidious-db:
     container_name: if-dev-invidious-db
+    mem_limit: 512m
     image: postgres:14-alpine
     restart: always
     environment:
@@ -176,6 +183,7 @@ services:
 
   invidious:
     container_name: if-dev-invidious
+    mem_limit: 512m
     image: quay.io/invidious/invidious:latest
     depends_on:
       - invidious-db
@@ -198,8 +206,8 @@ services:
       context: ./indexer
       dockerfile: Dockerfile
     container_name: if-dev-indexer
-    mem_limit: 1024m
-    mem_reservation: 256m
+    mem_limit: 2048m
+    mem_reservation: 512m
     volumes:
       - ./indexer/index_data:/app/index_data
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
@@ -214,7 +222,7 @@ services:
       context: ./crawler
       dockerfile: Dockerfile
     container_name: if-dev-crawler
-    mem_limit: 1024m
+    mem_limit: 2048m
     mem_reservation: 512m
     environment:
       # crawler=debug surfaces the per-page "Content length: raw= truncated= cap="
@@ -271,8 +279,8 @@ services:
       context: ./gateway
       dockerfile: Dockerfile
     container_name: if-dev-gateway
-    mem_limit: 4096m
-    mem_reservation: 1024m
+    mem_limit: 512m
+    mem_reservation: 256m
     environment:
       - INTENT_ENGINE_URL=http://localhost:3005
       - SEARXNG_URL=http://localhost:8080
