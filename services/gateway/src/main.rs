@@ -3960,7 +3960,7 @@ fn parse_h_product(html: &str) -> Option<OfferFacts> {
 
     static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let tag_re = TAG_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)<\w+\b[^>]*class[^>]*>"#).unwrap()
+        regex::Regex::new(r#"(?i)<[a-zA-Z/][^>]*>"#).unwrap()
     });
     static CLASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let class_re = CLASS_RE.get_or_init(|| {
@@ -3988,6 +3988,10 @@ fn parse_h_product(html: &str) -> Option<OfferFacts> {
 
     for cap in tag_re.captures_iter(html) {
         let tag = cap.get(0).unwrap().as_str();
+        // Skip closing tags (</span>, </div>, etc.) — they carry no class.
+        if tag.starts_with("</") {
+            continue;
+        }
         let classes_str = match class_re.captures(tag).and_then(|c| c.get(1)) {
             Some(m) => m.as_str().to_lowercase(),
             None => continue,
