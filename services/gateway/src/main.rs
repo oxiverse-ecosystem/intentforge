@@ -63,6 +63,12 @@ struct Constraints {
     /// per-query tuning.
     #[serde(default)]
     hard_exclusions: Vec<String>,
+    /// Soft-negative terms: generic-noun exclusions the `is_real_exclusion` gate
+    /// declined but that are not manner qualifiers. Demoted in scoring (×0.3)
+    /// but never hard-dropped — preserves conservative intent while still
+    /// pushing down off-topic pages about the negated generic noun.
+    #[serde(default)]
+    soft_negatives: Vec<String>,
     /// Declined (non-manner) candidate exclusions the `is_real_exclusion` gate did
     /// not apply, surfaced for transparency (D3) so they are not silently dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1987,7 +1993,7 @@ fn constraint_score(
     constraints: &Constraints,
 ) -> f32 {
 
-    if constraints.positive.is_empty() && constraints.negative.is_empty() {
+    if constraints.positive.is_empty() && constraints.negative.is_empty() && constraints.soft_negatives.is_empty() {
         return 1.0; // no constraints = no penalty
     }
 
@@ -2150,6 +2156,70 @@ fn constraint_score(
         }
     }
 
+    // Soft-negative scoring: generic-noun exclusions the gate declined but that
+    // are not manner qualifiers. Apply a dampening multiplier (0.1) to results
+    // that match a soft negative — but do NOT hard-drop them. This preserves the
+    // conservative intent of is_real_exclusion (no false-positive drops) while
+    // still demoting pages about the negated generic noun.
+    if !constraints.soft_negatives.is_empty() {
+        let mut expanded_soft: Vec<String> = Vec::new();
+        for sn in &constraints.soft_negatives {
+            for syn in expand_negative_synonyms(sn) {
+                if !expanded_soft.contains(&syn) {
+                    expanded_soft.push(syn);
+                }
+            }
+        }
+        for sn in &expanded_soft {
+            let sn_lower = sn.to_lowercase();
+            let sn_normalized: String = sn_lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
+            let sn_words: Vec<&str> = sn_lower.split_whitespace().collect();
+            let soft_title_or_url_matched = if sn_words.len() == 1 {
+                text_matches_negative(&title_lower, &sn_lower)
+                    || text_matches_negative(&title_normalized, &sn_normalized)
+                    || url.to_lowercase().split('/').any(|segment| {
+                        let seg = segment.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                        seg == sn_lower
+                            || {
+                                let no_www = seg.strip_prefix("www.").unwrap_or(&seg);
+                                let domain = no_www.split('.').next().unwrap_or(no_www);
+                                domain == sn_lower
+                            }
+                            || {
+                                let seg_alpha: String = seg.chars().filter(|c| c.is_alphanumeric()).collect();
+                                seg_alpha.len() > sn_normalized.len()
+                                    && sn_normalized.len() >= 3
+                                    && seg_alpha.starts_with(&sn_normalized)
+                                    && sn_normalized.len() as f32 / seg_alpha.len() as f32 >= 0.6
+                            }
+                    })
+            } else {
+                title_lower.contains(&sn_lower) || title_normalized.contains(&sn_normalized)
+                    || url.to_lowercase().contains(&sn_lower)
+            };
+            let soft_content_matched = if sn_words.len() == 1 {
+                text_matches_negative(&content.to_lowercase(), &sn_lower)
+            } else {
+                content.to_lowercase().contains(&sn_lower)
+            };
+            if soft_title_or_url_matched || soft_content_matched {
+                // Check negating context — if the soft negative appears in a
+                // negating frame, the page is FULFILLING the exclusion, not violating it.
+                let neg_ctx = term_in_negating_context(sn_lower.as_str(), &title_lower)
+                    || term_in_negating_context(sn_lower.as_str(), &content.to_lowercase());
+                if !neg_ctx {
+                    let soft_penalty = 0.1;
+                    tracing::info!(
+                        "SOFT NEGATIVE HIT: '{}' in '{}' → penalty={:.2} (generic noun, demoted not dropped)",
+                        sn, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                        soft_penalty
+                    );
+                    score *= soft_penalty;
+                }
+            }
+        }
+    }
+
     if any_unresolved_violation {
         // Alt pages get one single flat penalty regardless of how many excluded
         // terms they mention. This prevents "Django vs FastAPI vs Flask: Which to
@@ -2178,6 +2248,16 @@ fn constraint_score(
         );
         score *= alt_penalty;
     }
+
+    // FIX-IF-02: Multi-negation soft-penalty floor.
+    // With multiple negative constraints, per-term multiplicative penalties
+    // compound and crush results to near-zero even if they match only some
+    // exclusions. A result matching ANY negative should not be demoted below
+    // 0.15 of its original score — "not react not angular not vue" means
+    // "show me none of these", so a Vue result should still appear (demoted),
+    // not be eliminated. The hard-drop check below catches genuinely dominated
+    // titles, so this floor only lifts results that survive that gate.
+    score = score.max(0.15);
 
     // ── BUG P0: hard-exclude pages whose TOPIC IS the excluded term ──
     // Soft penalties alone let "best python ide NOT pycharm" surface PyCharm
@@ -2633,6 +2713,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         positive,
         negative,
         hard_exclusions,
+        soft_negatives: vec![],
         entities: c.entities.clone(),
         language: c.language.clone(),
         file_types,
@@ -15391,6 +15472,7 @@ async fn handle_search(
     }
     let mut gated_neg_dedup: Vec<String> = Vec::new();
     let mut explicit_survivors: Vec<String> = Vec::new();
+    let mut soft_negatives: Vec<String> = Vec::new();
     for n in raw_neg.clone() {
         if explicit_neg.iter().any(|e| e == &n) {
             // Unambiguous directive: always keep, never re-inject as positive.
@@ -15401,6 +15483,17 @@ async fn handle_search(
         }
         if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
             gated_neg_dedup.push(n);
+        } else if !is_manner_phrase(&n) && !is_manner_frame(&q_orig, &n) && !soft_negatives.contains(&n) {
+            // Soft negative: generic noun the gate declined but not a manner qualifier.
+            // Demoted in scoring (×0.3), never hard-dropped.
+            soft_negatives.push(n);
+        }
+    }
+    // query_neg_dropped: compounds the extractor already classified as non-manner
+    // declined candidates — these are soft negatives by definition.
+    for d in &query_neg_dropped {
+        if !soft_negatives.contains(d) {
+            soft_negatives.push(d.clone());
         }
     }
     gated_neg_dedup.extend(explicit_survivors.clone());
@@ -15451,13 +15544,17 @@ async fn handle_search(
         }
     }
     let mut ignored_vec: Vec<String> = Vec::new();
-    for n in declined {
+    for n in &declined {
         // Explicit NL-negation directives are honored (survive the gate above as
         // `gated_neg_dedup`), so they must NOT be surfaced as "exclusion not applied".
-        if explicit_neg.iter().any(|e| e == &n) {
+        if explicit_neg.iter().any(|e| e == n) {
             continue;
         }
-        if is_manner_phrase(&n) || is_manner_frame(&q_orig, &n) {
+        if is_manner_phrase(n) || is_manner_frame(&q_orig, n) {
+            continue;
+        }
+        // Soft negatives are applied (demoted in scoring), not ignored — don't surface them.
+        if soft_negatives.contains(n) {
             continue;
         }
         // Skip grammar/preposition noise the intent engine may emit as a negative
@@ -15476,6 +15573,7 @@ async fn handle_search(
     intent.structured_constraints.ignored_constraints =
         if ignored_vec.is_empty() { None } else { Some(ignored_vec) };
     intent.structured_constraints.negative = gated_neg_dedup.clone();
+    intent.structured_constraints.soft_negatives = soft_negatives.clone();
 
     // D4b (2026-08-17): a term that became a REAL negative exclusion must not also
     // remain a positive requirement — that is a contradiction no downstream gate can
@@ -16978,6 +17076,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         positive: vec![],
         negative,
         hard_exclusions,
+        soft_negatives: vec![],
         entities: vec![],
         language,
         file_types,
