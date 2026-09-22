@@ -3484,10 +3484,17 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
 /// facts the earlier ones never provided, never rewrite what a stronger
 /// source already asserted.
 fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
-    if dst.price.is_none() { dst.price = src.price; }
-    if dst.price_low.is_none() { dst.price_low = src.price_low; }
-    if dst.price_high.is_none() { dst.price_high = src.price_high; }
-    if dst.offer_count.is_none() { dst.offer_count = src.offer_count; }
+    // Price group (price/price_low/price_high/offer_count) is coupled: a
+    // price RANGE from one signal must not supplement a single canonical
+    // price from a stronger signal (that would conflate two distinct offer
+    // structures). Only merge the price group when NO stronger price exists.
+    if dst.price.is_none() && dst.price_low.is_none() {
+        if dst.price.is_none() { dst.price = src.price; }
+        if dst.price_low.is_none() { dst.price_low = src.price_low; }
+        if dst.price_high.is_none() { dst.price_high = src.price_high; }
+        if dst.offer_count.is_none() { dst.offer_count = src.offer_count; }
+    }
+    // Other fields: simple supplement if None — safe to fill independently.
     if dst.currency.is_none() { dst.currency = src.currency.clone(); }
     if dst.availability.is_none() { dst.availability = src.availability.clone(); }
     if dst.merchant.is_none() { dst.merchant = src.merchant.clone(); }
@@ -3537,8 +3544,23 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         }
     }
 
-    // 4) Secondary commerce extraction: parse common HTML price patterns from the
-    //    page when structured extraction (JSON-LD, OG, microdata) found nothing.
+    // 4) Fallback: Microformats2 h-product (only when no price yet).
+    //    Used by Shopify, WooCommerce, and independent stores that mark up
+    //    products with `class="h-product"` + `p-price`, `p-brand`, etc.
+    //    Pure supplement — never overwrites a stronger signal, fires only on
+    //    pages carrying an explicit `h-product` class (no false positives from
+    //    unrelated microformats like h-entry/h-card).
+    if facts.price.is_none() && facts.price_low.is_none() {
+        if let Some(mf2) = parse_h_product(html) {
+            merge_offer_facts(&mut facts, &mf2);
+            if source.is_none() {
+                source = Some("microformats2".to_string());
+            }
+        }
+    }
+
+    // 5) Secondary commerce extraction: parse common HTML price patterns from the
+    //    page when structured extraction (JSON-LD, OG, microdata, MF2) found nothing.
     //    Many product pages (Amazon, eBay, Walmart, etc.) embed prices in custom
     //    HTML (e.g., <span class="a-price">) that don't conform to any standard
     //    schema. This fallback ONLY fires when primary extraction returned no price,
@@ -3551,21 +3573,6 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
             facts.price = Some(price);
             facts.currency = Some(currency);
             source = Some("extracted_from_text".to_string());
-        }
-    }
-
-    // 5) Fallback: Microformats2 h-product (only when no price yet).
-    //    Used by Shopify, WooCommerce, and independent stores that mark up
-    //    products with `class="h-product"` + `p-price`, `p-brand`, etc.
-    //    Pure supplement — never overwrites a stronger signal, fires only on
-    //    pages carrying an explicit `h-product` class (no false positives from
-    //    unrelated microformats like h-entry/h-card).
-    if facts.price.is_none() && facts.price_low.is_none() {
-        if let Some(mf2) = parse_h_product(html) {
-            merge_offer_facts(&mut facts, &mf2);
-            if source.is_none() {
-                source = Some("microformats2".to_string());
-            }
         }
     }
 
