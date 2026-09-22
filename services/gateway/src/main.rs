@@ -1993,7 +1993,7 @@ fn constraint_score(
     constraints: &Constraints,
 ) -> f32 {
 
-    if constraints.positive.is_empty() && constraints.negative.is_empty() {
+    if constraints.positive.is_empty() && constraints.negative.is_empty() && constraints.soft_negatives.is_empty() {
         return 1.0; // no constraints = no penalty
     }
 
@@ -2156,6 +2156,70 @@ fn constraint_score(
         }
     }
 
+    // Soft-negative scoring: generic-noun exclusions the gate declined but that
+    // are not manner qualifiers. Apply a dampening multiplier (0.1) to results
+    // that match a soft negative — but do NOT hard-drop them. This preserves the
+    // conservative intent of is_real_exclusion (no false-positive drops) while
+    // still demoting pages about the negated generic noun.
+    if !constraints.soft_negatives.is_empty() {
+        let mut expanded_soft: Vec<String> = Vec::new();
+        for sn in &constraints.soft_negatives {
+            for syn in expand_negative_synonyms(sn) {
+                if !expanded_soft.contains(&syn) {
+                    expanded_soft.push(syn);
+                }
+            }
+        }
+        for sn in &expanded_soft {
+            let sn_lower = sn.to_lowercase();
+            let sn_normalized: String = sn_lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
+            let sn_words: Vec<&str> = sn_lower.split_whitespace().collect();
+            let soft_title_or_url_matched = if sn_words.len() == 1 {
+                text_matches_negative(&title_lower, &sn_lower)
+                    || text_matches_negative(&title_normalized, &sn_normalized)
+                    || url.to_lowercase().split('/').any(|segment| {
+                        let seg = segment.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                        seg == sn_lower
+                            || {
+                                let no_www = seg.strip_prefix("www.").unwrap_or(&seg);
+                                let domain = no_www.split('.').next().unwrap_or(no_www);
+                                domain == sn_lower
+                            }
+                            || {
+                                let seg_alpha: String = seg.chars().filter(|c| c.is_alphanumeric()).collect();
+                                seg_alpha.len() > sn_normalized.len()
+                                    && sn_normalized.len() >= 3
+                                    && seg_alpha.starts_with(&sn_normalized)
+                                    && sn_normalized.len() as f32 / seg_alpha.len() as f32 >= 0.6
+                            }
+                    })
+            } else {
+                title_lower.contains(&sn_lower) || title_normalized.contains(&sn_normalized)
+                    || url.to_lowercase().contains(&sn_lower)
+            };
+            let soft_content_matched = if sn_words.len() == 1 {
+                text_matches_negative(&content.to_lowercase(), &sn_lower)
+            } else {
+                content.to_lowercase().contains(&sn_lower)
+            };
+            if soft_title_or_url_matched || soft_content_matched {
+                // Check negating context — if the soft negative appears in a
+                // negating frame, the page is FULFILLING the exclusion, not violating it.
+                let neg_ctx = term_in_negating_context(sn_lower.as_str(), &title_lower)
+                    || term_in_negating_context(sn_lower.as_str(), &content.to_lowercase());
+                if !neg_ctx {
+                    let soft_penalty = 0.1;
+                    tracing::info!(
+                        "SOFT NEGATIVE HIT: '{}' in '{}' → penalty={:.2} (generic noun, demoted not dropped)",
+                        sn, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
+                        soft_penalty
+                    );
+                    score *= soft_penalty;
+                }
+            }
+        }
+    }
+
     if any_unresolved_violation {
         // Alt pages get one single flat penalty regardless of how many excluded
         // terms they mention. This prevents "Django vs FastAPI vs Flask: Which to
@@ -2184,6 +2248,16 @@ fn constraint_score(
         );
         score *= alt_penalty;
     }
+
+    // FIX-IF-02: Multi-negation soft-penalty floor.
+    // With multiple negative constraints, per-term multiplicative penalties
+    // compound and crush results to near-zero even if they match only some
+    // exclusions. A result matching ANY negative should not be demoted below
+    // 0.15 of its original score — "not react not angular not vue" means
+    // "show me none of these", so a Vue result should still appear (demoted),
+    // not be eliminated. The hard-drop check below catches genuinely dominated
+    // titles, so this floor only lifts results that survive that gate.
+    score = score.max(0.15);
 
     // ── BUG P0: hard-exclude pages whose TOPIC IS the excluded term ──
     // Soft penalties alone let "best python ide NOT pycharm" surface PyCharm
