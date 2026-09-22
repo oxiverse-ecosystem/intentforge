@@ -12029,6 +12029,33 @@ fn build_inspect(index: &spell::SymSpellIndex, q: &str) -> serde_json::Value {
     })
 }
 
+/// True if a word is a keyboard-row run (asdfghjkl, zxcvbnm, qwerty, etc.).
+/// These are Gibberish tokens — consecutive letters from a single QWERTY row.
+fn is_keyboard_gibberish(w: &str) -> bool {
+    let w_lower = w.to_lowercase();
+    if w_lower.len() < 4 {
+        return false;
+    }
+    let chars: Vec<char> = w_lower.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    if chars.len() < 4 {
+        return false;
+    }
+    // QWERTY rows
+    let row1: std::collections::HashSet<char> = "qwertyuiop".chars().collect();
+    let row2: std::collections::HashSet<char> = "asdfghjkl".chars().collect();
+    let row3: std::collections::HashSet<char> = "zxcvbnm".chars().collect();
+
+    // A token is keyboard gibberish if >= 80% of its chars come from ONE row.
+    // This catches "asdfghjkl", "zxcvbnm", "qwerty" but not "hello" (h,e,l,o span rows).
+    for row in [&row1, &row2, &row3] {
+        let in_row = chars.iter().filter(|c| row.contains(c)).count();
+        if in_row >= chars.len() * 4 / 5 && in_row >= 3 {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_pronounceable(w: &str) -> bool {
     let lower = w.to_lowercase();
     if lower.len() < 3 {
