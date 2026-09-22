@@ -3487,8 +3487,9 @@ fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
     // Price group (price/price_low/price_high/offer_count) is coupled: a
     // price RANGE from one signal must not supplement a single canonical
     // price from a stronger signal (that would conflate two distinct offer
-    // structures). Only merge the price group when NO stronger price exists.
-    if dst.price.is_none() && dst.price_low.is_none() {
+    // structures). Only merge the price group when NO price signal exists yet.
+    let has_price_signal = dst.price.is_some() || dst.price_low.is_some() || dst.price_high.is_some();
+    if !has_price_signal {
         if dst.price.is_none() { dst.price = src.price; }
         if dst.price_low.is_none() { dst.price_low = src.price_low; }
         if dst.price_high.is_none() { dst.price_high = src.price_high; }
@@ -3959,7 +3960,7 @@ fn parse_h_product(html: &str) -> Option<OfferFacts> {
 
     static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let tag_re = TAG_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)<\w+\b[^>]*class[^>]*>"#).unwrap()
+        regex::Regex::new(r#"(?i)<w+b[^>]*class[^>]*>"#).unwrap()
     });
     static CLASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let class_re = CLASS_RE.get_or_init(|| {
