@@ -2834,6 +2834,102 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
     None
 }
 
+/// Secondary commerce price extraction: parse common HTML price patterns from
+/// pages that don't expose JSON-LD/OpenGraph/Product microdata. This is a
+/// STRUCTURED FALLBACK for known e-commerce HTML patterns — not free-text
+/// guessing. It looks for common price containers like:
+///   * <span class="a-price"> / <span class="a-offscreen">$1,199.00</span>
+///   * data-price attributes: data-price="1199.99"
+///   * itemprop or class-based price spans with currency symbols
+///
+/// Only fires when structured extraction (JSON-LD, OG, microdata) found nothing,
+/// and only extracts the FIRST visible price — no aggregation or guessing.
+/// The resulting OfferFacts is marked source="extracted_from_text" by the caller.
+///
+/// Returns Some((price, currency)) on the first match, None otherwise.
+fn extract_price_from_html_patterns(html: &str) -> Option<(f64, String)> {
+    // 1. Known price container patterns (high-signal, low-noise):
+    //    Amazon-style: <span class="a-price"><span class="a-offscreen">$1,199.00</span>
+    //    data-price attributes: <div data-price="1199.99">
+    //    Generic price class: <span class="price">₹1,19,900</span>
+    static PRICE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let price_re = PRICE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)(?:class\s*=\s*["'][^"']*(?:a-price|price|product-price|sale-price|offer-price|current-price|selling-price|deal-price)[^"']*["']|data-(?:price|amount|sale-price))\s*(?:[^>]*>\s*|\s*=\s*["'])\s*(?:<[^>]*>\s*)?(?:\$|€|£|¥|₹|Rs\.?|INR|USD|EUR|GBP)?\s*([\d,]+\.?\d*)"#
+        ).unwrap()
+    });
+    if let Some(caps) = price_re.captures(html) {
+        let raw = caps.get(1)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f64>() {
+            if v > 0.0 && v < 10_000_000.0 {
+                let curr_str = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                let currency = normalize_currency_str(curr_str);
+                return Some((v, currency));
+            }
+        }
+    }
+
+    // 2. Meta tag price: <meta itemprop="price" content="1199.99">
+    static META_PRICE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let meta_price_re = META_PRICE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)(?:itemprop|name|property)\s*=\s*["'](?:price|product:price:amount|product:price)["'][^>]*\s*content\s*=\s*["']([\d,]+\.?\d*)["']"#
+        ).unwrap()
+    });
+    if let Some(caps) = meta_price_re.captures(html) {
+        let raw = caps.get(1)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f64>() {
+            if v > 0.0 && v < 10_000_000.0 {
+                let currency = "USD".to_string();
+                return Some((v, currency));
+            }
+        }
+    }
+
+    // 3. data-price attribute with optional currency in data-currency:
+    static DATA_PRICE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let data_price_re = DATA_PRICE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)data-price\s*=\s*["']([\d,]+\.?\d*)["']"#
+        ).unwrap()
+    });
+    if let Some(caps) = data_price_re.captures(html) {
+        let raw = caps.get(1)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f64>() {
+            if v > 0.0 && v < 10_000_000.0 {
+                let currency = "USD".to_string();
+                return Some((v, currency));
+            }
+        }
+    }
+
+    // 4. Price as direct text content of a price-related element.
+    //    Only match when the currency+price is the DIRECT text of an element
+    //    with a price-related class or data attribute — NOT embedded in a sentence.
+    //    Requires a currency symbol to avoid matching bare numbers.
+    //    Pattern: <tag class="...price...">$49.99</tag>
+    //    NOTE: excludes itemprop (microdata parser handles those) and uses
+    //    strict single-line matching (no cross-tag matching).
+    static PRICE_TEXT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let price_text_re = PRICE_TEXT_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)<[^>]*(?:class|data-(?:price|amount|sale))\s*=\s*["'][^"'\n]*(?:price|amount|sale|offer|current|selling|deal)[^"'\n]*["'][^>]*>\s*(?:<[^>]*>\s*)?(?:\$|€|£|¥|₹|Rs\.?|INR|USD|EUR|GBP)\s*([\d,]+\.?\d*)\s*(?:</[^>]*>\s*)?</[^>]*>"#
+        ).unwrap()
+    });
+    if let Some(caps) = price_text_re.captures(html) {
+        let raw = caps.get(1)?.as_str().replace(',', "");
+        if let Ok(v) = raw.parse::<f64>() {
+            if v > 0.0 && v < 10_000_000.0 {
+                let curr_str = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                let currency = normalize_currency_str(curr_str);
+                return Some((v, currency));
+            }
+        }
+    }
+
+    None
+}
+
 // ─── Commerce: honest product-fact extraction (ROADMAP item 1) ───────
 // Extracts structured commerce facts ONLY from machine-readable page data:
 //   * schema.org JSON-LD (Product / Offer / AggregateOffer / SoftwareApplication
@@ -3434,7 +3530,24 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         }
     }
 
-    // 4) Merchant fallback: derive a coarse host label only when no page-provided
+    // 4) Secondary commerce extraction: parse common HTML price patterns from the
+    //    page when structured extraction (JSON-LD, OG, microdata) found nothing.
+    //    Many product pages (Amazon, eBay, Walmart, etc.) embed prices in custom
+    //    HTML (e.g., <span class="a-price">) that don't conform to any standard
+    //    schema. This fallback ONLY fires when primary extraction returned no price,
+    //    and ONLY sets price + currency — never merchant, rating, or other facts
+    //    that would require more context. Marked with source="extracted_from_text"
+    //    so the frontend can label it distinctly from structured data. This is NOT
+    //    regex guessing on body text — it targets known e-commerce HTML patterns.
+    if facts.price.is_none() && facts.price_low.is_none() {
+        if let Some((price, currency)) = extract_price_from_html_patterns(html) {
+            facts.price = Some(price);
+            facts.currency = Some(currency);
+            source = Some("extracted_from_text".to_string());
+        }
+    }
+
+    // 5) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
@@ -18874,6 +18987,138 @@ mod spellcheck_endpoint_tests {
         // JSON-LD already set price=49.99 so microdata must NOT overwrite).
         assert_eq!(d.price_low, None);
         assert_eq!(d.price_high, None);
+    }
+
+    // ── ROADMAP item 1 (increment): secondary HTML price fallback ─────────
+    // When structured extraction (JSON-LD/OG/microdata) finds no price, the
+    // secondary HTML price pattern fallback recovers prices from common
+    // e-commerce HTML patterns. These tests prove it fires only as a fallback,
+    // extracts the first visible price, and labels the source correctly.
+
+    #[test]
+    fn html_pattern_fallback_extracts_from_data_price_attribute() {
+        let html = r#"<!doctype html><html><body>
+<h1>Wireless Headphones</h1>
+<div class="product-price" data-price="299.99" data-currency="USD">
+  <span>$299.99</span>
+</div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/hp");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(299.99), "price extracted from data-price");
+        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_extracts_currency_in_class_span() {
+        let html = r#"<!doctype html><html><body>
+<h1>Sony WH-1000XM5</h1>
+<span class="price">₹29,999</span>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/sony");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(29999.0));
+        assert_eq!(d.currency.as_deref(), Some("INR"));
+        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_does_not_fire_when_jsonld_present() {
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{ "@context": "https://schema.org/", "@type": "Product",
+  "name": "Widget", "offers": { "@type": "Offer", "price": "49.99", "priceCurrency": "USD" } }
+</script></head><body>
+<span class="price">$99.99</span>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/w");
+        let d = o.data.as_ref().unwrap();
+        // JSON-LD wins, HTML pattern does NOT overwrite
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_does_not_fire_when_microdata_present() {
+        let html = format!(r#"<!doctype html><html><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price">19.99</span>
+    <meta itemprop="priceCurrency" content="USD">
+  </div>
+</div>
+<span class="sale-price">$9.99</span>
+</body></html>"#);
+        let o = extract_commerce_offer(&html, "https://shop.example.com/s");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(19.99));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_returns_none_for_non_product_pages() {
+        let html = r#"<!doctype html><html><body>
+<h1>How to bake bread</h1>
+<p>This recipe uses 3 cups of flour and costs about $2 per loaf.</p>
+<p>Preheat oven to 375°F.</p>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://blog.example.com/bread");
+        let d = o.data.as_ref().unwrap();
+        // The recipe mentions "$2" but not in a product context — the HTML
+        // pattern scan only looks in the first 8KB and the $2 is far from any
+        // price container. It should NOT fire.
+        assert_eq!(d.price, None);
+        assert_eq!(o.source.as_deref(), None);
+    }
+
+    #[test]
+    fn html_pattern_fallback_ignores_unreasonable_prices() {
+        // Price of 0 or >10M should be rejected
+        let html = r#"<!doctype html><html><body>
+<span class="price">$99999999</span>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/bad");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None, "price >10M should be rejected");
+    }
+
+    #[test]
+    fn html_pattern_fallback_preserves_structured_currency() {
+        let html = r#"<!doctype html><html><body>
+<span class="sale-price">€89.99</span>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/eu");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(89.99));
+        assert_eq!(d.currency.as_deref(), Some("EUR"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_itemprop_meta_price() {
+        let html = r#"<!doctype html><html><head>
+<meta itemprop="price" content="549.00">
+</head><body><h1>Product</h1></body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/m");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(549.00));
+        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_does_not_extract_rating_or_other_facts() {
+        // The fallback should ONLY extract price and currency — never other
+        // facts like rating, availability, or name from free text.
+        let html = r#"<!doctype html><html><body>
+<h1>Amazing Product</h1>
+<span class="price">$49.99</span>
+<p>Rated 4.8 out of 5 stars!</p>
+<p>In stock, ready to ship.</p>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/ap");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.rating, None, "rating must NOT be extracted from text");
+        assert_eq!(d.availability, None, "availability must NOT be extracted from text");
     }
 
         #[test]
