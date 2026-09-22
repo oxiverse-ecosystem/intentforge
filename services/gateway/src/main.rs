@@ -6183,6 +6183,24 @@ fn has_local_intent(query: &str) -> bool {
             || lower.ends_with(" neighbourhood")
             || lower.ends_with(" neighborhood")
         )
+        // Detect "X in <gazetteer_city>" patterns (e.g. "restaurants in bangalore",
+        // "hotels in paris"). When " in " is followed by a known place from the
+        // LOCATION_GAZETTEER, the query has explicit local intent. General guard —
+        // no per-query literals, reuses the same gazetteer reference data as geo
+        // detection (line 1542) so the policy is consistent and future-proof.
+        || {
+            let parts: Vec<&str> = lower.split(" in ").collect();
+            if let Some(after_in) = parts.last() {
+                LOCATION_GAZETTEER.iter().any(|(name, _)| {
+                    let name_lower = name.to_lowercase();
+                    whole_word_contains(after_in, &name_lower)
+                        || after_in.starts_with(&name_lower)
+                        || after_in == name_lower
+                })
+            } else {
+                false
+            }
+        }
 }
 
 /// Known video-hosting domains. Used by the P8 video dampening so that videos
@@ -13991,9 +14009,10 @@ async fn handle_search(
         }
 
         // Override 4: local intent signals → force local intent
-        let has_local_keywords = q_lower.contains(" near me") || q_lower.starts_with("near me")
-            || q_lower.contains("nearby") || q_lower.contains(" close to")
-            || q_lower.starts_with("close to") || q_lower.contains("coffee shop");
+        // Delegates to `has_local_intent` so the keyword list stays in ONE
+        // place. This covers "near me", "nearby", "coffee shop", AND
+        // gazetteer-city patterns like "restaurants in bangalore".
+        let has_local_keywords = has_local_intent(&q_lower);
         if has_local_keywords && intent.intent != "local" {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): local query '{}' was '{}' (conf={:.3}) -> local",
