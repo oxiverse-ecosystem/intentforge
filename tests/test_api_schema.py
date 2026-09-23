@@ -275,3 +275,147 @@ def test_other_brand_negatives_applied_only(session):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# 10. /analyze schema
+ANALYZE_KEYS = ["query", "contrastive_framing", "exclusions", "declined", "manner_qualifiers", "decisions"]
+
+
+def test_analyze_schema(session):
+    """GET /analyze -> 200, all 6 documented top-level keys present."""
+    r = session.get(f"{BASE}/analyze", params={"q": "javascript not java not typescript"}, timeout=10)
+    assert r.status_code == 200, f"GET /analyze -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    _require_keys("GET /analyze", body, ANALYZE_KEYS)
+    decisions = body.get("decisions", [])
+    assert isinstance(decisions, list) and len(decisions) > 0, (
+        f"GET /analyze decisions[] must be non-empty for a negated query; got {decisions!r}"
+    )
+    for d in decisions:
+        assert "term" in d and "decision" in d and "reason" in d, (
+            f"GET /analyze decision entry missing required keys: {d}"
+        )
+
+
+# 11. /inspect schema
+INSPECT_KEYS = ["query", "spelling", "negation", "intent", "constraints", "recency", "quality"]
+
+
+def test_inspect_schema(session):
+    """GET /inspect -> 200, all 7 documented top-level keys present."""
+    r = session.get(f"{BASE}/inspect", params={"q": "python web framework not django"}, timeout=10)
+    assert r.status_code == 200, f"GET /inspect -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    _require_keys("GET /inspect", body, INSPECT_KEYS)
+    negation = body.get("negation", {})
+    assert isinstance(negation, dict), f"GET /inspect negation must be an object, got {type(negation).__name__}"
+    for k in ("contrastive_framing", "exclusions", "declined", "manner_qualifiers", "decisions"):
+        assert k in negation, f"GET /inspect negation missing key '{k}'"
+    intent = body.get("intent", {})
+    assert "intent" in intent and "category" in intent and "confidence" in intent, (
+        f"GET /inspect intent missing required keys: {intent}"
+    )
+
+
+# 12. /geolocate schema
+GEOLOCATE_KEYS = ["query", "resolved", "source", "explicit_location", "local_intent"]
+
+
+def test_geolocate_schema(session):
+    """GET /geolocate -> 200, all 5 documented top-level keys present."""
+    r = session.get(f"{BASE}/geolocate", params={"q": "quiet places to study near chennai"}, timeout=10)
+    assert r.status_code == 200, f"GET /geolocate -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    _require_keys("GET /geolocate", body, GEOLOCATE_KEYS)
+    assert body.get("source") == "explicit", (
+        f"GET /geolocate source should be 'explicit' for a gazetteer query; got {body.get('source')!r}"
+    )
+    assert body.get("explicit_location") is True, (
+        f"GET /geolocate explicit_location should be True for a gazetteer query"
+    )
+
+
+# 13. /intent schema
+INTENT_KEYS = ["query", "intent", "category", "confidence", "contrastive_framing", "local_intent", "structured_constraints", "expanded_queries"]
+
+
+def test_intent_schema(session):
+    """GET /intent -> 200, all 8 documented top-level keys present."""
+    r = session.get(f"{BASE}/intent", params={"q": "violin vs viola for beginner"}, timeout=10)
+    assert r.status_code == 200, f"GET /intent -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    _require_keys("GET /intent", body, INTENT_KEYS)
+    assert body.get("contrastive_framing") is True, (
+        f"GET /intent contrastive_framing should be true for 'violin vs viola'; got {body.get('contrastive_framing')!r}"
+    )
+    expanded = body.get("expanded_queries", [])
+    assert isinstance(expanded, list) and len(expanded) > 0, (
+        f"GET /intent expanded_queries must be a non-empty list; got {expanded!r}"
+    )
+
+
+# 14. /video schema
+VIDEO_INSPECT_KEYS = ["query", "video_intent", "video_intent_markers", "would_pin_non_video_sources", "is_video_source_examples", "intent", "note"]
+
+
+def test_video_inspect_schema(session):
+    """GET /video -> 200, all 7 documented top-level keys present."""
+    r = session.get(f"{BASE}/video", params={"q": "rust vs go high concurrency servers"}, timeout=10)
+    assert r.status_code == 200, f"GET /video -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    _require_keys("GET /video", body, VIDEO_INSPECT_KEYS)
+    assert body.get("video_intent") is False, (
+        f"GET /video video_intent should be false for a text query; got {body.get('video_intent')!r}"
+    )
+    assert body.get("would_pin_non_video_sources") is True, (
+        f"GET /video would_pin_non_video_sources should be true for a non-video query"
+    )
+    markers = body.get("video_intent_markers", [])
+    assert isinstance(markers, list) and len(markers) > 0, (
+        f"GET /video video_intent_markers must be a non-empty list; got {markers!r}"
+    )
+
+
+# 15. /shopping schema
+def test_shopping_schema(session):
+    """GET /shopping -> 200, results[] present with commerce/affiliate structure."""
+    r = session.get(f"{BASE}/shopping", params={"q": "best wireless earbuds under 50", "count": 3}, timeout=60)
+    assert r.status_code == 200, f"GET /shopping -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    results = body.get("results", [])
+    assert isinstance(results, list) and len(results) > 0, (
+        f"GET /shopping results must be a non-empty list; got {results!r}"
+    )
+    first = results[0]
+    # Every result must carry commerce_provenance (honest signal)
+    assert "commerce_provenance" in first, (
+        f"GET /shopping result missing 'commerce_provenance' key: {sorted(first.keys())}"
+    )
+    prov = first["commerce_provenance"]
+    assert isinstance(prov, dict), f"commerce_provenance must be an object, got {type(prov).__name__}"
+    assert "observed_at" in prov and "source" in prov and "url" in prov, (
+        f"commerce_provenance missing required keys: {sorted(prov.keys())}"
+    )
+
+
+# 16. POST /commerce/extract schema
+def test_commerce_extract_schema(session):
+    """POST /commerce/extract -> 200, returns price/currency/merchant fields."""
+    html = (
+        '<html><head><script type="application/ld+json">'
+        '{"@type":"Product","name":"Test Widget","offers":{"@type":"Offer",'
+        '"price":"29.99","priceCurrency":"USD","availability":"https://schema.org/InStock",'
+        '"seller":{"@type":"Organization","name":"TestStore"}}}'
+        '</script></head><body></body></html>'
+    )
+    r = session.post(
+        f"{BASE}/commerce/extract",
+        json={"html": html, "url": "https://store.example.com/p/test-widget"},
+        timeout=10,
+    )
+    assert r.status_code == 200, f"POST /commerce/extract -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    for field in ("price", "currency", "availability", "merchant", "source", "observed_at"):
+        assert field in body, f"POST /commerce/extract missing key '{field}'; have {sorted(body.keys())}"
+    assert body.get("price") == 29.99, f"POST /commerce/extract price should be 29.99; got {body.get('price')!r}"
+    assert body.get("currency") == "USD", f"POST /commerce/extract currency should be 'USD'; got {body.get('currency')!r}"
