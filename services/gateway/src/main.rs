@@ -3882,40 +3882,69 @@ async fn enrich_with_commerce_par<F, Fut>(
 {
     let max_par = MAX_PARALLEL_FETCH.min(results.len());
 
-    // 1) Collect indices + spawn parallel fetch tasks (bounded concurrency).
-    let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(usize, String)>>)> = results
+    // 1) Collect indices eligible for enrichment: object results with a URL
+    //    that don't already carry a commerce block from an earlier step.
+    let eligible: Vec<usize> = results
         .iter()
         .enumerate()
-        .filter_map(|(idx, r)| {
-            if !r.is_object() {
-                return None;
-            }
-            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            if url.is_empty() {
-                return None;
-            }
-            if r.get("commerce").is_some() {
-                return None; // already enriched by an earlier step
-            }
-            let fetch_clone = fetch.clone();
-            let url_owned = url.to_string();
-            let handle = tokio::spawn(async move {
-                match fetch_clone(url_owned.clone()).await {
-                    Some(html) => Some((idx, html)),
-                    None => None,
-                }
-            });
-            Some((idx, handle))
+        .filter(|(_, r)| {
+            r.is_object()
+                && !r.get("url").and_then(|v| v.as_str()).unwrap_or("").is_empty()
+                && r.get("commerce").is_none()
         })
-        .take(max_par)
+        .map(|(idx, _)| idx)
         .collect();
 
-    // 2) Wait for ALL spawned tasks concurrently (await each JoinHandle).
+    // 2) Fetch in bounded-concurrency WAVES of max_par: every eligible result
+    //    is eventually fetched (`.take(max_par)` would silently drop the tail
+    //    beyond the first wave), while at most max_par fetches are in flight.
+    //    `.max(1)` keeps `chunks` non-zero when `results` is empty.
+    //    The whole batch is bounded by `wall_timeout` (documented contract:
+    //    /search must stay inside its 30s TimeoutLayer budget) — on expiry the
+    //    remaining fetches are abandoned and those results keep commerce: null
+    //    but still receive provenance in step 4 (honest, never fabricated).
+    let deadline = std::time::Instant::now() + wall_timeout;
     let mut fetched: Vec<(usize, String)> = Vec::new();
-    for (_, handle) in tasks {
-        match handle.await {
-            Ok(Some((idx, html))) => fetched.push((idx, html)),
-            _ => {} // task panicked or returned None — skip
+    for wave in eligible.chunks(max_par.max(1)) {
+        let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(idx, String)>>)> = wave
+            .iter()
+            .map(|&idx| {
+                let fetch_clone = fetch.clone();
+                let url_owned = results[idx]
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let handle = tokio::spawn(async move {
+                    match fetch_clone(url_owned.clone()).await {
+                        Some(html) => Some((idx, html)),
+                        None => None,
+                    }
+                });
+                (idx, handle)
+            })
+            .collect();
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            // Budget exhausted — abandon pending waves (handles are dropped;
+            // tokio detaches the tasks, matching the pre-existing semantics
+            // where a slow fetch could never block the response past the cap).
+            break;
+        }
+        match tokio::time::timeout(remaining, async {
+            let mut wave_results = Vec::new();
+            for (_, handle) in tasks {
+                match handle.await {
+                    Ok(Some((idx, html))) => wave_results.push((idx, html)),
+                    _ => {} // task panicked or returned None — skip
+                }
+            }
+            wave_results
+        })
+        .await
+        {
+            Ok(wave_results) => fetched.extend(wave_results),
+            Err(_) => break, // wall clock expired mid-wave — stop fetching
         }
     }
 
