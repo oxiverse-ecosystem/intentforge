@@ -211,3 +211,55 @@ def test_leaderboard_is_list(session):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# 7. POST /goals/:id/phases/:phase_id/complete
+def test_complete_phase_schema(session):
+    """POST /goals/:id/phases/:phase_id/complete -> 200, phase completion tracked."""
+    goal_id, questions = _create_goal(session)
+    answers = _real_answers(questions)
+    r = session.post(
+        f"{BASE}/goals/{goal_id}/answers", json={"answers": answers}, timeout=60
+    )
+    assert r.status_code == 200, f"POST answers -> {r.status_code} {r.text[:300]}"
+    roadmap = r.json().get("roadmap", {})
+    total_phases = roadmap.get("total_phases", 0)
+    assert total_phases >= 1, "roadmap must have at least 1 phase to test completion"
+
+    r2 = session.post(
+        f"{BASE}/goals/{goal_id}/phases/1/complete", json={}, timeout=10
+    )
+    assert r2.status_code == 200, f"POST complete phase -> {r2.status_code} {r2.text[:300]}"
+    body = r2.json()
+    assert body.get("goal_id") == goal_id
+    assert body.get("completed_phase_id") == 1
+    assert body.get("completed_phases") == 1
+    assert body.get("total_phases") == total_phases
+    assert body.get("score", 0) >= 100
+
+
+# 8. POST /goals/:id/progress
+def test_update_progress_schema(session):
+    """POST /goals/:id/progress -> 200, phase progress updated via JSON payload."""
+    goal_id, questions = _create_goal(session)
+    answers = _real_answers(questions)
+    r = session.post(
+        f"{BASE}/goals/{goal_id}/answers", json={"answers": answers}, timeout=60
+    )
+    assert r.status_code == 200, f"POST answers -> {r.status_code} {r.text[:300]}"
+    total_phases = r.json().get("roadmap", {}).get("total_phases", 0)
+    assert total_phases >= 1
+
+    r2 = session.post(
+        f"{BASE}/goals/{goal_id}/progress",
+        json={"phase_id": 1, "is_completed": True},
+        timeout=10,
+    )
+    assert r2.status_code == 200, f"POST progress -> {r2.status_code} {r2.text[:300]}"
+    body = r2.json()
+    assert body.get("goal_id") == goal_id
+    assert body.get("phase_id") == 1
+    assert body.get("is_completed") is True
+    assert body.get("completed_phases") == 1
+    assert body.get("total_phases") == total_phases
+    assert body.get("score", 0) >= 100

@@ -82,10 +82,34 @@ jobs:
       - name: Install pytest
         run: pip install -r tests/requirements.txt
 
-      - name: Run API schema regression
+      - name: Check gateway reachability
+        id: gateway-check
         env:
-          # Default: skip cleanly if no gateway (bare runner). The QA loop and
-          # any job that brings the stack up should set this to "1".
-          INTENTFORGE_REQUIRE_GATEWAY: "0"
+          INTENTFORGE_BASE: http://localhost:4000
+        run: |
+          echo "Checking gateway reachability at $INTENTFORGE_BASE..."
+          if curl -sf --max-time 5 "$INTENTFORGE_BASE/health" > /dev/null 2>&1; then
+            echo "gateway_reachable=true" >> "$GITHUB_OUTPUT"
+            echo "Gateway is UP — schema regression will run as a real guard."
+          else
+            echo "gateway_reachable=false" >> "$GITHUB_OUTPUT"
+            echo "Gateway at $INTENTFORGE_BASE is NOT reachable."
+            echo "schema-regression skipped (no live gateway). The Rust unit tests"
+            echo "(gateway-tests job) cover pure logic. Live-API schema tests are the"
+            echo "QA loop's responsibility (runs where the stack exists)."
+          fi
+
+      - name: Run API schema regression
+        if: steps.gateway-check.outputs.gateway_reachable == 'true'
+        env:
+          # Only reached when gateway is reachable — now REQUIRE it (fail if down).
+          INTENTFORGE_REQUIRE_GATEWAY: "1"
           INTENTFORGE_BASE: http://localhost:4000
         run: pytest tests/goals_api_schema.py -v
+
+      - name: Report schema-regression skip
+        if: steps.gateway-check.outputs.gateway_reachable == 'false'
+        run: |
+          echo "::warning::schema-regression SKIPPED — no live gateway at $INTENTFORGE_BASE"
+          echo "::warning::This job is a no-op on a bare runner. The QA loop runs"
+          echo "::warning::the suite where the stack exists."
