@@ -3906,7 +3906,7 @@ async fn enrich_with_commerce_par<F, Fut>(
     let deadline = std::time::Instant::now() + wall_timeout;
     let mut fetched: Vec<(usize, String)> = Vec::new();
     for wave in eligible.chunks(max_par.max(1)) {
-        let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(idx, String)>>)> = wave
+        let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(usize, String)>>)> = wave
             .iter()
             .map(|&idx| {
                 let fetch_clone = fetch.clone();
