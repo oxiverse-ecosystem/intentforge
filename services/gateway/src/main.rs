@@ -13467,6 +13467,7 @@ async fn handle_search(
         // pages for "biryani without a pressure cooker") cancelled the stripped
         // variant before it could fetch the genuine on-topic results. Ordering
         // the stripped variant first guarantees it is never the cancelled one.
+        let clean_q = preprocess_searxng_query(&engine_q);
         let (first_q, second_q) = match &stripped_override {
             Some(stripped) => {
                 let clean_stripped = preprocess_searxng_query(stripped);
