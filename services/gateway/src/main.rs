@@ -1550,7 +1550,7 @@ const LOCATION_GAZETTEER: &[(&str, &str)] = &[
     ("poland", "PL"), ("austria", "AT"), ("switzerland", "CH"), ("belgium", "BE"),
     ("russia", "RU"), ("ukraine", "UA"), ("turkey", "TR"), ("greece", "GR"),
     ("japan", "JP"), ("china", "CN"), ("korea", "KR"), ("south korea", "KR"),
-    ("india", "IN"), ("singapore", "SG"), ("hong kong", "HK"),
+    ("india", "IN"), ("indian", "IN"), ("singapore", "SG"), ("singaporean", "SG"), ("hong kong", "HK"),
     ("brazil", "BR"), ("mexico", "MX"), ("argentina", "AR"),
     ("united arab emirates", "AE"), ("uae", "AE"), ("saudi arabia", "SA"),
     ("egypt", "EG"), ("israel", "IL"), ("thailand", "TH"), ("vietnam", "VN"),

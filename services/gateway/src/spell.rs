@@ -65,6 +65,9 @@ const PROTECTED_TERMS: &[&str] = &[
     "github", "gitlab", "apple", "ubuntu", "debian", "alpine", "macos",
     "android", "linux", "windows", "aws", "gcp", "azure", "vim", "neovim",
     "emacs", "json", "yaml", "toml", "grpc", "graphql", "kafka", "duckdb",
+    // Food & cooking terms that collide with English words / tech terms
+    "batter", "dosa", "idli", "vada", "poha", "upma", "biryani", "tandoori",
+    "masala", "chutney", "achar", "ghee", "besan", "rava", "semolina",
 ];
 
 /// Returns true if `word` is a protected brand/entity that must never be
