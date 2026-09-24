@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "note": "Runtime-loaded audio-content URL patterns. Used by the audio demotion fix so that podcast/audio results arriving through the GENERAL web result set (e.g. a podcasts.apple.com URL returned by SearXNG, which is NOT tagged with an audio source) are still recognized as audio results and demoted for non-audio queries. This is a structural allow-list of platforms the engine explicitly treats as 'audio surfaces', not a per-query tuned list — same approach as VIDEO_HOSTS.",
+  "hosts": [
+    "podcasts.apple.com",
+    "anchor.fm",
+    "soundcloud.com",
+    "open.spotify.com",
+    "spotify.com",
+    "baltimoreravens.com",
+    "podbean.com",
+    "buzzsprout.com",
+    "simplecast.com",
+    "libsyn.com",
+    "pocketcasts.com",
+    "overcast.fm",
+    "castro.fm",
+    "player.fm",
+    "tunein.com",
+    "iheart.com",
+    "radio.com",
+    "audible.com",
+    "audible.in",
+    "gaana.com",
+    "jiosaavn.com",
+    "wynk.in",
+    "podcast",
+    "radio"
+  ],
+  "intent_markers": [
+    "podcast",
+    "listen",
+    "audio",
+    "episode",
+    "show",
+    "radio"
+  ]
+}
