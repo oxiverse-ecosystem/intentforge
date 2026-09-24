@@ -13471,12 +13471,12 @@ async fn handle_search(
             Some(stripped) => {
                 let clean_stripped = preprocess_searxng_query(stripped);
                 if !clean_stripped.is_empty() {
-                    (clean_stripped, preprocess_searxng_query(&engine_q))
+                    (clean_stripped, clean_q.clone())
                 } else {
-                    (preprocess_searxng_query(&engine_q), String::new())
+                    (clean_q.clone(), String::new())
                 }
             }
-            None => (preprocess_searxng_query(&engine_q), String::new()),
+            None => (clean_q.clone(), String::new()),
         };
         // Primary query URL (with geolocation parameters)
         searx_urls.push(searxng_url(base_url, &first_q, geo_location.as_ref(), lang));
@@ -13491,16 +13491,16 @@ async fn handle_search(
         // 0 upstream can be recovered from the site:-scoped result set.
         if let Some(ref relaxed) = filetype_relax_variant(&engine_q) {
             let clean_relaxed = preprocess_searxng_query(relaxed);
-            if !clean_relaxed.is_empty() && clean_relaxed != clean_q {
+            if !clean_relaxed.is_empty() && clean_relaxed != first_q {
                 searx_urls.push(searxng_url(base_url, &clean_relaxed, geo_location.as_ref(), lang));
                 searx_instance_keys.push(key.clone());
             }
         }
         // Verbose query keyphrase relaxation (strips filler words like "construct a ... using ...")
-        // Fires in parallel during initial fan-out to ensure upstream engines return hits for verbose natural language queries.
+        // Fires in parallel during initial fan-out to ensure upstream engines return hits for verbose natural-language queries.
         if let Some(ref keyphrase) = keyphrase_relax_variant(&engine_q) {
             let clean_kp = preprocess_searxng_query(keyphrase);
-            if !clean_kp.is_empty() && clean_kp != clean_q {
+            if !clean_kp.is_empty() && clean_kp != first_q {
                 searx_urls.push(searxng_url(base_url, &clean_kp, geo_location.as_ref(), lang));
                 searx_instance_keys.push(key.clone());
             }
