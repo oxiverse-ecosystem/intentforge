@@ -1678,22 +1678,30 @@ if no upstream page exposed structured product data — every result carries
 honest presentation signal. A result that *did* expose structured data
 additionally carries a `commerce` block with price/currency/availability etc.
 
-**Example (real, verified live 2026-09-14):**
+**Example (real, verified live 2026-09-24):**
 
 ```bash
-curl -s "localhost:4000/search?q=buy%20sony%20wh-1000xm5%20headphones&count=3"
+curl -s "localhost:4000/search?q=buy%20iphone%2016%20pro%20max%20price&count=8"
 # intent= transactional
 # shopping present= True
-# shopping results= 3
+# shopping results= 8
+# first result url= https://www.bestbuy.com/site/all-iphone/iphone-16-pro-max/pc...
 # first affiliate disclosed= True  network= Sovrn Commerce
-# first provenance source= None  observed= <unix-timestamp>
+# first commerce_provenance source= None  observed= 1790241030
+# first commerce= null  (no structured product markup found on upstream page)
+# third affiliate network= Sovrn Commerce  cuid=www.flipkart.com  bf=0.10
 ```
 
 ```bash
 curl -s "localhost:4000/search?q=rust%20ownership%20explained"
-# intent= technical
-# shopping present= False
+# intent= technical  shopping present= False
 ```
+
+**Fix applied this round:** `GET /shopping` was using the sequential `enrich_with_commerce`
+(36s for 5 pages → 408 timeout). Switched to the bounded-parallel `enrich_with_commerce_par`
+with a 22s wall cap — same enrichment + decoration pipeline, now consistent with the main-path
+`/search` code path. Every result still carries `commerce_provenance` + `affiliate` with
+`disclosed: true`.
 
 > The `shopping` field carries the same `commerce` / `commerce_provenance` / `affiliate`
 > structure as `GET /shopping`. Every `affiliate` block has `disclosed: true`; no
