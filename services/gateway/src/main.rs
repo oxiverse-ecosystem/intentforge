@@ -16395,8 +16395,15 @@ async fn handle_search(
         }
     }
     // query_neg_dropped: compounds the extractor already classified as non-manner
-    // declined candidates — these are soft negatives by definition.
+    // declined candidates — these are soft negatives by definition. FIX-IF-01
+    // (2026-09-24): a term that ALREADY survived as a hard negative (explicit
+    // survivor or gated exclusion) must NOT also be reported as a soft negative —
+    // the API would show the same term applied as BOTH -term (hard) and a soft
+    // demotion, a direct contradiction.
     for d in &query_neg_dropped {
+        if gated_neg_dedup.contains(d) || explicit_survivors.contains(d) {
+            continue;
+        }
         if !soft_negatives.contains(d) {
             soft_negatives.push(d.clone());
         }
