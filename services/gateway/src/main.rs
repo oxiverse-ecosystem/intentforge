@@ -6469,6 +6469,80 @@ fn is_url_video_host(url: &str) -> bool {
     })
 }
 
+/// Audio-content host patterns loaded from `data/audio_sources.json` at runtime.
+/// Mirrors the data-driven approach of AffiliateCtx (data/commerce/affiliate.json).
+/// An empty/missing file is NOT fatal: the engine simply has no audio hosts and
+/// every result is treated as non-audio (graceful degradation).
+static AUDIO_HOSTS_RUNTIME: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Runtime-resolved audio hosts. Loads once from data/audio_sources.json.
+fn audio_hosts() -> &'static Vec<String> {
+    AUDIO_HOSTS_RUNTIME.get_or_init(|| {
+        let mut hosts = Vec::new();
+        let candidates = [
+            "data/audio_sources.json",
+            "/app/data/audio_sources.json",
+            "./data/audio_sources.json",
+        ];
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("hosts").and_then(|h| h.as_array()) {
+                        for h in arr {
+                            if let Some(s) = h.as_str() {
+                                hosts.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                if !hosts.is_empty() {
+                    break;
+                }
+            }
+        }
+        tracing::info!("audio: loaded {} host(s) from data file", hosts.len());
+        hosts
+    })
+}
+
+/// Returns true if `url` points at a known audio platform (see AUDIO_HOSTS_RUNTIME).
+/// Cheap host suffix check — same pattern as is_url_video_host, but data-driven.
+fn is_url_audio_host(url: &str) -> bool {
+    let u = url.to_lowercase();
+    let host = if let Some(idx) = u.find("://") {
+        &u[idx + 3..]
+    } else {
+        &u
+    };
+    let host = host.split(['/', '?', '#']).next().unwrap_or(host);
+    audio_hosts().iter().any(|h| {
+        let h_str = h.as_str();
+        host == h_str
+            || host.ends_with(&format!(".{}", h_str))
+            // Match bare label (e.g. "podcast.example.com" or "radio.example.com")
+            || (h_str == "podcast"
+                && (host == "podcast"
+                    || host.starts_with("podcast.")
+                    || host.ends_with(".podcast")))
+            || (h_str == "radio"
+                && (host == "radio"
+                    || host.starts_with("radio.")
+                    || host.ends_with(".radio")))
+    })
+}
+
+/// Audio-intent markers: words/phrases that signal a query is seeking audio
+/// content. Same approach as VIDEO_INTENT_MARKERS — data, not per-query tuned.
+const AUDIO_INTENT_MARKERS: &[&str] = &["podcast", "listen", "audio", "episode", "show", "radio"];
+
+/// Returns true if the query explicitly indicates audio/podcast intent.
+/// Used by the audio demotion fix to skip dampening when the user is
+/// explicitly seeking audio content. Same pattern as has_video_intent.
+fn has_audio_intent(query: &str) -> bool {
+    let q_lc = query.to_lowercase();
+    AUDIO_INTENT_MARKERS.iter().any(|m| q_lc.contains(m))
+}
+
 /// Video-intent markers: words/phrases that signal a query is seeking video content.
 /// This is the EXACT data set the P8 video-dominance fix keys off — shared with
 /// /search so the /video preview always matches real engine behavior. No per-query
@@ -10306,6 +10380,28 @@ fn merge_local_and_web(
         } else {
             1.0
         };
+        // Audio-suppression (non-/audio /search): Podcast/audio results enter the web merge
+        // via SearXNG with source="brave" and generic web titles — there is no
+        // `invidious`/`video`-style source tag to key off (unlike video). Detect them by
+        // URL host (is_url_audio_host). Podcasts/audio have their own consumption context;
+        // in /search they are secondary for text queries, so dampen them ~0.25 unless the
+        // query is explicitly audio-seeking (has_audio_intent). Same data-driven approach
+        // as the P8 video cap: host list is a structural allow-list, not per-query tuned.
+        let is_audio_source = is_url_audio_host(&r.url);
+        let audio_mult = if is_audio_source {
+            if has_audio_intent(query) {
+                1.0 // explicit audio intent → keep
+            } else {
+                // Podcasts/apple-podcasts etc. arrive as `source: "brave"` web results
+                // with generic titles; dampen so a news query doesn't surface a podcast
+                // at #2-3. 0.25 mirrors the original P8 video dampening strength (the
+                // video cap later crush-hard via the post-cal pass). Kept as a multiplier
+                // here so the post-calibration audio cap below has a durable floor too.
+                0.25
+            }
+        } else {
+            1.0
+        };
         // Cross-lingual relevance guard (D2, this round): a result written in a
         // non-Latin script (CJK, Cyrillic, Devanagari, Arabic, …) is almost never
         // the answer to an English / Roman-script query, yet upstream engines
@@ -10346,7 +10442,7 @@ fn merge_local_and_web(
         };
 
         let p2d_mult = if p2d_offtopic { 0.05 } else { 1.0 };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult;
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * audio_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult;
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
@@ -10942,6 +11038,36 @@ fn merge_local_and_web(
                         );
                         r.post_cal_cap = Some(video_cap);
                         r.score = video_cap;
+                    }
+                }
+            }
+
+            // (b0-audio) POST-CALIBRATION AUDIO CAP (mirrors P8 video cap).
+            // The in-loop audio dampening (r.score *= 0.25 for non-audio queries)
+            // is partially defeated by calibrate_scores, which rescales the WHOLE
+            // set onto [0.05,1.0]. Whenever the only surviving candidates for a
+            // text query are podcast/audio results (thin result sets), the rescale
+            // stretches them back up — so a podcasts.apple.com result outranks a
+            // topical news article. This cap re-applies AFTER calibration so the
+            // dampening is durable: audio may still appear (floor preserved) but
+            // can never outrank genuine text results for a non-audio query.
+            // Audio-intent queries keep full score.
+            let is_audio_src = is_url_audio_host(&r.url);
+            if is_audio_src {
+                if !has_audio_intent(query) {
+                    // 0.04 sits UNDER the calibrated article floor (0.05) so a
+                    // podcast is demoted *below* every genuine text result for a
+                    // non-audio query. Floor preserved so audio remains present.
+                    // Signal-driven (query self-describes intent via AUDIO_INTENT_MARKERS),
+                    // not tuned to a query.
+                    let audio_cap = 0.04f32;
+                    if r.score > audio_cap {
+                        tracing::info!(
+                            "POST-CAL AUDIO CAP -> {:.2}: '{}' (non-audio query, audio source)",
+                            audio_cap, r.url.chars().take(60).collect::<String>()
+                        );
+                        r.post_cal_cap = Some(audio_cap);
+                        r.score = audio_cap;
                     }
                 }
             }
@@ -12514,6 +12640,48 @@ fn build_video_empty() -> serde_json::Value {
         "video_intent_markers": VIDEO_INTENT_MARKERS,
         "would_pin_non_video_sources": true,
         "is_video_source_examples": {},
+    })
+}
+
+/// Pure builder for audio-introspection. Mirrors `build_video_inspect`: reuses
+/// the EXACT pure fns `/search` uses for its audio-dominance check --
+/// `has_audio_intent` + `is_url_audio_host`. No ranking, no network, no new
+/// logic. Exposes the audio-demotion decision for operators/tests.
+fn build_audio_inspect(q: &str) -> serde_json::Value {
+    let audio_intent = has_audio_intent(q);
+    let intent_resp = fallback_intent(q);
+    let is_audio_source_examples = serde_json::json!({
+        "apple_podcasts": is_url_audio_host("https://podcasts.apple.com/us/podcast/episode123"),
+        "anchor_fm": is_url_audio_host("https://anchor.fm/show/episodes/episode123"),
+        "soundcloud": is_url_audio_host("https://soundcloud.com/artist/track"),
+        "spotify_episode": is_url_audio_host("https://open.spotify.com/episode/abc123"),
+        "podcast_word_in_path": is_url_audio_host("https://example.com/podcast-guide-article"),
+        "python_org_article": is_url_audio_host("https://docs.python.org/3/tutorial/"),
+    });
+    serde_json::json!({
+        "query": q,
+        "audio_intent": audio_intent,
+        "audio_intent_markers": AUDIO_INTENT_MARKERS,
+        "would_pin_non_audio_sources": !audio_intent,
+        "is_audio_source_examples": is_audio_source_examples,
+        "intent": intent_resp.intent,
+        "note": "Additive introspection of the audio-dominance fix. Does not change ranking. An audio source is any url matching is_url_audio_host (podcasts.apple.com, anchor.fm, soundcloud, spotify episode, etc.). audio_intent=true exempts a query from the non-audio pin.",
+    })
+}
+
+/// Build the `400 empty_query` envelope for `/audio` when `q` is empty or
+/// whitespace. Mirrors `build_video_empty`: carries the `audio_intent` +
+/// `audio_intent_markers` + `would_pin_non_audio_sources` top-level keys
+/// (neutral values).
+fn build_audio_empty() -> serde_json::Value {
+    serde_json::json!({
+        "error": "empty_query",
+        "message": "Query parameter 'q' is empty",
+        "query": "",
+        "audio_intent": false,
+        "audio_intent_markers": AUDIO_INTENT_MARKERS,
+        "would_pin_non_audio_sources": true,
+        "is_audio_source_examples": {},
     })
 }
 
@@ -19812,6 +19980,94 @@ mod spellcheck_endpoint_tests {
             // (has_video_intent checks for these phrases, matching live /search).
             let stripped = simple_negation_strip("watch video tutorial").unwrap_or_else(|| "watch video tutorial".to_string());
             assert!(has_video_intent(&stripped));
+        }
+    }
+
+    // -- audio demotion tests (mirrors video_endpoint_tests pattern) --
+    // Locks the audio-classification pure fns: has_audio_intent, is_url_audio_host.
+    // These mirror the P8 video tests — same structural host-class check.
+    mod audio_demotion_tests {
+        use super::*;
+
+        #[test]
+        fn audio_news_query_returns_pin_true() {
+            let res = build_audio_inspect("what happened in the ipl auction today");
+            assert_eq!(res["query"].as_str(), Some("what happened in the ipl auction today"));
+            assert_eq!(res["audio_intent"].as_bool(), Some(false));
+            assert_eq!(res["would_pin_non_audio_sources"].as_bool(), Some(true));
+            assert_eq!(res["intent"].as_str(), Some("informational"));
+        }
+
+        #[test]
+        fn audio_podcast_query_exempts_from_pin() {
+            let res = build_audio_inspect("ipl auction podcast discussion");
+            assert_eq!(res["audio_intent"].as_bool(), Some(true));
+            assert_eq!(res["would_pin_non_audio_sources"].as_bool(), Some(false));
+        }
+
+        #[test]
+        fn audio_is_audio_source_examples_match_is_url_audio_host() {
+            let res = build_audio_inspect("some query");
+            let ex = &res["is_audio_source_examples"];
+            assert_eq!(ex["apple_podcasts"], serde_json::json!(true));
+            assert_eq!(ex["anchor_fm"], serde_json::json!(true));
+            assert_eq!(ex["soundcloud"], serde_json::json!(true));
+            assert_eq!(ex["spotify_episode"], serde_json::json!(true));
+            assert_eq!(ex["podcast_word_in_path"], serde_json::json!(false));
+            assert_eq!(ex["python_org_article"], serde_json::json!(false));
+        }
+
+        #[test]
+        fn audio_empty_query_returns_documented_envelope() {
+            // Empty / whitespace q must return an audio-shaped empty_query
+            // envelope (neutral audio_intent + markers present), NOT a 200 with
+            // a classified result.
+            let res = build_audio_empty();
+            assert_eq!(res["error"].as_str(), Some("empty_query"));
+            assert_eq!(res["message"].as_str(), Some("Query parameter 'q' is empty"));
+            assert_eq!(res["query"].as_str(), Some(""));
+            assert_eq!(res["audio_intent"].as_bool(), Some(false));
+            assert_eq!(res["would_pin_non_audio_sources"].as_bool(), Some(true));
+        }
+
+        #[test]
+        fn audio_response_shape_matches_docs() {
+            // Locks the documented top-level keys so the contract cannot drift.
+            let res = build_audio_inspect("best podcast for rust async");
+            for key in [
+                "query", "audio_intent", "audio_intent_markers",
+                "would_pin_non_audio_sources", "is_audio_source_examples",
+                "intent", "note",
+            ] {
+                assert!(res.get(key).is_some(), "missing /audio top-level key: {}", key);
+            }
+            assert_eq!(
+                res["audio_intent_markers"],
+                serde_json::json!(["podcast", "listen", "audio", "episode", "show", "radio"])
+            );
+        }
+
+        #[test]
+        fn audio_podcast_phrase_triggers_audio_intent() {
+            // "podcast" must be detected as audio intent (has_audio_intent
+            // checks for these markers, matching live /search).
+            assert!(has_audio_intent("best podcast for rust async"));
+            assert!(has_audio_intent("listen to this episode"));
+            assert!(has_audio_intent("audio book recommendations"));
+            assert!(has_audio_intent("radio stations online"));
+            assert!(!has_audio_intent("what happened in the ipl auction today"));
+        }
+
+        #[test]
+        fn audio_is_url_audio_host_matches_known_platforms() {
+            // Mirrors the video is_url_video_host tests — known audio platforms
+            // must be detected; unrelated URLs must not.
+            assert!(is_url_audio_host("https://podcasts.apple.com/us/podcast/ep123"));
+            assert!(is_url_audio_host("https://anchor.fm/show/episodes/ep123"));
+            assert!(is_url_audio_host("https://soundcloud.com/artist/track"));
+            assert!(is_url_audio_host("https://open.spotify.com/episode/abc123"));
+            assert!(!is_url_audio_host("https://docs.python.org/3/tutorial/"));
+            assert!(!is_url_audio_host("https://example.com/podcast-guide-article"));
         }
     }
 }
