@@ -14826,6 +14826,47 @@ async fn handle_search(
             let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
             intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
         }
+
+        // Override 10: cooking/how-to queries with "without" pattern → how-to
+        // The intent-engine's linear probe misclassifies "cook X without Y" and
+        // "make X without Y" patterns as "comparison" (conf ~0.9) because the
+        // word "without" triggers comparison logic. But the distribution tells
+        // the truth: how-to is dominant (0.235 vs 0.077 comparison). Force
+        // how-to when:
+        //   (a) query contains a cooking/creation verb + "without", AND
+        //   (b) no genuine comparison markers (vs/versus/compare/alternative)
+        {
+            let cooking_verbs = [
+                "cook", "cooking", "bake", "baking", "make", "making",
+                "prepare", "preparing", "build", "building",
+            ];
+            let has_cooking_verb = cooking_verbs.iter().any(|v| q_has_word(&q_lower, v));
+            let has_without = q_has_word(&q_lower, "without");
+
+            let comparison_markers = [
+                "vs", "versus", "compare", "comparison",
+                "alternative", "replacement", "difference between",
+            ];
+            let has_comparison_marker = comparison_markers.iter().any(|m| q_lower.contains(m));
+
+            if has_cooking_verb && has_without && !has_comparison_marker
+                && intent.intent == "comparison"
+            {
+                tracing::info!(
+                    "INTENT OVERRIDE (STRONG): cooking/how-to query '{}' was 'comparison' (conf={:.3}) -> how-to",
+                    q, intent.confidence
+                );
+                intent.intent = "how-to".to_string();
+                intent.confidence = intent.confidence.max(0.80);
+                let howto_prob = intent.distribution.get("how-to").copied().unwrap_or(0.0);
+                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+                intent.distribution.insert("how-to".to_string(), (howto_prob + current_top_prob * 0.5).min(0.85));
+                // Dampen the spurious comparison probability
+                if let Some(c) = intent.distribution.get_mut("comparison") {
+                    *c = (*c * 0.3).min(0.20);
+                }
+            }
+        }
     }
 
     let vector: Option<Vec<f32>> = match embed_res {
