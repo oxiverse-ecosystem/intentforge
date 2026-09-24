@@ -7647,6 +7647,23 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                         idx += 1;
                         continue;
                     }
+                    // Round 2026-09-24: protected-term boundary split. When both the
+                    // current accumulated entity AND the next token are protected terms,
+                    // they must be separate exclusions — "not react vue or angular" must
+                    // yield [react, vue, angular], not [react vue, angular]. Without
+                    // this, the compound "react vue" substring-matches no page and the
+                    // exclusion silently no-ops. The split is data-driven (same
+                    // PROTECTED_TERMS seed as is_protected_term), no per-query literals.
+                    if !ent.is_empty() && spell::is_protected_term(&wc) && spell::is_protected_term(&ent.join(" ")) {
+                        let entity = ent.join(" ");
+                        if !out.contains(&entity) {
+                            out.push(entity);
+                        }
+                        ent.clear();
+                        ent.push(wc);
+                        idx += 1;
+                        continue;
+                    }
                     if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
                         break; // trailing stopword ends the entity
                     }
@@ -18327,6 +18344,19 @@ mod explicit_negation_list_tests {
         let out = extract_explicit_negation_terms("healthy dinner recipes without onion and garlic");
         assert!(out.contains(&"onion".to_string()), "onion missing: {:?}", out);
         assert!(out.contains(&"garlic".to_string()), "garlic missing: {:?}", out);
+    }
+
+    #[test]
+    fn protected_term_boundary_split_yields_separate_exclusions() {
+        // Round 2026-09-24: "not react vue or angular" must yield
+        // [react, vue, angular] — not [react vue, angular]. The compound
+        // "react vue" substring-matches no page title/content and the
+        // exclusion silently no-ops.
+        let out = extract_explicit_negation_terms("javascript frameworks not react vue or angular");
+        assert!(out.contains(&"react".to_string()), "react missing: {:?}", out);
+        assert!(out.contains(&"vue".to_string()), "vue missing: {:?}", out);
+        assert!(out.contains(&"angular".to_string()), "angular missing: {:?}", out);
+        assert!(!out.iter().any(|t| t.contains("react vue")), "compound 'react vue' must not appear: {:?}", out);
     }
 
     #[test]

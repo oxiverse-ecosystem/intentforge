@@ -65,6 +65,14 @@ const PROTECTED_TERMS: &[&str] = &[
     "github", "gitlab", "apple", "ubuntu", "debian", "alpine", "macos",
     "android", "linux", "windows", "aws", "gcp", "azure", "vim", "neovim",
     "emacs", "json", "yaml", "toml", "grpc", "graphql", "kafka", "duckdb",
+    // JS frameworks / libraries (round 2026-09-24: these are top-tier
+    // package names that must never be spell-corrected or declined as
+    // generic nouns in negation contexts — "not react/vue/angular").
+    "react", "vue", "angular",
+    // Consumer electronics brands (round 2026-09-24: "not apple or sony"
+    // exclusion queries need these recognized as entities).
+    "sony", "samsung", "oneplus", "xiaomi", "nothing", "motorola", "oppo",
+    "vivo", "realme", "poco", "asus", "acer", "lenovo", "dell", "hp",
     // Food & cooking terms that collide with English words / tech terms
     "batter", "dosa", "idli", "vada", "poha", "upma", "biryani", "tandoori",
     "masala", "chutney", "achar", "ghee", "besan", "rava", "semolina",
@@ -1474,5 +1482,22 @@ mod tests {
         // a known-misspelling entry, exempt from the absent-word block.
         let index = SymSpellIndex::build();
         assert_eq!(index.correct("ngnix"), Some("nginx".to_string()));
+    }
+
+    // Round 2026-09-24: PROTECTED_TERMS must include top-tier JS frameworks
+    // and consumer electronics brands so that "not react/vue/angular" and
+    // "not apple or sony" exclusion queries are recognized as entities.
+    #[test]
+    fn test_js_frameworks_are_protected_terms() {
+        assert!(is_protected_term("react"), "react must be protected");
+        assert!(is_protected_term("vue"), "vue must be protected");
+        assert!(is_protected_term("angular"), "angular must be protected");
+    }
+
+    #[test]
+    fn test_consumer_electronics_brands_are_protected_terms() {
+        assert!(is_protected_term("sony"), "sony must be protected");
+        assert!(is_protected_term("samsung"), "samsung must be protected");
+        assert!(is_protected_term("oneplus"), "oneplus must be protected");
     }
 }
