@@ -7075,6 +7075,41 @@ fn is_real_exclusion(
     if compound == "pay" || compound == "paying" || lc == "pay" || lc == "paying" {
         return pay_exclusion_is_money(&q_orig);
     }
+    if negated_compound_is_recognized_entity(compound, q_orig) {
+        return true;
+    }
+    // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
+    // (e.g. "javascript not java not typescript" → java, typescript).
+    if query_is_contrastive {
+        return true;
+    }
+    // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
+    // acceptance here that unconditionally treated ANY object of `without`/`not`/`except`
+    // as a real exclusion. That over-reached: generic attribute/manner objects
+    // ("without soap", "recipes not spicy") were wrongly extracted as hard-filter
+    // exclusions, breaking the manner/attribute tests and degrading result sets. It
+    // had no unit test of its own and cannot distinguish "spicy" from "systemd" without
+    // a hardcoded allow-list (which the no-hardcoding doctrine forbids). The pre-c4317bc
+    // behavior — decline generic nouns unless they are protected terms, capitalized
+    // proper nouns, or in contrastive framing — is the correct contract (covered by the
+    // existing manner/attribute tests), so this path is intentionally NOT taken.
+    false
+}
+
+/// FIX-IF-01 (2026-09-24): the entity-recognition core of `is_real_exclusion`,
+/// extracted so the explicit-directive manner-frame exception in handle_search
+/// can consult the SAME recognition signals. A negated compound is a recognized
+/// entity when any token (or the whole compound) is a protected brand/tech
+/// term, a country-of-origin demonym, a household appliance/cooking tool
+/// (seed lists — general data, no per-query literals), or a capitalized proper
+/// noun the user named in the original query. Recognition is framing-independent:
+/// "without django" is a real exclusion because django is a recognized entity,
+/// even though it sits in a "without X" manner frame.
+fn negated_compound_is_recognized_entity(compound: &str, q_orig: &str) -> bool {
+    let lc = compound.trim().to_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
     let tokens: Vec<&str> = lc.split_whitespace().collect();
     // Entity: any token (or the whole compound) is a protected brand/tech term.
     if tokens.iter().any(|t| spell::is_protected_term(t)) {
@@ -7115,21 +7150,6 @@ fn is_real_exclusion(
             }
         }
     }
-    // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
-    // (e.g. "javascript not java not typescript" → java, typescript).
-    if query_is_contrastive {
-        return true;
-    }
-    // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
-    // acceptance here that unconditionally treated ANY object of `without`/`not`/`except`
-    // as a real exclusion. That over-reached: generic attribute/manner objects
-    // ("without soap", "recipes not spicy") were wrongly extracted as hard-filter
-    // exclusions, breaking the manner/attribute tests and degrading result sets. It
-    // had no unit test of its own and cannot distinguish "spicy" from "systemd" without
-    // a hardcoded allow-list (which the no-hardcoding doctrine forbids). The pre-c4317bc
-    // behavior — decline generic nouns unless they are protected terms, capitalized
-    // proper nouns, or in contrastive framing — is the correct contract (covered by the
-    // existing manner/attribute tests), so this path is intentionally NOT taken.
     false
 }
 
@@ -16428,17 +16448,20 @@ async fn handle_search(
             // ("not from X", "except X", "other than X") carry no such frame
             // and keep their explicit-directive status.
             //
-            // FIX-IF-01 (2026-09-24) — appliance carve-out: a negated
-            // HOUSEHOLD APPLIANCE / cooking tool ("cook salmon without oven or
-            // microwave", "biryani without a pressure cooker", "fried rice
-            // without a wok") is NOT a manner qualifier — it is a concrete
-            // tool the user wants removed from the method space. The bare
-            // is_manner_frame gate killed these entirely (negative:[] and
-            // "How to Cook Salmon in the Oven" ranked #1). The seed check
-            // takes precedence over the manner frame; everything else keeps
-            // the 0559Z behavior ("music background", "soap", "artificial
-            // sweeteners" stay manner qualifiers).
-            if is_manner_frame(&q_orig, &n) && !is_household_appliance(&n) {
+            // FIX-IF-01 (2026-09-24) — entity/contrastive carve-out: the manner
+            // frame must NOT swallow a RECOGNIZED entity or a contrastively-
+            // framed negation. "without django or flask" (protected terms) and
+            // "no dairy and no gelatin" (double negation → contrastive) were
+            // silently killed by the bare is_manner_frame gate — only the FIRST
+            // list member survived. A negated household appliance ("without
+            // oven or microwave") is covered by the same recognition helper
+            // (appliance seed). Everything unrecognized in a plain "without X"
+            // frame keeps the 0559Z manner behavior ("music background",
+            // "soap", "artificial sweeteners").
+            if is_manner_frame(&q_orig, &n)
+                && !negated_compound_is_recognized_entity(&n, &q_orig)
+                && !query_contrastive
+            {
                 continue; // manner qualifier: not an exclusion at all
             }
             if !explicit_survivors.contains(&n) {
@@ -18370,6 +18393,23 @@ mod explicit_negation_list_tests {
         assert!(!is_real_exclusion("soap", "how to clean a cast iron skillet without soap", false));
         assert!(!is_real_exclusion("spicy", "healthy recipes not spicy", false));
     }
+
+    #[test]
+    fn recognized_entity_survives_manner_frame() {
+        // FIX-IF-01: the entity-recognition core must accept a negated protected
+        // term / appliance regardless of the "without X" manner frame — the
+        // 0559Z exception was silently killing every entity that happened to
+        // directly follow "without" ("without django or flask" lost django).
+        assert!(negated_compound_is_recognized_entity("django", "python web frameworks without django or flask"));
+        assert!(negated_compound_is_recognized_entity("flask", "python web frameworks without django or flask"));
+        assert!(negated_compound_is_recognized_entity("oven", "cook salmon without oven or microwave"));
+        assert!(negated_compound_is_recognized_entity("microwave", "cook salmon without oven or microwave"));
+        // Unrecognized generic nouns in the same frame are NOT entities — they
+        // keep the manner-qualifier path.
+        assert!(!negated_compound_is_recognized_entity("music background", "how to learn guitar with no music background"));
+        assert!(!negated_compound_is_recognized_entity("soap", "how to clean a cast iron skillet without soap"));
+        assert!(!negated_compound_is_recognized_entity("artificial sweeteners", "protein powder without artificial sweeteners"));
+    }
 }
 
 #[cfg(test)]
@@ -19682,13 +19722,18 @@ mod spellcheck_endpoint_tests {
         assert!(excl.contains(&"typescript".to_string()), "typescript must be an exclusion: {:?}", excl);
 
         // Manner qualifier must not be an exclusion and must appear once.
+        // FIX-IF-01 (2026-09-24): contract updated — a negated household
+        // appliance ("without an oven") is a REAL exclusion, not a manner
+        // qualifier (the pre-FIX classification silently dropped the user's
+        // tool exclusion and let "How to Cook Salmon in the Oven" rank #1).
+        // The extractor, /analyze and /search must all agree on this.
         let r2 = build_inspect(&index, "best way to cook salmon without an oven");
         let excl2: Vec<String> = r2["negation"]["exclusions"].as_array().unwrap()
             .iter().map(|v| v.as_str().unwrap().to_string()).collect();
         let man2: Vec<String> = r2["negation"]["manner_qualifiers"].as_array().unwrap()
             .iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        assert!(!excl2.iter().any(|e| e.contains("oven")), "oven must NOT be an exclusion: {:?}", excl2);
-        assert!(man2.iter().any(|m| m.contains("oven")), "oven must be a manner qualifier: {:?}", man2);
+        assert!(excl2.iter().any(|e| e.contains("oven")), "oven must be an exclusion (FIX-IF-01 appliance carve-out): {:?}", excl2);
+        assert!(!man2.iter().any(|m| m.contains("oven")), "oven must NOT be a manner qualifier (FIX-IF-01): {:?}", man2);
     }
 
     #[test]
