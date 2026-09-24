@@ -1311,6 +1311,17 @@ mod tests {
     }
 
     #[test]
+    fn test_isro_not_corrected_to_iso() {
+        let index = SymSpellIndex::build();
+        // "isro" (Indian Space Research Organisation) is a real acronym like
+        // "nasa"/"esa" and must never be distance-1 corrected to "iso". Seeded
+        // as a dictionary word (round auto/round-2026-09-24T0559Z) so the
+        // absent-word guard sees it as present and returns None.
+        let result = index.correct("isro");
+        assert_eq!(result, None, "isro must NOT be corrected to iso");
+    }
+
+    #[test]
     fn test_yawn_not_corrected_to_yarn() {
         // D-A: "yawn" is a real English word absent from the 15k dictionary; a
         // distance-1 substitution into the dictionary word "yarn" corrupted the

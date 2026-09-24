@@ -7870,6 +7870,23 @@ fn simple_negation_strip(query: &str) -> Option<String> {
     let mut result: Vec<&str> = Vec::new();
     let mut in_negation = false;
 
+    // Negation scope ends at the next CLAUSE-STARTING CONJUNCTION ("... without
+    // X **for** Y", "... not X **and** Y", "... not X **that** Y"). These
+    // coordinating/subordinating conjunctions unambiguously begin a new clause,
+    // so the words after them are back in normal scope. Prepositions (from/
+    // with/at/in/...) are deliberately NOT boundaries: in "not FROM chinese
+    // brands" the preposition is part of the negated phrase, and treating it
+    // as a boundary would re-inject the negated term into the search query.
+    // Same for "or"/"nor" ("without sugar OR honey" negates both sides).
+    // Without any boundary, every word after a "without X" clause is swallowed
+    // forever ("protein powder without artificial sweeteners FOR lactose
+    // intolerant beginners" -> "protein powder"), silently deleting the user's
+    // remaining topic from the query we send upstream.
+    let clause_boundary: std::collections::HashSet<&str> = [
+        "for", "and", "but", "when", "while", "if", "so", "because",
+        "that", "which", "who", "where",
+    ].iter().copied().collect();
+
     for w in &words {
         let w_lower = w.to_lowercase();
         let clean_w = w_lower.trim_matches(|c: char| !c.is_alphanumeric());
@@ -7881,6 +7898,13 @@ fn simple_negation_strip(query: &str) -> Option<String> {
         }
 
         if in_negation {
+            // A new clause begins: the negation scope is over. This word is a
+            // boundary word itself (kept as ordinary structure, not topic), and
+            // everything AFTER it is back in normal scope.
+            if clause_boundary.contains(w_lower.as_str()) {
+                in_negation = false;
+                continue; // boundary word itself is not topical content
+            }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
                 in_negation = false;
                 result.push(w);
@@ -8931,6 +8955,59 @@ fn merge_local_and_web(
         .filter(|tl| !is_weak_anchor_word(tl))
         .collect();
     let query_entity_count = comparison_entities.len();
+
+    // ── Comparison principals: the entities flanking the comparison marker ──
+    // "postgres VERSUS mongodb for a social media app feed" — the PRINCIPALS are
+    // postgres and mongodb (the words adjacent to the marker), while "social media
+    // app feed" is the CONTEXT. A comparison result must name at least one
+    // PRINCIPAL; naming only context words (a Planoly "Social Media Planner" page)
+    // is off-topic. Extraction is purely positional: the nearest non-structure
+    // word before the marker and the nearest non-structure word after it. No
+    // literals, works for any "X vs Y" / "X versus Y" / "compare X and Y" query.
+    let comparison_principals: Vec<String> = {
+        let marker_idx = q_words.iter().position(|w| {
+            let l = w.to_lowercase();
+            l == "versus" || l == "vs" || l == "compare" || l == "comparison"
+        });
+        match marker_idx {
+            Some(mi) => {
+                let is_structure = |w: &str| -> bool {
+                    let l = w.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+                    l.is_empty()
+                        || stop_words.contains(l.as_str())
+                        || comparison_structure_words.contains(&l.as_str())
+                        || l.chars().all(|c| c.is_ascii_digit())
+                };
+                let mut principals: Vec<String> = Vec::new();
+                // Walk LEFT from the marker to the nearest substantive word.
+                if mi > 0 {
+                    for w in q_words[..mi].iter().rev() {
+                        if !is_structure(w) {
+                            principals.push(w.to_lowercase());
+                            break;
+                        }
+                    }
+                }
+                // Walk RIGHT from the marker to the nearest substantive word.
+                for w in q_words[mi + 1..].iter() {
+                    if !is_structure(w) {
+                        principals.push(w.to_lowercase());
+                        break;
+                    }
+                }
+                principals
+            }
+            None => Vec::new(),
+        }
+    };
+    // For marker-less comparison queries ("difference between X and Y"), fall
+    // back to the full comparison_entities set (attribute-filtered distinctive
+    // terms) so the D3 cap still has an anchor set.
+    let comparison_anchor_terms: Vec<String> = if comparison_principals.is_empty() {
+        comparison_entities.clone()
+    } else {
+        comparison_principals
+    };
 
     let core_topic_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
@@ -10770,6 +10847,33 @@ fn merge_local_and_web(
             .copied().collect();
         let query_has_many_topics = strong_topics.len() >= 3;
 
+        // ── RARE-ANCHOR extraction (round auto/round-2026-09-24T0559Z) ──
+        // A query's distinctive terms split into two classes by corpus frequency:
+        // COMMON terms (present in the 15k English word-frequency dictionary —
+        // "social", "launch", "sunday", "thyroid") and RARE anchors (absent —
+        // "nisar", "visakhapatnam", "ashwagandha", "postgres": proper nouns,
+        // brands, technical terms). Junk pages survive the >=2-topics cap by
+        // matching several COMMON terms while containing NONE of the rare
+        // anchors (car pages matching "launch"+"updates" for an ISRO query;
+        // Fox News matching "sunday"+"morning" for an eye-hospital query; a
+        // Dutch retail page matching "social"+"media"+"app"+"feed" for a
+        // postgres query). When the query HAS rare anchors, a result matching
+        // zero of them is anchored on the wrong subject entirely. The split is
+        // derived from the same runtime corpus data the spell corrector uses —
+        // no per-query literals, and it self-extends to any future query.
+        let rare_anchor_terms: Vec<String> = strong_topics.iter()
+            .filter(|t| {
+                let tl = t.to_lowercase();
+                // Absent from the common-word dictionary => rare/technical/proper
+                // noun. (Word forms are stored lowercase; trim a trailing 's' is
+                // NOT done here — "hospitals" present does not make "hospital"
+                // rare, and vice versa, which is the conservative direction.)
+                dictionary::word_frequency(&tl).is_none()
+            })
+            .map(|t| t.to_lowercase())
+            .collect();
+        let query_has_rare_anchors = !rare_anchor_terms.is_empty();
+
         // These caps MUST sit strictly BELOW the calibrated article floor so the
         // spam is demoted *under* every genuine article, not merely tied with it.
         // calibrate_scores maps the raw set onto [0.05, 1.0]; a relevant article's
@@ -10862,33 +10966,83 @@ fn merge_local_and_web(
                 }
             }
 
-            // (c) COMPARISON off-topic local result (D3, this task).
-            // The in-loop D3 gate crushes the relevance of a local page that names
-            // NONE of the query's compared entities (e.g. "Honda City Mileage" for a
+            // (b2) RARE-ANCHOR CAP (round auto/round-2026-09-24T0559Z).
+            // The >=2-topics cap above is defeated by junk that matches several
+            // COMMON dictionary words while containing NONE of the query's rare
+            // anchors (proper nouns / brands / technical terms): car pages match
+            // "launch"+"updates" for an ISRO query, Fox News matches "sunday"+
+            // "morning" for an eye-hospital query, foreign retail pages match
+            // "social"+"media"+"app"+"feed" for a postgres query. When the query
+            // HAS rare anchors, a result matching too few of them is anchored on
+            // the wrong subject — cap it below the genuine article floor even
+            // if it matches many common terms. Coverage requirement scales with
+            // anchor count: 1-2 anchors need ANY match (a "postgres vs mongodb"
+            // page naming one side is on-topic); >=3 anchors need at least HALF
+            // (a query with three rare terms is a multi-facet query, and a page
+            // matching just one facet — lactose pages for a "protein powder ...
+            // lactose intolerant" query — is a partial-subject mismatch).
+            // Anchor set is derived from the same corpus frequency data the
+            // spell corrector uses (runtime data, no literals), so it
+            // generalises to every future query.
+            if query_has_rare_anchors {
+                let matched_anchors = rare_anchor_terms.iter().filter(|a| {
+                    rl.contains(a.as_str()) || cl.contains(a.as_str()) || ul.contains(a.as_str())
+                }).count();
+                let required_anchors = if rare_anchor_terms.len() >= 3 {
+                    (rare_anchor_terms.len() + 1) / 2 // ceil(half): 3->2, 4->2, 5->3
+                } else {
+                    1
+                };
+                if matched_anchors < required_anchors && r.score > weak_cap {
+                    tracing::info!(
+                        "POST-CAL RARE-ANCHOR CAP -> {:.2}: '{}' (matched {} of {} rare anchors {:?}, need {})",
+                        weak_cap, r.url.chars().take(60).collect::<String>(),
+                        matched_anchors, rare_anchor_terms.len(), rare_anchor_terms, required_anchors
+                    );
+                    r.post_cal_cap = Some(weak_cap);
+                    r.score = weak_cap;
+                }
+            }
+
+            // (c) COMPARISON off-topic result (D3 generalized, round 2026-09-24T0559Z).
+            // The in-loop D3 gate crushes the relevance of a page that names NONE of
+            // the query's compared entities (e.g. "Honda City Mileage" for a
             // "Brezza vs Venue" query). But calibrate_scores (and the thin-result
             // boost) rescales it right back to the top band, so the off-topic brand
             // still outranks the genuine Brezza/Venue pages — the exact bug. Re-apply
             // the cap AFTER calibration so it survives, matching the durable pattern
-            // used by the D1/D2/D3 (weak-match) caps above. `compared_entities` is
+            // used by the D1/D2/D3 (weak-match) caps above. `comparison_entities` is
             // derived from the query's own distinctive terms minus attribute/structure
             // vocab (no brand literals), so this is fully general: it fires for any
             // comparison ("swift vs nexon", "city vs amaze", ...) and never names a
-            // specific brand/model. A local page that names none of the compared
-            // entities may still appear (floor preserved) but can never outrank the
-            // genuine comparative web/local pages. RELATIVE cap (like the video cap)
-            // so it holds in both healthy ([0.05,1.0]) and weak-set ([0.05,0.12])
-            // calibration regimes.
-            if r.is_local && comparison_query && !comparison_entities.is_empty() {
-                let names_entity = comparison_entities.iter().any(|e| {
+            // specific brand/model. GENERALIZED this round from local-only to ALL
+            // results: web junk pages that name none of the compared principals
+            // (a Planoly "Social Media Planner" App Store page ranking #1 for
+            // "postgres versus mongodb for a social media app feed") are the same
+            // defect class — a comparison result must name at least one side. A
+            // page that names none may still appear (floor preserved) but can never
+            // outrank the genuine comparative pages. RELATIVE cap (like the video
+            // cap) so it holds in both healthy ([0.05,1.0]) and weak-set
+            // ([0.05,0.12]) calibration regimes.
+            if comparison_query && !comparison_anchor_terms.is_empty() {
+                let names_entity = comparison_anchor_terms.iter().any(|e| {
                     rl.contains(e.as_str()) || cl.contains(e.as_str()) || ul.contains(e.as_str())
                 });
                 if !names_entity {
-                    let d3_cap = (best_non_video * 0.6).max(0.05);
+                    // Absolute weak_cap (0.04, UNDER the calibrated article floor of
+                    // 0.05) — same convention as the video/weak-match caps. The old
+                    // relative best_non_video*0.6 cap FAILED when the whole result set
+                    // was weak (Planoly at 0.072 vs genuine comparison articles at
+                    // 0.051: the relative cap stayed ABOVE the genuine floor because
+                    // the best text result itself was weak). An absolute sub-floor
+                    // cap guarantees a principal-naming article always outranks junk.
+                    let d3_cap = weak_cap;
                     if r.score > d3_cap {
                         tracing::info!(
                             "POST-CAL D3 COMP-CAP -> {:.2}: '{}' names none of compared entities {:?} (best_text={:.2})",
-                            d3_cap, r.url.chars().take(60).collect::<String>(), comparison_entities, best_non_video
+                            d3_cap, r.url.chars().take(60).collect::<String>(), comparison_anchor_terms, best_non_video
                         );
+                        r.post_cal_cap = Some(d3_cap);
                         r.score = d3_cap;
                     }
                 }
@@ -13265,7 +13419,7 @@ async fn handle_search(
         || q.starts_with("without ") || q.starts_with("except ")
         || q.starts_with("excluding ") || q.starts_with("minus ")
         || q.starts_with("-") || q.contains(" not ") || q.contains(" no ")
-        || q.contains(" -");
+        || q.contains(" without ") || q.contains(" -");
     let stripped_override: Option<String> = if has_neg_pattern {
         simple_negation_strip(&q).filter(|s| {
             let processed = preprocess_searxng_query(s);
@@ -13305,33 +13459,49 @@ async fn handle_search(
 
     for (i, base_url) in searx_base_urls.iter().enumerate() {
         let key = format!("searxng{}", i);
-        // Raw query URL (with geolocation parameters)
+        // NEGATION ORDERING (round auto/round-2026-09-24T0559Z): when the query
+        // carries a negation pattern, the STRIPPED variant (negated clause
+        // removed) is the user's actual intent and must fire FIRST. The fan-out
+        // early-returns once any instance yields >=15 results; with the raw
+        // query first, a 26-result page of EXCLUDED-topic junk (cooker product
+        // pages for "biryani without a pressure cooker") cancelled the stripped
+        // variant before it could fetch the genuine on-topic results. Ordering
+        // the stripped variant first guarantees it is never the cancelled one.
         let clean_q = preprocess_searxng_query(&engine_q);
-        searx_urls.push(searxng_url(base_url, &clean_q, geo_location.as_ref(), lang));
-        searx_instance_keys.push(key.clone());
-        // Stripped query URL (same instance, runs in parallel)
-        if let Some(ref stripped) = stripped_override {
-            let clean_stripped = preprocess_searxng_query(stripped);
-            if !clean_stripped.is_empty() {
-                searx_urls.push(searxng_url(base_url, &clean_stripped, geo_location.as_ref(), lang));
-                searx_instance_keys.push(key.clone());
+        let (first_q, second_q) = match &stripped_override {
+            Some(stripped) => {
+                let clean_stripped = preprocess_searxng_query(stripped);
+                if !clean_stripped.is_empty() {
+                    (clean_stripped, clean_q.clone())
+                } else {
+                    (clean_q.clone(), String::new())
+                }
             }
+            None => (clean_q.clone(), String::new()),
+        };
+        // Primary query URL (with geolocation parameters)
+        searx_urls.push(searxng_url(base_url, &first_q, geo_location.as_ref(), lang));
+        searx_instance_keys.push(key.clone());
+        // Secondary (raw when a stripped variant fired first, else nothing)
+        if !second_q.is_empty() && second_q != first_q {
+            searx_urls.push(searxng_url(base_url, &second_q, geo_location.as_ref(), lang));
+            searx_instance_keys.push(key.clone());
         }
         // P1-compound: filetype-relaxed variant (site: kept, filetype: dropped)
         // fires in parallel so a narrow site:+filetype: conjunction that yields
         // 0 upstream can be recovered from the site:-scoped result set.
         if let Some(ref relaxed) = filetype_relax_variant(&engine_q) {
             let clean_relaxed = preprocess_searxng_query(relaxed);
-            if !clean_relaxed.is_empty() && clean_relaxed != clean_q {
+            if !clean_relaxed.is_empty() && clean_relaxed != first_q {
                 searx_urls.push(searxng_url(base_url, &clean_relaxed, geo_location.as_ref(), lang));
                 searx_instance_keys.push(key.clone());
             }
         }
         // Verbose query keyphrase relaxation (strips filler words like "construct a ... using ...")
-        // Fires in parallel during initial fan-out to ensure upstream engines return hits for verbose natural language queries.
+        // Fires in parallel during initial fan-out to ensure upstream engines return hits for verbose natural-language queries.
         if let Some(ref keyphrase) = keyphrase_relax_variant(&engine_q) {
             let clean_kp = preprocess_searxng_query(keyphrase);
-            if !clean_kp.is_empty() && clean_kp != clean_q {
+            if !clean_kp.is_empty() && clean_kp != first_q {
                 searx_urls.push(searxng_url(base_url, &clean_kp, geo_location.as_ref(), lang));
                 searx_instance_keys.push(key.clone());
             }
@@ -14487,7 +14657,17 @@ async fn handle_search(
     // IMPORTANT: only strip negation trigger words, NOT the negated content terms themselves.
     // The negated terms ARE the core topic ("not django" → search "django") — the constraint
     // system handles exclusion via is_alternative_listing_page detection + graduated penalties.
-    let stripped_query: Option<String> = if !intent.structured_constraints.negative.is_empty() {
+    let stripped_query: Option<String> = if !intent.structured_constraints.negative.is_empty()
+        // MANNER-QUALIFIER CASE (round auto/round-2026-09-24T0559Z): a "without X"
+        // phrase that the manner gate declined as an EXCLUSION still describes
+        // what the user does NOT want in the result set ("biryani WITHOUT a
+        // pressure cooker" must fetch biryani recipes, not cooker product
+        // pages). The negation-strip must therefore fire on the RAW negation
+        // pattern in the query text, not only when a negative constraint
+        // survived the gate — otherwise the raw query (with the negated term)
+        // goes upstream and fetches exactly the excluded-topic pages.
+        || q.starts_with("not ") || q.starts_with("no ") || q.starts_with("without ") || q.contains(" not ") || q.contains(" without ") || q.contains(" -")
+    {
         // Use the same simple_negation_strip function that the initial
         // SearXNG fan-out uses—strips both trigger words AND the negated
         // content terms immediately following them.
@@ -15886,6 +16066,21 @@ async fn handle_search(
     for n in raw_neg.clone() {
         if explicit_neg.iter().any(|e| e == &n) {
             // Unambiguous directive: always keep, never re-inject as positive.
+            // EXCEPTION (round auto/round-2026-09-24T0559Z): a "without X" /
+            // "with no X" phrase is a MANNER qualifier (the user describes the
+            // product feature sought — "protein powder WITHOUT artificial
+            // sweeteners" — not content to exclude). extract_explicit_negation
+            // terms treats every "without X" as an explicit directive, which
+            // bypassed the manner gate and inverted the query: pages ABOUT
+            // sweeteners got penalized for containing "artificial", and the
+            // alt-query seeding fetched sweetener-alternative pages. Route
+            // explicit "without X" phrases through the SAME is_manner_frame
+            // gate the other paths use; genuine source/contrastive negations
+            // ("not from X", "except X", "other than X") carry no such frame
+            // and keep their explicit-directive status.
+            if is_manner_frame(&q_orig, &n) {
+                continue; // manner qualifier: not an exclusion at all
+            }
             if !explicit_survivors.contains(&n) {
                 explicit_survivors.push(n.clone());
             }
@@ -17605,6 +17800,74 @@ async fn handle_search_fast(
     }
 
     (axum::http::StatusCode::OK, Json(response))
+}
+
+#[cfg(test)]
+mod negation_scope_tests {
+    use super::*;
+
+    // ── Negation scope must end at a clause-starting conjunction ──
+    // Root cause (round auto/round-2026-09-24T0559Z): simple_negation_strip
+    // swallowed EVERY word after a "without X" clause, so
+    // "protein powder without artificial sweeteners for lactose intolerant
+    //  beginners" was stripped to "protein powder" — deleting the user's
+    // remaining topic from the upstream query and collapsing recall (SERP 3→1).
+
+    #[test]
+    fn without_clause_does_not_swallow_following_clause() {
+        let stripped = simple_negation_strip(
+            "protein powder without artificial sweeteners for lactose intolerant beginners",
+        )
+        .expect("should strip the negated clause but keep the trailing clause");
+        assert!(
+            stripped.contains("lactose"),
+            "trailing clause must survive stripping, got: {:?}",
+            stripped
+        );
+        assert!(
+            stripped.contains("protein powder"),
+            "head topic must survive, got: {:?}",
+            stripped
+        );
+        assert!(
+            !stripped.contains("artificial"),
+            "negated term must be stripped, got: {:?}",
+            stripped
+        );
+    }
+
+    #[test]
+    fn not_chains_still_strip_both_terms() {
+        // The original purpose of the function: "not X not Y" chains.
+        assert_eq!(
+            simple_negation_strip("browser not chrome not edge"),
+            Some("browser".to_string())
+        );
+        assert_eq!(
+            simple_negation_strip("javascript framework not react not vue not angular"),
+            Some("javascript framework".to_string())
+        );
+    }
+
+    #[test]
+    fn not_from_phrase_keeps_negation_scope() {
+        // Prepositions are NOT clause boundaries: "not from <country>" keeps
+        // the negated phrase in scope (P9 regression guard).
+        let stripped = simple_negation_strip("smartphones not from chinese brands");
+        assert_eq!(stripped, Some("smartphones".to_string()));
+    }
+
+    #[test]
+    fn without_sugar_or_honey_negates_both_sides() {
+        // "or" continues the negation scope: both alternatives stay excluded.
+        let stripped = simple_negation_strip("dessert recipes without sugar or honey");
+        assert!(stripped.unwrap().contains("dessert recipes"));
+    }
+
+    #[test]
+    fn plain_query_returns_none() {
+        assert_eq!(simple_negation_strip("best laptop for programming"), None);
+    }
 }
 
 #[cfg(test)]

@@ -493,7 +493,7 @@ pub(crate) const WORD_FREQUENCIES: &[(&str, f64)] = &[
     ("cooperation", 0.220), ("counties", 0.220), ("acquisition", 0.220), ("ports", 0.220), ("implemented", 0.220), ("sf", 0.220), ("directories", 0.220), ("recognized", 0.220),
     ("dreams", 0.220), ("blogger", 0.220), ("notification", 0.220), ("prod", 0.220), ("helm", 0.220), ("podman", 0.220), ("kg", 0.220), ("licensing", 0.220),
     ("stands", 0.220), ("teach", 0.220), ("occurred", 0.220), ("textbooks", 0.220), ("rapid", 0.220), ("pull", 0.220), ("hairy", 0.220), ("diversity", 0.220),
-    ("cleveland", 0.220), ("ut", 0.220), ("reverse", 0.220), ("deposit", 0.219), ("seminar", 0.219), ("investments", 0.219), ("latina", 0.219), ("nasa", 0.219),
+    ("cleveland", 0.220), ("ut", 0.220), ("reverse", 0.220), ("deposit", 0.219), ("seminar", 0.219), ("investments", 0.219), ("latina", 0.219), ("nasa", 0.219), ("isro", 0.219),
     ("wheels", 0.219), ("sexcam", 0.219), ("specify", 0.219), ("accessibility", 0.219), ("dutch", 0.219), ("sensitive", 0.219), ("templates", 0.219), ("formats", 0.219),
     ("tab", 0.219), ("depends", 0.219), ("boots", 0.219), ("holds", 0.219), ("router", 0.219), ("concrete", 0.219), ("si", 0.219), ("editing", 0.219),
     ("poland", 0.219), ("folder", 0.219), ("womens", 0.219), ("completion", 0.219), ("upload", 0.219), ("pulse", 0.219), ("universities", 0.219), ("technique", 0.218),
@@ -1903,3 +1903,19 @@ pub(crate) const WORD_FREQUENCIES: &[(&str, f64)] = &[
     ("perfom", 0.0010), ("editer", 0.0010), ("begginners", 0.0010), ("orcale", 0.0010), ("agular", 0.0010), ("pypeline", 0.0010), ("surprize", 0.0010),
     ("tranfer", 0.0010), ("bluetooh", 0.0010),
 ];
+
+/// Look up a lowercase word's corpus frequency. Returns None when the word is
+/// ABSENT from the common-word dictionary — i.e. it is a rare term (proper
+/// noun, brand, technical token, foreign word) rather than an everyday English
+/// word. Used by the ranking layer to split a query's distinctive terms into
+/// COMMON terms vs RARE ANCHORS: a result that matches several common words
+/// but none of the query's rare anchors is generically-matched off-topic junk
+/// (car pages matching "launch"+"updates" for an ISRO-satellite query).
+/// O(log n) binary search; the array is sorted by frequency, so we scan it —
+/// 15k entries, one linear pass per query term is negligible (~microseconds).
+pub(crate) fn word_frequency(word: &str) -> Option<f64> {
+    WORD_FREQUENCIES
+        .iter()
+        .find(|(w, _)| *w == word)
+        .map(|(_, f)| *f)
+}
