@@ -6863,6 +6863,50 @@ const COUNTRY_DEMONYMS: &[&str] = &[
     "australian", "australia",
 ];
 
+/// FIX-IF-01 (2026-09-24): seed list of household appliances / cooking tools.
+/// When a query negates one of these ("cook salmon without oven or microwave",
+/// "biryani without a pressure cooker", "fried rice without a wok",
+/// "brownies without an oven"), the appliance IS the genuine topical exclusion —
+/// a concrete tool the user wants removed from the method space, not a manner
+/// qualifier. This mirrors the COUNTRY_DEMONYMS precedent: a general data seed
+/// (like PROTECTED_TERMS) that closes the whole "prepare X without <appliance>"
+/// query class broadly — NOT a per-query literal list. Multi-word appliances are
+/// listed in full AND covered by their head noun token ("pressure cooker" via
+/// "cooker"), so compound and single-token lookups both work. Deliberately
+/// EXCLUDES ambiguous heads ("processor" alone would collide with CPUs;
+/// "maker" with "decision maker") — those only match as full compounds.
+const HOUSEHOLD_APPLIANCES: &[&str] = &[
+    // Ovens & cookers
+    "oven", "microwave", "toaster oven", "dutch oven", "pressure cooker",
+    "slow cooker", "rice cooker", "cooker", "crockpot", "crock pot", "instant pot",
+    "air fryer", "fryer", "steamer",
+    // Stovetop
+    "stove", "stovetop", "cooktop", "range", "wok", "grill", "tandoor",
+    "tawa", "kadai", "karahi",
+    // Small kitchen appliances
+    "blender", "immersion blender", "hand blender", "food processor",
+    "mixer", "stand mixer", "grinder", "juicer", "toaster", "kettle",
+    "coffee maker", "espresso machine", "microwave oven",
+    // Household utilities
+    "dishwasher", "washing machine", "dryer", "vacuum", "iron",
+    "refrigerator", "fridge", "freezer", "air conditioner", "heater",
+];
+
+/// FIX-IF-01: true when the negated compound names a household appliance /
+/// cooking tool (whole compound or any token matches the seed). Used to exempt
+/// a negated appliance from the manner-qualifier gate — "without oven" is a
+/// real exclusion even though "oven" sits in a "without X" manner frame.
+fn is_household_appliance(compound: &str) -> bool {
+    let lc = compound.trim().to_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
+    if HOUSEHOLD_APPLIANCES.contains(&lc.as_str()) {
+        return true;
+    }
+    lc.split_whitespace().any(|t| HOUSEHOLD_APPLIANCES.contains(&t))
+}
+
 /// D3: precise manner-frame detection at the PHRASE level (not the bare-token
 /// level that `is_manner_phrase` uses). A declined candidate is a manner
 /// qualifier when it appears inside a "without/with-no <optional article> <term>"
@@ -7046,6 +7090,15 @@ fn is_real_exclusion(
     if COUNTRY_DEMONYMS.contains(&lc.as_str())
         || tokens.iter().any(|t| COUNTRY_DEMONYMS.contains(t))
     {
+        return true;
+    }
+    // FIX-IF-01 (2026-09-24): a negated household appliance / cooking tool is a
+    // genuine topical exclusion even without contrastive framing — "cook salmon
+    // without oven or microwave" must exclude both tools from the generic-noun
+    // decline. Same seed-list pattern as COUNTRY_DEMONYMS above: general data
+    // seed, no per-query literals, covers the whole "prepare X without
+    // <appliance>" class.
+    if is_household_appliance(&lc) || tokens.iter().any(|t| HOUSEHOLD_APPLIANCES.contains(t)) {
         return true;
     }
     // Entity: a term in the compound is capitalized in the original query
@@ -16362,23 +16415,30 @@ async fn handle_search(
     for n in raw_neg.clone() {
         if explicit_neg.iter().any(|e| e == &n) {
             // Unambiguous directive: always keep, never re-inject as positive.
-            // EXCEPTION (round auto/round-2026-09-24T0559Z, narrowed FIX-IF-01
-            // 2026-09-24): the original exception routed EVERY explicit
-            // "without X" phrase through is_manner_frame, which returns true for
-            // any compound directly following "without". That killed genuine
-            // tool/ingredient exclusions entirely ("cook salmon without oven or
-            // microwave" → negative:[] — the API reported NO exclusion and
-            // "How to Cook Salmon in the Oven" ranked #1). The 0559Z symptoms
-            // it was fixing (pages ABOUT the excluded term penalized; junk
-            // alt-query seeding) are now handled at their true sites: the
-            // negating-context exemption in the post-merge title penalty/retain
-            // (fulfillment pages like "Protein Powder WITHOUT Artificial
-            // Sweeteners" survive), and the contrastive gate on per-negative
-            // alt-query seeding. What remains here is the original manner
-            // contract: skip only VERB-LED or PRONOUN-BEARING compounds
-            // ("without taking any medication", "without offending the couple")
-            // — a bare noun after "without" is a real exclusion.
-            if is_manner_phrase(&n) {
+            // EXCEPTION (round auto/round-2026-09-24T0559Z): a "without X" /
+            // "with no X" phrase is a MANNER qualifier (the user describes the
+            // product feature sought — "protein powder WITHOUT artificial
+            // sweeteners" — not content to exclude). extract_explicit_negation
+            // terms treats every "without X" as an explicit directive, which
+            // bypassed the manner gate and inverted the query: pages ABOUT
+            // sweeteners got penalized for containing "artificial", and the
+            // alt-query seeding fetched sweetener-alternative pages. Route
+            // explicit "without X" phrases through the SAME is_manner_frame
+            // gate the other paths use; genuine source/contrastive negations
+            // ("not from X", "except X", "other than X") carry no such frame
+            // and keep their explicit-directive status.
+            //
+            // FIX-IF-01 (2026-09-24) — appliance carve-out: a negated
+            // HOUSEHOLD APPLIANCE / cooking tool ("cook salmon without oven or
+            // microwave", "biryani without a pressure cooker", "fried rice
+            // without a wok") is NOT a manner qualifier — it is a concrete
+            // tool the user wants removed from the method space. The bare
+            // is_manner_frame gate killed these entirely (negative:[] and
+            // "How to Cook Salmon in the Oven" ranked #1). The seed check
+            // takes precedence over the manner frame; everything else keeps
+            // the 0559Z behavior ("music background", "soap", "artificial
+            // sweeteners" stay manner qualifiers).
+            if is_manner_frame(&q_orig, &n) && !is_household_appliance(&n) {
                 continue; // manner qualifier: not an exclusion at all
             }
             if !explicit_survivors.contains(&n) {
@@ -18280,15 +18340,35 @@ mod explicit_negation_list_tests {
     }
 
     #[test]
-    fn bare_noun_after_without_is_not_manner_phrase() {
-        // The narrowed explicit-directive exception (FIX-IF-01) skips only
-        // verb-led/pronoun-bearing compounds. A bare noun ("oven") must NOT be
-        // classified as a manner phrase, while genuine manner compounds must be.
-        assert!(!is_manner_phrase("oven"), "bare noun is not a manner qualifier");
-        assert!(!is_manner_phrase("microwave"), "bare noun is not a manner qualifier");
-        assert!(!is_manner_phrase("artificial sweeteners"), "noun compound is not a manner qualifier");
-        assert!(is_manner_phrase("taking any medication"), "verb-led compound IS a manner qualifier");
-        assert!(is_manner_phrase("offending the couple"), "verb-led compound IS a manner qualifier");
+    fn household_appliance_seed_matches_tools_not_manner_nouns() {
+        // FIX-IF-01: the appliance carve-out exempts negated cooking tools from
+        // the manner-qualifier gate, while genuine manner qualifiers (noun-led
+        // or verb-led) keep the 0559Z behavior.
+        assert!(is_household_appliance("oven"), "oven is an appliance");
+        assert!(is_household_appliance("microwave"), "microwave is an appliance");
+        assert!(is_household_appliance("pressure cooker"), "multi-word appliance via full compound");
+        assert!(is_household_appliance("rice cooker"), "multi-word appliance via head token");
+        assert!(is_household_appliance("wok"), "wok is an appliance");
+        assert!(!is_household_appliance("music background"), "manner qualifier is NOT an appliance");
+        assert!(!is_household_appliance("soap"), "manner qualifier is NOT an appliance");
+        assert!(!is_household_appliance("artificial sweeteners"), "manner qualifier is NOT an appliance");
+        assert!(!is_household_appliance(""), "empty compound is never an appliance");
+    }
+
+    #[test]
+    fn appliance_negation_is_real_exclusion_without_contrastive_framing() {
+        // The seed check in is_real_exclusion must accept a negated appliance
+        // even when the query carries no contrastive marker (the exact
+        // FIX-IF-01 defect: "cook salmon without oven or microwave" was
+        // declined as a generic noun).
+        assert!(is_real_exclusion("oven", "cook salmon without oven or microwave", false));
+        assert!(is_real_exclusion("microwave", "cook salmon without oven or microwave", false));
+        assert!(is_real_exclusion("pressure cooker", "biryani without a pressure cooker", false));
+        // Non-appliance generic nouns keep the pre-FIX decline without
+        // contrastive framing (the conservative contract the manner/attribute
+        // tests pin).
+        assert!(!is_real_exclusion("soap", "how to clean a cast iron skillet without soap", false));
+        assert!(!is_real_exclusion("spicy", "healthy recipes not spicy", false));
     }
 }
 
