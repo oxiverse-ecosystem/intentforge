@@ -4497,12 +4497,17 @@ async fn handle_shopping(
             // the call in `async move` moves the cloned client and the owned `url` into the
             // future, so no borrow escapes.
             let http_client = state.http_client.clone();
-            enrich_with_commerce(arr, move |url: String| {
-                let client = http_client.clone();
-                async move {
-                    fetch_page_html(&client, &url).await
-                }
-            }).await;
+            enrich_with_commerce_par(
+                arr,
+                move |url: String| {
+                    let client = http_client.clone();
+                    async move {
+                        fetch_page_html(&client, &url).await
+                    }
+                },
+                Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            )
+            .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
             decorate_affiliate(arr, &state.affiliate_ctx);
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
@@ -6531,16 +6536,46 @@ fn is_url_audio_host(url: &str) -> bool {
     })
 }
 
-/// Audio-intent markers: words/phrases that signal a query is seeking audio
-/// content. Same approach as VIDEO_INTENT_MARKERS — data, not per-query tuned.
-const AUDIO_INTENT_MARKERS: &[&str] = &["podcast", "listen", "audio", "episode", "show", "radio"];
+/// Audio-intent markers loaded from `data/audio_sources.json` at runtime.
+/// Same data-driven approach as the host patterns — not hardcoded.
+static AUDIO_INTENT_MARKERS_RUNTIME: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Runtime-resolved audio intent markers. Loads once from data/audio_sources.json.
+fn audio_intent_markers() -> &'static Vec<String> {
+    AUDIO_INTENT_MARKERS_RUNTIME.get_or_init(|| {
+        let mut markers = Vec::new();
+        let candidates = [
+            "data/audio_sources.json",
+            "/app/data/audio_sources.json",
+            "./data/audio_sources.json",
+        ];
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("intent_markers").and_then(|m| m.as_array()) {
+                        for m in arr {
+                            if let Some(s) = m.as_str() {
+                                markers.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                if !markers.is_empty() {
+                    break;
+                }
+            }
+        }
+        tracing::info!("audio: loaded {} intent marker(s) from data file", markers.len());
+        markers
+    })
+}
 
 /// Returns true if the query explicitly indicates audio/podcast intent.
 /// Used by the audio demotion fix to skip dampening when the user is
 /// explicitly seeking audio content. Same pattern as has_video_intent.
 fn has_audio_intent(query: &str) -> bool {
     let q_lc = query.to_lowercase();
-    AUDIO_INTENT_MARKERS.iter().any(|m| q_lc.contains(m))
+    audio_intent_markers().iter().any(|m| q_lc.contains(m.as_str()))
 }
 
 /// Video-intent markers: words/phrases that signal a query is seeking video content.
@@ -11055,12 +11090,14 @@ fn merge_local_and_web(
             let is_audio_src = is_url_audio_host(&r.url);
             if is_audio_src {
                 if !has_audio_intent(query) {
-                    // 0.04 sits UNDER the calibrated article floor (0.05) so a
-                    // podcast is demoted *below* every genuine text result for a
-                    // non-audio query. Floor preserved so audio remains present.
-                    // Signal-driven (query self-describes intent via AUDIO_INTENT_MARKERS),
-                    // not tuned to a query.
-                    let audio_cap = 0.04f32;
+                    // 0.02 sits UNDER the dict-cap (0.03) and weak-cap (0.04) so
+                    // a podcast is demoted *below* every genuine text result for a
+                    // non-audio query (verified: "what happened in the ipl auction
+                    // today" → podcast at #3 with 0.04 was tied with weak-match
+                    // results; 0.02 pushes it below them). Floor preserved so audio
+                    // remains present. Signal-driven (query self-describes intent
+                    // via audio_intent_markers), not tuned to a query.
+                    let audio_cap = 0.02f32;
                     if r.score > audio_cap {
                         tracing::info!(
                             "POST-CAL AUDIO CAP -> {:.2}: '{}' (non-audio query, audio source)",
@@ -12661,7 +12698,7 @@ fn build_audio_inspect(q: &str) -> serde_json::Value {
     serde_json::json!({
         "query": q,
         "audio_intent": audio_intent,
-        "audio_intent_markers": AUDIO_INTENT_MARKERS,
+        "audio_intent_markers": audio_intent_markers(),
         "would_pin_non_audio_sources": !audio_intent,
         "is_audio_source_examples": is_audio_source_examples,
         "intent": intent_resp.intent,
@@ -12679,7 +12716,7 @@ fn build_audio_empty() -> serde_json::Value {
         "message": "Query parameter 'q' is empty",
         "query": "",
         "audio_intent": false,
-        "audio_intent_markers": AUDIO_INTENT_MARKERS,
+        "audio_intent_markers": audio_intent_markers(),
         "would_pin_non_audio_sources": true,
         "is_audio_source_examples": {},
     })
@@ -20043,7 +20080,7 @@ mod spellcheck_endpoint_tests {
             }
             assert_eq!(
                 res["audio_intent_markers"],
-                serde_json::json!(["podcast", "listen", "audio", "episode", "show", "radio"])
+                serde_json::json!(audio_intent_markers())
             );
         }
 

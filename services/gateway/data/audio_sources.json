@@ -26,5 +26,13 @@
     "wynk.in",
     "podcast",
     "radio"
+  ],
+  "intent_markers": [
+    "podcast",
+    "listen",
+    "audio",
+    "episode",
+    "show",
+    "radio"
   ]
 }
