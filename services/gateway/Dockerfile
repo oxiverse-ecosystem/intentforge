@@ -15,5 +15,8 @@ RUN apt-get update && apt-get install -y libssl3 ca-certificates curl && rm -rf 
 WORKDIR /app
 COPY --from=builder /usr/src/gateway/target/release/gateway .
 
+# Copy runtime data files (commerce, audio_sources, etc.)
+COPY data ./data
+
 EXPOSE 4000
 CMD ["./gateway"]
