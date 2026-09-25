@@ -6967,12 +6967,13 @@ fn is_instructional_subject(q_orig: &str) -> bool {
         .min()
         .map(|i| &q_lower[..i])
         .unwrap_or(&q_lower);
-    let subject_tokens: Vec<&str> = subject
+    let subject_tokens: Vec<String> = subject
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
         .collect();
     INSTRUCTIONAL_FRAMES.iter().any(|frame| {
-        let f: Vec<&str> = frame.split_whitespace().collect();
+        let f: Vec<String> = frame.split_whitespace().map(|t| t.to_string()).collect();
         subject_tokens.windows(f.len()).any(|w| w == f.as_slice())
     })
 }
