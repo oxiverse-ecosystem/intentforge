@@ -4485,6 +4485,56 @@ fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
 /// it only changes how many enriched shopping cards show, never their order.
 const COMMERCE_MAINPATH_TOP_N: usize = 8;
 
+/// How many ALREADY-RANKED results the main-path commerce enrichment inspects
+/// (ROADMAP item 7 + 8).
+///
+/// This is deliberately SEPARATE from `COMMERCE_MAINPATH_TOP_N` (the display
+/// cap). The two were previously the same window, which made the feature
+/// unreachable in practice: for a commercial query the top-ranked results are
+/// overwhelmingly bot-check/interstitial pages (Amazon, Walmart, Flipkart) whose
+/// markup yields no structured product facts, while the results that DO expose
+/// facts sit further down the ranking. Enriching only the first 8 therefore found
+/// nothing and the whole `shopping` block was suppressed — a live-verified defect
+/// (verified 2026-09-25: `/shopping` found commerce at ranks 8, 11, 12 while
+/// main-path `/search` emitted no `shopping` field at all).
+///
+/// Enriching a deeper window is NOT a ranking change: `paginated_results` is
+/// still only `.iter().take(ENRICH_WINDOW)`n in its EXISTING ranked order, and the
+/// real `results` array is never read, mutated, reordered, or reselected. It only
+/// widens the candidate pool the post-rank passes may attach facts to.
+const COMMERCE_ENRICH_WINDOW: usize = 24;
+
+/// Selects the shopping-strip entries to DISPLAY from the enriched candidate
+/// window: the first `COMMERCE_MAINPATH_TOP_N` candidates (in the already-fixed
+/// ranked order) that actually carry a `commerce` block.
+///
+/// Pure + offline-testable. Two invariants this function exists to guarantee:
+///   1. ORDER PRESERVED — output is a strict subsequence of the input in input
+///      order. It never sorts, scores, or reorders; monetization and fact
+///      availability cannot promote a lower-ranked result above a higher-ranked
+///      one.
+///   2. HONESTY — entries with no extracted product facts are dropped rather
+///      than shown as bare affiliate cards. Never invents or carries facts.
+///
+/// Returns `None` when no candidate has product facts, so the caller can omit
+/// the block entirely instead of emitting an empty strip.
+fn select_shopping_strip(
+    candidates: &[serde_json::Value],
+    cap: usize,
+) -> Option<Vec<serde_json::Value>> {
+    let strip: Vec<serde_json::Value> = candidates
+        .iter()
+        .filter(|r| r.get("commerce").is_some())
+        .take(cap)
+        .cloned()
+        .collect();
+    if strip.is_empty() {
+        None
+    } else {
+        Some(strip)
+    }
+}
+
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
 /// Returns true when the in-process intent signals indicate the user wants to buy.
@@ -17531,11 +17581,14 @@ let mut results = match tokio::task::spawn_blocking(move || {
         &intent.distribution,
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
     ) {
-        // Clone only the top-N ranked results into a JSON array we can enrich in
-        // place. `serde_json::to_value` on `MergedResult` is lossless/Serialize.
+        // Clone the top-`COMMERCE_ENRICH_WINDOW` ranked results into a JSON array
+        // we can enrich in place. This is WIDER than the display cap: the post-rank
+        // passes need a deep enough candidate pool to find the results that actually
+        // expose product facts (see `COMMERCE_ENRICH_WINDOW`). `serde_json::to_value`
+        // on `MergedResult` is lossless/Serialize.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
             .iter()
-            .take(COMMERCE_MAINPATH_TOP_N)
+            .take(COMMERCE_ENRICH_WINDOW)
             .filter_map(|r| serde_json::to_value(r).ok())
             .collect();
         if shop_arr.is_empty() {
@@ -17560,29 +17613,33 @@ let mut results = match tokio::task::spawn_blocking(move || {
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
             // ROADMAP item 8: snippet-based price fallback — same as handle_shopping.
             enrich_snippet_fallback(&mut shop_arr);
-            // ROADMAP item 7 (refinement): only surface the main-path `shopping`
-            // strip when at least one of the top-N ranked results actually exposed
-            // structured product data (a `commerce` block). A commercial-intent
-            // query whose top results are articles/reviews/guides with no product
-            // schema would otherwise render an empty strip of cards carrying only
-            // affiliate links — a low-value, link-farm-like surface that invites
-            // misuse of the affiliate thesis. Gating on a REAL `commerce` block
-            // keeps the block honest: it appears only when we have product facts to
-            // show. Pure post-enrichment signal, no query-specific logic, and the
-            // `results` ordering is untouched either way (no-manipulation holds).
-            if !shop_arr.iter().any(|r| r.get("commerce").is_some()) {
-                None
-            } else {
-                // Read-only multi-merchant offer comparison from the attached facts.
-                let mut block = serde_json::json!({ "results": shop_arr });
-                if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                    let comparisons = build_offer_comparisons(arr_ref);
-                    if !comparisons.is_empty() {
-                        block["offer_comparisons"] =
-                            serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+            // ROADMAP item 7 (refinement) + item 8: only surface the main-path
+            // `shopping` strip when at least one candidate actually carries
+            // product facts. Entries WITHOUT facts are dropped rather than shown
+            // as bare affiliate cards — a commercial-intent query whose candidates
+            // are all articles/reviews/guides with no product schema would
+            // otherwise render an empty strip of links, a low-value link-farm-like
+            // surface that invites misuse of the affiliate thesis.
+            //
+            // `select_shopping_strip` keeps the first `COMMERCE_MAINPATH_TOP_N`
+            // fact-bearing candidates IN RANKED ORDER (a strict subsequence — it
+            // cannot promote a lower-ranked result), and returns None when there
+            // are none. Pure, no query-specific logic, and the `results` ordering
+            // is untouched either way (no-manipulation holds).
+            match select_shopping_strip(&shop_arr, COMMERCE_MAINPATH_TOP_N) {
+                None => None,
+                Some(strip) => {
+                    // Read-only multi-merchant offer comparison from the attached facts.
+                    let mut block = serde_json::json!({ "results": strip });
+                    if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                        let comparisons = build_offer_comparisons(arr_ref);
+                        if !comparisons.is_empty() {
+                            block["offer_comparisons"] =
+                                serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+                        }
                     }
+                    Some(block)
                 }
-                Some(block)
             }
         }
     } else {
@@ -21601,6 +21658,135 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(results[0].get("commerce").is_some());
         assert!(results[1].get("commerce").is_some());
         assert!(results[2].get("commerce").is_none());
+    }
+}
+
+// ── ROADMAP item 7 + 8 integration: shopping-strip selection ────────────
+//
+// REGRESSION COVERAGE for the live-verified defect: the enrich window and the
+// display cap were the SAME constant, so for a commercial query whose top-8
+// results are all bot-checked merchant pages (no structured product facts) the
+// whole `shopping` block was suppressed even though fact-bearing results
+// existed further down the ranking.
+
+#[cfg(test)]
+mod mainpath_shopping_strip_tests {
+    use super::*;
+
+    fn cand(url: &str, has_facts: bool) -> serde_json::Value {
+        let mut v = serde_json::json!({ "url": url, "title": url, "content": "x" });
+        if has_facts {
+            v["commerce"] = serde_json::json!({
+                "url": url,
+                "source": "snippet_extracted",
+                "data": { "price": 100.0, "currency": "USD" }
+            });
+        }
+        v
+    }
+
+    /// THE regression test: fact-bearing results below the first 8 must still
+    /// produce a non-empty strip. Under the old code (cap == enrich window == 8)
+    /// this returned None and `/search` emitted no `shopping` field at all.
+    #[test]
+    fn strip_surfaces_facts_beyond_the_first_eight_candidates() {
+        let cands: Vec<serde_json::Value> = (0..24)
+            .map(|i| {
+                let facts = i == 11; // rank 11 — beyond the old window of 8
+                cand(&format!("https://example.com/{i}"), facts)
+            })
+            .collect();
+        let strip = select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N)
+            .expect("fact-bearing result at rank 11 must surface");
+        assert_eq!(strip.len(), 1);
+        assert_eq!(strip[0]["url"], serde_json::json!("https://example.com/11"));
+    }
+
+    /// No-manipulation: the strip is a strict SUBSEQUENCE of the candidates in
+    /// input (ranked) order. Adding facts further down can never promote a
+    /// lower-ranked result above a higher-ranked one, and can never reorder.
+    #[test]
+    fn strip_is_a_strict_subsequence_in_ranked_order() {
+        let cands: Vec<serde_json::Value> = vec![
+            cand("https://a/1", true),
+            cand("https://a/2", false),
+            cand("https://a/3", true),
+            cand("https://a/4", true),
+        ];
+        let strip = select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N).unwrap();
+        let urls: Vec<&str> = strip.iter().filter_map(|r| r["url"].as_str()).collect();
+        assert_eq!(urls, vec!["https://a/1", "https://a/3", "https://a/4"]);
+    }
+
+    /// The display cap is respected independently of the enrich window.
+    #[test]
+    fn strip_respects_the_display_cap() {
+        let cands: Vec<serde_json::Value> = (0..24)
+            .map(|i| cand(&format!("https://example.com/{i}"), true))
+            .collect();
+        let strip = select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N).unwrap();
+        assert_eq!(strip.len(), COMMERCE_MAINPATH_TOP_N);
+    }
+
+    /// Honesty: no facts anywhere => no block at all (never an empty strip of
+    /// bare affiliate cards, and never a fabricated fact).
+    #[test]
+    fn strip_is_none_when_no_candidate_has_facts() {
+        let cands: Vec<serde_json::Value> = (0..24)
+            .map(|i| cand(&format!("https://example.com/{i}"), false))
+            .collect();
+        assert!(select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N).is_none());
+    }
+
+    /// The informational case must stay empty — proves the gate is driven by
+    /// EXTRACTED FACTS, not by query text (privacy/no-keyword contract).
+    #[test]
+    fn review_and_article_candidates_yield_no_strip() {
+        let cands = vec![
+            cand("https://techradar.com/review", false),
+            cand("https://reddit.com/r/headphones", false),
+        ];
+        assert!(select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N).is_none());
+    }
+
+    /// The enrich window must be strictly wider than the display cap, otherwise
+    /// the defect this module guards against can silently return.
+    #[test]
+    fn enrich_window_is_wider_than_display_cap() {
+        assert!(
+            COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N,
+            "enrich window ({COMMERCE_ENRICH_WINDOW}) must exceed display cap \
+             ({COMMERCE_MAINPATH_TOP_N}) or fact-bearing results below the cap \
+             are never examined"
+        );
+    }
+
+    /// End-to-end shape of the defect: the real pipeline order is
+    /// enrich (deep window) -> snippet fallback -> affiliate decoration ->
+    /// select. A pipeline that produces facts only at rank 11 must yield a
+    /// non-empty, correctly-ordered, affiliate-disclosed strip.
+    #[test]
+    fn full_post_rank_pipeline_yields_strip_for_deep_facts() {
+        let mut cands: Vec<serde_json::Value> = (0..24)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("https://example.com/{i}"),
+                    "title": "result",
+                    "content": if i == 11 { "Buy it for $248 now" } else { "no price here" },
+                    "commerce_provenance": { "url": format!("https://example.com/{i}"), "observed_at": "1" }
+                })
+            })
+            .collect();
+        // Only rank 11 gets facts, and only via the snippet fallback.
+        enrich_snippet_fallback(&mut cands);
+        let strip = select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N)
+            .expect("deep fact-bearing candidate must surface after snippet fallback");
+        assert_eq!(strip.len(), 1);
+        assert_eq!(
+            strip[0]["commerce"]["data"]["price"],
+            serde_json::json!(248.0)
+        );
+        assert_eq!(strip[0]["url"], serde_json::json!("https://example.com/11"));
     }
 }
 

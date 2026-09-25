@@ -151,7 +151,7 @@ Full search endpoint. Queries multiple backends (SearXNG via VPN, local index) i
 > `query`, `intent`, `category`, `confidence`, `constraints`, `structured_constraints`, `expanded_queries`, `distribution`, `results`, `results_before_filter`, `results_after_filter`, `total`, `limit`, `offset`, `has_more`.
 > Optionally present: `applied_constraints` (when operators/negations are applied), `spell_corrected_query` (when a correction fired), `query_quality` (only on `low`/`junk` queries), `deep_result`, `price_verified` (transactional), `recall_gap_terms` (when a distinctive query term is absent from every returned result — an honest upstream recall-gap signal; see [below](#honest-recall-gap-signal)).
 > `geo_location`, `warnings`, `ignored_constraints` were **absent** from all observed successful responses (declared-but-omitted `None` fields).
-> **`shopping`** (ROADMAP item 7, main-path commercial intent): present **only** when the resolved intent is commercial (the `transactional` label, a strong `transactional` distribution ≥ 0.50, or a stated price bound). It is a `serde_json::Value` object `{ "results": [ …up to COMMERCE_MAINPATH_TOP_N cloned top-ranked results… ], "offer_comparisons"?: [ … ] }` carrying the same honest `commerce` facts + post-rank `affiliate` blocks already produced by `GET /shopping`, built from a **clone** of the already-ranked results. The main `results` array is NEVER touched, so the `shopping` field is purely additive. An informational query (`rust ownership`, `how do black holes work`) returns **no** `shopping` field (verified live, 2026-08-30). Detection is SIGNAL-based — reuses the existing intent distribution + price constraints, no keyword list, no third-party call.
+> **`shopping`** (ROADMAP item 7, main-path commercial intent): present **only** when the resolved intent is commercial (the `transactional` label, a strong `transactional` distribution ≥ 0.50, or a stated price bound) **and** at least one candidate carries extracted product facts. It is a `serde_json::Value` object `{ "results": [ …up to `mainpath_top_n` fact-bearing cards, in ranked order… ], "offer_comparisons"?: [ … ] }` carrying the same honest `commerce` facts + post-rank `affiliate` blocks already produced by `GET /shopping`, built from a **clone** of the already-ranked results. Enrichment inspects the top `COMMERCE_ENRICH_WINDOW` (24) ranked results; display is capped at `mainpath_top_n` (8). The displayed strip is a strict **subsequence** of the ranked candidates, so a lower-ranked result is never promoted, and the main `results` array is NEVER touched — the `shopping` field is purely additive. An informational query (`rust ownership`, `how do black holes work`) returns **no** `shopping` field, and neither does a commercial query whose candidates expose no product facts (verified live, 2026-09-25). Detection is SIGNAL-based — reuses the existing intent distribution + price constraints, no keyword list, no third-party call.
 > **`confidence` is a real float in ~0.30–0.90**, not always `0.75` — the value depends on the query and the intent engine.
 
 Example (real response truncated; full body in `docs/_generated/api-transcript.md` block 12 — `python web framework not django`):
@@ -1672,30 +1672,52 @@ returns true when the in-process intent signals say "wants to buy":
 - a price bound was parsed by the existing constraint parser (`price:<N` / `price:>N`
   / `price_min` / `price_max`).
 
-The `shopping` block is surfaced whenever commercial intent is detected, even
-if no upstream page exposed structured product data — every result carries
-`commerce_provenance` (`source: null` => "we checked, nothing") which is the
-honest presentation signal. A result that *did* expose structured data
-additionally carries a `commerce` block with price/currency/availability etc.
+The `shopping` block is surfaced only when at least one candidate actually
+carries **extracted product facts** (a `commerce` block). Candidates without
+facts are dropped from the strip rather than shown as bare affiliate cards, and
+if no candidate has facts the `shopping` field is omitted entirely (never an
+empty strip of links). This is the honesty gate: a commercial query whose
+candidates are all reviews/guides with no product schema produces no block.
 
-**Example (real, verified live 2026-09-24):**
+**Enrich window vs display cap (fixed 2026-09-25):** these are now SEPARATE.
+Enrichment inspects the top `COMMERCE_ENRICH_WINDOW` (24) already-ranked
+results — deep enough to reach the results that actually expose product facts —
+while at most `mainpath_top_n` (8) fact-bearing cards are displayed, in ranked
+order. They used to be the same window, which made the feature unreachable: the
+top-ranked results for a commercial query are overwhelmingly bot-checked
+merchant pages with no structured markup, so the block was suppressed even when
+fact-bearing results existed further down. Widening the enrich window is **not**
+a ranking change — `results` is still read in its existing ranked order and never
+mutated, reordered, or reselected; the displayed strip is a strict *subsequence*
+of the ranked candidates, so a lower-ranked result can never be promoted.
+
+**Example (real, verified live 2026-09-25, after the enrich-window fix):**
 
 ```bash
-curl -s "localhost:4000/search?q=buy%20iphone%2016%20pro%20max%20price&count=8"
+curl -s "localhost:4000/search?q=buy%20sony%20wh-1000xm5"
 # intent= transactional
-# shopping present= True
-# shopping results= 8
-# first result url= https://www.bestbuy.com/site/all-iphone/iphone-16-pro-max/pc...
-# first affiliate disclosed= True  network= Sovrn Commerce
-# first commerce_provenance source= None  observed= 1790241030
-# first commerce= null  (no structured product markup found on upstream page)
-# third affiliate network= Sovrn Commerce  cuid=www.flipkart.com  bf=0.10
+# shopping present= True   shopping results= 4
+#  0 https://www.croma.com/unboxed/sony-wh-1000xm5-price-cut-croma-fest
+#      commerce price= 20000.0 INR source= snippet_extracted
+#      affiliate: Sovrn Commerce disclosed= True
+#  1 https://www.techradar.com/reviews/sony-wh-1000xm5-wireless-headphones
+#      commerce price= 198.0 USD source= snippet_extracted
+#      affiliate: Sovrn Commerce disclosed= True
+#  2 https://gizmodo.com/twice-as-cheap-as-the-xm6-the-sony-wh-1000xm5-
+#      commerce price= 449.0 USD source= snippet_extracted
+#  3 https://swiftronicsinc.com/products/sony-wireless-noise-cancelling
+#      commerce price= 239.99 USD source= snippet_extracted
 ```
 
 ```bash
-curl -s "localhost:4000/search?q=rust%20ownership%20explained"
-# intent= technical  shopping present= False
+curl -s "localhost:4000/search?q=rust%20ownership"
+# intent= technical  shopping present= False  normal results= 18
 ```
+
+Note `source: "snippet_extracted"` (ROADMAP item 8): when a merchant page is
+bot-checked and exposes no structured markup, an honest price is extracted from
+the **search snippet** for that exact URL and labelled distinctly so the frontend
+can present it as snippet-derived rather than page-verified.
 
 **Fix applied this round:** `GET /shopping` was using the sequential `enrich_with_commerce`
 (36s for 5 pages → 408 timeout). Switched to the bounded-parallel `enrich_with_commerce_par`
