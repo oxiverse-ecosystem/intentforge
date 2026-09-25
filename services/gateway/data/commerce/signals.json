@@ -5,5 +5,12 @@
     "buy", "price", "pricing", "cheap", "cheapest", "purchase", "shop",
     "discount", "coupon", "deal", "deals", "offer", "sale", "order", "pay",
     "budget", "cost", "worth", "value", "refurbished", "under", "store"
+  ],
+  "model_number_patterns": [
+    "(?i)\\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto|surface|watch)\\s+\\d{1,2}",
+    "(?i)\\b(macbook|imac|mac)\\s+(pro|air|mini|studio|max|plus|ultra|lite|se|note|edge|fold|flip)\\s+m\\d",
+    "(?i)\\b(macbook|imac|mac)\\s+m\\d",
+    "(?i)\\b(sony)\\s+(wh-|xm|wf-|rs-)\\d",
+    "(?i)\\b(audio|headphone|earphone|earbud|speaker)\\s+-\\s*\\d"
   ]
 }

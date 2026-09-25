@@ -195,11 +195,35 @@ fn normalize_currency_str(s: &str) -> String {
 }
 
 fn is_model_number_price_query(q_lower: &str) -> bool {
-    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let model_re = MODEL_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+\d{1,2}").unwrap()
+    static MODEL_PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    let patterns = MODEL_PATTERNS.get_or_init(|| {
+        let mut result = Vec::new();
+        let candidates = [
+            "data/commerce/signals.json",
+            "/app/data/commerce/signals.json",
+            "./data/commerce/signals.json",
+        ];
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("model_number_patterns").and_then(|m| m.as_array()) {
+                        for p in arr {
+                            if let Some(s) = p.as_str() {
+                                if let Ok(re) = regex::Regex::new(s) {
+                                    result.push(re);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !result.is_empty() {
+                    break;
+                }
+            }
+        }
+        result
     });
-    let has_model = model_re.is_match(q_lower);
+    let has_model = patterns.iter().any(|re| re.is_match(q_lower));
     let has_price = q_lower.contains("price") || q_lower.contains("cost")
         || q_lower.contains("rupee") || q_lower.contains("rupees")
         || q_lower.contains("inr") || q_lower.contains('₹')
@@ -7429,7 +7453,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         && !terms.contains(&joined)
                     {
                         terms.push(joined);
-                    } else if is_manner_phrase(&joined) || is_manner_frame(q_orig, &joined) {
+                    } else if is_manner_phrase(&joined) {
                         // Manner qualifier ("without soap", "without offending the
                         // couple"): describes HOW not WHAT to exclude. It is NOT a
                         // search exclusion — record it (the third tuple element) so
@@ -16292,7 +16316,7 @@ async fn handle_search(
         }
         if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
             gated_neg_dedup.push(n);
-        } else if !is_manner_phrase(&n) && !is_manner_frame(&q_orig, &n) && !soft_negatives.contains(&n) {
+        } else if !is_manner_phrase(&n) && !soft_negatives.contains(&n) {
             // Soft negative: generic noun the gate declined but not a manner qualifier.
             // Demoted in scoring (×0.3), never hard-dropped.
             soft_negatives.push(n);
