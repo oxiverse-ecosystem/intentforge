@@ -18354,6 +18354,38 @@ fn apply_intent_overrides(q: &str, intent: &mut IntentResponse) {
 /// Pure: unit-testable without a running engine.
 fn recompute_confidence(intent: &mut IntentResponse) {
     let p = intent.distribution.get(&intent.intent).copied().unwrap_or(0.0) as f64;
+
+    // HONESTY: an EMPTY distribution means no model ever scored this label --
+    // either the intent-engine was unreachable and `fallback_intent`'s
+    // deterministic rules produced it, or the probe returned no distribution.
+    // There is no probability to report, and no probe score to calibrate.
+    //
+    // The number is therefore left at whatever the deterministic rule baseline
+    // set, and explicitly flagged UNCALIBRATED. Two things this must NOT do:
+    //
+    //  * Claim calibration. Feeding p=0.0 through the Platt curve yields
+    //    ~0.0 with `confidence_calibrated: true` -- a *calibrated* assertion
+    //    that the label is certainly wrong, which is a different claim from
+    //    "no model evidence exists". Observed live during COLD verification.
+    //
+    //  * Report 0.0. The local-intent gate at `handle_search` keys on
+    //    `intent.confidence >= 0.20`; a hard 0.0 for rule-derived local labels
+    //    would silently disable geo-boost for every "near me" query. A
+    //    rule-based label is uncalibrated, not certainly-wrong.
+    //
+    // So: keep the rule-baseline score, mark it uncalibrated, and expose no
+    // probe probability (there is none to audit or re-fit).
+    if intent.distribution.is_empty() {
+        intent.probe_probability = None;
+        intent.confidence_calibrated = false;
+        tracing::warn!(
+            "UNCALIBRATED: no intent distribution for '{}' (no model evidence) — \
+             reporting rule-baseline confidence {:.3} with confidence_calibrated=false",
+            intent.intent, intent.confidence
+        );
+        return;
+    }
+
     intent.probe_probability = Some(p as f32);
     intent.confidence = match intent_calibration() {
         Some((slope, intercept)) => {
@@ -21921,8 +21953,75 @@ mod fix_if_32_intent_confidence_tests {
         assert!(logit.is_finite(), "logit must never be inf/NaN at the boundary");
     }
 
-    /// `recompute_confidence` must always populate probe_probability and always
-    /// set an explicit calibrated flag -- never leave the caller guessing.
+    /// No model scored this label, so there is no probe probability and the
+    /// score must not claim calibration. Observed live during COLD verification:
+    /// 5 of 12 queries returned `confidence=0.000` while still claiming
+    /// `confidence_calibrated=true` — a *calibrated* assertion that the label
+    /// is certainly wrong, which is a different claim from "no model evidence".
+    ///
+    /// The number itself is deliberately NOT forced to 0.0: the local-intent
+    /// gate in `handle_search` keys on `confidence >= 0.20`, so a hard zero
+    /// would silently disable geo-boost for every rule-derived "near me" query.
+    /// A rule-based label is uncalibrated, not certainly-wrong. This test
+    /// therefore pins the honest part (uncalibrated, no probe) and only asserts
+    /// the score stays above the gate that downstream logic depends on.
+    #[test]
+    fn engine_unreachable_reports_uncalibrated_rather_than_a_fake_probability() {
+        let mut r = fallback_intent("some query"); // empty distribution by construction
+        assert!(r.distribution.is_empty(), "precondition: fallback has no distribution");
+
+        recompute_confidence(&mut r);
+        assert!(
+            !r.confidence_calibrated,
+            "must NOT claim a calibrated number for a label no model scored"
+        );
+        assert!(
+            r.probe_probability.is_none(),
+            "there is no probe probability to report or re-fit"
+        );
+        assert!(
+            r.confidence >= 0.20,
+            "rule-derived label must stay above the local-intent gate (0.20); \
+             got {}",
+            r.confidence
+        );
+    }
+
+    /// The empty-distribution path must never claim calibration, even when the
+    /// calibration artifact IS loadable. This is the exact live defect: the
+    /// Platt curve was fed p=0.0 and returned ~0.0 flagged `calibrated: true`.
+    #[test]
+    fn empty_distribution_is_never_calibrated_even_with_the_artifact_loaded() {
+        // Artifact is mounted by scripts/gateway_test_container.sh, so this
+        // asserts the genuinely dangerous case rather than a missing-file case.
+        assert!(
+            intent_calibration().is_some(),
+            "precondition: the calibration artifact is available in this harness"
+        );
+
+        let mut r = fallback_intent("python rest api framework not flask");
+        assert!(r.distribution.is_empty(), "precondition: no model evidence");
+        recompute_confidence(&mut r);
+        assert!(
+            !r.confidence_calibrated,
+            "a loadable artifact must not launder a zero-evidence label into a \
+             calibrated probability"
+        );
+    }
+
+    /// The mirror image: once a real distribution exists, the calibrated flag
+    /// must be set. This guards against a fix that simply hardcodes `false`.
+    #[test]
+    fn a_real_distribution_is_reported_as_calibrated() {
+        let mut r = resp("informational", &[("informational", 0.30), ("navigational", 0.10)]);
+        recompute_confidence(&mut r);
+        assert!(
+            r.confidence_calibrated,
+            "a scored label must be reported as calibrated, not hardcoded false"
+        );
+        assert!(r.probe_probability.is_some());
+    }
+
     #[test]
     fn recompute_always_reports_calibration_status_and_probe_probability() {
         for label in ["informational", "navigational", "local", "comparison", "fresh"] {
