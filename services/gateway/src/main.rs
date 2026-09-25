@@ -6686,6 +6686,20 @@ const MANNER_PRONOUNS: &[&str] = &[
     "you", "your", "yours", "as", "me", "us", "them", "it", "its", "we", "i",
     "my", "our", "they", "he", "she", "him", "her",
 ];
+/// Nouns naming a TRAIT / CAPABILITY OF THE USER rather than a property of the
+/// content they want. A negated clause whose HEAD is one of these states a
+/// prerequisite or a how-qualifier ("a tutorial with no music background",
+/// "without a computer science degree", "with no prior experience"), never a
+/// topic to remove from the result set. Kept separate from the broader
+/// `ATTRIBUTE_NOUNS` seed inside `is_verb_attribute_exclusion`: that list also
+/// covers product artifacts (app/login/download/permission) and requires EVERY
+/// token to match, so a modifier phrase ("music background") never qualifies
+/// there. Structural vocabulary, no per-query literals.
+const USER_TRAIT_NOUNS: &[&str] = &[
+    "background", "experience", "degree", "qualification", "qualifications",
+    "knowledge", "skill", "skills", "training", "expertise", "familiarity",
+    "coordination", "dependents", "prerequisite", "prerequisites", "basis",
+];
 const MANNER_VERBS: &[&str] = &[
     "taking", "taken", "take", "using", "use", "used", "having", "have", "has",
     "buying", "buy", "bought", "getting", "get", "got", "making", "make", "made",
@@ -6948,6 +6962,29 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     let lc = q_orig.to_lowercase();
     let compound_lower = compound.to_lowercase();
     let c_tokens: Vec<&str> = compound_lower.split_whitespace().collect();
+    // D2: the `pay`/`paying` family is genuinely AMBIGUOUS — a manner idiom
+    // ("without paying attention") describes HOW, while a monetary object
+    // ("without paying for a course") is a real exclusion the user refuses.
+    // The broad procedural rule below cannot tell them apart (both appear in
+    // `how to …` queries), so decide this family from the query's object
+    // vocabulary FIRST: a monetary object means it is NOT a manner frame.
+    if !c_tokens.is_empty() && c_tokens.iter().all(|t| *t == "pay" || *t == "paying") {
+        return !pay_exclusion_is_money(&lc);
+    }
+    // A negated clause whose HEAD noun names a TRAIT of the user (their
+    // background / experience / degree) rather than a property of the desired
+    // CONTENT states a prerequisite, not a topic to remove. "a tutorial with
+    // no music background" is a HOW/prerequisite qualifier; "dessert recipes
+    // with no nuts" names the content, so its head ("nuts") is untouched and
+    // it stays a real exclusion. Structural (head-noun class), no per-query
+    // literals. `is_verb_attribute_exclusion` uses the same trait class but
+    // requires EVERY token to be a trait noun, which a modifier phrase
+    // ("music background") never satisfies.
+    if let Some(head) = c_tokens.last() {
+        if USER_TRAIT_NOUNS.contains(head) {
+            return true;
+        }
+    }
     // In a procedural request, a bare `without NOUN` / `no NOUN` states a
     // constraint on HOW the user wants to accomplish the task (cleaning without
     // soap, learning without a degree), not a result topic to remove. In a
