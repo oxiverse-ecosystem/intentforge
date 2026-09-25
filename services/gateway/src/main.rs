@@ -6994,6 +6994,7 @@ fn negated_by_preposition(q_orig: &str, compound: &str) -> bool {
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
         .collect();
     if c_tokens.is_empty() {
         return false;
