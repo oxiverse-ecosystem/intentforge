@@ -2671,6 +2671,16 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             // dictionary / orphan pages. Signal-driven: a general English
             // question-word list, no per-query literals, no tuned thresholds.
             if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) { continue; }
+            // A NEGATION MARKER or pure quantifier can never be a positive
+            // requirement. "not from chinese brands and have usb c charging"
+            // leaked `+not` into `positive`: the bare marker matches no page
+            // content but is scored as a topical requirement, and it is also
+            // self-contradictory next to the `-…` exclusion derived from the
+            // same marker. Reuse the SAME closed-class grammar-noise gate the
+            // negative path already applies (is_exclusion_grammar_noise) so both
+            // directions share one vocabulary seed — structural, no per-query
+            // literals, no new tuned list.
+            if is_exclusion_grammar_noise(pl) { continue; }
             // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
             // extraction (e.g. "under 15000" / "below 2000" can leave the digits
             // in `positive` as "+15000"). A purely-numeric positive carries no
@@ -7810,6 +7820,22 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     }
                     if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
                         break; // trailing stopword ends the entity
+                    }
+                    // A function word arriving when NO target is being collected
+                    // means the exclusion list has ended and a new, independent
+                    // clause has begun. "not from chinese brands AND have usb c
+                    // charging" splits on "and", then "have" (an auxiliary) used
+                    // to be pushed as the head of a fresh target, producing the
+                    // phantom exclusion "have usb c charging" — a verb phrase
+                    // that substring-matches no product page and wrongly penalises
+                    // every charger result. The leading-skip loop above already
+                    // handles function words directly after the lead-in
+                    // ("not from X"); this is the in-list counterpart: after a
+                    // connector, a function word terminates the clause instead of
+                    // seeding a new target. Structural (closed-class stopword
+                    // list already in scope), no per-query literals.
+                    if ent.is_empty() && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break;
                     }
                     ent.push(wc);
                     idx += 1;
@@ -18560,6 +18586,36 @@ mod explicit_negation_list_tests {
     }
 
     #[test]
+    fn and_clause_starting_with_verb_is_not_a_second_exclusion() {
+        // LIVE-VERIFIED DEFECT (round 2026-09-25T1155Z): the query
+        // "not from chinese brands and have usb c charging" extracted the
+        // phantom exclusion "have usb c charging". After the "and" connector
+        // splits the list, the auxiliary "have" was pushed as the head of a
+        // fresh target and swept up the rest of the clause. That verb phrase
+        // matches no product page, so it cannot drop anything — it only
+        // poisons `applied_constraints` with a constraint the user never
+        // asked for, and penalises legitimate results mentioning "charging".
+        let out = extract_explicit_negation_terms("not from chinese brands and have usb c charging");
+        assert!(out.iter().any(|t| t.contains("chinese")),
+            "the real exclusion must survive, got {:?}", out);
+        assert!(!out.iter().any(|t| t.split_whitespace().any(|w| w == "have"
+                || w == "has" || w == "had" || w == "having")),
+            "an auxiliary must never head an exclusion target, got {:?}", out);
+        assert!(!out.iter().any(|t| t.contains("charging")),
+            "the trailing clause is a requirement, not an exclusion, got {:?}", out);
+    }
+
+    #[test]
+    fn connector_split_still_yields_second_real_target() {
+        // GUARD: the fix above must not break the legitimate list case the
+        // connector split exists for — "without X and Y" has TWO real noun
+        // targets, and the second one follows the connector directly.
+        let out = extract_explicit_negation_terms("dinner recipes without onion and garlic");
+        assert!(out.contains(&"garlic".to_string()),
+            "a real second target after 'and' must still be extracted, got {:?}", out);
+    }
+
+    #[test]
     fn no_x_and_no_y_does_not_sweep_lead_into_entity() {
         // The second "no" is a NEW lead-in, not part of the following entity:
         // the compound "no gelatin" must never be emitted.
@@ -18690,6 +18746,45 @@ mod constraint_fix_tests {
 
     fn cst() -> Constraints {
         Constraints::default()
+    }
+
+    #[test]
+    fn negation_marker_never_becomes_a_positive() {
+        // LIVE-VERIFIED DEFECT (round 2026-09-25T1155Z): the query
+        // "not from chinese brands and have usb c charging" reported
+        // constraints ["+not", "-chinese brands", ...]. The bare negation
+        // marker "not" was scored as a POSITIVE topical requirement. It
+        // matches no page content, so it contributes no retrievable signal,
+        // and it is self-contradictory sitting next to the "-chinese brands"
+        // exclusion derived from the very same marker. Both directions now
+        // share one closed-class grammar-noise gate.
+        let mut c = cst();
+        c.positive = vec!["not".to_string(), "chinese".to_string()];
+        c.negative = vec!["chinese brands".to_string()];
+        let out = sanitize_constraints(&c);
+        assert!(!out.positive.iter().any(|p| p == "not"),
+            "a negation marker must never survive as a positive, got {:?}", out.positive);
+        assert!(!out.positive.iter().any(|p| p == "chinese"),
+            "a term that is also the negative target must not stay positive, got {:?}", out.positive);
+    }
+
+    #[test]
+    fn real_content_positives_survive_grammar_noise_gate() {
+        // GUARD: the shared gate must not eat genuine topical terms. This is
+        // the anti-hardcoding check — a fix that only works because it drops
+        // suspicious-looking words would pass the test above.
+        let mut c = cst();
+        c.positive = vec![
+            "chinese".to_string(),
+            "cooking".to_string(),
+            "quantifier".to_string(),
+            "keyboard".to_string(),
+        ];
+        let out = sanitize_constraints(&c);
+        for keep in ["cooking", "quantifier", "keyboard"] {
+            assert!(out.positive.iter().any(|p| p == keep),
+                "genuine content term '{}` must survive, got {:?}", keep, out.positive);
+        }
     }
 
     #[test]
