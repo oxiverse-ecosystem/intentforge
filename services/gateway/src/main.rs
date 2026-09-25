@@ -12194,7 +12194,15 @@ async fn main() {
         .route("/goals/:goal_id/progress", post(goals::handle_update_progress))
         .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
+    // Bind port is env-configurable (default 4000) so a second, side-by-side
+    // instance can be started — e.g. an affiliate-keys-ABSENT twin used to prove
+    // ranked order is byte-identical with and without affiliate keys. Production
+    // sets nothing and keeps 4000.
+    let port: u16 = std::env::var("GATEWAY_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(4000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("Gateway listening on {} (circuit-breaker + cache)", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
