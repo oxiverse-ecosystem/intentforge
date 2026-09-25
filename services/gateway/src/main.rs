@@ -7696,7 +7696,26 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     if wc.is_empty() {
                         break;
                     }
-                    if wc.starts_with("price:") || wc == "under" || wc == "over" || wc == "below"
+                    // C1 (2026-09-24): stop at ANY search-operator prefix. The
+                    // alphanumeric-stripped `wc` can never carry a `:` (it is
+                    // filtered out by `.filter(|c| c.is_alphanumeric())`), so the old
+                    // `wc.starts_with("price:")` guard was DEAD CODE (always false).
+                    // Check the original lowercased word `w` against the full operator
+                    // set — same list as extract_query_negative_terms_with_dropped's
+                    // OPERATOR_PREFIXES. Without this, a constraint token like
+                    // "after:2025-01-01" is swallowed into the preceding exclusion
+                    // ("not bose after:2025-01-01" → compound "bose after20250101"),
+                    // which never matches the bare term "bose" in the negation gate —
+                    // the brand is dropped from `applied_constraints`. General data,
+                    // no per-query literals.
+                    const EXPLICIT_NEG_OPERATOR_PREFIXES: &[&str] = &[
+                        "price:", "after:", "before:", "site:", "filetype:",
+                        "intitle:", "inurl:", "intext:", "related:", "lang:",
+                    ];
+                    if EXPLICIT_NEG_OPERATOR_PREFIXES.iter().any(|p| w.starts_with(p)) {
+                        break;
+                    }
+                    if wc == "under" || wc == "over" || wc == "below"
                         || wc == "above" || wc == "less" || wc == "more" || wc == "max"
                         || wc == "min" || wc == "$" || wc.parse::<f64>().is_ok()
                     {
@@ -18501,6 +18520,34 @@ mod explicit_negation_list_tests {
             "entity before the price op must be captured, got {:?}", out);
         assert!(!out.iter().any(|t| t.contains("80000")),
             "price bound must terminate the entity, got {:?}", out);
+    }
+
+    #[test]
+    fn explicit_negation_stops_at_after_date_op() {
+        // C1 (2026-09-24): "not bose after:2025-01-01" must yield "bose" alone.
+        // The old code did not check operator prefixes on the original word `w`
+        // (it checked the alphanumeric-stripped `wc`, which never carries `:`),
+        // so "after:2025-01-01" was swallowed into the entity → "bose after20250101".
+        // That compound never matched the bare "bose" term in the negation gate,
+        // so the brand was dropped from `applied_constraints`.
+        let out = extract_explicit_negation_terms("wireless headphones price:<100 not bose after:2025-01-01");
+        assert!(out.contains(&"bose".to_string()),
+            "bose must be extracted cleanly, got {:?}", out);
+        assert!(!out.iter().any(|t| t.contains("after") || t.contains("2025")),
+            "date constraint must terminate the entity, got {:?}", out);
+    }
+
+    #[test]
+    fn explicit_negation_stops_at_before_and_site_ops() {
+        // C1: operator-prefix stop works for any constraint op, not just after:.
+        let out1 = extract_explicit_negation_terms("cameras not canon before:2024-06-01");
+        assert!(out1.contains(&"canon".to_string()), "canon missing: {:?}", out1);
+        assert!(!out1.iter().any(|t| t.contains("before")),
+            "before: constraint must terminate the entity, got {:?}", out1);
+        let out2 = extract_explicit_negation_terms("headphones not sennheiser site:amazon.com");
+        assert!(out2.contains(&"sennheiser".to_string()), "sennheiser missing: {:?}", out2);
+        assert!(!out2.iter().any(|t| t.contains("site")),
+            "site: constraint must terminate the entity, got {:?}", out2);
     }
 
     #[test]
