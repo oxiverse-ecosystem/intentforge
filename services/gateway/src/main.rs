@@ -4515,7 +4515,8 @@ async fn handle_shopping(
             )
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
-            decorate_affiliate(arr, &state.affiliate_ctx);
+            // Sacred policy: only exact-model queries may receive affiliate metadata.
+            decorate_affiliate_for_query(arr, &state.affiliate_ctx, &params.q);
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
             // already-attached `commerce` blocks. Never reorders/reselects results.
             if let Some(arr_ref) = value.get("results").and_then(|v| v.as_array()) {
@@ -4588,19 +4589,24 @@ fn default_priority() -> i64 {
     0
 }
 
-/// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
+/// Runtime-resolved config: data files + env-resolved keys. Built once at startup.
 #[derive(Clone)]
 struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
+    /// Regex sources for the exact-product-model eligibility policy. These stay
+    /// as data (compiled at startup) so a new product family can be monetized by
+    /// editing JSON only — never by adding a brand/query branch in Rust.
+    exact_model_patterns: Vec<String>,
 }
 
 impl AffiliateCtx {
-    /// Load networks from the data file. An empty/missing file is NOT fatal: the
-    /// engine simply has no networks and every result degrades to `affiliate:
-    /// null`. This is intentional — affiliate decoration is best-effort and must
-    /// never break search.
+    /// Load networks and exact-model eligibility patterns from runtime data. An
+    /// empty/missing file is NOT fatal: the engine simply has no networks and
+    /// every result degrades to `affiliate: null`. This is intentional — affiliate
+    /// decoration is best-effort and must never break search.
     fn load() -> Self {
         let mut networks: Vec<AffiliateNetwork> = Vec::new();
+        let mut exact_model_patterns: Vec<String> = Vec::new();
         // Resolve the data path relative to the process cwd (container WORKDIR is
         // /app, app binary at /app/gateway; data baked at /app/data/commerce).
         let candidates = [
@@ -4618,15 +4624,47 @@ impl AffiliateCtx {
                             }
                         }
                     }
+                    if let Some(arr) = v
+                        .get("eligibility")
+                        .and_then(|e| e.get("exact_model_patterns"))
+                        .and_then(|p| p.as_array())
+                    {
+                        exact_model_patterns = arr
+                            .iter()
+                            .filter_map(|p| p.as_str().map(|s| s.to_string()))
+                            .collect();
+                    }
                 }
                 if !networks.is_empty() {
                     break;
                 }
             }
         }
+        // Ignore malformed policy patterns rather than taking the gateway down;
+        // monetization is strictly best-effort. Every valid regex is a generic
+        // matcher over runtime data, not a per-query branch in compiled code.
+        let valid_pattern_count = exact_model_patterns
+            .iter()
+            .filter(|p| regex::Regex::new(p).is_ok())
+            .count();
         networks.sort_by(|a, b| b.priority.cmp(&a.priority));
-        tracing::info!("affiliate: loaded {} network(s) from data file", networks.len());
-        Self { networks }
+        tracing::info!(
+            "affiliate: loaded {} network(s) and {} exact-model pattern(s) from data file",
+            networks.len(),
+            valid_pattern_count
+        );
+        Self { networks, exact_model_patterns }
+    }
+
+    /// Sacred monetization gate: affiliate decoration is allowed only for an
+    /// exact product-model query. Broad category/product queries remain free and
+    /// receive no affiliate metadata. The policy is entirely data-driven; this
+    /// method only compiles and matches the regex sources.
+    fn is_exact_model_query(&self, query: &str) -> bool {
+        self.exact_model_patterns
+            .iter()
+            .filter_map(|p| regex::Regex::new(p).ok())
+            .any(|re| re.is_match(query))
     }
 
     /// The first enabled network that has its required key present in the env.
@@ -4752,6 +4790,20 @@ fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> 
         }
     }
     base
+}
+
+/// Policy-gated entry point used by every production commerce surface. Search
+/// itself remains always free; this gate controls monetization metadata only.
+/// Broad category/product searches receive no affiliate decoration even when a
+/// valid network key is configured.
+fn decorate_affiliate_for_query(
+    results: &mut [serde_json::Value],
+    ctx: &AffiliateCtx,
+    query: &str,
+) {
+    if ctx.is_exact_model_query(query) {
+        decorate_affiliate(results, ctx);
+    }
 }
 
 /// STRICT POST-RANKING decoration pass. Takes the ALREADY-RANKED `results` and
