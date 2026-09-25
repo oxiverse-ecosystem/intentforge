@@ -594,8 +594,10 @@ struct UnifiedResponse {
     /// commercial. This is the "IntentForge knows you want to buy" feature: the
     /// normal `/search` response gains a `shopping` field, not a separate tab.
     /// Decoration is strictly post-ranking — proven by the order-invariance test.
+    /// This is an array: every entry is a concrete product offer with a real
+    /// `commerce` block. The main ranked `results` array is separate and untouched.
     #[serde(skip_serializing_if = "Option::is_none")]
-    shopping: Option<serde_json::Value>,
+    shopping: Option<Vec<serde_json::Value>>,
 }
 
 const DOWNLOAD_KEYWORDS: &[&str] = &[
@@ -7020,8 +7022,10 @@ fn is_real_exclusion(
     q_orig: &str,
     query_is_contrastive: bool,
 ) -> bool {
-    // Manner phrases are never exclusions, regardless of framing.
-    if is_manner_phrase(compound) {
+    // Manner phrases are never exclusions, regardless of framing. The
+    // phrase-level check also catches a verb-led frame whose target is the noun
+    // after the verb ("without using a library").
+    if is_manner_phrase(compound) || is_manner_frame(q_orig, compound) {
         return false;
     }
     let lc = compound.to_lowercase();
@@ -7071,10 +7075,10 @@ fn is_real_exclusion(
     // Unlike a bare "not X", the preposition form is unambiguous: it names
     // something the user does not want in the result. Keep the manner guard
     // above so "without using a library" remains a HOW qualifier.
-    let q_tokens: Vec<&str> = q_orig
+    let q_tokens: Vec<String> = q_orig
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
-        .map(str::to_lowercase)
+        .map(|t| t.to_lowercase())
         .collect();
     if q_tokens.iter().any(|t| t == "without" || t == "no") {
         return true;
@@ -17192,7 +17196,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // so the order-invariance guarantee holds: affiliate decoration runs strictly
     // AFTER the order is fixed and cannot move a result. No external call, no
     // keyword list — the commercial signal comes purely from in-process intent.
-    let shopping_block: Option<serde_json::Value> = if is_commercial_intent(
+    let shopping_block: Option<Vec<serde_json::Value>> = if is_commercial_intent(
         &intent.intent,
         &intent.distribution,
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
@@ -17224,29 +17228,18 @@ let mut results = match tokio::task::spawn_blocking(move || {
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
-            // ROADMAP item 7 (refinement): only surface the main-path `shopping`
-            // strip when at least one of the top-N ranked results actually exposed
-            // structured product data (a `commerce` block). A commercial-intent
-            // query whose top results are articles/reviews/guides with no product
-            // schema would otherwise render an empty strip of cards carrying only
-            // affiliate links — a low-value, link-farm-like surface that invites
-            // misuse of the affiliate thesis. Gating on a REAL `commerce` block
-            // keeps the block honest: it appears only when we have product facts to
-            // show. Pure post-enrichment signal, no query-specific logic, and the
-            // `results` ordering is untouched either way (no-manipulation holds).
-            if !shop_arr.iter().any(|r| r.get("commerce").is_some()) {
+            // Only concrete product offers belong on the main-path shopping array.
+            // Keep the enriched order and drop rows with no real commerce block;
+            // this is presentation filtering over a clone, never selection or
+            // reordering of the main ranked `results` array.
+            let concrete_offers: Vec<serde_json::Value> = shop_arr
+                .into_iter()
+                .filter(|r| r.get("commerce").is_some())
+                .collect();
+            if concrete_offers.is_empty() {
                 None
             } else {
-                // Read-only multi-merchant offer comparison from the attached facts.
-                let mut block = serde_json::json!({ "results": shop_arr });
-                if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                    let comparisons = build_offer_comparisons(arr_ref);
-                    if !comparisons.is_empty() {
-                        block["offer_comparisons"] =
-                            serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
-                    }
-                }
-                Some(block)
+                Some(concrete_offers)
             }
         }
     } else {
@@ -18085,6 +18078,29 @@ mod negation_scope_tests {
         // "or" continues the negation scope: both alternatives stay excluded.
         let stripped = simple_negation_strip("dessert recipes without sugar or honey");
         assert!(stripped.unwrap().contains("dessert recipes"));
+    }
+
+    #[test]
+    fn without_generic_compound_is_preserved_as_exclusion() {
+        let (kept, dropped, manner) =
+            extract_query_negative_terms_with_dropped("dessert recipes without artificial sweeteners");
+        assert!(kept.iter().any(|t| t == "artificial sweeteners"), "kept={kept:?}");
+        assert!(!dropped.iter().any(|t| t == "artificial sweeteners"), "dropped={dropped:?}");
+        assert!(manner.is_empty(), "manner={manner:?}");
+        assert!(is_real_exclusion(
+            "artificial sweeteners",
+            "dessert recipes without artificial sweeteners",
+            false
+        ));
+    }
+
+    #[test]
+    fn without_manner_clause_stays_non_exclusion() {
+        let (kept, dropped, manner) =
+            extract_query_negative_terms_with_dropped("a tutorial with no music background");
+        assert!(!kept.iter().any(|t| t.contains("music background")), "kept={kept:?}");
+        assert!(!dropped.iter().any(|t| t.contains("music background")), "dropped={dropped:?}");
+        assert!(manner.iter().any(|t| t.contains("music background")), "manner={manner:?}");
     }
 
     #[test]
