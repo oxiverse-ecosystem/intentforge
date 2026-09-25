@@ -4133,33 +4133,39 @@ struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
 }
 
-/// Reserved, non-routable documentation domains (RFC 2606 §2 + RFC 6761).
+/// Host labels that are IANA-reserved and can never be a real merchant:
+/// matched EXACTLY as a host label. RFC 2606 §2 reserves `example`; RFC 6761
+/// reserves the `test` / `invalid` / `localhost` special-use names.
 ///
-/// A network's `fallback_url` (Sovrn `fbu`) is the destination a user is sent to
-/// when a link's bid does not clear the configured bid floor. If that value is a
-/// documentation placeholder, every such click lands on a dead/non-existent
-/// merchant — a fabricated destination presented as a real one, which is
-/// exactly the product-misrepresentation the commerce contract forbids.
-///
-/// This is a check against IANA-reserved names, NOT a list of merchants: it
-/// hardcodes no merchant, network, or query, and any genuinely configured
-/// fallback passes untouched. The reserved set is a published standard, so this
-/// stays data-driven in spirit — the operator's real fallback still lives in
-/// `data/commerce/affiliate.json`.
-const RESERVED_DOCUMENTATION_DOMAINS: &[&str] = &[
-    // RFC 2606 §2 — reserved for documentation/examples.
-    "example.com",
-    "example.net",
-    "example.org",
-    // RFC 6761 — special-use TLDs plus the reserved `example` label.
-    "example",
-    "test",
-    "invalid",
-    "localhost",
-];
+/// Exact matching only — deliberately. `invalid` is a special-use NAME, not a
+/// documentation PREFIX, so prefix-matching it would wrongly reject real hosts
+/// like `invalid-syntax.co.uk`.
+const RESERVED_HOST_LABELS: &[&str] = &["example", "test", "invalid", "localhost"];
 
-/// True when `url`'s host is (or is a subdomain of) an IANA-reserved
-/// documentation domain, i.e. it cannot be a real merchant destination.
+/// Host-label PREFIXES reserved by the documentation-label convention. A label
+/// beginning with one of these followed by a separator (`example-merchant`,
+/// `example-shop`) is a documentation placeholder, not a merchant.
+///
+/// This is a separate list from `RESERVED_HOST_LABELS` precisely because
+/// prefix-matching is only correct for `example`: `example-merchant.com` is its
+/// OWN registrable domain, NOT a subdomain of `example.com`, so a pure
+/// suffix/exact check on the reserved set misses the exact value that shipped in
+/// production config.
+const RESERVED_HOST_LABEL_PREFIXES: &[&str] = &["example"];
+
+/// True when any label of `url`'s host marks it as a documentation/example
+/// placeholder, i.e. it cannot be a real merchant destination.
+///
+/// Rejected shapes:
+///   * a label exactly equal to a reserved name (`example.com`, `foo.test`), and
+///   * a label beginning with a reserved documentation prefix + separator
+///     (`example-merchant.com`, `example-shop.co.uk`).
+///
+/// Matching is always on a LABEL boundary: a real host that merely CONTAINS a
+/// reserved word as a substring (`notexample.com`, `testosterone-shop.com`,
+/// `invalid-syntax.co.uk`) is NOT rejected, so the guard cannot silently disable
+/// a legitimate merchant fallback.
+///
 /// Returns `true` for unparseable/host-less input: a fallback we cannot even
 /// resolve is treated as unusable rather than shipped.
 fn is_reserved_placeholder_url(url: &str) -> bool {
@@ -4170,9 +4176,18 @@ fn is_reserved_placeholder_url(url: &str) -> bool {
         },
         Err(_) => return true,
     };
-    RESERVED_DOCUMENTATION_DOMAINS
-        .iter()
-        .any(|d| host == *d || host.ends_with(&format!(".{}", d)))
+    let separated_prefix = |label: &str, prefix: &str| {
+        label
+            .strip_prefix(prefix)
+            .map(|rest| rest.starts_with('-') || rest.starts_with('_'))
+            .unwrap_or(false)
+    };
+    host.split('.').any(|label| {
+        RESERVED_HOST_LABELS.iter().any(|r| label == *r)
+            || RESERVED_HOST_LABEL_PREFIXES
+                .iter()
+                .any(|p| separated_prefix(label, p))
+    })
 }
 
 impl AffiliateCtx {

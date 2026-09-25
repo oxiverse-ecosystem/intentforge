@@ -580,7 +580,7 @@ fn item6_bid_floor_and_fallback_appended_and_reported() {
             );
             assert_eq!(
                 aff.get("fallback").and_then(|v| v.as_str()),
-                Some("https://shop.example.com/fallback"),
+                Some("https://shop.acme-electronics.com/fallback"),
                 "fallback surfaced for reporting"
             );
         }
@@ -728,7 +728,12 @@ fn item5_no_comparison_without_shared_id() {
 #[test]
 fn reserved_documentation_domains_are_never_valid_fallbacks() {
     for bad in [
+        // The exact value that shipped in production config. Note this is its OWN
+        // registrable domain, NOT a subdomain of example.com — a pure
+        // suffix-match guard misses it, which is why the guard matches labels.
         "https://www.example-merchant.com/",
+        "https://example-merchant.com/fallback",
+        "https://example-shop.co.uk/checkout",
         "https://example.com/fallback",
         "http://shop.example.org/checkout",
         "https://deep.sub.example.net/x",
@@ -750,9 +755,11 @@ fn reserved_documentation_domains_are_never_valid_fallbacks() {
         "https://shop.acme-electronics.com/fallback",
         "https://www.electronics.sony.com/",
         "https://merchant.co.uk/checkout",
-        // A real host that merely CONTAINS a reserved label as a substring
-        // (not a label boundary) is still real.
+        // Real hosts that merely CONTAIN a reserved word as a SUBSTRING, not at
+        // a label boundary. These must NOT be rejected.
         "https://notexample.com/fallback",
+        "https://testosterone-shop.com/",
+        "https://www.invalid-syntax.co.uk/",
     ] {
         assert!(
             !is_reserved_placeholder_url(good),
