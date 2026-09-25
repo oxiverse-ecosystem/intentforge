@@ -210,6 +210,9 @@ fn real_data_whole_config_order_invariant_keys_present_vs_absent() {
 /// non-model queries, and still no reordering.
 #[test]
 fn real_data_broad_queries_never_decorate_and_never_reorder() {
+    // This test calls present_all_keys(), so it mutates process-global env vars
+    // and must hold the same lock as the other env-mutating tests.
+    let _env_guard = crate::ENV_TEST_LOCK.lock();
     let ctx = real_ctx();
     let all_keys: Vec<String> = ctx.networks.iter().filter_map(|n| n.key_env.clone()).collect();
     present_all_keys(&ctx);

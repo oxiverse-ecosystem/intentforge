@@ -36,6 +36,32 @@ services:
       # independent paths" fallback to a single dead-end whenever tor2 is the
       # one that's up. 172.19.0.0/16 is the services_default bridge subnet.
       - FIREWALL_OUTBOUND_SUBNETS=172.19.0.0/16
+    # ──────────────────────────────────────────────────────────────────
+    # Service names for everything that shares THIS container's network
+    # namespace (`network_mode: "service:gluetun"`).
+    #
+    # Docker's embedded DNS (127.0.0.11) only publishes A records for
+    # containers that OWN a network attachment.  A service that borrows
+    # gluetun's namespace therefore gets no DNS record of its own, so
+    # `getent hosts searxng|intent-engine|crawler|indexer` failed from
+    # inside the gateway even though every one of those services is healthy
+    # and listening on 0.0.0.0 in this very namespace (the gateway env
+    # addressed them as http://localhost:<port> for exactly that reason).
+    #
+    # Fix: register the names on the network gluetun DOES own.  Each alias
+    # resolves to gluetun's own bridge IP, and because the target process
+    # binds 0.0.0.0 inside this namespace, name:port connects for real — no
+    # /etc/hosts hack, no static IP (the bridge subnet is assigned at
+    # `docker network create` time), and no change to the app's own URLs.
+    #   searxng2 is the mirror image of this on tor2 (see the tor2 service).
+    networks:
+      default:
+        aliases:
+          - searxng
+          - intent-engine
+          - crawler
+          - indexer
+          - tor
     ports:
       - "18888:8888/tcp"
       - "8388:8388/tcp"
@@ -101,6 +127,14 @@ services:
       - "8081:8081"    # SearXNG2 accessible via tor2's network
     volumes:
       - ./privacy-layer/tor2/data:/var/lib/tor
+    # Mirror of the gluetun alias block: searxng2 borrows tor2's network
+    # namespace, so it has no DNS record of its own.  Registering the name on
+    # the network tor2 owns makes searxng2:8081 resolve and connect from the
+    # gateway (searxng2 listens on 0.0.0.0:8081 in that namespace).
+    networks:
+      default:
+        aliases:
+          - searxng2
     restart: always
     logging:
       driver: "json-file"
@@ -208,6 +242,10 @@ services:
     container_name: if-dev-indexer
     mem_limit: 2048m
     mem_reservation: 512m
+    # CPU was previously UNBOUNDED (no cpus: on any service). Measured
+    # 2026-09-25: indexer sustained 31-58% of a core. It is a batch worker,
+    # not latency-critical, so cap it at 1 core.
+    cpus: "1.0"
     volumes:
       - ./indexer/index_data:/app/index_data
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
@@ -222,8 +260,13 @@ services:
       context: ./crawler
       dockerfile: Dockerfile
     container_name: if-dev-crawler
-    mem_limit: 2048m
+    # Lowered 2048m -> 1536m: measured 1.20-1.44 GiB steady, i.e. sitting
+    # right against the old 2GB ceiling. 1536m keeps headroom without OOM.
+    mem_limit: 1536m
     mem_reservation: 512m
+    # CPU was previously UNBOUNDED. Measured 2026-09-25: crawler swung
+    # 17-98% of a core. Batch worker, not latency-critical -> cap at 1 core.
+    cpus: "1.0"
     environment:
       # crawler=debug surfaces the per-page "Content length: raw= truncated= cap="
       # line used for raw-length distribution measurement (cap tuning).

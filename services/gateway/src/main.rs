@@ -7628,6 +7628,7 @@ fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
 fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
     let leads: &[&str] = &[
         r"(?i)\bnot\s+from\b",
+        r"(?i)\bnot\b",
         r"(?i)\bexcept\s+for\b",
         r"(?i)\bexcept\b",
         r"(?i)\bexcluding\b",
