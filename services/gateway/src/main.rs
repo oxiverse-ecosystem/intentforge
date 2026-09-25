@@ -9162,10 +9162,20 @@ fn merge_local_and_web(
     let phrase_entities: Vec<String> = {
         let mut phrases = Vec::new();
         let mut run: Vec<String> = Vec::new();
+        // Question/naming framing words are grammatical glue, not entity names.
+        // Excluding them prevents the object of the question (for example
+        // "named after X") from becoming a competing phrase entity. This is a
+        // general closed-class/function-word rule, not a per-query vocabulary.
+        let phrase_glue: std::collections::HashSet<&str> = [
+            "named", "name", "names", "called", "call", "get", "got", "become",
+            "becomes", "after", "before", "about", "does", "did", "why", "how",
+            "what", "which", "who", "when", "where", "explain", "explanation",
+        ].iter().copied().collect();
         for w in q_words.iter() {
             let lower = w.to_lowercase();
             let is_content = lower.len() >= 2
                 && !stop_words.contains(lower.as_str())
+                && !phrase_glue.contains(lower.as_str())
                 && !lower.chars().all(|c| c.is_ascii_digit());
             if is_content {
                 run.push(lower);
@@ -9373,15 +9383,28 @@ fn merge_local_and_web(
         // it sinks below results that do contain the phrase. Title phrase = strong; content
         // phrase = partial; neither = damped. This is generic (no brand hardcodes).
         if !phrase_entities.is_empty() {
-            let phrase_hits: usize = phrase_entities.iter().filter(|p| {
-                title_lower.contains(p.as_str()) || content_lower.contains(p.as_str()) || url_lower.contains(p.as_str())
-            }).count();
-            let phrase_ratio = phrase_hits as f32 / phrase_entities.len() as f32;
-            // Blend the phrase ratio into relevance: a result missing every phrase entity
-            // drops to at most ~0.45 of its token-overlap relevance; full phrase coverage
-            // keeps it intact. This lets "Why Is the Sky Blue?" (title has the phrase) rank
-            // above "Sky Blue Credit" (no contiguous phrase), purely from structure.
-            relevance *= 0.45 + 0.55 * phrase_ratio;
+            // Exact contiguous phrases are the strongest evidence, but natural result
+            // titles often insert a technical modifier ("Apache HTTP Server" for
+            // "Apache Web Server"). Count ordered token coverage as a conservative
+            // fallback: at least two-thirds of a multi-word entity must be present,
+            // while a page matching only its ambiguous head noun gets no credit.
+            let mut phrase_credit = 0.0f32;
+            for phrase in &phrase_entities {
+                let phrase_tokens: Vec<&str> = phrase.split_whitespace().collect();
+                let matched = phrase_tokens.iter().filter(|t| {
+                    title_lower.contains(**t) || content_lower.contains(**t) || url_lower.contains(**t)
+                }).count();
+                let coverage = if phrase_tokens.is_empty() { 0.0 } else { matched as f32 / phrase_tokens.len() as f32 };
+                let exact = title_lower.contains(phrase.as_str())
+                    || content_lower.contains(phrase.as_str())
+                    || url_lower.contains(phrase.as_str());
+                let entity_credit = if exact { 1.0 } else if phrase_tokens.len() >= 2 && coverage >= 0.66 { 0.70 } else { 0.0 };
+                phrase_credit = phrase_credit.max(entity_credit);
+            }
+            // A missing entity is a hard lexical mismatch, not a mild weight tweak.
+            // Keeping the floor small prevents calibration from renormalizing a
+            // wrong-sense result back to 1.0 after the final relevance fold.
+            relevance *= 0.08 + 0.92 * phrase_credit;
         }
 
         // ── Administrative & Sitemap Demotion ──
@@ -11128,6 +11151,32 @@ fn merge_local_and_web(
             }
 
             // (b) single-distinctive-term-only match on a multi-topic query
+            // Re-apply phrase-entity fidelity after calibration. Calibration is
+            // distribution-relative and can otherwise turn a 0.08 relevance
+            // multiplier back into the top score when the upstream set is weak.
+            if !phrase_entities.is_empty() {
+                let title_lower = r.title.to_lowercase();
+                let content_lower = r.content.to_lowercase();
+                let url_lower = r.url.to_lowercase();
+                let mut has_entity = false;
+                for phrase in &phrase_entities {
+                    let exact = title_lower.contains(phrase.as_str())
+                        || content_lower.contains(phrase.as_str())
+                        || url_lower.contains(phrase.as_str());
+                    if exact {
+                        has_entity = true;
+                        break;
+                    }
+                }
+                // Post-calibration requires the contiguous entity in the result
+                // text; token coverage is useful pre-calibration but is too
+                // permissive when a question repeats the same words in prose.
+                if !has_entity && r.score > 0.04 {
+                    r.post_cal_cap = Some(0.04);
+                    r.score = 0.04;
+                }
+            }
+
             if query_has_many_topics {
                 let matched_strong = strong_topics.iter().filter(|t| {
                     let lt = t.to_lowercase();
