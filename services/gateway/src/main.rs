@@ -4481,7 +4481,10 @@ async fn handle_shopping(
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
-    let commerce_query = params.q.clone();
+    // Preserve the query before `params` is moved into the shared search pipeline.
+    // It is used only for in-process commerce/affiliate eligibility matching;
+    // it is never sent to an affiliate network.
+    let commerce_query = params.q.clone().unwrap_or_default();
     let (status, body) = handle_search(
         state.clone(),
         Query(params),
