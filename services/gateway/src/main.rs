@@ -6958,7 +6958,7 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     // with no nuts) the same grammar names the thing the results must exclude.
     // Detect the broad instruction/content frame structurally, not by domain
     // nouns. Verb-led targets are handled below.
-    let procedural = ["how to ", "best way to ", "way to ", "tutorial for ", "guide to ", "learn "]
+    let procedural = ["how to ", "best way to ", "way to ", "tutorial for ", "a tutorial ", "guide to ", "learn "]
         .iter()
         .any(|frame| lc.starts_with(frame));
     if procedural && c_tokens.iter().all(|t| !MANNER_PRONOUNS.contains(t)) {
@@ -7127,6 +7127,13 @@ fn is_real_exclusion(
     q_orig: &str,
     query_is_contrastive: bool,
 ) -> bool {
+    // Resolve the ambiguous "pay"/"paying" sense before the broad procedural
+    // manner-frame check: "how to learn ... without paying for a course" is a
+    // monetary exclusion, not a manner qualifier merely because the query starts
+    // with "how to".
+    if compound.eq_ignore_ascii_case("pay") || compound.eq_ignore_ascii_case("paying") {
+        return pay_exclusion_is_money(q_orig);
+    }
     // Manner phrases are never exclusions, regardless of framing. The
     // phrase-level check also catches a verb-led frame whose target is the noun
     // after the verb ("without using a library").
