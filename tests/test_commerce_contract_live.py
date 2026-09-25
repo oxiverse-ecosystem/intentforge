@@ -136,3 +136,42 @@ def test_commercial_query_resolves_to_transactional_intent(session):
         f"intent signal — intent={intent!r}, transactional_prob={txn_prob:.3f}. "
         "The intent classifier or distribution regression broke the gate signal."
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# (D) Main-path response contract: concrete product offers only
+# ──────────────────────────────────────────────────────────────────────
+
+def test_commercial_search_shopping_is_non_empty_array_of_real_offers(session):
+    """Commercial /search responses expose `shopping` as a direct array. Every
+    entry must carry a real `commerce` block extracted from that exact URL;
+    article/review rows without product facts must never leak into the strip."""
+    r = session.get(
+        f"{BASE}/search",
+        params={"q": COMMERCIAL_Q, "count": 8},
+        timeout=120,
+    )
+    assert r.status_code == 200, f"GET /search -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    shopping = body.get("shopping")
+    assert isinstance(shopping, list) and shopping, (
+        "commercial /search response must contain a non-empty `shopping` array; "
+        f"got {shopping!r}"
+    )
+
+    ranked_urls = [entry.get("url") for entry in body.get("results", [])]
+    for i, entry in enumerate(shopping):
+        assert isinstance(entry, dict), f"shopping[{i}] must be an object"
+        assert entry.get("url") in ranked_urls, (
+            f"shopping[{i}] was not cloned from the main ranked result set"
+        )
+        commerce = entry.get("commerce")
+        assert isinstance(commerce, dict), (
+            f"shopping[{i}] has no concrete commerce block"
+        )
+        assert commerce.get("url") == entry["url"], (
+            f"shopping[{i}] commerce provenance URL differs from result URL"
+        )
+        assert commerce.get("observed_at"), (
+            f"shopping[{i}] commerce facts must carry observed_at provenance"
+        )
