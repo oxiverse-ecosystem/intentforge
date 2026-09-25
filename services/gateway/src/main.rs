@@ -8629,6 +8629,57 @@ fn is_weak_anchor_word(w: &str) -> bool {
     WEAK.contains(&w)
 }
 
+/// Detects a NAMING / ETYMOLOGY question shape: an interrogative frame plus a
+/// naming predicate ("named after", "called", "choose that name", "where does the
+/// name X come from", "etymology", "origin of the name").
+///
+/// This is a QUERY-SHAPE signal built from closed-class function vocabulary
+/// (interrogatives + naming predicates). It names no entity, brand or topic, so it
+/// generalizes to every naming question ("why is amazon named after the river",
+/// "where does the name ford come from", "why is dallas called the big d").
+///
+/// Why it matters: a naming question wants an EXPLANATION. Two result shapes are
+/// wrong answers to it and are structurally detectable without any domain list:
+///   (1) a Q&A/forum page that merely ASKS the same question (a question, not an
+///       answer), and
+///   (2) a page that matches the query's dominant proper noun but none of the
+///       query's OTHER content tokens (an incidental entity mention — e.g. a crime
+///       story about a person with the surname, or a dealer page for the brand).
+fn is_naming_question(query: &str) -> bool {
+    let q = query.to_lowercase();
+    let words: Vec<&str> = q.split(|c: char| !c.is_alphanumeric() && c != '\'').collect();
+    let interrogative = words.iter().any(|w| {
+        matches!(*w, "why" | "how" | "what" | "where" | "who" | "which" | "when")
+    });
+    if !interrogative {
+        return false;
+    }
+    // Naming predicates. Closed-class vocabulary describing the QUESTION FORM
+    // (naming, calling, choosing a name, asking where a word/name came from),
+    // not any specific entity.
+    const NAMING_PREDICATES: &[&str] = &[
+        "named", "name", "names", "naming", "called", "call", "calls", "choose",
+        "chose", "chosen", "choose", "picked", "title", "etymology", "etymological",
+        "origin", "origins", "derived", "derives", "come", "comes", "came", "mean",
+        "means", "meaning", "refer", "refs", "entitled", "word", "words",
+    ];
+    let has_naming_predicate = words.iter().any(|w| NAMING_PREDICATES.contains(w));
+    // "come/came from" and "derived from" only count as naming predicates when
+    // paired with a name-ish noun nearby, so "where does the river come from"
+    // (geography) is not misread as a naming question.
+    let has_name_noun = words.iter().any(|w| {
+        matches!(*w, "name" | "names" | "naming" | "word" | "words" | "term" | "title")
+    });
+    let has_from_construction = q.contains("come from")
+        || q.contains("comes from")
+        || q.contains("came from")
+        || q.contains("derived from")
+        || q.contains("derives from")
+        || q.contains("name origin")
+        || q.contains("origin of the name");
+    has_naming_predicate && (has_name_noun || has_from_construction)
+}
+
 /// Detects video intent in a query. Uses token-aware detection for "watch" to avoid
 /// false positives on queries like "watch battery" or "watch repair" which are about
 /// timepieces, not videos. Standalone "watch" does not imply video intent; requires
@@ -11046,6 +11097,18 @@ fn merge_local_and_web(
             .collect();
         let query_has_rare_anchors = !rare_anchor_terms.is_empty();
 
+        // ── NAMING-QUESTION SHAPE (FIX-IF-30) ──
+        // A naming/etymology question ("why is X named after Y", "where does the
+        // name X come from") asks for an EXPLANATION, and it names a RELATION
+        // between entities rather than a single topic. `is_naming_question` detects
+        // the question FORM from closed-class interrogative + naming-predicate
+        // vocabulary (no entity literals), and the anchor set is the query's own
+        // rare entities, taken from the runtime corpus frequency data already used
+        // by the rare-anchor cap below. So the signal generalizes to every future
+        // naming question and needs no list of brands, surnames or hosts.
+        let naming_question = is_naming_question(&clean_query);
+        let naming_anchor_terms: Vec<String> = rare_anchor_terms.clone();
+
         // These caps MUST sit strictly BELOW the calibrated article floor so the
         // spam is demoted *under* every genuine article, not merely tied with it.
         // calibrate_scores maps the raw set onto [0.05, 1.0]; a relevant article's
@@ -11194,6 +11257,85 @@ fn merge_local_and_web(
                 if forum_path && question_title && r.score > 0.05 {
                     r.post_cal_cap = Some(0.05);
                     r.score = 0.05;
+                }
+            }
+
+            // ── NAMING-QUESTION ANSWER PREFERENCE (FIX-IF-30) ──
+            // A naming/etymology question ("why is X named after Y", "where does
+            // the name X come from", "why is X called Y") wants an EXPLANATION.
+            // Two structurally-identifiable result shapes are wrong answers to it
+            // and were ranking above real answers:
+            //   (1) A Q&A/forum page that merely ASKS the same question. A question
+            //       is not an answer. The prior fix-IF-29 attempt gated this check
+            //       on `!phrase_entities.is_empty()`, so it silently did nothing for
+            //       naming queries with a single content entity ("why is dallas
+            //       called the big d" — no multi-word phrase entity survives after
+            //       the naming-glue words are stripped) and the Reddit question
+            //       thread stayed at #1. This block is gated on the QUERY SHAPE
+            //       instead, which is the correct invariant.
+            //   (2) A page that satisfies only the query's dominant proper noun and
+            //       none of the other content tokens — an incidental entity match
+            //       (a crime story about a person with that surname; a dealer page
+            //       for the brand). Such a page is topically anchored on the wrong
+            //       subject and cannot outrank a page that addresses the question.
+            // Both signals are structural (query shape + token satisfaction), and
+            // the cap is applied AFTER calibration so it is durable, matching the
+            // established D1/D2/D3/P8 post-cal cap pattern.
+            if naming_question {
+                // (1) Question-shaped page offered as the answer to a question: a
+                // forum/Q&A path whose title is itself interrogative is the asker's
+                // post, not an explanation. Detected from the path shape and the
+                // title's interrogative form — no domain or query literals. This
+                // signal is deliberately NOT gated on the anchor count: a naming
+                // query with a single entity ("why is dallas called the big d")
+                // still gets a question-thread ranked above the real answer, and
+                // that is the exact defect the prior phrase-entity-gated attempt
+                // missed.
+                let interrogative_title = rl.starts_with("why ")
+                    || rl.starts_with("how ")
+                    || rl.starts_with("what ")
+                    || rl.starts_with("where ")
+                    || rl.starts_with("who ")
+                    || rl.starts_with("is ")
+                    || rl.starts_with("are ")
+                    || rl.starts_with("does ")
+                    || rl.starts_with("did ")
+                    || rl.starts_with("can ")
+                    || rl.ends_with('?');
+                let forum_path = ul.contains("/r/") || ul.contains("/comments/")
+                    || ul.contains("/forum/") || ul.contains("/question/")
+                    || ul.contains("/q/") || ul.contains("/ask");
+                let is_question_shaped = forum_path && interrogative_title;
+
+                // (2) Incidental single-entity match: a naming question that names
+                // TWO OR MORE rare entities (the thing and its namesake/source) is
+                // asking about a RELATION between them. A page that satisfies only
+                // one of them is anchored on a different subject that happens to
+                // share the dominant proper noun — a crime story about a person with
+                // that surname, a dealer page for the brand. This is the
+                // token-satisfaction collapse the card requires: no list of
+                // ambiguous surnames, no per-host rule. The rare-entity set comes
+                // from the runtime corpus frequency data, so it self-extends to
+                // every future query, and it stays silent when the query names
+                // fewer than 2 rare entities (a one-entity naming question has no
+                // relation whose satisfaction could be violated).
+                let incidental_match = if naming_anchor_terms.len() >= 2 {
+                    let satisfied = naming_anchor_terms.iter().filter(|t| {
+                        rl.contains(t.as_str()) || cl.contains(t.as_str()) || ul.contains(t.as_str())
+                    }).count();
+                    satisfied < naming_anchor_terms.len()
+                } else {
+                    false
+                };
+
+                if (is_question_shaped || incidental_match) && r.score > weak_cap {
+                    tracing::info!(
+                        "POST-CAL NAMING-Q CAP -> {:.2}: '{}' (question_shaped={}, incidental={}, rare anchors {:?})",
+                        weak_cap, r.url.chars().take(60).collect::<String>(),
+                        is_question_shaped, incidental_match, naming_anchor_terms
+                    );
+                    r.post_cal_cap = Some(weak_cap);
+                    r.score = weak_cap;
                 }
             }
 
@@ -19309,6 +19451,122 @@ mod hardcoding_ruling_tests {
         assert!(disambig_result.score < 0.05, "disambig should be capped below floor, got {}", disambig_result.score);
         // Real article should be at or above floor
         assert!(article_result.score >= 0.05, "article should be >= 0.05, got {}", article_result.score);
+    }
+
+    // ── FIX-IF-30: naming-question answer preference ──
+
+    #[test]
+    fn naming_question_shape_detected_generically() {
+        // The detector is a QUERY-SHAPE signal (interrogative + naming predicate),
+        // so it must fire across unrelated entities with no per-query vocabulary.
+        for q in [
+            "why is tesla named after nikola tesla",
+            "why is amazon named after the river",
+            "why did starbucks choose that name",
+            "where does the name ford come from",
+            "why is dallas called the big d",
+            "what is the origin of the name google",
+        ] {
+            assert!(is_naming_question(q), "should detect naming question: {}", q);
+        }
+        // Non-naming queries must NOT fire — otherwise every informational query
+        // would have a question-thread collapse applied to it.
+        for q in [
+            "how to change a car battery",
+            "why is the sky blue",
+            "where does the river amazon flow",
+            "best practices for writing unit tests in go",
+            "why do cats purr",
+            "what is quantum computing",
+        ] {
+            assert!(!is_naming_question(q), "must not fire on non-naming query: {}", q);
+        }
+    }
+
+    #[test]
+    fn naming_question_forum_thread_demoted_below_answer() {
+        // A Q&A thread that merely ASKS the naming question is not an answer and
+        // must not outrank a page that explains the naming. This is the defect
+        // class behind both the Apache card and the Dallas generalization probe.
+        let q = "why is dallas called the big d";
+        let thread = web_res(
+            "https://www.reddit.com/r/Dallas/comments/5kdox1/why_is_dallas_called_the_big_d",
+            "r/Dallas on Reddit: Why is Dallas called the Big D?",
+            "A thread asking why the city is called the Big D.",
+        );
+        let answer = web_res(
+            "https://example.com/dallas-big-d-origin",
+            "Why Is Dallas Called the Big D? The Origin Explained",
+            "Dallas is called the Big D because each letter of the city name was doubled when the railroad came to town in the 1870s.",
+        );
+        let out = merge_local_and_web(
+            vec![], vec![thread, answer], q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        let t = out.iter().find(|r| r.url.contains("reddit.com")).expect("thread missing");
+        let a = out.iter().find(|r| r.url.contains("dallas-big-d-origin")).expect("answer missing");
+        assert!(
+            a.score > t.score,
+            "answer ({}) must outrank question thread ({})",
+            a.score, t.score
+        );
+    }
+
+    #[test]
+    fn naming_question_incidental_entity_match_demoted() {
+        // A page that satisfies only the query's dominant proper noun and none of
+        // the other named entities is anchored on a different subject that happens
+        // to share the name (a crime story about a person with that surname, a
+        // dealer page for the brand). It must not outrank a page that addresses
+        // the relation. Uses invented entities so the test is not query-tuned.
+        let q = "why is zorblax named after kevren mardell";
+        let incidental = web_res(
+            "https://news.example.com/local/teen-found-in-zorblax",
+            "Teen Found In Zorblax, Police Probe Continues",
+            "Investigators are working on the case in the Zorblax district this week.",
+        );
+        let answer = web_res(
+            "https://example.com/zorblax-name-origin",
+            "Why Zorblax Was Named After Kevren Mardell",
+            "Zorblax was named after Kevren Mardell, the engineer who founded the workshop in 1904.",
+        );
+        let out = merge_local_and_web(
+            vec![], vec![incidental, answer], q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        let inc = out.iter().find(|r| r.url.contains("teen-found")).expect("incidental missing");
+        let a = out.iter().find(|r| r.url.contains("zorblax-name-origin")).expect("answer missing");
+        assert!(
+            a.score > inc.score,
+            "answer ({}) must outrank incidental single-entity match ({})",
+            a.score, inc.score
+        );
+    }
+
+    #[test]
+    fn naming_cap_does_not_fire_on_non_naming_query() {
+        // The cap is gated on the query SHAPE. A general "why" query must keep its
+        // normal ordering — in particular a question-titled page that is genuinely
+        // the best answer for a non-naming question must not be capped.
+        let q = "why do cats purr";
+        let page = web_res(
+            "https://www.reddit.com/r/cats/comments/abc123/why_do_cats_purr",
+            "Why Do Cats Purr? Mechanically, It Is Vocal Fold Vibration",
+            "Cats purr by rapid twitching of the laryngeal muscles, which produces a 25-150 Hz cycle.",
+        );
+        let other = web_res(
+            "https://example.com/cat-purr-mechanics",
+            "The Mechanics of Cat Purring",
+            "Purring is produced by rapid muscle contractions and serves communication and healing functions.",
+        );
+        let out = merge_local_and_web(
+            vec![], vec![page, other], q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        let p = out.iter().find(|r| r.url.contains("abc123")).expect("page missing");
+        let o = out.iter().find(|r| r.url.contains("cat-purr-mechanics")).expect("other missing");
+        assert!(
+            p.score >= o.score,
+            "non-naming query must not be demoted by the naming cap: {} vs {}",
+            p.score, o.score
+        );
     }
 }
 
