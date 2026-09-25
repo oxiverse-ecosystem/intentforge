@@ -6935,6 +6935,84 @@ const COUNTRY_DEMONYMS: &[&str] = &[
     "australian", "australia",
 ];
 
+/// Frame vocabulary that marks a query's SUBJECT as instructional — the user is
+/// asking how to DO something, or for material that explains how. Used only to
+/// classify the subject that PRECEDES a prepositional negation; it never matches
+/// the negated object itself, so "dessert recipes without artificial sweeteners"
+/// (content subject) is unaffected.
+///
+/// Structural vocabulary (a closed class of English how-to frames), not per-query
+/// literals and not tuned thresholds — same pattern as `MANNER_VERBS` /
+/// `CONTRASTIVE_MARKERS` above.
+const INSTRUCTIONAL_FRAMES: &[&str] = &[
+    "how to", "how do i", "how can i", "how do you", "how can you", "ways to",
+    "way to", "best way to", "tutorial", "tutorials", "tutorial for", "tutorials for",
+    "guide", "guides", "guide to", "guides to", "walkthrough", "learn", "learning",
+    "teach", "lesson",
+];
+
+/// True when the query's subject (the span BEFORE the first negation marker) is
+/// instructional rather than topical. "how to clean a cast iron skillet without
+/// soap" → the subject is "how to clean a cast iron skillet" → instructional.
+/// "dessert recipes without artificial sweeteners" → subject "dessert recipes" →
+/// topical. This is the single discriminator that separates a HOW qualifier from a
+/// WHAT exclusion; the negation object is never inspected here, so no domain nouns
+/// are hardcoded.
+fn is_instructional_subject(q_orig: &str) -> bool {
+    let q_lower = q_orig.to_lowercase();
+    // Cut the query at the first negation marker so only the subject is judged.
+    let subject = ["without", "not", " no ", "except", "excluding", "minus", "other than", "besides"]
+        .iter()
+        .filter_map(|m| q_lower.find(m))
+        .min()
+        .map(|i| &q_lower[..i])
+        .unwrap_or(&q_lower);
+    let subject_tokens: Vec<&str> = subject
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    INSTRUCTIONAL_FRAMES.iter().any(|frame| {
+        let f: Vec<&str> = frame.split_whitespace().collect();
+        subject_tokens.windows(f.len()).any(|w| w == f.as_slice())
+    })
+}
+
+/// True when `compound` is the object of a PREPOSITIONAL negation — i.e. it sits
+/// inside a `without <optional articles> <compound>` or `with no <compound>` frame
+/// in the original query. This deliberately excludes the bare-`not` form, which
+/// carries no manner ambiguity and is already resolved by the entity/contrastive
+/// gates. Token-based, so a compound that merely appears elsewhere in the query
+/// (or a substring collision like "notebook" vs "not") does not match.
+fn negated_by_preposition(q_orig: &str, compound: &str) -> bool {
+    let q_tokens: Vec<String> = q_orig
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect();
+    let c_tokens: Vec<String> = compound
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if c_tokens.is_empty() {
+        return false;
+    }
+    for (i, tok) in q_tokens.iter().enumerate() {
+        let is_marker = tok == "without" || (tok == "no" && q_tokens.get(i.wrapping_sub(1)) == Some(&"with".to_string()));
+        if !is_marker {
+            continue;
+        }
+        let mut j = i + 1;
+        while matches!(q_tokens.get(j).map(|s| s.as_str()), Some("a") | Some("an") | Some("the") | Some("any")) {
+            j += 1;
+        }
+        if j + c_tokens.len() <= q_tokens.len() && q_tokens[j..j + c_tokens.len()] == c_tokens {
+            return true;
+        }
+    }
+    false
+}
+
 /// D3: precise manner-frame detection at the PHRASE level (not the bare-token
 /// level that `is_manner_phrase` uses). A declined candidate is a manner
 /// qualifier when it appears inside a "without/with-no <optional article> <term>"
@@ -6951,23 +7029,29 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     let lc = q_orig.to_lowercase();
     let compound_lower = compound.to_lowercase();
     let c_tokens: Vec<&str> = compound_lower.split_whitespace().collect();
-    // In a procedural request, a bare `without NOUN` / `no NOUN` states a
-    // constraint on HOW the user wants to accomplish the task (cleaning without
-    // soap, learning without a degree), not a result topic to remove. In a
-    // content request (dessert recipes without artificial sweeteners, recipes
-    // with no nuts) the same grammar names the thing the results must exclude.
-    // Detect the broad instruction/content frame structurally, not by domain
-    // nouns. Verb-led targets are handled below.
-    let procedural = ["how to ", "best way to ", "way to ", "tutorial for ", "guide to ", "learn "]
-        .iter()
-        .any(|frame| lc.starts_with(frame));
-    if procedural && c_tokens.iter().all(|t| !MANNER_PRONOUNS.contains(t)) {
-        return true;
-    }
 
     // A relation pronoun is an unambiguous manner signal wherever it occurs
     // ("does not track you as", "without offending the couple").
     if c_tokens.iter().any(|t| MANNER_PRONOUNS.contains(t)) {
+        return true;
+    }
+
+    // A prepositional negation (`without X` / `with no X`) inside an
+    // INSTRUCTIONAL subject constrains HOW the task is to be accomplished, not
+    // WHAT the results must contain: "how to clean a skillet without soap",
+    // "a tutorial with no music background", "learn machine learning without a
+    // computer science degree". The mirror case is a CONTENT subject — "dessert
+    // recipes without artificial sweeteners", "recipes with no nuts" — where the
+    // same grammar names a real exclusion.
+    //
+    // Both conditions are required. A blanket "any `without` in a how-to query is
+    // manner" rule (the bug this replaces) also swallowed genuine exclusions that
+    // ride inside an instructional query, e.g. the money sense of "without paying
+    // for a course" — `is_real_exclusion` resolves that separately, BEFORE it
+    // consults this frame. Scoping the rule to a prepositional negation also
+    // leaves the bare-`not` path alone, so "learn spanish not duolingo" is still
+    // decided by the entity/contrastive gates rather than by manner suppression.
+    if negated_by_preposition(q_orig, compound) && is_instructional_subject(q_orig) {
         return true;
     }
 
@@ -7127,12 +7211,6 @@ fn is_real_exclusion(
     q_orig: &str,
     query_is_contrastive: bool,
 ) -> bool {
-    // Manner phrases are never exclusions, regardless of framing. The
-    // phrase-level check also catches a verb-led frame whose target is the noun
-    // after the verb ("without using a library").
-    if is_manner_phrase(compound) || is_manner_frame(q_orig, compound) {
-        return false;
-    }
     let lc = compound.to_lowercase();
     // D2 (2026-08-19): the bare token "pay"/"paying" is ambiguous. If the query
     // context shows a MANNER object ("pay attention", "pay respect"), it is a
@@ -7141,8 +7219,21 @@ fn is_real_exclusion(
     // We require the money sense to be signalled; otherwise a bare "pay" with no
     // monetary object still defaults to declined (the manner guard's job). This
     // keeps "without paying attention" rejected while rescuing "without paying".
+    //
+    // ORDERING: this gate runs BEFORE the manner-frame guard below. Both senses
+    // live in the same `without <verb> ...` prepositional frame, so consulting
+    // the manner guard first would classify EVERY `without paying ...` clause as a
+    // HOW qualifier and the money exclusion ("how to learn programming without
+    // paying for a course") could never be honored. The money/manner object
+    // vocabulary is the specific signal, so it wins over the generic frame test.
     if compound == "pay" || compound == "paying" || lc == "pay" || lc == "paying" {
         return pay_exclusion_is_money(&q_orig);
+    }
+    // Manner phrases are never exclusions, regardless of framing. The
+    // phrase-level check also catches a verb-led frame whose target is the noun
+    // after the verb ("without using a library").
+    if is_manner_phrase(compound) || is_manner_frame(q_orig, compound) {
+        return false;
     }
     let tokens: Vec<&str> = lc.split_whitespace().collect();
     // Entity: any token (or the whole compound) is a protected brand/tech term.
