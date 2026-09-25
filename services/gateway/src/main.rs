@@ -4481,6 +4481,10 @@ async fn handle_shopping(
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
+    // Preserve the query before `params` is moved into the shared search pipeline.
+    // It is used only for in-process affiliate eligibility matching; it is never
+    // sent to an affiliate network.
+    let affiliate_query = params.q.clone().unwrap_or_default();
     let (status, body) = handle_search(
         state.clone(),
         Query(params),
@@ -4516,7 +4520,7 @@ async fn handle_shopping(
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
             // Sacred policy: only exact-model queries may receive affiliate metadata.
-            decorate_affiliate_for_query(arr, &state.affiliate_ctx, &q);
+            decorate_affiliate_for_query(arr, &state.affiliate_ctx, &affiliate_query);
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
             // already-attached `commerce` blocks. Never reorders/reselects results.
             if let Some(arr_ref) = value.get("results").and_then(|v| v.as_array()) {
