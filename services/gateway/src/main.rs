@@ -4927,6 +4927,25 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     None
 }
 
+/// Returns `(absolute_threshold, effective_threshold)` for the semantic
+/// relevance gate. See the call site for the rationale: the absolute gate is
+/// capped at half the best score observed in THIS pool, so a weak-but-
+/// discriminating scorer cannot reduce a 30+ candidate pool to a single
+/// survivor. The effective value is never greater than the absolute one, so
+/// pools with a strong top hit behave exactly as before.
+fn semantic_filter_threshold(pool_size: usize, best_score: f32) -> (f32, f32) {
+    let absolute: f32 = if pool_size > 30 { 0.18 }
+        else if pool_size > 20 { 0.15 }
+        else if pool_size > 10 { 0.12 }
+        else { 0.08 };
+    let effective = if best_score > 0.0 {
+        absolute.min(best_score * 0.5)
+    } else {
+        absolute
+    };
+    (absolute, effective)
+}
+
 fn should_filter_by_constraints(
     title: &str, content: &str, url: &str, published_date: Option<&str>, constraints: &Constraints,
 ) -> bool {
@@ -15647,10 +15666,37 @@ async fn handle_search(
 
     // Adaptive threshold: higher when we have many results, lower when few
     // No positional exceptions — rank #1 can still be garbage
-    let semantic_threshold = if web_results.len() > 30 { 0.18 }
+    let absolute_threshold = if web_results.len() > 30 { 0.18 }
         else if web_results.len() > 20 { 0.15 }
         else if web_results.len() > 10 { 0.12 }
         else { 0.08 };
+
+    // Relative cap (self-calibrating): the absolute thresholds above are only
+    // meaningful when the scorer actually SPREADS the pool. When the strongest
+    // candidate scores barely above the garbage-cluster boundary (best≈0.15-0.19,
+    // e.g. a short-tail news topic where few pages carry rich text), an absolute
+    // 0.18 gate on a 30+ pool sits at the SAME level as best_score and keeps
+    // essentially one item — the top-3 floor then pads the response back to 3
+    // arbitrary survivors. That is the "5 results for a query SearXNG answered
+    // with 33" collapse: the loss happens UPSTREAM of any date/price constraint
+    // filter, so fail-open logic further down can never recover it.
+    //
+    // So cap the gate at a FRACTION OF THE OBSERVED BEST SCORE. This is
+    // scale-free and query-agnostic: it asks "is this result competitive with the
+    // best one we actually retrieved?" rather than "does it clear a magic
+    // constant?". It can only ever LOWER the threshold, never raise it, so a
+    // pool with a strong top hit (best≈1.0) keeps the exact previous behaviour
+    // (min(0.18, 0.5) = 0.18) and ranking regressions are impossible by
+    // construction. A weak-but-not-degenerate pool (best≈0.18) relaxes to
+    // ≈0.09 and keeps the genuinely competitive half instead of one outlier.
+    let semantic_threshold = semantic_filter_threshold(web_results.len(), best_score);
+    if semantic_threshold.1 < semantic_threshold.0 {
+        tracing::info!(
+            "SEMANTIC THRESHOLD RELATIVE CAP: pool={} best={:.3} mean={:.3} — threshold {:.3} -> {:.3} (weak-but-discriminating scorer; absolute gate would keep ~1 result)",
+            web_results.len(), best_score, mean_score, semantic_threshold.0, semantic_threshold.1
+        );
+    }
+    let semantic_threshold = semantic_threshold.1;
 
     // When the relevance model cannot discriminate (garbage cluster: every
     // candidate scored ~identically, e.g. results with empty/short
@@ -15805,7 +15851,7 @@ async fn handle_search(
         //     week" → 8/9 dropped, 1 survives = 11%). A near-empty result set is
         //     the same user-facing failure as a zero one: relevant, date-less
         //     results get discarded in favour of a single stale-but-dated item.
-        //     Fail-open when the surviving fraction is below a general 50% floor
+        //     Fail open when the surviving fraction is below a general 50% floor
         //     AND the surviving count is too small to be useful (< 3). This is
         //     keyed on survival ratio, not on any query/window, so it stays general.
         //     2026-09-04: threshold raised from 0.25 → 0.50 after "latest news about
@@ -15816,7 +15862,36 @@ async fn handle_search(
         } else {
             1.0
         };
-        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.50;
+        // FIX-IF-23: the old predicate also demanded `survivors_after_window < 3`,
+        // which made the fail-open blind to the most common shape of this bug: a
+        // LARGE pool where the window retains a plausible-looking handful. Live
+        // trace for "gaganyaan latest news launch date" (pool=26, dated window
+        // 2026-09-18..2026-09-25) left exactly 3 survivors — 11% — so the
+        // absolute clause read "not near-empty", the window stood, and 23/26
+        // relevant results were discarded. The user-visible page collapsed to 7.
+        //
+        // A hard recency window that discards the MAJORITY of a pool it was given
+        // is evidence the upstream snippets simply do not carry usable dates, not
+        // evidence that the user wants a 3-item page. So the ratio test stands on
+        // its own for any pool big enough to have had real recall, and small
+        // pools keep the previous conservative behaviour (a 2-of-3 pool is not
+        // evidence of anything). This stays keyed on the survival ratio and pool
+        // size — no query, domain, or window is special-cased — and recency is
+        // not lost: the freshness half-life boost still ranks what survives.
+        //
+        // The ratio relaxation applies ONLY to a window the ENGINE derived. A
+        // date range the user typed explicitly ("python after:2024-01-01
+        // before:2024-06-01") is a deliberate instruction, and silently widening
+        // it because the corpus is sparse would be the engine overriding the
+        // user — the same class of failure in the opposite direction. Explicit
+        // ranges keep the strict zero-survivor fail-open only, which protects
+        // against a hard 0-result page without discarding the user's intent.
+        const MIN_POOL_FOR_RATIO_FAILOPEN: usize = 10;
+        let q_lower_window = q.to_lowercase();
+        let user_stated_date_range = q_lower_window.contains("after:") || q_lower_window.contains("before:");
+        let fraction_too_low = !user_stated_date_range
+            && survivor_fraction < 0.50
+            && pre_filter_count >= MIN_POOL_FOR_RATIO_FAILOPEN;
         if survivors_after_window == 0 || fraction_too_low {
             tracing::info!(
                 "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
@@ -21042,5 +21117,150 @@ mod kb_gibberish_mixed_tests {
         // digit garbage; a lone kb run with a real word must stay searchable.
         let (flag, _) = query_quality_flag("qwerty vs dvorak", &index);
         assert_ne!(flag, "junk");
+    }
+}
+
+#[cfg(test)]
+mod semantic_threshold_relative_cap_tests {
+    use super::semantic_filter_threshold;
+
+    // FIX-IF-23: a weak-but-discriminating scorer used to collapse a large
+    // candidate pool to ~1 survivor. Live trace for "gaganyaan latest news
+    // launch date": SearXNG returned 33, dedup kept 33, but best_score=0.184
+    // against an absolute 0.18 gate (pool > 30) meant only the single best item
+    // passed, and the top-3 floor padded the response back to 3-5 results.
+    // The collapse happened UPSTREAM of the date/price constraint filters, so
+    // their fail-open logic could not recover it.
+    #[test]
+    fn weak_scorer_on_large_pool_relaxes_threshold() {
+        let (absolute, effective) = semantic_filter_threshold(33, 0.184);
+        assert_eq!(absolute, 0.18);
+        // Relaxed well below the absolute gate so the competitive majority of
+        // the pool survives instead of a single outlier.
+        assert!(effective < absolute, "threshold must relax for a weak scorer");
+        assert!(
+            (effective - 0.092).abs() < 1e-6,
+            "expected half of best_score, got {}",
+            effective
+        );
+    }
+
+    // No-regression guard: when the scorer produces a strong top hit, the
+    // relative cap must not engage at all. This is the "best laptop for
+    // programming 2026" shape (best=1.0) — behaviour must be byte-identical to
+    // the pre-fix absolute gate.
+    #[test]
+    fn strong_scorer_is_unchanged() {
+        for pool in [5usize, 15, 25, 40] {
+            let (absolute, effective) = semantic_filter_threshold(pool, 1.0);
+            assert_eq!(
+                absolute, effective,
+                "strong scorer must keep the absolute gate (pool={})",
+                pool
+            );
+        }
+    }
+
+    // The cap is monotonic: it can only lower the gate, never raise it, for any
+    // pool size and any best score. This makes ranking regressions structurally
+    // impossible for well-scoring queries.
+    #[test]
+    fn cap_never_raises_threshold() {
+        for pool in [1usize, 5, 11, 21, 31, 100] {
+            for best in [0.0f32, 0.01, 0.1, 0.184, 0.3, 0.7, 1.0] {
+                let (absolute, effective) = semantic_filter_threshold(pool, best);
+                assert!(
+                    effective <= absolute,
+                    "cap raised the gate: pool={} best={} abs={} eff={}",
+                    pool,
+                    best,
+                    absolute,
+                    effective
+                );
+            }
+        }
+    }
+
+    // Absolute tiering by pool size is preserved for the strong-scorer case.
+    #[test]
+    fn absolute_tiers_preserved() {
+        assert_eq!(semantic_filter_threshold(31, 1.0).0, 0.18);
+        assert_eq!(semantic_filter_threshold(21, 1.0).0, 0.15);
+        assert_eq!(semantic_filter_threshold(11, 1.0).0, 0.12);
+        assert_eq!(semantic_filter_threshold(10, 1.0).0, 0.08);
+    }
+
+    // Degenerate pool (best_score == 0) must fall back to the absolute gate so
+    // the separate garbage-cluster path retains sole ownership of that case.
+    #[test]
+    fn zero_best_falls_back_to_absolute() {
+        let (absolute, effective) = semantic_filter_threshold(33, 0.0);
+        assert_eq!(absolute, effective);
+    }
+}
+
+#[cfg(test)]
+mod date_window_failopen_tests {
+    // Mirrors the predicate in the date fail-open gate.
+    fn fraction_too_low(survivors: usize, pre_filter: usize, user_stated: bool) -> bool {
+        const MIN_POOL_FOR_RATIO_FAILOPEN: usize = 10;
+        if pre_filter == 0 {
+            return false;
+        }
+        let fraction = survivors as f32 / pre_filter as f32;
+        !user_stated && fraction < 0.50 && pre_filter >= MIN_POOL_FOR_RATIO_FAILOPEN
+    }
+
+    // FIX-IF-23 live case: pool=26, window left exactly 3 survivors (11%). The
+    // old predicate required survivors < 3, so 3 read as "healthy" and the hard
+    // window stood, discarding 23/26 relevant results.
+    #[test]
+    fn three_survivors_from_large_pool_triggers_failopen() {
+        assert!(
+            fraction_too_low(3, 26, false),
+            "3/26 must fail open — this is the exact FIX-IF-23 regression"
+        );
+    }
+
+    #[test]
+    fn majority_survival_keeps_the_hard_window() {
+        // A window that keeps most of a real pool is doing its job: the user
+        // asked for recency and the corpus supports it. Must NOT be relaxed.
+        assert!(!fraction_too_low(18, 26, false));
+        assert!(!fraction_too_low(25, 26, false));
+    }
+
+    #[test]
+    fn small_pools_keep_previous_conservative_behaviour() {
+        // Below the minimum pool size there is no evidence of missing dates, so
+        // the hard window is honoured exactly as before this change.
+        assert!(!fraction_too_low(1, 3, false));
+        assert!(!fraction_too_low(2, 5, false));
+        assert!(!fraction_too_low(0, 9, false));
+    }
+
+    // The engine must never widen a date range the USER typed. Live check:
+    // "python after:2024-01-01 before:2024-06-01" kept 15/32 (47%), which the
+    // ratio rule alone would have relaxed — silently discarding an explicit
+    // user instruction. The explicit-range guard prevents that.
+    #[test]
+    fn user_stated_range_is_never_ratio_relaxed() {
+        assert!(
+            !fraction_too_low(3, 26, true),
+            "an explicit after:/before: range must keep the hard window"
+        );
+        assert!(!fraction_too_low(15, 32, true));
+        assert!(!fraction_too_low(1, 20, true));
+    }
+
+    #[test]
+    fn total_collapse_is_caught_by_the_zero_survivor_branch() {
+        // Zero survivors is handled by a separate `survivors == 0` branch that
+        // fires for ANY pool size, including pools too small for the ratio test.
+        // This predicate only covers the ratio path, so it must not claim those.
+        assert!(!fraction_too_low(0, 3, false));
+        assert!(!fraction_too_low(0, 9, false));
+        // A large pool with zero survivors is caught by both branches.
+        assert!(fraction_too_low(0, 26, false));
     }
 }
