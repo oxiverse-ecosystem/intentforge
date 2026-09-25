@@ -16245,7 +16245,8 @@ async fn handle_search(
         .filter(|t| !is_exclusion_grammar_noise(t)) // F3 (2026-08-17): drop grammar-noise
         .filter(|t| !is_subjective_quality_term(t)) // DA/DB (2026-08-17): drop quality adjectives
         .filter(|t| !is_verb_attribute_exclusion(t)) // V1: drop verb-led/attribute exclusions
-        .filter(|t| {
+                .filter(|t| !is_manner_phrase(t) && !is_manner_frame(&q_orig, t)) // manner clauses are HOW, not WHAT: "without blocking"
+                .filter(|t| {
             // D2 (2026-08-19): a bare "pay"/"paying" engine Exclusion is only a
             // manner false-positive when the query context says so. "pay attention"
             // / "pay respect" → manner, DROP it (it must not become a real
