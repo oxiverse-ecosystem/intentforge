@@ -194,6 +194,31 @@ fn normalize_currency_str(s: &str) -> String {
     }
 }
 
+/// Structural model-number shapes used as the BUILT-IN FALLBACK when
+/// `data/commerce/signals.json` carries no `model_number_patterns` (missing file,
+/// missing field, or all entries failed to compile). These are product-code
+/// GRAMMARS, not a brand/product catalogue: "brand + model code", "hyphenated
+/// model code", "product line + tier + chip generation". The runtime data file
+/// is where new shapes are learned/extended; this keeps a missing file
+/// non-fatal instead of silently disabling exact-model price detection.
+const FALLBACK_MODEL_NUMBER_PATTERNS: &[&str] = &[
+    // product line + numeric model: iphone 16, oneplus 12, pixel 7
+    r"(?i)\b[a-z]{2,10}\s+\d{1,3}\b",
+    // "brand + alphanumeric model code": macbook pro m3, bose qc45, dyson v15
+    r"(?i)\b[a-z]{2,10}\s+[a-z]{1,4}-?\d{1,4}[a-z]{0,3}\b",
+    // bare hyphenated model code: wh-1000xm5, wh-1000xm4, wf-1000xm5
+    r"(?i)\b[a-z]{1,6}-\d{2,6}[a-z0-9]*\b",
+    // product line + tier + chip generation: macbook pro m3, macbook air m2
+    r"(?i)\b[a-z]{2,10}\s+(pro|air|max|plus|ultra|mini|studio|se)\s+m\d{1,2}\b",
+];
+
+/// True when the query names an exact product model AND a price/money term —
+/// e.g. "iphone 16 pro max price in india", "macbook pro m3 price in india",
+/// "sony wh-1000xm5 price". Exact-model + price is decisively transactional.
+///
+/// The model shapes live in `data/commerce/signals.json` (`model_number_patterns`)
+/// so they can be extended WITHOUT recompiling; the built-in fallback above
+/// keeps a missing/empty data file non-fatal.
 fn is_model_number_price_query(q_lower: &str) -> bool {
     static MODEL_PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
     let patterns = MODEL_PATTERNS.get_or_init(|| {
@@ -221,9 +246,21 @@ fn is_model_number_price_query(q_lower: &str) -> bool {
                 }
             }
         }
+        tracing::info!(
+            "commerce: loaded {} model-number pattern(s) for exact-model price detection",
+            result.len()
+        );
         result
     });
-    let has_model = patterns.iter().any(|re| re.is_match(q_lower));
+    // Data file empty/absent -> fall back to the built-in structural shapes.
+    let has_model = if patterns.is_empty() {
+        FALLBACK_MODEL_NUMBER_PATTERNS
+            .iter()
+            .filter_map(|p| regex::Regex::new(p).ok())
+            .any(|re| re.is_match(q_lower))
+    } else {
+        patterns.iter().any(|re| re.is_match(q_lower))
+    };
     let has_price = q_lower.contains("price") || q_lower.contains("cost")
         || q_lower.contains("rupee") || q_lower.contains("rupees")
         || q_lower.contains("inr") || q_lower.contains('₹')
@@ -7360,6 +7397,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         {
                             terms.push(joined);
                         } else if !is_manner_phrase(&joined)
+                            && !is_manner_frame(q_orig, &joined)
                         {
                             if !dropped.contains(&joined) {
                                 dropped.push(joined);
@@ -7453,7 +7491,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         && !terms.contains(&joined)
                     {
                         terms.push(joined);
-                    } else if is_manner_phrase(&joined) {
+                    } else if is_manner_phrase(&joined) || is_manner_frame(q_orig, &joined) {
                         // Manner qualifier ("without soap", "without offending the
                         // couple"): describes HOW not WHAT to exclude. It is NOT a
                         // search exclusion — record it (the third tuple element) so
@@ -16316,7 +16354,7 @@ async fn handle_search(
         }
         if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
             gated_neg_dedup.push(n);
-        } else if !is_manner_phrase(&n) && !soft_negatives.contains(&n) {
+        } else if !is_manner_phrase(&n) && !is_manner_frame(&q_orig, &n) && !soft_negatives.contains(&n) {
             // Soft negative: generic noun the gate declined but not a manner qualifier.
             // Demoted in scoring (×0.3), never hard-dropped.
             soft_negatives.push(n);
@@ -21041,5 +21079,70 @@ mod kb_gibberish_mixed_tests {
         // digit garbage; a lone kb run with a real word must stay searchable.
         let (flag, _) = query_quality_flag("qwerty vs dvorak", &index);
         assert_ne!(flag, "junk");
+    }
+}
+
+#[cfg(test)]
+mod exact_model_price_tests {
+    use super::is_model_number_price_query;
+
+    /// FIX-IF-22 — exact-model + price queries must all resolve to
+    /// transactional. The model shapes are structural (data-driven product-code
+    /// grammars), so they cover brands the classifier has never seen: MacBook
+    /// (product line + chip generation) and Sony (brand + hyphenated model code)
+    /// generalize the same way the iPhone case already did.
+    #[test]
+    fn exact_model_price_queries_are_transactional() {
+        for q in [
+            "iphone 16 pro max price in india",
+            "macbook pro m3 price in india",
+            "macbook air m2 price",
+            "sony wh-1000xm5 price",
+            "sony wh-1000xm4 price in india",
+            "bose qc45 price",
+            "dyson v15 detect price",
+        ] {
+            assert!(
+                is_model_number_price_query(q),
+                "exact-model price query must be detected as transactional: {}",
+                q
+            );
+        }
+    }
+
+    /// A model code with NO money term is a spec/review question, not a
+    /// purchase — the price co-occurrence is what makes this transactional.
+    #[test]
+    fn model_without_price_term_is_not_transactional() {
+        for q in [
+            "macbook pro m3 review",
+            "sony wh-1000xm5 vs wh-1000xm4",
+            "iphone 16 pro max specs",
+        ] {
+            assert!(
+                !is_model_number_price_query(q),
+                "model code without a price term must NOT be transactional: {}",
+                q
+            );
+        }
+    }
+
+    /// The decisive override must not turn ordinary non-commerce queries with a
+    /// stray number into transactional.
+    #[test]
+    fn ordinary_queries_are_not_exact_model_price() {
+        for q in [
+            "mutual funds in india",
+            "how to install python 3",
+            "rust book chapter 2 summary",
+            "best practices for rest api design",
+            "top 10 universities in usa",
+        ] {
+            assert!(
+                !is_model_number_price_query(q),
+                "non-commerce query must NOT be classified transactional: {}",
+                q
+            );
+        }
     }
 }

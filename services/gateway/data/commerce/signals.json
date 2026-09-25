@@ -7,10 +7,9 @@
     "budget", "cost", "worth", "value", "refurbished", "under", "store"
   ],
   "model_number_patterns": [
-    "(?i)\\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto|surface|watch)\\s+\\d{1,2}",
-    "(?i)\\b(macbook|imac|mac)\\s+(pro|air|mini|studio|max|plus|ultra|lite|se|note|edge|fold|flip)\\s+m\\d",
-    "(?i)\\b(macbook|imac|mac)\\s+m\\d",
-    "(?i)\\b(sony)\\s+(wh-|xm|wf-|rs-)\\d",
-    "(?i)\\b(audio|headphone|earphone|earbud|speaker)\\s+-\\s*\\d"
+    "(?i)\\b[a-z]{2,10}\\s+\\d{1,3}\\b",
+    "(?i)\\b[a-z]{2,10}\\s+[a-z]{1,4}-?\\d{1,4}[a-z]{0,3}\\b",
+    "(?i)\\b[a-z]{1,6}-\\d{2,6}[a-z0-9]*\\b",
+    "(?i)\\b[a-z]{2,10}\\s+(pro|air|max|plus|ultra|mini|studio|se)\\s+m\\d{1,2}\\b"
   ]
 }
