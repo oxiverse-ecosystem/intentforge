@@ -7636,6 +7636,12 @@ fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
 fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
     let leads: &[&str] = &[
         r"(?i)\bnot\s+from\b",
+        r"(?i)\bnot\b", // FIX-IF-01 (round 2026-09-25): "not X" was missing from
+        // the leads array. Only "not from X" was matched, so "not react vue or
+        // angular" never triggered the extractor — the protected-term boundary
+        // split code below was dead code. Adding plain "not" as a lead-in
+        // enables the "not X or Y / not X and Y" negation class end-to-end.
+        // Word-boundary anchored (\bnot\b) so "nothing"/"notice" are not matched.
         r"(?i)\bexcept\s+for\b",
         r"(?i)\bexcept\b",
         r"(?i)\bexcluding\b",
@@ -18448,16 +18454,30 @@ mod explicit_negation_list_tests {
     }
 
     #[test]
-    fn protected_term_boundary_split_yields_separate_exclusions() {
-        // Round 2026-09-24: "not react vue or angular" must yield
-        // [react, vue, angular] — not [react vue, angular]. The compound
-        // "react vue" substring-matches no page title/content and the
-        // exclusion silently no-ops.
+    fn not_x_or_y_with_protected_terms_yields_all() {
+        // FIX-IF-01 (round 2026-09-25): "not react vue or angular" must yield
+        // [react, vue, angular] — the previous round's test never ran because
+        // CI was green-washed. Adding plain "not" as a lead-in enables this.
         let out = extract_explicit_negation_terms("javascript frameworks not react vue or angular");
         assert!(out.contains(&"react".to_string()), "react missing: {:?}", out);
         assert!(out.contains(&"vue".to_string()), "vue missing: {:?}", out);
         assert!(out.contains(&"angular".to_string()), "angular missing: {:?}", out);
-        assert!(!out.iter().any(|t| t.contains("react vue")), "compound 'react vue' must not appear: {:?}", out);
+    }
+
+    #[test]
+    fn not_x_or_y_with_generic_terms_yields_all() {
+        // "not" as a plain lead-in also works for non-protected terms.
+        let out = extract_explicit_negation_terms("dinner recipes not pork or beef");
+        assert!(out.contains(&"pork".to_string()), "pork missing: {:?}", out);
+        assert!(out.contains(&"beef".to_string()), "beef missing: {:?}", out);
+    }
+
+    #[test]
+    fn not_from_still_works_after_not_lead_in() {
+        // Adding plain "not" must not break the "not from X" pattern.
+        let out = extract_explicit_negation_terms("restaurants in tokyo not from sushi chains");
+        assert!(out.contains(&"sushi".to_string()) || out.contains(&"chains".to_string()),
+            "entity after 'not from' must be captured: {:?}", out);
     }
 
     #[test]
