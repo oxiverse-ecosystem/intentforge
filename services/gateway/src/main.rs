@@ -9834,18 +9834,20 @@ fn merge_local_and_web(
                     relevance *= 1.10;
                 }
             } else if !price_signal {
-                // Fail-open: only demote price-less results when at least one merged
-                // result actually carries a detectable price. When NO result has a
-                // price (the normal web-snippet case), demoting every price-less
-                // result would collapse a valid product query to zero results — so
-                // the bound stays ranking-only and the gap is reported via
-                // `ignored_constraints`. This replaces the old PRICE FAIL-OPEN branch
-                // that MUTATED `structured_constraints` (deleting the user's stated
-                // price bound), which misrepresented the query to downstream
-                // consumers (notably commerce/shopping). Extraction truth is now
-                // preserved regardless of upstream price availability.
+                // Price-aware demotion for results with no detectable price.
+                // When priced results exist (priced_result_count > 0), a no-price
+                // result is clearly not the product asked for — demote strongly (0.45).
+                // When NO result carries a parseable price (the normal web case),
+                // the bound would otherwise be a complete no-op. Still demote, but
+                // gently (0.7): a transactional query with a price bound describing
+                // a product category means a result with NO price signal at all is
+                // very likely not a product page. This makes the bound MEANINGFUL at
+                // ranking time without collapsing results to zero. Generic; no
+                // hardcoded merchants or domains.
                 if priced_result_count > 0 {
                     relevance *= 0.45;
+                } else {
+                    relevance *= 0.7;
                 }
             }
         }
