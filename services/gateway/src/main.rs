@@ -3509,6 +3509,83 @@ fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
     if dst.image.is_none() { dst.image = src.image.clone(); }
 }
 
+/// Extract visible text from the title, meta description, and first paragraph
+/// only — NOT the full body. This is the conservative scope for the
+/// text-based commerce fallback: we only guess a price when it appears in
+/// the page's headline metadata or opening paragraph, never from arbitrary
+/// body text (which may mention prices in passing, e.g. a blog article).
+fn strip_html_to_text(html: &str) -> String {
+    // Extract ONLY title + meta description + first paragraph — NOT the full body.
+    // This is the conservative scope for the text-based commerce fallback.
+    let mut pieces: Vec<String> = Vec::new();
+
+    // 1. Page title.
+    static TITLE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let title_re = TITLE_RE.get_or_init(|| regex::Regex::new(r#"(?i)<title[^>]*>(.*?)</title>"#).unwrap());
+    if let Some(caps) = title_re.captures(html) {
+        let raw = caps.get(1).unwrap().as_str();
+        let decoded = decode_html_entities(raw);
+        pieces.push(decoded.trim().to_string());
+    }
+
+    // 2. Meta description (name="description" or property="og:description" or itemprop="description").
+    static META_DESC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let meta_re = META_DESC_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)<meta\s+(?:name|property|itemprop)\s*=\s*["'](?:description|og:description|product:description)["'][^>]*\s+content\s*=\s*["'](.*?)["']"#).unwrap()
+    });
+    if let Some(caps) = meta_re.captures(html) {
+        let raw = caps.get(1).unwrap().as_str();
+        let decoded = decode_html_entities(raw);
+        pieces.push(decoded.trim().to_string());
+    }
+
+    // 3. First paragraph (first <p> tag with substantial text).
+    static P_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let p_re = P_RE.get_or_init(|| regex::Regex::new(r#"(?i)<p[^>]*>(.*?)</p>"#).unwrap());
+    if let Some(caps) = p_re.captures(html) {
+        let raw = caps.get(1).unwrap().as_str();
+        // Strip any remaining inner tags from the paragraph.
+        let stripped = regex::Regex::new(r"<[^>]*>").unwrap().replace_all(raw, "").to_string();
+        let decoded = decode_html_entities(&stripped);
+        let trimmed = decoded.trim().to_string();
+        if !trimmed.is_empty() {
+            pieces.push(trimmed);
+        }
+    }
+
+    // Join pieces with spaces and collapse whitespace.
+    let combined = pieces.join(" ");
+    collapse_whitespace(&combined)
+}
+
+/// Decode common HTML entities in-place.
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", """)
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+}
+
+/// Collapse runs of whitespace into single spaces and trim.
+fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = true;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
 fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     let mut facts = OfferFacts::default();
     let mut source: Option<String> = None;
@@ -3576,6 +3653,8 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
             source = Some("extracted_from_text".to_string());
         }
     }
+
+
 
     // 6) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
@@ -4225,6 +4304,31 @@ async fn enrich_with_commerce<F, Fut>(
                         }
                         Err(_) => {}
                     }
+                } else if offer.data.as_ref().map(|d| d.price.is_none() && d.price_low.is_none()).unwrap_or(false)
+                    && offer.source.as_deref() != Some("text_extracted")
+                {
+                    // Secondary: text-based price extraction from visible page content.
+                    // When structured extraction (JSON-LD, OG, microdata, MF2, HTML patterns)
+                    // found nothing, strip tags and scan visible text for currency patterns.
+                    // This catches JS-rendered or non-markup product pages that still display
+                    // prices in visible text. Pure supplement — only sets price + currency.
+                    let text = strip_html_to_text(&h);
+                    if !text.is_empty() {
+                        if let Some(price_info) = extract_price_from_text(&text) {
+                            let mut fallback_facts = OfferFacts::default();
+                            fallback_facts.price = Some(price_info.amount);
+                            fallback_facts.currency = Some(price_info.currency);
+                            let fallback_offer = CommerceBlock {
+                                url: Some(url.clone()),
+                                observed_at: Some(now_unix_string()),
+                                source: Some("text_extracted".to_string()),
+                                data: Some(fallback_facts),
+                            };
+                            if let Ok(v) = serde_json::to_value(&fallback_offer) {
+                                r["commerce"] = v;
+                            }
+                        }
+                    }
                 }
             }
             None => {}
@@ -4274,6 +4378,32 @@ fn enrich_single_commerce(
     if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
         if let Ok(v) = serde_json::to_value(&offer) {
             r["commerce"] = v;
+        }
+    } else if offer.data.as_ref().map(|d| d.price.is_none() && d.price_low.is_none()).unwrap_or(false)
+        && offer.source.as_deref() != Some("text_extracted")
+    {
+        // Secondary: text-based price extraction from title, meta description,
+        // and first paragraph only. When structured extraction (JSON-LD, OG,
+        // microdata, MF2, HTML patterns) found nothing, scan the visible
+        // headline text for currency patterns. This catches JS-rendered or
+        // non-markup product pages that display prices in visible text.
+        // Pure supplement — only sets price + currency.
+        let text = strip_html_to_text(html);
+        if !text.is_empty() {
+            if let Some(price_info) = extract_price_from_text(&text) {
+                let mut fallback_facts = OfferFacts::default();
+                fallback_facts.price = Some(price_info.amount);
+                fallback_facts.currency = Some(price_info.currency);
+                let fallback_offer = CommerceBlock {
+                    url: Some(url.clone()),
+                    observed_at: Some(now_unix_string()),
+                    source: Some("text_extracted".to_string()),
+                    data: Some(fallback_facts),
+                };
+                if let Ok(v) = serde_json::to_value(&fallback_offer) {
+                    r["commerce"] = v;
+                }
+            }
         }
     }
     r["commerce_provenance"] = provenance;
