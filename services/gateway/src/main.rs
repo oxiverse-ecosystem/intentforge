@@ -2680,7 +2680,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             // negative path already applies (is_exclusion_grammar_noise) so both
             // directions share one vocabulary seed — structural, no per-query
             // literals, no new tuned list.
-            if is_exclusion_grammar_noise(pl) { continue; }
+            if is_exclusion_grammar_noise(&pl) { continue; }
             // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
             // extraction (e.g. "under 15000" / "below 2000" can leave the digits
             // in `positive` as "+15000"). A purely-numeric positive carries no
