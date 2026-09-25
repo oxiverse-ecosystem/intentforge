@@ -4133,6 +4133,48 @@ struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
 }
 
+/// Reserved, non-routable documentation domains (RFC 2606 §2 + RFC 6761).
+///
+/// A network's `fallback_url` (Sovrn `fbu`) is the destination a user is sent to
+/// when a link's bid does not clear the configured bid floor. If that value is a
+/// documentation placeholder, every such click lands on a dead/non-existent
+/// merchant — a fabricated destination presented as a real one, which is
+/// exactly the product-misrepresentation the commerce contract forbids.
+///
+/// This is a check against IANA-reserved names, NOT a list of merchants: it
+/// hardcodes no merchant, network, or query, and any genuinely configured
+/// fallback passes untouched. The reserved set is a published standard, so this
+/// stays data-driven in spirit — the operator's real fallback still lives in
+/// `data/commerce/affiliate.json`.
+const RESERVED_DOCUMENTATION_DOMAINS: &[&str] = &[
+    // RFC 2606 §2 — reserved for documentation/examples.
+    "example.com",
+    "example.net",
+    "example.org",
+    // RFC 6761 — special-use TLDs plus the reserved `example` label.
+    "example",
+    "test",
+    "invalid",
+    "localhost",
+];
+
+/// True when `url`'s host is (or is a subdomain of) an IANA-reserved
+/// documentation domain, i.e. it cannot be a real merchant destination.
+/// Returns `true` for unparseable/host-less input: a fallback we cannot even
+/// resolve is treated as unusable rather than shipped.
+fn is_reserved_placeholder_url(url: &str) -> bool {
+    let host = match reqwest::Url::parse(url) {
+        Ok(u) => match u.host_str() {
+            Some(h) => h.trim_end_matches('.').to_ascii_lowercase(),
+            None => return true,
+        },
+        Err(_) => return true,
+    };
+    RESERVED_DOCUMENTATION_DOMAINS
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{}", d)))
+}
+
 impl AffiliateCtx {
     /// Load networks from the data file. An empty/missing file is NOT fatal: the
     /// engine simply has no networks and every result degrades to `affiliate:
@@ -4152,7 +4194,21 @@ impl AffiliateCtx {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
                         for n in arr {
-                            if let Ok(net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                            if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                                // Never accept a non-routable documentation domain as
+                                // a real merchant fallback. Dropping the FIELD (not the
+                                // whole network) keeps the network usable for wrapping
+                                // while guaranteeing no click is ever routed to a
+                                // fabricated destination.
+                                if let Some(fbu) = net.fallback_url.clone() {
+                                    if is_reserved_placeholder_url(&fbu) {
+                                        tracing::warn!(
+                                            network = %net.id,
+                                            "affiliate: ignoring reserved placeholder fallback_url (RFC 2606/6761 documentation domain)"
+                                        );
+                                        net.fallback_url = None;
+                                    }
+                                }
                                 networks.push(net);
                             }
                         }

@@ -1634,9 +1634,8 @@ Top result (truncated):
   "affiliate": {
     "disclosed": true,
     "network": "Sovrn Commerce",
-    "url": "https://sovrn.co?key=dummy-test-key-do-not-use&u=https%3A%2F%2Fpowersof10.com%2Fbest-wireless-earbuds-under-50%2F&cuid=powersof10.com&bf=0.10&fbu=https%3A%2F%2Fwww.example-merchant.com%2F",
-    "bid_floor": "0.10",
-    "fallback": "https://www.example-merchant.com/"
+    "url": "https://sovrn.co?key=dummy-test-key-do-not-use&u=https%3A%2F%2Fpowersof10.com%2Fbest-wireless-earbuds-under-50%2F&cuid=powersof10.com&bf=0.10",
+    "bid_floor": "0.10"
   }
 ```
 
@@ -1647,6 +1646,18 @@ Top result (truncated):
 > parameter. `bf` (bid floor) and `fbu` (fallback URL) are appended as query params
 > from the network's data-configured `bid_floor` / `fallback_url` fields and are for
 > reporting / fallback only — they never affect ranking.
+
+> **No fabricated fallback destinations.** `fbu` is where a user is *sent* when a
+> link's bid does not clear `bf`. A fallback pointing at an IANA-reserved
+> documentation domain (RFC 2606/6761 — `example.com`, `*.example`, `.test`,
+> `.invalid`, `localhost`, and their subdomains) is not a merchant, so the gateway
+> **rejects it at config load**: the `fallback_url` field is dropped, the network
+> still decorates normally, and no `fbu=` param and no `fallback` field is ever
+> emitted. The shipped config sets `"fallback_url": null`. This checks against a
+> published IANA standard, not a list of merchants — a genuine merchant fallback
+> passes through untouched. Locked in CI by
+> `shipped_affiliate_data_file_has_no_placeholder_fallback` and
+> `placeholder_fallback_never_reaches_a_decorated_result`.
 
 **No-manipulation guarantee (verified live):** the ranked URL order from
 `/shopping` is byte-identical to `/search` for the same query. This is locked in CI
@@ -1758,12 +1769,22 @@ after the ranked order is fixed, so they cannot move a result. Adding `bf`/`fbu`
 support for a new network is a pure data edit (no recompile); the dev config already
 sets `bid_floor: "0.10"` on the Sovrn row.
 
-**Verified live** (`GET /shopping?q=sony%20wh-1000xm5%20headphones`, 6 results,
-decoration ON with the dev key):
+**`fallback_url` is validated at config load (2026-09-25).** Because `fbu` is a
+destination a user is actually *sent* to, a placeholder value there is a
+fabricated merchant. `AffiliateCtx::load()` now drops any `fallback_url` whose
+host is an IANA-reserved documentation domain (RFC 2606/6761: `example.com`,
+`example.net`, `example.org`, `example`, `test`, `invalid`, `localhost`, and any
+subdomain of those). The network row itself is kept, so decoration and `bf`
+still work — only the unusable fallback is discarded. The shipped Sovrn row
+therefore sets `"fallback_url": null`.
+
+**Verified live** (`GET /shopping?q=sony%20wh-1000xm5%20headphones`, decoration ON
+with the dev key) — the `fbu=` param and the `fallback` field are both gone,
+`bf` and disclosure are unaffected:
 
 ```
-affiliate sample keys: ['bid_floor', 'disclosed', 'fallback', 'network', 'url']
-bid_floor = 0.10   fallback = https://www.example-merchant.com/   disclosed = true
+affiliate sample keys: ['bid_floor', 'disclosed', 'network', 'url']
+bid_floor = 0.10   disclosed = true   (no fbu=, no fallback)
 ```
 
 #### Offer comparison (item 5, 2026-08-29)

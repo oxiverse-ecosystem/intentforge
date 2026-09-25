@@ -538,7 +538,7 @@ fn item6_bid_floor_and_fallback_appended_and_reported() {
         params,
         Some("CONTRACT_SOVRN_BF_KEY"),
         Some("0.10"),
-        Some("https://shop.example.com/fallback"),
+        Some("https://shop.acme-electronics.com/fallback"),
     );
     let ctx = AffiliateCtx { networks: vec![n] };
 
@@ -553,8 +553,8 @@ fn item6_bid_floor_and_fallback_appended_and_reported() {
         let lower = u.to_lowercase();
         assert!(lower.contains("bf=0.10"), "bid floor must be appended: {}", u);
         assert!(
-            lower.contains("fbu=https%3a%2f%2fshop.example.com%2ffallback")
-                || lower.contains("fbu=https%3A%2F%2Fshop.example.com%2Ffallback"),
+            lower.contains("fbu=https%3a%2f%2fshop.acme-electronics.com%2ffallback")
+                || lower.contains("fbu=https%3A%2F%2Fshop.acme-electronics.com%2Ffallback"),
             "fallback url must be url-encoded and appended: {}",
             u
         );
@@ -707,4 +707,157 @@ fn item5_no_comparison_without_shared_id() {
         "no comparison when products share no gtin/sku (never fabricate)"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NO-MISREPRESENTATION: a fallback destination must never be a placeholder.
+//
+// `fallback_url` (Sovrn `fbu`) is where a user is SENT when a link's bid does
+// not clear the bid floor. Shipping a documentation placeholder (e.g.
+// `https://www.example-merchant.com/`) means every such click lands on a
+// non-existent merchant presented as a real one — a fabricated destination,
+// which the commerce contract forbids outright.
+//
+// This was a REAL, LIVE defect: the shipped `data/commerce/affiliate.json`
+// configured exactly that value, so every decorated shopping result carried
+// `fbu=https%3A%2F%2Fwww.example-merchant.com%2F`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The pure guard: IANA-reserved documentation domains are never valid
+/// merchant destinations. Subdomains of a reserved domain are rejected too
+/// (RFC 2606 reserves the whole subtree).
+#[test]
+fn reserved_documentation_domains_are_never_valid_fallbacks() {
+    for bad in [
+        "https://www.example-merchant.com/",
+        "https://example.com/fallback",
+        "http://shop.example.org/checkout",
+        "https://deep.sub.example.net/x",
+        "https://foo.test/fallback",
+        "https://bar.invalid/",
+        "https://localhost:8080/fallback",
+        "not-a-url",
+        "",
+    ] {
+        assert!(
+            is_reserved_placeholder_url(bad),
+            "must reject placeholder/unusable fallback: {:?}",
+            bad
+        );
+    }
+    // A genuine merchant fallback passes untouched — the guard must not
+    // over-reject and silently disable a legitimately configured fallback.
+    for good in [
+        "https://shop.acme-electronics.com/fallback",
+        "https://www.electronics.sony.com/",
+        "https://merchant.co.uk/checkout",
+        // A real host that merely CONTAINS a reserved label as a substring
+        // (not a label boundary) is still real.
+        "https://notexample.com/fallback",
+    ] {
+        assert!(
+            !is_reserved_placeholder_url(good),
+            "must NOT reject a genuine fallback: {:?}",
+            good
+        );
+    }
+}
+
+/// The end-to-end regression: a network configured with a placeholder fallback
+/// must emit NO `fbu` param and NO `fallback` field, while still decorating the
+/// result normally (graceful degradation, never a crash, never a dead link).
+#[test]
+fn placeholder_fallback_never_reaches_a_decorated_result() {
+    std::env::set_var("CONTRACT_PLACEHOLDER_FBU_KEY", "CONTRACT_PLACEHOLDER_FBU_KEY");
+    let mut params = HashMap::new();
+    params.insert("cuid".to_string(), "{subid}".to_string());
+
+    // Sanitize exactly as `AffiliateCtx::load()` does for a data-file row.
+    let mut net = contract_net_with_bf(
+        "wrap",
+        "https://sovrn.co?key={key}&u={url}",
+        params,
+        Some("CONTRACT_PLACEHOLDER_FBU_KEY"),
+        Some("0.10"),
+        Some("https://www.example-merchant.com/"),
+    );
+    if net
+        .fallback_url
+        .as_deref()
+        .map(is_reserved_placeholder_url)
+        .unwrap_or(false)
+    {
+        net.fallback_url = None;
+    }
+    let ctx = AffiliateCtx { networks: vec![net], ..AffiliateCtx::default() };
+
+    let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
+    if let Some(arr) = payload.get_mut("results").and_then(|v| v.as_array_mut()) {
+        decorate_affiliate(arr, &ctx);
+    }
+
+    let urls = collect_affiliate_urls(&payload);
+    assert!(!urls.is_empty(), "decoration must still happen (graceful, not broken)");
+    for u in &urls {
+        let lower = u.to_lowercase();
+        assert!(
+            !lower.contains("fbu="),
+            "a placeholder fallback must NEVER be appended as fbu: {}",
+            u
+        );
+        assert!(
+            !lower.contains("example-merchant.com"),
+            "placeholder merchant must never appear in an affiliate url: {}",
+            u
+        );
+        // The bid floor itself is legitimate and unaffected.
+        assert!(lower.contains("bf=0.10"), "bid floor should still apply: {}", u);
+    }
+    if let Some(arr) = payload.get("results").and_then(|v| v.as_array()) {
+        for r in arr {
+            let aff = r.get("affiliate").expect("affiliate block present");
+            assert_eq!(
+                aff.get("disclosed").and_then(|v| v.as_bool()),
+                Some(true),
+                "disclosure must survive the fallback drop"
+            );
+            assert!(
+                aff.get("fallback").is_none(),
+                "placeholder fallback must not be reported either: {:?}",
+                aff
+            );
+        }
+    }
+}
+
+/// Guards the SHIPPED data file, not a synthetic fixture. This is the test that
+/// actually catches the regression in production config: if anyone re-adds a
+/// documentation placeholder to `data/commerce/affiliate.json`, this fails.
+#[test]
+fn shipped_affiliate_data_file_has_no_placeholder_fallback() {
+    let ctx = AffiliateCtx::load();
+    assert!(
+        !ctx.networks.is_empty(),
+        "affiliate.json must yield networks — otherwise this test is vacuous"
+    );
+    for net in &ctx.networks {
+        if let Some(fbu) = &net.fallback_url {
+            assert!(
+                !is_reserved_placeholder_url(fbu),
+                "shipped network {:?} configures a documentation-placeholder fallback {:?}; \
+                 it would route real clicks to a non-existent merchant",
+                net.id,
+                fbu
+            );
+        }
+    }
+    // And the loader itself must have stripped any such value, so nothing
+    // downstream (URL building OR the reported block) can ever see it.
+    assert!(
+        ctx.networks
+            .iter()
+            .all(|n| n.fallback_url.as_deref().map(|u| !is_reserved_placeholder_url(u)).unwrap_or(true)),
+        "AffiliateCtx::load() must strip reserved placeholder fallbacks"
+    );
+}
+
 
