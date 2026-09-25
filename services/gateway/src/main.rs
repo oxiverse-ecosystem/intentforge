@@ -14365,6 +14365,22 @@ async fn handle_search(
     };
 
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+
+    // The upstream classifier can mistake causal/how-to language for a freshness
+    // label when the topic itself contains a food-safety adjective (e.g. "yogurt
+    // spoil faster"). Freshness is a recency intent only when the query carries an
+    // actual temporal signal; without one, preserve the natural-language intent
+    // shape instead of applying a freshness/date-sensitive ranking profile.
+    if intent.intent == "fresh" && derive_recency_window(&q.to_lowercase()).is_none() {
+        let ql = q.to_lowercase();
+        intent.intent = if ql.starts_with("how ") || ql.starts_with("how to ") {
+            "how-to".to_string()
+        } else if ql.starts_with("why ") || ql.starts_with("what causes") {
+            "informational".to_string()
+        } else {
+            intent.intent.clone()
+        };
+    }
     
     // Merge constraints parsed directly by the gateway to prevent any loss of operators
     let gateway_extracted = extract_gateway_constraints(&q_orig);
@@ -16244,6 +16260,12 @@ async fn handle_search(
         .filter(|t| !t.is_empty())
         .filter(|t| !is_exclusion_grammar_noise(t)) // F3 (2026-08-17): drop grammar-noise
         .filter(|t| !is_subjective_quality_term(t)) // DA/DB (2026-08-17): drop quality adjectives
+        // A negated `without <term>` clause is a manner/attribute request unless the
+        // term is otherwise a recognized topical entity. Apply the same frame guard
+        // used by gateway-derived exclusions to engine-role entities too; otherwise
+        // phrases such as "without duplicate charges" or "with no commercial
+        // experience" become hard content filters and collapse the result set.
+        .filter(|t| !is_manner_frame(&q_orig, t))
         .filter(|t| !is_verb_attribute_exclusion(t)) // V1: drop verb-led/attribute exclusions
         .filter(|t| {
             // D2 (2026-08-19): a bare "pay"/"paying" engine Exclusion is only a

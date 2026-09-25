@@ -2898,6 +2898,19 @@ async fn analyze_query(
         confidence = confidence.max(0.7);
     }
 
+    // A freshness label without an explicit temporal signal is not a freshness
+    // request. The linear probe can confuse ordinary causal/how-to vocabulary
+    // with recency; use the question shape as a safe fallback intent.
+    if intent == "fresh" && !has_temporal {
+        if ql.starts_with("how ") || ql.starts_with("how to ") {
+            intent = "how-to".to_string();
+            confidence = confidence.max(0.6);
+        } else if ql.starts_with("why ") || ql.starts_with("what causes") {
+            intent = "informational".to_string();
+            confidence = confidence.max(0.6);
+        }
+    }
+
     // Phase 3b: technical / documentation override. Developer doc queries like
     // "kubernetes ingress tls configuration" or "python asyncio event loop
     // explained" were being classified navigational at low confidence (0.37)
