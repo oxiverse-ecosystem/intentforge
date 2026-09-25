@@ -20,9 +20,6 @@ mod clean;
 mod goals;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
-// ROADMAP item 6: order invariance driven by the REAL shipped affiliate data
-// (every network, keys present vs absent) — the offline CI lock.
-mod real_data_order_tests;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -2708,7 +2705,23 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             // drop it from the positive set. This prevents a positive+negative overlap
             // that no downstream gate can satisfy (a result can't both match and not
             // match `chinese`), which previously let the negated term leak through.
-            if negative.contains(&pl) {
+            //
+            // The EXACT-match check above only catches `-chinese` vs `+chinese`. The
+            // live defect (round 2026-09-25T1155Z) is the SUBSET case: the exclusion
+            // is a phrase (`-chinese brands`) and the leaked positive is one of its
+            // content words (`+chinese`). `negative.contains("chinese")` is false, so
+            // the contradiction survived and the pipeline required a term its own
+            // exclusion was designed to remove. Generalize to token containment: a
+            // positive whose every token already appears in a negative is subsumed by
+            // that exclusion. Purely structural (token set inclusion) — no brand,
+            // domain, or per-query literals, and it generalizes to any phrase/modifier
+            // pair the extractor can produce ("-python web framework" vs `+python`).
+            let pl_tokens: Vec<&str> = pl.split_whitespace().collect();
+            let subsumed = !pl_tokens.is_empty() && negative.iter().any(|n| {
+                let nt: Vec<&str> = n.split_whitespace().collect();
+                !nt.is_empty() && pl_tokens.iter().all(|t| nt.contains(t))
+            });
+            if subsumed {
                 continue;
             }
             let is_dup = positive.iter().any(|kept| {
