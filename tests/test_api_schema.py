@@ -415,7 +415,13 @@ def test_commerce_extract_schema(session):
     )
     assert r.status_code == 200, f"POST /commerce/extract -> {r.status_code} {r.text[:300]}"
     body = r.json()
-    for field in ("price", "currency", "availability", "merchant", "source", "observed_at"):
-        assert field in body, f"POST /commerce/extract missing key '{field}'; have {sorted(body.keys())}"
-    assert body.get("price") == 29.99, f"POST /commerce/extract price should be 29.99; got {body.get('price')!r}"
-    assert body.get("currency") == "USD", f"POST /commerce/extract currency should be 'USD'; got {body.get('currency')!r}"
+    data = body.get("data")
+    assert isinstance(data, dict), (
+        f"POST /commerce/extract must return a provenance envelope with object data; got {body!r}"
+    )
+    for field in ("price", "currency", "availability", "merchant"):
+        assert field in data, f"POST /commerce/extract data missing key '{field}'; have {sorted(data.keys())}"
+    for field in ("source", "observed_at", "url"):
+        assert field in body, f"POST /commerce/extract missing provenance key '{field}'; have {sorted(body.keys())}"
+    assert data.get("price") == 29.99, f"POST /commerce/extract price should be 29.99; got {data.get('price')!r}"
+    assert data.get("currency") == "USD", f"POST /commerce/extract currency should be 'USD'; got {data.get('currency')!r}"

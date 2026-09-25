@@ -74,11 +74,6 @@ fn real_ctx() -> AffiliateCtx {
         !ctx.networks.is_empty(),
         "data/commerce/affiliate.json yielded no networks — invariance tests would be vacuous"
     );
-    assert!(
-        !ctx.exact_model_patterns.is_empty(),
-        "no exact-model eligibility patterns loaded — the monetization policy is data-driven \
-         and must ship in the data file"
-    );
     ctx
 }
 
@@ -122,10 +117,7 @@ fn real_data_order_is_invariant_for_every_network_key_on_and_off() {
     let all_networks: Vec<AffiliateNetwork> = ctx.networks.clone();
 
     for net in &all_networks {
-        let solo = AffiliateCtx {
-            networks: vec![net.clone()],
-            exact_model_patterns: ctx.exact_model_patterns.clone(),
-        };
+        let solo = AffiliateCtx { networks: vec![net.clone()] };
         let key = net.key_env.clone().unwrap_or_default();
         assert!(
             !key.is_empty(),

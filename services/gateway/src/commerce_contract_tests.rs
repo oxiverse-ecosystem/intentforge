@@ -94,14 +94,9 @@ fn collect_affiliate_urls(payload: &Value) -> Vec<String> {
 
 #[test]
 fn affiliate_policy_allows_exact_model_and_rejects_broad_product_query() {
-    let ctx = AffiliateCtx {
-        exact_model_patterns: vec![
-            r"(?i)^\s*(?:buy\s+)?iphone\s+\d{1,5}(?:\s+(?:pro|max|plus))*(?:\s+price)?\s*$".to_string(),
-        ],
-        ..AffiliateCtx::default()
-    };
+    let ctx = AffiliateCtx::default();
     assert!(ctx.is_exact_model_query("iphone 16 pro max price"));
-    assert!(ctx.is_exact_model_query("buy iphone 15 pro"));
+    assert!(ctx.is_exact_model_query("acme nova x7 headset"));
     assert!(!ctx.is_exact_model_query("best wireless earbuds under 50 dollars"));
     assert!(!ctx.is_exact_model_query("steel water bottle"));
 }
@@ -115,12 +110,7 @@ fn affiliate_policy_gate_decorates_exact_model_but_not_broad_query() {
         HashMap::new(),
         Some("EXACT_MODEL_POLICY_TEST_KEY"),
     );
-    let ctx = AffiliateCtx {
-        networks: vec![n],
-        exact_model_patterns: vec![
-            r"(?i)^\s*sony\s+[a-z0-9-]*\d[a-z0-9-]*\s*$".to_string(),
-        ],
-    };
+    let ctx = AffiliateCtx { networks: vec![n] };
 
     let exact = vec![json!({"url": "https://shop.example/product/sony-wh-1000xm5"})];
     let broad = vec![json!({"url": "https://shop.example/headphones"})];

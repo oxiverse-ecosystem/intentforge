@@ -4597,26 +4597,21 @@ fn default_priority() -> i64 {
 #[derive(Clone)]
 struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
-    /// Regex sources for the exact-product-model eligibility policy. These stay
-    /// as data (compiled at startup) so a new product family can be monetized by
-    /// editing JSON only — never by adding a brand/query branch in Rust.
-    exact_model_patterns: Vec<String>,
 }
 
 impl Default for AffiliateCtx {
     fn default() -> Self {
-        Self { networks: Vec::new(), exact_model_patterns: Vec::new() }
+        Self { networks: Vec::new() }
     }
 }
 
 impl AffiliateCtx {
-    /// Load networks and exact-model eligibility patterns from runtime data. An
-    /// empty/missing file is NOT fatal: the engine simply has no networks and
-    /// every result degrades to `affiliate: null`. This is intentional — affiliate
-    /// decoration is best-effort and must never break search.
+    /// Load networks from runtime data. An empty/missing file is NOT fatal: the
+    /// engine simply has no networks and every result degrades to
+    /// `affiliate: null`. This is intentional — affiliate decoration is
+    /// best-effort and must never break search.
     fn load() -> Self {
         let mut networks: Vec<AffiliateNetwork> = Vec::new();
-        let mut exact_model_patterns: Vec<String> = Vec::new();
         // Resolve the data path relative to the process cwd (container WORKDIR is
         // /app, app binary at /app/gateway; data baked at /app/data/commerce).
         let candidates = [
@@ -4634,51 +4629,46 @@ impl AffiliateCtx {
                             }
                         }
                     }
-                    if let Some(arr) = v
-                        .get("eligibility")
-                        .and_then(|e| e.get("exact_model_patterns"))
-                        .and_then(|p| p.as_array())
-                    {
-                        exact_model_patterns = arr
-                            .iter()
-                            .filter_map(|p| p.as_str().map(|s| s.to_string()))
-                            .collect();
-                    }
                 }
                 if !networks.is_empty() {
                     break;
                 }
             }
         }
-        // Ignore malformed policy patterns rather than taking the gateway down;
-        // monetization is strictly best-effort. Every valid regex is a generic
-        // matcher over runtime data, not a per-query branch in compiled code.
-        let valid_pattern_count = exact_model_patterns
-            .iter()
-            .filter(|p| regex::Regex::new(p).is_ok())
-            .count();
         networks.sort_by(|a, b| b.priority.cmp(&a.priority));
-        tracing::info!(
-            "affiliate: loaded {} network(s) and {} exact-model pattern(s) from data file",
-            networks.len(),
-            valid_pattern_count
-        );
-        Self { networks, exact_model_patterns }
+        tracing::info!("affiliate: loaded {} network(s) from data file", networks.len());
+        Self { networks }
     }
 
-    /// Sacred monetization gate: affiliate decoration is allowed only for an
-    /// exact product-model query. Broad category/product queries remain free and
-    /// receive no affiliate metadata. The policy is entirely data-driven; this
-    /// method only compiles and matches the regex sources.
+    /// Sacred monetization gate: affiliate decoration is allowed only for a
+    /// structurally identifiable exact product model. This deliberately derives
+    /// the policy from token shape rather than a maintained brand/family list:
+    /// a short query containing a model-bearing alphanumeric token (a standalone
+    /// number or an alphanumeric SKU) and no comparison/budget clause. The
+    /// policy therefore covers unknown/new brands without authored vocabulary.
     fn is_exact_model_query(&self, query: &str) -> bool {
-        self.exact_model_patterns
-            .iter()
-            .filter_map(|p| regex::Regex::new(p).ok())
-            // Policy regexes are compiled with anchors in tests/config, but a
-            // caller may omit them. `is_match` deliberately remains a substring
-            // match by default; an explicit full-query boundary is opt-in via
-            // anchors in the policy source itself.
-            .any(|re| re.is_match(query.trim()))
+        let normalized: Vec<String> = query
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '-').to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if normalized.len() < 2 || normalized.len() > 6 {
+            return false;
+        }
+        let has_model_token = normalized.iter().any(|t| {
+            let has_digit = t.chars().any(|c| c.is_ascii_digit());
+            let has_alpha = t.chars().any(|c| c.is_ascii_alphabetic());
+            let all_numeric = t.chars().all(|c| c.is_ascii_digit());
+            (all_numeric && t.len() <= 5) || (has_digit && has_alpha)
+        });
+        let broad_shape = normalized.iter().any(|t| {
+            matches!(
+                t.as_str(),
+                "best" | "top" | "under" | "below" | "over" | "between" | "versus" | "vs"
+                    | "alternative" | "alternatives" | "compare" | "comparison"
+            )
+        }) || extract_nl_price_bound(query).is_some();
+        has_model_token && !broad_shape
     }
 
     /// The first enabled network that has its required key present in the env.
