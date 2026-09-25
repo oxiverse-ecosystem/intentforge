@@ -296,6 +296,15 @@ services:
       - ./shared-signals/resolv-gateway.conf:/etc/resolv.conf:ro
       - ../data/geolite2:/var/lib/geolite2:ro
       - ./gateway/data/commerce:/app/data/commerce:ro
+      # FIX-IF-32: intent-confidence calibration coefficients, fitted by
+      # scripts/fit_intent_calibration.py against the labeled corpus. The
+      # gateway re-derives the reported confidence after applying its own
+      # intent overrides, so it needs the same coefficients the engine uses.
+      # Mounted read-only from the same artifact the engine bakes in, so the
+      # two can never disagree. If this file is absent the gateway reports
+      # `confidence_calibrated: false` rather than presenting an uncalibrated
+      # probe score as a probability.
+      - ./intent-engine/config/intent_calibration.json:/app/config/intent_calibration.json:ro
     network_mode: "service:gluetun"
     depends_on:
       gluetun:

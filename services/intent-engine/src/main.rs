@@ -120,6 +120,20 @@ pub struct IntentResponse {
     pub expanded_queries: Vec<String>,
     #[serde(default)]
     pub distribution: std::collections::HashMap<String, f32>, // calibrated probability distribution
+    /// FIX-IF-32: whether `confidence` is a calibrated probability that the
+    /// reported `intent` label is correct, or an explicitly-flagged
+    /// uncalibrated probe score. Consumers must not treat the two alike.
+    #[serde(default = "default_true")]
+    pub confidence_calibrated: bool,
+    /// FIX-IF-32: the uncalibrated probe probability for the reported label
+    /// (`distribution[intent]`). Preserved so the calibration can be audited
+    /// or re-fit without re-running the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_probability: Option<f32>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -164,6 +178,98 @@ struct ConfidenceConfig {
 }
 
 static CONFIG: OnceLock<IntentWeights> = OnceLock::new();
+
+// ─── Intent Confidence Calibration (FIX-IF-32) ─────────────────────
+//
+// The probe used to publish `confidence = base + margin*multiplier`, a
+// synthetic score that is NOT a probability of the label actually reported.
+// Measured against the project's own labeled corpus, the reported label
+// differed from the distribution argmax on 91% of rows and the number
+// separated right from wrong labels at AUC 0.555 -- chance.
+//
+// `IntentCalibration` is Platt scaling fitted by NLL against that corpus
+// (scripts/fit_intent_calibration.py) and stored as a runtime artifact, so it
+// is DATA, not a tuned constant, and can be refit as evidence grows. It maps
+// the engine's own p(reported label) onto the empirically measured probability
+// that the reported label is correct.
+//
+// HONESTY CONTRACT: when the artifact is missing or unreadable we do NOT fall
+// back to presenting the raw margin score as a probability. We report the
+// normalized probe score with `confidence_calibrated: false` so no consumer can
+// mistake an uncalibrated number for a calibrated one.
+#[derive(Debug, Deserialize, Clone)]
+struct IntentCalibration {
+    /// Platt slope on logit(p(reported label)).
+    slope: f64,
+    /// Platt intercept.
+    intercept: f64,
+}
+
+static CALIBRATION: OnceLock<Option<IntentCalibration>> = OnceLock::new();
+
+/// Logit, guarded away from the open interval so inf never reaches exp.
+fn safe_logit(p: f64) -> f64 {
+    let clamped = p.clamp(1e-6, 1.0 - 1e-6);
+    (clamped / (1.0 - clamped)).ln()
+}
+
+/// Map a probe probability to the calibrated probability that the label is
+/// correct. Returns `None` when no calibration artifact is loaded, which the
+/// caller must surface as `confidence_calibrated: false`.
+fn calibrated_confidence(p: f64) -> Option<f64> {
+    let cal = CALIBRATION.get()?.as_ref()?;
+    let z = cal.slope * safe_logit(p) + cal.intercept;
+    Some(1.0 / (1.0 + (-z).exp()))
+}
+
+/// The score the public API reports as `confidence`.
+///
+/// Calibrated when the artifact is present; otherwise the honest uncalibrated
+/// fallback (the raw probe probability) plus an explicit `false` flag. Never a
+/// synthetic margin formula dressed up as a probability.
+fn report_confidence(p: f64) -> (f32, bool) {
+    match calibrated_confidence(p) {
+        Some(v) => (v as f32, true),
+        None => (p as f32, false),
+    }
+}
+
+/// Apply a lexical override to the label AND the distribution, atomically.
+///
+/// FIX-IF-32: previously an override rewrote `intent` and then clamped a
+/// synthetic scalar with `.max(0.9)`, leaving `distribution` still pointing at
+/// the old class. That is why the reported number described a label the API
+/// never returned (91% of the labeled corpus). Moving probability mass to the
+/// new label keeps label and distribution consistent, so the confidence
+/// derived from `distribution[intent]` genuinely describes the label we report.
+///
+/// `decisive` marks a marker that is unambiguous on its own (an explicit "vs",
+/// a "how to" imperative). Decisive overrides swap the top label; non-decisive
+/// ones blend toward it. Mass is moved, never invented: the winner's excess
+/// over the newcomer is what gets transferred, so the distribution still sums
+/// to ~1 and no probability is fabricated.
+fn apply_lexical_override(
+    distribution: &mut std::collections::HashMap<String, f32>,
+    current: &str,
+    new_label: &str,
+    decisive: bool,
+) {
+    if current == new_label {
+        return;
+    }
+    let cur_p = distribution.get(current).copied().unwrap_or(0.0);
+    let new_p = distribution.get(new_label).copied().unwrap_or(0.0);
+    if decisive {
+        // The newcomer becomes the winner, inheriting the outgoing label's mass.
+        distribution.insert(new_label.to_string(), cur_p.max(new_p));
+        distribution.insert(current.to_string(), new_p);
+    } else {
+        // Blend: the newcomer closes most of the gap to the leader.
+        let target = (cur_p + new_p) / 2.0;
+        distribution.insert(new_label.to_string(), target.max(new_p));
+        distribution.insert(current.to_string(), cur_p - (target - new_p));
+    }
+}
 
 // ─── Constraint Extraction (Algorithmic) ────────────────────────────
 // Extracts positive and negative constraints from natural language queries.
@@ -1478,7 +1584,12 @@ fn linear_classify(
     let intent = weights.labels[winner_idx].clone();
 
     let conf = &weights.confidence;
-    let confidence = (conf.base as f32 + margin as f32 * conf.margin_multiplier as f32).clamp(0.0, 1.0);
+    // The synthetic margin score `base + margin*multiplier` is RETAINED, but
+    // only as an internal decision signal for the override gates below -- it is
+    // NOT what the API reports as `confidence`. It is not a probability: it is
+    // unnormalized with respect to the 8-class softmax and, once lexical
+    // overrides rewrite the label, it describes a class the API never returns.
+    let margin_score = (conf.base as f32 + margin as f32 * conf.margin_multiplier as f32).clamp(0.0, 1.0);
 
     let mut intent = weights.labels[winner_idx].clone();
 
@@ -1488,17 +1599,21 @@ fn linear_classify(
     // Raised from 0.35 to 0.55: a navigational that wins at only 0.37 is a
     // weak over-prediction (see audit — "kubernetes ingress tls configuration"
     // was classified navigational @0.374 with how-to 0.24 right behind it).
-    if confidence < 0.55 && intent != "informational" {
+    //
+    // FIX-IF-32: this gate reads the MARGIN score, not the reported confidence,
+    // so moving the reported number onto a calibrated scale cannot silently
+    // change which queries get demoted to `informational`.
+    if margin_score < 0.55 && intent != "informational" {
         intent = "informational".to_string();
     }
 
     tracing::info!(
-        "linear_classify: intent={} (conf={:.3}) margin={:.3} probs=[{}]",
-        intent, confidence, margin,
+        "linear_classify: intent={} (margin_score={:.3} margin={:.3} p_top1={:.3}) probs=[{}]",
+        intent, margin_score, margin, top1,
         weights.labels.iter().enumerate().map(|(i, l)| format!("{}={:.3}", l, probs[i])).collect::<Vec<_>>().join(" ")
     );
 
-    (intent, confidence, distribution)
+    (intent, margin_score, distribution)
 }
 
 
@@ -2652,6 +2767,41 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("CONFIG already initialized"))?;
     tracing::info!("Linear probe weights loaded successfully");
 
+    // ── Load intent-confidence calibration (FIX-IF-32) ──
+    // Optional by design: a missing artifact must NOT crash the engine, and it
+    // must NOT silently degrade to reporting the old synthetic margin score as
+    // if it were a probability. Absent artifact => `confidence_calibrated:
+    // false` on every response, which is the honest state.
+    let calib_path = "./config/intent_calibration.json";
+    let calibration = match std::fs::File::open(calib_path) {
+        Ok(f) => match serde_json::from_reader::<_, IntentCalibration>(f) {
+            Ok(c) => {
+                tracing::info!(
+                    "Intent confidence calibration loaded from {} (slope={:.4} intercept={:.4})",
+                    calib_path, c.slope, c.intercept
+                );
+                Some(c)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Calibration artifact {} present but unparseable ({}) — reporting \
+                     UNCALIBRATED confidence (confidence_calibrated=false)",
+                    calib_path, e
+                );
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                "No calibration artifact at {} ({}) — reporting UNCALIBRATED confidence \
+                 (confidence_calibrated=false). Run scripts/fit_intent_calibration.py to create it.",
+                calib_path, e
+            );
+            None
+        }
+    };
+    let _ = CALIBRATION.set(calibration);
+
     let device = Device::Cpu;
 
     let bert_path = "./models/model.safetensors";
@@ -2781,7 +2931,7 @@ async fn analyze_query(
     // ── Linear probe classification ──
     // Uses logistic regression weights trained on calibration_benchmark_200.csv
     let weights = CONFIG.get().expect("weights not loaded");
-    let (intent, confidence, distribution) = query_embedding.as_ref()
+    let (intent, margin_score, mut distribution) = query_embedding.as_ref()
         .map(|emb| linear_classify(emb, weights))
         .unwrap_or_else(|| {
             let mut d = std::collections::HashMap::new();
@@ -2796,7 +2946,10 @@ async fn analyze_query(
     // When a high-precision lexical marker is present we override/boost the
     // model so the API contract holds: "vs" ⇒ comparison, "how to" ⇒ how-to.
     let mut intent = intent;
-    let mut confidence = confidence;
+    // FIX-IF-32: this is the INTERNAL margin score, used only by the override
+    // gates below to decide when the probe is unsure enough for a lexical rule
+    // to take over. It is deliberately NOT the number the API reports.
+    let mut margin_score = margin_score;
     let ql = normalized.to_lowercase();
     let has_vs = ql.contains(" vs ") || ql.contains(" versus ")
         || ql.starts_with("vs ") || ql.starts_with("versus ");
@@ -2806,9 +2959,8 @@ async fn analyze_query(
     if has_vs || has_or_compare {
         if intent != "comparison" {
             tracing::info!("Lexical override: 'vs'/'or' marker ⇒ comparison (was {})", intent);
+            apply_lexical_override(&mut distribution, &intent, "comparison", true);
             intent = "comparison".to_string();
-            // High confidence: lexical comparison markers are unambiguous.
-            confidence = confidence.max(0.9);
         }
     }
     // "better than" / "worse than" / "faster than" ⇒ explicit comparison between
@@ -2829,25 +2981,24 @@ async fn analyze_query(
     let has_better_than = comparison_than_markers.iter().any(|m| ql.contains(m));
     if has_better_than && intent != "comparison" {
         tracing::info!("Lexical override: 'better/worse/faster than' marker ⇒ comparison (was {})", intent);
+        apply_lexical_override(&mut distribution, &intent, "comparison", true);
         intent = "comparison".to_string();
-        confidence = confidence.max(0.9);
     }
     // "how to" / "how do i" / "how can i" / "how do you" ⇒ how-to.
-    // Raise confidence so it isn't misranked behind informational/navigational.
     let howto_markers = ["how to ", "how do i ", "how do you ", "how can i ",
                          "how can i ", "how to", "steps to ", "tutorial for "];
     let is_howto = howto_markers.iter().any(|m| ql.contains(m))
         || ql.starts_with("how to") || ql.starts_with("how do");
     if is_howto && intent == "how-to" {
-        // Boost weak how-to confidence to a more usable level.
-        confidence = confidence.max(0.6);
-        tracing::info!("Lexical boost: how-to confidence raised to {:.3}", confidence);
+        // FIX-IF-32: no `.max()` boost. The probe already put its mass on
+        // how-to; the reported confidence is derived from that mass, so there
+        // is nothing to inflate.
     } else if is_howto && intent != "how-to" {
         // Model missed the how-to signal — override when the lexical marker is clear.
         if ql.contains("how to") || ql.starts_with("how do") || ql.contains("steps to ") {
             tracing::info!("Lexical override: how-to marker ⇒ how-to (was {})", intent);
+            apply_lexical_override(&mut distribution, &intent, "how-to", true);
             intent = "how-to".to_string();
-            confidence = confidence.max(0.6);
         }
     }
 
@@ -2871,8 +3022,8 @@ async fn analyze_query(
     if is_chitchat {
         if intent != "chitchat" {
             tracing::info!("Lexical override: chitchat marker ⇒ chitchat (was {})", intent);
+            apply_lexical_override(&mut distribution, &intent, "chitchat", true);
             intent = "chitchat".to_string();
-            confidence = confidence.max(0.7);
         }
     }
 
@@ -2894,8 +3045,8 @@ async fn analyze_query(
         .count();
     if has_temporal && topic_token_count >= 1 && intent != "fresh" {
         tracing::info!("Temporal override: recency marker + topic ⇒ fresh (was {})", intent);
+        apply_lexical_override(&mut distribution, &intent, "fresh", true);
         intent = "fresh".to_string();
-        confidence = confidence.max(0.7);
     }
 
     // Phase 3b: technical / documentation override. Developer doc queries like
@@ -2943,8 +3094,8 @@ async fn analyze_query(
     let tech_trigger = code_token_count >= 1 && (has_tech_marker || token_count >= 2);
     if tech_trigger && intent != "technical" {
         tracing::info!("Lexical override: technical marker ⇒ technical (was {})", intent);
+        apply_lexical_override(&mut distribution, &intent, "technical", true);
         intent = "technical".to_string();
-        confidence = confidence.max(0.6);
     }
 
     // ── Step 2: Compress long queries before expansion ──
@@ -2958,7 +3109,19 @@ async fn analyze_query(
         tracing::info!("Query compressed: {:?} → {:?} (negation-aware)", normalized, expansion_input);
     }
 
-    let expanded = expand_queries(&expansion_input, &intent, confidence, contains_brand_or_proper_noun(&params.q), &structured);
+    // FIX-IF-32: derive the reported confidence from the probability mass that
+    // actually sits on the label we are about to report, AFTER every lexical
+    // override has moved that mass. This is the whole fix: previously the number
+    // was computed for the probe's argmax and then survived label rewrites, so
+    // on 91% of the labeled corpus it described a class the API never returned.
+    let probe_probability = distribution.get(&intent).copied().unwrap_or(0.0) as f64;
+    let (confidence, confidence_calibrated) = report_confidence(probe_probability);
+    tracing::info!(
+        "Reported intent={} probe_p={:.3} -> confidence={:.3} calibrated={}",
+        intent, probe_probability, confidence, confidence_calibrated
+    );
+
+    let expanded = expand_queries(&expansion_input, &intent, margin_score, contains_brand_or_proper_noun(&params.q), &structured);
     tracing::info!("Expanded to {} query variations", expanded.len());
 
     let result = IntentResponse {
@@ -2969,6 +3132,8 @@ async fn analyze_query(
         structured_constraints: structured,
         expanded_queries: expanded,
         distribution,
+        confidence_calibrated,
+        probe_probability: Some(probe_probability as f32),
     };
 
     state.intent_cache.insert(query_norm, result.clone()).await;

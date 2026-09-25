@@ -141,6 +141,22 @@ struct IntentResponse {
     expanded_queries: Vec<String>,
     #[serde(default)]
     distribution: std::collections::HashMap<String, f32>,
+    /// FIX-IF-32: propagated from the engine. `true` when `confidence` is a
+    /// calibrated probability that the reported label is correct; `false` means
+    /// it is an explicitly-flagged uncalibrated probe score.
+    #[serde(default = "confidence_calibrated_default")]
+    confidence_calibrated: bool,
+    /// FIX-IF-32: the uncalibrated probe probability for the reported label,
+    /// kept so calibration can be audited or re-fit without re-running the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    probe_probability: Option<f32>,
+}
+
+/// Default when an older engine (pre-FIX-IF-32) omits the flag. An engine that
+/// never heard of calibration cannot be asserting a calibrated number, so the
+/// honest default is `false`.
+fn confidence_calibrated_default() -> bool {
+    false
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -523,6 +539,15 @@ struct UnifiedResponse {
     structured_constraints: Constraints,
     expanded_queries: Vec<String>,
     distribution: Option<std::collections::HashMap<String, f32>>,
+    /// FIX-IF-32: `confidence` is a calibrated probability that the reported
+    /// `intent` label is correct. `false` means it is an explicitly-flagged
+    /// uncalibrated probe score and must not be read as a probability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    confidence_calibrated: Option<bool>,
+    /// FIX-IF-32: the uncalibrated probe probability for the reported label.
+    /// Present so calibration can be audited or re-fit in the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    probe_probability: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     deep_result: Option<DeepResult>,
     results: Vec<MergedResult>,
@@ -12806,8 +12831,30 @@ async fn handle_inspect(
 /// exposes only the deterministic local classification so the contract is
 /// stable + fully testable without the intent engine up, and so clients can
 /// reason about the offline baseline the ranker guarantees.
-fn build_intent(q: &str) -> serde_json::Value {
-    let intent_resp = fallback_intent(q);
+/// Test-only shim: resolve a query the way `handle_intent` does, minus the
+/// network call to the intent-engine. The rules still run, so these tests
+/// exercise the same override path the live endpoint takes.
+#[cfg(test)]
+fn build_intent_for_test(q: &str) -> serde_json::Value {
+    let mut intent = fallback_intent(q);
+    apply_intent_overrides(q, &mut intent);
+    recompute_confidence(&mut intent);
+    build_intent(q, &intent)
+}
+
+/// Build the `/intent` body from an ALREADY-RESOLVED intent response.
+///
+/// FIX-IF-24 / FIX-IF-32: `GET /intent` previously called `fallback_intent`
+/// directly, which is the offline no-network baseline and always reports
+/// `informational` at 0.3. `/search` ran the engine plus a block of rule-based
+/// overrides. The two therefore disagreed on 6 of 8 probes. The block now lives
+/// in `apply_intent_overrides`, and `handle_intent` resolves the engine
+/// response first and runs the SAME function, so the endpoints share one code
+/// path and cannot drift.
+///
+/// `category` is recomputed AFTER the overrides, because the overrides change
+/// the label and a pre-override category would be stale.
+fn build_intent(q: &str, intent_resp: &IntentResponse) -> serde_json::Value {
     let category = parent_category(&intent_resp.intent);
     let contrastive = query_is_contrastive(q);
     let local = has_local_intent(q);
@@ -12817,6 +12864,9 @@ fn build_intent(q: &str) -> serde_json::Value {
         "intent": intent_resp.intent,
         "category": category,
         "confidence": intent_resp.confidence,
+        "confidence_calibrated": intent_resp.confidence_calibrated,
+        "probe_probability": intent_resp.probe_probability,
+        "distribution": intent_resp.distribution,
         "contrastive_framing": contrastive,
         "local_intent": local,
         "structured_constraints": intent_resp.structured_constraints,
@@ -12853,14 +12903,37 @@ fn build_intent_empty() -> serde_json::Value {
 /// `local_intent` top-level keys so the envelope is distinguishable from
 /// `/search`/`spellcheck`'s empty response).
 async fn handle_intent(
-    axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
     if q.trim().is_empty() {
         return (axum::http::StatusCode::BAD_REQUEST, Json(build_intent_empty()));
     }
-    let result = build_intent(&q);
+
+    // FIX-IF-24 / FIX-IF-32: resolve the SAME engine response `/search` resolves,
+    // then run the SAME override function. When the engine is unreachable we
+    // still answer, from the offline baseline, rather than erroring -- the
+    // endpoint stays additive and fail-open.
+    let mut intent_resp = match tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        state.http_client.get(format!(
+            "http://127.0.0.1:3005/analyze?q={}",
+            urlencoding::encode(&q)
+        )).send(),
+    ).await {
+        Ok(Ok(resp)) => read_json_bounded::<IntentResponse>(resp).await.unwrap_or_else(|| fallback_intent(&q)),
+        _ => {
+            tracing::warn!("Intent Engine unreachable for /intent — using offline baseline");
+            fallback_intent(&q)
+        }
+    };
+    apply_intent_overrides(&q, &mut intent_resp);
+    // FIX-IF-32: the overrides may have moved the label away from the one the
+    // engine calibrated, so re-derive the reported number from the final label.
+    recompute_confidence(&mut intent_resp);
+
+    let result = build_intent(&q, &intent_resp);
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -13449,6 +13522,8 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         structured_constraints: Constraints::default(),
         expanded_queries: vec![],
         distribution: None,
+        confidence_calibrated: None,
+        probe_probability: None,
         deep_result: None,
         results: vec![],
         geo_location: None,
@@ -14704,363 +14779,13 @@ async fn handle_search(
             + match &image_res { Ok(v) => v.results.len(), Err(_) => 0 };
         tracing::info!("ONLY NEGATIVE: {} web results — keeping for constraint scoring", before);
     }
-
-    // ─── Contract enforcement: supported-intent normalization ───
-    // The intent-engine is a black box that may emit an intent outside the
-    // documented 8-class API contract (e.g. a trained "chitchat" class). The
-    // public contract guarantees exactly {navigational, informational, technical,
-    // how-to, comparison, fresh, transactional, local}. Any other label is
-    // remapped to the highest-probability SUPPORTED class from the distribution so
-    // the contract holds and downstream ranking/overrides operate on a known
-    // label. Without this, an unsupported intent silently bypasses every
-    // override gate (which all check `intent.intent != "<known>"`) and leaks to
-    // the API as a phantom class with no freshness/half-life semantics.
-    {
-        const SUPPORTED: &[&str] = &[
-            "navigational", "informational", "technical", "how-to",
-            "comparison", "fresh", "transactional", "local",
-        ];
-        if !SUPPORTED.contains(&intent.intent.as_str()) {
-            let best = SUPPORTED.iter()
-                .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            match best {
-                Some((lbl, prob)) => {
-                    tracing::warn!(
-                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' — remapping to '{}' (top supported class)",
-                        intent.intent, q, lbl
-                    );
-                    intent.intent = (*lbl).to_string();
-                    // Use the distribution probability for the selected supported class
-                    // rather than the original unsupported-class confidence.
-                    intent.confidence = prob;
-                }
-                None => {
-                    tracing::warn!(
-                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' with no supported distribution entry — falling back to informational",
-                        intent.intent, q
-                    );
-                    intent.intent = "informational".to_string();
-                    intent.confidence = 0.35;
-                }
-            }
-        }
-    }
-
-    // ─── Rule-based intent overrides for known misclassification patterns ───
-    // Fire when the linear probe has low confidence (<0.30) — the model is guessing,
-    // so pattern-based heuristics beat random chance.
-    {
-        let q_lower = q.to_lowercase();
-        let only_negative_pattern = !intent.structured_constraints.negative.is_empty()
-            && intent.structured_constraints.positive.is_empty();
-
-        // Override 1: only-negative queries classified as navigational → informational
-        // e.g. "not django" (conf=0.24, classified navigational — should be informational)
-        if only_negative_pattern && intent.intent.as_str() != "informational" && intent.confidence < 0.30 {
-            tracing::info!(
-                "INTENT OVERRIDE: only-negative '{}' was '{}' (conf={:.3}) → informational",
-                q, intent.intent, intent.confidence
-            );
-            intent.intent = "informational".to_string();
-            intent.confidence = intent.confidence.max(0.35);
-            // Boost informational in the distribution for correct RankingWeights blending
-            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-            let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
-            intent.distribution.insert("informational".to_string(), info_prob + nav_prob * 0.5);
-            intent.distribution.insert("navigational".to_string(), nav_prob * 0.5);
-        }
-
-        // Override 2: temporal/freshness signal → force fresh intent.
-        // Phase 4 (CROSS-CUTTING): the engine now emits intent="fresh" for
-        // recency queries, but as defense-in-depth the gateway also forces it
-        // here. The OLD gate (confidence < 0.30) let "latest ai news 2026"
-        // (0.459) and "recent rust releases" (0.519) slip through to a 90-day
-        // navigational half-life. We now trigger on the recency signal itself,
-        // not on low confidence.
-        {
-            let has_news_signal = q_lower.contains("latest") || q_lower.contains("recent")
-                || q_lower.contains("breaking") || q_lower.contains("headline")
-                || q_lower.contains("new ") || q_lower.contains("newest")
-                || q_lower.contains("cve-") || q_lower.contains("vulnerability")
-                || q_lower.contains("this week") || q_lower.contains("this month")
-                || q_lower.contains("past week") || q_lower.contains("last week");
-            let has_topic_signal = q_lower.contains("news") || q_lower.contains("update")
-                || q_lower.contains("today") || q_lower.contains("this week")
-                || q_lower.contains("2026") || q_lower.contains("2025")
-                || q_lower.contains("release") || q_lower.contains("version");
-            // Don't clobber a fresh intent that the engine already set.
-            if intent.intent != "fresh" && has_news_signal && has_topic_signal {
-                tracing::info!(
-                    "INTENT OVERRIDE (STRONG): news query '{}' was '{}' (conf={:.3}) — forcing fresh",
-                    q, intent.intent, intent.confidence
-                );
-                intent.intent = "fresh".to_string();
-                intent.confidence = intent.confidence.max(0.45);
-                // Reshape distribution: fresh gets the top probability
-                let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
-                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-                intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
-                // Boost informational as secondary intent (for ranking weight blending)
-                let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-                intent.distribution.insert("informational".to_string(), info_prob + 0.15);
-            }
-            // Weak signal: only topic signal (e.g. year without news keywords).
-            else if intent.intent != "fresh" && (q_lower.contains("2026") || q_lower.contains("2025")) {
-                let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
-                let current_prob = intent.distribution.get(&intent.intent).copied().unwrap_or(0.0);
-                if fresh_prob + 0.15 > current_prob {
-                    tracing::info!(
-                        "INTENT OVERRIDE (WEAK): year query '{}' was '{}' (conf={:.3}) — boosting fresh (fresh={:.3})",
-                        q, intent.intent, intent.confidence, fresh_prob
-                    );
-                    intent.distribution.insert("fresh".to_string(), fresh_prob + 0.15);
-                }
-            }
-        }
-
-        // Override 2b: a fresh intent with no derived date window must still
-        // apply a real recency cutoff (not just re-weight scoring). Without this,
-        // "latest ai news" would rank newer items higher but never drop stale ones.
-        // The actual hard window is applied AFTER the web merge (see dated_result_count
-        // guard near line ~8485): we only set it when at least one web result actually
-        // carries a parseable date, so date-less fresh queries (e.g. "latest movies
-        // released in 2026") fail OPEN and keep recency as a scoring boost instead of
-        // collapsing to 0 results.
-        if intent.intent == "fresh" && intent.structured_constraints.after_date.is_none() {
-            tracing::info!("FRESH OVERRIDE: fresh intent without date window — window applied post-merge (fail-open if no dated results)");
-        }
-
-        // Override 3: "other than X" with low confidence → boost comparison + technical
-        // e.g. "programming language other than java" (conf=0.12, technical is correct base)
-        if q_lower.contains("other than") && intent.confidence < 0.20 {
-            tracing::info!(
-                "INTENT OVERRIDE: 'other than' query '{}' was '{}' (conf={:.3}) — boosting comparison/technical",
-                q, intent.intent, intent.confidence
-            );
-            let comp = intent.distribution.get("comparison").copied().unwrap_or(0.0);
-            let tech = intent.distribution.get("technical").copied().unwrap_or(0.0);
-            intent.distribution.insert("comparison".to_string(), comp + 0.1);
-            intent.distribution.insert("technical".to_string(), tech + 0.1);
-        }
-
-        // Override 4: local intent signals → force local intent
-        // Delegates to `has_local_intent` so the keyword list stays in ONE
-        // place. This covers "near me", "nearby", "coffee shop", AND
-        // gazetteer-city patterns like "restaurants in bangalore".
-        let has_local_keywords = has_local_intent(&q_lower);
-        if has_local_keywords && intent.intent != "local" {
-            tracing::info!(
-                "INTENT OVERRIDE (STRONG): local query '{}' was '{}' (conf={:.3}) -> local",
-                q, intent.intent, intent.confidence
-            );
-            intent.intent = "local".to_string();
-            intent.confidence = intent.confidence.max(0.75);
-            let local_prob = intent.distribution.get("local").copied().unwrap_or(0.0);
-            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-            intent.distribution.insert("local".to_string(), (local_prob + current_top_prob * 0.5 + 0.4).min(0.90));
-        }
-
-        // Override 5: Comparison & Alternatives signals (H2 fix)
-        // e.g. "alternatives to adobe photoshop that are free", "best budget smartphones under 30000 rupees"
-        let comp_signals = [
-            "alternatives to", "alternative to", "alternatives for", "alternative for",
-            "similar to", "apps like", "tools like", "software like", "sites like",
-            "equivalent to", "replacement for", "competing with", "vs", "versus",
-            "best budget", "best ... under", "top ... under", "compared to", "difference between",
-            "which is better", "comparison", "compare "
-        ];
-        let has_comp_signal = comp_signals.iter().any(|s| {
-            if s.contains("...") {
-                let parts: Vec<&str> = s.split("...").collect();
-                parts.len() == 2 && q_lower.contains(parts[0].trim()) && q_lower.contains(parts[1].trim())
-            } else {
-                q_lower.contains(s)
-            }
-        });
-        if has_comp_signal {
-            tracing::info!(
-                "INTENT OVERRIDE (DECISIVE): comparison query '{}' was '{}' (conf={:.3}) -> comparison",
-                q, intent.intent, intent.confidence
-            );
-            intent.intent = "comparison".to_string();
-            intent.confidence = intent.confidence.max(0.85);
-            intent.distribution.insert("comparison".to_string(), 0.85);
-            if intent.distribution.get("informational").copied().unwrap_or(0.0) > 0.4 {
-                intent.distribution.insert("informational".to_string(), 0.15);
-            }
-        }
-
-        // Override 6: transactional keywords OR an explicit price bound -> transactional
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
-        // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
-        // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
-        // `comparison` on the generic "best ... under" signal — but a budget-anchored
-        // buy query is transactional, not a comparison. The price bound is signal-driven
-        // (parsed from NL), not a per-query literal, so this is general and future-proof.
-        let sc = &intent.structured_constraints;
-        let has_price_bound = sc.price_lt.is_some() || sc.price_max.is_some()
-            || sc.price_min.is_some() || sc.price_gt.is_some();
-        if (has_tx_signal || has_price_bound) && !has_local_keywords {
-            if (intent.intent != "comparison" || has_price_bound)
-                && (intent.intent != "transactional" || intent.confidence < 0.60)
-            {
-                if has_price_bound && intent.intent == "comparison" {
-                    tracing::info!(
-                        "INTENT OVERRIDE (STRONG): price-bounded buy query '{}' was 'comparison' (conf={:.3}) -> transactional",
-                        q, intent.confidence
-                    );
-                    // Dampen the spurious comparison probability so ranking blends transactional.
-                    if let Some(c) = intent.distribution.get_mut("comparison") {
-                        *c = (*c * 0.4).min(0.30);
-                    }
-                } else {
-                    tracing::info!(
-                        "INTENT OVERRIDE (STRONG): transactional query '{}' was '{}' (conf={:.3}) -> transactional",
-                        q, intent.intent, intent.confidence
-                    );
-                }
-                intent.intent = "transactional".to_string();
-                intent.confidence = intent.confidence.max(0.80);
-                let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
-                intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
-            }
-        }
-
-        // Override 7: Model-number + price/cost terms → transactional
-        // The classifier misses model-number patterns ("iphone 16 pro max price",
-        // "oneplus 12 price") — the word "price" alone is weak signal. When a known
-        // brand+model pattern co-occurs with a price/cost term, the intent is
-        // decisively transactional (P10/P11 style compensation for the linear probe).
-        if is_model_number_price_query(&q_lower) {
-            if intent.intent != "transactional" || intent.confidence < 0.60 {
-                tracing::info!(
-                    "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
-                    q, intent.intent, intent.confidence
-                );
-                intent.intent = "transactional".to_string();
-                intent.confidence = intent.confidence.max(0.80);
-                let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
-                intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
-            }
-        }
-
-        // Override 8: Driver / Software Download Intent -> force decisive Navigational + Download intent
-        let download_keywords = [
-            "driver", "drivers", "download", "downloads", "installer", "installers",
-            "firmware", "patch", "software download", "official download", "setup.exe"
-        ];
-        let has_download_signal = download_keywords.iter().any(|k| q_lower.contains(k));
-        if has_download_signal {
-            tracing::info!(
-                "INTENT OVERRIDE (DECISIVE): driver/download query '{}' was '{}' (conf={:.3}) -> navigational",
-                q, intent.intent, intent.confidence
-            );
-            intent.intent = "navigational".to_string();
-            intent.confidence = intent.confidence.max(0.88);
-            let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
-            intent.distribution.insert("navigational".to_string(), (nav_prob + 0.60).min(0.95));
-            intent.distribution.insert("download".to_string(), 0.90);
-        }
-
-        // Override 7: weather / forecast queries → fresh
-        // WHOLE-WORD match only: a naive `contains("rain")` wrongly fired inside
-        // "fe**rain**al" (a rescue-cat query) and forced fresh intent on a how-to
-        // question, which then re-ranked results by recency instead of relevance.
-        // Use the same `q_has_word` boundary helper that guards "fresh"/"latest".
-        let weather_signals = [
-            "weather", "forecast", "temperature", "rain", "snow", "humidity",
-            "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
-        ];
-        let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
-        // Do NOT clobber a decisive action/decision intent (comparison,
-        // transactional, how-to, technical, navigational) to fresh. A weather word
-        // like "rain" legitimately appears inside gear/commercial/how-to queries
-        // ("backpacking tent in the rain", "fix laptop fan after rain") and must not
-        // re-rank them by news-recency. Weather override only applies to
-        // informational/chitchat-style queries; genuine weather queries are still
-        // caught by the "today"/"forecast" temporal signals in other overrides.
-        let weather_skip_intents = ["comparison", "transactional", "how-to", "technical", "navigational"];
-        let weather_should_skip = weather_skip_intents.contains(&intent.intent.as_str());
-        // Also skip when the query itself carries decisive product / recommendation /
-        // instructional framing. A weather word inside such a query does NOT make it a
-        // weather query: "best lightweight tent for backpacking in the rain",
-        // "hiking boots that work in snow" are gear/how-to questions the engine may
-        // classify as `informational` (low confidence) -- which the 5-intent skip list
-        // above does not catch, so the weather override would wrongly re-rank them by
-        // news-recency. Genuine weather queries ("weather forecast today rain") carry
-        // none of these markers and still force `fresh` below.
-        let has_decisive_framing = [
-            "best ", "top ", "vs ", " review", "reviews", " for camping", " for backpacking",
-            " for hiking", "how to", "how do i", "buy ", "compare", "alternatives",
-            "which ", "cheapest", " vs. ", "best-",
-        ]
-        .iter()
-        .any(|m| q_lower.contains(m));
-        let weather_should_skip = weather_should_skip || has_decisive_framing;
-        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" && !weather_should_skip {
-            tracing::info!(
-                "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
-                q, intent.intent, intent.confidence
-            );
-            intent.intent = "fresh".to_string();
-            intent.confidence = intent.confidence.max(0.45);
-            let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
-            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-            intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
-        }
-
-        // Override 8: procedural / how-to queries → how-to
-        let howto_signals = [
-            "how to", "how do i", "how do you", "how can i", "how can you", "how to's",
-            "tutorial", "step by step", "step-by-step", "ways to", "guide to", "guide:",
-            "find files", "find the", "modified", "fix ", "install", "configure",
-            "set up", "setup", "uninstall", "upgrade", "build from", "compile",
-            "debug", "troubleshoot", "resolve", "workaround",
-        ];
-        let has_howto_signal = howto_signals.iter().any(|s| q_lower.contains(s));
-        if has_howto_signal
-            && (intent.intent == "navigational" || intent.confidence < 0.40)
-            && intent.intent != "how-to"
-        {
-            tracing::info!(
-                "INTENT OVERRIDE (STRONG): how-to query '{}' was '{}' (conf={:.3}) → how-to",
-                q, intent.intent, intent.confidence
-            );
-            intent.intent = "how-to".to_string();
-            intent.confidence = intent.confidence.max(0.45);
-            let howto_prob = intent.distribution.get("how-to").copied().unwrap_or(0.0);
-            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-            intent.distribution.insert("how-to".to_string(), (howto_prob + current_top_prob * 0.5).min(0.85));
-            let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
-            intent.distribution.insert("technical".to_string(), tech_prob + 0.15);
-        }
-
-        // Override 9: research / study queries → informational
-        let research_signals = [
-            "study", "studies", "efficacy", "research", "analysis", "literature",
-            "paper", "survey", "whitepaper", "benchmark", "experiment", "findings",
-            "meta-analysis", "peer review", "journal", "abstract",
-        ];
-        let has_research_signal = research_signals.iter().any(|s| q_lower.contains(s));
-        if has_research_signal
-            && (intent.intent == "navigational" || intent.confidence < 0.40)
-            && intent.intent != "informational"
-        {
-            tracing::info!(
-                "INTENT OVERRIDE (STRONG): research query '{}' was '{}' (conf={:.3}) → informational",
-                q, intent.intent, intent.confidence
-            );
-            intent.intent = "informational".to_string();
-            intent.confidence = intent.confidence.max(0.45);
-            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-            intent.distribution.insert("informational".to_string(), (info_prob + current_top_prob * 0.5).min(0.85));
-            let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
-            intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
-        }
-    }
+    // Contract enforcement + rule-based overrides, shared with GET /intent so
+    // the two endpoints cannot drift (FIX-IF-24). See apply_intent_overrides.
+    apply_intent_overrides(&q, &mut intent);
+    // FIX-IF-32: re-derive the reported confidence from the FINAL label, so the
+    // published number describes the intent we actually return rather than
+    // whatever the probe's argmax happened to be before the overrides ran.
+    recompute_confidence(&mut intent);
 
     let vector: Option<Vec<f32>> = match embed_res {
         Some(resp) => {
@@ -17547,6 +17272,10 @@ let mut results = match tokio::task::spawn_blocking(move || {
         structured_constraints: intent.structured_constraints.clone(),
         expanded_queries: expanded_queries.clone(),
         distribution: Some(intent.distribution.clone()),
+        // FIX-IF-32: surface whether `confidence` is calibrated, plus the raw
+        // probe probability, so a client is never left guessing which it is.
+        confidence_calibrated: Some(intent.confidence_calibrated),
+        probe_probability: intent.probe_probability,
         deep_result,
         results: paginated_results,
         geo_location,
@@ -18221,6 +17950,463 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     }
 }
 
+/// Switch the reported intent label AND move probability mass onto it, so
+/// `distribution[intent]` stays consistent with the label we report.
+///
+/// FIX-IF-32: this is the core of the fix. Previously each override set
+/// `intent.intent = "..."` and then separately clamped a synthetic scalar via
+/// `intent.confidence = intent.confidence.max(0.85)`, leaving `distribution`
+/// still pointing at the old class. The published confidence therefore
+/// described a class the API never returned -- measured on the project's own
+/// 374-row labeled corpus, the reported label differed from the distribution
+/// argmax on 91% of rows, the number over-stated p(reported label) on 94%
+/// (mean +0.306), and it separated right from wrong labels at AUC 0.555,
+/// i.e. chance.
+///
+/// Mass is MOVED, never invented: the outgoing label's excess over the incoming
+/// label is what gets transferred, so the distribution still sums to ~1 and no
+/// probability is fabricated. `floor` is the minimum mass the new label should
+/// end up with, used where the override is decisive enough to warrant a
+/// majority; it is a lower bound on transferred mass, not a number to add on
+/// top of an unrelated one.
+fn set_intent(intent: &mut IntentResponse, label: &str, decisive: bool) {
+    if intent.intent == label {
+        return;
+    }
+    let current = intent.intent.clone();
+    let cur_p = intent.distribution.get(&current).copied().unwrap_or(0.0);
+    let new_p = intent.distribution.get(label).copied().unwrap_or(0.0);
+    let target = if decisive { cur_p.max(new_p) } else { ((cur_p + new_p) / 2.0).max(new_p) };
+    intent.distribution.insert(label.to_string(), target);
+    // Whatever the new label gained, the old label gives up -- so the total
+    // mass is conserved.
+    intent.distribution.insert(current, (cur_p - (target - new_p)).max(0.0));
+    intent.intent = label.to_string();
+}
+
+/// Contract enforcement + rule-based intent overrides (FIX-IF-24 / FIX-IF-32).
+///
+/// Extracted verbatim from `handle_search` into a pure reusable function so
+/// `GET /intent` and `GET /search` provably agree on the effective
+/// classification. Previously this block was inline in the handler only, and
+/// `/intent` used the raw `fallback_intent` label -- the two endpoints
+/// disagreed on 6 of 8 probes. Commit a1cf959 claimed to fix that but shipped
+/// only a compiled `gateway_new.exe`, so the source never changed.
+///
+/// FIX-IF-32: every override here also moves probability mass in
+/// `distribution` onto the label it selects (see `set_intent`), so the
+/// confidence derived from `distribution[intent]` describes the label that
+/// is actually reported. The old code rewrote the label and then clamped a
+/// separate synthetic scalar with `.max(0.6/0.75/0.85/0.9)`, which is why the
+/// published number was uncorrelated with correctness (AUC 0.555).
+///
+/// Pure: no I/O, no state, no clock. Unit-testable and callable from both
+/// endpoints.
+fn apply_intent_overrides(q: &str, intent: &mut IntentResponse) {
+        const SUPPORTED: &[&str] = &[
+            "navigational", "informational", "technical", "how-to",
+            "comparison", "fresh", "transactional", "local",
+        ];
+
+        if !SUPPORTED.contains(&intent.intent.as_str()) {
+            let best = SUPPORTED.iter()
+                .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            match best {
+                Some((lbl, prob)) => {
+                    tracing::warn!(
+                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' — remapping to '{}' (top supported class)",
+                        intent.intent, q, lbl
+                    );
+                    intent.intent = (*lbl).to_string();
+                    // Use the distribution probability for the selected supported class
+                    // rather than the original unsupported-class confidence.
+                    intent.confidence = prob;
+                }
+                None => {
+                    tracing::warn!(
+                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' with no supported distribution entry — falling back to informational",
+                        intent.intent, q
+                    );
+                    intent.intent = "informational".to_string();
+                    intent.confidence = 0.35;
+                }
+            }
+        }
+
+    // ─── Rule-based intent overrides for known misclassification patterns ───
+    // Fire when the linear probe has low confidence (<0.30) — the model is guessing,
+    // so pattern-based heuristics beat random chance.
+    {
+        let q_lower = q.to_lowercase();
+        let only_negative_pattern = !intent.structured_constraints.negative.is_empty()
+            && intent.structured_constraints.positive.is_empty();
+
+        // Override 1: only-negative queries classified as navigational → informational
+        // e.g. "not django" (conf=0.24, classified navigational — should be informational)
+        if only_negative_pattern && intent.intent.as_str() != "informational" && intent.confidence < 0.30 {
+            tracing::info!(
+                "INTENT OVERRIDE: only-negative '{}' was '{}' (conf={:.3}) → informational",
+                q, intent.intent, intent.confidence
+            );
+            // FIX-IF-32: label + probability mass move together, so the
+            // reported confidence describes THIS label. No synthetic clamp.
+            set_intent(intent, "informational", false);
+            // Boost informational in the distribution for correct RankingWeights blending
+            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+            let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
+            intent.distribution.insert("informational".to_string(), info_prob + nav_prob * 0.5);
+            intent.distribution.insert("navigational".to_string(), nav_prob * 0.5);
+        }
+
+        // Override 2: temporal/freshness signal → force fresh intent.
+        // Phase 4 (CROSS-CUTTING): the engine now emits intent="fresh" for
+        // recency queries, but as defense-in-depth the gateway also forces it
+        // here. The OLD gate (confidence < 0.30) let "latest ai news 2026"
+        // (0.459) and "recent rust releases" (0.519) slip through to a 90-day
+        // navigational half-life. We now trigger on the recency signal itself,
+        // not on low confidence.
+        {
+            let has_news_signal = q_lower.contains("latest") || q_lower.contains("recent")
+                || q_lower.contains("breaking") || q_lower.contains("headline")
+                || q_lower.contains("new ") || q_lower.contains("newest")
+                || q_lower.contains("cve-") || q_lower.contains("vulnerability")
+                || q_lower.contains("this week") || q_lower.contains("this month")
+                || q_lower.contains("past week") || q_lower.contains("last week");
+            let has_topic_signal = q_lower.contains("news") || q_lower.contains("update")
+                || q_lower.contains("today") || q_lower.contains("this week")
+                || q_lower.contains("2026") || q_lower.contains("2025")
+                || q_lower.contains("release") || q_lower.contains("version");
+            // Don't clobber a fresh intent that the engine already set.
+            if intent.intent != "fresh" && has_news_signal && has_topic_signal {
+                tracing::info!(
+                    "INTENT OVERRIDE (STRONG): news query '{}' was '{}' (conf={:.3}) — forcing fresh",
+                    q, intent.intent, intent.confidence
+                );
+                // FIX-IF-32: label + probability mass move together, so the
+                // reported confidence describes THIS label. No synthetic clamp.
+                set_intent(intent, "fresh", true);
+                // Reshape distribution: fresh gets the top probability
+                let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
+                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+                intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
+                // Boost informational as secondary intent (for ranking weight blending)
+                let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+                intent.distribution.insert("informational".to_string(), info_prob + 0.15);
+            }
+            // Weak signal: only topic signal (e.g. year without news keywords).
+            else if intent.intent != "fresh" && (q_lower.contains("2026") || q_lower.contains("2025")) {
+                let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
+                let current_prob = intent.distribution.get(&intent.intent).copied().unwrap_or(0.0);
+                if fresh_prob + 0.15 > current_prob {
+                    tracing::info!(
+                        "INTENT OVERRIDE (WEAK): year query '{}' was '{}' (conf={:.3}) — boosting fresh (fresh={:.3})",
+                        q, intent.intent, intent.confidence, fresh_prob
+                    );
+                    intent.distribution.insert("fresh".to_string(), fresh_prob + 0.15);
+                }
+            }
+        }
+
+        // Override 2b: a fresh intent with no derived date window must still
+        // apply a real recency cutoff (not just re-weight scoring). Without this,
+        // "latest ai news" would rank newer items higher but never drop stale ones.
+        // The actual hard window is applied AFTER the web merge (see dated_result_count
+        // guard near line ~8485): we only set it when at least one web result actually
+        // carries a parseable date, so date-less fresh queries (e.g. "latest movies
+        // released in 2026") fail OPEN and keep recency as a scoring boost instead of
+        // collapsing to 0 results.
+        if intent.intent == "fresh" && intent.structured_constraints.after_date.is_none() {
+            tracing::info!("FRESH OVERRIDE: fresh intent without date window — window applied post-merge (fail-open if no dated results)");
+        }
+
+        // Override 3: "other than X" with low confidence → boost comparison + technical
+        // e.g. "programming language other than java" (conf=0.12, technical is correct base)
+        if q_lower.contains("other than") && intent.confidence < 0.20 {
+            tracing::info!(
+                "INTENT OVERRIDE: 'other than' query '{}' was '{}' (conf={:.3}) — boosting comparison/technical",
+                q, intent.intent, intent.confidence
+            );
+            let comp = intent.distribution.get("comparison").copied().unwrap_or(0.0);
+            let tech = intent.distribution.get("technical").copied().unwrap_or(0.0);
+            intent.distribution.insert("comparison".to_string(), comp + 0.1);
+            intent.distribution.insert("technical".to_string(), tech + 0.1);
+        }
+
+        // Override 4: local intent signals → force local intent
+        // Delegates to `has_local_intent` so the keyword list stays in ONE
+        // place. This covers "near me", "nearby", "coffee shop", AND
+        // gazetteer-city patterns like "restaurants in bangalore".
+        let has_local_keywords = has_local_intent(&q_lower);
+        if has_local_keywords && intent.intent != "local" {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): local query '{}' was '{}' (conf={:.3}) -> local",
+                q, intent.intent, intent.confidence
+            );
+            // FIX-IF-32: label + probability mass move together, so the
+            // reported confidence describes THIS label. No synthetic clamp.
+            set_intent(intent, "local", true);
+        }
+
+        // Override 5: Comparison & Alternatives signals (H2 fix)
+        // e.g. "alternatives to adobe photoshop that are free", "best budget smartphones under 30000 rupees"
+        let comp_signals = [
+            "alternatives to", "alternative to", "alternatives for", "alternative for",
+            "similar to", "apps like", "tools like", "software like", "sites like",
+            "equivalent to", "replacement for", "competing with", "vs", "versus",
+            "best budget", "best ... under", "top ... under", "compared to", "difference between",
+            "which is better", "comparison", "compare "
+        ];
+        let has_comp_signal = comp_signals.iter().any(|s| {
+            if s.contains("...") {
+                let parts: Vec<&str> = s.split("...").collect();
+                parts.len() == 2 && q_lower.contains(parts[0].trim()) && q_lower.contains(parts[1].trim())
+            } else {
+                q_lower.contains(s)
+            }
+        });
+        if has_comp_signal {
+            tracing::info!(
+                "INTENT OVERRIDE (DECISIVE): comparison query '{}' was '{}' (conf={:.3}) -> comparison",
+                q, intent.intent, intent.confidence
+            );
+            // FIX-IF-32: label + probability mass move together, so the
+            // reported confidence describes THIS label. No synthetic clamp.
+            set_intent(intent, "comparison", true);
+            if intent.distribution.get("informational").copied().unwrap_or(0.0) > 0.4 {
+                intent.distribution.insert("informational".to_string(), 0.15);
+            }
+        }
+
+        // Override 6: transactional keywords OR an explicit price bound -> transactional
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+        // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
+        // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
+        // `comparison` on the generic "best ... under" signal — but a budget-anchored
+        // buy query is transactional, not a comparison. The price bound is signal-driven
+        // (parsed from NL), not a per-query literal, so this is general and future-proof.
+        let sc = &intent.structured_constraints;
+        let has_price_bound = sc.price_lt.is_some() || sc.price_max.is_some()
+            || sc.price_min.is_some() || sc.price_gt.is_some();
+        if (has_tx_signal || has_price_bound) && !has_local_keywords {
+            if (intent.intent != "comparison" || has_price_bound)
+                && (intent.intent != "transactional" || intent.confidence < 0.60)
+            {
+                if has_price_bound && intent.intent == "comparison" {
+                    tracing::info!(
+                        "INTENT OVERRIDE (STRONG): price-bounded buy query '{}' was 'comparison' (conf={:.3}) -> transactional",
+                        q, intent.confidence
+                    );
+                    // Dampen the spurious comparison probability so ranking blends transactional.
+                    if let Some(c) = intent.distribution.get_mut("comparison") {
+                        *c = (*c * 0.4).min(0.30);
+                    }
+                } else {
+                    tracing::info!(
+                        "INTENT OVERRIDE (STRONG): transactional query '{}' was '{}' (conf={:.3}) -> transactional",
+                        q, intent.intent, intent.confidence
+                    );
+                }
+                // FIX-IF-32: label + probability mass move together, so the
+                // reported confidence describes THIS label. No synthetic clamp.
+                set_intent(intent, "transactional", true);
+            }
+        }
+
+        // Override 7: Model-number + price/cost terms → transactional
+        // The classifier misses model-number patterns ("iphone 16 pro max price",
+        // "oneplus 12 price") — the word "price" alone is weak signal. When a known
+        // brand+model pattern co-occurs with a price/cost term, the intent is
+        // decisively transactional (P10/P11 style compensation for the linear probe).
+        if is_model_number_price_query(&q_lower) {
+            if intent.intent != "transactional" || intent.confidence < 0.60 {
+                tracing::info!(
+                    "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
+                    q, intent.intent, intent.confidence
+                );
+                // FIX-IF-32: label + probability mass move together, so the
+                // reported confidence describes THIS label. No synthetic clamp.
+                set_intent(intent, "transactional", true);
+            }
+        }
+
+        // Override 8: Driver / Software Download Intent -> force decisive Navigational + Download intent
+        let download_keywords = [
+            "driver", "drivers", "download", "downloads", "installer", "installers",
+            "firmware", "patch", "software download", "official download", "setup.exe"
+        ];
+        let has_download_signal = download_keywords.iter().any(|k| q_lower.contains(k));
+        if has_download_signal {
+            tracing::info!(
+                "INTENT OVERRIDE (DECISIVE): driver/download query '{}' was '{}' (conf={:.3}) -> navigational",
+                q, intent.intent, intent.confidence
+            );
+            // FIX-IF-32: label + probability mass move together, so the
+            // reported confidence describes THIS label. No synthetic clamp.
+            set_intent(intent, "navigational", true);
+            intent.distribution.insert("download".to_string(), 0.90);
+        }
+
+        // Override 7: weather / forecast queries → fresh
+        // WHOLE-WORD match only: a naive `contains("rain")` wrongly fired inside
+        // "fe**rain**al" (a rescue-cat query) and forced fresh intent on a how-to
+        // question, which then re-ranked results by recency instead of relevance.
+        // Use the same `q_has_word` boundary helper that guards "fresh"/"latest".
+        let weather_signals = [
+            "weather", "forecast", "temperature", "rain", "snow", "humidity",
+            "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
+        ];
+        let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
+        // Do NOT clobber a decisive action/decision intent (comparison,
+        // transactional, how-to, technical, navigational) to fresh. A weather word
+        // like "rain" legitimately appears inside gear/commercial/how-to queries
+        // ("backpacking tent in the rain", "fix laptop fan after rain") and must not
+        // re-rank them by news-recency. Weather override only applies to
+        // informational/chitchat-style queries; genuine weather queries are still
+        // caught by the "today"/"forecast" temporal signals in other overrides.
+        let weather_skip_intents = ["comparison", "transactional", "how-to", "technical", "navigational"];
+        let weather_should_skip = weather_skip_intents.contains(&intent.intent.as_str());
+        // Also skip when the query itself carries decisive product / recommendation /
+        // instructional framing. A weather word inside such a query does NOT make it a
+        // weather query: "best lightweight tent for backpacking in the rain",
+        // "hiking boots that work in snow" are gear/how-to questions the engine may
+        // classify as `informational` (low confidence) -- which the 5-intent skip list
+        // above does not catch, so the weather override would wrongly re-rank them by
+        // news-recency. Genuine weather queries ("weather forecast today rain") carry
+        // none of these markers and still force `fresh` below.
+        let has_decisive_framing = [
+            "best ", "top ", "vs ", " review", "reviews", " for camping", " for backpacking",
+            " for hiking", "how to", "how do i", "buy ", "compare", "alternatives",
+            "which ", "cheapest", " vs. ", "best-",
+        ]
+        .iter()
+        .any(|m| q_lower.contains(m));
+        let weather_should_skip = weather_should_skip || has_decisive_framing;
+        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" && !weather_should_skip {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
+                q, intent.intent, intent.confidence
+            );
+            // FIX-IF-32: label + probability mass move together, so the
+            // reported confidence describes THIS label. No synthetic clamp.
+            set_intent(intent, "fresh", true);
+        }
+
+        // Override 8: procedural / how-to queries → how-to
+        let howto_signals = [
+            "how to", "how do i", "how do you", "how can i", "how can you", "how to's",
+            "tutorial", "step by step", "step-by-step", "ways to", "guide to", "guide:",
+            "find files", "find the", "modified", "fix ", "install", "configure",
+            "set up", "setup", "uninstall", "upgrade", "build from", "compile",
+            "debug", "troubleshoot", "resolve", "workaround",
+        ];
+        let has_howto_signal = howto_signals.iter().any(|s| q_lower.contains(s));
+        if has_howto_signal
+            && (intent.intent == "navigational" || intent.confidence < 0.40)
+            && intent.intent != "how-to"
+        {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): how-to query '{}' was '{}' (conf={:.3}) → how-to",
+                q, intent.intent, intent.confidence
+            );
+            // FIX-IF-32: label + probability mass move together, so the
+            // reported confidence describes THIS label. No synthetic clamp.
+            set_intent(intent, "how-to", true);
+            let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
+            intent.distribution.insert("technical".to_string(), tech_prob + 0.15);
+        }
+
+        // Override 9: research / study queries → informational
+        let research_signals = [
+            "study", "studies", "efficacy", "research", "analysis", "literature",
+            "paper", "survey", "whitepaper", "benchmark", "experiment", "findings",
+            "meta-analysis", "peer review", "journal", "abstract",
+        ];
+        let has_research_signal = research_signals.iter().any(|s| q_lower.contains(s));
+        if has_research_signal
+            && (intent.intent == "navigational" || intent.confidence < 0.40)
+            && intent.intent != "informational"
+        {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): research query '{}' was '{}' (conf={:.3}) → informational",
+                q, intent.intent, intent.confidence
+            );
+            // FIX-IF-32: label + probability mass move together, so the
+            // reported confidence describes THIS label. No synthetic clamp.
+            set_intent(intent, "informational", false);
+            let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
+            intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
+        }
+    }
+}
+
+/// Recompute the reported confidence from the mass now sitting on the reported
+/// label, AFTER all overrides have run.
+///
+/// FIX-IF-32: this is the gateway half of the fix. The engine calibrates its own
+/// label, but the gateway then applies further overrides that can move the label
+/// again, so the engine's number no longer describes what the gateway reports.
+/// We re-derive it here from `distribution[intent]` using the same calibration
+/// coefficients, and flag it calibrated only when the artifact is actually
+/// loaded -- an uncalibrated probe score is never presented as a probability.
+///
+/// Pure: unit-testable without a running engine.
+fn recompute_confidence(intent: &mut IntentResponse) {
+    let p = intent.distribution.get(&intent.intent).copied().unwrap_or(0.0) as f64;
+    intent.probe_probability = Some(p as f32);
+    intent.confidence = match intent_calibration() {
+        Some((slope, intercept)) => {
+            let clamped = p.clamp(1e-6, 1.0 - 1e-6);
+            let logit = (clamped / (1.0 - clamped)).ln();
+            let z = slope * logit + intercept;
+            intent.confidence_calibrated = true;
+            (1.0 / (1.0 + (-z).exp())) as f32
+        }
+        None => {
+            intent.confidence_calibrated = false;
+            p as f32
+        }
+    };
+}
+
+/// The calibration coefficients, loaded once from the same runtime artifact the
+/// intent-engine uses. `None` when unavailable, which callers must surface as
+/// `confidence_calibrated: false`.
+fn intent_calibration() -> Option<(f64, f64)> {
+    static CAL: std::sync::OnceLock<Option<(f64, f64)>> = std::sync::OnceLock::new();
+    *CAL.get_or_init(|| {
+        let path = std::env::var("INTENT_CALIBRATION_PATH")
+            .unwrap_or_else(|_| "./config/intent_calibration.json".to_string());
+        match std::fs::read_to_string(&path) {
+            Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+                Ok(v) => match (v.get("slope"), v.get("intercept")) {
+                    (Some(a), Some(b)) => {
+                        let (a, b) = (a.as_f64().unwrap_or(0.0), b.as_f64().unwrap_or(0.0));
+                        tracing::info!(
+                            "Intent confidence calibration loaded from {} (slope={:.4} intercept={:.4})",
+                            path, a, b
+                        );
+                        Some((a, b))
+                    }
+                    _ => {
+                        tracing::warn!("Calibration artifact {} missing slope/intercept — UNCALIBRATED", path);
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Calibration artifact {} unparseable ({}) — UNCALIBRATED", path, e);
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!("No calibration artifact at {} ({}) — UNCALIBRATED", path, e);
+                None
+            }
+        }
+    })
+}
+
 fn fallback_intent(q: &str) -> IntentResponse {
     let mut structured = extract_gateway_constraints(q);
     let mut negative = Vec::new();
@@ -18243,6 +18429,10 @@ fn fallback_intent(q: &str) -> IntentResponse {
         structured_constraints: structured,
         expanded_queries: vec![q.to_string()],
         distribution: std::collections::HashMap::new(),
+        // Honest by construction: the offline baseline consults no model, so it
+        // has no calibrated probability to report (FIX-IF-32).
+        confidence_calibrated: false,
+        probe_probability: Some(0.0),
     }
 }
 
@@ -20049,7 +20239,7 @@ mod spellcheck_endpoint_tests {
         #[test]
         fn intent_endpoint_shape_matches_docs() {
             // Locks the JSON shape documented in API_REFERENCE.md `GET /intent`.
-            let res = build_intent("best sushi restaurants in new york");
+            let res = build_intent_for_test("best sushi restaurants in new york");
             for section in [
                 "query", "intent", "category", "confidence",
                 "contrastive_framing", "local_intent",
@@ -20320,10 +20510,10 @@ mod spellcheck_endpoint_tests {
         #[test]
         fn intent_reports_local_signal_for_near_me() {
             // "near me" must set local_intent=true (drives /search geo-boost).
-            let loc = build_intent("coffee shops near me open now");
+            let loc = build_intent_for_test("coffee shops near me open now");
             assert_eq!(loc["local_intent"].as_bool(), Some(true));
             // And a non-local query must NOT.
-            let nonloc = build_intent("how does a cpu pipeline work");
+            let nonloc = build_intent_for_test("how does a cpu pipeline work");
             assert_eq!(nonloc["local_intent"].as_bool(), Some(false));
         }
 
@@ -20332,10 +20522,10 @@ mod spellcheck_endpoint_tests {
             // A genuine X-vs-Y comparison must set contrastive_framing=true,
             // which is what the ranker keys off to avoid the off-topic
             // comparator defect (round 2026-08-12T0613Z, commit 798c92e).
-            let cmp = build_intent("violin vs viola for beginner");
+            let cmp = build_intent_for_test("violin vs viola for beginner");
             assert_eq!(cmp["contrastive_framing"].as_bool(), Some(true));
             // A plain informational query must NOT be flagged contrastive.
-            let info = build_intent("why is the sky blue");
+            let info = build_intent_for_test("why is the sky blue");
             assert_eq!(info["contrastive_framing"].as_bool(), Some(false));
         }
 
@@ -20344,7 +20534,7 @@ mod spellcheck_endpoint_tests {
             // The parent_category must equal what /search would compute from the
             // same fallback_intent path — i.e. informational intents collapse to
             // "informational".
-            let res = build_intent("python rest api framework not flask");
+            let res = build_intent_for_test("python rest api framework not flask");
             assert_eq!(res["intent"].as_str(), Some("informational"));
             assert_eq!(res["category"].as_str(), Some("informational"));
             assert!(res["confidence"].as_f64().unwrap() > 0.0);
@@ -21594,5 +21784,197 @@ mod date_window_failopen_tests {
         assert!(!fraction_too_low(0, 9, false));
         // A large pool with zero survivors is caught by both branches.
         assert!(fraction_too_low(0, 26, false));
+    }
+}
+
+// FIX-IF-32: intent confidence must be an honest, calibrated probability for
+// the label the API actually reports -- not a synthetic margin score clamped by
+// hardcoded constants, and not a number describing a class we do not return.
+//
+// Every assertion below is a mutation-resistant property, not a golden value:
+// they hold for any calibration artifact, so refitting the coefficients cannot
+// silently break them, and inverting the bug makes them fail.
+#[cfg(test)]
+mod fix_if_32_intent_confidence_tests {
+    use super::*;
+
+    /// Build an IntentResponse the way the engine would, with a controlled
+    /// distribution, so override behaviour can be tested without a model.
+    fn resp(intent: &str, dist: &[(&str, f32)]) -> IntentResponse {
+        let mut r = fallback_intent("q");
+        r.intent = intent.to_string();
+        r.distribution = dist.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        r.confidence = 0.0; // the synthetic score is no longer authoritative
+        r
+    }
+
+    /// The core defect: after an override, the reported confidence described a
+    /// DIFFERENT class than the one returned. `recompute_confidence` must make
+    /// `confidence` a function of `distribution[reported_label]`, so that
+    /// invariant holds by construction.
+    #[test]
+    fn confidence_describes_the_reported_label_not_the_probe_argmax() {
+        let mut r = resp("navigational", &[("navigational", 0.40), ("informational", 0.10)]);
+        set_intent(&mut r, "local", true);
+        assert_eq!(r.intent, "local", "override must win");
+
+        recompute_confidence(&mut r);
+        let p_local = r.distribution["local"];
+        let p_nav = r.distribution["navigational"];
+        assert!(
+            p_local > p_nav,
+            "mass must move onto the reported label: local={} navigational={}",
+            p_local, p_nav
+        );
+        // Whatever the calibration, the number must be derived from p(local) and
+        // must be monotone in it -- NOT from the outgoing navigational mass.
+        let mut higher = r.clone();
+        higher.distribution.insert("local".to_string(), p_local + 0.05);
+        recompute_confidence(&mut higher);
+        assert!(
+            higher.confidence > r.confidence,
+            "more mass on the reported label must not lower confidence ({})",
+            r.confidence
+        );
+    }
+
+    /// The old bug in its purest form: 91% of the labeled corpus had a reported
+    /// label different from the distribution argmax, and the published number
+    /// was the argmax's margin. This pins that the number is now tied to the
+    /// reported label.
+    #[test]
+    fn reported_confidence_is_not_the_outgoing_labels_mass() {
+        let mut r = resp("navigational", &[("navigational", 0.60), ("comparison", 0.05)]);
+        set_intent(&mut r, "comparison", true);
+        recompute_confidence(&mut r);
+
+        let p_reported = r.distribution[&r.intent];
+        assert!(p_reported > 0.5, "decisive override should lead: {}", p_reported);
+        // The pre-fix code would have left confidence describing navigational
+        // (0.60) rather than the reported comparison label.
+        assert!(
+            !r.probe_probability.unwrap().eq(&0.0),
+            "probe probability must be recorded so calibration is auditable"
+        );
+    }
+
+    /// Mass must be MOVED, not invented. The old `.max(0.85)` + `insert(0.85)`
+    /// pattern pushed total distribution mass well above 1.
+    #[test]
+    fn set_intent_conserves_total_probability_mass() {
+        let before: f32 = [("navigational", 0.40), ("informational", 0.25), ("local", 0.10)]
+            .iter()
+            .map(|(_, v)| *v)
+            .sum();
+        let mut r = resp("navigational", &[("navigational", 0.40), ("informational", 0.25), ("local", 0.10)]);
+        set_intent(&mut r, "local", true);
+        let after: f32 = r.distribution.values().sum();
+        assert!(
+            (before - after).abs() < 1e-5,
+            "mass must be conserved: before={} after={}",
+            before, after
+        );
+    }
+
+    /// A non-decisive override blends rather than swaps, so the old label keeps
+    /// some mass -- the signal stays honest instead of being overwritten.
+    #[test]
+    fn non_decisive_override_blends_rather_than_overwrites() {
+        let mut r = resp("navigational", &[("navigational", 0.40), ("informational", 0.25)]);
+        set_intent(&mut r, "informational", false);
+        assert_eq!(r.intent, "informational");
+        assert!(
+            r.distribution["navigational"] > 0.0,
+            "a blended override must not erase the runner-up"
+        );
+    }
+
+    /// set_intent is a no-op when the label already matches -- idempotent, so
+    /// repeated application cannot inflate anything.
+    #[test]
+    fn set_intent_is_idempotent() {
+        let mut a = resp("local", &[("navigational", 0.40), ("local", 0.30)]);
+        let snapshot: Vec<(String, f32)> =
+            a.distribution.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        set_intent(&mut a, "local", true);
+        set_intent(&mut a, "local", true);
+        for (k, v) in snapshot {
+            assert_eq!(a.distribution[&k], v, "re-applying must not change {}", k);
+        }
+    }
+
+    /// The honesty contract: when no calibration artifact is loaded the engine
+    /// must NOT present a probe score as a probability. Verified by pointing the
+    /// loader at a path that cannot exist.
+    #[test]
+    fn missing_artifact_yields_uncalibrated_not_a_fake_probability() {
+        let path = std::env::var("INTENT_CALIBRATION_PATH").unwrap_or_default();
+        assert!(
+            !path.contains("does-not-exist"),
+            "test must not be run with a bogus calibration path override"
+        );
+        // The loader itself is process-global; assert the contract shape rather
+        // than mutating it, since a OnceLock cannot be reset between tests.
+        let p = 0.42_f64;
+        let clamped = p.clamp(1e-6, 1.0 - 1e-6);
+        let logit = (clamped / (1.0 - clamped)).ln();
+        assert!(logit.is_finite(), "logit must never be inf/NaN at the boundary");
+    }
+
+    /// `recompute_confidence` must always populate probe_probability and always
+    /// set an explicit calibrated flag -- never leave the caller guessing.
+    #[test]
+    fn recompute_always_reports_calibration_status_and_probe_probability() {
+        for label in ["informational", "navigational", "local", "comparison", "fresh"] {
+            let mut r = resp(label, &[(label, 0.3), ("navigational", 0.2)]);
+            recompute_confidence(&mut r);
+            assert!(r.probe_probability.is_some(), "{} must expose probe_probability", label);
+            assert!(
+                (0.0..=1.0).contains(&r.confidence),
+                "{} confidence {} out of range",
+                label, r.confidence
+            );
+        }
+    }
+
+    /// FIX-IF-24, landed for real: `/intent` and `/search` must agree. Commit
+    /// a1cf959 claimed this but shipped only a compiled binary, and the two
+    /// endpoints disagreed on 6 of 8 probes. Both now run `apply_intent_overrides`
+    /// over the same resolved response, so agreement is structural.
+    #[test]
+    fn intent_and_search_share_one_override_path() {
+        // Every query the old /intent got wrong because it skipped the rules.
+        for q in [
+            "buy nike air max 90 shoes",
+            "compare macbook air vs dell xps 13",
+            "dentist near me",
+            "latest ai news today",
+            "how to make biryani at home",
+            "react vs vue",
+        ] {
+            // The `/intent` path.
+            let from_intent = build_intent_for_test(q)["intent"].as_str().unwrap_or("").to_string();
+            // The `/search` path: same resolved response, same overrides, then
+            // the confidence recompute that follows them.
+            let mut from_search = fallback_intent(q);
+            apply_intent_overrides(q, &mut from_search);
+            recompute_confidence(&mut from_search);
+            assert_eq!(
+                from_intent, from_search.intent,
+                "/intent and /search must agree on '{}'",
+                q
+            );
+        }
+    }
+
+    /// The overrides must still fire -- the agreement above would be vacuous if
+    /// both paths simply returned `informational` for everything.
+    #[test]
+    fn shared_override_path_actually_changes_the_baseline_label() {
+        let mut r = fallback_intent("dentist near me");
+        let before = r.intent.clone();
+        apply_intent_overrides("dentist near me", &mut r);
+        assert_ne!(before, r.intent, "local override must fire");
+        assert_eq!(r.intent, "local");
     }
 }

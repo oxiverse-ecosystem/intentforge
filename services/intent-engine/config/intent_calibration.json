@@ -1,0 +1,12 @@
+{
+  "_description": "IntentForge v2 - intent confidence calibration (Platt scaling). Maps the engine's p(reported label) onto the empirically measured probability that the reported label is correct. Fitted by scripts/fit_intent_calibration.py against a labeled corpus; refit to improve from experience. No per-query table.",
+  "_method": "platt_scaling",
+  "_feature": "logit(p(reported_label))",
+  "slope": 2.402973,
+  "intercept": 3.502754,
+  "fit_n": 373,
+  "fit_base_rate": 0.343164,
+  "fit_ece": 0.184151,
+  "fit_auc": 0.788396,
+  "fit_auc_raw_before_fix": 0.55537
+}
