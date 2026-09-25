@@ -20842,6 +20842,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
     #[test]
     fn no_user_or_query_data_in_affiliate_params() {
+        let _env_guard = ENV_TEST_LOCK.lock();
         // Subid is the coarse merchant host only — never a query, user id, or IP.
         std::env::set_var("K", "K");
         let n = net(
