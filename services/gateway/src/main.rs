@@ -17571,6 +17571,18 @@ fn normalize_nl_operators(query: &str) -> String {
                         break;
                     }
                     if NL_NEG_STOPWORDS.contains(&wc.as_str()) && !ent.is_empty() {
+                        // "or"/"and" are list connectors: push current entity, clear,
+                        // skip the connector, continue collecting the next entity.
+                        // Other stopwords after we already have a head = end of entity.
+                        if (wc == "or" || wc == "and") && ent.len() >= *min_words {
+                            let entity = ent.join(" ");
+                            if !consumed.contains(&entity) {
+                                consumed.push(entity.clone());
+                            }
+                            ent.clear();
+                            idx += 1;
+                            continue;
+                        }
                         break; // stopword after we already have a head = end of entity
                     }
                     if ent.len() >= *min_words && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
