@@ -16509,6 +16509,19 @@ async fn handle_search(
             }
         })
         .collect();
+    // FIX-IF-01 (round 2026-09-25): engine_exclusions was DEAD CODE — computed
+    // but never used. The intent engine correctly tags multi-negation terms like
+    // "onion" and "garlic" in "recipe without onion and garlic" as Exclusion-role
+    // entities, but the gateway ignored this signal. The result: the explicit-neg
+    // path split on "and" correctly, but the manner-frame gate then dropped
+    // "onion" (not a protected term/country/appliance), collapsing the result set
+    // to ZERO. Now we feed engine_exclusions into raw_neg so the gating loop
+    // recognizes them as trusted directives that bypass the manner-frame gate.
+    for ee in &engine_exclusions {
+        if !raw_neg.contains(ee) {
+            raw_neg.push(ee.clone());
+        }
+    }
     let explicit_neg: Vec<String> = extract_explicit_negation_terms(&q_orig);
     for en in &explicit_neg {
         if !raw_neg.contains(en) {
@@ -17884,6 +17897,23 @@ fn normalize_nl_operators(query: &str) -> String {
                     {
                         break;
                     }
+                    // FIX-IF-01 (round 2026-09-25): list connector ("or"/"and") between
+                    // exclusion targets. When we already have a head and hit a connector,
+                    // finalize the current entity and push it to consumed, then start
+                    // a new entity. Without this, "recipe without onion and garlic" only
+                    // produces "onion" (the stopword break fires first); "garlic" is
+                    // left unconsumed and becomes a positive term. Mirrors the proven
+                    // pattern in extract_explicit_negation_terms (FIX-IF-01, 2026-09-24).
+                    let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
+                    if !ent.is_empty() && (bare == "or" || bare == "and") {
+                        let entity = ent.join(" ");
+                        if !consumed.contains(&entity) {
+                            consumed.push(entity);
+                        }
+                        ent.clear();
+                        idx += 1;
+                        continue;
+                    }
                     if NL_NEG_STOPWORDS.contains(&wc.as_str()) && !ent.is_empty() {
                         break; // stopword after we already have a head = end of entity
                     }
@@ -18461,6 +18491,20 @@ mod explicit_negation_list_tests {
             "\"no microwave needed\" must read as fulfillment");
         assert!(!term_in_negating_context("oven", "how to cook salmon in the oven"),
             "\"in the oven\" is a violation, not fulfillment");
+    }
+
+    #[test]
+    fn normalize_nl_operators_splits_on_and_or_connectors() {
+        // FIX-IF-01 (round 2026-09-25): normalize_nl_operators must split on
+        // "or"/"and" list connectors so "recipe without onion and garlic"
+        // produces BOTH -onion and -garlic, not just -onion. Without the split,
+        // only "onion" is consumed; "garlic" stays as a positive term.
+        let out = normalize_nl_operators("recipe without onion and garlic");
+        assert!(out.contains("-onion"), "must contain -onion, got: {}", out);
+        assert!(out.contains("-garlic"), "must contain -garlic, got: {}", out);
+        let out2 = normalize_nl_operators("laptop without apple or dell");
+        assert!(out2.contains("-apple"), "must contain -apple, got: {}", out2);
+        assert!(out2.contains("-dell"), "must contain -dell, got: {}", out2);
     }
 
     #[test]
