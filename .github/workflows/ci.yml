@@ -2,9 +2,14 @@ name: ci
 
 on:
   push:
-    branches: [master, main, 'auto/**']
+    branches: [master, main, 'auto/**', 'fix/**']
   pull_request:
-    branches: [master, main, 'auto/round-**']
+    # `fix/**` covers the CI-monitor repair topology: a `fix/auto-<slug>-<sig>`
+    # branch opens a PR into the failing `fix/auto-*` branch, and the monitor
+    # auto-merges it once green. Without `fix/**` here that PR gets no checks at
+    # all, so the monitor can never observe it green and the repair cannot
+    # converge. `auto/round-**` is the round-branch lane and stays as-is.
+    branches: [master, main, 'auto/round-**', 'fix/**']
 
 env:
   CARGO_TERM_COLOR: always
