@@ -2574,10 +2574,14 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         if clean_n.starts_with('+') {
             clean_n = clean_n.strip_prefix('+').unwrap().trim().to_string();
         }
-        if clean_n.split_whitespace().count() <= 2 && !clean_n.is_empty() {
+        if !clean_n.is_empty() {
             if is_subjective_quality_term(&clean_n) || is_exclusion_grammar_noise(&clean_n) {
                 continue;
             }
+            // Preserve multi-word negations such as "artificial sweeteners".
+            // The extractor already bounds compounds at clause boundaries; dropping
+            // them merely because they contain a space loses the user's actual
+            // constraint object.
             if !negative.contains(&clean_n) {
                 negative.push(clean_n);
             }
@@ -7061,6 +7065,19 @@ fn is_real_exclusion(
                 return true;
             }
         }
+    }
+    // "without X" / "no X" is an explicit user constraint even when X is a
+    // generic noun (e.g. "dessert recipes without artificial sweeteners").
+    // Unlike a bare "not X", the preposition form is unambiguous: it names
+    // something the user does not want in the result. Keep the manner guard
+    // above so "without using a library" remains a HOW qualifier.
+    let q_tokens: Vec<&str> = q_orig
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    if q_tokens.iter().any(|t| t == "without" || t == "no") {
+        return true;
     }
     // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
     // (e.g. "javascript not java not typescript" → java, typescript).
