@@ -7336,7 +7336,6 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         {
                             terms.push(joined);
                         } else if !is_manner_phrase(&joined)
-                            && !is_manner_frame(q_orig, &joined)
                         {
                             if !dropped.contains(&joined) {
                                 dropped.push(joined);
