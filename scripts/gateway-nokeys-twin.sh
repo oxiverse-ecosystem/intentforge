@@ -21,31 +21,44 @@ set -uo pipefail
 
 NAME=if-nokeys-twin
 PORT=4001
+# A SECOND keys-absent twin. It exists purely as the upstream-churn control: it is
+# the keys-vs-no-keys comparison with the affiliate variable removed, so drift that
+# appears in nokey-vs-nokey can be attributed to live-upstream nondeterminism
+# instead of being misread as monetization changing ranking.
+CONTROL_NAME=if-nokeys-control
+CONTROL_PORT=4002
 IMAGE=services-gateway:latest
 NETNS_CONTAINER=if-dev-gluetun
 COMPOSE_DIR="$(cd "$(dirname "$0")/../services" && pwd)"
 COMMERCE_DIR="$COMPOSE_DIR/gateway/data/commerce"
 SIGNALS_DIR="$COMPOSE_DIR/shared-signals"
 
+start_one() {
+  local cname="$1" cport="$2"
+  docker rm -f "$cname" >/dev/null 2>&1
+  # NO affiliate key env vars are passed => AffiliateCtx::first_usable() returns
+  # None => every result degrades to affiliate: null. Everything else is the same
+  # image/config as the keys-present gateway on :4000.
+  docker run -d --name "$cname" \
+    --network "container:${NETNS_CONTAINER}" \
+    -e GATEWAY_PORT="$cport" \
+    -v "${COMMERCE_DIR}:/app/data/commerce:ro" \
+    -v "${SIGNALS_DIR}:/tmp/vpn-signals" \
+    "$IMAGE" >/dev/null
+  echo "started $cname on :${cport} inside ${NETNS_CONTAINER} netns (no affiliate keys)"
+}
+
 case "${1:-start}" in
   start)
-    docker rm -f "$NAME" >/dev/null 2>&1
-    # NO affiliate key env vars are passed => AffiliateCtx::first_usable() returns
-    # None => every result degrades to affiliate: null. Everything else is the
-    # same image/config as the keys-present gateway on :4000.
-    docker run -d --name "$NAME" \
-      --network "container:${NETNS_CONTAINER}" \
-      -e GATEWAY_PORT="$PORT" \
-      -v "${COMMERCE_DIR}:/app/data/commerce:ro" \
-      -v "${SIGNALS_DIR}:/tmp/vpn-signals" \
-      "$IMAGE" >/dev/null
-    echo "started $NAME on :${PORT} inside ${NETNS_CONTAINER} netns (no affiliate keys)"
+    start_one "$NAME" "$PORT"
+    start_one "$CONTROL_NAME" "$CONTROL_PORT"
     ;;
   stop)
     docker rm -f "$NAME" >/dev/null 2>&1 && echo "stopped $NAME" || echo "$NAME not running"
+    docker rm -f "$CONTROL_NAME" >/dev/null 2>&1 && echo "stopped $CONTROL_NAME" || echo "$CONTROL_NAME not running"
     ;;
   probe)
-    # Runs INSIDE the shared netns so 127.0.0.1:4001 (the twin) is reachable.
+    # Runs INSIDE the shared netns so the twin ports (4001/4002) are reachable.
     docker run --rm --network "container:${NETNS_CONTAINER}" \
       curlimages/curl:8.11.1 -sS -m "${2:-120}" "$3"
     ;;

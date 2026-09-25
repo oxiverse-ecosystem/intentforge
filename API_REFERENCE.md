@@ -1660,6 +1660,33 @@ Top result (truncated):
 by a Rust unit test (`enrichment_preserves_result_order_with_or_without_affiliate_keys`
 and `decoration_preserves_ranking_order`).
 
+**Order invariance with and without affiliate keys (ROADMAP item 6).** Because the
+network keys are read from the *process* environment, "keys present" vs "keys absent"
+can only be compared through the real pipeline by running two gateway processes. The
+repo ships that harness:
+
+- `scripts/gateway-nokeys-twin.sh start` launches two extra gateway containers from
+  the **same image**, in the **same network namespace** as the compose gateway, with
+  **no affiliate key env vars**, bound to `GATEWAY_PORT=4001` and `4002`. (The bind
+  port is env-configurable; unset means the production `4000`.) `stop` removes them.
+- `scripts/verify_affiliate_order_invariance.py` compares the ranked URL lists of
+  `:4000` (keys present), `:4001` (keys absent) and `:4002` (keys absent), and exits
+  non-zero only on **real** affiliate-induced reordering.
+
+The second no-key twin is a **churn control**, not redundancy: all three processes
+query the same live upstreams independently, so result membership legitimately
+changes between calls. Comparing only keys-vs-no-keys would blame monetization for
+ordinary web churn. The control measures that churn with the affiliate variable
+removed, and drift is only reported as a violation when the control stayed stable.
+The probe also asserts the comparison is non-vacuous: the keys process must actually
+decorate at least once, and neither no-key twin may decorate anything.
+
+Offline CI lock: `services/gateway/src/real_data_order_tests.rs` loads the **real**
+`data/commerce/affiliate.json` via the same `AffiliateCtx::load()` production uses and
+asserts, for every shipped network and both template kinds, that the ranked URL list is
+byte-identical with the key present vs absent — plus that broad (non-model) queries
+never decorate and never reorder.
+
 ### Main-path `shopping` field on `/search` (ROADMAP item 7)
 
 The PRIMARY `/search` endpoint now *knows you want to buy*. When the resolved intent
