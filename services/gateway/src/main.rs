@@ -4405,6 +4405,70 @@ const MAX_PARALLEL_FETCH: usize = 4;
 /// top-N results must complete well before it fires. 22s leaves ~8s headroom.
 const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 22;
 
+/// Snippet-based price fallback (ROADMAP item 8).
+///
+/// When upstream page enrichment yields no structured commerce facts (common for
+/// bot-check pages like Amazon, Walmart, etc.), the search snippet (`content` field)
+/// is still a real upstream signal about that URL. This fallback extracts a price
+/// from the snippet using the same currency-aware patterns as `extract_price_from_text`,
+/// but ONLY when a currency symbol/word is present (never bare numbers).
+///
+/// Attached as `source="snippet_extracted"` so the frontend can label it distinctly
+/// from structured page data. This runs AFTER structured enrichment and provenance
+/// attachment, so it never overwrites stronger signals.
+///
+/// NO ranking manipulation: this is a read-only post-pass over already-ranked
+/// results that only *attaches* facts. Pure + offline-testable.
+fn enrich_snippet_fallback(results: &mut [serde_json::Value]) {
+    for r in results.iter_mut() {
+        if !r.is_object() {
+            continue;
+        }
+        // Only fire when structured enrichment found nothing
+        if r.get("commerce").is_some() {
+            continue;
+        }
+        let snippet = r
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if snippet.is_empty() {
+            continue;
+        }
+        // Try to extract a price from the snippet
+        if let Some(price_info) = extract_price_from_text(snippet) {
+            // Only accept reasonable product prices (reject $0, $9999999, etc.)
+            if price_info.amount <= 0.0 || price_info.amount >= 10_000_000.0 {
+                continue;
+            }
+            let facts = OfferFacts {
+                price: Some(price_info.amount),
+                currency: Some(price_info.currency),
+                ..Default::default()
+            };
+            let provenance_url = r
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let observed_at = r
+                .get("commerce_provenance")
+                .and_then(|cp| cp.get("observed_at"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let offer = CommerceOffer {
+                url: Some(provenance_url),
+                observed_at,
+                source: Some("snippet_extracted".to_string()),
+                data: Some(facts),
+            };
+            if let Ok(v) = serde_json::to_value(&offer) {
+                r["commerce"] = v;
+            }
+        }
+    }
+}
+
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
 /// page exposed structured product data, attached by `enrich_with_commerce`).
 /// Powers the main-path `shopping` gate: the strip is only surfaced when at
@@ -4508,6 +4572,11 @@ async fn handle_shopping(
                 Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
             )
             .await;
+            // ROADMAP item 8: snippet-based price fallback — when page enrichment
+            // yields nothing (bot-check pages), extract an honest price from the
+            // search snippet (a real upstream signal about the URL). Marked distinctly
+            // as source="snippet_extracted" so the frontend can label it separately.
+            enrich_snippet_fallback(arr);
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
             decorate_affiliate(arr, &state.affiliate_ctx);
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
@@ -17448,6 +17517,8 @@ let mut results = match tokio::task::spawn_blocking(move || {
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
+            // ROADMAP item 8: snippet-based price fallback — same as handle_shopping.
+            enrich_snippet_fallback(&mut shop_arr);
             // ROADMAP item 7 (refinement): only surface the main-path `shopping`
             // strip when at least one of the top-N ranked results actually exposed
             // structured product data (a `commerce` block). A commercial-intent
@@ -21310,6 +21381,112 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.price, Some(49.99), "JSON-LD price must not be overwritten by MF2");
         assert_eq!(d.currency.as_deref(), Some("USD"), "JSON-LD currency must not be overwritten");
         assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    // ── ROADMAP item 8: snippet-based price fallback ────────────────────────
+    // When page enrichment yields nothing (bot-check pages), the search snippet
+    // is still a real upstream signal. These tests prove the fallback fires
+    // only as a last resort, never overwrites stronger signals, and is
+    // order-preserving (it's a pure post-pass read-only attach).
+
+    #[test]
+    fn snippet_fallback_extracts_price_from_dollar_snippet() {
+        // Simulates a result where page enrichment found nothing (commerce absent)
+        // but the snippet carries a price like "$248".
+        let mut results = vec![
+            serde_json::json!({
+                "url": "https://www.amazon.com/dp/B0C7XFLWN5",
+                "title": "Sony WH-1000XM5 Headphones",
+                "content": "Sony WH-1000XM5 Wireless Noise Canceling Headphones - now $248 at Amazon",
+                "score": 9.7,
+                "commerce_provenance": { "url": "https://www.amazon.com/dp/B0C7XFLWN5", "observed_at": "1790295033", "source": null, "data": null }
+            }),
+        ];
+        enrich_snippet_fallback(&mut results);
+        let c = results[0].get("commerce").expect("snippet fallback should attach commerce");
+        let d = c.get("data").unwrap();
+        assert_eq!(d["price"], serde_json::json!(248.0));
+        assert_eq!(d["currency"], serde_json::json!("USD"));
+        assert_eq!(c["source"], serde_json::json!("snippet_extracted"));
+        assert_eq!(results[0]["url"], serde_json::json!("https://www.amazon.com/dp/B0C7XFLWN5"), "url unchanged");
+    }
+
+    #[test]
+    fn snippet_fallback_extracts_inr_price_from_snippet() {
+        // ₹29,999 price in snippet
+        let mut results = vec![
+            serde_json::json!({
+                "url": "https://www.flipkart.com/sony-wh-1000xm5/p/123",
+                "title": "Sony WH-1000XM5",
+                "content": "Buy Sony WH-1000XM5 for ₹29,999 at Flipkart",
+                "score": 9.0,
+                "commerce_provenance": { "url": "https://www.flipkart.com/sony-wh-1000xm5/p/123", "observed_at": "1", "source": null, "data": null }
+            }),
+        ];
+        enrich_snippet_fallback(&mut results);
+        let c = results[0].get("commerce").expect("INR snippet fallback should attach commerce");
+        assert_eq!(c["data"]["price"], serde_json::json!(29999.0));
+        assert_eq!(c["data"]["currency"], serde_json::json!("INR"));
+        assert_eq!(c["source"], serde_json::json!("snippet_extracted"));
+    }
+
+    #[test]
+    fn snippet_fallback_does_not_overwrite_structured_commerce() {
+        // If structured enrichment already attached a commerce block, the snippet
+        // fallback must NOT overwrite it.
+        let mut results = vec![
+            serde_json::json!({
+                "url": "https://www.amazon.com/dp/B0C7XFLWN5",
+                "content": "Sony WH-1000XM5 for $248",
+                "score": 9.0,
+                "commerce": {
+                    "url": "https://www.amazon.com/dp/B0C7XFLWN5",
+                    "observed_at": "1790295033",
+                    "source": "json-ld",
+                    "data": { "price": 299.99, "currency": "USD" }
+                },
+                "commerce_provenance": { "url": "https://www.amazon.com/dp/B0C7XFLWN5", "observed_at": "1790295033", "source": "json-ld", "data": { "price": 299.99 } }
+            }),
+        ];
+        enrich_snippet_fallback(&mut results);
+        let c = results[0].get("commerce").unwrap();
+        // Structured commerce preserved — snippet fallback skipped
+        assert_eq!(c["data"]["price"], serde_json::json!(299.99));
+        assert_eq!(c["source"], serde_json::json!("json-ld"));
+    }
+
+    #[test]
+    fn snippet_fallback_ignores_snippets_without_currency() {
+        // A snippet without a currency symbol must NOT produce a price (no bare numbers).
+        let mut results = vec![
+            serde_json::json!({
+                "url": "https://blog.example.com/review",
+                "content": "The Sony WH-1000XM5 has 40-hour battery life and weighs 250 grams",
+                "score": 8.5,
+                "commerce_provenance": { "url": "https://blog.example.com/review", "observed_at": "1", "source": null, "data": null }
+            }),
+        ];
+        enrich_snippet_fallback(&mut results);
+        // No currency symbol — snippet fallback should NOT fire
+        assert!(results[0].get("commerce").is_none(), "no currency symbol => no commerce");
+    }
+
+    #[test]
+    fn snippet_fallback_preserves_order_and_urls() {
+        // Multiple results: order and URLs must be byte-identical before/after.
+        let mut results = vec![
+            serde_json::json!({ "url": "https://a.example.com/1", "content": "Buy for $299", "score": 9.0, "commerce_provenance": { "url": "https://a.example.com/1", "observed_at": "1", "source": null, "data": null } }),
+            serde_json::json!({ "url": "https://b.example.com/2", "content": "Price: €199", "score": 8.5, "commerce_provenance": { "url": "https://b.example.com/2", "observed_at": "1", "source": null, "data": null } }),
+            serde_json::json!({ "url": "https://c.example.com/3", "content": "No price here", "score": 8.0, "commerce_provenance": { "url": "https://c.example.com/3", "observed_at": "1", "source": null, "data": null } }),
+        ];
+        let before: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        enrich_snippet_fallback(&mut results);
+        let after: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        assert_eq!(before, after, "snippet fallback must preserve order");
+        // First two get commerce, third stays null
+        assert!(results[0].get("commerce").is_some());
+        assert!(results[1].get("commerce").is_some());
+        assert!(results[2].get("commerce").is_none());
     }
 }
 
