@@ -8654,30 +8654,35 @@ fn is_naming_question(query: &str) -> bool {
     if !interrogative {
         return false;
     }
-    // Naming predicates. Closed-class vocabulary describing the QUESTION FORM
-    // (naming, calling, choosing a name, asking where a word/name came from),
-    // not any specific entity.
-    const NAMING_PREDICATES: &[&str] = &[
-        "named", "name", "names", "naming", "called", "call", "calls", "choose",
-        "chose", "chosen", "choose", "picked", "title", "etymology", "etymological",
-        "origin", "origins", "derived", "derives", "come", "comes", "came", "mean",
-        "means", "meaning", "refer", "refs", "entitled", "word", "words",
+    // Naming predicates, split by how much evidence each one carries on its own.
+    // STRONG predicates are unambiguously about naming ("named after", "called",
+    // "etymology", "choose that name", "derived from"), so one is enough to make
+    // the query a naming question. WEAK predicates ("come from", "means",
+    // "refer to") are also used in ordinary non-naming questions ("where does the
+    // river come from"), so they only count alongside a name-ish noun.
+    // This is closed-class vocabulary describing the QUESTION FORM — it names no
+    // entity, brand or topic.
+    const STRONG_NAMING_PREDICATES: &[&str] = &[
+        "named", "naming", "called", "etymology", "etymological", "entitled",
+        "chose", "chosen", "picked", "nickname", "surname", "codename",
     ];
-    let has_naming_predicate = words.iter().any(|w| NAMING_PREDICATES.contains(w));
-    // "come/came from" and "derived from" only count as naming predicates when
-    // paired with a name-ish noun nearby, so "where does the river come from"
-    // (geography) is not misread as a naming question.
+    const WEAK_NAMING_PREDICATES: &[&str] = &[
+        "name", "names", "title", "word", "words", "term", "call", "calls",
+        "choose", "mean", "means", "meaning", "refer", "refs", "derived",
+        "derives", "origin", "origins",
+    ];
+    const FROM_CONSTRUCTIONS: &[&str] = &[
+        "come from", "comes from", "came from", "derived from", "derives from",
+        "name origin", "origin of the name",
+    ];
+    let has_strong = words.iter().any(|w| STRONG_NAMING_PREDICATES.contains(w));
+    let has_weak = words.iter().any(|w| WEAK_NAMING_PREDICATES.contains(w));
     let has_name_noun = words.iter().any(|w| {
         matches!(*w, "name" | "names" | "naming" | "word" | "words" | "term" | "title")
     });
-    let has_from_construction = q.contains("come from")
-        || q.contains("comes from")
-        || q.contains("came from")
-        || q.contains("derived from")
-        || q.contains("derives from")
-        || q.contains("name origin")
-        || q.contains("origin of the name");
-    has_naming_predicate && (has_name_noun || has_from_construction)
+    let has_from_construction = FROM_CONSTRUCTIONS.iter().any(|c| q.contains(c));
+    has_strong || (has_weak && (has_name_noun || has_from_construction))
+        || has_from_construction
 }
 
 /// Detects video intent in a query. Uses token-aware detection for "watch" to avoid
