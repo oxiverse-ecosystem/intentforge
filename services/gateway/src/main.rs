@@ -4481,7 +4481,7 @@ async fn handle_shopping(
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
-    let commerce_query = params.q.clone();
+    let commerce_query = params.q.clone().unwrap_or_default();
     let (status, body) = handle_search(
         state.clone(),
         Query(params),
