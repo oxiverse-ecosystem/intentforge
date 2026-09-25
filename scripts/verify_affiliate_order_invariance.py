@@ -1,36 +1,40 @@
-"""ORDER-INVARIANCE PROBE (live, real gateway processes, honest attribution).
+"""ORDER-INVARIANCE PROBE (live, three real gateway processes, honest attribution).
 
-The claim under test: affiliate enrichment/keys NEVER change the ranked order.
+The claim under test: affiliate enrichment and affiliate keys NEVER change the
+ranked order.
 
-Why a multi-process design: the affiliate keys are read from the PROCESS
-environment, so the only way to compare "keys present" vs "keys absent" through
-the REAL pipeline is to run two gateway processes. We run:
+Affiliate keys are read from the PROCESS environment, so "keys present" vs "keys
+absent" can only be compared through the real pipeline by running two processes.
+`scripts/gateway-nokeys-twin.sh start` launches all three from ONE image, so the
+comparison never depends on whatever the shared `services-gateway:latest` tag
+currently points at:
 
-  :4000  the compose gateway            — affiliate key env PRESENT
-  :4001  twin, same image + same netns   — affiliate key env ABSENT
-  :4002  control twin, same image/netns  — affiliate key env ALSO ABSENT
+  :4003  keys PRESENT   (dummy key)
+  :4001  keys ABSENT    — the variable under test
+  :4002  keys ABSENT    — the upstream-churn CONTROL
 
-Why the control twin exists (this is the point of the script): all processes
-query the SAME live upstreams independently, so a result SET can change between
-any two calls for reasons unrelated to affiliate keys (an engine adds/drops a URL,
-a fetch times out, a cache expires). A naive "keys vs no-keys order differs =>
-FAIL" reading would blame monetization for ordinary web churn. The control twin
-measures that churn directly: nokey-vs-nokey is the SAME comparison with the
-affiliate variable removed. Keys-vs-nokeys drift that the control does NOT also
-exhibit is genuine affiliate-induced reordering.
+WHY THE CONTROL: all three query the SAME live upstreams independently, so a
+result SET can legitimately change between any two calls (an engine adds/drops a
+URL, a fetch times out, a cache expires). A naive "keys vs no-keys order differs
+=> FAIL" reading would blame monetization for ordinary web churn. The control
+measures that churn with the affiliate variable REMOVED. Keys-vs-nokeys drift
+that the control does not also exhibit is genuine affiliate-induced reordering.
 
 VERDICT RULES
   1. URLs present in ALL THREE ranked lists must appear in the same relative
      order in all three. (Membership churn is upstream; ORDER churn is ours.)
   2. Keys-vs-nokeys order drift FAILS only when the nokey-vs-nokey control stayed
-     stable. If the control also moved, the drift is upstream nondeterminism and
-     is reported as `upstream_churn`, not as a violation.
+     stable. If the control also moved, the drift is reported as
+     `upstream_churn`, not as a violation.
   3. The keys process must actually decorate at least once (otherwise the whole
-     comparison is vacuous) and neither no-key twin may decorate anything.
+     comparison is vacuous) and neither no-key process may decorate anything.
   4. On the SAME process, /search and /shopping must return byte-identical ranked
      URL lists for the same query — same handle_search pipeline, one with
      post-rank commerce decoration. Cache-backed, so upstream churn cannot fake
      either a pass or a failure here.
+
+All three ports are reachable only inside gluetun's network namespace, so every
+request goes through a short-lived curl container attached to it.
 
 Usage:  python scripts/verify_affiliate_order_invariance.py
 Exit 0 = invariant holds. Exit 1 = real affiliate-induced reordering.
@@ -40,7 +44,6 @@ import subprocess
 import sys
 import time
 import urllib.parse
-import urllib.request
 
 QUERIES = [
     "iphone 16 pro max price",
@@ -50,29 +53,16 @@ QUERIES = [
     "bose quietcomfort ultra headphones",
 ]
 COUNT = 5
-KEYS_BASE = "http://localhost:4000"
-TWIN_A_PORT = 4001  # keys absent — the variable under test
-TWIN_B_PORT = 4002  # keys absent — the upstream-churn control
+KEYS_PORT = 4003
+NOKEY_A_PORT = 4001
+NOKEY_B_PORT = 4002
 NETNS = "container:if-dev-gluetun"
 CURL_IMAGE = "curlimages/curl:8.11.1"
 RETRIES = 2
 
 
-def host_get(base, path, q):
-    url = f"{base}{path}?q={urllib.parse.quote(q)}&count={COUNT}"
-    last = None
-    for _ in range(RETRIES + 1):
-        try:
-            with urllib.request.urlopen(url, timeout=180) as r:
-                return json.loads(r.read().decode())
-        except Exception as e:  # noqa: BLE001 — upstream timeouts are expected
-            last = f"{type(e).__name__}: {e}"
-            time.sleep(3)
-    raise RuntimeError(last)
-
-
-def twin_get(port, path, q):
-    """Twin ports are not published to the host, so curl runs in the shared netns."""
+def get(port, path, q):
+    """All twin ports live inside gluetun's netns, so curl runs in there too."""
     url = f"http://127.0.0.1:{port}{path}?q={urllib.parse.quote(q)}&count={COUNT}"
     last = None
     for _ in range(RETRIES + 1):
@@ -84,7 +74,7 @@ def twin_get(port, path, q):
             return json.loads(out.stdout)
         last = (out.stderr or out.stdout)[:200]
         time.sleep(3)
-    raise RuntimeError(f"twin:{port} probe failed: {last}")
+    raise RuntimeError(f"port {port} probe failed: {last}")
 
 
 def ranked(body):
@@ -108,9 +98,9 @@ for q in QUERIES:
     row: dict = {"query": q, "surfaces": {}}
     for label, path in (("search", "/search"), ("shopping", "/shopping")):
         try:
-            keys_body = host_get(KEYS_BASE, path, q)
-            a_body = twin_get(TWIN_A_PORT, path, q)
-            b_body = twin_get(TWIN_B_PORT, path, q)
+            keys_body = get(KEYS_PORT, path, q)
+            a_body = get(NOKEY_A_PORT, path, q)
+            b_body = get(NOKEY_B_PORT, path, q)
         except Exception as e:  # noqa: BLE001
             row["surfaces"][label] = {"error": f"{type(e).__name__}: {e}"}
             verdict["pass"] = False
@@ -127,7 +117,7 @@ for q in QUERIES:
         if a_aff or b_aff:
             verdict["pass"] = False
             verdict["notes"].append(
-                f"{q} [{label}]: no-key twin emitted {a_aff + b_aff} affiliate blocks"
+                f"{q} [{label}]: no-key process emitted {a_aff + b_aff} affiliate blocks"
             )
 
         if not keys_vs_a and a_vs_b:
@@ -136,6 +126,17 @@ for q in QUERIES:
                 f"{q} [{label}]: ORDER-INVARIANCE VIOLATION — keys vs no-keys order "
                 "differs while the no-key control stayed stable"
             )
+
+        # Attribution is about the AFFILIATE VARIABLE, so it is only
+        # affiliate-induced when keys-vs-nokeys actually diverged while the
+        # nokey-vs-nokey control stayed stable. When keys-vs-nokeys agrees, the
+        # affiliate variable had no effect no matter what the control did — a
+        # control-only difference is pure upstream churn, and labeling it
+        # "AFFILIATE_INDUCED" would blame monetization for nothing.
+        if keys_vs_a:
+            attribution = "identical" if a_vs_b else "upstream_churn(control_only)"
+        else:
+            attribution = "AFFILIATE_INDUCED" if a_vs_b else "upstream_churn"
 
         row["surfaces"][label] = {
             "keys_ranked": k_rank,
@@ -147,16 +148,12 @@ for q in QUERIES:
             "shared_count": len(common),
             "keys_vs_nokeys_same_order": keys_vs_a,
             "nokeys_control_same_order": a_vs_b,
-            "drift_attribution": (
-                "identical" if keys_vs_a and a_vs_b
-                else "upstream_churn" if not keys_vs_a and not a_vs_b
-                else "AFFILIATE_INDUCED"
-            ),
+            "drift_attribution": attribution,
         }
 
     try:
-        s_k = host_get(KEYS_BASE, "/search", q)
-        sh_k = host_get(KEYS_BASE, "/shopping", q)
+        s_k = get(KEYS_PORT, "/search", q)
+        sh_k = get(KEYS_PORT, "/shopping", q)
         same_proc = ranked(s_k) == ranked(sh_k)
         row["same_process_search_vs_shopping_identical"] = same_proc
         if not same_proc:
