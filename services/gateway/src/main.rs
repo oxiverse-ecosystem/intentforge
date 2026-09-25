@@ -4674,7 +4674,11 @@ impl AffiliateCtx {
         self.exact_model_patterns
             .iter()
             .filter_map(|p| regex::Regex::new(p).ok())
-            .any(|re| re.is_match(query))
+            // Policy regexes are compiled with anchors in tests/config, but a
+            // caller may omit them. `is_match` deliberately remains a substring
+            // match by default; an explicit full-query boundary is opt-in via
+            // anchors in the policy source itself.
+            .any(|re| re.is_match(query.trim()))
     }
 
     /// The first enabled network that has its required key present in the env.
@@ -6947,6 +6951,19 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     let lc = q_orig.to_lowercase();
     let compound_lower = compound.to_lowercase();
     let c_tokens: Vec<&str> = compound_lower.split_whitespace().collect();
+    // In a procedural request, a bare `without NOUN` / `no NOUN` states a
+    // constraint on HOW the user wants to accomplish the task (cleaning without
+    // soap, learning without a degree), not a result topic to remove. In a
+    // content request (dessert recipes without artificial sweeteners, recipes
+    // with no nuts) the same grammar names the thing the results must exclude.
+    // Detect the broad instruction/content frame structurally, not by domain
+    // nouns. Verb-led targets are handled below.
+    let procedural = ["how to ", "best way to ", "way to ", "tutorial for ", "guide to ", "learn "]
+        .iter()
+        .any(|frame| lc.starts_with(frame));
+    if procedural && c_tokens.iter().all(|t| !MANNER_PRONOUNS.contains(t)) {
+        return true;
+    }
 
     // A relation pronoun is an unambiguous manner signal wherever it occurs
     // ("does not track you as", "without offending the couple").
