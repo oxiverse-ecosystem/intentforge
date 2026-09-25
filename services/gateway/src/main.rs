@@ -4671,7 +4671,11 @@ impl AffiliateCtx {
         self.exact_model_patterns
             .iter()
             .filter_map(|p| regex::Regex::new(p).ok())
-            .any(|re| re.is_match(query))
+            // Policy regexes are compiled with anchors in tests/config, but a
+            // caller may omit them. `is_match` deliberately remains a substring
+            // match by default; an explicit full-query boundary is opt-in via
+            // anchors in the policy source itself.
+            .any(|re| re.is_match(query.trim()))
     }
 
     /// The first enabled network that has its required key present in the env.
