@@ -96,7 +96,7 @@ fn collect_affiliate_urls(payload: &Value) -> Vec<String> {
 fn affiliate_policy_allows_exact_model_and_rejects_broad_product_query() {
     let ctx = AffiliateCtx {
         exact_model_patterns: vec![
-            r"(?i)^\s*(?:buy\s+)?iphone\s+\d{1,5}(?:\s+(?:pro|max|plus))?(?:\s+price)?\s*$".to_string(),
+            r"(?i)^\s*(?:buy\s+)?iphone\s+\d{1,5}(?:\s+(?:pro|max|plus))*(?:\s+price)?\s*$".to_string(),
         ],
         ..AffiliateCtx::default()
     };

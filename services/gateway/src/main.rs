@@ -6951,8 +6951,22 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
         format!("with no {}", c),
         format!("with no a {}", c),
     ];
-    if frames.iter().any(|f| lc.contains(f.as_str())) {
+    // A bare "without <noun>" is an explicit content constraint (e.g. desserts
+    // without artificial sweeteners), not automatically a manner qualifier.
+    // Only HOW-oriented frames qualify: instructional "how to ..." phrasing or
+    // an explicit "with no <attribute>" phrase. This keeps generic product/content
+    // compounds real exclusions while preserving established manner behavior.
+    let instructional = ["how to", "how do", "how can", "how should"]
+        .iter()
+        .any(|frame| lc.contains(frame));
+    if instructional {
         return true;
+    }
+    if lc.contains("with no") {
+        const ATTRIBUTE_OBJECTS: &[&str] = &[
+            "background", "experience", "training", "knowledge", "skill", "skills",
+        ];
+        return c.split_whitespace().any(|t| ATTRIBUTE_OBJECTS.contains(&t));
     }
     // Manner pronouns anywhere in the compound ("track you as", "offend the couple")
     // mark it as a manner qualifier even without the "without" frame.
@@ -7081,6 +7095,16 @@ fn is_real_exclusion(
     q_orig: &str,
     query_is_contrastive: bool,
 ) -> bool {
+    // Resolve the ambiguous payment verb from nearby object context before the
+    // generic "without <X>" manner-frame check. A financial transaction is a
+    // real exclusion; "pay attention/respect" remains a manner qualifier.
+    let compound_lc = compound.to_lowercase();
+    if compound_lc == "pay" || compound_lc == "paying" {
+        if pay_exclusion_is_manner(q_orig) {
+            return false;
+        }
+        return pay_exclusion_is_money(q_orig);
+    }
     // Manner phrases are never exclusions, regardless of framing. The
     // phrase-level check also catches a verb-led frame whose target is the noun
     // after the verb ("without using a library").
