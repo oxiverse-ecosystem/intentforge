@@ -106,6 +106,9 @@ fn remove_keys(keys: &[String]) {
 /// directions: the keyed run MUST have decorated, the keyless run MUST NOT.
 #[test]
 fn real_data_order_is_invariant_for_every_network_key_on_and_off() {
+    // Serialize against every other env-mutating test: these assertions depend
+    // on process-global key vars being exactly as we left them.
+    let _env_guard = crate::ENV_TEST_LOCK.lock();
     let ctx = real_ctx();
     // Queries the shipped policy must treat as exact-model. Asserted, not assumed.
     assert!(
@@ -176,6 +179,9 @@ fn real_data_order_is_invariant_for_every_network_key_on_and_off() {
 /// `AffiliateCtx::load()` production uses, only the env key presence differs.
 #[test]
 fn real_data_whole_config_order_invariant_keys_present_vs_absent() {
+    // Serialize against every other env-mutating test: these assertions depend
+    // on process-global key vars being exactly as we left them.
+    let _env_guard = crate::ENV_TEST_LOCK.lock();
     let ctx = real_ctx();
     let all_keys: Vec<String> = ctx.networks.iter().filter_map(|n| n.key_env.clone()).collect();
 

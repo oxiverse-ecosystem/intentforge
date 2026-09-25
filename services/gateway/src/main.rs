@@ -13,6 +13,21 @@ use tower_http::timeout::TimeoutLayer;
 use axum::http::HeaderMap;
 use std::net::IpAddr;
 
+/// Serializes every test that mutates process-global environment variables.
+///
+/// `cargo test` runs test functions in parallel threads, but `std::env` is
+/// process-global. Any test that toggles an affiliate network's `key_env` var
+/// therefore races every other test that reads or writes the same var — most
+/// visibly `commerce_contract_tests` setting `SOVRN_COMMERCE_KEY` while
+/// `real_data_order_tests` asserts that key is ABSENT. The symptom is a flaky
+/// 1-or-2 test failure whose failing set varies per run, and which disappears
+/// entirely under `--test-threads=1`.
+///
+/// This is a test-harness concern only; production reads these vars at startup
+/// and is unaffected.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 mod spell;
 mod geoloc;
 mod dictionary;
@@ -4661,14 +4676,10 @@ impl AffiliateCtx {
             let all_numeric = t.chars().all(|c| c.is_ascii_digit());
             (all_numeric && t.len() <= 5) || (has_digit && has_alpha)
         });
-        let broad_shape = normalized.iter().any(|t| {
-            matches!(
-                t.as_str(),
-                "best" | "top" | "under" | "below" | "over" | "between" | "versus" | "vs"
-                    | "alternative" | "alternatives" | "compare" | "comparison"
-            )
-        }) || extract_nl_price_bound(query).is_some();
-        has_model_token && !broad_shape
+        // Reject only price/budget expressions. The model-bearing token itself
+        // distinguishes a SKU from a broad category without consulting authored
+        // brand or category vocabulary.
+        has_model_token && extract_nl_price_bound(query).is_none()
     }
 
     /// The first enabled network that has its required key present in the env.
@@ -20714,6 +20725,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
     #[test]
     fn wrap_kind_encodes_destination_and_uses_key() {
+        let _env_guard = ENV_TEST_LOCK.lock();
         // `wrap`: network prefix + url-encoded destination, key interpolated.
         std::env::set_var("DUMMY_SOVRN_KEY", "DUMMY_SOVRN_KEY");
         let n = net(
@@ -20732,6 +20744,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
     #[test]
     fn append_params_kind_appends_encoded_params_to_raw_url() {
+        let _env_guard = ENV_TEST_LOCK.lock();
         // `append_params`: template is the raw destination; params appended encoded.
         std::env::set_var("DUMMY_AMAZON_TAG", "DUMMY_AMAZON_TAG");
         let mut params = HashMap::new();
@@ -20758,6 +20771,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
     #[test]
     fn wrap_kind_appends_network_params_like_cuid() {
+        let _env_guard = ENV_TEST_LOCK.lock();
         // A `wrap` network (e.g. Sovrn) carries its own `params` (cuid). These
         // MUST be appended (encoded) to the network prefix — the prior renderer
         // silently dropped them. This test locks that contract.
@@ -20776,6 +20790,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
     #[test]
     fn decoration_is_idempotent_no_double_wrap() {
+        let _env_guard = ENV_TEST_LOCK.lock();
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
         let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
@@ -20805,6 +20820,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
     #[test]
     fn decoration_preserves_ranking_order() {
+        let _env_guard = ENV_TEST_LOCK.lock();
         // The central no-manipulation guarantee: decoration never reorders.
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
