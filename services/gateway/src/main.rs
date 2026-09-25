@@ -7336,7 +7336,6 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         {
                             terms.push(joined);
                         } else if !is_manner_phrase(&joined)
-                            && !is_manner_frame(q_orig, &joined)
                         {
                             if !dropped.contains(&joined) {
                                 dropped.push(joined);
@@ -7430,7 +7429,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         && !terms.contains(&joined)
                     {
                         terms.push(joined);
-                    } else if is_manner_phrase(&joined) || is_manner_frame(q_orig, &joined) {
+                    } else if is_manner_phrase(&joined) {
                         // Manner qualifier ("without soap", "without offending the
                         // couple"): describes HOW not WHAT to exclude. It is NOT a
                         // search exclusion — record it (the third tuple element) so
@@ -12466,7 +12465,7 @@ async fn handle_analyze(
         }));
     }
     for term in &declined {
-        let is_manner = is_manner_phrase(term) || is_manner_frame(&q_orig, term);
+        let is_manner = is_manner_phrase(term);
         decisions.push(serde_json::json!({
             "term": term,
             "decision": "declined",
@@ -12770,7 +12769,7 @@ fn build_inspect(index: &spell::SymSpellIndex, q: &str) -> serde_json::Value {
         }));
     }
     for term in &declined {
-        let is_manner = is_manner_phrase(term) || is_manner_frame(&q_orig, term);
+        let is_manner = is_manner_phrase(term);
         decisions.push(serde_json::json!({
             "term": term,
             "decision": "declined",
@@ -16279,11 +16278,11 @@ async fn handle_search(
             // bypassed the manner gate and inverted the query: pages ABOUT
             // sweeteners got penalized for containing "artificial", and the
             // alt-query seeding fetched sweetener-alternative pages. Route
-            // explicit "without X" phrases through the SAME is_manner_frame
+            // explicit "without X" phrases through the SAME is_manner_phrase
             // gate the other paths use; genuine source/contrastive negations
             // ("not from X", "except X", "other than X") carry no such frame
             // and keep their explicit-directive status.
-            if is_manner_frame(&q_orig, &n) {
+            if is_manner_phrase(&n) {
                 continue; // manner qualifier: not an exclusion at all
             }
             if !explicit_survivors.contains(&n) {
@@ -16293,7 +16292,7 @@ async fn handle_search(
         }
         if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
             gated_neg_dedup.push(n);
-        } else if !is_manner_phrase(&n) && !is_manner_frame(&q_orig, &n) && !soft_negatives.contains(&n) {
+        } else if !is_manner_phrase(&n) && !soft_negatives.contains(&n) {
             // Soft negative: generic noun the gate declined but not a manner qualifier.
             // Demoted in scoring (×0.3), never hard-dropped.
             soft_negatives.push(n);
@@ -16360,7 +16359,7 @@ async fn handle_search(
         if explicit_neg.iter().any(|e| e == n) {
             continue;
         }
-        if is_manner_phrase(n) || is_manner_frame(&q_orig, n) {
+        if is_manner_phrase(n) {
             continue;
         }
         // Soft negatives are applied (demoted in scoring), not ignored — don't surface them.
@@ -18538,7 +18537,7 @@ mod constraint_fix_tests {
             }));
         }
         for term in &declined {
-            let is_manner = is_manner_phrase(term) || is_manner_frame(&q_orig, term);
+            let is_manner = is_manner_phrase(term);
             decisions.push(serde_json::json!({
                 "term": term,
                 "decision": "declined",
