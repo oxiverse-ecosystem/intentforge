@@ -20,6 +20,9 @@ mod clean;
 mod goals;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
+// ROADMAP item 6: order invariance driven by the REAL shipped affiliate data
+// (every network, keys present vs absent) — the offline CI lock.
+mod real_data_order_tests;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
