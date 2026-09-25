@@ -4516,7 +4516,7 @@ async fn handle_shopping(
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
             // Sacred policy: only exact-model queries may receive affiliate metadata.
-            decorate_affiliate_for_query(arr, &state.affiliate_ctx, &params.q);
+            decorate_affiliate_for_query(arr, &state.affiliate_ctx, &q);
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
             // already-attached `commerce` blocks. Never reorders/reselects results.
             if let Some(arr_ref) = value.get("results").and_then(|v| v.as_array()) {
@@ -20752,7 +20752,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn decoration_is_idempotent_no_double_wrap() {
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], exact_model_patterns: Vec::new() };
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -20769,7 +20769,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn missing_key_degrades_to_null_affiliate() {
         // No usable network (key env var unset) => results keep affiliate null.
         let n = net("wrap", "https://sovrn.co?key={key}&u={url}", HashMap::new(), Some("UNSET_KEY_ENV_VAR_XYZ"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], exact_model_patterns: Vec::new() };
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -20782,7 +20782,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // The central no-manipulation guarantee: decoration never reorders.
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], exact_model_patterns: Vec::new() };
         let mut results = vec![
             serde_json::json!({ "url": "https://a.example.com/x", "score": 9.7 }),
             serde_json::json!({ "url": "https://b.example.org/y", "score": 8.1 }),
