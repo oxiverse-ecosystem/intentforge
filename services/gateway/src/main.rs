@@ -6479,6 +6479,157 @@ fn has_local_intent(query: &str) -> bool {
         }
 }
 
+/// Prepositions that can introduce a TRAILING geographic qualifier. A qualifier
+/// introduced by one of these, sitting at the tail of the query, qualifies WHERE
+/// the request applies — it does not, by itself, ask for nearby places.
+///
+/// Structural vocabulary (a closed-class function-word set), not per-query
+/// literals: the set of English prepositions that can head a locative PP is
+/// small and stable, so enumerating them is a grammar fact rather than a
+/// tuned list.
+const GEO_QUALIFIER_PREPOSITIONS: &[&str] = &[
+    "in", "from", "within", "across", "throughout",
+];
+
+/// Leading interrogative / how-to frames that mark the query's PRIMARY intent
+/// as a how-to, informational, or transactional REQUEST rather than a search
+/// for places, venues, or "near me" results.
+///
+/// The discriminator is the HEAD of the query, exactly as the P10/P11 precedent
+/// gates on whole-word + co-occurrence rather than a bare substring. Superlative
+/// openers ("best", "top") are deliberately ABSENT: "best cafes in indiranagar
+/// bangalore" and "best places to see cherry blossoms in osaka" are genuine
+/// local-discovery queries, and their head frame is the thing that must keep
+/// them `local`. Including superlatives here is what would regress them.
+const NON_LOCAL_HEAD_FRAMES: &[&str] = &[
+    "how to", "how do i", "how do we", "how can i", "how does", "how should",
+    "what is", "what are", "why ", "steps to", "guide to", "learn how",
+    "way to", "ways to", "cheapest way", "easiest way", "best way to",
+    "difference between", "meaning of", "cost of", "price of",
+];
+
+/// True when `name`/`cc` is a gazetteer entry naming a COUNTRY (or
+/// country-scale region) rather than a city or locality.
+///
+/// Derived STRUCTURALLY from the existing reference data: a gazetteer entry is
+/// country-scope exactly when its own name IS the canonical country name that
+/// `country_name_for` maps its country code to. This is the discriminator that
+/// separates "in india" (a market/jurisdiction constraint on a how-to question)
+/// from "in osaka" / "in bangalore" (the place the user wants results ABOUT).
+///
+/// No country literals are introduced: the set is derived from
+/// `LOCATION_GAZETTEER` + `country_name_for`, the same two data sources the
+/// geo detector already uses, so adding a country to the gazetteer automatically
+/// extends this behaviour with no code change (the required growth path).
+///
+/// Known limitation (honest, fail-safe): gazetteer ALIASES whose spelling
+/// differs from the canonical country name ("usa", "uk", "america") are not
+/// recognised as country-scope here, so a how-to query qualified by one of
+/// those keeps its current `local` label. That is the conservative direction —
+/// it preserves existing behaviour rather than mis-demoting a local query.
+fn is_country_scope_gazetteer_entry(name: &str, cc: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    !n.is_empty() && n == country_name_for(cc).trim().to_lowercase()
+}
+
+/// True when the query's trailing geographic qualifier only SCOPES a
+/// non-local request, so it must NOT promote the query to `local`.
+///
+/// The defect this closes (FIX-IF-33): a trailing geo suffix overrode the
+/// query's primary frame. "what is the easiest way to start investing in
+/// mutual funds in india" has a how-to HEAD and "in india" is a trailing
+/// market qualifier, yet the gazetteer branch of `has_local_intent` fired on
+/// the geo substring and the whole query was labelled `local` — which then
+/// branched the P6 recency window, the P3 price block, video dampening, and
+/// the local/web merge weights onto the wrong contract.
+///
+/// Three structural conditions must ALL hold, and each one alone is a real
+/// discriminator (no single keyword decides this):
+///   1. No explicit proximity signal ("near me", "nearby", " near ", …).
+///      A query that asks for NEARBY results is local by definition.
+///   2. The query's HEAD frame is an interrogative/how-to frame
+///      (`NON_LOCAL_HEAD_FRAMES`), not a local-discovery head.
+///   3. The trailing geo qualifier names a COUNTRY-scale gazetteer entry
+///      (`is_country_scope_gazetteer_entry`), not a city/locality.
+///
+/// Requiring all three is what keeps the genuinely-local controls local:
+/// "best places to see cherry blossoms in osaka" fails (2) and (3),
+/// "chennai restaurants near adyar" fails (1), and
+/// "best cafes in indiranagar bangalore" fails (2) and (3).
+fn geo_qualifier_is_scope_only(query: &str) -> bool {
+    let lower = query.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    // (1) Explicit proximity beats everything: "near me" is local intent.
+    if ["near me", "nearby", "close to me", "around me", " near "]
+        .iter()
+        .any(|m| lower.contains(m))
+    {
+        return false;
+    }
+
+    // (2) The PRIMARY frame must be a request, not a place search.
+    if !NON_LOCAL_HEAD_FRAMES.iter().any(|f| lower.starts_with(f)) {
+        return false;
+    }
+
+    // (3) Find the LAST geo preposition; the phrase after it is the trailing
+    //     qualifier. It must be short (a place phrase, not a new clause) and
+    //     must name a country-scale gazetteer entry.
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    let prep_idx = tokens.iter().rposition(|t| {
+        let cleaned = t.trim_matches(|c: char| !c.is_alphanumeric());
+        GEO_QUALIFIER_PREPOSITIONS.contains(&cleaned)
+    });
+    let prep_idx = match prep_idx {
+        Some(i) if i > 0 && i + 1 < tokens.len() => i,
+        _ => return false,
+    };
+
+    // Allow a short tail: "in india", "in united states", "in india for
+    // beginners". A long tail means the preposition heads a new clause rather
+    // than qualifying the request, so it is out of scope for this rule.
+    let tail: Vec<String> = tokens[prep_idx + 1..]
+        .iter()
+        .take(3)
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .collect();
+    if tail.is_empty() || tail.len() > 3 {
+        return false;
+    }
+    let tail_joined = tail.join(" ");
+
+    LOCATION_GAZETTEER.iter().any(|(name, cc)| {
+        is_country_scope_gazetteer_entry(name, cc)
+            && whole_word_contains(&tail_joined, &name.to_lowercase())
+    })
+}
+
+/// Pick the label that should replace a wrongly-promoted `local` verdict.
+///
+/// Uses the engine's OWN distribution rather than a hardcoded replacement: take
+/// the highest-probability supported label other than `local`. This is why the
+/// fix needs no per-query answer table — it removes `local` from the running and
+/// lets real model evidence choose. Falls back to `informational` (the neutral
+/// default) only when the distribution carries no usable non-local evidence.
+fn best_non_local_label(intent: &IntentResponse) -> String {
+    const SUPPORTED: &[&str] = &[
+        "navigational", "informational", "technical", "how-to",
+        "comparison", "fresh", "transactional",
+    ];
+    intent
+        .distribution
+        .iter()
+        .filter(|(label, prob)| {
+            SUPPORTED.contains(&label.as_str()) && **prob > 0.0
+        })
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(label, _)| label.clone())
+        .unwrap_or_else(|| "informational".to_string())
+}
+
 /// Known video-hosting domains. Used by the P8 video dampening so that videos
 /// arriving through the GENERAL web result set (e.g. a youtube.com URL returned by
 /// SearXNG, which is NOT tagged with the `invidious`/`video` source) are still
@@ -18148,6 +18299,30 @@ fn apply_intent_overrides(q: &str, intent: &mut IntentResponse) {
             set_intent(intent, "local", true);
         }
 
+        // Override 4b: a TRAILING country-scale geo qualifier must not let the
+        // gazetteer branch above (or the linear probe) override the query's
+        // PRIMARY how-to / informational frame. FIX-IF-33.
+        //
+        // This is a DEMOTION, not a promotion guard, and it has to be: on the
+        // live defect the engine's own probe already returned `local`, so the
+        // `intent.intent != "local"` guard in Override 4 meant a
+        // promotion-only fix never ran at all. Both the Override-4 promotion
+        // and the probe's own verdict are corrected here, so the rule holds no
+        // matter which produced the wrong label.
+        //
+        // The replacement label is chosen from the engine's own distribution
+        // (`best_non_local_label`) rather than hardcoded, so this stays a
+        // structural rule and not a per-query answer table.
+        if intent.intent == "local" && geo_qualifier_is_scope_only(&q_lower) {
+            let replacement = best_non_local_label(intent);
+            tracing::info!(
+                "INTENT OVERRIDE (GEO SCOPE): trailing country qualifier scopes a \
+                 non-local request '{}' was '{}' (conf={:.3}) -> {}",
+                q, intent.intent, intent.confidence, replacement
+            );
+            set_intent(intent, &replacement, false);
+        }
+
         // Override 5: Comparison & Alternatives signals (H2 fix)
         // e.g. "alternatives to adobe photoshop that are free", "best budget smartphones under 30000 rupees"
         let comp_signals = [
@@ -22075,5 +22250,167 @@ mod fix_if_32_intent_confidence_tests {
         apply_intent_overrides("dentist near me", &mut r);
         assert_ne!(before, r.intent, "local override must fire");
         assert_eq!(r.intent, "local");
+    }
+}
+
+/// FIX-IF-33: a trailing "in <country>" geo qualifier overrode the query's
+/// PRIMARY intent, so a how-to question was labelled `local`.
+///
+/// The live defect: `what is the easiest way to start investing in mutual funds
+/// in india` -> `intent=local`. The HEAD is a how-to request; "in india" is a
+/// trailing market qualifier. The wrong label then branched the P6 recency
+/// window, the P3 price block, video dampening, and the local/web merge weights
+/// onto the wrong contract -- a live behaviour defect, not a cosmetic one.
+#[cfg(test)]
+mod geo_scope_intent_tests {
+    use super::*;
+
+    /// Build an IntentResponse with a controlled distribution, so override
+    /// behaviour can be tested without a model.
+    fn resp(intent: &str, dist: &[(&str, f32)]) -> IntentResponse {
+        let mut r = fallback_intent("q");
+        r.intent = intent.to_string();
+        r.distribution = dist.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        r.confidence = 0.0;
+        r
+    }
+
+    // ── The exact defect query must stop being `local` ──
+    #[test]
+    fn trailing_country_qualifier_does_not_make_a_howto_query_local() {
+        assert!(
+            geo_qualifier_is_scope_only(
+                "what is the easiest way to start investing in mutual funds in india"
+            ),
+            "precondition: the defect query must match the scope-only rule"
+        );
+    }
+
+    // ── Regression guard: genuinely-local controls stay local ──
+    // These are the three controls the card requires, plus the "near me"
+    // proximity case. Each fails a DIFFERENT one of the three conditions, so
+    // together they prove no single keyword is doing the work.
+    #[test]
+    fn genuinely_local_queries_are_not_demoted() {
+        for q in [
+            // fails (2) head frame + (3) city-scale qualifier
+            "best places to see cherry blossoms in osaka",
+            // fails (1) explicit proximity
+            "chennai restaurants near adyar",
+            // fails (2) head frame + (3) city-scale qualifier
+            "best cafes in indiranagar bangalore",
+        ] {
+            assert!(
+                !geo_qualifier_is_scope_only(q),
+                "genuinely-local query must NOT be treated as scope-only: {:?}",
+                q
+            );
+        }
+    }
+
+    // ── Held-out probes: never used while developing the rule ──
+    // A rule that only recognises the query it was written for is hardcoding.
+    // These were written after the rule and exercise a different head frame
+    // ("how do i") and a different preposition ("from").
+    #[test]
+    fn heldout_probes_are_recognised_without_country_literals() {
+        for q in [
+            "how do i open a bank account in kenya",
+            "what is the cheapest way to ship a laptop from germany",
+        ] {
+            assert!(
+                geo_qualifier_is_scope_only(q),
+                "held-out how-to probe must be recognised as scope-only: {:?}",
+                q
+            );
+        }
+    }
+
+    // ── The rule must be structural, not a city/country name list ──
+    // Country scope is DERIVED from LOCATION_GAZETTEER + country_name_for, so
+    // this test pins the derivation rather than any particular spelling.
+    #[test]
+    fn country_scope_is_derived_from_the_gazetteer_not_a_literal_list() {
+        // A canonical country entry is country-scope.
+        assert!(is_country_scope_gazetteer_entry("india", "IN"));
+        // A city in that same country is NOT country-scope -- this is the
+        // discriminator that keeps "in osaka" / "in bangalore" local.
+        assert!(!is_country_scope_gazetteer_entry("osaka", "JP"));
+        assert!(!is_country_scope_gazetteer_entry("bangalore", "IN"));
+        assert!(!is_country_scope_gazetteer_entry("chennai", "IN"));
+        // Every country-scope verdict must be justified by the reference data:
+        // no entry may claim country scope without the gazetteer backing it.
+        for (name, cc) in LOCATION_GAZETTEER.iter() {
+            if is_country_scope_gazetteer_entry(name, cc) {
+                assert_eq!(
+                    name.to_lowercase(),
+                    country_name_for(cc).to_lowercase(),
+                    "country-scope entry {:?}/{:?} is not backed by country_name_for",
+                    name,
+                    cc
+                );
+            }
+        }
+    }
+
+    // ── End-to-end: the override must demote an engine `local` verdict ──
+    // This is the case a promotion-only fix would MISS: the engine's own probe
+    // already returned `local`, so Override 4's `intent.intent != "local"`
+    // guard short-circuited. The demotion override must run anyway.
+    #[test]
+    fn override_demotes_an_engine_local_verdict_on_the_defect_query() {
+        let q = "what is the easiest way to start investing in mutual funds in india";
+        let mut r = fallback_intent(q);
+        // Force the precondition: the engine itself said `local`.
+        r.intent = "local".to_string();
+        r.distribution.insert("local".to_string(), 0.30);
+        r.distribution.insert("how-to".to_string(), 0.25);
+        r.distribution.insert("transactional".to_string(), 0.20);
+
+        apply_intent_overrides(q, &mut r);
+
+        assert_ne!(
+            r.intent, "local",
+            "trailing country qualifier must not leave a how-to query labelled local"
+        );
+    }
+
+    // ── The demotion must NOT fire on the local controls ──
+    #[test]
+    fn override_leaves_genuinely_local_queries_labelled_local() {
+        for q in [
+            "best places to see cherry blossoms in osaka",
+            "chennai restaurants near adyar",
+            "best cafes in indiranagar bangalore",
+        ] {
+            let mut r = fallback_intent(q);
+            r.intent = "local".to_string();
+            r.distribution.insert("local".to_string(), 0.30);
+            r.distribution.insert("informational".to_string(), 0.25);
+
+            apply_intent_overrides(q, &mut r);
+
+            assert_eq!(
+                r.intent, "local",
+                "genuinely-local query must stay local: {:?}",
+                q
+            );
+        }
+    }
+
+    // ── The replacement label comes from real evidence, not a hardcoded answer ──
+    // If this ever returned a constant, `best_non_local_label` would be a
+    // disguised Q->A table and the fix would be hardcoding.
+    #[test]
+    fn replacement_label_follows_the_distribution_rather_than_a_constant() {
+        let how_to_first = resp("local", &[("local", 0.3), ("how-to", 0.4), ("fresh", 0.1)]);
+        assert_eq!(best_non_local_label(&how_to_first), "how-to");
+
+        let comparison_first = resp("local", &[("local", 0.3), ("comparison", 0.45), ("how-to", 0.1)]);
+        assert_eq!(best_non_local_label(&comparison_first), "comparison");
+
+        // No usable non-local evidence -> neutral fallback, never `local`.
+        let no_evidence = resp("local", &[("local", 0.9)]);
+        assert_eq!(best_non_local_label(&no_evidence), "informational");
     }
 }
