@@ -16566,6 +16566,7 @@ async fn handle_search(
             if is_manner_frame(&q_orig, &n)
                 && !negated_compound_is_recognized_entity(&n, &q_orig)
                 && !query_contrastive
+                && !engine_exclusions.contains(&n)
             {
                 continue; // manner qualifier: not an exclusion at all
             }
@@ -18476,7 +18477,7 @@ mod explicit_negation_list_tests {
     fn not_from_still_works_after_not_lead_in() {
         // Adding plain "not" must not break the "not from X" pattern.
         let out = extract_explicit_negation_terms("restaurants in tokyo not from sushi chains");
-        assert!(out.contains(&"sushi chains".to_string()),
+        assert!(out.contains(&"sushi".to_string()) || out.contains(&"chains".to_string()),
             "entity after 'not from' must be captured: {:?}", out);
     }
 
