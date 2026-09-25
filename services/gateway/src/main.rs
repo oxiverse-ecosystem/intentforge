@@ -7354,7 +7354,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                             && !terms.contains(&joined)
                         {
                             terms.push(joined);
-                        } else if !is_manner_phrase(&joined)
+                        } else if !is_manner_phrase(&joined) && !is_manner_frame(q_orig, &joined)
                         {
                             if !dropped.contains(&joined) {
                                 dropped.push(joined);
@@ -7448,7 +7448,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                         && !terms.contains(&joined)
                     {
                         terms.push(joined);
-                    } else if is_manner_phrase(&joined) {
+                    } else if is_manner_phrase(&joined) || is_manner_frame(q_orig, &joined) {
                         // Manner qualifier ("without soap", "without offending the
                         // couple"): describes HOW not WHAT to exclude. It is NOT a
                         // search exclusion — record it (the third tuple element) so
