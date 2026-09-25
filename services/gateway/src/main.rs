@@ -6707,6 +6707,20 @@ const MANNER_PRONOUNS: &[&str] = &[
     "you", "your", "yours", "as", "me", "us", "them", "it", "its", "we", "i",
     "my", "our", "they", "he", "she", "him", "her",
 ];
+/// Nouns naming a TRAIT / CAPABILITY OF THE USER rather than a property of the
+/// content they want. A negated clause whose HEAD is one of these states a
+/// prerequisite or a how-qualifier ("a tutorial with no music background",
+/// "without a computer science degree", "with no prior experience"), never a
+/// topic to remove from the result set. Kept separate from the broader
+/// `ATTRIBUTE_NOUNS` seed inside `is_verb_attribute_exclusion`: that list also
+/// covers product artifacts (app/login/download/permission) and requires EVERY
+/// token to match, so a modifier phrase ("music background") never qualifies
+/// there. Structural vocabulary, no per-query literals.
+const USER_TRAIT_NOUNS: &[&str] = &[
+    "background", "experience", "degree", "qualification", "qualifications",
+    "knowledge", "skill", "skills", "training", "expertise", "familiarity",
+    "coordination", "dependents", "prerequisite", "prerequisites", "basis",
+];
 const MANNER_VERBS: &[&str] = &[
     "taking", "taken", "take", "using", "use", "used", "having", "have", "has",
     "buying", "buy", "bought", "getting", "get", "got", "making", "make", "made",
@@ -6969,6 +6983,29 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     let lc = q_orig.to_lowercase();
     let compound_lower = compound.to_lowercase();
     let c_tokens: Vec<&str> = compound_lower.split_whitespace().collect();
+    // D2: the `pay`/`paying` family is genuinely AMBIGUOUS — a manner idiom
+    // ("without paying attention") describes HOW, while a monetary object
+    // ("without paying for a course") is a real exclusion the user refuses.
+    // The broad procedural rule below cannot tell them apart (both appear in
+    // `how to …` queries), so decide this family from the query's object
+    // vocabulary FIRST: a monetary object means it is NOT a manner frame.
+    if !c_tokens.is_empty() && c_tokens.iter().all(|t| *t == "pay" || *t == "paying") {
+        return !pay_exclusion_is_money(&lc);
+    }
+    // A negated clause whose HEAD noun names a TRAIT of the user (their
+    // background / experience / degree) rather than a property of the desired
+    // CONTENT states a prerequisite, not a topic to remove. "a tutorial with
+    // no music background" is a HOW/prerequisite qualifier; "dessert recipes
+    // with no nuts" names the content, so its head ("nuts") is untouched and
+    // it stays a real exclusion. Structural (head-noun class), no per-query
+    // literals. `is_verb_attribute_exclusion` uses the same trait class but
+    // requires EVERY token to be a trait noun, which a modifier phrase
+    // ("music background") never satisfies.
+    if let Some(head) = c_tokens.last() {
+        if USER_TRAIT_NOUNS.contains(head) {
+            return true;
+        }
+    }
     // In a procedural request, a bare `without NOUN` / `no NOUN` states a
     // constraint on HOW the user wants to accomplish the task (cleaning without
     // soap, learning without a degree), not a result topic to remove. In a
@@ -6976,7 +7013,7 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     // with no nuts) the same grammar names the thing the results must exclude.
     // Detect the broad instruction/content frame structurally, not by domain
     // nouns. Verb-led targets are handled below.
-    let procedural = ["how to ", "best way to ", "way to ", "tutorial for ", "a tutorial ", "guide to ", "learn "]
+    let procedural = ["how to ", "best way to ", "way to ", "tutorial for ", "guide to ", "learn "]
         .iter()
         .any(|frame| lc.starts_with(frame));
     if procedural && c_tokens.iter().all(|t| !MANNER_PRONOUNS.contains(t)) {
@@ -7145,11 +7182,14 @@ fn is_real_exclusion(
     q_orig: &str,
     query_is_contrastive: bool,
 ) -> bool {
-    // Resolve the ambiguous "pay"/"paying" sense before the broad procedural
-    // manner-frame check: "how to learn ... without paying for a course" is a
-    // monetary exclusion, not a manner qualifier merely because the query starts
-    // with "how to".
-    if compound.eq_ignore_ascii_case("pay") || compound.eq_ignore_ascii_case("paying") {
+    // Resolve the ambiguous payment verb from nearby object context before the
+    // generic "without <X>" manner-frame check. A financial transaction is a
+    // real exclusion; "pay attention/respect" remains a manner qualifier.
+    let compound_lc = compound.to_lowercase();
+    if compound_lc == "pay" || compound_lc == "paying" {
+        if pay_exclusion_is_manner(q_orig) {
+            return false;
+        }
         return pay_exclusion_is_money(q_orig);
     }
     // Manner phrases are never exclusions, regardless of framing. The
@@ -12266,7 +12306,15 @@ async fn main() {
         .route("/goals/:goal_id/progress", post(goals::handle_update_progress))
         .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
+    // Bind port is env-configurable (default 4000) so a second, side-by-side
+    // instance can be started — e.g. an affiliate-keys-ABSENT twin used to prove
+    // ranked order is byte-identical with and without affiliate keys. Production
+    // sets nothing and keeps 4000.
+    let port: u16 = std::env::var("GATEWAY_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(4000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("Gateway listening on {} (circuit-breaker + cache)", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
