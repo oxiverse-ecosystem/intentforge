@@ -4842,7 +4842,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     for marker in upper_markers {
         if let Some(pos) = lower.find(marker) {
             let rest = &lower[pos + marker.len()..];
-            let re_num = regex::Regex::new(&format!(r"\s*{}\b", amount_pat)).ok()?;
+            let re_num = regex::Regex::new(&format!(r"^\s*{}\b", amount_pat)).ok()?;
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
@@ -15750,6 +15750,16 @@ async fn handle_search(
     }).count();
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
 
+    // FRESH/date fail-open v2 (P6): if NO merged web result carries a parseable
+    // date, the hard date window is meaningless — clear it so recency stays a
+    // scoring boost only. This prevents the window from crushing date-less
+    // fresh queries (e.g. "latest movies released in 2026") even when the
+    // survivor-fraction check would not fire (all results survive trivially).
+    if dated_result_count == 0 {
+        intent.structured_constraints.after_date = None;
+        intent.structured_constraints.before_date = None;
+    }
+
     // FRESH/date fail-open (prevents 0-result collapse): the FRESH OVERRIDE may have
     // flagged this as a recency query, and should_filter_by_constraints DROPS any
     // result without a parseable date OR with a date outside the hard window.
@@ -15795,15 +15805,18 @@ async fn handle_search(
         //     week" → 8/9 dropped, 1 survives = 11%). A near-empty result set is
         //     the same user-facing failure as a zero one: relevant, date-less
         //     results get discarded in favour of a single stale-but-dated item.
-        //     Fail-open when the surviving fraction is below a general 25% floor
+        //     Fail-open when the surviving fraction is below a general 50% floor
         //     AND the surviving count is too small to be useful (< 3). This is
         //     keyed on survival ratio, not on any query/window, so it stays general.
+        //     2026-09-04: threshold raised from 0.25 → 0.50 after "latest news about
+        //     chandrayaan 4 mission updates this week" returned 1/3 (0.33) and the
+        //     old 0.25 floor let the window stand, dropping 2/3 of relevant results.
         let survivor_fraction = if pre_filter_count > 0 {
             survivors_after_window as f32 / pre_filter_count as f32
         } else {
             1.0
         };
-        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.25;
+        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.50;
         if survivors_after_window == 0 || fraction_too_low {
             tracing::info!(
                 "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
