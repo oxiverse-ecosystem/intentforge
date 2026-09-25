@@ -575,6 +575,18 @@ mod tests {
     }
 
     #[test]
+    fn localized_lexicon_markers_are_detected() {
+        assert!(is_definition_site(
+            "happenedの意味・使い方・読み方 | Weblio英和辞書",
+            "happenの意味"
+        ));
+        assert!(is_definition_site(
+            "serendipity 사전 뜻",
+            "serendipity"
+        ));
+    }
+
+    #[test]
     fn clean_removes_css_and_html() {
         let dirty = "Body text here <img alt=\"x\"> and <div>more</div> @font-face{font-family:test} url(http://a.com/b.png) tail";
         let out = clean_result_content(dirty, "");
@@ -1041,6 +1053,15 @@ pub fn is_definition_site(title_lc: &str, content_lc: &str) -> bool {
         || content_prefix.starts_with("abbreviation");
     let content_is_short = content_lc.len() < 200;
     let short_title = title_words.len() <= 3;
+    // Localized lexicon pages often omit English pronunciation/POS markers. These
+    // are page-structure signals, not a host or query denylist: a reference entry
+    // pairs a headword with an explanatory/translation label.
+    let has_locale_lexicon_marker = title_lc.contains("意味")
+        || title_lc.contains("読み方")
+        || title_lc.contains("翻訳")
+        || title_lc.contains("的意思")
+        || title_lc.contains("뜻")
+        || title_lc.contains("사전");
     let dictionary_title_pattern = title_lc.contains("| meaning")
         || title_lc.contains(": meaning")
         || title_lc.contains("definition & meaning")
@@ -1052,6 +1073,7 @@ pub fn is_definition_site(title_lc: &str, content_lc: &str) -> bool {
         || (has_phonetic || has_pos_label) && short_title
         || has_pos_label && content_is_short
         || has_phonetic && short_title
+        || has_locale_lexicon_marker && (short_title || content_is_short)
 }
 
 /// P13 (round-2026-08-20T1935Z): query-agnostic adult/NSFW classifier.
