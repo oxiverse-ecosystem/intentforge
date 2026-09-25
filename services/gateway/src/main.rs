@@ -4481,6 +4481,7 @@ async fn handle_shopping(
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
+    let commerce_query = params.q.clone();
     let (status, body) = handle_search(
         state.clone(),
         Query(params),
@@ -4516,7 +4517,7 @@ async fn handle_shopping(
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
             // Sacred policy: only exact-model queries may receive affiliate metadata.
-            decorate_affiliate_for_query(arr, &state.affiliate_ctx, &params.q);
+            decorate_affiliate_for_query(arr, &state.affiliate_ctx, &commerce_query);
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
             // already-attached `commerce` blocks. Never reorders/reselects results.
             if let Some(arr_ref) = value.get("results").and_then(|v| v.as_array()) {
@@ -4597,6 +4598,12 @@ struct AffiliateCtx {
     /// as data (compiled at startup) so a new product family can be monetized by
     /// editing JSON only — never by adding a brand/query branch in Rust.
     exact_model_patterns: Vec<String>,
+}
+
+impl Default for AffiliateCtx {
+    fn default() -> Self {
+        Self { networks: Vec::new(), exact_model_patterns: Vec::new() }
+    }
 }
 
 impl AffiliateCtx {
@@ -17279,7 +17286,9 @@ let mut results = match tokio::task::spawn_blocking(move || {
             )
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
-            decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
+            // Sacred policy: broad shopping queries remain free; only exact
+            // product-model queries receive affiliate metadata.
+            decorate_affiliate_for_query(&mut shop_arr, &state.affiliate_ctx, &q);
             // Only concrete product offers belong on the main-path shopping array.
             // Keep the enriched order and drop rows with no real commerce block;
             // this is presentation filtering over a clone, never selection or
@@ -20726,7 +20735,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn decoration_is_idempotent_no_double_wrap() {
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -20743,7 +20752,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn missing_key_degrades_to_null_affiliate() {
         // No usable network (key env var unset) => results keep affiliate null.
         let n = net("wrap", "https://sovrn.co?key={key}&u={url}", HashMap::new(), Some("UNSET_KEY_ENV_VAR_XYZ"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -20756,7 +20765,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // The central no-manipulation guarantee: decoration never reorders.
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
         let mut results = vec![
             serde_json::json!({ "url": "https://a.example.com/x", "score": 9.7 }),
             serde_json::json!({ "url": "https://b.example.org/y", "score": 8.1 }),

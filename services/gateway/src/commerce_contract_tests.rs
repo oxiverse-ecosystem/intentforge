@@ -93,6 +93,46 @@ fn collect_affiliate_urls(payload: &Value) -> Vec<String> {
 }
 
 #[test]
+fn affiliate_policy_allows_exact_model_and_rejects_broad_product_query() {
+    let ctx = AffiliateCtx {
+        exact_model_patterns: vec![
+            r"(?i)^\s*(?:buy\s+)?iphone\s+\d{1,5}(?:\s+(?:pro|max|plus))?(?:\s+price)?\s*$".to_string(),
+        ],
+        ..AffiliateCtx::default()
+    };
+    assert!(ctx.is_exact_model_query("iphone 16 pro max price"));
+    assert!(ctx.is_exact_model_query("buy iphone 15 pro"));
+    assert!(!ctx.is_exact_model_query("best wireless earbuds under 50 dollars"));
+    assert!(!ctx.is_exact_model_query("steel water bottle"));
+}
+
+#[test]
+fn affiliate_policy_gate_decorates_exact_model_but_not_broad_query() {
+    std::env::set_var("EXACT_MODEL_POLICY_TEST_KEY", "present");
+    let n = contract_net(
+        "wrap",
+        "https://sovrn.co?key={key}&u={url}",
+        HashMap::new(),
+        Some("EXACT_MODEL_POLICY_TEST_KEY"),
+    );
+    let ctx = AffiliateCtx {
+        networks: vec![n],
+        exact_model_patterns: vec![
+            r"(?i)^\s*sony\s+[a-z0-9-]*\d[a-z0-9-]*\s*$".to_string(),
+        ],
+    };
+
+    let exact = vec![json!({"url": "https://shop.example/product/sony-wh-1000xm5"})];
+    let broad = vec![json!({"url": "https://shop.example/headphones"})];
+    let mut exact = exact;
+    let mut broad = broad;
+    decorate_affiliate_for_query(&mut exact, &ctx, "sony wh-1000xm5");
+    decorate_affiliate_for_query(&mut broad, &ctx, "wireless headphones under 50");
+    assert!(exact[0].get("affiliate").is_some(), "exact model must be eligible");
+    assert!(broad[0].get("affiliate").is_none(), "broad product query must remain free");
+}
+
+#[test]
 fn contract_disclosure_present_on_every_decorated_result() {
     // A wrap network (Sovrn-like) that also carries a cuid subid param.
     std::env::set_var("CONTRACT_SOVRN_KEY", "CONTRACT_SOVRN_KEY");
@@ -104,7 +144,7 @@ fn contract_disclosure_present_on_every_decorated_result() {
         params,
         Some("CONTRACT_SOVRN_KEY"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     // Decorate the ALREADY-RANKED results, exactly as handle_shopping does.
@@ -143,7 +183,7 @@ fn contract_no_query_user_or_ip_in_affiliate_urls() {
         params,
         Some("CONTRACT_SOVRN_KEY"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
 
     let user_query = "best wireless earbuds under 50 dollars";
     let mut payload = representative_shopping_payload(user_query);
@@ -241,7 +281,7 @@ fn contract_decoration_is_idempotent_and_order_preserved() {
         HashMap::new(),
         Some("CONTRACT_SOVRN_KEY"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     let before: Vec<String> = payload["results"]
@@ -290,7 +330,7 @@ fn contract_missing_key_degrades_without_leak_or_crash() {
         HashMap::new(),
         Some("CONTRACT_UNSET_KEY_ENV_VAR_ZZZ"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     if let Some(arr) = payload.get_mut("results").and_then(|v| v.as_array_mut()) {
@@ -377,7 +417,7 @@ fn test_affiliate_decoration_does_not_change_ranking() {
         },
         Some("SOVRN_COMMERCE_KEY"),
     );
-    let enabled_ctx = AffiliateCtx { networks: vec![enabled_net] };
+    let enabled_ctx = AffiliateCtx { networks: vec![enabled_net], ..AffiliateCtx::default() };
     let mut enabled_payload = ranked_input.clone();
     if let Some(arr) = enabled_payload
         .get_mut("results")
@@ -391,7 +431,7 @@ fn test_affiliate_decoration_does_not_change_ranking() {
     // ── DISABLED run ─────────────────────────────────────────────────────────
     // No networks at all => first_usable() returns None => affiliate omitted,
     // results returned untouched. This IS the "keys unset" behaviour.
-    let disabled_ctx = AffiliateCtx { networks: vec![] };
+    let disabled_ctx = AffiliateCtx::default();
     let mut disabled_payload = ranked_input.clone();
     if let Some(arr) = disabled_payload
         .get_mut("results")
@@ -453,7 +493,7 @@ fn test_affiliate_decoration_writes_affiliate_field_not_url() {
         },
         Some("SOVRN_COMMERCE_KEY"),
     );
-    let ctx = AffiliateCtx { networks: vec![net] };
+    let ctx = AffiliateCtx { networks: vec![net], ..AffiliateCtx::default() };
 
     let raw = representative_shopping_payload("buy wireless earbuds under 200");
     let before_urls: Vec<String> = raw["results"]
@@ -540,7 +580,7 @@ fn item6_bid_floor_and_fallback_appended_and_reported() {
         Some("0.10"),
         Some("https://shop.example.com/fallback"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     if let Some(arr) = payload.get_mut("results").and_then(|v| v.as_array_mut()) {
@@ -601,7 +641,7 @@ fn item6_bf_fbu_never_change_ranking() {
         Some("0.25"),
         Some("https://shop.example.com/fallback"),
     );
-    let enabled_ctx = AffiliateCtx { networks: vec![enabled_net] };
+    let enabled_ctx = AffiliateCtx { networks: vec![enabled_net], ..AffiliateCtx::default() };
     let ranked_input = representative_shopping_payload("buy wireless earbuds under 200");
 
     let mut enabled_payload = ranked_input.clone();
@@ -622,7 +662,7 @@ fn item6_bf_fbu_never_change_ranking() {
         "bf must be present in decorated urls"
     );
 
-    let disabled_ctx = AffiliateCtx { networks: vec![] };
+    let disabled_ctx = AffiliateCtx::default();
     let mut disabled_payload = ranked_input.clone();
     if let Some(arr) = disabled_payload
         .get_mut("results")

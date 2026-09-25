@@ -1576,7 +1576,13 @@ no user tracking or profiling. Two invariants govern every commerce feature:
    ordering. The `/shopping` endpoint reuses the *exact* `/search` ranking pipeline;
    affiliate decoration is a strict **post-rank** pass that only adds fields to
    already-ordered results. Result order is identical to `/search` (verified live below).
-2. **No product misrepresentation.** Every product fact (`price`, `currency`,
+2. **Exact-model-only monetization.** Affiliate metadata is emitted only when the
+   query names an exact product model (for example `iphone 16 pro max price` or
+   `sony wh-1000xm5`). Broad searches such as `best wireless earbuds under 50`
+   remain completely free of affiliate links. Eligibility regexes are runtime-loaded
+   from `services/gateway/data/commerce/affiliate.json`; no merchant/query keyword
+   branch is compiled into Rust.
+3. **No product misrepresentation.** Every product fact (`price`, `currency`,
    `availability`, `merchant`, `condition`, `sku`/`gtin`, `rating`) is **extracted
    from that result's own page** (schema.org/Product JSON-LD, OpenGraph `product:*`,
    microdata) — never inferred, never carried across URLs, never guessed from free
@@ -1592,9 +1598,10 @@ result:
   result whose page exposed no structured product data gets **no** `commerce` block.
 - `commerce_provenance` — `{ url, observed_at, source, data:null }` for **every**
   result, so the frontend can label facts and never show a stale price as current.
-- `affiliate` — added by the post-rank affiliate engine (see below). When no
-  network key is present in the environment, this field is omitted and the result is
-  still returned (graceful degradation). When a network with a configured bid floor /
+- `affiliate` — added only for exact-model queries by the post-rank affiliate engine
+  (see below). Broad product/category queries deliberately omit it, and search still
+  returns the same ranked URLs. When no network key is present in the environment,
+  this field is omitted and the result is still returned (graceful degradation). When a network with a configured bid floor /
   fallback is used, the block also carries `bid_floor` (the configured floor, for
   reporting) and `fallback` (the fallback URL), both `Optional` and **never**
   influencing ranking — see *Bid-floor / fallback (item 6)* below.

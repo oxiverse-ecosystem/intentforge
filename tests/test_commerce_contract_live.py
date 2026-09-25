@@ -29,6 +29,9 @@ BASE = os.environ.get("INTENTFORGE_BASE_URL", "http://localhost:4000").rstrip("/
 
 # Commercial: exact-model + price-bearing — reliably transactional intent.
 COMMERCIAL_Q = "iphone 16 pro max price"
+# Broad product/category query — commerce signals may be transactional, but the
+# sacred affiliate policy must leave it free of monetized links.
+BROAD_PRODUCT_Q = "best wireless earbuds under 50 dollars"
 # Purely informational — language-concept lookup, no product/price.
 INFORMATIONAL_Q = "rust ownership"
 
@@ -83,6 +86,25 @@ def test_shopping_endpoint_returns_results_with_provenance_and_affiliate(session
             f"result[{i}].affiliate.disclosed must be True (disclosure contract)"
         )
         assert aff.get("network"), f"result[{i}].affiliate.network missing"
+
+
+def test_broad_product_query_has_no_affiliate_links(session):
+    """A broad product/category query may use /shopping, but monetization is
+    restricted to exact product-model queries. The ranked result URLs still run
+    normally; only `affiliate` must be absent."""
+    r = session.get(
+        f"{BASE}/shopping",
+        params={"q": BROAD_PRODUCT_Q, "count": 5},
+        timeout=120,
+    )
+    assert r.status_code == 200, f"GET /shopping -> {r.status_code} {r.text[:300]}"
+    results = r.json().get("results", [])
+    assert results, "broad product query should still return normal search results"
+    decorated = [entry for entry in results if isinstance(entry.get("affiliate"), dict)]
+    assert not decorated, (
+        f"broad product query {BROAD_PRODUCT_Q!r} received affiliate links: "
+        f"{decorated[:2]!r}; exact-model-only policy violated"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
