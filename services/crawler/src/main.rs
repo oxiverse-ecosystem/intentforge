@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, BinaryHeap, VecDeque};
 use std::cmp::Ordering;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use scraper::{Html, Selector};
@@ -463,6 +464,31 @@ fn normalize_url(url: &str) -> String {
     }
 }
 
+// ─── Allowed domain gate ────────────────────────────────────────────
+/// Hard deny-list-free gate: every discovered URL must belong to one of the
+/// seeded domains. Prevents the crawler from escaping its intended vertical
+/// when pages link out to YouTube, unrelated blogs, etc.
+static ALLOWED_DOMAINS: OnceLock<HashSet<String>> = OnceLock::new();
+
+fn init_allowed_domains() -> &'static HashSet<String> {
+    ALLOWED_DOMAINS.get_or_init(|| {
+        default_seed_urls()
+            .iter()
+            .filter_map(|(url, _)| {
+                Url::parse(url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_string()))
+            })
+            .collect()
+    })
+}
+
+fn host_of(url: &str) -> Option<String> {
+    Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+}
+
 // ─── Seed URLs ───────────────────────────────────────────────────────
 
 fn default_seed_urls() -> Vec<(&'static str, &'static str)> {
@@ -686,6 +712,13 @@ async fn main() {
         perf: Mutex::new(PerfState { ewma_spd: 0.0, last_batch_docs: 0 }),
     });
 
+    // Warm the allowed-domains gate before any discovery can fire.
+    let _allowed = init_allowed_domains();
+    tracing::info!(
+        "Allowed-domain gate active: {} domains from seed URLs",
+        _allowed.len()
+    );
+
     // Queue snapshot saver: persist pending URLs + seen set periodically so a
     // crash/restart loses at most QUEUE_SAVE_INTERVAL of progress.
     {
@@ -820,9 +853,21 @@ async fn main() {
                         for result in results.into_iter().flatten() {
                             let (entry, links) = result;
                             let mut discovered = 0;
+                            let allowed = init_allowed_domains();
                             for link in links {
                                 if discovered >= queue.max_discovered_per_page {
                                     break;
+                                }
+                                let link_host = match host_of(&link) {
+                                    Some(h) => h,
+                                    None => continue,
+                                };
+                                if !allowed.contains(&link_host) {
+                                    tracing::debug!(
+                                        "Blocked discovery of disallowed-domain URL: {} (host: {})",
+                                        link, link_host
+                                    );
+                                    continue;
                                 }
                                 let link_type = detect_content_type(&link);
                                 let new_entry = CrawlEntry {
