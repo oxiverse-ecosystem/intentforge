@@ -11160,20 +11160,40 @@ fn merge_local_and_web(
                 let url_lower = r.url.to_lowercase();
                 let mut has_entity = false;
                 for phrase in &phrase_entities {
+                    let tokens: Vec<&str> = phrase.split_whitespace().collect();
+                    let matched = tokens.iter().filter(|t| {
+                        title_lower.contains(**t) || content_lower.contains(**t) || url_lower.contains(**t)
+                    }).count();
                     let exact = title_lower.contains(phrase.as_str())
                         || content_lower.contains(phrase.as_str())
                         || url_lower.contains(phrase.as_str());
-                    if exact {
+                    // Contiguous evidence is strongest; ordered token coverage
+                    // accommodates titles such as "Apache HTTP Server" while
+                    // still rejecting a page containing only the head noun.
+                    if exact || (tokens.len() >= 2 && matched as f32 / tokens.len() as f32 >= 0.66) {
                         has_entity = true;
                         break;
                     }
                 }
-                // Post-calibration requires the contiguous entity in the result
-                // text; token coverage is useful pre-calibration but is too
-                // permissive when a question repeats the same words in prose.
+                // Post-calibration cap makes the signal durable after relative
+                // score calibration. It is structural and contains no query literals.
                 if !has_entity && r.score > 0.04 {
                     r.post_cal_cap = Some(0.04);
                     r.score = 0.04;
+                }
+                // A forum/Q&A page that is itself a question is not an answer-shaped
+                // result for an explanatory query. Detect the content shape from
+                // common forum path markers and interrogative title, not domains.
+                let forum_path = url_lower.contains("/r/") || url_lower.contains("/comments/")
+                    || url_lower.contains("/forum/") || url_lower.contains("/question/")
+                    || url_lower.contains("/q/");
+                let question_title = title_lower.starts_with("are ") || title_lower.starts_with("is ")
+                    || title_lower.starts_with("why ") || title_lower.starts_with("how ")
+                    || title_lower.contains(" named") || title_lower.contains(" called")
+                    || title_lower.contains("? ");
+                if forum_path && question_title && r.score > 0.05 {
+                    r.post_cal_cap = Some(0.05);
+                    r.score = 0.05;
                 }
             }
 
