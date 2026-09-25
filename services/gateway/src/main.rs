@@ -6935,22 +6935,48 @@ const COUNTRY_DEMONYMS: &[&str] = &[
 /// hardcoding doctrine and the existing `is_manner_phrase`).
 fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     let lc = q_orig.to_lowercase();
-    let c = compound.to_lowercase();
-    let frames = [
-        format!("without {}", c),
-        format!("without a {}", c),
-        format!("without an {}", c),
-        format!("without the {}", c),
-        format!("with no {}", c),
-        format!("with no a {}", c),
-    ];
-    if frames.iter().any(|f| lc.contains(f.as_str())) {
+    let compound_lower = compound.to_lowercase();
+    let c_tokens: Vec<&str> = compound_lower.split_whitespace().collect();
+
+    // A relation pronoun is an unambiguous manner signal wherever it occurs
+    // ("does not track you as", "without offending the couple").
+    if c_tokens.iter().any(|t| MANNER_PRONOUNS.contains(t)) {
         return true;
     }
-    // Manner pronouns anywhere in the compound ("track you as", "offend the couple")
-    // mark it as a manner qualifier even without the "without" frame.
-    let c_tokens: Vec<&str> = c.split_whitespace().collect();
-    c_tokens.iter().any(|t| MANNER_PRONOUNS.contains(t))
+
+    // The extractor removes a leading action verb before collecting its noun
+    // target ("without using a library" -> target "library"). Recover that
+    // verb-led frame structurally: the target must occur after `without` or
+    // `with no`, optional articles, and a known manner/action verb. A plain
+    // `without NOUN` or `no NOUN` frame is NOT manner by itself: the noun can
+    // be the thing the user genuinely wants excluded.
+    let q_tokens: Vec<&str> = lc
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let target = c_tokens.first().copied().unwrap_or_default();
+    if target.is_empty() {
+        return false;
+    }
+    for i in 0..q_tokens.len().saturating_sub(1) {
+        if q_tokens[i] != "without" && !(q_tokens[i] == "with" && q_tokens.get(i + 1) == Some(&"no")) {
+            continue;
+        }
+        let mut j = i + if q_tokens[i] == "with" { 2 } else { 1 };
+        while matches!(q_tokens.get(j), Some(&"a") | Some(&"an") | Some(&"the") | Some(&"any")) {
+            j += 1;
+        }
+        if q_tokens.get(j).is_some_and(|verb| MANNER_VERBS.contains(verb)) {
+            j += 1;
+            while matches!(q_tokens.get(j), Some(&"a") | Some(&"an") | Some(&"the") | Some(&"any")) {
+                j += 1;
+            }
+            if q_tokens.get(j) == Some(&target) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_manner_phrase(compound: &str) -> bool {
