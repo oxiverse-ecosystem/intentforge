@@ -4926,20 +4926,37 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                             continue;
                         }
                         // Currency-proximity guard: Pattern A is "<marker> <number>",
-                        // but a discourse marker like "about" can be followed by an
-                        // unrelated number that is NOT a price (e.g. "gpt 5",
-                        // "chapter 3", "version 2"). Require a currency word to
-                        // appear IMMEDIATELY after the number (within 20 chars),
-                        // not anywhere in the rest of the query. Without a nearby
-                        // currency word, this is not a price bound — skip and try
-                        // the next marker. General guard; no per-query literals.
+                        // and for a DISCOURSE marker ("about", "around", "up to")
+                        // a trailing number may be unrelated to price ("gpt 5",
+                        // "chapter 3", "version 2"). For those, require a currency
+                        // word near the number.
+                        //
+                        // A DEFINITIONAL comparison marker ("under", "below", "at
+                        // most", "max", ...) is different: a bare number after it IS
+                        // the bound, with or without a currency word ("under 50",
+                        // "under 50 dollars"). Requiring currency there made
+                        // "wireless headphones under 50" parse as having NO price
+                        // bound at all, so the bare "50" was then mistaken for a
+                        // product-model token and the broad query was wrongly
+                        // treated as exact-model (and monetized).
+                        //
+                        // The split is grammatical (definitional vs discourse), not
+                        // per-query; no authored query literals. Note this is scoped
+                        // to the UPPER-marker loop; NL lower bounds are handled
+                        // separately below and are not yet wired to price_gt.
                         let after_num = &rest[m.end()..];
+                        let marker_is_definitional = matches!(
+                            marker,
+                            "under" | "below" | "less than" | "cheaper than"
+                                | "at most" | "no more than" | "min" | "minimum"
+                                | "max" | "maximum"
+                        );
                         let near_currency = currency_words.iter().any(|c| {
                             after_num.len() >= c.len() && after_num[..c.len()].starts_with(c)
                                 || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
                                 || after_num[..after_num.len().min(20)].contains(c)
                         });
-                        if !near_currency {
+                        if !marker_is_definitional && !near_currency {
                             continue;
                         }
                         let currency = currency_words.iter().find(|c| after_num[..after_num.len().min(20)].contains(*c))
@@ -20661,6 +20678,43 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // EXISTING gateway/engine constraint parser, never a keyword.
         let dist = std::collections::HashMap::new();
         assert!(is_commercial_intent("informational", &dist, true));
+    }
+
+    #[test]
+    fn price_bound_definitional_marker_needs_no_currency_word() {
+        // A DEFINITIONAL comparison marker plus a bare number IS a price bound,
+        // with or without a currency word. Without this, "under 50" parsed as
+        // having NO bound at all, so the bare "50" was then mistaken for a
+        // product-model token and the broad query was wrongly monetized.
+        //
+        // Scoped to the UPPER-marker set: NL lower bounds ("over N", "at least
+        // N") are deliberately not yet wired to price_gt (see the lower_markers
+        // loop in extract_nl_price_bound), so they are NOT asserted here.
+        for q in [
+            "wireless headphones under 50",
+            "wireless headphones under 50 dollars",
+            "laptops below 1000",
+            "monitors at most 300",
+            "tablets maximum 900",
+        ] {
+            assert!(
+                extract_nl_price_bound(q).is_some(),
+                "{q:?} must parse as a price bound"
+            );
+        }
+    }
+
+    #[test]
+    fn price_bound_discourse_marker_still_requires_currency_word() {
+        // The counterpart guard, which must NOT be weakened: a DISCOURSE marker
+        // ("about", "around") may be followed by an unrelated number that is not
+        // a price ("gpt 5", "chapter 3", "version 2").
+        for q in ["gpt 5", "about chapter 3", "version 2 guide", "around 300 options"] {
+            assert!(
+                extract_nl_price_bound(q).is_none(),
+                "{q:?} must NOT parse as a price bound"
+            );
+        }
     }
 
     #[test]
