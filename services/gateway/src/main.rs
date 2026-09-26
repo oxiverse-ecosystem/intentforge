@@ -16217,8 +16217,9 @@ async fn handle_search(
     //     results — but only while enough in-range priced results remain to
     //     fill the page (>= 6), so we never collapse to 1-3 arbitrary hits.
     {
-        let pmin = intent.structured_constraints.price_min;
-        let pmax = intent.structured_constraints.price_max;
+        let bound_cur = intent.structured_constraints.price_currency.as_deref();
+        let pmin = bound_to_usd(intent.structured_constraints.price_min, bound_cur);
+        let pmax = bound_to_usd(intent.structured_constraints.price_max, bound_cur);
         if pmin.is_some() || pmax.is_some() {
             let lo = pmin.unwrap_or(0.0) as f64;
             let hi = pmax.unwrap_or(f32::MAX) as f64;
@@ -18436,6 +18437,65 @@ mod constraint_fix_tests {
         assert_eq!(price_to_usd(100.0, "USD"), 100.0);
         let inr_usd = price_to_usd(2000.0, "INR");
         assert!(inr_usd < 30.0 && inr_usd > 20.0, "2000 INR should be ~24 USD, got {}", inr_usd);
+    }
+
+    // ── P3 regression: a non-USD price bound must not be a silent no-op ──────
+    //
+    // The bound is denominated in the currency the USER stated; result prices
+    // are normalized to USD. Comparing the two raw made every non-USD query
+    // pass: "under 50000 rupees" (bound 50000) was tested against a Rs 60,000
+    // phone normalized to 720 USD, and 720 < 50000 read as "in budget" — the
+    // filter did nothing while still BOOSTING results.
+    #[test]
+    fn p3_rupee_bound_is_compared_in_usd_not_raw() {
+        // The extractor already returns the currency; only the wiring dropped it.
+        let (bound, cur) = extract_nl_price_bound("smartphone under 15000 rupees")
+            .expect("rupee bound should be extracted");
+        assert_eq!(bound, 15000.0);
+        assert_eq!(cur, "INR");
+
+        // A Rs 20,000 phone is 240 USD — OVER a Rs 15,000 (180 USD) bound.
+        let phone = price_to_usd(20000.0, "INR") as f32;
+        let b = bound_to_usd(Some(bound), Some(&cur)).unwrap();
+        assert!(
+            phone > b,
+            "Rs 20,000 ({:.0} USD) must be OVER a Rs 15,000 bound ({:.0} USD)",
+            phone, b
+        );
+
+        // The same phone against the pre-fix raw bound read as IN budget,
+        // which is exactly the no-op being fixed.
+        assert!(
+            phone < bound,
+            "guard: the old raw comparison really did pass (no-op reproduced)"
+        );
+
+        // A Rs 10,000 phone is 120 USD — genuinely within budget.
+        let cheap = price_to_usd(10000.0, "INR") as f32;
+        assert!(cheap <= b, "Rs 10,000 must stay in budget");
+    }
+
+    #[test]
+    fn p3_usd_bound_behaviour_is_unchanged() {
+        // No stated currency (the `price:<N` operator form, or bare dollars)
+        // must behave EXACTLY as before — the fix must not move USD queries.
+        assert_eq!(bound_to_usd(Some(500.0), None), Some(500.0));
+        assert_eq!(bound_to_usd(Some(500.0), Some("USD")), Some(500.0));
+        assert_eq!(bound_to_usd(Some(500.0), Some("usd")), Some(500.0));
+        // An unstated bound stays unstated.
+        assert_eq!(bound_to_usd(None, Some("INR")), None);
+    }
+
+    #[test]
+    fn p3_bound_currency_survives_sanitize() {
+        // sanitize_constraints rebuilds the struct; a dropped field there would
+        // silently reintroduce the no-op on every subsequent pass.
+        let mut c = cst();
+        c.price_max = Some(15000.0);
+        c.price_lt = Some(15000.0);
+        c.price_currency = Some("INR".to_string());
+        let s = sanitize_constraints(&c);
+        assert_eq!(s.price_currency.as_deref(), Some("INR"));
     }
 
     #[test]
