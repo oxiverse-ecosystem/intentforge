@@ -16068,13 +16068,27 @@ async fn handle_search(
         let constraints_ref = &intent.structured_constraints;
         // Pre-filter: remove results that violate constraints beyond redemption
         let pre_before = web_results.len();
-        web_results.retain(|r| {
+        let pre_filtered: Vec<SearxResult> = web_results.iter().filter(|r| {
             !should_filter_by_constraints(&r.title, &r.content, &r.url, r.published_date.as_deref(), constraints_ref)
-        });
-        let pre_removed = pre_before.saturating_sub(web_results.len());
-        if pre_removed > 0 {
+        }).cloned().collect();
+        // FAIL-OPEN: a hard constraint filter that removes EVERY result has not
+        // answered the question, it has deleted it. "laptops except dell and hp"
+        // filtered 17/17 to zero — every laptop page mentions one of the two
+        // excluded brands, so the user got an empty page instead of a ranked,
+        // demoted list. This mirrors the existing fail-open design of the date
+        // filter (dateless results are assumed in-range). Only keep the filtered
+        // set when it is strictly smaller than the unfiltered one; otherwise the
+        // filter proved nothing and the original ranking is the honest answer.
+        if !pre_filtered.is_empty() && pre_filtered.len() < pre_before {
+            let pre_removed = pre_before - pre_filtered.len();
+            web_results = pre_filtered;
             tracing::info!("should_filter: removed {}/{} results (from {})",
                 pre_removed, pre_before, before_count);
+        } else if pre_filtered.is_empty() && pre_before > 0 {
+            tracing::warn!(
+                "should_filter: constraint filter removed ALL {}/{} results; failing open to unfiltered set",
+                pre_before, before_count
+            );
         }
         if !intent.structured_constraints.negative.is_empty() {
             let mut negative_norm: Vec<String> = Vec::new();
