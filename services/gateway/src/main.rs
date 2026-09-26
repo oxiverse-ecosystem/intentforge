@@ -4212,26 +4212,47 @@ async fn handle_commerce_extract(
 
 /// Fetch a result page's HTML through the shared (VPN-routed) HTTP client so the
 /// commerce facts we attach come from the SAME upstream the result was produced
-/// from. Bounded and best-effort: any failure yields None and the caller degrades
-/// gracefully (no commerce block) — it must never break the search response.
+/// from. Best-effort: any failure yields None and the caller degrades gracefully
+/// (no commerce block) — it must never break the search response.
+///
+/// DELIBERATELY carries NO hardcoded per-request timeout of its own. It used to
+/// wrap the request in a 2500ms `tokio::time::timeout` plus a 2000ms cap on the
+/// body read — a 4500ms total budget that a real VPN-routed merchant/review page
+/// cannot meet (measured: a techradar.com product-review page returns 200 in
+/// ~7.8s through this client). Every fetch therefore returned None and
+/// `commerce` was null on 100% of real results.
+///
+/// The bound now lives in ONE place — `commerce_fetch_budget` / the per-task
+/// timeout inside `enrich_with_commerce_par` — and is DERIVED from the outer
+/// wall-clock budget divided by the number of remaining waves, so it can never
+/// again be a hand-tuned constant tighter than reality. The reqwest client's own
+/// 25s request timeout remains the backstop for a pathological upstream.
 async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> {
-    let resp = match tokio::time::timeout(
-        Duration::from_millis(2500),
-        client
-            .get(url)
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
-            .send(),
-    ).await {
-        Ok(Ok(r)) => r,
-        _ => return None,
-    };
-    match tokio::time::timeout(Duration::from_millis(2000), resp.text()).await {
-        Ok(Ok(h)) => Some(h),
-        _ => None,
-    }
+    let resp = client
+        .get(url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        .send()
+        .await
+        .ok()?;
+    resp.text().await.ok()
+}
+
+/// Derive the per-page-fetch budget for one wave of parallel enrichment.
+///
+/// It is `remaining_wall / waves_remaining` — the outer budget shared fairly
+/// across the waves still to run, so a slow first wave cannot starve later ones
+/// and no wave can overrun the wall. This is a pure function of the budget
+/// geometry, not a tuned latency constant: 22s over 2 waves of 4 = 11s per page,
+/// which is far above the real ~8s VPN-routed page fetch, while still bounding
+/// the total.
+fn commerce_fetch_budget(
+    remaining_wall: std::time::Duration,
+    waves_remaining: usize,
+) -> std::time::Duration {
+    remaining_wall.checked_div(waves_remaining.max(1) as u32).unwrap_or(remaining_wall)
 }
 
 /// PURE, OFFLINE-TESTABLE enrichment: attach honest product facts to already-ranked
@@ -4312,6 +4333,14 @@ fn data_has_fact(d: &OfferFacts) -> bool {
 /// Apply the same single-result enrichment (extract_commerce_offer → optional commerce +
 /// commerce_provenance) onto one serde_json::Value. Factored out of the parallel
 /// function so unit tests can exercise the attach + provenance contract independently.
+///
+/// The provenance block is built FROM the extracted offer, not from a constant
+/// `source: null, data: null` template. It previously hardcoded both to null even
+/// on the success path, so an attached fact shipped with a provenance block that
+/// disclaimed it — the no-misrepresentation/disclosure contract is only meaningful
+/// if the provenance actually names the source the fact came from and carries the
+/// same observed_at. A page that exposed no facts keeps the honest all-null
+/// provenance (never fabricated).
 fn enrich_single_commerce(
     r: &mut serde_json::Value,
     html: &str,
@@ -4324,18 +4353,21 @@ fn enrich_single_commerce(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let provenance = serde_json::json!({
-        "url": url,
-        "observed_at": now_unix_string(),
-        "source": null,
-        "data": null,
-    });
     let offer: CommerceOffer = extract_commerce_offer(html, &url);
-    if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
+    let has_fact = offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false);
+    if has_fact {
         if let Ok(v) = serde_json::to_value(&offer) {
             r["commerce"] = v;
         }
     }
+    let provenance = serde_json::json!({
+        "url": url,
+        "observed_at": offer.observed_at,
+        // Only disclose a source when a fact was actually attached; a null fact
+        // must never be attributed to an extraction source.
+        "source": if has_fact { offer.source.clone() } else { None },
+        "data": if has_fact { offer.data.clone() } else { None },
+    });
     r["commerce_provenance"] = provenance;
 }
 
@@ -4365,6 +4397,13 @@ async fn enrich_with_commerce_par<F, Fut>(
 
     // 1) Collect indices eligible for enrichment: object results with a URL
     //    that don't already carry a commerce block from an earlier step.
+    //    Capped at `COMMERCE_MAINPATH_TOP_N` — the same data-free presentation cap
+    //    the main /search path already applies. Without a cap the /shopping path
+    //    (which passes the WHOLE results array) would schedule e.g. 21 results =
+    //    6 waves, and the derived per-fetch budget (22s/6 = 3.6s) would fall back
+    //    below the real VPN-routed page latency — the exact defect this function
+    //    was fixed for. Results past the cap are not silently dropped from the
+    //    response; they simply keep commerce: null with honest provenance.
     let eligible: Vec<usize> = results
         .iter()
         .enumerate()
@@ -4374,6 +4413,7 @@ async fn enrich_with_commerce_par<F, Fut>(
                 && r.get("commerce").is_none()
         })
         .map(|(idx, _)| idx)
+        .take(COMMERCE_MAINPATH_TOP_N)
         .collect();
 
     // 2) Fetch in bounded-concurrency WAVES of max_par: every eligible result
@@ -4385,26 +4425,15 @@ async fn enrich_with_commerce_par<F, Fut>(
     //    remaining fetches are abandoned and those results keep commerce: null
     //    but still receive provenance in step 4 (honest, never fabricated).
     let deadline = std::time::Instant::now() + wall_timeout;
+    let wave_width = max_par.max(1);
+    let total_waves = eligible.len().div_ceil(wave_width).max(1);
     let mut fetched: Vec<(usize, String)> = Vec::new();
-    for wave in eligible.chunks(max_par.max(1)) {
-        let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(usize, String)>>)> = wave
-            .iter()
-            .map(|&idx| {
-                let fetch_clone = fetch.clone();
-                let url_owned = results[idx]
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let handle = tokio::spawn(async move {
-                    match fetch_clone(url_owned.clone()).await {
-                        Some(html) => Some((idx, html)),
-                        None => None,
-                    }
-                });
-                (idx, handle)
-            })
-            .collect();
+    // Completed fetches are streamed back through a channel rather than collected
+    // from JoinHandles at the end of the wave, so a slow/timed-out SIBLING never
+    // discards facts that already arrived (partial progress is preserved). The
+    // previous JoinHandle-collect-on-whole-wave shape was all-or-nothing per wave.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, String)>(wave_width);
+    for (wave_no, wave) in eligible.chunks(wave_width).enumerate() {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             // Budget exhausted — abandon pending waves (handles are dropped;
@@ -4412,22 +4441,44 @@ async fn enrich_with_commerce_par<F, Fut>(
             // where a slow fetch could never block the response past the cap).
             break;
         }
-        match tokio::time::timeout(remaining, async {
-            let mut wave_results = Vec::new();
-            for (_, handle) in tasks {
-                match handle.await {
-                    Ok(Some((idx, html))) => wave_results.push((idx, html)),
-                    _ => {} // task panicked or returned None — skip
+        // Per-fetch budget is DERIVED from the remaining wall and the number of
+        // waves still to run (see `commerce_fetch_budget`), not a hand-tuned
+        // latency constant. A real VPN-routed page can take ~8s, so a 2.5s inner
+        // cap made `commerce` null on 100% of real results.
+        let waves_remaining = total_waves - wave_no;
+        let per_fetch = commerce_fetch_budget(remaining, waves_remaining);
+        for &idx in wave {
+            let fetch_clone = fetch.clone();
+            let url_owned = results[idx]
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tx = tx.clone();
+            let per_fetch = per_fetch;
+            tokio::spawn(async move {
+                if let Ok(Some(html)) = tokio::time::timeout(per_fetch, fetch_clone(url_owned)).await
+                {
+                    let _ = tx.send((idx, html)).await;
                 }
+            });
+        }
+        // Drain this wave. Each recv is bounded by whatever wall remains, and a
+        // recv timeout abandons only the SLOW tail of the wave — everything
+        // already delivered above stays in `fetched`.
+        for _ in 0..wave.len() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            wave_results
-        })
-        .await
-        {
-            Ok(wave_results) => fetched.extend(wave_results),
-            Err(_) => break, // wall clock expired mid-wave — stop fetching
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(item)) => fetched.push(item),
+                Ok(None) => break, // all senders gone (only at end of function)
+                Err(_) => break,    // wall clock expired mid-wave — keep partial progress
+            }
         }
     }
+    drop(tx);
 
     // 3) Attach results back onto the original array (preserving order).
     for (idx, html) in fetched {
@@ -21417,6 +21468,191 @@ structured product data, so nothing must be extracted from the body.</p></body><
             assert!(
                 r.get("commerce").is_none(),
                 "no commerce block when fetch returns None"
+            );
+        }
+    }
+
+    /// The provenance block must DISCLOSE the fact it ships with. It used to be a
+    /// constant `{source: null, data: null}` template, so a successfully attached
+    /// fact shipped with a provenance block that disclaimed it — the
+    /// no-misrepresentation contract is meaningless if the provenance lies.
+    #[test]
+    fn attached_fact_provenance_discloses_source_and_observed_at() {
+        let mut r = serde_json::json!({
+            "url": "https://shop.example.com/p/widget",
+        });
+        enrich_single_commerce(&mut r, HTML_SINGLE_OFFER);
+
+        assert!(
+            r.get("commerce").is_some(),
+            "a page with a real offer must attach commerce"
+        );
+        let p = &r["commerce_provenance"];
+        assert_eq!(p["url"].as_str().unwrap(), "https://shop.example.com/p/widget");
+        assert!(
+            p["source"].as_str().is_some(),
+            "provenance must name the extraction source for an attached fact, got {:?}",
+            p["source"]
+        );
+        assert!(
+            p["observed_at"].as_str().is_some(),
+            "provenance must carry observed_at for an attached fact"
+        );
+        assert!(
+            !p["data"].is_null(),
+            "provenance must carry the observed data it attributes to the page"
+        );
+        // observed_at must match the attached offer's own stamp (same observation).
+        assert_eq!(
+            p["observed_at"].as_str().unwrap(),
+            r["commerce"]["observed_at"].as_str().unwrap()
+        );
+    }
+
+    /// A page with NO structured product data must stay honestly null: no
+    /// `commerce` block, and provenance that does NOT claim a source (a null fact
+    /// must never be attributed to an extraction source).
+    #[test]
+    fn no_fact_page_keeps_honest_null_provenance() {
+        let mut r = serde_json::json!({
+            "url": "https://blog.example.com/post",
+        });
+        enrich_single_commerce(&mut r, HTML_NO_H_PRODUCT);
+
+        assert!(r.get("commerce").is_none(), "no fabricated commerce block");
+        let p = &r["commerce_provenance"];
+        assert!(p["source"].is_null(), "no source claimed for a null fact");
+        assert!(p["data"].is_null(), "no data claimed for a null fact");
+        assert_eq!(p["url"].as_str().unwrap(), "https://blog.example.com/post");
+    }
+
+    /// REGRESSION (real bug, 2026-09-26): `commerce` was null on 100% of live
+    /// results. The old fake slept 500ms — faster than the removed 2500ms
+    /// per-fetch cap — so no test could ever see the defect. A real VPN-routed
+    /// product page takes ~8s. This fake sleeps 3s: still SLOWER than the old
+    /// cap, still comfortably inside the DERIVED per-fetch budget, and it must
+    /// still yield real commerce facts with honest provenance.
+    #[tokio::test]
+    async fn slow_but_successful_fetch_still_yields_commerce_facts() {
+        let mut ranked: Vec<serde_json::Value> = (0..4)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("https://slowmerchant{}.example.com/p/{}", i, i),
+                })
+            })
+            .collect();
+
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |_url: String| {
+            let html = fake_html.clone();
+            async move {
+                // 3s — 6x the removed 2500ms inner cap, ~1/3 of a real page.
+                tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+                Some(html)
+            }
+        };
+
+        let start = std::time::Instant::now();
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        for r in ranked.iter() {
+            assert!(
+                r.get("commerce").is_some(),
+                "a SLOW-but-successful fetch must still attach commerce facts"
+            );
+            // Honesty invariant: the fact carries provenance tied to THIS url.
+            assert_eq!(
+                r["commerce_provenance"]["url"].as_str().unwrap(),
+                r["url"].as_str().unwrap(),
+                "provenance url must be the exact result url the facts came from"
+            );
+            assert!(
+                r["commerce_provenance"]["observed_at"].as_str().is_some(),
+                "every attached fact carries observed_at provenance"
+            );
+        }
+        // One wave of 4 (MAX_PARALLEL_FETCH=4) => ~3s total, well inside the wall.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "slow fetches must run in parallel, took {:?}",
+            elapsed
+        );
+    }
+
+    /// The per-fetch budget must be DERIVED from the outer wall and the number
+    /// of waves still to run — never a hand-tuned latency constant. This is the
+    /// property that makes the class of bug above impossible to reintroduce: with
+    /// the real production geometry (22s wall, 8 results, 4 concurrent) the
+    /// budget is 11s per page, which comfortably covers the ~8s real latency.
+    #[test]
+    fn fetch_budget_is_derived_from_wall_and_wave_count() {
+        let wall = std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS);
+        // 8 eligible results at MAX_PARALLEL_FETCH=4 => 2 waves.
+        assert_eq!(commerce_fetch_budget(wall, 2), std::time::Duration::from_secs(11));
+        // Last wave gets the whole remainder.
+        assert_eq!(commerce_fetch_budget(wall, 1), wall);
+        // Never collapses to zero on a degenerate wave count.
+        assert_eq!(
+            commerce_fetch_budget(wall, 0),
+            wall,
+            "waves_remaining=0 must not divide by zero"
+        );
+        // The regression value: 22s/2 waves = 11s is far above the old 4.5s
+        // total (2500ms + 2000ms) that made every real fetch fail.
+        assert!(
+            commerce_fetch_budget(wall, 2) > std::time::Duration::from_millis(4500),
+            "derived per-fetch budget must exceed the old 4500ms total cap"
+        );
+    }
+
+    /// Partial-progress correctness: a fast sibling's facts must survive when a
+    /// slow sibling in the SAME wave times out. Enrichment must not be
+    /// all-or-nothing across the array.
+    #[tokio::test]
+    async fn timed_out_sibling_does_not_discard_fast_sibling_facts() {
+        let mut ranked: Vec<serde_json::Value> = (0..4)
+            .map(|i| {
+                let kind = if i < 2 { "fast" } else { "slow" };
+                serde_json::json!({
+                    "url": format!("https://{}{}.example.com/p/{}", kind, i, i),
+                })
+            })
+            .collect();
+
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |url: String| {
+            let html = fake_html.clone();
+            async move {
+                if url.contains("/fast") {
+                    Some(html)
+                } else {
+                    // Exceeds the whole 2s wall — guaranteed to time out.
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    Some(html)
+                }
+            }
+        };
+
+        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2)).await;
+
+        let with_commerce = ranked
+            .iter()
+            .filter(|r| r.get("commerce").is_some())
+            .count();
+        assert_eq!(
+            with_commerce, 2,
+            "the two fast results must keep their facts despite two timed-out siblings"
+        );
+        for r in ranked.iter() {
+            assert!(
+                r.get("commerce_provenance").is_some(),
+                "every result still gets provenance (honest null), fast or slow"
             );
         }
     }
