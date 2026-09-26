@@ -7052,6 +7052,92 @@ fn is_negated_source_entity(q_orig: &str, compound: &str) -> bool {
     false
 }
 
+/// Tokens that make a preceding `not` a PREDICATE negation about the subject
+/// ("does not spin", "is not available", "will not work") rather than a
+/// SELECTION exclusion of a named alternative. Structural closed-class
+/// vocabulary (auxiliaries / copulas / modals) — not per-query literals.
+const NEGATION_PREDICATE_AUXILIARIES: &[&str] = &[
+    "do", "does", "did", "is", "are", "am", "was", "were", "be", "been", "being",
+    "have", "has", "had", "will", "would", "shall", "should", "can", "could",
+    "may", "might", "must", "need", "needs", "let", "help", "makes", "make",
+];
+
+/// True when `compound` is the object of a BARE `not` selection negation —
+/// "wireless headphones not bose", "laptops not thinkpad" — i.e. the user named
+/// an alternative they do NOT want. This is the same English form the marker
+/// table already honours via "except"/"other than"/"besides", and it was the
+/// one negation lead-in the shared extractor did NOT recognise, so a brand the
+/// user explicitly wrote `not <brand>` was silently demoted to a soft negative
+/// and the excluded brand kept ranking.
+///
+/// The distinction from the attribute/qualifier negations that must stay
+/// declined ("recipes not spicy", "movies not rated r", "books not in
+/// hardcover", "news not about politics", "the door does not latch") is
+/// STRUCTURAL, not lexical — no brand list and no tuned threshold:
+///
+///  1. `not` must not follow an auxiliary/copula/modal — that is a predicate
+///     about the subject, never a selection ("does not spin").
+///  2. the token DIRECTLY governed by `not` (article-skipping only) must be a
+///     content word equal to the compound head — a preposition or function
+///     word there ("not in hardcover", "not about politics") means the negated
+///     phrase modifies the subject, it is not the excluded entity.
+///  3. the target must not be a subjective-quality adjective (existing data
+///     seed) or a verb form ("rated", "working", "existing") — both are
+///     predicates, not topics to remove from the index.
+///
+/// Every rule is a closed-class structural check; any brand, product, language,
+/// place or person the user writes after a bare `not` is honored.
+fn is_bare_not_selection(q_orig: &str, compound: &str) -> bool {
+    let head: String = compound
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    if head.is_empty() {
+        return false;
+    }
+    let toks: Vec<String> = q_orig
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect();
+    for i in 0..toks.len() {
+        if toks[i] != "not" {
+            continue;
+        }
+        // (1) predicate negation — an auxiliary/copula/modal governs `not`.
+        if i > 0 && NEGATION_PREDICATE_AUXILIARIES.contains(&toks[i - 1].as_str()) {
+            continue;
+        }
+        // The token directly governed by `not`: skip determiners only.
+        let mut j = i + 1;
+        while j < toks.len() && ["a", "an", "the", "any", "some"].contains(&toks[j].as_str()) {
+            j += 1;
+        }
+        if j >= toks.len() || toks[j] != head {
+            continue;
+        }
+        // (2) the governed token must itself be a content word, not a
+        // preposition/function word ("not in hardcover", "not about politics").
+        if is_exclusion_grammar_noise(&toks[j]) {
+            continue;
+        }
+        // (3) not a predicate form: past participle / gerund / adjective seed.
+        // Structural morphology, so any language works without a lexicon.
+        let t = toks[j].as_str();
+        if (t.len() > 3 && t.ends_with("ed")) || (t.len() > 4 && t.ends_with("ing")) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
 /// A negated compound is a real search EXCLUSION (not a manner qualifier) when at
 /// least one holds:
 ///  - (a) the compound names a recognized entity (protected brand/tech term — a
@@ -7128,6 +7214,16 @@ fn is_real_exclusion(
     // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
     // (e.g. "javascript not java not typescript" → java, typescript).
     if query_is_contrastive {
+        return true;
+    }
+    // BARE-NOT SELECTION ("wireless headphones not bose"): a single `not`
+    // directly governing a content word is the same explicit user directive as
+    // "except X" / "other than X" — the user named an alternative they do not
+    // want. Without this the class was demoted to a soft negative and the
+    // excluded brand kept ranking. Structurally separated from the attribute /
+    // predicate negations that must stay declined ("recipes not spicy",
+    // "movies not rated r", "does not latch") by `is_bare_not_selection`.
+    if is_bare_not_selection(q_orig, &lc) {
         return true;
     }
     // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
@@ -18763,6 +18859,75 @@ mod constraint_fix_tests {
         assert!(pay_exclusion_is_money("learn without paying for a course"));
         assert!(pay_exclusion_is_money("free ways to watch without paying a subscription fee"));
         assert!(!pay_exclusion_is_money("study without paying attention"));
+    }
+
+    #[test]
+    fn bare_not_selection_negation_is_honored_as_real_exclusion() {
+        // CLASS test for the bare `not <term>` form. The shared extractor honours
+        // an exclusion introduced by a contrast marker ("except", "other than",
+        // "besides") but used to DROP a bare `not <term>` adjunct, so a brand the
+        // user explicitly wrote `not <brand>` was demoted to a soft negative and
+        // the excluded brand kept ranking. Asserted on GENERIC non-brand terms and
+        // on the extractor's OUTPUT SHAPE — no brand literals, no per-query rules.
+        for (q, expected) in [
+            ("wireless headphones not sony", "sony"),
+            ("running shoes not brooks", "brooks"),
+            ("budget laptop not lenovo price:<600", "lenovo"),
+            ("mechanical keyboards not keychron", "keychron"),
+        ] {
+            let (kept, dropped, _manner) = extract_query_negative_terms_with_dropped(q);
+            assert!(
+                kept.iter().any(|t| t == expected),
+                "bare `not {}` must be a REAL exclusion for {:?}; kept={:?} dropped={:?}",
+                expected, q, kept, dropped
+            );
+        }
+        // The extraction shape must be identical to the working "except" control:
+        // exactly one exclusion, and it must never ALSO be reported as declined.
+        let (kept, dropped, _manner) =
+            extract_query_negative_terms_with_dropped("wireless headphones not sony");
+        assert_eq!(kept, vec!["sony".to_string()]);
+        assert!(
+            !dropped.iter().any(|d| d.contains("sony")),
+            "an applied exclusion must not also surface as ignored: {:?}",
+            dropped
+        );
+        // Article-skipping and multi-word compounds keep working.
+        assert!(
+            extract_query_negative_terms("laptops not the dell xps")
+                .iter()
+                .any(|t| t.contains("dell")),
+            "bare not + article + multi-word entity must be honored"
+        );
+    }
+
+    #[test]
+    fn bare_not_selection_does_not_swallow_attribute_or_predicate_negations() {
+        // Anti-regression: the bare-not acceptance must NOT re-open the c4317bc
+        // over-reach where ANY object of `not` became a hard content filter. These
+        // are attribute / qualifier / predicate negations and MUST stay declined
+        // (surfaced via `declined`, never applied).
+        for (q, forbidden) in [
+            ("healthy recipes not spicy", "spicy"),
+            ("movies not rated r", "rated"),
+            ("books not in hardcover", "hardcover"),
+            ("news not about politics", "politics"),
+            ("my washing machine does not spin", "spin"),
+            ("the door does not latch", "latch"),
+            ("this laptop is not working", "working"),
+            ("python not installed on windows", "installed"),
+        ] {
+            let (kept, dropped, _manner) = extract_query_negative_terms_with_dropped(q);
+            assert!(
+                !kept.iter().any(|t| t.contains(forbidden)),
+                "attribute/predicate `not {}` must NOT be a hard exclusion for {:?}; kept={:?}",
+                forbidden, q, kept
+            );
+            assert!(
+                dropped.iter().any(|d| d.contains(forbidden)) || !kept.iter().any(|t| t.contains(forbidden)),
+                "declined `not {}` must still be surfaced for {:?}", forbidden, q
+            );
+        }
     }
 
     #[test]
