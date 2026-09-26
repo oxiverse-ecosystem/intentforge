@@ -8086,6 +8086,25 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     {
                         break; // a fresh price constraint starts here
                     }
+                    if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break; // trailing stopword ends the entity
+                    }
+                    // A function word arriving when NO target is being collected
+                    // means the exclusion list has ended and a new, independent
+                    // clause has begun. "not from chinese brands AND have usb c
+                    // charging" splits on "and", then "have" (an auxiliary) used
+                    // to be pushed as the head of a fresh target, producing the
+                    // phantom exclusion "have usb c charging" — a verb phrase
+                    // that substring-matches no product page and wrongly penalises
+                    // every charger result. The leading-skip loop above already
+                    // handles function words directly after the lead-in
+                    // ("not from X"); this is the in-list counterpart: after a
+                    // connector, a function word terminates the clause instead of
+                    // seeding a new target. Structural (closed-class stopword
+                    // list already in scope), no per-query literals.
+                    if ent.is_empty() && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break;
+                    }
                     // List connector ("or"/"and"/",") between exclusion targets: the
                     // current target is finalised and pushed, then we start a new one.
                     // MUST precede the trailing-stopword break below — "or"/"and" are
