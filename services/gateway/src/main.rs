@@ -3880,10 +3880,15 @@ async fn enrich_with_commerce_par<F, Fut>(
     F: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Option<String>> + Send,
 {
-    let max_par = MAX_PARALLEL_FETCH.min(results.len());
+    // Bounded concurrency: process the eligible indices in WAVES of at most
+    // MAX_PARALLEL_FETCH. Every eligible index is eventually attempted — the
+    // wave bound limits how many run at once, it must NOT truncate the set.
+    // (An earlier `.take(max_par)` silently dropped everything past the first
+    // wave, so the tail of the result list never received a `commerce` block.)
+    let max_par = MAX_PARALLEL_FETCH.max(1);
 
-    // 1) Collect indices + spawn parallel fetch tasks (bounded concurrency).
-    let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(usize, String)>>)> = results
+    // 1) Collect the indices that still need a fetch.
+    let eligible: Vec<(usize, String)> = results
         .iter()
         .enumerate()
         .filter_map(|(idx, r)| {
@@ -3897,25 +3902,35 @@ async fn enrich_with_commerce_par<F, Fut>(
             if r.get("commerce").is_some() {
                 return None; // already enriched by an earlier step
             }
-            let fetch_clone = fetch.clone();
-            let url_owned = url.to_string();
-            let handle = tokio::spawn(async move {
-                match fetch_clone(url_owned.clone()).await {
-                    Some(html) => Some((idx, html)),
-                    None => None,
-                }
-            });
-            Some((idx, handle))
+            Some((idx, url.to_string()))
         })
-        .take(max_par)
         .collect();
 
-    // 2) Wait for ALL spawned tasks concurrently (await each JoinHandle).
+    // 2) Run the eligible set in waves, joining each wave concurrently under a
+    //    single wall-time deadline that covers the WHOLE batch.
+    let deadline = tokio::time::Instant::now() + wall_timeout;
     let mut fetched: Vec<(usize, String)> = Vec::new();
-    for (_, handle) in tasks {
-        match handle.await {
-            Ok(Some((idx, html))) => fetched.push((idx, html)),
-            _ => {} // task panicked or returned None — skip
+    for wave in eligible.chunks(max_par) {
+        if tokio::time::Instant::now() >= deadline {
+            break; // wall budget exhausted — remaining results still get provenance
+        }
+        let mut handles: Vec<(usize, tokio::task::JoinHandle<Option<String>>)> =
+            Vec::with_capacity(wave.len());
+        for (idx, url_owned) in wave.iter() {
+            let fetch_clone = fetch.clone();
+            let url_owned = url_owned.clone();
+            handles.push((
+                *idx,
+                tokio::spawn(async move { fetch_clone(url_owned).await }),
+            ));
+        }
+        for (idx, handle) in handles {
+            // The handles were all spawned before any is awaited, so the wave
+            // truly runs in parallel; `timeout_at` bounds the whole batch.
+            match tokio::time::timeout_at(deadline, handle).await {
+                Ok(Ok(Some(html))) => fetched.push((idx, html)),
+                _ => {} // timed out, panicked, or fetch returned None — skip
+            }
         }
     }
 
@@ -4133,6 +4148,63 @@ struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
 }
 
+/// Host labels that are IANA-reserved and can never be a real merchant:
+/// matched EXACTLY as a host label. RFC 2606 §2 reserves `example`; RFC 6761
+/// reserves the `test` / `invalid` / `localhost` special-use names.
+///
+/// Exact matching only — deliberately. `invalid` is a special-use NAME, not a
+/// documentation PREFIX, so prefix-matching it would wrongly reject real hosts
+/// like `invalid-syntax.co.uk`.
+const RESERVED_HOST_LABELS: &[&str] = &["example", "test", "invalid", "localhost"];
+
+/// Host-label PREFIXES reserved by the documentation-label convention. A label
+/// beginning with one of these followed by a separator (`example-merchant`,
+/// `example-shop`) is a documentation placeholder, not a merchant.
+///
+/// This is a separate list from `RESERVED_HOST_LABELS` precisely because
+/// prefix-matching is only correct for `example`: `example-merchant.com` is its
+/// OWN registrable domain, NOT a subdomain of `example.com`, so a pure
+/// suffix/exact check on the reserved set misses the exact value that shipped in
+/// production config.
+const RESERVED_HOST_LABEL_PREFIXES: &[&str] = &["example"];
+
+/// True when any label of `url`'s host marks it as a documentation/example
+/// placeholder, i.e. it cannot be a real merchant destination.
+///
+/// Rejected shapes:
+///   * a label exactly equal to a reserved name (`example.com`, `foo.test`), and
+///   * a label beginning with a reserved documentation prefix + separator
+///     (`example-merchant.com`, `example-shop.co.uk`).
+///
+/// Matching is always on a LABEL boundary: a real host that merely CONTAINS a
+/// reserved word as a substring (`notexample.com`, `testosterone-shop.com`,
+/// `invalid-syntax.co.uk`) is NOT rejected, so the guard cannot silently disable
+/// a legitimate merchant fallback.
+///
+/// Returns `true` for unparseable/host-less input: a fallback we cannot even
+/// resolve is treated as unusable rather than shipped.
+fn is_reserved_placeholder_url(url: &str) -> bool {
+    let host = match reqwest::Url::parse(url) {
+        Ok(u) => match u.host_str() {
+            Some(h) => h.trim_end_matches('.').to_ascii_lowercase(),
+            None => return true,
+        },
+        Err(_) => return true,
+    };
+    let separated_prefix = |label: &str, prefix: &str| {
+        label
+            .strip_prefix(prefix)
+            .map(|rest| rest.starts_with('-') || rest.starts_with('_'))
+            .unwrap_or(false)
+    };
+    host.split('.').any(|label| {
+        RESERVED_HOST_LABELS.iter().any(|r| label == *r)
+            || RESERVED_HOST_LABEL_PREFIXES
+                .iter()
+                .any(|p| separated_prefix(label, p))
+    })
+}
+
 impl AffiliateCtx {
     /// Load networks from the data file. An empty/missing file is NOT fatal: the
     /// engine simply has no networks and every result degrades to `affiliate:
@@ -4152,7 +4224,21 @@ impl AffiliateCtx {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
                         for n in arr {
-                            if let Ok(net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                            if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                                // Never accept a non-routable documentation domain as
+                                // a real merchant fallback. Dropping the FIELD (not the
+                                // whole network) keeps the network usable for wrapping
+                                // while guaranteeing no click is ever routed to a
+                                // fabricated destination.
+                                if let Some(fbu) = net.fallback_url.clone() {
+                                    if is_reserved_placeholder_url(&fbu) {
+                                        tracing::warn!(
+                                            network = %net.id,
+                                            "affiliate: ignoring reserved placeholder fallback_url (RFC 2606/6761 documentation domain)"
+                                        );
+                                        net.fallback_url = None;
+                                    }
+                                }
                                 networks.push(net);
                             }
                         }
@@ -19538,6 +19624,47 @@ structured product data, so nothing must be extracted from the body.</p></body><
         for r in ranked.iter() {
             assert!(r.get("commerce").is_some(), "commerce block attached in parallel");
             assert!(r.get("commerce_provenance").is_some(), "provenance attached in parallel");
+        }
+    }
+
+    /// Regression guard for the `.take(max_par)` truncation bug: bounding
+    /// concurrency must bound how many fetches run AT ONCE, never how many are
+    /// ATTEMPTED. Uses a zero-latency fetch so the assertion is about coverage,
+    /// not timing, and covers 3× the wave size.
+    #[tokio::test]
+    async fn every_result_beyond_first_wave_is_still_enriched() {
+        let n = MAX_PARALLEL_FETCH * 3;
+        let mut ranked: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("https://wave{}.example.com/p/{}", i, i),
+                    "score": 9.0 - (i as f64 * 0.01),
+                })
+            })
+            .collect();
+
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |_url: String| {
+            let html = fake_html.clone();
+            async move { Some(html) }
+        };
+
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+        )
+        .await;
+
+        assert_eq!(ranked.len(), n);
+        for (i, r) in ranked.iter().enumerate() {
+            assert!(
+                r.get("commerce").is_some(),
+                "result {} of {} was never enriched — the wave bound must not \
+                 truncate the eligible set",
+                i,
+                n
+            );
         }
     }
 
