@@ -3880,10 +3880,15 @@ async fn enrich_with_commerce_par<F, Fut>(
     F: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Option<String>> + Send,
 {
-    let max_par = MAX_PARALLEL_FETCH.min(results.len());
+    // Bounded concurrency: process the eligible indices in WAVES of at most
+    // MAX_PARALLEL_FETCH. Every eligible index is eventually attempted — the
+    // wave bound limits how many run at once, it must NOT truncate the set.
+    // (An earlier `.take(max_par)` silently dropped everything past the first
+    // wave, so the tail of the result list never received a `commerce` block.)
+    let max_par = MAX_PARALLEL_FETCH.max(1);
 
-    // 1) Collect indices + spawn parallel fetch tasks (bounded concurrency).
-    let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(usize, String)>>)> = results
+    // 1) Collect the indices that still need a fetch.
+    let eligible: Vec<(usize, String)> = results
         .iter()
         .enumerate()
         .filter_map(|(idx, r)| {
@@ -3897,25 +3902,35 @@ async fn enrich_with_commerce_par<F, Fut>(
             if r.get("commerce").is_some() {
                 return None; // already enriched by an earlier step
             }
-            let fetch_clone = fetch.clone();
-            let url_owned = url.to_string();
-            let handle = tokio::spawn(async move {
-                match fetch_clone(url_owned.clone()).await {
-                    Some(html) => Some((idx, html)),
-                    None => None,
-                }
-            });
-            Some((idx, handle))
+            Some((idx, url.to_string()))
         })
-        .take(max_par)
         .collect();
 
-    // 2) Wait for ALL spawned tasks concurrently (await each JoinHandle).
+    // 2) Run the eligible set in waves, joining each wave concurrently under a
+    //    single wall-time deadline that covers the WHOLE batch.
+    let deadline = tokio::time::Instant::now() + wall_timeout;
     let mut fetched: Vec<(usize, String)> = Vec::new();
-    for (_, handle) in tasks {
-        match handle.await {
-            Ok(Some((idx, html))) => fetched.push((idx, html)),
-            _ => {} // task panicked or returned None — skip
+    for wave in eligible.chunks(max_par) {
+        if tokio::time::Instant::now() >= deadline {
+            break; // wall budget exhausted — remaining results still get provenance
+        }
+        let mut handles: Vec<(usize, tokio::task::JoinHandle<Option<String>>)> =
+            Vec::with_capacity(wave.len());
+        for (idx, url_owned) in wave.iter() {
+            let fetch_clone = fetch.clone();
+            let url_owned = url_owned.clone();
+            handles.push((
+                *idx,
+                tokio::spawn(async move { fetch_clone(url_owned).await }),
+            ));
+        }
+        for (idx, handle) in handles {
+            // The handles were all spawned before any is awaited, so the wave
+            // truly runs in parallel; `timeout_at` bounds the whole batch.
+            match tokio::time::timeout_at(deadline, handle).await {
+                Ok(Ok(Some(html))) => fetched.push((idx, html)),
+                _ => {} // timed out, panicked, or fetch returned None — skip
+            }
         }
     }
 
