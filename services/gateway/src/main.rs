@@ -16653,7 +16653,16 @@ let mut results = match tokio::task::spawn_blocking(move || {
             before_count
         );
     } else {
-        results.retain(|r| {
+        // FAIL-OPEN, same rule as the pre-merge gate above: a negative hard-drop
+        // that removes EVERY result has deleted the answer, not answered it.
+        // "laptops except dell and hp" has a positive term ("laptops"), so
+        // has_only_negative is false and this branch runs — and because nearly
+        // every laptop page mentions Dell or HP somewhere, it dropped 14/14 to
+        // zero. Evaluate into a candidate set and only adopt it if it is
+        // non-empty; otherwise keep the unfiltered set and let the soft
+        // constraint_score penalty + the 8c re-rank demote offenders, which is
+        // the documented design for topical exclusions.
+        let post_candidates: Vec<MergedResult> = results.iter().filter(|r| {
             // Alternative-listing page check: keep comparison/alternative pages
             // even if they mention excluded terms (they are HIGHLY relevant).
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
@@ -16740,7 +16749,15 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 }
             }
             should_keep
-        });
+        }).cloned().collect();
+        if !post_candidates.is_empty() {
+            results = post_candidates;
+        } else if !results.is_empty() {
+            tracing::warn!(
+                "post-merge negative hard-drop removed ALL {} results; failing open to unfiltered set",
+                results.len()
+            );
+        }
     }
         let removed = before_count.saturating_sub(results.len());
         if removed > 0 {
