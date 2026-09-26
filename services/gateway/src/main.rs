@@ -4143,7 +4143,7 @@ fn default_priority() -> i64 {
 }
 
 /// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
 }
