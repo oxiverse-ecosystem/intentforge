@@ -109,6 +109,15 @@ struct Constraints {
     /// Lower bound from an explicit `>` operator, e.g. `price:>50`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     price_gt: Option<f32>,
+    /// Currency the price BOUND is denominated in, as stated by the user
+    /// ("under 50000 rupees" -> INR). Recorded because every comparison site
+    /// normalizes the RESULT price to USD (`price_to_usd`) but the bound was
+    /// previously kept as a raw number, so a non-USD bound was compared in the
+    /// wrong unit and silently became a no-op (see `bound_to_usd`). `None`
+    /// means "unstated" and is treated as USD, which preserves the behaviour of
+    /// the `price:<N` operator form and of bare-dollar natural language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_currency: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -172,6 +181,29 @@ fn price_to_usd(amount: f64, currency: &str) -> f64 {
         "BRL" | "R$" => amount * 0.18,
         "CNY" | "RMB" => amount * 0.14,
         _ => amount,
+    }
+}
+
+/// Normalize a query's price BOUND into USD so it can be compared against a
+/// result price that has already been run through `price_to_usd`.
+///
+/// P3 root-cause fix. Previously the bound was stored as the raw number the
+/// user typed while every result price was currency-normalized to USD, so a
+/// non-USD bound was compared in the wrong unit: "under 50000 rupees" (bound
+/// 50000) was tested against a Rs 60,000 phone normalized to 720 USD, and
+/// 720 < 50000 read as "in budget" — the price filter was a silent no-op for
+/// every non-USD query, and in-budget results were actively boosted. The
+/// currency WAS already extracted (`extract_nl_price_bound` returns it) but was
+/// discarded at the assignment site.
+///
+/// `None` (currency unstated — the `price:<N` operator form, or bare-dollar
+/// natural language) is treated as USD, which preserves existing behaviour
+/// exactly and avoids inventing an exchange rate the user never gave.
+fn bound_to_usd(bound: Option<f32>, currency: Option<&str>) -> Option<f32> {
+    let b = bound?;
+    match currency {
+        None => Some(b),
+        Some(cur) => Some(price_to_usd(b as f64, cur) as f32),
     }
 }
 
@@ -2756,6 +2788,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         price_max,
         price_lt,
         price_gt,
+        price_currency: c.price_currency.clone(),
         ignored_constraints: None,
     }
 }
@@ -5185,16 +5218,19 @@ fn should_filter_by_constraints(
         };
         if let Some(p_info) = dummy.get_price() {
             let p_usd = price_to_usd(p_info.amount, &p_info.currency) as f32;
-            if let Some(pmin) = constraints.price_min {
+            // Same-unit rule as the P3 ranking block: the bound is in the user's
+            // stated currency, the result price is normalized to USD.
+            let cur = constraints.price_currency.as_deref();
+            if let Some(pmin) = bound_to_usd(constraints.price_min, cur) {
                 if p_usd < pmin { return true; }
             }
-            if let Some(pmax) = constraints.price_max {
+            if let Some(pmax) = bound_to_usd(constraints.price_max, cur) {
                 if p_usd > pmax { return true; }
             }
-            if let Some(plt) = constraints.price_lt {
+            if let Some(plt) = bound_to_usd(constraints.price_lt, cur) {
                 if p_usd > plt { return true; }
             }
-            if let Some(pgt) = constraints.price_gt {
+            if let Some(pgt) = bound_to_usd(constraints.price_gt, cur) {
                 if p_usd < pgt { return true; }
             }
         }
@@ -9681,17 +9717,26 @@ fn merge_local_and_web(
         //     bound present) AND the result shows no price/product lexical signal, demote
         //     it — almost certainly not the priced product asked for. Generic; no hardcoded
         //     merchants or domains.
-        let price_bound = constraints.price_max.or(constraints.price_lt)
-            .or_else(|| constraints.price_min.or(constraints.price_gt));
+        // P3: the bound is denominated in the currency the USER stated ("under
+        // 50000 rupees"), while the result price is normalized to USD below.
+        // Both sides must be in the same unit or the comparison is meaningless
+        // — comparing raw 50000 against a USD-normalized 720 made every rupee
+        // query pass and actively boosted its results.
+        let bound_cur = constraints.price_currency.as_deref();
+        let b_max_usd = bound_to_usd(constraints.price_max, bound_cur);
+        let b_lt_usd = bound_to_usd(constraints.price_lt, bound_cur);
+        let b_min_usd = bound_to_usd(constraints.price_min, bound_cur);
+        let b_gt_usd = bound_to_usd(constraints.price_gt, bound_cur);
+        let price_bound = b_max_usd.or(b_lt_usd).or(b_min_usd).or(b_gt_usd);
         if let Some(_bound) = price_bound {
             let res_price = r.get_price();
             let price_signal = has_price_signal(&title_lower, &content_lower);
             if let Some(p_info) = res_price {
                 let p_usd = price_to_usd(p_info.amount, &p_info.currency) as f32;
-                let over = (constraints.price_max.is_some() && p_usd > constraints.price_max.unwrap())
-                    || (constraints.price_lt.is_some() && p_usd > constraints.price_lt.unwrap())
-                    || (constraints.price_min.is_some() && p_usd < constraints.price_min.unwrap())
-                    || (constraints.price_gt.is_some() && p_usd < constraints.price_gt.unwrap());
+                let over = b_max_usd.map(|b| p_usd > b).unwrap_or(false)
+                    || b_lt_usd.map(|b| p_usd > b).unwrap_or(false)
+                    || b_min_usd.map(|b| p_usd < b).unwrap_or(false)
+                    || b_gt_usd.map(|b| p_usd < b).unwrap_or(false);
                 if over {
                     relevance *= 0.12;
                 } else {
@@ -14491,10 +14536,18 @@ async fn handle_search(
     if intent.structured_constraints.price_lt.is_none()
         && intent.structured_constraints.price_max.is_none()
     {
-        if let Some((lt, _currency)) = extract_nl_price_bound(&q_orig) {
+        if let Some((lt, currency)) = extract_nl_price_bound(&q_orig) {
             intent.structured_constraints.price_lt = Some(lt);
             intent.structured_constraints.price_max = Some(lt);
-            tracing::info!("NL PRICE BOUND: extracted lt={} from query", lt);
+            // P3: the bound is denominated in the currency the USER stated, but
+            // every comparison site normalizes result prices to USD. Recording
+            // it is what lets `bound_to_usd` put both sides in the same unit —
+            // without this the bound is compared raw against USD and the filter
+            // is a silent no-op for every non-USD query.
+            intent.structured_constraints.price_currency = Some(currency.clone());
+            tracing::info!(
+                "NL PRICE BOUND: extracted lt={} currency={} from query", lt, currency
+            );
         }
     }
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
@@ -18003,6 +18056,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         price_max,
         price_lt,
         price_gt,
+        price_currency: None,
         ignored_constraints: None,
     }
 }
