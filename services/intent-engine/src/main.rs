@@ -3086,4 +3086,22 @@ mod tests {
         assert!(c.negative.contains(&"django".to_string()), "django should be excluded: {:?}", c.negative);
         assert!(c.negative.contains(&"flask".to_string()), "flask should be excluded: {:?}", c.negative);
     }
+
+    // ── DIAGNOSTIC (temporary): where does "boots under 3000" lose its price? ──
+    #[test]
+    fn diag_bare_number_budget() {
+        for q in [
+            "boots under 3000",
+            "boots under 3000 rupees",
+            "boots price:<3000",
+            "boots under 3000rs",
+        ] {
+            let norm = normalize_nl_operators(q);
+            let c = extract_constraints(q);
+            println!(
+                "q={:?} norm={:?} min={:?} max={:?} positive={:?}",
+                q, norm, c.price_min, c.price_max, c.positive
+            );
+        }
+    }
 }
