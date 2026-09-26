@@ -50,66 +50,121 @@ jobs:
         run: cargo test --locked
 
   schema-regression:
-    name: API schema regression (live gateway contract)
+    name: API contract regression (real gateway in CI)
     runs-on: ubuntu-latest
-    # This job asserts the documented JSON contracts for EVERY endpoint in
-    # API_REFERENCE.md (incl. the Goals API). It needs a RUNNING gateway.
+    # This job is a REAL GUARD. It builds the gateway image, runs it, and
+    # asserts the documented JSON contract of every endpoint against it.
     #
-    # IMPORTANT: a bare runner has no IntentForge stack, so the suite is designed
-    # to SKIP cleanly there (no green-washing of a real failure). To make it a
-    # real guard, bring the stack up (docker compose) and set
-    # INTENTFORGE_REQUIRE_GATEWAY=1 so an unreachable/contract-drifted gateway
-    # FAILS the run. The QA loop already does this locally/where the stack runs.
+    # It used to be a guaranteed-green no-op: it probed localhost:4000 on a
+    # bare runner (always unreachable), gated the run step behind that probe,
+    # and concluded `success` having asserted nothing. Three defects are fixed
+    # here, and each one is load-bearing:
     #
-    # Example (when the stack is brought up in this job):
-    #   - name: Bring up IntentForge stack
-    #     run: (cd services && docker compose -f docker-compose.dev.yml up -d gateway indexer ...)
-    #   - name: Wait for gateway health
-    #     run: for i in $(seq 1 30); do curl -sf localhost:4000/health && break; sleep 5; done
-    #   - name: Run schema regression (must fail if gateway missing)
-    #     env:
-    #       INTENTFORGE_BASE: http://localhost:4000
-    #       INTENTFORGE_REQUIRE_GATEWAY: "1"
-    #     run: pytest tests/goals_api_schema.py -v
+    #   1. The job brings up its own gateway, so there is no reachability
+    #      branch to fall through. There is no `if:` on the test step and no
+    #      "skipped, sorry" path — a dead gateway is a hard failure.
+    #   2. Collection is BY DIRECTORY over the whole tests/ tree. The old job
+    #      pinned `pytest tests/goals_api_schema.py`, and because that file had
+    #      no `test_` prefix, directory collection silently MISSED it — those
+    #      assertions were invisible to every run. The file is now
+    #      tests/test_goals_contract.py so `pytest tests/` actually collects it.
+    #   3. A non-vacuity check runs afterwards and fails the job if too few
+    #      tests pass. A green conclusion with no executed assertions is no
+    #      longer expressible.
+    #
+    # `-m "not requires_upstream"` excludes the handful of tests that need a
+    # live SearXNG result set (non-deterministic, third-party, and would make
+    # CI flaky). They are still run by the QA loop against the full stack.
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: false
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install pytest
-        run: pip install -r tests/requirements.txt
-
-      - name: Check gateway reachability
-        id: gateway-check
-        env:
-          INTENTFORGE_BASE: http://localhost:4000
+      - name: Install test deps
         run: |
-          echo "Checking gateway reachability at $INTENTFORGE_BASE..."
-          if curl -sf --max-time 5 "$INTENTFORGE_BASE/health" > /dev/null 2>&1; then
-            echo "gateway_reachable=true" >> "$GITHUB_OUTPUT"
-            echo "Gateway is UP — schema regression will run as a real guard."
-          else
-            echo "gateway_reachable=false" >> "$GITHUB_OUTPUT"
-            echo "Gateway at $INTENTFORGE_BASE is NOT reachable."
-            echo "schema-regression skipped (no live gateway). The Rust unit tests"
-            echo "(gateway-tests job) cover pure logic. Live-API schema tests are the"
-            echo "QA loop's responsibility (runs where the stack exists)."
+          python -m pip install --upgrade pip
+          pip install -r requirements-tests.txt
+
+      - name: Build gateway image
+        run: docker build -t intentforge-gateway:ci services/gateway
+
+      - name: Start gateway
+        run: |
+          docker run -d --name if-ci-gateway -p 4000:4000 \
+            -e RUST_LOG=info \
+            intentforge-gateway:ci
+
+      - name: Wait for gateway health (fail if it never comes up)
+        run: |
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf --max-time 5 http://localhost:4000/health >/dev/null 2>&1; then
+              ok=1; echo "gateway healthy after ${i} attempt(s)"; break
+            fi
+            sleep 2
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::gateway never became healthy; container log follows"
+            docker logs if-ci-gateway
+            exit 1
           fi
 
-      - name: Run API schema regression
-        if: steps.gateway-check.outputs.gateway_reachable == 'true'
+      - name: Assert collection is non-vacuous
+        # Catches the exact class of defect this job was created to kill: a
+        # renamed/moved/prefix-stripped file that silently drops out of
+        # collection, leaving the suite green because nothing ran.
+        #
+        # This compares the collected set against a floor recorded in the repo,
+        # not a hand-tuned magic number: tests/EXPECTED_COLLECTION records the
+        # count that a full `pytest tests/` collection produces today (44). Any
+        # file that stops being collected moves this number DOWN, which fails
+        # here. Verified: renaming test_goals_contract.py back to its old
+        # prefix-less name drops collection to 29 and this gate fires.
+        run: |
+          # Last non-comment line is the number; the rest of the file is rationale.
+          expected=$(grep -E '^[0-9]+$' tests/EXPECTED_COLLECTION | tail -1)
+          if [ -z "$expected" ]; then
+            echo "::error::could not read a count from tests/EXPECTED_COLLECTION"; exit 1
+          fi
+          summary=$(pytest tests/ --collect-only -q | tail -1)
+          echo "expected >= $expected ; summary: $summary"
+          count=$(echo "$summary" | grep -oE '^[0-9]+' || echo 0)
+          if [ "$count" -lt "$expected" ]; then
+            echo "::error::directory collection found $count tests, expected at least $expected."
+            echo "::error::A test file has likely stopped being collected (renamed without a test_ prefix, moved, or deleted)."
+            exit 1
+          fi
+
+      - name: Run API contract regression
         env:
-          # Only reached when gateway is reachable — now REQUIRE it (fail if down).
+          # REQUIRED, not optional: the gateway is up (previous step proved it),
+          # so an unreachable gateway here is a real failure and must not skip.
           INTENTFORGE_REQUIRE_GATEWAY: "1"
           INTENTFORGE_BASE: http://localhost:4000
-        run: pytest tests/goals_api_schema.py -v
+          INTENTFORGE_BASE_URL: http://localhost:4000
+        run: pytest tests/ -m "not requires_upstream" -v -rs
 
-      - name: Report schema-regression skip
-        if: steps.gateway-check.outputs.gateway_reachable == 'false'
+      - name: Assert the run was non-vacuous
+        # Final gate: a `success` conclusion must imply real assertions ran.
+        # Parses the pytest summary line and fails when too few tests passed, so
+        # a suite that silently stops executing cannot report green.
         run: |
-          echo "::warning::schema-regression SKIPPED — no live gateway at $INTENTFORGE_BASE"
-          echo "::warning::This job is a no-op on a bare runner. The QA loop runs"
-          echo "::warning::the suite where the stack exists."
+          set -o pipefail
+          pytest tests/ -m "not requires_upstream" -q -rs 2>&1 | tee /tmp/pytest-summary.txt
+          line=$(grep -E '^[0-9]+ (passed|failed)' /tmp/pytest-summary.txt | tail -1)
+          echo "summary: ${line:-<none>}"
+          passed=$(echo "$line" | grep -oE '^[0-9]+' || echo 0)
+          if [ "$passed" -lt 20 ]; then
+            echo "::error::contract run executed fewer than 20 assertions (got $passed) — refusing to report success"
+            exit 1
+          fi
+
+      - name: Gateway logs on failure
+        if: failure()
+        run: docker logs if-ci-gateway

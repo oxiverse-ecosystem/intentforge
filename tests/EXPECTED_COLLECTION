@@ -1,0 +1,18 @@
+# Floor for directory collection, consumed by the "Assert collection is
+# non-vacuous" step in .github/workflows/ci.yml. It holds the number of tests
+# `pytest tests/` collects today (44). It exists because a file whose name lacks
+# a `test_` prefix is SILENTLY skipped by directory collection — that is how
+# tests/goals_api_schema.py (15 assertions) went invisible to every run for
+# months while CI stayed green. A bare `pytest tests/goals_api_schema.py` did
+# collect it, which is exactly why the bug was so easy to miss.
+#
+# RULES FOR MAINTAINING THIS NUMBER
+#   * Adding tests        -> raise it to the new total.
+#   * Deleting tests      -> lower it, and say why in the PR (a lower number
+#                            with tests removed is legitimate; a lower number
+#                            with none removed is the bug this guards).
+#   * Renaming any file in tests/ -> re-run `pytest tests/ --collect-only -q`
+#                            and confirm the total before merging.
+#
+# Current: 44 total = 35 gateway-contract + 9 requires_upstream.
+44

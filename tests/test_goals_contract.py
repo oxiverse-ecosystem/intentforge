@@ -12,9 +12,10 @@ a running gateway (see .github/workflows/ci.yml — the `schema-regression` job
 skips cleanly when no gateway is reachable, so it is a no-op on a bare runner
 and a real guard on a runner that brings the stack up).
 
-Run locally:
-    pytest tests/goals_api_schema.py -v
-    INTENTFORGE_BASE=http://other-host:4000 pytest tests/goals_api_schema.py -v
+Run the whole gateway-contract suite the way CI does:
+    INTENTFORGE_REQUIRE_GATEWAY=1 pytest tests/ -m "not requires_upstream" -v
+(`not requires_upstream` selects out the few tests that need a live SearXNG
+result set; the QA loop runs the full directory with no marker filter.)
 
 Expected-fail → pass transition (documented for the PR):
   * D1 (roadmap.total_phases)  — FIXED (t_cebacba8); asserted directly, GREEN.
@@ -183,6 +184,7 @@ def test_search_fast_schema():
 # --------------------------------------------------------------------------- #
 # Media endpoints
 # --------------------------------------------------------------------------- #
+@pytest.mark.requires_upstream
 def test_images_schema():
     """GET /images → 200 + {count, query, results[]} with image_url+thumbnail_url."""
     _assert_gateway_up()
@@ -199,6 +201,7 @@ def test_images_schema():
     )
 
 
+@pytest.mark.requires_upstream
 def test_videos_schema():
     """GET /videos → 200 + {count, query, results[]} with thumbnail+video_id."""
     _assert_gateway_up()
@@ -215,6 +218,7 @@ def test_videos_schema():
     )
 
 
+@pytest.mark.requires_upstream
 def test_news_schema():
     """GET /news → 200 + {count, query, results[]} with published_at."""
     _assert_gateway_up()

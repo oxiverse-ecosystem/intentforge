@@ -46,15 +46,14 @@ def _reachable() -> bool:
 
 
 @pytest.fixture(scope="module")
-def session():
-    s = requests.Session()
-    # Smoke check — skip the whole module if the dev gateway is down.
-    try:
-        r = s.get(f"{BASE}/health", timeout=5)
-        assert r.status_code == 200, f"gateway /health -> {r.status_code}"
-    except Exception as e:
-        pytest.skip(f"IntentForge gateway not reachable at {BASE}: {e}")
-    return s
+def session(gateway_or_skip):
+    """HTTP session bound to a verified-live gateway.
+
+    Delegates the up/down decision to the shared `gateway_or_skip` fixture so
+    INTENTFORGE_REQUIRE_GATEWAY=1 turns an absent gateway into a FAILURE here
+    too, instead of this suite's old unconditional silent skip.
+    """
+    return requests.Session()
 
 
 def _require_keys(label, obj, expected):
@@ -131,6 +130,7 @@ def test_search_fast_schema(session):
 IMAGE_RESULT_KEYS = ["title", "url", "image_url", "thumbnail_url", "source", "score"]
 
 
+@pytest.mark.requires_upstream
 def test_images_schema(session):
     """GET /images -> 200, keys count/query/results, each result has image fields."""
     r = session.get(f"{BASE}/images", params={"q": "northern lights aurora"}, timeout=30)
@@ -148,6 +148,7 @@ def test_images_schema(session):
 VIDEO_RESULT_KEYS = ["title", "url", "thumbnail", "video_id", "source", "score"]
 
 
+@pytest.mark.requires_upstream
 def test_videos_schema(session):
     """GET /videos -> 200, keys count/query/results, each result has video fields."""
     r = session.get(f"{BASE}/videos", params={"q": "lofi hip hop beats"}, timeout=30)
@@ -165,6 +166,7 @@ def test_videos_schema(session):
 NEWS_RESULT_KEYS = ["title", "url", "description", "published_at", "source", "score"]
 
 
+@pytest.mark.requires_upstream
 def test_news_schema(session):
     """GET /news -> 200, keys count/query/results, each result has news fields."""
     r = session.get(f"{BASE}/news", params={"q": "latest ai news"}, timeout=30)
@@ -377,6 +379,7 @@ def test_video_inspect_schema(session):
 
 
 # 15. /shopping schema
+@pytest.mark.requires_upstream
 def test_shopping_schema(session):
     """GET /shopping -> 200, results[] present with commerce/affiliate structure."""
     r = session.get(f"{BASE}/shopping", params={"q": "best wireless earbuds under 50", "count": 3}, timeout=60)

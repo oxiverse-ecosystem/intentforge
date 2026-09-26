@@ -38,15 +38,10 @@ def _reachable() -> bool:
 
 
 @pytest.fixture(scope="module")
-def session():
-    s = requests.Session()
-    # Smoke check — skip the whole module if the dev gateway is down.
-    try:
-        r = s.get(f"{BASE}/health", timeout=5)
-        assert r.status_code == 200, f"gateway /health -> {r.status_code}"
-    except Exception as e:
-        pytest.skip(f"IntentForge gateway not reachable at {BASE}: {e}")
-    return s
+def session(gateway_or_skip):
+    """See tests/conftest.py: the shared guard fails instead of skipping when
+    INTENTFORGE_REQUIRE_GATEWAY=1."""
+    return requests.Session()
 
 
 def _create_goal(s, goal_text="learn rust for systems programming in 6 months"):
