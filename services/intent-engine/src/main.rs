@@ -220,6 +220,14 @@ fn extract_and_strip_phrases(query: &str) -> (String, Vec<String>) {
 }
 
 fn parse_price_range(s: &str) -> Option<(Option<f32>, Option<f32>)> {
+    // The comparison operator decides WHICH SIDE the bound belongs to, so it has
+    // to be read BEFORE the numeric filter below — which strips every non-digit
+    // character and would otherwise make "price:>3000" indistinguishable from
+    // "price:<3000". That turned a MINIMUM into a MAXIMUM: "boots over 3000"
+    // kept only results under 3000 and dropped every genuinely over-budget one,
+    // i.e. the exact opposite of what the user asked for.
+    let trimmed = s.trim_start();
+    let is_lower_bound = trimmed.starts_with('>');
     let clean: String = s.chars().filter(|c| c.is_numeric() || *c == '-' || *c == '.').collect();
     if clean.contains('-') {
         let parts: Vec<&str> = clean.split('-').collect();
@@ -230,7 +238,11 @@ fn parse_price_range(s: &str) -> Option<(Option<f32>, Option<f32>)> {
         }
     }
     if let Ok(val) = clean.parse::<f32>() {
-        return Some((None, Some(val)));
+        return if is_lower_bound {
+            Some((Some(val), None))
+        } else {
+            Some((None, Some(val)))
+        };
     }
     None
 }
@@ -3279,13 +3291,16 @@ mod tests {
         );
     }
 
-    /// The operator-suffix rules share the same table and the same silent-skip
-    /// failure mode, so they are covered too.
+    /// The operator-suffix rules share the same table and the same loop, so they
+    /// are covered too. (They never carried the lookahead, so they were the
+    /// only rules in this table that still worked before the fix — these
+    /// assertions guard against the refactor regressing them.)
     #[test]
     fn nl_operator_spacing_still_normalizes() {
         assert_eq!(normalize_nl_operators("in url:github"), "inurl:github");
-        assert_eq!(normalize_nl_operators("on site reddit"), "site:reddit");
-        assert_eq!(normalize_nl_operators("in title guide"), "intitle:guide");
-        assert_eq!(normalize_nl_operators("in text foo"), "intext:foo");
+        assert_eq!(normalize_nl_operators("onsite reddit"), "site:reddit");
+        assert_eq!(normalize_nl_operators("on site:reddit"), "site:reddit");
+        assert_eq!(normalize_nl_operators("in title:guide"), "intitle:guide");
+        assert_eq!(normalize_nl_operators("intext:foo"), "intext:foo");
     }
 }

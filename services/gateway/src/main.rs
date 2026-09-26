@@ -17637,24 +17637,51 @@ fn normalize_nl_operators(query: &str) -> String {
     // can rewrite them into `price:<N`. Must run before the digit-only rules.
     let query = normalize_spoken_numbers(query);
     let mut out = query.to_string();
+
+    // Time-unit guard: a number immediately followed by a temporal unit
+    // (years/months/weeks/days/hours/minutes) is a DURATION, not a price.
+    // Without this guard, "over five years" / "under 3 months" / "within 2
+    // weeks" were mis-read as price bounds (round 2026-08-20: "over five years"
+    // in a car TCO comparison became price:>5 and crushed every result).
+    //
+    // This guard was originally written as an IN-PATTERN negative lookahead,
+    // `(?!\s*(?:years?|...))`. The `regex` crate has NO look-around support, so
+    // `Regex::new` returns `Err` for such a pattern — and the `if let Ok(re)`
+    // below then skipped the rule SILENTLY. Every natural-language price rule
+    // ("under 3000", "below 100", "less than 50", "over 200", ...) was
+    // therefore dead code: no NL price bound was ever produced here, and the
+    // digits leaked out as junk. The guard is now applied AFTER the match,
+    // against the text that follows it, which is what it was always meant to do.
+    let temporal_units = [
+        "years", "year", "months", "month", "weeks", "week", "days", "day",
+        "hours", "hour", "minutes", "minute",
+    ];
+    // Does the first alphanumeric token at `pos` name a temporal unit?
+    let followed_by_temporal_unit = |hay: &str, pos: usize| -> bool {
+        if pos > hay.len() {
+            return false;
+        }
+        let token: String = hay[pos..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+        temporal_units.iter().any(|u| *u == token)
+    };
+
     for (re_src, replacement) in [
-        // Time-unit guard: a number immediately followed by a temporal unit
-        // (years/months/weeks/days/hours/minutes) is a DURATION, not a price.
-        // Without this, "over five years" / "under 3 months" / "within 2 weeks"
-        // were mis-read as price bounds (round 2026-08-20: "over five years" in
-        // a car TCO comparison became price:>5 and crushed every result). The
-        // negative lookahead rejects the rewrite so the duration phrase is left
-        // as a plain term. General — no per-query literals, no tuned constants.
-        (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bless\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bbelow\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bcheaper\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bmax(?:imum)?\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bover\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
-        (r"(?i)\bmore\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
-        (r"(?i)\babove\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
-        (r"(?i)\bgreater\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
-        (r"(?i)\bmin(?:imum)?\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
+        // Time-unit guard applies after the match, not inside the pattern.
+        (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bless\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bbelow\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bcheaper\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bmax(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bover\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bmore\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\babove\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bgreater\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bmin(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
         (r"(?i)\bin\s+url\s*:\s*", "inurl:"),
         (r"(?i)\binurl\s+", "inurl:"),
         (r"(?i)\bon\s+site\s*:\s*", "site:"),
@@ -17664,9 +17691,34 @@ fn normalize_nl_operators(query: &str) -> String {
         (r"(?i)\bin\s+text\s*:\s*", "intext:"),
         (r"(?i)\bintext\s+", "intext:"),
     ] {
-        if let Ok(re) = regex::Regex::new(re_src) {
-            out = re.replace_all(&out, replacement).to_string();
-        }
+        let Ok(re) = regex::Regex::new(re_src) else {
+            // A rule that cannot compile must be loud, not silently dropped —
+            // that silent skip is what made the whole NL price table dead.
+            tracing::error!("normalize_nl_operators: rule {:?} failed to compile", re_src);
+            continue;
+        };
+        let input = out.clone();
+        out = re
+            .replace_all(&input, |caps: &regex::Captures| {
+                let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                let end = caps.get(0).map(|m| m.end()).unwrap_or(0);
+                // Duration guard: leave the phrase exactly as the user typed it.
+                if followed_by_temporal_unit(&input, end) {
+                    return whole.to_string();
+                }
+                // Expand `$1`..`$9` capture references. Done here rather than via
+                // a second anchored regex so each rule is compiled only once.
+                let mut expanded = replacement.to_string();
+                for i in 1..=9usize {
+                    let token = format!("${}", i);
+                    if expanded.contains(&token) {
+                        let value = caps.get(i).map(|m| m.as_str()).unwrap_or("");
+                        expanded = expanded.replace(&token, value);
+                    }
+                }
+                expanded
+            })
+            .to_string();
     }
 
     // ── NEGATION family (spoken "not from X" → explicit `-X` exclusion) ──
@@ -19471,6 +19523,70 @@ mod hardcoding_ruling_tests {
         assert!(disambig_result.score < 0.05, "disambig should be capped below floor, got {}", disambig_result.score);
         // Real article should be at or above floor
         assert!(article_result.score >= 0.05, "article should be >= 0.05, got {}", article_result.score);
+    }
+}
+
+#[cfg(test)]
+mod nl_operator_normalize_tests {
+    use super::*;
+
+    // The gateway's copy of `normalize_nl_operators` carried the SAME defect as
+    // the intent-engine's: its price rules embedded a negative LOOKAHEAD
+    // (`(?!\s*(?:years?|...))`) to keep durations out of the price path. The
+    // `regex` crate has no look-around support, so `Regex::new` returned Err and
+    // the surrounding `if let Ok(re)` skipped every price rule SILENTLY. The
+    // gateway therefore never rewrote "under 3000" into `price:<3000`, and a
+    // bare budget — the most natural way to state one — was dropped before it
+    // could reach extraction. The guard now runs after the match instead.
+
+    #[test]
+    fn nl_price_markers_rewrite_to_the_price_operator() {
+        for (q, want) in [
+            ("boots under 3000", "boots price:<3000"),
+            ("boots below 3000", "boots price:<3000"),
+            ("boots less than 3000", "boots price:<3000"),
+            ("boots cheaper than 3000", "boots price:<3000"),
+            ("boots max 3000", "boots price:<3000"),
+            ("boots over 3000", "boots price:>3000"),
+            ("boots more than 3000", "boots price:>3000"),
+            ("boots above 3000", "boots price:>3000"),
+            ("boots minimum 3000", "boots price:>3000"),
+        ] {
+            assert_eq!(normalize_nl_operators(q), want, "{:?} must normalize", q);
+        }
+    }
+
+    #[test]
+    fn nl_price_marker_carries_currency_symbol_and_separators() {
+        assert_eq!(normalize_nl_operators("boots under $3000"), "boots price:<3000");
+        assert_eq!(normalize_nl_operators("laptop under 1,500"), "laptop price:<1,500");
+    }
+
+    /// The duration guard must still protect the price path now that it is
+    /// applied after the match rather than by an unsupported lookahead.
+    #[test]
+    fn duration_phrases_are_left_untouched() {
+        for q in [
+            "car warranty over five years",
+            "trial under 3 months",
+            "plan within 2 weeks",
+        ] {
+            assert_eq!(
+                normalize_nl_operators(q),
+                normalize_spoken_numbers(q),
+                "{:?} is a DURATION and must not become a price bound",
+                q
+            );
+        }
+    }
+
+    /// The operator-suffix rules share the same table and loop; they never had
+    /// the lookahead, so they must keep working after the refactor.
+    #[test]
+    fn operator_spacing_rules_still_normalize() {
+        assert_eq!(normalize_nl_operators("in url:github"), "inurl:github");
+        assert_eq!(normalize_nl_operators("onsite reddit"), "site:reddit");
+        assert_eq!(normalize_nl_operators("intext:foo"), "intext:foo");
     }
 }
 
