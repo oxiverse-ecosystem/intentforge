@@ -19627,6 +19627,47 @@ structured product data, so nothing must be extracted from the body.</p></body><
         }
     }
 
+    /// Regression guard for the `.take(max_par)` truncation bug: bounding
+    /// concurrency must bound how many fetches run AT ONCE, never how many are
+    /// ATTEMPTED. Uses a zero-latency fetch so the assertion is about coverage,
+    /// not timing, and covers 3× the wave size.
+    #[tokio::test]
+    async fn every_result_beyond_first_wave_is_still_enriched() {
+        let n = MAX_PARALLEL_FETCH * 3;
+        let mut ranked: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("https://wave{}.example.com/p/{}", i, i),
+                    "score": 9.0 - (i as f64 * 0.01),
+                })
+            })
+            .collect();
+
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |_url: String| {
+            let html = fake_html.clone();
+            async move { Some(html) }
+        };
+
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+        )
+        .await;
+
+        assert_eq!(ranked.len(), n);
+        for (i, r) in ranked.iter().enumerate() {
+            assert!(
+                r.get("commerce").is_some(),
+                "result {} of {} was never enriched — the wave bound must not \
+                 truncate the eligible set",
+                i,
+                n
+            );
+        }
+    }
+
     #[tokio::test]
     async fn parallel_enrichment_timeout_gracefully_attaches_provenance() {
         // A fetch that ALWAYS exceeds the wall timeout must not panic. Every
