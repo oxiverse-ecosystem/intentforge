@@ -21206,6 +21206,70 @@ mod nl_operator_normalize_tests {
 }
 
 #[cfg(test)]
+mod nl_operator_normalize_tests {
+    use super::*;
+
+    // The gateway's copy of `normalize_nl_operators` carried the SAME defect as
+    // the intent-engine's: its price rules embedded a negative LOOKAHEAD
+    // (`(?!\s*(?:years?|...))`) to keep durations out of the price path. The
+    // `regex` crate has no look-around support, so `Regex::new` returned Err and
+    // the surrounding `if let Ok(re)` skipped every price rule SILENTLY. The
+    // gateway therefore never rewrote "under 3000" into `price:<3000`, and a
+    // bare budget — the most natural way to state one — was dropped before it
+    // could reach extraction. The guard now runs after the match instead.
+
+    #[test]
+    fn nl_price_markers_rewrite_to_the_price_operator() {
+        for (q, want) in [
+            ("boots under 3000", "boots price:<3000"),
+            ("boots below 3000", "boots price:<3000"),
+            ("boots less than 3000", "boots price:<3000"),
+            ("boots cheaper than 3000", "boots price:<3000"),
+            ("boots max 3000", "boots price:<3000"),
+            ("boots over 3000", "boots price:>3000"),
+            ("boots more than 3000", "boots price:>3000"),
+            ("boots above 3000", "boots price:>3000"),
+            ("boots minimum 3000", "boots price:>3000"),
+        ] {
+            assert_eq!(normalize_nl_operators(q), want, "{:?} must normalize", q);
+        }
+    }
+
+    #[test]
+    fn nl_price_marker_carries_currency_symbol_and_separators() {
+        assert_eq!(normalize_nl_operators("boots under $3000"), "boots price:<3000");
+        assert_eq!(normalize_nl_operators("laptop under 1,500"), "laptop price:<1,500");
+    }
+
+    /// The duration guard must still protect the price path now that it is
+    /// applied after the match rather than by an unsupported lookahead.
+    #[test]
+    fn duration_phrases_are_left_untouched() {
+        for q in [
+            "car warranty over five years",
+            "trial under 3 months",
+            "plan within 2 weeks",
+        ] {
+            assert_eq!(
+                normalize_nl_operators(q),
+                normalize_spoken_numbers(q),
+                "{:?} is a DURATION and must not become a price bound",
+                q
+            );
+        }
+    }
+
+    /// The operator-suffix rules share the same table and loop; they never had
+    /// the lookahead, so they must keep working after the refactor.
+    #[test]
+    fn operator_spacing_rules_still_normalize() {
+        assert_eq!(normalize_nl_operators("in url:github"), "inurl:github");
+        assert_eq!(normalize_nl_operators("onsite reddit"), "site:reddit");
+        assert_eq!(normalize_nl_operators("intext:foo"), "intext:foo");
+    }
+}
+
+#[cfg(test)]
 mod dns_classifier_tests {
     use super::error_chain_is_dns;
     use std::error::Error;
