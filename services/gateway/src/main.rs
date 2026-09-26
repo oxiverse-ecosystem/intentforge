@@ -3563,7 +3563,7 @@ fn decode_html_entities(s: &str) -> String {
     s.replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
-        .replace("&quot;", """)
+        .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&nbsp;", " ")
 }
