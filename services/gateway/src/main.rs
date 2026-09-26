@@ -2671,6 +2671,16 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             // dictionary / orphan pages. Signal-driven: a general English
             // question-word list, no per-query literals, no tuned thresholds.
             if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) { continue; }
+            // A NEGATION MARKER or pure quantifier can never be a positive
+            // requirement. "not from chinese brands and have usb c charging"
+            // leaked `+not` into `positive`: the bare marker matches no page
+            // content but is scored as a topical requirement, and it is also
+            // self-contradictory next to the `-…` exclusion derived from the
+            // same marker. Reuse the SAME closed-class grammar-noise gate the
+            // negative path already applies (is_exclusion_grammar_noise) so both
+            // directions share one vocabulary seed — structural, no per-query
+            // literals, no new tuned list.
+            if is_exclusion_grammar_noise(&pl) { continue; }
             // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
             // extraction (e.g. "under 15000" / "below 2000" can leave the digits
             // in `positive` as "+15000"). A purely-numeric positive carries no
@@ -2695,7 +2705,24 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             // drop it from the positive set. This prevents a positive+negative overlap
             // that no downstream gate can satisfy (a result can't both match and not
             // match `chinese`), which previously let the negated term leak through.
-            if negative.contains(&pl) {
+            //
+            // The EXACT-match check only catches `-chinese` vs `+chinese`. The
+            // live defect (round 2026-09-25T1155Z) is the SUBSET case: the
+            // exclusion is a phrase (`-chinese brands`) and the leaked positive is
+            // one of its content words (`+chinese`). `negative.contains("chinese")`
+            // is false, so the contradiction survived and the pipeline required a
+            // term its own exclusion was designed to remove. Generalize to token
+            // containment: a positive whose every token already appears in a
+            // negative is subsumed by that exclusion. Purely structural (token-set
+            // inclusion) — no brand, domain, or per-query literals, and it
+            // generalizes to any phrase/modifier pair the extractor can produce
+            // (`-python web framework` vs `+python`).
+            let pl_tokens: Vec<&str> = pl.split_whitespace().collect();
+            let subsumed = !pl_tokens.is_empty() && negative.iter().any(|n| {
+                let nt: Vec<&str> = n.split_whitespace().collect();
+                !nt.is_empty() && pl_tokens.iter().all(|t| nt.contains(t))
+            });
+            if subsumed {
                 continue;
             }
             let is_dup = positive.iter().any(|kept| {
@@ -7545,6 +7572,22 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     }
                     if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
                         break; // trailing stopword ends the entity
+                    }
+                    // A function word arriving when NO target is being collected
+                    // means the exclusion list has ended and a new, independent
+                    // clause has begun. "not from chinese brands AND have usb c
+                    // charging" splits on "and", then "have" (an auxiliary) used
+                    // to be pushed as the head of a fresh target, producing the
+                    // phantom exclusion "have usb c charging" — a verb phrase
+                    // that substring-matches no product page and wrongly penalises
+                    // every charger result. The leading-skip loop above already
+                    // handles function words directly after the lead-in
+                    // ("not from X"); this is the in-list counterpart: after a
+                    // connector, a function word terminates the clause instead of
+                    // seeding a new target. Structural (closed-class stopword
+                    // list already in scope), no per-query literals.
+                    if ent.is_empty() && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break;
                     }
                     // List connector ("or"/"and"/",") between exclusion targets: the
                     // current target is finalised and pushed, then we start a new one.
@@ -18094,6 +18137,121 @@ mod negation_scope_tests {
     #[test]
     fn plain_query_returns_none() {
         assert_eq!(simple_negation_strip("best laptop for programming"), None);
+    }
+
+    // ── A bare negation marker must never survive as a POSITIVE requirement ──
+    // Round auto/round-2026-09-25T1155Z-negconstraint-v2: for
+    // "not from chinese brands and have usb c charging" the extractor emitted
+    // ["+not", "-chinese brands", "-have usb c charging"]. `+not` is the marker
+    // ITSELF scored as a topical requirement — it matches no page content, and
+    // is self-contradictory next to the `-…` exclusion derived from the same
+    // marker. sanitize_constraints now routes positives through the SAME
+    // closed-class grammar-noise gate the negative path already used.
+
+    #[test]
+    fn negation_marker_not_emitted_as_positive_constraint() {
+        let c = Constraints {
+            positive: vec!["not".into(), "usb".into(), "charging".into()],
+            negative: vec!["chinese brands".into()],
+            ..Default::default()
+        };
+        let s = sanitize_constraints(&c);
+        assert!(
+            !s.positive.iter().any(|p| p == "not"),
+            "bare negation marker must not survive as a positive, got {:?}",
+            s.positive
+        );
+        assert!(
+            s.positive.iter().any(|p| p == "charging"),
+            "real topical positives must survive the shared gate, got {:?}",
+            s.positive
+        );
+    }
+
+    // The same gate must not over-filter: an ordinary content word that merely
+    // LOOKS like a function word in another class must stay. This pins the fix
+    // as a shared closed-class gate rather than a blunt "drop all short tokens".
+
+    #[test]
+    fn content_positives_survive_grammar_noise_gate() {
+        let c = Constraints {
+            positive: vec!["python".into(), "django".into(), "framework".into()],
+            ..Default::default()
+        };
+        let s = sanitize_constraints(&c);
+        for want in ["python", "django", "framework"] {
+            assert!(
+                s.positive.iter().any(|p| p == want),
+                "content positive '{}' must survive, got {:?}",
+                want,
+                s.positive
+            );
+        }
+    }
+
+    // A positive whose EVERY token already appears in a negative is subsumed by
+    // that exclusion — the pipeline must not simultaneously require and forbid
+    // the same term. Token-set containment (not exact string equality) so the
+    // phrase/modifier pair `-chinese brands` vs `+chinese` is caught.
+
+    #[test]
+    fn positive_subsumed_by_phrase_exclusion_is_dropped() {
+        let c = Constraints {
+            positive: vec!["chinese".into(), "charger".into()],
+            negative: vec!["chinese brands".into()],
+            ..Default::default()
+        };
+        let s = sanitize_constraints(&c);
+        assert!(
+            !s.positive.iter().any(|p| p == "chinese"),
+            "positive fully contained in a negative must be dropped, got {:?}",
+            s.positive
+        );
+        assert!(
+            s.positive.iter().any(|p| p == "charger"),
+            "unrelated positive must survive, got {:?}",
+            s.positive
+        );
+    }
+
+    // ── An auxiliary after a list connector ends the exclusion clause ──
+    // The phantom exclusion "have usb c charging" was a verb phrase that
+    // substring-matches no product page and wrongly penalised every charger
+    // result. A function word arriving when NO target is being collected now
+    // terminates the clause instead of seeding a fresh target.
+
+    #[test]
+    fn auxiliary_after_connector_does_not_seed_phantom_exclusion() {
+        let negs = extract_explicit_negation_terms("not from chinese brands and have usb c charging");
+        assert!(
+            !negs.iter().any(|n| n == "have usb c charging"),
+            "phantom verb-phrase exclusion must not be produced, got {:?}",
+            negs
+        );
+        assert!(
+            negs.iter().any(|n| n.contains("chinese")),
+            "the real exclusion must survive, got {:?}",
+            negs
+        );
+    }
+
+    // Guard against the fix over-reaching: a GENUINE second target after "and"
+    // must still be extracted. If the break fired on the connector itself, every
+    // compound exclusion would silently degrade to its first half.
+
+    #[test]
+    fn genuine_second_target_after_and_still_extracted() {
+        let negs = extract_explicit_negation_terms("recipe without oven or microwave");
+        assert!(
+            negs.iter().any(|n| n == "oven"),
+            "first target must be extracted, got {:?}",
+            negs
+        );
+        assert!(
+            negs.iter().any(|n| n == "microwave"),
+            "genuine second target after the connector must be extracted, got {:?}",
+            negs
+        );
     }
 }
 
