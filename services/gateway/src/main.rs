@@ -109,6 +109,15 @@ struct Constraints {
     /// Lower bound from an explicit `>` operator, e.g. `price:>50`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     price_gt: Option<f32>,
+    /// Currency the price BOUND is denominated in, as stated by the user
+    /// ("under 50000 rupees" -> INR). Recorded because every comparison site
+    /// normalizes the RESULT price to USD (`price_to_usd`) but the bound was
+    /// previously kept as a raw number, so a non-USD bound was compared in the
+    /// wrong unit and silently became a no-op (see `bound_to_usd`). `None`
+    /// means "unstated" and is treated as USD, which preserves the behaviour of
+    /// the `price:<N` operator form and of bare-dollar natural language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    price_currency: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -172,6 +181,29 @@ fn price_to_usd(amount: f64, currency: &str) -> f64 {
         "BRL" | "R$" => amount * 0.18,
         "CNY" | "RMB" => amount * 0.14,
         _ => amount,
+    }
+}
+
+/// Normalize a query's price BOUND into USD so it can be compared against a
+/// result price that has already been run through `price_to_usd`.
+///
+/// P3 root-cause fix. Previously the bound was stored as the raw number the
+/// user typed while every result price was currency-normalized to USD, so a
+/// non-USD bound was compared in the wrong unit: "under 50000 rupees" (bound
+/// 50000) was tested against a Rs 60,000 phone normalized to 720 USD, and
+/// 720 < 50000 read as "in budget" — the price filter was a silent no-op for
+/// every non-USD query, and in-budget results were actively boosted. The
+/// currency WAS already extracted (`extract_nl_price_bound` returns it) but was
+/// discarded at the assignment site.
+///
+/// `None` (currency unstated — the `price:<N` operator form, or bare-dollar
+/// natural language) is treated as USD, which preserves existing behaviour
+/// exactly and avoids inventing an exchange rate the user never gave.
+fn bound_to_usd(bound: Option<f32>, currency: Option<&str>) -> Option<f32> {
+    let b = bound?;
+    match currency {
+        None => Some(b),
+        Some(cur) => Some(price_to_usd(b as f64, cur) as f32),
     }
 }
 
@@ -2671,6 +2703,16 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             // dictionary / orphan pages. Signal-driven: a general English
             // question-word list, no per-query literals, no tuned thresholds.
             if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) { continue; }
+            // A NEGATION MARKER or pure quantifier can never be a positive
+            // requirement. "not from chinese brands and have usb c charging"
+            // leaked `+not` into `positive`: the bare marker matches no page
+            // content but is scored as a topical requirement, and it is also
+            // self-contradictory next to the `-…` exclusion derived from the
+            // same marker. Reuse the SAME closed-class grammar-noise gate the
+            // negative path already applies (is_exclusion_grammar_noise) so both
+            // directions share one vocabulary seed — structural, no per-query
+            // literals, no new tuned list.
+            if is_exclusion_grammar_noise(&pl) { continue; }
             // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
             // extraction (e.g. "under 15000" / "below 2000" can leave the digits
             // in `positive` as "+15000"). A purely-numeric positive carries no
@@ -2695,7 +2737,24 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             // drop it from the positive set. This prevents a positive+negative overlap
             // that no downstream gate can satisfy (a result can't both match and not
             // match `chinese`), which previously let the negated term leak through.
-            if negative.contains(&pl) {
+            //
+            // The EXACT-match check only catches `-chinese` vs `+chinese`. The
+            // live defect (round 2026-09-25T1155Z) is the SUBSET case: the
+            // exclusion is a phrase (`-chinese brands`) and the leaked positive is
+            // one of its content words (`+chinese`). `negative.contains("chinese")`
+            // is false, so the contradiction survived and the pipeline required a
+            // term its own exclusion was designed to remove. Generalize to token
+            // containment: a positive whose every token already appears in a
+            // negative is subsumed by that exclusion. Purely structural (token-set
+            // inclusion) — no brand, domain, or per-query literals, and it
+            // generalizes to any phrase/modifier pair the extractor can produce
+            // (`-python web framework` vs `+python`).
+            let pl_tokens: Vec<&str> = pl.split_whitespace().collect();
+            let subsumed = !pl_tokens.is_empty() && negative.iter().any(|n| {
+                let nt: Vec<&str> = n.split_whitespace().collect();
+                !nt.is_empty() && pl_tokens.iter().all(|t| nt.contains(t))
+            });
+            if subsumed {
                 continue;
             }
             let is_dup = positive.iter().any(|kept| {
@@ -2729,6 +2788,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         price_max,
         price_lt,
         price_gt,
+        price_currency: c.price_currency.clone(),
         ignored_constraints: None,
     }
 }
@@ -5158,16 +5218,19 @@ fn should_filter_by_constraints(
         };
         if let Some(p_info) = dummy.get_price() {
             let p_usd = price_to_usd(p_info.amount, &p_info.currency) as f32;
-            if let Some(pmin) = constraints.price_min {
+            // Same-unit rule as the P3 ranking block: the bound is in the user's
+            // stated currency, the result price is normalized to USD.
+            let cur = constraints.price_currency.as_deref();
+            if let Some(pmin) = bound_to_usd(constraints.price_min, cur) {
                 if p_usd < pmin { return true; }
             }
-            if let Some(pmax) = constraints.price_max {
+            if let Some(pmax) = bound_to_usd(constraints.price_max, cur) {
                 if p_usd > pmax { return true; }
             }
-            if let Some(plt) = constraints.price_lt {
+            if let Some(plt) = bound_to_usd(constraints.price_lt, cur) {
                 if p_usd > plt { return true; }
             }
-            if let Some(pgt) = constraints.price_gt {
+            if let Some(pgt) = bound_to_usd(constraints.price_gt, cur) {
                 if p_usd < pgt { return true; }
             }
         }
@@ -6989,6 +7052,92 @@ fn is_negated_source_entity(q_orig: &str, compound: &str) -> bool {
     false
 }
 
+/// Tokens that make a preceding `not` a PREDICATE negation about the subject
+/// ("does not spin", "is not available", "will not work") rather than a
+/// SELECTION exclusion of a named alternative. Structural closed-class
+/// vocabulary (auxiliaries / copulas / modals) — not per-query literals.
+const NEGATION_PREDICATE_AUXILIARIES: &[&str] = &[
+    "do", "does", "did", "is", "are", "am", "was", "were", "be", "been", "being",
+    "have", "has", "had", "will", "would", "shall", "should", "can", "could",
+    "may", "might", "must", "need", "needs", "let", "help", "makes", "make",
+];
+
+/// True when `compound` is the object of a BARE `not` selection negation —
+/// "wireless headphones not bose", "laptops not thinkpad" — i.e. the user named
+/// an alternative they do NOT want. This is the same English form the marker
+/// table already honours via "except"/"other than"/"besides", and it was the
+/// one negation lead-in the shared extractor did NOT recognise, so a brand the
+/// user explicitly wrote `not <brand>` was silently demoted to a soft negative
+/// and the excluded brand kept ranking.
+///
+/// The distinction from the attribute/qualifier negations that must stay
+/// declined ("recipes not spicy", "movies not rated r", "books not in
+/// hardcover", "news not about politics", "the door does not latch") is
+/// STRUCTURAL, not lexical — no brand list and no tuned threshold:
+///
+///  1. `not` must not follow an auxiliary/copula/modal — that is a predicate
+///     about the subject, never a selection ("does not spin").
+///  2. the token DIRECTLY governed by `not` (article-skipping only) must be a
+///     content word equal to the compound head — a preposition or function
+///     word there ("not in hardcover", "not about politics") means the negated
+///     phrase modifies the subject, it is not the excluded entity.
+///  3. the target must not be a subjective-quality adjective (existing data
+///     seed) or a verb form ("rated", "working", "existing") — both are
+///     predicates, not topics to remove from the index.
+///
+/// Every rule is a closed-class structural check; any brand, product, language,
+/// place or person the user writes after a bare `not` is honored.
+fn is_bare_not_selection(q_orig: &str, compound: &str) -> bool {
+    let head: String = compound
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    if head.is_empty() {
+        return false;
+    }
+    let toks: Vec<String> = q_orig
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect();
+    for i in 0..toks.len() {
+        if toks[i] != "not" {
+            continue;
+        }
+        // (1) predicate negation — an auxiliary/copula/modal governs `not`.
+        if i > 0 && NEGATION_PREDICATE_AUXILIARIES.contains(&toks[i - 1].as_str()) {
+            continue;
+        }
+        // The token directly governed by `not`: skip determiners only.
+        let mut j = i + 1;
+        while j < toks.len() && ["a", "an", "the", "any", "some"].contains(&toks[j].as_str()) {
+            j += 1;
+        }
+        if j >= toks.len() || toks[j] != head {
+            continue;
+        }
+        // (2) the governed token must itself be a content word, not a
+        // preposition/function word ("not in hardcover", "not about politics").
+        if is_exclusion_grammar_noise(&toks[j]) {
+            continue;
+        }
+        // (3) not a predicate form: past participle / gerund / adjective seed.
+        // Structural morphology, so any language works without a lexicon.
+        let t = toks[j].as_str();
+        if (t.len() > 3 && t.ends_with("ed")) || (t.len() > 4 && t.ends_with("ing")) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
 /// A negated compound is a real search EXCLUSION (not a manner qualifier) when at
 /// least one holds:
 ///  - (a) the compound names a recognized entity (protected brand/tech term — a
@@ -7065,6 +7214,16 @@ fn is_real_exclusion(
     // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
     // (e.g. "javascript not java not typescript" → java, typescript).
     if query_is_contrastive {
+        return true;
+    }
+    // BARE-NOT SELECTION ("wireless headphones not bose"): a single `not`
+    // directly governing a content word is the same explicit user directive as
+    // "except X" / "other than X" — the user named an alternative they do not
+    // want. Without this the class was demoted to a soft negative and the
+    // excluded brand kept ranking. Structurally separated from the attribute /
+    // predicate negations that must stay declined ("recipes not spicy",
+    // "movies not rated r", "does not latch") by `is_bare_not_selection`.
+    if is_bare_not_selection(q_orig, &lc) {
         return true;
     }
     // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
@@ -7543,11 +7702,13 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     {
                         break; // a fresh price constraint starts here
                     }
-                    if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
-                        break; // trailing stopword ends the entity
-                    }
                     // List connector ("or"/"and"/",") between exclusion targets: the
                     // current target is finalised and pushed, then we start a new one.
+                    // MUST precede the trailing-stopword break below — "or"/"and" are
+                    // themselves stopwords, so checking them second made this branch
+                    // unreachable and every compound exclusion ("without oven or
+                    // microwave") silently degraded to its first half, which
+                    // substring-matches no page and no-ops as a filter.
                     let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
                     if !ent.is_empty() && (bare == "or" || bare == "and") {
                         let entity = ent.join(" ");
@@ -7557,6 +7718,25 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                         ent.clear();
                         idx += 1;
                         continue;
+                    }
+                    if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break; // trailing stopword ends the entity
+                    }
+                    // A function word arriving when NO target is being collected
+                    // means the exclusion list has ended and a new, independent
+                    // clause has begun. "not from chinese brands AND have usb c
+                    // charging" splits on "and", then "have" (an auxiliary) used
+                    // to be pushed as the head of a fresh target, producing the
+                    // phantom exclusion "have usb c charging" — a verb phrase
+                    // that substring-matches no product page and wrongly penalises
+                    // every charger result. The leading-skip loop above already
+                    // handles function words directly after the lead-in
+                    // ("not from X"); this is the in-list counterpart: after a
+                    // connector, a function word terminates the clause instead of
+                    // seeding a new target. Structural (closed-class stopword
+                    // list already in scope), no per-query literals.
+                    if ent.is_empty() && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break;
                     }
                     ent.push(wc);
                     idx += 1;
@@ -9633,17 +9813,26 @@ fn merge_local_and_web(
         //     bound present) AND the result shows no price/product lexical signal, demote
         //     it — almost certainly not the priced product asked for. Generic; no hardcoded
         //     merchants or domains.
-        let price_bound = constraints.price_max.or(constraints.price_lt)
-            .or_else(|| constraints.price_min.or(constraints.price_gt));
+        // P3: the bound is denominated in the currency the USER stated ("under
+        // 50000 rupees"), while the result price is normalized to USD below.
+        // Both sides must be in the same unit or the comparison is meaningless
+        // — comparing raw 50000 against a USD-normalized 720 made every rupee
+        // query pass and actively boosted its results.
+        let bound_cur = constraints.price_currency.as_deref();
+        let b_max_usd = bound_to_usd(constraints.price_max, bound_cur);
+        let b_lt_usd = bound_to_usd(constraints.price_lt, bound_cur);
+        let b_min_usd = bound_to_usd(constraints.price_min, bound_cur);
+        let b_gt_usd = bound_to_usd(constraints.price_gt, bound_cur);
+        let price_bound = b_max_usd.or(b_lt_usd).or(b_min_usd).or(b_gt_usd);
         if let Some(_bound) = price_bound {
             let res_price = r.get_price();
             let price_signal = has_price_signal(&title_lower, &content_lower);
             if let Some(p_info) = res_price {
                 let p_usd = price_to_usd(p_info.amount, &p_info.currency) as f32;
-                let over = (constraints.price_max.is_some() && p_usd > constraints.price_max.unwrap())
-                    || (constraints.price_lt.is_some() && p_usd > constraints.price_lt.unwrap())
-                    || (constraints.price_min.is_some() && p_usd < constraints.price_min.unwrap())
-                    || (constraints.price_gt.is_some() && p_usd < constraints.price_gt.unwrap());
+                let over = b_max_usd.map(|b| p_usd > b).unwrap_or(false)
+                    || b_lt_usd.map(|b| p_usd > b).unwrap_or(false)
+                    || b_min_usd.map(|b| p_usd < b).unwrap_or(false)
+                    || b_gt_usd.map(|b| p_usd < b).unwrap_or(false);
                 if over {
                     relevance *= 0.12;
                 } else {
@@ -14365,6 +14554,22 @@ async fn handle_search(
     };
 
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+
+    // The upstream classifier can mistake causal/how-to language for a freshness
+    // label when the topic itself contains a food-safety adjective (e.g. "yogurt
+    // spoil faster"). Freshness is a recency intent only when the query carries an
+    // actual temporal signal; without one, preserve the natural-language intent
+    // shape instead of applying a freshness/date-sensitive ranking profile.
+    if intent.intent == "fresh" && derive_recency_window(&q.to_lowercase()).is_none() {
+        let ql = q.to_lowercase();
+        intent.intent = if ql.starts_with("how ") || ql.starts_with("how to ") {
+            "how-to".to_string()
+        } else if ql.starts_with("why ") || ql.starts_with("what causes") {
+            "informational".to_string()
+        } else {
+            intent.intent.clone()
+        };
+    }
     
     // Merge constraints parsed directly by the gateway to prevent any loss of operators
     let gateway_extracted = extract_gateway_constraints(&q_orig);
@@ -14427,10 +14632,18 @@ async fn handle_search(
     if intent.structured_constraints.price_lt.is_none()
         && intent.structured_constraints.price_max.is_none()
     {
-        if let Some((lt, _currency)) = extract_nl_price_bound(&q_orig) {
+        if let Some((lt, currency)) = extract_nl_price_bound(&q_orig) {
             intent.structured_constraints.price_lt = Some(lt);
             intent.structured_constraints.price_max = Some(lt);
-            tracing::info!("NL PRICE BOUND: extracted lt={} from query", lt);
+            // P3: the bound is denominated in the currency the USER stated, but
+            // every comparison site normalizes result prices to USD. Recording
+            // it is what lets `bound_to_usd` put both sides in the same unit —
+            // without this the bound is compared raw against USD and the filter
+            // is a silent no-op for every non-USD query.
+            intent.structured_constraints.price_currency = Some(currency.clone());
+            tracing::info!(
+                "NL PRICE BOUND: extracted lt={} currency={} from query", lt, currency
+            );
         }
     }
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
@@ -16004,13 +16217,27 @@ async fn handle_search(
         let constraints_ref = &intent.structured_constraints;
         // Pre-filter: remove results that violate constraints beyond redemption
         let pre_before = web_results.len();
-        web_results.retain(|r| {
+        let pre_filtered: Vec<SearxResult> = web_results.iter().filter(|r| {
             !should_filter_by_constraints(&r.title, &r.content, &r.url, r.published_date.as_deref(), constraints_ref)
-        });
-        let pre_removed = pre_before.saturating_sub(web_results.len());
-        if pre_removed > 0 {
+        }).cloned().collect();
+        // FAIL-OPEN: a hard constraint filter that removes EVERY result has not
+        // answered the question, it has deleted it. "laptops except dell and hp"
+        // filtered 17/17 to zero — every laptop page mentions one of the two
+        // excluded brands, so the user got an empty page instead of a ranked,
+        // demoted list. This mirrors the existing fail-open design of the date
+        // filter (dateless results are assumed in-range). Only keep the filtered
+        // set when it is strictly smaller than the unfiltered one; otherwise the
+        // filter proved nothing and the original ranking is the honest answer.
+        if !pre_filtered.is_empty() && pre_filtered.len() < pre_before {
+            let pre_removed = pre_before - pre_filtered.len();
+            web_results = pre_filtered;
             tracing::info!("should_filter: removed {}/{} results (from {})",
                 pre_removed, pre_before, before_count);
+        } else if pre_filtered.is_empty() && pre_before > 0 {
+            tracing::warn!(
+                "should_filter: constraint filter removed ALL {}/{} results; failing open to unfiltered set",
+                pre_before, before_count
+            );
         }
         if !intent.structured_constraints.negative.is_empty() {
             let mut negative_norm: Vec<String> = Vec::new();
@@ -16086,8 +16313,9 @@ async fn handle_search(
     //     results — but only while enough in-range priced results remain to
     //     fill the page (>= 6), so we never collapse to 1-3 arbitrary hits.
     {
-        let pmin = intent.structured_constraints.price_min;
-        let pmax = intent.structured_constraints.price_max;
+        let bound_cur = intent.structured_constraints.price_currency.as_deref();
+        let pmin = bound_to_usd(intent.structured_constraints.price_min, bound_cur);
+        let pmax = bound_to_usd(intent.structured_constraints.price_max, bound_cur);
         if pmin.is_some() || pmax.is_some() {
             let lo = pmin.unwrap_or(0.0) as f64;
             let hi = pmax.unwrap_or(f32::MAX) as f64;
@@ -16244,6 +16472,12 @@ async fn handle_search(
         .filter(|t| !t.is_empty())
         .filter(|t| !is_exclusion_grammar_noise(t)) // F3 (2026-08-17): drop grammar-noise
         .filter(|t| !is_subjective_quality_term(t)) // DA/DB (2026-08-17): drop quality adjectives
+        // A negated `without <term>` clause is a manner/attribute request unless the
+        // term is otherwise a recognized topical entity. Apply the same frame guard
+        // used by gateway-derived exclusions to engine-role entities too; otherwise
+        // phrases such as "without duplicate charges" or "with no commercial
+        // experience" become hard content filters and collapse the result set.
+        .filter(|t| !is_manner_frame(&q_orig, t))
         .filter(|t| !is_verb_attribute_exclusion(t)) // V1: drop verb-led/attribute exclusions
         .filter(|t| {
             // D2 (2026-08-19): a bare "pay"/"paying" engine Exclusion is only a
@@ -16569,7 +16803,16 @@ let mut results = match tokio::task::spawn_blocking(move || {
             before_count
         );
     } else {
-        results.retain(|r| {
+        // FAIL-OPEN, same rule as the pre-merge gate above: a negative hard-drop
+        // that removes EVERY result has deleted the answer, not answered it.
+        // "laptops except dell and hp" has a positive term ("laptops"), so
+        // has_only_negative is false and this branch runs — and because nearly
+        // every laptop page mentions Dell or HP somewhere, it dropped 14/14 to
+        // zero. Evaluate into a candidate set and only adopt it if it is
+        // non-empty; otherwise keep the unfiltered set and let the soft
+        // constraint_score penalty + the 8c re-rank demote offenders, which is
+        // the documented design for topical exclusions.
+        let post_candidates: Vec<MergedResult> = results.iter().filter(|r| {
             // Alternative-listing page check: keep comparison/alternative pages
             // even if they mention excluded terms (they are HIGHLY relevant).
             let alt_score = is_alternative_listing_page(&r.title, &r.url, &r.content);
@@ -16656,7 +16899,15 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 }
             }
             should_keep
-        });
+        }).cloned().collect();
+        if !post_candidates.is_empty() {
+            results = post_candidates;
+        } else if !results.is_empty() {
+            tracing::warn!(
+                "post-merge negative hard-drop removed ALL {} results; failing open to unfiltered set",
+                results.len()
+            );
+        }
     }
         let removed = before_count.saturating_sub(results.len());
         if removed > 0 {
@@ -17482,24 +17733,51 @@ fn normalize_nl_operators(query: &str) -> String {
     // can rewrite them into `price:<N`. Must run before the digit-only rules.
     let query = normalize_spoken_numbers(query);
     let mut out = query.to_string();
+
+    // Time-unit guard: a number immediately followed by a temporal unit
+    // (years/months/weeks/days/hours/minutes) is a DURATION, not a price.
+    // Without this guard, "over five years" / "under 3 months" / "within 2
+    // weeks" were mis-read as price bounds (round 2026-08-20: "over five years"
+    // in a car TCO comparison became price:>5 and crushed every result).
+    //
+    // This guard was originally written as an IN-PATTERN negative lookahead,
+    // `(?!\s*(?:years?|...))`. The `regex` crate has NO look-around support, so
+    // `Regex::new` returns `Err` for such a pattern — and the `if let Ok(re)`
+    // below then skipped the rule SILENTLY. Every natural-language price rule
+    // ("under 3000", "below 100", "less than 50", "over 200", ...) was
+    // therefore dead code: no NL price bound was ever produced here, and the
+    // digits leaked out as junk. The guard is now applied AFTER the match,
+    // against the text that follows it, which is what it was always meant to do.
+    let temporal_units = [
+        "years", "year", "months", "month", "weeks", "week", "days", "day",
+        "hours", "hour", "minutes", "minute",
+    ];
+    // Does the first alphanumeric token at `pos` name a temporal unit?
+    let followed_by_temporal_unit = |hay: &str, pos: usize| -> bool {
+        if pos > hay.len() {
+            return false;
+        }
+        let token: String = hay[pos..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+        temporal_units.iter().any(|u| *u == token)
+    };
+
     for (re_src, replacement) in [
-        // Time-unit guard: a number immediately followed by a temporal unit
-        // (years/months/weeks/days/hours/minutes) is a DURATION, not a price.
-        // Without this, "over five years" / "under 3 months" / "within 2 weeks"
-        // were mis-read as price bounds (round 2026-08-20: "over five years" in
-        // a car TCO comparison became price:>5 and crushed every result). The
-        // negative lookahead rejects the rewrite so the duration phrase is left
-        // as a plain term. General — no per-query literals, no tuned constants.
-        (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bless\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bbelow\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bcheaper\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bmax(?:imum)?\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bover\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
-        (r"(?i)\bmore\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
-        (r"(?i)\babove\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
-        (r"(?i)\bgreater\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
-        (r"(?i)\bmin(?:imum)?\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
+        // Time-unit guard applies after the match, not inside the pattern.
+        (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bless\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bbelow\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bcheaper\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bmax(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bover\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bmore\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\babove\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bgreater\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bmin(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
         (r"(?i)\bin\s+url\s*:\s*", "inurl:"),
         (r"(?i)\binurl\s+", "inurl:"),
         (r"(?i)\bon\s+site\s*:\s*", "site:"),
@@ -17509,9 +17787,34 @@ fn normalize_nl_operators(query: &str) -> String {
         (r"(?i)\bin\s+text\s*:\s*", "intext:"),
         (r"(?i)\bintext\s+", "intext:"),
     ] {
-        if let Ok(re) = regex::Regex::new(re_src) {
-            out = re.replace_all(&out, replacement).to_string();
-        }
+        let Ok(re) = regex::Regex::new(re_src) else {
+            // A rule that cannot compile must be loud, not silently dropped —
+            // that silent skip is what made the whole NL price table dead.
+            tracing::error!("normalize_nl_operators: rule {:?} failed to compile", re_src);
+            continue;
+        };
+        let input = out.clone();
+        out = re
+            .replace_all(&input, |caps: &regex::Captures| {
+                let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                let end = caps.get(0).map(|m| m.end()).unwrap_or(0);
+                // Duration guard: leave the phrase exactly as the user typed it.
+                if followed_by_temporal_unit(&input, end) {
+                    return whole.to_string();
+                }
+                // Expand `$1`..`$9` capture references. Done here rather than via
+                // a second anchored regex so each rule is compiled only once.
+                let mut expanded = replacement.to_string();
+                for i in 1..=9usize {
+                    let token = format!("${}", i);
+                    if expanded.contains(&token) {
+                        let value = caps.get(i).map(|m| m.as_str()).unwrap_or("");
+                        expanded = expanded.replace(&token, value);
+                    }
+                }
+                expanded
+            })
+            .to_string();
     }
 
     // ── NEGATION family (spoken "not from X" → explicit `-X` exclusion) ──
@@ -17902,6 +18205,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         price_max,
         price_lt,
         price_gt,
+        price_currency: None,
         ignored_constraints: None,
     }
 }
@@ -18073,6 +18377,121 @@ mod negation_scope_tests {
     fn plain_query_returns_none() {
         assert_eq!(simple_negation_strip("best laptop for programming"), None);
     }
+
+    // ── A bare negation marker must never survive as a POSITIVE requirement ──
+    // Round auto/round-2026-09-25T1155Z-negconstraint-v2: for
+    // "not from chinese brands and have usb c charging" the extractor emitted
+    // ["+not", "-chinese brands", "-have usb c charging"]. `+not` is the marker
+    // ITSELF scored as a topical requirement — it matches no page content, and
+    // is self-contradictory next to the `-…` exclusion derived from the same
+    // marker. sanitize_constraints now routes positives through the SAME
+    // closed-class grammar-noise gate the negative path already used.
+
+    #[test]
+    fn negation_marker_not_emitted_as_positive_constraint() {
+        let c = Constraints {
+            positive: vec!["not".into(), "usb".into(), "charging".into()],
+            negative: vec!["chinese brands".into()],
+            ..Default::default()
+        };
+        let s = sanitize_constraints(&c);
+        assert!(
+            !s.positive.iter().any(|p| p == "not"),
+            "bare negation marker must not survive as a positive, got {:?}",
+            s.positive
+        );
+        assert!(
+            s.positive.iter().any(|p| p == "charging"),
+            "real topical positives must survive the shared gate, got {:?}",
+            s.positive
+        );
+    }
+
+    // The same gate must not over-filter: an ordinary content word that merely
+    // LOOKS like a function word in another class must stay. This pins the fix
+    // as a shared closed-class gate rather than a blunt "drop all short tokens".
+
+    #[test]
+    fn content_positives_survive_grammar_noise_gate() {
+        let c = Constraints {
+            positive: vec!["python".into(), "django".into(), "framework".into()],
+            ..Default::default()
+        };
+        let s = sanitize_constraints(&c);
+        for want in ["python", "django", "framework"] {
+            assert!(
+                s.positive.iter().any(|p| p == want),
+                "content positive '{}' must survive, got {:?}",
+                want,
+                s.positive
+            );
+        }
+    }
+
+    // A positive whose EVERY token already appears in a negative is subsumed by
+    // that exclusion — the pipeline must not simultaneously require and forbid
+    // the same term. Token-set containment (not exact string equality) so the
+    // phrase/modifier pair `-chinese brands` vs `+chinese` is caught.
+
+    #[test]
+    fn positive_subsumed_by_phrase_exclusion_is_dropped() {
+        let c = Constraints {
+            positive: vec!["chinese".into(), "charger".into()],
+            negative: vec!["chinese brands".into()],
+            ..Default::default()
+        };
+        let s = sanitize_constraints(&c);
+        assert!(
+            !s.positive.iter().any(|p| p == "chinese"),
+            "positive fully contained in a negative must be dropped, got {:?}",
+            s.positive
+        );
+        assert!(
+            s.positive.iter().any(|p| p == "charger"),
+            "unrelated positive must survive, got {:?}",
+            s.positive
+        );
+    }
+
+    // ── An auxiliary after a list connector ends the exclusion clause ──
+    // The phantom exclusion "have usb c charging" was a verb phrase that
+    // substring-matches no product page and wrongly penalised every charger
+    // result. A function word arriving when NO target is being collected now
+    // terminates the clause instead of seeding a fresh target.
+
+    #[test]
+    fn auxiliary_after_connector_does_not_seed_phantom_exclusion() {
+        let negs = extract_explicit_negation_terms("not from chinese brands and have usb c charging");
+        assert!(
+            !negs.iter().any(|n| n == "have usb c charging"),
+            "phantom verb-phrase exclusion must not be produced, got {:?}",
+            negs
+        );
+        assert!(
+            negs.iter().any(|n| n.contains("chinese")),
+            "the real exclusion must survive, got {:?}",
+            negs
+        );
+    }
+
+    // Guard against the fix over-reaching: a GENUINE second target after "and"
+    // must still be extracted. If the break fired on the connector itself, every
+    // compound exclusion would silently degrade to its first half.
+
+    #[test]
+    fn genuine_second_target_after_and_still_extracted() {
+        let negs = extract_explicit_negation_terms("recipe without oven or microwave");
+        assert!(
+            negs.iter().any(|n| n == "oven"),
+            "first target must be extracted, got {:?}",
+            negs
+        );
+        assert!(
+            negs.iter().any(|n| n == "microwave"),
+            "genuine second target after the connector must be extracted, got {:?}",
+            negs
+        );
+    }
 }
 
 #[cfg(test)]
@@ -18166,6 +18585,65 @@ mod constraint_fix_tests {
         assert_eq!(price_to_usd(100.0, "USD"), 100.0);
         let inr_usd = price_to_usd(2000.0, "INR");
         assert!(inr_usd < 30.0 && inr_usd > 20.0, "2000 INR should be ~24 USD, got {}", inr_usd);
+    }
+
+    // ── P3 regression: a non-USD price bound must not be a silent no-op ──────
+    //
+    // The bound is denominated in the currency the USER stated; result prices
+    // are normalized to USD. Comparing the two raw made every non-USD query
+    // pass: "under 50000 rupees" (bound 50000) was tested against a Rs 60,000
+    // phone normalized to 720 USD, and 720 < 50000 read as "in budget" — the
+    // filter did nothing while still BOOSTING results.
+    #[test]
+    fn p3_rupee_bound_is_compared_in_usd_not_raw() {
+        // The extractor already returns the currency; only the wiring dropped it.
+        let (bound, cur) = extract_nl_price_bound("smartphone under 15000 rupees")
+            .expect("rupee bound should be extracted");
+        assert_eq!(bound, 15000.0);
+        assert_eq!(cur, "INR");
+
+        // A Rs 20,000 phone is 240 USD — OVER a Rs 15,000 (180 USD) bound.
+        let phone = price_to_usd(20000.0, "INR") as f32;
+        let b = bound_to_usd(Some(bound), Some(&cur)).unwrap();
+        assert!(
+            phone > b,
+            "Rs 20,000 ({:.0} USD) must be OVER a Rs 15,000 bound ({:.0} USD)",
+            phone, b
+        );
+
+        // The same phone against the pre-fix raw bound read as IN budget,
+        // which is exactly the no-op being fixed.
+        assert!(
+            phone < bound,
+            "guard: the old raw comparison really did pass (no-op reproduced)"
+        );
+
+        // A Rs 10,000 phone is 120 USD — genuinely within budget.
+        let cheap = price_to_usd(10000.0, "INR") as f32;
+        assert!(cheap <= b, "Rs 10,000 must stay in budget");
+    }
+
+    #[test]
+    fn p3_usd_bound_behaviour_is_unchanged() {
+        // No stated currency (the `price:<N` operator form, or bare dollars)
+        // must behave EXACTLY as before — the fix must not move USD queries.
+        assert_eq!(bound_to_usd(Some(500.0), None), Some(500.0));
+        assert_eq!(bound_to_usd(Some(500.0), Some("USD")), Some(500.0));
+        assert_eq!(bound_to_usd(Some(500.0), Some("usd")), Some(500.0));
+        // An unstated bound stays unstated.
+        assert_eq!(bound_to_usd(None, Some("INR")), None);
+    }
+
+    #[test]
+    fn p3_bound_currency_survives_sanitize() {
+        // sanitize_constraints rebuilds the struct; a dropped field there would
+        // silently reintroduce the no-op on every subsequent pass.
+        let mut c = cst();
+        c.price_max = Some(15000.0);
+        c.price_lt = Some(15000.0);
+        c.price_currency = Some("INR".to_string());
+        let s = sanitize_constraints(&c);
+        assert_eq!(s.price_currency.as_deref(), Some("INR"));
     }
 
     #[test]
@@ -18381,6 +18859,75 @@ mod constraint_fix_tests {
         assert!(pay_exclusion_is_money("learn without paying for a course"));
         assert!(pay_exclusion_is_money("free ways to watch without paying a subscription fee"));
         assert!(!pay_exclusion_is_money("study without paying attention"));
+    }
+
+    #[test]
+    fn bare_not_selection_negation_is_honored_as_real_exclusion() {
+        // CLASS test for the bare `not <term>` form. The shared extractor honours
+        // an exclusion introduced by a contrast marker ("except", "other than",
+        // "besides") but used to DROP a bare `not <term>` adjunct, so a brand the
+        // user explicitly wrote `not <brand>` was demoted to a soft negative and
+        // the excluded brand kept ranking. Asserted on GENERIC non-brand terms and
+        // on the extractor's OUTPUT SHAPE — no brand literals, no per-query rules.
+        for (q, expected) in [
+            ("wireless headphones not sony", "sony"),
+            ("running shoes not brooks", "brooks"),
+            ("budget laptop not lenovo price:<600", "lenovo"),
+            ("mechanical keyboards not keychron", "keychron"),
+        ] {
+            let (kept, dropped, _manner) = extract_query_negative_terms_with_dropped(q);
+            assert!(
+                kept.iter().any(|t| t == expected),
+                "bare `not {}` must be a REAL exclusion for {:?}; kept={:?} dropped={:?}",
+                expected, q, kept, dropped
+            );
+        }
+        // The extraction shape must be identical to the working "except" control:
+        // exactly one exclusion, and it must never ALSO be reported as declined.
+        let (kept, dropped, _manner) =
+            extract_query_negative_terms_with_dropped("wireless headphones not sony");
+        assert_eq!(kept, vec!["sony".to_string()]);
+        assert!(
+            !dropped.iter().any(|d| d.contains("sony")),
+            "an applied exclusion must not also surface as ignored: {:?}",
+            dropped
+        );
+        // Article-skipping and multi-word compounds keep working.
+        assert!(
+            extract_query_negative_terms("laptops not the dell xps")
+                .iter()
+                .any(|t| t.contains("dell")),
+            "bare not + article + multi-word entity must be honored"
+        );
+    }
+
+    #[test]
+    fn bare_not_selection_does_not_swallow_attribute_or_predicate_negations() {
+        // Anti-regression: the bare-not acceptance must NOT re-open the c4317bc
+        // over-reach where ANY object of `not` became a hard content filter. These
+        // are attribute / qualifier / predicate negations and MUST stay declined
+        // (surfaced via `declined`, never applied).
+        for (q, forbidden) in [
+            ("healthy recipes not spicy", "spicy"),
+            ("movies not rated r", "rated"),
+            ("books not in hardcover", "hardcover"),
+            ("news not about politics", "politics"),
+            ("my washing machine does not spin", "spin"),
+            ("the door does not latch", "latch"),
+            ("this laptop is not working", "working"),
+            ("python not installed on windows", "installed"),
+        ] {
+            let (kept, dropped, _manner) = extract_query_negative_terms_with_dropped(q);
+            assert!(
+                !kept.iter().any(|t| t.contains(forbidden)),
+                "attribute/predicate `not {}` must NOT be a hard exclusion for {:?}; kept={:?}",
+                forbidden, q, kept
+            );
+            assert!(
+                dropped.iter().any(|d| d.contains(forbidden)) || !kept.iter().any(|t| t.contains(forbidden)),
+                "declined `not {}` must still be surfaced for {:?}", forbidden, q
+            );
+        }
     }
 
     #[test]
@@ -19141,6 +19688,70 @@ mod hardcoding_ruling_tests {
         assert!(disambig_result.score < 0.05, "disambig should be capped below floor, got {}", disambig_result.score);
         // Real article should be at or above floor
         assert!(article_result.score >= 0.05, "article should be >= 0.05, got {}", article_result.score);
+    }
+}
+
+#[cfg(test)]
+mod nl_operator_normalize_tests {
+    use super::*;
+
+    // The gateway's copy of `normalize_nl_operators` carried the SAME defect as
+    // the intent-engine's: its price rules embedded a negative LOOKAHEAD
+    // (`(?!\s*(?:years?|...))`) to keep durations out of the price path. The
+    // `regex` crate has no look-around support, so `Regex::new` returned Err and
+    // the surrounding `if let Ok(re)` skipped every price rule SILENTLY. The
+    // gateway therefore never rewrote "under 3000" into `price:<3000`, and a
+    // bare budget — the most natural way to state one — was dropped before it
+    // could reach extraction. The guard now runs after the match instead.
+
+    #[test]
+    fn nl_price_markers_rewrite_to_the_price_operator() {
+        for (q, want) in [
+            ("boots under 3000", "boots price:<3000"),
+            ("boots below 3000", "boots price:<3000"),
+            ("boots less than 3000", "boots price:<3000"),
+            ("boots cheaper than 3000", "boots price:<3000"),
+            ("boots max 3000", "boots price:<3000"),
+            ("boots over 3000", "boots price:>3000"),
+            ("boots more than 3000", "boots price:>3000"),
+            ("boots above 3000", "boots price:>3000"),
+            ("boots minimum 3000", "boots price:>3000"),
+        ] {
+            assert_eq!(normalize_nl_operators(q), want, "{:?} must normalize", q);
+        }
+    }
+
+    #[test]
+    fn nl_price_marker_carries_currency_symbol_and_separators() {
+        assert_eq!(normalize_nl_operators("boots under $3000"), "boots price:<3000");
+        assert_eq!(normalize_nl_operators("laptop under 1,500"), "laptop price:<1,500");
+    }
+
+    /// The duration guard must still protect the price path now that it is
+    /// applied after the match rather than by an unsupported lookahead.
+    #[test]
+    fn duration_phrases_are_left_untouched() {
+        for q in [
+            "car warranty over five years",
+            "trial under 3 months",
+            "plan within 2 weeks",
+        ] {
+            assert_eq!(
+                normalize_nl_operators(q),
+                normalize_spoken_numbers(q),
+                "{:?} is a DURATION and must not become a price bound",
+                q
+            );
+        }
+    }
+
+    /// The operator-suffix rules share the same table and loop; they never had
+    /// the lookahead, so they must keep working after the refactor.
+    #[test]
+    fn operator_spacing_rules_still_normalize() {
+        assert_eq!(normalize_nl_operators("in url:github"), "inurl:github");
+        assert_eq!(normalize_nl_operators("onsite reddit"), "site:reddit");
+        assert_eq!(normalize_nl_operators("intext:foo"), "intext:foo");
     }
 }
 

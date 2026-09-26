@@ -46,15 +46,14 @@ def _reachable() -> bool:
 
 
 @pytest.fixture(scope="module")
-def session():
-    s = requests.Session()
-    # Smoke check — skip the whole module if the dev gateway is down.
-    try:
-        r = s.get(f"{BASE}/health", timeout=5)
-        assert r.status_code == 200, f"gateway /health -> {r.status_code}"
-    except Exception as e:
-        pytest.skip(f"IntentForge gateway not reachable at {BASE}: {e}")
-    return s
+def session(gateway_or_skip):
+    """HTTP session bound to a verified-live gateway.
+
+    Delegates the up/down decision to the shared `gateway_or_skip` fixture so
+    INTENTFORGE_REQUIRE_GATEWAY=1 turns an absent gateway into a FAILURE here
+    too, instead of this suite's old unconditional silent skip.
+    """
+    return requests.Session()
 
 
 def _require_keys(label, obj, expected):
@@ -131,6 +130,7 @@ def test_search_fast_schema(session):
 IMAGE_RESULT_KEYS = ["title", "url", "image_url", "thumbnail_url", "source", "score"]
 
 
+@pytest.mark.requires_upstream
 def test_images_schema(session):
     """GET /images -> 200, keys count/query/results, each result has image fields."""
     r = session.get(f"{BASE}/images", params={"q": "northern lights aurora"}, timeout=30)
@@ -148,6 +148,7 @@ def test_images_schema(session):
 VIDEO_RESULT_KEYS = ["title", "url", "thumbnail", "video_id", "source", "score"]
 
 
+@pytest.mark.requires_upstream
 def test_videos_schema(session):
     """GET /videos -> 200, keys count/query/results, each result has video fields."""
     r = session.get(f"{BASE}/videos", params={"q": "lofi hip hop beats"}, timeout=30)
@@ -165,6 +166,7 @@ def test_videos_schema(session):
 NEWS_RESULT_KEYS = ["title", "url", "description", "published_at", "source", "score"]
 
 
+@pytest.mark.requires_upstream
 def test_news_schema(session):
     """GET /news -> 200, keys count/query/results, each result has news fields."""
     r = session.get(f"{BASE}/news", params={"q": "latest ai news"}, timeout=30)
@@ -377,6 +379,7 @@ def test_video_inspect_schema(session):
 
 
 # 15. /shopping schema
+@pytest.mark.requires_upstream
 def test_shopping_schema(session):
     """GET /shopping -> 200, results[] present with commerce/affiliate structure."""
     r = session.get(f"{BASE}/shopping", params={"q": "best wireless earbuds under 50", "count": 3}, timeout=60)
@@ -400,7 +403,14 @@ def test_shopping_schema(session):
 
 # 16. POST /commerce/extract schema
 def test_commerce_extract_schema(session):
-    """POST /commerce/extract -> 200, returns price/currency/merchant fields."""
+    """POST /commerce/extract -> 200, returns the CommerceBlock provenance envelope.
+
+    The endpoint returns the SAME envelope the rest of the commerce surface uses
+    (`CommerceBlock` in services/gateway/src/main.rs): top-level
+    `url`/`observed_at`/`source` provenance plus the typed facts under `data`
+    (the same shape `/shopping` emits as `commerce_provenance` / `commerce`).
+    Facts are asserted inside `data`; provenance at the top level.
+    """
     html = (
         '<html><head><script type="application/ld+json">'
         '{"@type":"Product","name":"Test Widget","offers":{"@type":"Offer",'
@@ -415,7 +425,25 @@ def test_commerce_extract_schema(session):
     )
     assert r.status_code == 200, f"POST /commerce/extract -> {r.status_code} {r.text[:300]}"
     body = r.json()
-    for field in ("price", "currency", "availability", "merchant", "source", "observed_at"):
-        assert field in body, f"POST /commerce/extract missing key '{field}'; have {sorted(body.keys())}"
-    assert body.get("price") == 29.99, f"POST /commerce/extract price should be 29.99; got {body.get('price')!r}"
-    assert body.get("currency") == "USD", f"POST /commerce/extract currency should be 'USD'; got {body.get('currency')!r}"
+    # Provenance envelope — same CommerceBlock shape as /shopping's
+    # commerce_provenance. The honest "we observed this, here, from this
+    # structured source" record is what makes a stale price labelable.
+    for field in ("url", "source", "observed_at", "data"):
+        assert field in body, (
+            f"POST /commerce/extract envelope missing key '{field}'; have {sorted(body.keys())}"
+        )
+    assert body.get("source") == "json-ld", (
+        f"POST /commerce/extract source should be 'json-ld' for a JSON-LD page; got {body.get('source')!r}"
+    )
+    assert body.get("observed_at"), "POST /commerce/extract observed_at must be present (provenance)"
+    assert body.get("url") == "https://store.example.com/p/test-widget", (
+        f"POST /commerce/extract url should echo the supplied page url; got {body.get('url')!r}"
+    )
+    data = body.get("data")
+    assert isinstance(data, dict), (
+        f"POST /commerce/extract 'data' must be the typed facts object; got {type(data).__name__} ({data!r})"
+    )
+    for field in ("price", "currency", "availability", "merchant"):
+        assert field in data, f"POST /commerce/extract data missing key '{field}'; have {sorted(data.keys())}"
+    assert data.get("price") == 29.99, f"POST /commerce/extract price should be 29.99; got {data.get('price')!r}"
+    assert data.get("currency") == "USD", f"POST /commerce/extract currency should be 'USD'; got {data.get('currency')!r}"
