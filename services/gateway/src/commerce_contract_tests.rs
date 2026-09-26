@@ -795,7 +795,7 @@ fn placeholder_fallback_never_reaches_a_decorated_result() {
     {
         net.fallback_url = None;
     }
-    let ctx = AffiliateCtx { networks: vec![net], ..AffiliateCtx::default() };
+    let ctx = AffiliateCtx { networks: vec![net] };
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     if let Some(arr) = payload.get_mut("results").and_then(|v| v.as_array_mut()) {
