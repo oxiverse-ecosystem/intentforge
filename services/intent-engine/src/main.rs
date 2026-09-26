@@ -3481,4 +3481,5 @@ mod tests {
         assert_eq!(normalize_nl_operators("in title:guide"), "intitle:guide");
         assert_eq!(normalize_nl_operators("intext:foo"), "intext:foo");
     }
+
 }
