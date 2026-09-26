@@ -337,24 +337,52 @@ fn normalize_nl_operators(query: &str) -> String {
     let query = normalize_spoken_numbers(query);
     let mut out = query.to_string();
 
-    // Price: upper-bound forms. All price markers carry a time-unit negative
-    // lookahead so a number followed by a temporal unit (years/months/weeks/
-    // days/hours/minutes) is treated as a DURATION, not a price. Without this
-    // guard, "over five years" (spoken -> "over 5") became price:>5 and silently
-    // crushed every result for a car TCO comparison query (IntentForge round
-    // 2026-08-20). Mirror of the gateway's fix in normalize_nl_operators.
+    // Time-unit guard: a number immediately followed by a temporal unit
+    // (years/months/weeks/days/hours/minutes) is a DURATION, not a price.
+    // Without this guard, "over five years" (spoken -> "over 5") became
+    // price:>5 and silently crushed every result for a car TCO comparison
+    // query (IntentForge round 2026-08-20).
+    //
+    // This guard was originally written as an IN-PATTERN negative lookahead,
+    // `(?!\s*(?:years?|...))`. The `regex` crate has NO look-around support, so
+    // `Regex::new` returns `Err` for such a pattern — and the `if let Ok(re)`
+    // below then skipped the rule SILENTLY. Every natural-language price rule
+    // ("under 3000", "below 100", "less than 50", "over 200", ...) was
+    // therefore dead code: no NL price bound was ever extracted, and the digits
+    // leaked out as a junk positive constraint instead (e.g. "+3000"). The
+    // guard is now applied AFTER the match, against the text that follows it,
+    // which is what it was always meant to do.
+    let temporal_units = [
+        "years", "year", "months", "month", "weeks", "week", "days", "day",
+        "hours", "hour", "minutes", "minute",
+    ];
+    // Does the first alphanumeric token at `pos` name a temporal unit?
+    let followed_by_temporal_unit = |hay: &str, pos: usize| -> bool {
+        if pos > hay.len() {
+            return false;
+        }
+        let token: String = hay[pos..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+        temporal_units.iter().any(|u| *u == token)
+    };
+
+    // Price: upper-bound forms.
     for (re_src, replacement) in [
-        (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bless\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bbelow\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bcheaper\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
-        (r"(?i)\bmax(?:imum)?\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:<$1"),
+        (r"(?i)\bunder\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bless\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bbelow\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bcheaper\s+than\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
+        (r"(?i)\bmax(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:<$1"),
         // Price: lower-bound forms.
-        (r"(?i)\bover\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
-        (r"(?i)\bmore\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
-        (r"(?i)\babove\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
-        (r"(?i)\bgreater\s+than\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
-        (r"(?i)\bmin(?:imum)?\s*\$?\s*(\d[\d.,]*)(?!\s*(?:years?|months?|weeks?|days?|hours?|minutes?))", "price:>$1"),
+        (r"(?i)\bover\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bmore\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\babove\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bgreater\s+than\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
+        (r"(?i)\bmin(?:imum)?\s*\$?\s*(\d[\d.,]*)", "price:>$1"),
         // Operator spacing: "in url:github" / "inurl github" -> "inurl:github"
         (r"(?i)\bin\s+url\s*:\s*", "inurl:"),
         (r"(?i)\binurl\s+", "inurl:"),
@@ -368,9 +396,34 @@ fn normalize_nl_operators(query: &str) -> String {
         (r"(?i)\bin\s+text\s*:\s*", "intext:"),
         (r"(?i)\bintext\s+", "intext:"),
     ] {
-        if let Ok(re) = regex::Regex::new(re_src) {
-            out = re.replace_all(&out, replacement).to_string();
-        }
+        let Ok(re) = regex::Regex::new(re_src) else {
+            // A rule that cannot compile must be loud, not silently dropped —
+            // that silent skip is what made the whole NL price table dead.
+            tracing::error!("normalize_nl_operators: rule {:?} failed to compile", re_src);
+            continue;
+        };
+        let input = out.clone();
+        out = re
+            .replace_all(&input, |caps: &regex::Captures| {
+                let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                let end = caps.get(0).map(|m| m.end()).unwrap_or(0);
+                // Duration guard: leave the phrase exactly as the user typed it.
+                if followed_by_temporal_unit(&input, end) {
+                    return whole.to_string();
+                }
+                // Expand `$1`..`$9` capture references. Done here rather than via
+                // a second anchored regex so each rule is compiled only once.
+                let mut expanded = replacement.to_string();
+                for i in 1..=9usize {
+                    let token = format!("${}", i);
+                    if expanded.contains(&token) {
+                        let value = caps.get(i).map(|m| m.as_str()).unwrap_or("");
+                        expanded = expanded.replace(&token, value);
+                    }
+                }
+                expanded
+            })
+            .to_string();
     }
     out
 }
@@ -3087,21 +3140,152 @@ mod tests {
         assert!(c.negative.contains(&"flask".to_string()), "flask should be excluded: {:?}", c.negative);
     }
 
-    // ── DIAGNOSTIC (temporary): where does "boots under 3000" lose its price? ──
+    // ── Multi-constraint queries (backlog item 3) ──────────────────────────
+    //
+    // A natural-language price bound used to be dropped entirely. The price
+    // rules carried a time-unit negative LOOKAHEAD, which the `regex` crate
+    // cannot compile; `Regex::new` returned Err and the surrounding
+    // `if let Ok(re)` skipped the rule SILENTLY. So "under 3000" produced no
+    // price bound at all, the digits leaked out as a junk positive constraint,
+    // and the whole transactional/price path (applied_constraints, shopping
+    // block, price ranking) was skipped for a query that clearly had a budget.
     #[test]
-    fn diag_bare_number_budget() {
-        for q in [
-            "boots under 3000",
-            "boots under 3000 rupees",
-            "boots price:<3000",
-            "boots under 3000rs",
+    fn nl_bare_number_budget_yields_a_price_bound() {
+        for (q, want) in [
+            ("boots under 3000", 3000.0),
+            ("boots below 3000", 3000.0),
+            ("boots less than 3000", 3000.0),
+            ("boots cheaper than 3000", 3000.0),
+            ("boots max 3000", 3000.0),
+            ("boots under $3000", 3000.0),
+            ("boots under 1,500", 1500.0),
         ] {
-            let norm = normalize_nl_operators(q);
             let c = extract_constraints(q);
-            println!(
-                "q={:?} norm={:?} min={:?} max={:?} positive={:?}",
-                q, norm, c.price_min, c.price_max, c.positive
+            assert_eq!(
+                c.price_max,
+                Some(want),
+                "{:?} must extract an upper price bound of {} (got {:?})",
+                q,
+                want,
+                c.price_max
             );
         }
+    }
+
+    #[test]
+    fn nl_bare_number_lower_bound_yields_a_price_floor() {
+        // A lower bound must not be recorded as an upper one.
+        for (q, want) in [
+            ("boots over 3000", 3000.0),
+            ("boots more than 3000", 3000.0),
+            ("boots above 3000", 3000.0),
+            ("boots minimum 3000", 3000.0),
+        ] {
+            let c = extract_constraints(q);
+            assert_eq!(
+                c.price_min,
+                Some(want),
+                "{:?} must extract a lower price bound of {} (got {:?})",
+                q,
+                want,
+                c.price_min
+            );
+            assert!(
+                c.price_max.is_none(),
+                "{:?} must not invent an upper bound (got {:?})",
+                q,
+                c.price_max
+            );
+        }
+    }
+
+    /// The price digits must NOT leak out as a topic constraint. "boots under
+    /// 3000" asking for "3000" as a topic term is junk that can then be
+    /// required of every result.
+    #[test]
+    fn nl_budget_digits_do_not_leak_as_positive_constraints() {
+        for q in ["boots under 3000", "laptop below 500", "shoes under 2000"] {
+            let c = extract_constraints(q);
+            for p in &c.positive {
+                assert!(
+                    !p.chars().all(|ch| ch.is_numeric() || ch == '.' || ch == ','),
+                    "{:?} leaked the price amount {:?} into positive constraints: {:?}",
+                    q,
+                    p,
+                    c.positive
+                );
+            }
+        }
+    }
+
+    /// The round-2026-08-20 duration guard must still hold now that it is
+    /// applied after the match instead of via an unsupported in-pattern
+    /// lookahead. A number followed by a temporal unit is a DURATION.
+    #[test]
+    fn duration_phrases_are_not_mis_read_as_prices() {
+        for q in [
+            "car warranty over five years",
+            "trial under 3 months",
+            "plan within 2 weeks",
+            "subscription above 12 months",
+        ] {
+            let c = extract_constraints(q);
+            assert!(
+                c.price_min.is_none() && c.price_max.is_none(),
+                "{:?} is a DURATION, not a price (got min={:?} max={:?})",
+                q,
+                c.price_min,
+                c.price_max
+            );
+        }
+    }
+
+    /// Spoken prices must still reach the same bound ("four hundred dollars").
+    #[test]
+    fn spoken_price_still_normalizes() {
+        let c = extract_constraints("boots under four hundred");
+        assert_eq!(c.price_max, Some(400.0), "got {:?}", c.price_max);
+    }
+
+    /// A real multi-constraint query: budget AND attributes AND exclusion.
+    /// Every constraint present in the query must be detected simultaneously.
+    #[test]
+    fn multi_constraint_query_detects_every_constraint() {
+        let c = extract_constraints(
+            "noise cancelling headphones with long battery life and mic under 20000 without bluetooth",
+        );
+        // 1. the budget
+        assert_eq!(c.price_max, Some(20000.0), "budget lost: {:?}", c);
+        // 2. the exclusion
+        assert!(
+            c.negative.iter().any(|n| n.contains("bluetooth")),
+            "exclusion lost: negative={:?}",
+            c.negative
+        );
+        // 3. the attributes survive as topic constraints
+        for topic in ["headphones", "battery"] {
+            assert!(
+                c.positive.iter().any(|p| p == topic),
+                "topic {:?} lost: positive={:?}",
+                topic,
+                c.positive
+            );
+        }
+        // 4. and the budget amount is not itself demanded as a topic
+        assert!(
+            !c.positive.iter().any(|p| p.contains("20000")),
+            "budget leaked into topics: {:?}",
+            c.positive
+        );
+    }
+
+    /// The operator-suffix rules share the same table and the same silent-skip
+    /// failure mode, so they are covered too.
+    #[test]
+    fn nl_operator_spacing_still_normalizes() {
+        assert_eq!(normalize_nl_operators("in url:github"), "inurl:github");
+        assert_eq!(normalize_nl_operators("on site reddit"), "site:reddit");
+        assert_eq!(normalize_nl_operators("in title guide"), "intitle:guide");
+        assert_eq!(normalize_nl_operators("in text foo"), "intext:foo");
     }
 }
