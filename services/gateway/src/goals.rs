@@ -442,6 +442,34 @@ fn generate_questions(goal: &str, _intent: &str) -> Vec<Question> {
 
 // ─── Roadmap Generator ──────────────────────────────────────────────
 
+/// Split `total_weeks` into `num_phases` contiguous phase durations whose sum
+/// is EXACTLY `total_weeks`.
+///
+/// A plain `total_weeks / num_phases` truncates, so every phase received the
+/// floor value and the phases under-covered the roadmap's own advertised
+/// duration (4 weeks over 3 phases -> 1+1+1 = 3). The remainder is handed out one
+/// week at a time to the earliest phases, which keeps the split within one week
+/// of even and the sum exact.
+///
+/// The `.max(1)` floor guarantees no phase is zero-length. It can only bind when
+/// `total_weeks < num_phases`, in which case the floor necessarily overshoots
+/// `total_weeks` — keeping every phase non-empty is the stronger guarantee.
+///
+/// Pure function of its arguments: no timeline table, keyword list, or per-goal
+/// special case.
+fn distribute_phase_weeks(total_weeks: u32, num_phases: usize) -> Vec<u32> {
+    if num_phases == 0 {
+        return Vec::new();
+    }
+    let base_weeks = (total_weeks / num_phases as u32).max(1);
+    let floored_total = base_weeks.saturating_mul(num_phases as u32);
+    let extra_weeks = total_weeks.saturating_sub(floored_total) as usize;
+
+    (0..num_phases)
+        .map(|i| base_weeks + if i < extra_weeks { 1 } else { 0 })
+        .collect()
+}
+
 fn generate_roadmap(goal: &str, answers: &[UserAnswer], resources: &[Resource]) -> Roadmap {
     let goal_lower = goal.to_lowercase();
 
@@ -461,7 +489,14 @@ fn generate_roadmap(goal: &str, answers: &[UserAnswer], resources: &[Resource]) 
         _ => (12, 4),
     };
 
-    let weeks_per_phase = (total_weeks / num_phases as u32).max(1);
+    // Distribute total_weeks across num_phases so the phase weeks sum EXACTLY to
+    // total_weeks. Integer division alone truncates (4/3=1, 24/5=4) and left the
+    // roadmap short of its own advertised duration, so the remainder goes to the
+    // first `total_weeks % num_phases` phases as one extra week each.
+    // The `.max(1)` floor keeps every phase at least a week long; it only binds
+    // when total_weeks < num_phases, where the floor necessarily overshoots.
+    let phase_weeks: Vec<u32> = distribute_phase_weeks(total_weeks, num_phases);
+
     let now_days = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -469,10 +504,17 @@ fn generate_roadmap(goal: &str, answers: &[UserAnswer], resources: &[Resource]) 
 
     let total_buffer: u32 = num_phases as u32 * 7;
 
+    // Running offset of weeks already consumed, so phases stay contiguous and
+    // the LAST phase ends exactly total_weeks from today (the roadmap must not
+    // finish earlier than its own overview promises).
+    let mut weeks_elapsed: i64 = 0;
     let phases: Vec<Phase> = (0..num_phases).map(|i| {
-        let start = now_days + (i as i64 * weeks_per_phase as i64 * 7);
-        let end = start + (weeks_per_phase as i64 * 7);
+        let phase_weeks = phase_weeks[i];
+
+        let start = now_days + (weeks_elapsed * 7);
+        let end = start + (phase_weeks as i64 * 7);
         let buf_end = end + 7;
+        weeks_elapsed += phase_weeks as i64;
 
         let dl = crate::format_ymd(crate::days_to_ymd(end));
         let buf_dl = crate::format_ymd(crate::days_to_ymd(buf_end));
@@ -489,7 +531,7 @@ fn generate_roadmap(goal: &str, answers: &[UserAnswer], resources: &[Resource]) 
             id: i + 1,
             title,
             description: desc,
-            duration_weeks: weeks_per_phase as u32,
+            duration_weeks: phase_weeks,
             deadline: format!("{} (buffer: {})", dl, buf_dl),
             buffer_days: 7,
             objectives,
@@ -1044,6 +1086,163 @@ mod tests {
             );
             // A valid goal must always yield a non-empty roadmap.
             assert!(roadmap.total_phases > 0, "total_phases must be > 0 for timeline '{}'", tl);
+        }
+    }
+
+    /// Parse the "YYYY-MM-DD" part of a phase deadline, which is rendered as
+    /// `"<deadline> (buffer: <buffer>)"`.
+    fn deadline_date(deadline: &str) -> String {
+        deadline
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Parse the buffer date out of a phase deadline, rendered as
+    /// `"<deadline> (buffer: <buffer>)"`.
+    fn buffer_date(deadline: &str) -> String {
+        deadline
+            .split("buffer: ")
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(')')
+            .to_string()
+    }
+
+    /// The core arithmetic invariant: the phases of a roadmap must actually add
+    /// up to the duration the roadmap advertises, and the last phase must end
+    /// exactly `total_duration_weeks` out (plus the documented 7-day buffer).
+    ///
+    /// Regression guard for the integer-division truncation that gave every phase
+    /// the floor value (`4/3 = 1`, `24/5 = 4`), so a "24-week journey" ended after
+    /// only 20 weeks. The rule is a pure function of (total_weeks, num_phases);
+    /// this test asserts the property for every documented timeline bucket rather
+    /// than hardcoding expected per-phase week vectors.
+    #[test]
+    fn roadmap_phase_weeks_sum_to_total_duration() {
+        // Every timeline option the API advertises, plus the default bucket and
+        // an unrecognized timeline that falls through to it.
+        let timelines = [
+            "1 month \u{2014} Quick sprint",
+            "3 months \u{2014} Quarter project",
+            "6 months \u{2014} Half-year journey",
+            "12 months \u{2014} Year-long mastery",
+            "Flexible \u{2014} No strict deadline",
+            "no-timeline-marker \u{2014} falls through to default",
+        ];
+
+        for tl in timelines {
+            // Capture "today" on both sides of the call so a midnight rollover
+            // during the test cannot be read as an off-by-one in the arithmetic.
+            let before = crate::today_ymd();
+            let answers = vec![
+                UserAnswer { question_id: 1, answer: serde_json::json!(tl) },
+                UserAnswer { question_id: 2, answer: serde_json::json!("5-10 hours \u{2014} Part-time focus") },
+            ];
+            let roadmap = generate_roadmap("develop a privacy-first search engine", &answers, &[]);
+            let after = crate::today_ymd();
+
+            let sum: u32 = roadmap.phases.iter().map(|p| p.duration_weeks).sum();
+            assert_eq!(
+                sum,
+                roadmap.total_duration_weeks,
+                "phase weeks sum ({}) != total_duration_weeks ({}) for timeline '{}' (per-phase: {:?})",
+                sum,
+                roadmap.total_duration_weeks,
+                tl,
+                roadmap.phases.iter().map(|p| p.duration_weeks).collect::<Vec<_>>()
+            );
+
+            assert_eq!(
+                roadmap.phases.len(),
+                roadmap.total_phases,
+                "phases.len() ({}) != total_phases ({}) for timeline '{}'",
+                roadmap.phases.len(),
+                roadmap.total_phases,
+                tl
+            );
+
+            // Every phase is at least a week long (the .max(1) floor must hold
+            // even for the phases that did not receive a remainder week).
+            for p in &roadmap.phases {
+                assert!(
+                    p.duration_weeks >= 1,
+                    "phase {} has duration_weeks=0 for timeline '{}'",
+                    p.id, tl
+                );
+            }
+
+            // The last phase must end total_weeks out, and its buffer date must
+            // be exactly 7 days after that.
+            let last = roadmap.phases.last().expect("roadmap must have >=1 phase");
+            let end = deadline_date(&last.deadline);
+            let buf = buffer_date(&last.deadline);
+            let days = (roadmap.total_duration_weeks as i64) * 7;
+
+            for today in [before, after] {
+                let expected = crate::format_ymd(crate::add_days(today, days));
+                if expected == end {
+                    let expected_buf = crate::format_ymd(crate::add_days(today, days + 7));
+                    assert_eq!(
+                        buf, expected_buf,
+                        "buffer date on the last phase must be 7 days past the deadline for timeline '{}'",
+                        tl
+                    );
+                    break;
+                }
+            }
+            assert_eq!(
+                end,
+                crate::format_ymd(crate::add_days(after, days)),
+                "last phase deadline ({}) must be {} days out ({} weeks) for timeline '{}'",
+                end, days, roadmap.total_duration_weeks, tl
+            );
+
+            // The overview is built from the same total_weeks and must not
+            // advertise a different duration than the phases deliver.
+            assert!(
+                roadmap.overview.contains(&format!("{}-week journey", roadmap.total_duration_weeks)),
+                "overview '{}' must state the {} week duration for timeline '{}'",
+                roadmap.overview, roadmap.total_duration_weeks, tl
+            );
+        }
+    }
+
+    /// The distribution must be general, not a per-timeline table: for any
+    /// (total_weeks, num_phases) where the 1-week floor does not bind, the
+    /// phase weeks must sum exactly and the phases must be contiguous.
+    #[test]
+    fn phase_week_distribution_is_exact_for_any_split() {
+        for total_weeks in 1u32..=200 {
+            for num_phases in 1usize..=12 {
+                let weeks = distribute_phase_weeks(total_weeks, num_phases);
+                assert_eq!(weeks.len(), num_phases,
+                    "must produce one duration per phase for ({}, {})", total_weeks, num_phases);
+                assert!(weeks.iter().all(|w| *w >= 1),
+                    "floor violated for ({}, {}): {:?}", total_weeks, num_phases, weeks);
+
+                // The remainder weeks land on the EARLIEST phases, so the series
+                // is non-increasing and never spread by more than one week.
+                for i in 1..num_phases {
+                    assert!(weeks[i] <= weeks[i - 1],
+                        "phases must be non-increasing for ({}, {}): {:?}",
+                        total_weeks, num_phases, weeks);
+                    assert!(weeks[i - 1] - weeks[i] <= 1,
+                        "phase spread >1 week for ({}, {}): {:?}",
+                        total_weeks, num_phases, weeks);
+                }
+
+                // Whenever the floor does not bind (total_weeks >= num_phases),
+                // the sum must equal total_weeks EXACTLY.
+                if total_weeks >= num_phases as u32 {
+                    let sum: u32 = weeks.iter().sum();
+                    assert_eq!(sum, total_weeks,
+                        "sum ({}) != total_weeks ({}) for {} phases: {:?}",
+                        sum, total_weeks, num_phases, weeks);
+                }
+            }
         }
     }
 
