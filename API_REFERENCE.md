@@ -1561,7 +1561,7 @@ All Goals errors return a JSON body with `error` + `message`.
 | `400` | `empty_goal` | `goal` missing or `< 3` characters (e.g. `{"goal":"ab"}`) |
 | `400` | `invalid_phase` | `phase_id` not in `1..total_phases`. Phase IDs are **1-indexed** — `phase_id:0` returns this (verified: `POST /goals/goal_0002/progress` with `{"phase_id":0}` → `invalid_phase`). Use the `id` field from each roadmap phase. |
 | `404` | `not_found` | Goal ID does not exist (e.g. `GET /goals/goal_does_not_exist`) |
-| `422` | `invalid_payload` | Malformed JSON body or missing required field (from the custom `AppJson` extractor) |
+| `422` | `invalid_payload` | Malformed JSON body or missing required field (from the custom `AppJson` extractor). Also fires on `POST /goals/:goal_id/answers` when `answers` is a flat string array instead of objects — `{"answers":["beginner"]}` → `answers[0]: invalid type: string "beginner", expected struct UserAnswer` (verified live 2026-09-27). See [POST /goals/:goal_id/answers](#post-goalsgoal_idanswers). |
 
 See `docs/_generated/_round_v2_raw.md` for the exact raw bodies (`GOALS update progress ...` and the corrected `phase_id:1` blocks).
 
@@ -1929,6 +1929,24 @@ Submits answers to the questions from `POST /goals` and generates a personalized
 
 **Request Body**
 
+The body is a single `answers` key holding an **array of OBJECTS** — one object per answered
+question. A flat array of strings (e.g. `{"answers":["beginner","3 months"]}`) is rejected with
+`422 invalid_payload`.
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `answers` | array of objects | yes | One entry per answered question. May be empty (`[]`) — the server then applies `default_answers` (Q1 = timeline, Q2 = hours). |
+| `answers[].question_id` | integer | yes | The `id` of the question being answered, copied verbatim from the `questions[].id` field returned by `POST /goals`. **1-indexed** — the first question is `1`, never `0`. |
+| `answers[].answer` | any JSON value | yes | The answer itself. Normally a string; for `single_choice` questions pass one of the `options` labels verbatim. Free-form strings are accepted for open questions (e.g. `"build a production web service"`). |
+
+Server-side type (`services/gateway/src/goals.rs`):
+`AnswerSubmission { answers: Vec<UserAnswer> }` where
+`UserAnswer { question_id: usize, answer: serde_json::Value }`.
+
+The `next_step` object in the `POST /goals` response is the **machine-readable, authoritative**
+statement of this shape — it echoes `{"answers":[{"question_id":1,"answer":"..."}]}` and the
+`POST` path to use. Read the schema from there if the two ever disagree.
+
 ```json
 {
   "answers": [
@@ -2000,12 +2018,14 @@ Submits answers to the questions from `POST /goals` and generates a personalized
 | Code | Meaning |
 |------|---------|
 | 200  | Roadmap generated successfully |
+| 422  | Body is not the object-array shape above (e.g. `{"answers":["beginner"]}`) — see `invalid_payload` |
 
 **Error Codes**
 
 | Code | Meaning |
 |------|---------|
 | `not_found` | Goal ID does not exist. Create one first with `POST /goals`. |
+| `invalid_payload` | `422` — the JSON body does not deserialize into `AnswerSubmission`. The common case is a flat string array instead of objects: `{"answers":["beginner","3 months"]}` → `answers[0]: invalid type: string "beginner", expected struct UserAnswer`. Send `{"answers":[{"question_id":1,"answer":"..."}]}` instead. Also fires on malformed JSON or a missing `answers` key. |
 
 ---
 
