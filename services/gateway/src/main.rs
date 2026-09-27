@@ -20,6 +20,9 @@ mod clean;
 mod goals;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
+// ROADMAP item 6: order invariance driven by the REAL shipped affiliate data
+// (every network, keys present vs absent) — the offline CI lock.
+mod real_data_order_tests;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -4439,70 +4442,53 @@ async fn enrich_with_commerce_par<F, Fut>(
     // discards facts that already arrived (partial progress is preserved). The
     // previous JoinHandle-collect-on-whole-wave shape was all-or-nothing per wave.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, String)>(wave_width);
-    // Rolling window: at most `wave_width` fetches in flight; a new URL starts the
-    // instant any one completes or times out.
-    let mut next = 0usize;
-    let mut in_flight = 0usize;
-    while in_flight < wave_width && next < eligible.len() {
+    // Wave-based, bounded concurrency. A rolling window was tried here and
+    // reverted: it always consumes the ENTIRE wall (there is always another
+    // eligible URL to start), so /shopping — which runs handle_search (itself
+    // enriching for up to the same wall) and THEN enriches again — blew past
+    // the global 30s TimeoutLayer and every request returned 408. The wave
+    // shape lets the batch finish early when the eligible set runs out.
+    for wave in eligible.chunks(wave_width) {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
+            // Budget exhausted — abandon pending waves (handles are dropped;
+            // tokio detaches the tasks, matching the pre-existing semantics
+            // where a slow fetch could never block the response past the cap).
             break;
         }
-        let idx = eligible[next];
-        next += 1;
-        let url_owned = results[idx]
-            .get("url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let tx = tx.clone();
-        let fetch_clone = fetch.clone();
+        // Per-fetch budget is the whole remaining wall (see
+        // `commerce_fetch_budget`), not a hand-tuned latency constant and NOT
+        // divided by wave count — a real VPN-routed page needs ~6.5-8s.
         let per_fetch = commerce_fetch_budget(remaining, 1);
-        in_flight += 1;
-        tokio::spawn(async move {
-            if let Ok(Some(html)) = tokio::time::timeout(per_fetch, fetch_clone(url_owned)).await
-            {
-                let _ = tx.send((idx, html)).await;
-            }
-        });
-    }
-    // Reap completions until the wall expires or every eligible URL is done.
-    // Each completion frees a slot, which the loop refills on the next pass.
-    while in_flight > 0 {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Some(item)) => fetched.push(item),
-            Ok(None) => break, // all senders gone
-            Err(_) => break,    // wall expired — keep the partial progress above
-        }
-        in_flight -= 1;
-        // Refill the freed slot.
-        if next < eligible.len() {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let idx = eligible[next];
-            next += 1;
+        for &idx in wave {
+            let fetch_clone = fetch.clone();
             let url_owned = results[idx]
                 .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
             let tx = tx.clone();
-            let fetch_clone = fetch.clone();
-            let per_fetch = commerce_fetch_budget(remaining, 1);
-            in_flight += 1;
+            let per_fetch = per_fetch;
             tokio::spawn(async move {
-                if let Ok(Some(html)) =
-                    tokio::time::timeout(per_fetch, fetch_clone(url_owned)).await
+                if let Ok(Some(html)) = tokio::time::timeout(per_fetch, fetch_clone(url_owned)).await
                 {
                     let _ = tx.send((idx, html)).await;
                 }
             });
+        }
+        // Drain this wave. Each recv is bounded by whatever wall remains, and a
+        // recv timeout abandons only the SLOW tail of the wave — everything
+        // already delivered above stays in `fetched`.
+        for _ in 0..wave.len() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(item)) => fetched.push(item),
+                Ok(None) => break, // all senders gone (only at end of function)
+                Err(_) => break,    // wall clock expired mid-wave — keep partial progress
+            }
         }
     }
     drop(tx);
@@ -12452,7 +12438,15 @@ async fn main() {
         .route("/goals/:goal_id/progress", post(goals::handle_update_progress))
         .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
+    // Bind port is env-configurable (default 4000) so a second, side-by-side
+    // instance can be started — e.g. an affiliate-keys-ABSENT twin used to prove
+    // ranked order is byte-identical with and without affiliate keys. Production
+    // sets nothing and keeps 4000.
+    let port: u16 = std::env::var("GATEWAY_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(4000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("Gateway listening on {} (circuit-breaker + cache)", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();

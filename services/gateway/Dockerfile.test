@@ -5,6 +5,14 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 RUN mkdir src && echo "fn main(){}" > src/main.rs
 RUN cargo build --release
 COPY src ./src
+# The runtime-loaded commerce config MUST be present: tests that assert against
+# the SHIPPED data/commerce/affiliate.json (e.g. the order-invariance guard)
+# resolve it relative to CWD and silently become VACUOUS without this copy —
+# AffiliateCtx::load() would find nothing, every result would carry no affiliate
+# block, and a keys-present-vs-keys-absent comparison would "pass" by comparing
+# two no-op runs. The test file asserts a non-empty network set so this cannot
+# regress silently.
+COPY data ./data
 # Rebuild the bin (release) then run the test suite against the same deps cache.
 RUN touch src/main.rs && cargo build --release
 CMD ["cargo", "test", "--release"]
