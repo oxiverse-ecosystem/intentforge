@@ -275,11 +275,51 @@ def test_other_brand_negatives_applied_only(session):
         )
 
 
+# 10. structured_constraints: NL negation and price parsing (D3)
+# These two arrived from tests/test_goals_contract.py, which was folded into the
+# two per-concern files (this one + test_goals_api_schema.py) on 2026-09-27.
+# They are search-CONTRACT assertions, not Goals ones, so they live here.
+# Previously they lived in a third file that duplicated both of the others,
+# which is how a fix landing in one file left another silently unverified.
+def test_negation_not_from_sony(session):
+    """query '... not from sony' -> structured_constraints.negative contains
+    'sony' AND positive excludes it.
+
+    D3: a brand negated in natural language must reach the SEARCH-time
+    structured constraints, not merely the reported `constraints` string.
+    """
+    r = session.get(
+        f"{BASE}/search", params={"q": "wireless earbuds not from sony"}, timeout=60
+    )
+    assert r.status_code == 200, f"GET /search -> {r.status_code} {r.text[:300]}"
+    sc = r.json().get("structured_constraints") or {}
+    assert "sony" in (sc.get("negative") or []), (
+        f"negation 'not from sony' not captured in structured_constraints.negative: {sc!r}"
+    )
+    assert "sony" not in (sc.get("positive") or []), (
+        f"'sony' must be excluded from positive on a negated query: {sc!r}"
+    )
+
+
+def test_price_lt_parsed(session):
+    """query '... price:<200' -> structured_constraints.price_lt == 200.0.
+
+    D3: the price:<N search operator must be parsed into a real numeric bound
+    that ranking can enforce, not left as literal query text.
+    """
+    r = session.get(
+        f"{BASE}/search", params={"q": "wireless earbuds price:<200"}, timeout=60
+    )
+    assert r.status_code == 200, f"GET /search -> {r.status_code} {r.text[:300]}"
+    sc = r.json().get("structured_constraints") or {}
+    assert sc.get("price_lt") == 200.0, f"price:<200 not parsed into price_lt: {sc!r}"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 
 
-# 10. /analyze schema
+# 11. /analyze schema
 ANALYZE_KEYS = ["query", "contrastive_framing", "exclusions", "declined", "manner_qualifiers", "decisions"]
 
 
