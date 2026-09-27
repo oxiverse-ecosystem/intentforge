@@ -11993,12 +11993,74 @@ fn recall_gap_stopwords() -> std::collections::HashSet<&'static str> {
 }
 
 
+/// Nonsense probe values used to ask the gateway's OWN operator parser
+/// (`extract_gateway_constraints`) whether a `head:` prefix is an operator it
+/// consumes. Three value shapes so every form the parser accepts is exercised:
+/// a host (`site:`), a number (`price:`/`after:`), and a bare word
+/// (`lang:`/`intext:`/`NOT:`). The values are deliberately meaningless — only
+/// the DIFFERENCE between the two parses matters, never the values themselves.
+const OPERATOR_PROBE_VALUES: &[&str] = &["zzqqxxprobe.example", "4173", "zzqqxxprobe"];
+
+/// True when `head` names an advanced-search operator that the gateway's own
+/// constraint parser consumes and enforces itself.
+///
+/// DERIVED, NOT LISTED: this probes `extract_gateway_constraints` — the same
+/// parser that produced `structured_constraints` / `applied_constraints` — by
+/// parsing `<head>:<probe>` and comparing it to parsing the bare probe. If the
+/// prefix changes the parse, the parser acted on it, so the token is operator
+/// syntax and not query content. A NEW operator added to the parser is
+/// therefore recognised here with no second edit; there is deliberately NO
+/// literal list of operator names anywhere in this function.
+fn parser_consumes_operator_head(head: &str) -> bool {
+    let head = head.trim().to_lowercase();
+    if head.is_empty() {
+        return false;
+    }
+    OPERATOR_PROBE_VALUES.iter().any(|probe| {
+        let with_op = extract_gateway_constraints(&format!("{}:{}", head, probe));
+        let bare = extract_gateway_constraints(probe);
+        serde_json::to_value(&with_op).ok() != serde_json::to_value(&bare).ok()
+    })
+}
+
+/// The whitespace tokens of `query` that the gateway's own operator parser
+/// consumed (`site:…`, `NOT:…`, `after:…`, `lang:…`, `intext:…`, `filetype:…`,
+/// and anything a future operator adds). These are already-applied filtering
+/// decisions, never upstream recall gaps, so they must not be reported as
+/// such. Pure function of the query; head recognition is memoised per call.
+fn consumed_operator_tokens(query: &str) -> std::collections::HashSet<String> {
+    let mut head_cache: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    query
+        .split_whitespace()
+        .filter(|tok| {
+            let lower = tok.to_lowercase();
+            match lower.split_once(':') {
+                Some((head, value)) => {
+                    if head.is_empty() || value.is_empty() {
+                        return false;
+                    }
+                    *head_cache
+                        .entry(head.to_string())
+                        .or_insert_with(|| parser_consumes_operator_head(head))
+                }
+                // No colon ⇒ not operator syntax (the parser's operators are
+                // all `head:value` shaped; this is the structural gate, not a
+                // name check).
+                None => false,
+            }
+        })
+        .map(|tok| tok.to_lowercase())
+        .collect()
+}
+
 /// Extract the salient (distinctive) query terms worth checking for recall
 /// coverage. These are the query's content-bearing words after removing
-/// generic stopwords, weak anchor words, pure numbers, and single chars.
+/// generic stopwords, weak anchor words, pure numbers, single chars, and any
+/// operator token the gateway's own parser already consumed and enforced.
 /// Pure function of the query — no per-query strings, no domain lists.
 fn distinctive_query_terms(query: &str) -> Vec<String> {
     let stops = recall_gap_stopwords();
+    let consumed = consumed_operator_tokens(query);
     query
         .split_whitespace()
         .filter(|w| {
@@ -12007,6 +12069,7 @@ fn distinctive_query_terms(query: &str) -> Vec<String> {
                 && !stops.contains(lower.as_str())
                 && !is_weak_anchor_word(&lower)
                 && !lower.chars().all(|c| c.is_ascii_digit())
+                && !consumed.contains(&lower)
         })
         .map(|w| w.to_lowercase())
         .collect()
@@ -18992,6 +19055,155 @@ mod constraint_fix_tests {
             &c,
         );
         assert!(!kept, "alternative-listing page mentioning flask must be kept (alt exemption)");
+    }
+
+    // ── Recall-gap honesty: operators are NOT upstream recall gaps ──
+    //
+    // `recall_gap_terms` is documented as "distinctive query terms absent from
+    // ALL returned results — an index-coverage gap". Operator tokens the
+    // gateway already parsed and ENFORCED (site:, NOT:, after:, lang:,
+    // filetype:, intext:) are its own filtering decisions, so reporting them as
+    // upstream gaps is dishonest. The exclusion must be derived from the
+    // gateway's own operator parser, never from a literal operator list.
+
+    fn merged(title: &str, content: &str, url: &str) -> MergedResult {
+        MergedResult {
+            url: url.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            score: 1.0,
+            authority: 0.5,
+            sources: vec!["bing".to_string()],
+            is_local: false,
+            published_date: None,
+            price: None,
+            currency: None,
+            quality: 1.0,
+            post_cal_cap: None,
+            engine_trust_mult: 1.0,
+            commerce: None,
+            commerce_provenance: None,
+        }
+    }
+
+    #[test]
+    fn recall_gap_excludes_every_operator_token_the_gateway_applied() {
+        // Live case (audit t_3d1f1608): all six operators came back as gaps
+        // while the real content words were correctly absent from the list.
+        let q = "rust async web framework site:github.com filetype:rs after:2024-01-01 NOT:flask lang:en intext:benchmark";
+        let results = vec![
+            merged(
+                "Rust async web framework",
+                "An async web framework written in rust",
+                "https://github.com/tokio-rs/axum",
+            ),
+            merged(
+                "Async framework guide",
+                "rust async web framework benchmarks",
+                "https://example.com/async",
+            ),
+        ];
+        let gap = compute_recall_gap_terms(q, &results);
+        for op in [
+            "site:github.com",
+            "filetype:rs",
+            "after:2024-01-01",
+            "not:flask",
+            "lang:en",
+            "intext:benchmark",
+        ] {
+            assert!(
+                !gap.as_ref().map(|g| g.iter().any(|t| t == op)).unwrap_or(false),
+                "operator token '{}' must not be reported as an upstream recall gap, got: {:?}",
+                op,
+                gap
+            );
+        }
+        // The whole operator set was the only thing missing ⇒ field omitted.
+        assert_eq!(gap, None, "operator-only gaps must yield no field, got: {:?}", gap);
+    }
+
+    #[test]
+    fn recall_gap_excludes_single_operator_tokens() {
+        // The two minimal live cases from the audit card.
+        let r = vec![merged(
+            "Kubernetes deployment guide",
+            "How to write a kubernetes deployment",
+            "https://example.com/k8s",
+        )];
+        let gap = compute_recall_gap_terms("kubernetes deployment guide site:github.com", &r);
+        assert!(
+            !gap.as_ref().map(|g| g.iter().any(|t| t == "site:github.com")).unwrap_or(false),
+            "site: token must not be a recall gap, got: {:?}", gap
+        );
+
+        let r2 = vec![merged(
+            "Python web frameworks",
+            "A python web framework overview",
+            "https://example.com/py",
+        )];
+        let gap2 = compute_recall_gap_terms("python web framework NOT:flask", &r2);
+        assert!(
+            !gap2.as_ref().map(|g| g.iter().any(|t| t == "not:flask")).unwrap_or(false),
+            "NOT: token must not be a recall gap, got: {:?}", gap2
+        );
+    }
+
+    #[test]
+    fn recall_gap_still_reports_genuine_uncovered_content_word() {
+        // The fix must not silence the signal: a real content word absent from
+        // every result is still an honest index-coverage gap.
+        let q = "zygomatic architectural photography techniques";
+        let results = vec![merged(
+            "Architectural photography techniques",
+            "A guide to architectural photography",
+            "https://example.com/archphoto",
+        )];
+        let gap = compute_recall_gap_terms(q, &results);
+        assert_eq!(
+            gap,
+            Some(vec!["zygomatic".to_string()]),
+            "uncovered content word must still be reported"
+        );
+    }
+
+    #[test]
+    fn recall_gap_still_omitted_for_fully_covered_query() {
+        let q = "rust web framework";
+        let results = vec![merged(
+            "Rust web framework",
+            "Choosing a rust web framework",
+            "https://example.com/rust",
+        )];
+        assert_eq!(compute_recall_gap_terms(q, &results), None);
+    }
+
+    #[test]
+    fn recall_gap_operator_exclusion_is_parser_derived_not_a_name_list() {
+        // (a) A head the parser does NOT support must still be treated as
+        //     content — proof the exclusion is derived, not a banned list.
+        assert!(
+            !parser_consumes_operator_head("zzqqnotanoperator"),
+            "an unknown head must not be treated as an operator"
+        );
+        // (b) Heads the parser DOES support are recognised with no code change
+        //     here. `related:` / `inurl:` / `intitle:` are not mentioned by any
+        //     recall-gap code — only the parser knows them.
+        for head in ["site", "not", "filetype", "after", "before", "lang", "intext", "intitle", "inurl", "related", "price"] {
+            assert!(
+                parser_consumes_operator_head(head),
+                "parser-supported operator '{}' must be recognised as consumed", head
+            );
+        }
+        // (c) End-to-end through the real signal for a parser-only operator.
+        let q = "rust async web framework related:tokio inurl:docs intitle:async";
+        let results = vec![merged(
+            "Rust async web framework",
+            "rust async web framework in practice",
+            "https://example.com/af",
+        )];
+        let gap = compute_recall_gap_terms(q, &results);
+        assert_eq!(gap, None, "parser-consumed operator tokens must not surface as gaps, got: {:?}", gap);
     }
 
     #[test]
