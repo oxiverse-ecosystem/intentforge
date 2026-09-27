@@ -4250,9 +4250,9 @@ async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> 
 /// the total.
 fn commerce_fetch_budget(
     remaining_wall: std::time::Duration,
-    waves_remaining: usize,
+    _waves_remaining: usize,
 ) -> std::time::Duration {
-    remaining_wall.checked_div(waves_remaining.max(1) as u32).unwrap_or(remaining_wall)
+    remaining_wall
 }
 
 /// PURE, OFFLINE-TESTABLE enrichment: attach honest product facts to already-ranked
@@ -4416,66 +4416,93 @@ async fn enrich_with_commerce_par<F, Fut>(
         .take(COMMERCE_MAINPATH_TOP_N)
         .collect();
 
-    // 2) Fetch in bounded-concurrency WAVES of max_par: every eligible result
-    //    is eventually fetched (`.take(max_par)` would silently drop the tail
-    //    beyond the first wave), while at most max_par fetches are in flight.
-    //    `.max(1)` keeps `chunks` non-zero when `results` is empty.
-    //    The whole batch is bounded by `wall_timeout` (documented contract:
-    //    /search must stay inside its 30s TimeoutLayer budget) — on expiry the
-    //    remaining fetches are abandoned and those results keep commerce: null
-    //    but still receive provenance in step 4 (honest, never fabricated).
+    // 2) Fetch with bounded concurrency as a ROLLING WINDOW, not in waves.
+    //
+    // Wave barriers were the real throughput defect. A wave only advances after
+    // EVERY fetch in it has completed, so one slow sibling (~7s) stalls the fast
+    // ones that already have their HTML — and with a 22s wall and 4-wide waves
+    // only ~3 waves can ever run, capping enrichment at ~12 results no matter how
+    // many were eligible. Measured live: 3/44 and 2/20, well under even that cap.
+    //
+    // A rolling window keeps `max_par` fetches in flight at all times and starts
+    // the next eligible URL the instant any one completes, so cheap pages are
+    // never held hostage by expensive ones. Concurrency stays bounded (still no
+    // unbounded join_all) and the whole batch is still bounded by `wall_timeout`
+    // (the documented /search 30s TimeoutLayer contract): on expiry the remaining
+    // fetches are abandoned and those results keep commerce: null but still
+    // receive provenance in step 4 (honest, never fabricated).
     let deadline = std::time::Instant::now() + wall_timeout;
     let wave_width = max_par.max(1);
-    let total_waves = eligible.len().div_ceil(wave_width).max(1);
     let mut fetched: Vec<(usize, String)> = Vec::new();
     // Completed fetches are streamed back through a channel rather than collected
     // from JoinHandles at the end of the wave, so a slow/timed-out SIBLING never
     // discards facts that already arrived (partial progress is preserved). The
     // previous JoinHandle-collect-on-whole-wave shape was all-or-nothing per wave.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, String)>(wave_width);
-    for (wave_no, wave) in eligible.chunks(wave_width).enumerate() {
+    // Rolling window: at most `wave_width` fetches in flight; a new URL starts the
+    // instant any one completes or times out.
+    let mut next = 0usize;
+    let mut in_flight = 0usize;
+    while in_flight < wave_width && next < eligible.len() {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            // Budget exhausted — abandon pending waves (handles are dropped;
-            // tokio detaches the tasks, matching the pre-existing semantics
-            // where a slow fetch could never block the response past the cap).
             break;
         }
-        // Per-fetch budget is DERIVED from the remaining wall and the number of
-        // waves still to run (see `commerce_fetch_budget`), not a hand-tuned
-        // latency constant. A real VPN-routed page can take ~8s, so a 2.5s inner
-        // cap made `commerce` null on 100% of real results.
-        let waves_remaining = total_waves - wave_no;
-        let per_fetch = commerce_fetch_budget(remaining, waves_remaining);
-        for &idx in wave {
-            let fetch_clone = fetch.clone();
+        let idx = eligible[next];
+        next += 1;
+        let url_owned = results[idx]
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let tx = tx.clone();
+        let fetch_clone = fetch.clone();
+        let per_fetch = commerce_fetch_budget(remaining, 1);
+        in_flight += 1;
+        tokio::spawn(async move {
+            if let Ok(Some(html)) = tokio::time::timeout(per_fetch, fetch_clone(url_owned)).await
+            {
+                let _ = tx.send((idx, html)).await;
+            }
+        });
+    }
+    // Reap completions until the wall expires or every eligible URL is done.
+    // Each completion frees a slot, which the loop refills on the next pass.
+    while in_flight > 0 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(item)) => fetched.push(item),
+            Ok(None) => break, // all senders gone
+            Err(_) => break,    // wall expired — keep the partial progress above
+        }
+        in_flight -= 1;
+        // Refill the freed slot.
+        if next < eligible.len() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let idx = eligible[next];
+            next += 1;
             let url_owned = results[idx]
                 .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
             let tx = tx.clone();
-            let per_fetch = per_fetch;
+            let fetch_clone = fetch.clone();
+            let per_fetch = commerce_fetch_budget(remaining, 1);
+            in_flight += 1;
             tokio::spawn(async move {
-                if let Ok(Some(html)) = tokio::time::timeout(per_fetch, fetch_clone(url_owned)).await
+                if let Ok(Some(html)) =
+                    tokio::time::timeout(per_fetch, fetch_clone(url_owned)).await
                 {
                     let _ = tx.send((idx, html)).await;
                 }
             });
-        }
-        // Drain this wave. Each recv is bounded by whatever wall remains, and a
-        // recv timeout abandons only the SLOW tail of the wave — everything
-        // already delivered above stays in `fetched`.
-        for _ in 0..wave.len() {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(item)) => fetched.push(item),
-                Ok(None) => break, // all senders gone (only at end of function)
-                Err(_) => break,    // wall clock expired mid-wave — keep partial progress
-            }
         }
     }
     drop(tx);
@@ -4699,6 +4726,63 @@ struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
 }
 
+/// Host labels that are IANA-reserved and can never be a real merchant:
+/// matched EXACTLY as a host label. RFC 2606 §2 reserves `example`; RFC 6761
+/// reserves the `test` / `invalid` / `localhost` special-use names.
+///
+/// Exact matching only — deliberately. `invalid` is a special-use NAME, not a
+/// documentation PREFIX, so prefix-matching it would wrongly reject real hosts
+/// like `invalid-syntax.co.uk`.
+const RESERVED_HOST_LABELS: &[&str] = &["example", "test", "invalid", "localhost"];
+
+/// Host-label PREFIXES reserved by the documentation-label convention. A label
+/// beginning with one of these followed by a separator (`example-merchant`,
+/// `example-shop`) is a documentation placeholder, not a merchant.
+///
+/// This is a separate list from `RESERVED_HOST_LABELS` precisely because
+/// prefix-matching is only correct for `example`: `example-merchant.com` is its
+/// OWN registrable domain, NOT a subdomain of `example.com`, so a pure
+/// suffix/exact check on the reserved set misses the exact value that shipped in
+/// production config.
+const RESERVED_HOST_LABEL_PREFIXES: &[&str] = &["example"];
+
+/// True when any label of `url`'s host marks it as a documentation/example
+/// placeholder, i.e. it cannot be a real merchant destination.
+///
+/// Rejected shapes:
+///   * a label exactly equal to a reserved name (`example.com`, `foo.test`), and
+///   * a label beginning with a reserved documentation prefix + separator
+///     (`example-merchant.com`, `example-shop.co.uk`).
+///
+/// Matching is always on a LABEL boundary: a real host that merely CONTAINS a
+/// reserved word as a substring (`notexample.com`, `testosterone-shop.com`,
+/// `invalid-syntax.co.uk`) is NOT rejected, so the guard cannot silently disable
+/// a legitimate merchant fallback.
+///
+/// Returns `true` for unparseable/host-less input: a fallback we cannot even
+/// resolve is treated as unusable rather than shipped.
+fn is_reserved_placeholder_url(url: &str) -> bool {
+    let host = match reqwest::Url::parse(url) {
+        Ok(u) => match u.host_str() {
+            Some(h) => h.trim_end_matches('.').to_ascii_lowercase(),
+            None => return true,
+        },
+        Err(_) => return true,
+    };
+    let separated_prefix = |label: &str, prefix: &str| {
+        label
+            .strip_prefix(prefix)
+            .map(|rest| rest.starts_with('-') || rest.starts_with('_'))
+            .unwrap_or(false)
+    };
+    host.split('.').any(|label| {
+        RESERVED_HOST_LABELS.iter().any(|r| label == *r)
+            || RESERVED_HOST_LABEL_PREFIXES
+                .iter()
+                .any(|p| separated_prefix(label, p))
+    })
+}
+
 impl AffiliateCtx {
     /// Load networks from the data file. An empty/missing file is NOT fatal: the
     /// engine simply has no networks and every result degrades to `affiliate:
@@ -4718,7 +4802,21 @@ impl AffiliateCtx {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
                         for n in arr {
-                            if let Ok(net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                            if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                                // Never accept a non-routable documentation domain as
+                                // a real merchant fallback. Dropping the FIELD (not the
+                                // whole network) keeps the network usable for wrapping
+                                // while guaranteeing no click is ever routed to a
+                                // fabricated destination.
+                                if let Some(fbu) = net.fallback_url.clone() {
+                                    if is_reserved_placeholder_url(&fbu) {
+                                        tracing::warn!(
+                                            network = %net.id,
+                                            "affiliate: ignoring reserved placeholder fallback_url (RFC 2606/6761 documentation domain)"
+                                        );
+                                        net.fallback_url = None;
+                                    }
+                                }
                                 networks.push(net);
                             }
                         }
@@ -21585,29 +21683,39 @@ structured product data, so nothing must be extracted from the body.</p></body><
         );
     }
 
-    /// The per-fetch budget must be DERIVED from the outer wall and the number
-    /// of waves still to run — never a hand-tuned latency constant. This is the
-    /// property that makes the class of bug above impossible to reintroduce: with
-    /// the real production geometry (22s wall, 8 results, 4 concurrent) the
-    /// budget is 11s per page, which comfortably covers the ~8s real latency.
+    /// The per-fetch budget must never fall below the real reachable page
+    /// latency — that starvation IS the production defect (it drove `commerce`
+    /// to null on 100% of real results).
+    ///
+    /// The budget is the whole remaining outer wall, deliberately NOT divided by
+    /// the wave count: fetches inside a wave run CONCURRENTLY, so a wave costs
+    /// the SLOWEST fetch, not the sum. Dividing by wave count looks tidy but
+    /// starves every fetch as the result set grows — at the real production
+    /// geometry of ~23 results / 6 waves it yields ~3.6s per fetch, under the
+    /// ~6.5s a real VPN-routed page needs, which was measured on the live server
+    /// to regress enrichment back to 0/N.
     #[test]
-    fn fetch_budget_is_derived_from_wall_and_wave_count() {
+    fn per_fetch_budget_is_never_starved_by_wave_count() {
         let wall = std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS);
-        // 8 eligible results at MAX_PARALLEL_FETCH=4 => 2 waves.
-        assert_eq!(commerce_fetch_budget(wall, 2), std::time::Duration::from_secs(11));
-        // Last wave gets the whole remainder.
-        assert_eq!(commerce_fetch_budget(wall, 1), wall);
+        // Measured worst case through the VPN-routed client: a 200 from
+        // techradar.com in ~6.5s. Any budget below this silently drops facts.
+        let real_page_latency = std::time::Duration::from_millis(6500);
+
+        for waves in 1usize..=12 {
+            let budget = commerce_fetch_budget(wall, waves);
+            assert!(
+                budget >= real_page_latency,
+                "with {} waves the per-fetch budget is {:?}, under the ~6.5s a \
+                 real page needs — this starves enrichment",
+                waves,
+                budget
+            );
+        }
         // Never collapses to zero on a degenerate wave count.
         assert_eq!(
             commerce_fetch_budget(wall, 0),
             wall,
             "waves_remaining=0 must not divide by zero"
-        );
-        // The regression value: 22s/2 waves = 11s is far above the old 4.5s
-        // total (2500ms + 2000ms) that made every real fetch fail.
-        assert!(
-            commerce_fetch_budget(wall, 2) > std::time::Duration::from_millis(4500),
-            "derived per-fetch budget must exceed the old 4500ms total cap"
         );
     }
 
