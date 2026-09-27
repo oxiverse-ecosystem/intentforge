@@ -14716,10 +14716,16 @@ async fn handle_search(
         }
     }
     // 2. Process Intent & Embedding (now available alongside engine results)
+    let mut intent_degraded = false;
     let mut intent: IntentResponse = match intent_result {
         Ok(parsed) => parsed,
         Err(()) => {
             tracing::error!("Intent Engine unreachable after 3 attempts — using fallback");
+            // The fallback derives topic terms from the gateway's own structural
+            // parser, so `structured_constraints` stays meaningful, but it is a
+            // degraded reconstruction — say so instead of presenting it as the
+            // engine's authoritative extraction.
+            intent_degraded = true;
             fallback_intent(&q)
         }
     };
@@ -17355,6 +17361,18 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // negation-gate entries survive into the response.
     let mut warnings: Vec<String> = Vec::new();
 
+    // Degraded-extraction honesty: when the intent engine was unreachable, the
+    // reported constraints are the gateway's own structural reconstruction, not
+    // the engine's authoritative extraction. Downstream consumers must be able
+    // to tell the difference instead of reading a degraded parse as the user's
+    // literal stated intent.
+    if intent_degraded {
+        warnings.push(
+            "intent extraction degraded — the intent engine was unreachable, so topic constraints were reconstructed from the gateway's own parser and may be less precise than a normal extraction"
+                .to_string(),
+        );
+    }
+
     if let Some(l) = &sc.language { applied.push(format!("lang:{}", l)); }
     if let Some(a) = &sc.after_date { applied.push(format!("after:{}", a)); }
     if let Some(b) = &sc.before_date { applied.push(format!("before:{}", b)); }
@@ -18381,6 +18399,135 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     }
 }
 
+/// Structural topic-term extraction for the DEGRADED path, used only when the
+/// intent engine is unreachable (see `fallback_intent`).
+///
+/// `extract_gateway_constraints` parses OPERATORS only — it knows `site:`,
+/// `price:`, `after:`, … but it has no notion of "what is this query about".
+/// So the fallback used to report `positive: []` and an empty top-level
+/// `constraints` for every natural-language query, while still reporting the
+/// price bound correctly. Observed live: a price-filtered multi-constraint query
+/// returned `positive: []` / `constraints: []` purely because the engine call
+/// timed out, which reads downstream (notably the commerce/shopping block, which
+/// consumes `structured_constraints`) as "the user stated no constraints at all".
+///
+/// This derives topic terms the same way the engine's implicit (Phase 5) pass
+/// does, so the degraded path and the healthy path agree on term SHAPE:
+///
+///  * operator tokens (`site:`, `price:`, `filetype:`, …) are not topic terms;
+///  * a negated token (`-django`) and a bare number (`20000`) are not topic terms;
+///  * grammar/function words are PHRASE BOUNDARIES, never content — a run of
+///    content words is cut wherever one appears, so "headphones with long
+///    battery" can never collapse into the junk phrase "headphones long";
+///  * a surviving run is emitted as at most [`FALLBACK_TERM_MAX_WORDS`]-word
+///    terms (greedy, left to right), so "battery life" stays ONE requirement
+///    instead of two independent fragments.
+///
+/// Every gate above is structural (operator names, the existing grammar-word
+/// lists, digit shape) — no per-query literals and no tuned thresholds, so this
+/// generalizes to any query the engine is down for.
+fn fallback_positive_terms(q: &str, negative: &[String]) -> Vec<String> {
+    // Same normalization the operator parser uses, so "under 20000" is already
+    // an operator token and its digits never reach the topic-term pass.
+    let normalized = normalize_nl_operators(q);
+    let neg_tokens: std::collections::HashSet<String> = negative
+        .iter()
+        .flat_map(|n| n.split_whitespace().map(|t| t.to_lowercase()))
+        .collect();
+
+    // Operator names the gateway parser already understands (see
+    // `extract_gateway_constraints`). A token carrying one is an instruction,
+    // not a topic — and its payload is already captured in the operator field.
+    const OPERATORS: &[&str] = &[
+        "site:", "filetype:", "price:", "after:", "before:", "intitle:", "inurl:",
+        "intext:", "related:", "lang:", "not:",
+    ];
+
+    let mut out: Vec<String> = Vec::new();
+    let mut run: Vec<String> = Vec::new();
+    let mut flush = |run: &mut Vec<String>, out: &mut Vec<String>| {
+        // Head-final pairing, filled from the end of the run backwards — the
+        // same rule the engine's implicit pass uses, so a degraded response and
+        // a healthy one describe the same requirement shape.
+        let mut end = run.len();
+        while end > 0 {
+            let start = end.saturating_sub(FALLBACK_TERM_MAX_WORDS);
+            let term = run[start..end].join(" ");
+            if !out.contains(&term) {
+                out.push(term);
+            }
+            end = start;
+        }
+        run.clear();
+    };
+
+    for raw in normalized.to_lowercase().split_whitespace() {
+        let tok = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '-' && c != '_');
+        // Any rejected token ends the run — phrases never span a boundary.
+        let mut reject = |run: &mut Vec<String>| flush(run, &mut out);
+        if tok.is_empty() || tok.len() < 2 {
+            reject(&mut run);
+            continue;
+        }
+        if OPERATORS.iter().any(|op| tok.starts_with(op)) {
+            reject(&mut run);
+            continue;
+        }
+        // Negated token: already an exclusion, never also a requirement.
+        if tok.starts_with('-') {
+            reject(&mut run);
+            continue;
+        }
+        // Bare numbers carry no retrievable lexical meaning (a budget is already
+        // in `price_*`; a year is already a date constraint).
+        if tok.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') {
+            reject(&mut run);
+            continue;
+        }
+        if neg_tokens.contains(tok) {
+            reject(&mut run);
+            continue;
+        }
+        // Grammar/function words from the lists the rest of the pipeline already
+        // uses, so the fallback drops the same non-topical words the healthy
+        // path does instead of inventing a private vocabulary.
+        if NON_TOPICAL_QUERY_WORDS.contains(&tok)
+            || STOPWORDS.contains(&tok)
+            || IGNORED_CONSTRAINT_NOISE.contains(&tok)
+        {
+            reject(&mut run);
+            continue;
+        }
+        run.push(tok.to_string());
+    }
+    flush(&mut run, &mut out);
+
+    // Subsumption dedupe (same rule as the engine's implicit pass): a bare word
+    // already carried by a multi-word term is redundant, not a second
+    // requirement — satisfying the phrase necessarily satisfies the fragment.
+    let phrase_words: Vec<Vec<String>> = out
+        .iter()
+        .filter(|t| t.split_whitespace().count() > 1)
+        .map(|t| t.split_whitespace().map(|w| w.to_string()).collect())
+        .collect();
+    if !phrase_words.is_empty() {
+        out.retain(|t| {
+            if t.split_whitespace().count() > 1 {
+                return true;
+            }
+            !phrase_words.iter().any(|ph| ph.iter().any(|w| w == t))
+        });
+    }
+
+    out.retain(|t| t.len() >= 2 && t.len() <= 50);
+    out
+}
+
+/// Word cap for a fallback-derived positive term. Mirrors the engine's
+/// `POSITIVE_TERM_MAX_WORDS` and `extract_constraint_term(max_words = 2)` so a
+/// degraded response describes the same requirement shape as a healthy one.
+const FALLBACK_TERM_MAX_WORDS: usize = 2;
+
 fn fallback_intent(q: &str) -> IntentResponse {
     let mut structured = extract_gateway_constraints(q);
     let mut negative = Vec::new();
@@ -18393,6 +18540,12 @@ fn fallback_intent(q: &str) -> IntentResponse {
             }
         }
     }
+    // The operator parser extracts FILTERS but not TOPIC. Without this the
+    // degraded path reported `positive: []` and an empty top-level `constraints`
+    // for every NL query — indistinguishable from "user stated no constraints",
+    // which is exactly the wrong signal for downstream consumers on precisely
+    // the multi-constraint / price-filtered queries that need it most.
+    structured.positive = fallback_positive_terms(q, &negative);
     structured.negative = negative;
 
     IntentResponse {
@@ -22041,5 +22194,122 @@ mod kb_gibberish_mixed_tests {
         // digit garbage; a lone kb run with a real word must stay searchable.
         let (flag, _) = query_quality_flag("qwerty vs dvorak", &index);
         assert_ne!(flag, "junk");
+    }
+}
+
+/// Defect 2: the degraded (intent-engine unreachable) path used to report
+/// `positive: []` and an empty top-level `constraints` for every
+/// natural-language query, while still reporting the price bound correctly.
+/// Live repro before the fix: stopping `if-dev-intent-engine` and issuing a
+/// price-filtered multi-constraint query returned
+/// `positive: []`, `constraints: []`, `price_lt: 4500` — indistinguishable
+/// downstream from "the user stated no constraints at all".
+#[cfg(test)]
+mod fallback_constraint_tests {
+    use super::*;
+
+    /// The headline defect: a plain NL query with a price bound must still
+    /// report its topic constraints on the degraded path.
+    #[test]
+    fn degraded_path_still_reports_topic_constraints() {
+        let intent = fallback_intent(
+            "noise cancelling headphones with long battery life and mic under 20000",
+        );
+        let sc = &intent.structured_constraints;
+        assert!(
+            !sc.positive.is_empty(),
+            "degraded path reported NO topic constraints: {:?}",
+            sc
+        );
+        // The price bound is still reported (that part always worked).
+        assert_eq!(sc.price_max, Some(20000.0), "price bound lost: {:?}", sc);
+        // And the topic is actually about headphones, not a stray function word.
+        for topic in ["headphones", "battery", "noise", "mic"] {
+            assert!(
+                sc.positive
+                    .iter()
+                    .any(|p| p.split_whitespace().any(|w| w == topic)),
+                "topic {:?} missing from degraded extraction: {:?}",
+                topic,
+                sc.positive
+            );
+        }
+    }
+
+    /// The budget digits are a FILTER, already captured in `price_*` — they
+    /// must never also be reported as a lexical requirement.
+    #[test]
+    fn degraded_path_never_reports_budget_digits_as_topics() {
+        for q in [
+            "boots under 3000 rupees",
+            "laptop below 500",
+            "mirrorless camera under 60000 rupees",
+        ] {
+            let sc = &fallback_intent(q).structured_constraints;
+            for p in &sc.positive {
+                assert!(
+                    !p.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ','),
+                    "{:?}: budget digits leaked into topics as {:?}: {:?}",
+                    q,
+                    p,
+                    sc.positive
+                );
+            }
+        }
+    }
+
+    /// Multi-word concepts must survive as ONE requirement on the degraded path
+    /// too, so a degraded response describes the same requirement SHAPE as a
+    /// healthy one (`constraint_score` divides by `positive.len()`, so fragment
+    /// counts are the defect).
+    #[test]
+    fn degraded_path_groups_multi_word_concepts() {
+        let sc = &fallback_intent("4k monitor with 144hz refresh rate").structured_constraints;
+        assert!(
+            sc.positive.iter().any(|p| p == "refresh rate"),
+            "\"refresh rate\" was shredded into fragments: {:?}",
+            sc.positive
+        );
+    }
+
+    /// Stop words are PHRASE BOUNDARIES. A naive adjacency pairing glues the
+    /// topics on either side of "with" / "and" into one junk phrase
+    /// ("headphones long"), which is a requirement no page can satisfy as a
+    /// concept.
+    #[test]
+    fn degraded_path_treats_stop_words_as_boundaries() {
+        let sc = &fallback_intent(
+            "noise cancelling headphones with long battery life and mic",
+        )
+        .structured_constraints;
+        for junk in ["headphones long", "battery mic", "with long", "life and"] {
+            assert!(
+                !sc.positive.iter().any(|p| p == junk),
+                "stop words joined into junk phrase {:?}: {:?}",
+                junk,
+                sc.positive
+            );
+        }
+    }
+
+    /// Operator tokens, negated tokens, and excluded terms must not become topic
+    /// requirements. `-django` is an exclusion; `site:`/`price:` payloads are
+    /// already captured in their operator fields.
+    #[test]
+    fn degraded_path_excludes_operators_and_negations_from_topics() {
+        let sc = &fallback_intent("python framework site:github.com -django").structured_constraints;
+        for bad in ["site:github.com", "github.com", "-django", "django"] {
+            assert!(
+                !sc.positive.iter().any(|p| p.contains(bad)),
+                "{:?} must not be a positive topic requirement: {:?}",
+                bad,
+                sc.positive
+            );
+        }
+        assert!(
+            !sc.positive.is_empty(),
+            "sanity: the query DOES have topic content, extraction must not be empty: {:?}",
+            sc
+        );
     }
 }

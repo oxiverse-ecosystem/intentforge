@@ -27,6 +27,15 @@ const INTENT_CATEGORIES: &[&str] = &[
     "local",
 ];
 
+/// Maximum words in a POSITIVE constraint term produced by the implicit
+/// (Phase 5) topic-term pass. Matches the `max_words=2` the phrase-aware
+/// `extract_constraint_term` already uses for positives, so marker-derived and
+/// implicitly-derived positive terms have one consistent shape: a multi-word
+/// concept is ONE requirement, never a bag of independent fragments.
+/// `constraint_score` divides by `positive.len()`, so shredding "battery life"
+/// into two requirements wrongly demands two independent hits.
+const POSITIVE_TERM_MAX_WORDS: usize = 2;
+
 // ─── Entity Roles (Query Graph IR) ────────────────────────────────
 // Instead of flat positive/negative constraints, entities have semantic roles
 // that determine how they're used in expansion, retrieval, and ranking.
@@ -1122,30 +1131,114 @@ fn extract_constraints(query: &str) -> Constraints {
             }
         }
 
-        // Extract candidate topic words from the query
-        // Prefer keeping phrase groups intact so hyphenated/slashed negative terms
-        // like "react/vue/nextjs" survive as whole phrases and won't leak back
-        // into positives after alnum-filtering.
+        // Extract candidate topic terms from the query, preserving PHRASE groups.
+        //
+        // This pass used to push every surviving whitespace token as its own
+        // single-word positive, which shredded multi-word concepts into
+        // independent requirements: "battery life", "noise cancelling" and
+        // "refresh rate" each became 2-3 separate positives. `constraint_score`
+        // scores coverage as `matched / positive_count`, so a page that
+        // discusses "battery life" perfectly still lost coverage pressure to a
+        // page that happened to echo the fragments "battery" AND "life" AND
+        // "long" separately. Multi-word positives are the same requirement the
+        // marker-based paths (negation / Reference) already produce via
+        // `extract_constraint_term(text, max_words=2)`, so grouping here makes
+        // the implicit path agree with the rest of the extractor.
+        //
+        // Segmentation is BOUNDARY-based, not adjacency-based: any token this
+        // pass does not emit (stop word, already-captured positive, negation
+        // member, consumed compound component) ENDS the current run. That is
+        // what keeps "with" / "for" / "and" from silently gluing two unrelated
+        // topics together ("headphones long") — the trap the previous
+        // `continue`-based loop walked straight into.
+        //
+        // Still preserved:
+        //  - hyphen/slashed/underscored tokens are one token ("react/vue/nextjs"),
+        //    so a whole slashed phrase survives as a single term;
+        //  - `alt_operands` (explicit "or"/"and" alternatives) are emitted as
+        //    INDEPENDENT single-word terms, because they are deliberate
+        //    alternatives, not one phrase — "best OR worst" must not become
+        //    the single constraint "best worst".
         let words: Vec<&str> = q_lower.split_whitespace().collect();
+        // Greedy pairing of a run into at most `POSITIVE_TERM_MAX_WORDS`-word
+        // terms, filled from the END of the run backwards. English noun phrases
+        // are head-final — the modifier binds to the noun that FOLLOWS it — so
+        // filling from the end is what keeps the concept intact: "long battery
+        // life" pairs as "battery life" (+ the bare modifier "long"), and
+        // "144hz refresh rate" pairs as "refresh rate". Filling from the start
+        // instead would produce the cross-concept junk "long battery" and
+        // "144hz refresh" — grammatically adjacent but semantically wrong, and
+        // the exact class of defect this pass existed to remove.
+        let mut run: Vec<String> = Vec::new();
+        let flush_run = |run: &mut Vec<String>, out: &mut Vec<String>| {
+            let mut end = run.len();
+            while end > 0 {
+                let start = end.saturating_sub(POSITIVE_TERM_MAX_WORDS);
+                let term = run[start..end].join(" ");
+                if !out.contains(&term) {
+                    out.push(term);
+                }
+                end = start;
+            }
+            run.clear();
+        };
         for w in &words {
             let mut w_clean: String = w.chars()
                 .map(|c| if c.is_alphanumeric() { c } else if c == '/' || c == '-' || c == '_' { c } else { ' ' })
                 .collect();
             w_clean = w_clean.split_whitespace().collect::<Vec<_>>().join(" ");
-            if w_clean.is_empty() { continue; }
-            if w_clean.len() < 2 { continue; }
-            // Explicit OR/AND operands survive the stop-word filter (see above).
-            if !alt_operands.contains(w_clean.as_str()) && stop_words.contains(w_clean.as_str()) { continue; }
+            if w_clean.is_empty() { flush_run(&mut run, &mut positive); continue; }
+            if w_clean.len() < 2 { flush_run(&mut run, &mut positive); continue; }
             // Use lowercase string forms for set lookups (HashSet<String>).
             let w_lower: String = w.to_lowercase();
-            if neg_set.contains(&w_lower) { continue; }
-            if pos_set.contains(&w_lower) { continue; }
-            if consumed_words.contains(&w_lower) { continue; }
-            // If the raw token matched a negative phrase exactly, skip adding it as a positive.
-            if negative.iter().any(|n| n == &w_lower) { continue; }
-            // Only add as implicit positive if it looks like a topic noun
-            // (not a generic adjective or verb)
-            positive.push(w_clean);
+            // Explicit OR/AND operands survive the stop-word filter (see above)
+            // but stay INDEPENDENT: they are alternatives, so they never join a
+            // neighbouring run and never absorb a following word.
+            let is_alt_operand = alt_operands.contains(w_clean.as_str());
+            let is_stop = !is_alt_operand && stop_words.contains(w_clean.as_str());
+            let excluded = is_stop
+                || neg_set.contains(&w_lower)
+                || pos_set.contains(&w_lower)
+                || consumed_words.contains(&w_lower)
+                // If the raw token matched a negative phrase exactly, skip adding
+                // it as a positive.
+                || negative.iter().any(|n| n == &w_lower);
+            if excluded {
+                // A dropped token is a phrase boundary — never glue across it.
+                flush_run(&mut run, &mut positive);
+                continue;
+            }
+            if is_alt_operand {
+                flush_run(&mut run, &mut positive);
+                if !positive.contains(&w_clean) {
+                    positive.push(w_clean);
+                }
+                continue;
+            }
+            run.push(w_clean);
+        }
+        flush_run(&mut run, &mut positive);
+
+        // Subsumption dedupe: a single-word term whose word already appears in a
+        // multi-word term is REDUNDANT, not an extra requirement. Multi-word
+        // matching requires every word of the phrase to be present in a result,
+        // so a result that satisfies "battery life" necessarily satisfies
+        // "battery" too — keeping both would count one concept twice in the
+        // coverage denominator (`matched / positive_count`) and quietly restore
+        // part of the fragment pressure this pass just removed. Multi-word terms
+        // are never dropped this way; only bare words they subsume.
+        let phrase_words: Vec<Vec<String>> = positive
+            .iter()
+            .filter(|p| p.split_whitespace().count() > 1)
+            .map(|p| p.split_whitespace().map(|w| w.to_string()).collect())
+            .collect();
+        if !phrase_words.is_empty() {
+            positive.retain(|p| {
+                if p.split_whitespace().count() > 1 {
+                    return true;
+                }
+                !phrase_words.iter().any(|ph| ph.iter().any(|w| w == p))
+            });
         }
     }
 
@@ -3274,10 +3367,19 @@ mod tests {
             "exclusion lost: negative={:?}",
             c.negative
         );
-        // 3. the attributes survive as topic constraints
-        for topic in ["headphones", "battery"] {
+        // 3. the attributes survive as topic constraints.
+        //    A topic may now be carried by a MULTI-WORD term ("battery life",
+        //    "cancelling headphones") rather than a standalone token — that is
+        //    the point of phrase grouping: the concept is ONE requirement, not
+        //    a bag of independent fragments. So the invariant is that every
+        //    topic word is still COVERED by some positive term, not that it is
+        //    still its own term. (Asserting `p == topic` here would lock the
+        //    shredding behaviour back in.)
+        for topic in ["headphones", "battery", "noise", "mic"] {
             assert!(
-                c.positive.iter().any(|p| p == topic),
+                c.positive
+                    .iter()
+                    .any(|p| p.split_whitespace().any(|w| w == topic)),
                 "topic {:?} lost: positive={:?}",
                 topic,
                 c.positive
@@ -3288,6 +3390,126 @@ mod tests {
             !c.positive.iter().any(|p| p.contains("20000")),
             "budget leaked into topics: {:?}",
             c.positive
+        );
+    }
+
+    /// Defect 1: the implicit (Phase 5) topic-term pass used to push every
+    /// surviving whitespace token as its OWN single-word positive, shredding
+    /// multi-word concepts into independent requirements. `constraint_score`
+    /// divides matched hits by `positive.len()`, so "battery life" demanded two
+    /// independent hits and a page that discussed the concept perfectly still
+    /// lost coverage pressure. A multi-word concept must survive as ONE term.
+    #[test]
+    fn implicit_topic_pass_keeps_multi_word_concepts_intact() {
+        let c = extract_constraints("noise cancelling headphones with long battery life and mic");
+        // "battery life" and "refresh rate"-style head-final pairs survive.
+        assert!(
+            c.positive.iter().any(|p| p == "battery life"),
+            "\"battery life\" was shredded into fragments: positive={:?}",
+            c.positive
+        );
+        let c2 = extract_constraints("4k monitor with 144hz refresh rate");
+        assert!(
+            c2.positive.iter().any(|p| p == "refresh rate"),
+            "\"refresh rate\" was shredded into fragments: positive={:?}",
+            c2.positive
+        );
+        // Grouping must genuinely REDUCE the requirement count — the whole point
+        // is that fewer, larger units carry the same topical demand — while
+        // still covering every content word the user actually typed. A fix that
+        // merely reshuffled the same number of terms would leave
+        // `matched / positive_count` exactly as demanding as before.
+        for (q, c, content_tokens) in [
+            (
+                "noise cancelling headphones with long battery life and mic",
+                &c,
+                vec!["noise", "cancelling", "headphones", "long", "battery", "life", "mic"],
+            ),
+            (
+                "4k monitor with 144hz refresh rate",
+                &c2,
+                vec!["4k", "monitor", "144hz", "refresh", "rate"],
+            ),
+        ] {
+            assert!(
+                c.positive.len() < content_tokens.len(),
+                "{:?}: grouping did not reduce the requirement count ({} terms for {} content words): {:?}",
+                q,
+                c.positive.len(),
+                content_tokens.len(),
+                c.positive
+            );
+            for t in content_tokens {
+                assert!(
+                    c.positive.iter().any(|p| p.split_whitespace().any(|w| w == t)),
+                    "{:?}: content word {:?} lost while grouping: {:?}",
+                    q,
+                    t,
+                    c.positive
+                );
+            }
+        }
+    }
+
+    /// Defect 1 (the trap the card calls out): the Phase 5 loop `continue`s over
+    /// stop words instead of breaking, so a naive "pair adjacent pushed tokens"
+    /// fix glues two unrelated topics together. "with" / "for" / "and" must be
+    /// PHRASE BOUNDARIES — the run before them and the run after them are
+    /// separate concepts and must never form one term.
+    #[test]
+    fn stop_words_are_phrase_boundaries_not_joins() {
+        // "with" separates the headphone concept from the battery concept, and
+        // "and" separates the battery concept from the mic.
+        let c = extract_constraints("noise cancelling headphones with long battery life and mic");
+        for junk in [
+            "headphones long",
+            "cancelling long",
+            "battery mic",
+            "life and",
+            "with long",
+        ] {
+            assert!(
+                !c.positive.iter().any(|p| p == junk),
+                "stop words were joined into the junk phrase {:?}: positive={:?}",
+                junk,
+                c.positive
+            );
+        }
+    }
+
+    /// Defect 1 (preservation clauses): the phrase-grouping rewrite must not
+    /// regress the two behaviours the Phase 5 block existed for.
+    ///  - a hyphenated/slashed/underscored token is ONE token, so a slashed
+    ///    NEGATIVE phrase stays intact in `negative` and none of its fragments
+    ///    leaks back into `positive`;
+    ///  - explicit OR/AND operands are deliberate ALTERNATIVES and must stay
+    ///    independent — never merged into one phrase like "best worst".
+    #[test]
+    fn phrase_grouping_preserves_slashed_phrases_and_alt_operands() {
+        let c = extract_constraints("rust not react/vue/nextjs");
+        assert!(
+            c.negative.iter().any(|n| n == "react/vue/nextjs"),
+            "slashed phrase was split in negative: negative={:?}",
+            c.negative
+        );
+        for fragment in ["react", "vue", "nextjs"] {
+            assert!(
+                !c.positive.iter().any(|p| p.split_whitespace().any(|w| w == fragment)),
+                "{:?} leaked back into positives from the slashed exclusion: {:?}",
+                fragment,
+                c.positive
+            );
+        }
+        let alt = extract_constraints("best OR worst language");
+        assert!(
+            alt.positive.iter().any(|p| p == "best") && alt.positive.iter().any(|p| p == "worst"),
+            "explicit OR operands were lost or merged: positive={:?}",
+            alt.positive
+        );
+        assert!(
+            !alt.positive.iter().any(|p| p == "best worst"),
+            "explicit OR alternatives were merged into one phrase: positive={:?}",
+            alt.positive
         );
     }
 
