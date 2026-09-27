@@ -58,6 +58,12 @@ jobs:
       # real pass, so assert the test NAMES are in the log, the same way the
       # schema-regression job asserts a non-zero executed count.
       - name: Assert the order-invariance guard actually ran
+        # `always()`, NOT the default `success()`: this step is skipped whenever
+        # the step before it fails, and the failure that matters here is exactly
+        # a red suite. A guard that only speaks up on green is no guard — it
+        # would stay silent through every regression it exists to catch, and
+        # silently-skipped is the failure mode this whole card is about.
+        if: always()
         working-directory: services/gateway
         run: |
           set -euo pipefail
