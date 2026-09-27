@@ -84,10 +84,17 @@ fn affiliate_urls(arr: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// A query the shipped eligibility patterns must accept. It is ASSERTED at
-/// runtime (not assumed) so this file fails loudly if the data policy drifts,
-/// rather than silently becoming vacuous.
+/// A query the SHIPPED model shape must accept. It is ASSERTED at runtime (not
+/// assumed) so this file fails loudly if the data policy drifts, rather than
+/// silently becoming vacuous.
 const EXACT_MODEL_QUERY: &str = "iphone 16 pro max price";
+
+/// A SECOND exact-model family the shipped shape must accept — one whose
+/// designator is a hyphenated alphanumeric compound rather than `brand + number`.
+/// This is the case the old fitted regex MISSED while its own synthetic-pattern
+/// test passed; asserting it against the REAL loaded shape is what stops the
+/// data file and the Rust tests from drifting apart again.
+const EXACT_MODEL_COMPOUND_QUERY: &str = "sony wh-1000xm5";
 
 /// Load the real runtime config and assert it is actually usable, so a broken or
 /// missing data file fails here instead of making every invariance test below
@@ -99,15 +106,24 @@ fn real_ctx() -> AffiliateCtx {
         "data/commerce/affiliate.json yielded no networks — invariance tests would be vacuous"
     );
     assert!(
-        !ctx.exact_model_patterns.is_empty(),
-        "no exact-model eligibility patterns loaded — the monetization policy is \
-         data-driven and must ship in the data file"
+        ctx.model_shape.min_designator_len > 0 && ctx.model_shape.max_number_len > 0,
+        "no exact-model shape loaded — the monetization policy is data-driven and \
+         must ship in the data file"
     );
     assert!(
-        ctx.is_exact_model_query(EXACT_MODEL_QUERY),
-        "shipped eligibility patterns must accept {EXACT_MODEL_QUERY:?} — otherwise \
-         the invariance comparisons below would never exercise decoration"
+        !ctx.model_shape.variant_suffixes.is_empty()
+            && !ctx.model_shape.commerce_words.is_empty()
+            && !ctx.model_shape.quantity_markers.is_empty(),
+        "shipped model_shape is missing a structural vocabulary list — the gate \
+         would degenerate into a bare number-mention test"
     );
+    for q in [EXACT_MODEL_QUERY, EXACT_MODEL_COMPOUND_QUERY] {
+        assert!(
+            ctx.is_exact_model_query(q),
+            "shipped model shape must accept {q:?} — otherwise the invariance \
+             comparisons below would never exercise decoration"
+        );
+    }
     ctx
 }
 
@@ -132,11 +148,8 @@ fn remap_keys(networks: &[AffiliateNetwork], suffix: &str, set_them: bool) -> Ve
     cloned
 }
 
-fn ctx_with(networks: Vec<AffiliateNetwork>, patterns: &[String]) -> AffiliateCtx {
-    AffiliateCtx {
-        networks,
-        exact_model_patterns: patterns.to_vec(),
-    }
+fn ctx_with(networks: Vec<AffiliateNetwork>, shape: &ModelShape) -> AffiliateCtx {
+    AffiliateCtx { networks, model_shape: shape.clone() }
 }
 
 /// THE ORDER-INVARIANCE LOCK, driven by the REAL data file.
@@ -153,9 +166,9 @@ fn real_data_order_is_invariant_for_every_network_key_on_and_off() {
     for net in &ctx.networks {
         // KEYS PRESENT: only this network, its remapped key set to a dummy value.
         let keyed = remap_keys(std::slice::from_ref(net), "PRESENT", true);
-        let keyed_ctx = ctx_with(keyed, &ctx.exact_model_patterns);
+        let keyed_ctx = ctx_with(keyed, &ctx.model_shape);
         let mut with_key = ranked_fixture();
-        decorate_affiliate_for_query(&mut with_key, &keyed_ctx, EXACT_MODEL_QUERY);
+        decorate_affiliate_for_query(&mut with_key, &keyed_ctx, EXACT_MODEL_QUERY, true);
         let with_key_ranked = ranked_urls(&with_key);
         let with_key_aff = affiliate_urls(&with_key);
         assert!(
@@ -168,9 +181,9 @@ fn real_data_order_is_invariant_for_every_network_key_on_and_off() {
 
         // KEYS ABSENT: same network, key_env remapped to a name nothing ever sets.
         let unkeyed = remap_keys(std::slice::from_ref(net), "ABSENT", false);
-        let unkeyed_ctx = ctx_with(unkeyed, &ctx.exact_model_patterns);
+        let unkeyed_ctx = ctx_with(unkeyed, &ctx.model_shape);
         let mut no_key = ranked_fixture();
-        decorate_affiliate_for_query(&mut no_key, &unkeyed_ctx, EXACT_MODEL_QUERY);
+        decorate_affiliate_for_query(&mut no_key, &unkeyed_ctx, EXACT_MODEL_QUERY, true);
         let no_key_ranked = ranked_urls(&no_key);
         let no_key_aff = affiliate_urls(&no_key);
         assert!(
@@ -199,10 +212,10 @@ fn real_data_whole_config_order_invariant_keys_present_vs_absent() {
 
     let unkeyed_ctx = ctx_with(
         remap_keys(&ctx.networks, "WHOLE_ABSENT", false),
-        &ctx.exact_model_patterns,
+        &ctx.model_shape,
     );
     let mut absent = ranked_fixture();
-    decorate_affiliate_for_query(&mut absent, &unkeyed_ctx, EXACT_MODEL_QUERY);
+    decorate_affiliate_for_query(&mut absent, &unkeyed_ctx, EXACT_MODEL_QUERY, true);
     let absent_ranked = ranked_urls(&absent);
     assert!(
         affiliate_urls(&absent).is_empty(),
@@ -211,10 +224,10 @@ fn real_data_whole_config_order_invariant_keys_present_vs_absent() {
 
     let keyed_ctx = ctx_with(
         remap_keys(&ctx.networks, "WHOLE_PRESENT", true),
-        &ctx.exact_model_patterns,
+        &ctx.model_shape,
     );
     let mut present = ranked_fixture();
-    decorate_affiliate_for_query(&mut present, &keyed_ctx, EXACT_MODEL_QUERY);
+    decorate_affiliate_for_query(&mut present, &keyed_ctx, EXACT_MODEL_QUERY, true);
     let present_ranked = ranked_urls(&present);
     assert!(
         !affiliate_urls(&present).is_empty(),
@@ -240,7 +253,7 @@ fn real_data_broad_queries_never_decorate_and_never_reorder() {
     let ctx = real_ctx();
     let keyed_ctx = ctx_with(
         remap_keys(&ctx.networks, "BROAD_PRESENT", true),
-        &ctx.exact_model_patterns,
+        &ctx.model_shape,
     );
 
     let broad = [
@@ -256,7 +269,7 @@ fn real_data_broad_queries_never_decorate_and_never_reorder() {
         );
         let baseline_ranked = ranked_urls(&ranked_fixture());
         let mut arr = ranked_fixture();
-        decorate_affiliate_for_query(&mut arr, &keyed_ctx, q);
+        decorate_affiliate_for_query(&mut arr, &keyed_ctx, q, true);
         assert!(
             affiliate_urls(&arr).is_empty(),
             "broad query {q:?} received affiliate decoration: {:?}",
@@ -266,6 +279,74 @@ fn real_data_broad_queries_never_decorate_and_never_reorder() {
             ranked_urls(&arr),
             baseline_ranked,
             "broad query {q:?}: the no-op decoration path altered the ranked order"
+        );
+    }
+}
+
+/// THE ELIGIBILITY TABLE, driven by the REAL shipped `model_shape`.
+///
+/// The previous policy was a regex fitted to four test literals, and its own
+/// Rust test injected a SYNTHETIC pattern instead of loading the shipped data
+/// file — so `sony wh-1000xm5` (which the test claimed was monetized) was in
+/// fact rejected by production, and `1984 Orwell book` was in fact monetized.
+/// This test closes both directions against the real file.
+///
+/// The sets are SHAPES, not literals the shape was fitted to: the accepted set
+/// spans three designator forms (alphanumeric compound `wh-1000xm5`, multi-token
+/// variant `note 13 pro`, trailing bare number `3310`, release-suffixed `20 LTS`),
+/// and the rejected set spans four non-model numeric shapes (year, year-decade,
+/// quantity, count) plus the broad/price-fragment shapes already locked above.
+#[test]
+fn real_data_model_shape_accepts_models_and_rejects_non_model_numbers() {
+    let ctx = real_ctx();
+
+    // Exact product models, across designator families and regions.
+    let accept = [
+        "sony wh-1000xm5",
+        "sony wh-1000xm5 price",
+        "sony wh-1000xm5 price in india",
+        "redmi note 13 pro",
+        "nokia 3310",
+        "node 20 LTS",
+        "pixel 9 pro max",
+        EXACT_MODEL_QUERY,
+        "buy iphone 15 pro",
+    ];
+    for q in accept {
+        assert!(
+            ctx.is_exact_model_query(q),
+            "exact-model query {q:?} must be eligible — the shape must admit every \
+             product family, not just an enumerated one"
+        );
+        // …and the full gate still requires a commercial signal.
+        assert!(
+            !ctx.is_monetizable(q, false),
+            "{q:?} carries a model designator but the request is NOT commercial; \
+             the gate must still refuse to monetize it"
+        );
+        assert!(
+            ctx.is_monetizable(q, true),
+            "{q:?} is a commercial exact-model query and must be monetizable"
+        );
+    }
+
+    // Numbers that are years, decades, quantities, or counts — never a product.
+    let reject = [
+        "1984 Orwell book",
+        "f1 2024 standings",
+        "1920s jazz playlist",
+        "2 minute chess",
+        "buy 2 pairs of socks",
+    ];
+    for q in reject {
+        assert!(
+            !ctx.is_exact_model_query(q),
+            "non-model numeric query {q:?} must NOT be eligible — a bare number \
+             that is a year/quantity, not a product designator"
+        );
+        assert!(
+            !ctx.is_monetizable(q, true),
+            "non-model query {q:?} was monetized even with a commercial signal"
         );
     }
 }

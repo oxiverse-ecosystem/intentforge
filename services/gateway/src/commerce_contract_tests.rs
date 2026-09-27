@@ -92,18 +92,24 @@ fn collect_affiliate_urls(payload: &Value) -> Vec<String> {
     out
 }
 
+/// The SHIPPED model shape, loaded from `data/commerce/affiliate.json` — the
+/// same file production loads. Tests here must never inject a synthetic policy:
+/// that is exactly how the previous regex stayed green while the shipped data
+/// file disagreed with it.
+fn shipped_shape() -> ModelShape {
+    AffiliateCtx::load().model_shape
+}
+
 #[test]
 fn affiliate_policy_allows_exact_model_and_rejects_broad_product_query() {
     let ctx = AffiliateCtx {
-        exact_model_patterns: vec![
-            r"(?i)^\s*(?:buy\s+)?iphone\s+\d{1,5}(?:\s+(?:pro|max|plus))*(?:\s+price)?\s*$".to_string(),
-        ],
+        model_shape: shipped_shape(),
         ..AffiliateCtx::default()
     };
-    assert!(ctx.is_exact_model_query("iphone 16 pro max price"));
-    assert!(ctx.is_exact_model_query("buy iphone 15 pro"));
-    assert!(!ctx.is_exact_model_query("best wireless earbuds under 50 dollars"));
-    assert!(!ctx.is_exact_model_query("steel water bottle"));
+    assert!(ctx.is_monetizable("iphone 16 pro max price", true));
+    assert!(ctx.is_monetizable("buy iphone 15 pro", true));
+    assert!(!ctx.is_monetizable("best wireless earbuds under 50 dollars", true));
+    assert!(!ctx.is_monetizable("steel water bottle", true));
 }
 
 #[test]
@@ -117,17 +123,15 @@ fn affiliate_policy_gate_decorates_exact_model_but_not_broad_query() {
     );
     let ctx = AffiliateCtx {
         networks: vec![n],
-        exact_model_patterns: vec![
-            r"(?i)^\s*sony\s+[a-z0-9-]*\d[a-z0-9-]*\s*$".to_string(),
-        ],
+        model_shape: shipped_shape(),
     };
 
     let exact = vec![json!({"url": "https://shop.example/product/sony-wh-1000xm5"})];
     let broad = vec![json!({"url": "https://shop.example/headphones"})];
     let mut exact = exact;
     let mut broad = broad;
-    decorate_affiliate_for_query(&mut exact, &ctx, "sony wh-1000xm5");
-    decorate_affiliate_for_query(&mut broad, &ctx, "wireless headphones under 50");
+    decorate_affiliate_for_query(&mut exact, &ctx, "sony wh-1000xm5", true);
+    decorate_affiliate_for_query(&mut broad, &ctx, "wireless headphones under 50", true);
     assert!(exact[0].get("affiliate").is_some(), "exact model must be eligible");
     assert!(broad[0].get("affiliate").is_none(), "broad product query must remain free");
 }
@@ -748,3 +752,203 @@ fn item5_no_comparison_without_shared_id() {
     );
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (C) NO STALE TOP-LEVEL PRICE — the crawl-index price must never be presented
+// as a page-verified fact.
+//
+// Live defect (audit t_5b3dc912, 2026-09-27): /shopping served a top-level
+// `price: 199.99` for a Dell page that contains the string "199.99" ZERO times
+// (its own structured data says 399.99). The value came from the crawl-time
+// index and carried no observation timestamp, while the SAME row said
+// `commerce: null` + `commerce_provenance.data: null` — i.e. the API claimed it
+// had looked at the page and found nothing, while showing a confident price.
+//
+// These tests lock the single honesty gate: a top-level price is only ever
+// served when it was extracted from that row's OWN page in this request, and it
+// always carries `price_observed_at` + `price_source`. Otherwise it is null.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A row shaped exactly like the live defect: a crawl-time index price with no
+/// `commerce` block and a provenance that says "fetched, found no facts".
+fn stale_index_row() -> Value {
+    json!({
+        "url": "https://www.dell.com/en-us/shop/sony-wh-1000xm5-headphones/apd/ac097778/audio",
+        "title": "Sony WH-1000XM5 Premium Wireless Noise Canceling Headphones",
+        "price": "199.99",
+        "currency": "USD",
+        "commerce_provenance": {
+            "url": "https://www.dell.com/en-us/shop/sony-wh-1000xm5-headphones/apd/ac097778/audio",
+            "observed_at": "1790528924",
+            "source": null,
+            "data": null,
+        },
+    })
+}
+
+#[test]
+fn unverified_index_price_is_not_serialised() {
+    // RED case: 199.99 exists nowhere on the page the row is attributed to, and
+    // the provenance admits no facts were extracted. It must not be served.
+    let mut r = stale_index_row();
+    assert_eq!(r["price"], "199.99", "fixture reproduces the live defect");
+    reconcile_top_level_price(&mut r);
+
+    assert!(
+        r["price"].is_null(),
+        "a price no successful page fetch verified must be null, not served"
+    );
+    assert!(r["currency"].is_null(), "currency follows the same rule");
+    assert!(r["price_observed_at"].is_null(), "no bogus observation time");
+    assert!(r["price_source"].is_null(), "no source label for a non-fact");
+    // The honest provenance is untouched — we never delete evidence.
+    assert_eq!(r["commerce_provenance"]["data"], Value::Null);
+}
+
+#[test]
+fn verified_page_price_replaces_conflicting_index_price() {
+    // The page's own JSON-LD says 399.99; the index says 199.99. The served
+    // top-level price must agree with the PAGE, never with the stale index.
+    let mut r = stale_index_row();
+    r["commerce"] = json!({
+        "url": "https://www.dell.com/en-us/shop/sony-wh-1000xm5-headphones/apd/ac097778/audio",
+        "observed_at": "1790547600",
+        "source": "json-ld",
+        "data": { "price": 399.99, "currency": "USD" },
+    });
+    reconcile_top_level_price(&mut r);
+
+    assert_eq!(
+        r["price"].as_str().unwrap().parse::<f64>().unwrap(),
+        399.99,
+        "top-level price must mirror the extracted page price, not the index"
+    );
+    assert_ne!(r["price"], "199.99", "the conflicting index price is gone");
+    assert_eq!(r["currency"], "USD");
+    // A kept price is ALWAYS accompanied by a real observation timestamp.
+    assert_eq!(
+        r["price_observed_at"].as_str().unwrap(),
+        "1790547600",
+        "a served price must expose when it was observed"
+    );
+    assert_eq!(r["price_source"], "page");
+}
+
+#[test]
+fn kept_price_always_carries_an_observation_timestamp() {
+    // Schema.org commonly serialises the price as a STRING ("399.99"). That must
+    // reconcile identically, and the timestamp must survive — a stale price is
+    // labelled stale, never presented as current.
+    let mut r = stale_index_row();
+    r["commerce"] = json!({
+        "observed_at": "1790547600",
+        "source": "og",
+        "data": { "price": "399.99", "currency": "USD" },
+    });
+    reconcile_top_level_price(&mut r);
+
+    assert_eq!(r["price"].as_str().unwrap().parse::<f64>().unwrap(), 399.99);
+    assert!(
+        r["price_observed_at"].is_string(),
+        "string-typed page prices still get an observation timestamp"
+    );
+    assert!(r["price_observed_at"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .all(|c| c.is_ascii_digit()));
+}
+
+#[test]
+fn price_range_never_collapses_to_a_single_top_level_price() {
+    // An AggregateOffer exposes price_low/price_high but no single `price`. We
+    // must NOT lift a low bound into the top-level field as if it were the price.
+    let mut r = stale_index_row();
+    r["commerce"] = json!({
+        "observed_at": "1790547600",
+        "source": "json-ld",
+        "data": { "price_low": 19.99, "price_high": 49.99, "currency": "USD" },
+    });
+    reconcile_top_level_price(&mut r);
+
+    assert!(
+        r["price"].is_null(),
+        "a price RANGE must not be presented as a single verified price"
+    );
+}
+
+#[test]
+fn reconcile_never_reorders_or_drops_results() {
+    // The gate is presentation-only: it mutates fields in place, so the ranked
+    // order and membership are byte-identical before and after.
+    let mut results = vec![stale_index_row(), stale_index_row(), stale_index_row()];
+    results[0]["url"] = json!("https://a.example/1");
+    results[1]["url"] = json!("https://b.example/2");
+    results[2]["url"] = json!("https://c.example/3");
+    let before: Vec<String> = results
+        .iter()
+        .map(|r| r["url"].as_str().unwrap().to_string())
+        .collect();
+
+    reconcile_prices(&mut results);
+
+    let after: Vec<String> = results
+        .iter()
+        .map(|r| r["url"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(before, after, "the honesty gate must never reorder results");
+    assert_eq!(results.len(), 3, "and must never drop a result");
+    for r in results.iter() {
+        assert!(r["price"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn shopping_enrichment_nulls_the_unverified_stale_price() {
+    // End-to-end through the REAL enrichment pass: a locally-indexed row whose
+    // page fetch FAILS keeps provenance ("we tried, got nothing") and must have
+    // no top-level price to contradict it.
+    let mut ranked = vec![stale_index_row()];
+    let fetch = |_url: String| async { None };
+    enrich_with_commerce(&mut ranked, fetch).await;
+
+    let r = &ranked[0];
+    assert!(r["price"].is_null(), "failed fetch => no price claim");
+    assert!(r["price_observed_at"].is_null());
+    assert!(
+        r["commerce_provenance"].is_object(),
+        "provenance is still attached (honest: we did try)"
+    );
+}
+
+#[tokio::test]
+async fn shopping_enrichment_serves_the_page_price_when_the_fetch_succeeds() {
+    // Same row, but the page fetch succeeds and its JSON-LD says 399.99. The
+    // top-level price must become 399.99 — never the index 199.99.
+    let page = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Sony WH-1000XM5",
+  "offers": {"@type": "Offer", "price": "399.99", "priceCurrency": "USD"}
+}
+</script></head><body></body></html>"#;
+    let mut ranked = vec![stale_index_row()];
+    let html = page.to_string();
+    let fetch = move |_url: String| {
+        let h = html.clone();
+        async move { Some(h) }
+    };
+    enrich_with_commerce(&mut ranked, fetch).await;
+
+    let r = &ranked[0];
+    assert_eq!(
+        r["price"].as_str().unwrap().parse::<f64>().unwrap(),
+        399.99,
+        "served price must equal the page structured price"
+    );
+    assert_ne!(r["price"], "199.99", "the stale index price must not survive");
+    assert_eq!(r["price_source"], "page");
+    assert!(r["price_observed_at"].is_string());
+}

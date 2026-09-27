@@ -2843,6 +2843,38 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
     None
 }
 
+/// Is this captured numeric token STRUCTURALLY a price, rather than a fragment
+/// of a split whole/fraction price widget?
+///
+/// Many storefronts render a price as two sibling spans — a whole part
+/// (`<span class="a-price-whole">27</span>`) and a fraction
+/// (`<span class="a-price-fraction">.99</span>`). Both spans carry the same
+/// `a-price`-ish class, so a class-keyed scan legitimately matches BOTH, and the
+/// bare "27" is not a price on its own — it is half of one. A captured token
+/// therefore only counts as a price when it is written the way a price is
+/// written: with exactly two cents digits after the decimal point, or with a
+/// three-or-more-digit magnitude (`1199`, `1,199.00`, `29,999`).
+///
+/// This is a property of the NUMBER'S OWN FORM, not of a merchant, a domain or
+/// a query — there is no per-site branch and no threshold fitted to a demo.
+/// The cost is honest recall: a genuinely sub-10 integer price expressed with no
+/// cents is reported as "no price observed" rather than as a confident number.
+fn is_structural_price_token(raw: &str) -> bool {
+    let cleaned: String = raw.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+    match cleaned.split_once('.') {
+        // Decimal form: must be written with cents (`89.99`), not `89.9` / `89.`.
+        Some((whole, frac)) => {
+            !whole.is_empty()
+                && whole.chars().all(|c| c.is_ascii_digit())
+                && frac.len() == 2
+                && frac.chars().all(|c| c.is_ascii_digit())
+        }
+        // Integer form: needs a real magnitude, so a bare 1-2 digit fragment of a
+        // split widget can never stand in for a price.
+        None => cleaned.len() >= 3 && cleaned.chars().all(|c| c.is_ascii_digit()),
+    }
+}
+
 /// Secondary commerce price extraction: parse common HTML price patterns from
 /// pages that don't expose JSON-LD/OpenGraph/Product microdata. This is a
 /// STRUCTURED FALLBACK for known e-commerce HTML patterns — not free-text
@@ -2851,92 +2883,120 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
 ///   * data-price attributes: data-price="1199.99"
 ///   * itemprop or class-based price spans with currency symbols
 ///
-/// Only fires when structured extraction (JSON-LD, OG, microdata) found nothing,
-/// and only extracts the FIRST visible price — no aggregation or guessing.
-/// The resulting OfferFacts is marked source="extracted_from_text" by the caller.
+/// Only fires when structured extraction (JSON-LD, OG, microdata) found nothing.
 ///
-/// Returns Some((price, currency)) on the first match, None otherwise.
-fn extract_price_from_html_patterns(html: &str) -> Option<(f64, String)> {
-    // 1. Known price container patterns (high-signal, low-noise):
-    //    Amazon-style: <span class="a-price"><span class="a-offscreen">$1,199.00</span>
-    //    data-price attributes: <div data-price="1199.99">
-    //    Generic price class: <span class="price">₹1,19,900</span>
-    static PRICE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let price_re = PRICE_RE.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?i)(?:class\s*=\s*["'][^"']*(?:a-price|price|product-price|sale-price|offer-price|current-price|selling-price|deal-price)[^"']*["']|data-(?:price|amount|sale-price))\s*(?:[^>]*>\s*|\s*=\s*["'])\s*(?:<[^>]*>\s*)?(?:\$|€|£|¥|₹|Rs\.?|INR|USD|EUR|GBP)?\s*([\d,]+\.?\d*)"#
-        ).unwrap()
-    });
-    if let Some(caps) = price_re.captures(html) {
-        let raw = caps.get(1)?.as_str().replace(',', "");
+/// MULTI-PRICE HONESTY (audit t_5b3dc912): this function does NOT return "the
+/// first price on the page". On a listing/search page that renders dozens of
+/// products, taking the first match silently presents ONE product's price as
+/// THE page's price — and the first regex hit is not even reliably a price (a
+/// live Amazon `/s?k=` page matched an ad placementId UUID and served
+/// `price: 1886.0`, a number that appears nowhere as a price on that page).
+///
+/// Instead it returns EVERY DISTINCT price the page's price CONTAINERS expose,
+/// deduplicated in first-seen order, so the caller can apply the same rule the
+/// structured paths already use: one distinct price -> canonical `price`;
+/// several -> `price_low`/`price_high`/`offer_count` with `price` left null.
+///
+/// The four tiers are still tried in the same descending-signal order; the
+/// highest-signal tier that yields any usable price supplies the whole set, so a
+/// page-level `itemprop`/`data-price` marker is never mixed with body prices.
+///
+/// Returns an empty Vec when the page exposes no usable price token.
+fn collect_prices_from_html_patterns(html: &str) -> Vec<(f64, String)> {
+    let mut out: Vec<(f64, String)> = Vec::new();
+    // Record a capture group as a price candidate, deduplicating by value so a
+    // price repeated across several containers (offscreen + whole + fraction
+    // spans of the SAME product) counts once, while a genuinely different price
+    // does count separately.
+    let take = |caps: &regex::Captures<'_>, out: &mut Vec<(f64, String)>| {
+        let Some(m) = caps.get(1) else { return };
+        let raw = m.as_str().replace(',', "");
+        if !is_structural_price_token(&raw) {
+            return;
+        }
         if let Ok(v) = raw.parse::<f64>() {
-            if v > 0.0 && v < 10_000_000.0 {
-                let curr_str = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-                let currency = normalize_currency_str(curr_str);
-                return Some((v, currency));
+            if v > 0.0 && v < 10_000_000.0 && !out.iter().any(|(seen, _)| (*seen - v).abs() < 0.005) {
+                let currency = normalize_currency_str(caps.get(0).map(|x| x.as_str()).unwrap_or(""));
+                out.push((v, currency));
             }
         }
-    }
-
-    // 2. Meta tag price: <meta itemprop="price" content="1199.99">
-    static META_PRICE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let meta_price_re = META_PRICE_RE.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?i)(?:itemprop|name|property)\s*=\s*["'](?:price|product:price:amount|product:price)["'][^>]*\s*content\s*=\s*["']([\d,]+\.?\d*)["']"#
-        ).unwrap()
-    });
-    if let Some(caps) = meta_price_re.captures(html) {
-        let raw = caps.get(1)?.as_str().replace(',', "");
-        if let Ok(v) = raw.parse::<f64>() {
-            if v > 0.0 && v < 10_000_000.0 {
-                let currency = "USD".to_string();
-                return Some((v, currency));
+    };
+    // Highest-signal tier first; stop at the first tier that yields a price.
+    for tier in 0..4 {
+        out.clear();
+        match tier {
+            // 1. Known price container patterns (high-signal, low-noise).
+            0 => {
+                static PRICE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+                let price_re = PRICE_RE.get_or_init(|| {
+                    regex::Regex::new(
+                        r#"(?i)(?:class\s*=\s*["'][^"']*(?:a-price|price|product-price|sale-price|offer-price|current-price|selling-price|deal-price)[^"']*["']|data-(?:price|amount|sale-price))\s*(?:[^>]*>\s*|\s*=\s*["'])\s*(?:<[^>]*>\s*)?(?:\$|€|£|¥|₹|Rs\.?|INR|USD|EUR|GBP)?\s*([\d,]+\.?\d*)"#
+                    ).unwrap()
+                });
+                for caps in price_re.captures_iter(html) {
+                    take(&caps, &mut out);
+                }
+            }
+            // 2. Meta tag price: <meta itemprop="price" content="1199.99">
+            1 => {
+                static META_PRICE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+                let meta_price_re = META_PRICE_RE.get_or_init(|| {
+                    regex::Regex::new(
+                        r#"(?i)(?:itemprop|name|property)\s*=\s*["'](?:price|product:price:amount|product:price)["'][^>]*\s*content\s*=\s*["']([\d,]+\.?\d*)["']"#
+                    ).unwrap()
+                });
+                for caps in meta_price_re.captures_iter(html) {
+                    take(&caps, &mut out);
+                }
+            }
+            // 3. data-price attribute with optional currency in data-currency.
+            2 => {
+                static DATA_PRICE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+                let data_price_re = DATA_PRICE_RE.get_or_init(|| {
+                    regex::Regex::new(
+                        r#"(?i)data-price\s*=\s*["']([\d,]+\.?\d*)["']"#
+                    ).unwrap()
+                });
+                for caps in data_price_re.captures_iter(html) {
+                    take(&caps, &mut out);
+                }
+            }
+            // 4. Price as direct text content of a price-related element.
+            //    Only match when the currency+price is the DIRECT text of an element
+            //    with a price-related class or data attribute — NOT embedded in a
+            //    sentence. Requires a currency symbol to avoid matching bare numbers.
+            _ => {
+                static PRICE_TEXT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+                let price_text_re = PRICE_TEXT_RE.get_or_init(|| {
+                    regex::Regex::new(
+                        r#"(?i)<[^>]*(?:class|data-(?:price|amount|sale))\s*=\s*["'][^"'\n]*(?:price|amount|sale|offer|current|selling|deal)[^"'\n]*["'][^>]*>\s*(?:<[^>]*>\s*)?(?:\$|€|£|¥|₹|Rs\.?|INR|USD|EUR|GBP)\s*([\d,]+\.?\d*)\s*(?:</[^>]*>\s*)?</[^>]*>"#
+                    ).unwrap()
+                });
+                for caps in price_text_re.captures_iter(html) {
+                    take(&caps, &mut out);
+                }
             }
         }
-    }
-
-    // 3. data-price attribute with optional currency in data-currency:
-    static DATA_PRICE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let data_price_re = DATA_PRICE_RE.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?i)data-price\s*=\s*["']([\d,]+\.?\d*)["']"#
-        ).unwrap()
-    });
-    if let Some(caps) = data_price_re.captures(html) {
-        let raw = caps.get(1)?.as_str().replace(',', "");
-        if let Ok(v) = raw.parse::<f64>() {
-            if v > 0.0 && v < 10_000_000.0 {
-                let currency = "USD".to_string();
-                return Some((v, currency));
-            }
+        if !out.is_empty() {
+            break;
         }
     }
-
-    // 4. Price as direct text content of a price-related element.
-    //    Only match when the currency+price is the DIRECT text of an element
-    //    with a price-related class or data attribute — NOT embedded in a sentence.
-    //    Requires a currency symbol to avoid matching bare numbers.
-    //    Pattern: <tag class="...price...">$49.99</tag>
-    //    NOTE: excludes itemprop (microdata parser handles those) and uses
-    //    strict single-line matching (no cross-tag matching).
-    static PRICE_TEXT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let price_text_re = PRICE_TEXT_RE.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?i)<[^>]*(?:class|data-(?:price|amount|sale))\s*=\s*["'][^"'\n]*(?:price|amount|sale|offer|current|selling|deal)[^"'\n]*["'][^>]*>\s*(?:<[^>]*>\s*)?(?:\$|€|£|¥|₹|Rs\.?|INR|USD|EUR|GBP)\s*([\d,]+\.?\d*)\s*(?:</[^>]*>\s*)?</[^>]*>"#
-        ).unwrap()
-    });
-    if let Some(caps) = price_text_re.captures(html) {
-        let raw = caps.get(1)?.as_str().replace(',', "");
-        if let Ok(v) = raw.parse::<f64>() {
-            if v > 0.0 && v < 10_000_000.0 {
-                let curr_str = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-                let currency = normalize_currency_str(curr_str);
-                return Some((v, currency));
-            }
+    // Whole-part suppression. A split price widget emits the integer whole
+    // (`<span class="a-price-whole">3,111</span>`) next to the real decimal price
+    // (`3,111.18`). Whenever a captured integer is exactly the FLOOR of another
+    // captured price on the same page, it is that widget's whole half, not a
+    // price of its own, so it must not be counted as a distinct offer. The test
+    // is arithmetic on the page's own numbers — "is this integer the whole part
+    // of another number we observed?" — with no merchant, class name or query
+    // involved. An integer that is nobody's floor (`$299` written on its own) is
+    // still an honest price and survives.
+    if out.len() > 1 {
+        let decimals: Vec<f64> = out.iter().map(|(v, _)| *v).filter(|v| v.fract() != 0.0).collect();
+        if !decimals.is_empty() {
+            out.retain(|(v, _)| v.fract() != 0.0 || !decimals.iter().any(|d| d.floor() == *v));
         }
     }
-
-    None
+    out
 }
 
 // ─── Commerce: honest product-fact extraction (ROADMAP item 1) ───────
@@ -3569,19 +3629,47 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         }
     }
 
-    // 5) Secondary commerce extraction: parse common HTML price patterns from the
-    //    page when structured extraction (JSON-LD, OG, microdata, MF2) found nothing.
-    //    Many product pages (Amazon, eBay, Walmart, etc.) embed prices in custom
-    //    HTML (e.g., <span class="a-price">) that don't conform to any standard
-    //    schema. This fallback ONLY fires when primary extraction returned no price,
-    //    and ONLY sets price + currency — never merchant, rating, or other facts
-    //    that would require more context. Marked with source="extracted_from_text"
-    //    so the frontend can label it distinctly from structured data. This is NOT
-    //    regex guessing on body text — it targets known e-commerce HTML patterns.
+    // 5) Secondary commerce extraction: parse common HTML price CONTAINERS from
+    //    the page when structured extraction (JSON-LD, OG, microdata, MF2) found
+    //    nothing. Many product pages (Amazon, eBay, Walmart, etc.) embed prices in
+    //    custom HTML (e.g. <span class="a-price">) that don't conform to any
+    //    standard schema. This fallback ONLY fires when primary extraction
+    //    returned no price, and ONLY sets the price group + currency — never
+    //    merchant, rating, or other facts that would require more context. Marked
+    //    with source="extracted_from_text" so the frontend can label it distinctly
+    //    from structured data.
+    //
+    //    HONESTY (audit t_5b3dc912): the page is scanned for ALL distinct prices
+    //    its containers expose, and the SAME multi-offer rule the structured
+    //    paths use is applied — one distinct price -> canonical `price`; several
+    //    -> price_low/price_high/offer_count with `price` left NULL. A listing
+    //    page rendering dozens of products therefore never presents one
+    //    product's price as the page's canonical price.
     if facts.price.is_none() && facts.price_low.is_none() {
-        if let Some((price, currency)) = extract_price_from_html_patterns(html) {
-            facts.price = Some(price);
-            facts.currency = Some(currency);
+        let prices = collect_prices_from_html_patterns(html);
+        if prices.len() == 1 {
+            let (p, c) = &prices[0];
+            facts.price = Some(*p);
+            facts.currency = Some(c.clone());
+            facts.offer_count = Some(1);
+            source = Some("extracted_from_text".to_string());
+        } else if prices.len() > 1 {
+            let mut lo = f64::MAX;
+            let mut hi = f64::MIN;
+            for (p, _) in &prices {
+                lo = lo.min(*p);
+                hi = hi.max(*p);
+            }
+            // Only assert a currency when every observed price carried the same
+            // one; mixed currencies -> null (never guess), same rule as the
+            // JSON-LD / microdata paths.
+            let all_agree = prices.windows(2).all(|w| w[0].1 == w[1].1);
+            facts.price_low = Some(lo);
+            facts.price_high = Some(hi);
+            facts.offer_count = Some(prices.len());
+            if all_agree {
+                facts.currency = Some(prices[0].1.clone());
+            }
             source = Some("extracted_from_text".to_string());
         }
     }
@@ -4214,7 +4302,10 @@ async fn enrich_with_commerce<F, Fut>(
             .unwrap_or("")
             .to_string();
         if r.get("commerce").is_some() {
-            continue; // already enriched by an earlier step
+            // Already enriched by an earlier step — still run the honesty gate so
+            // the top-level price mirrors the commerce block either way.
+            reconcile_top_level_price(r);
+            continue;
         }
         let provenance = serde_json::json!({
             "url": url,
@@ -4239,6 +4330,76 @@ async fn enrich_with_commerce<F, Fut>(
             None => {}
         }
         r["commerce_provenance"] = provenance;
+        // HONESTY GATE: the top-level price must agree with (or be nulled by) the
+        // facts just extracted from THIS row's page. See reconcile_top_level_price.
+        reconcile_top_level_price(r);
+    }
+}
+
+/// HONESTY GATE — reconcile a result's TOP-LEVEL `price`/`currency` with the
+/// product facts actually extracted from that result's own page.
+///
+/// WHY (live defect, audit t_5b3dc912): two independent pipelines wrote a price
+/// onto the same result object. `commerce` came from `extract_commerce_offer`
+/// (fresh, per-fetch, `observed_at`-stamped). The top-level `price`/`currency`
+/// came from the CRAWL-TIME index (crawler → Tantivy `price` field, read back in
+/// `merge_local_and_web`). Those two never reconciled, so a row could say
+/// `commerce: null` + `commerce_provenance.data: null` ("we fetched this page and
+/// it exposed no facts") while showing a confident top-level price taken from an
+/// older crawl. Live case: the API served 199.99 for a Dell page that contains
+/// "199.99" ZERO times and whose own structured data says 399.99 — the served
+/// value existed nowhere on the page it was attributed to.
+///
+/// THE RULE (one gate, all commerce surfaces):
+///   * a verified page price  → top-level price/currency MIRROR that extraction
+///     and carry its `observed_at` + `price_source: "page"`;
+///   * no verified page price → top-level price/currency are NULL, because a
+///     crawl-time value with no observation timestamp cannot be presented as a
+///     current fact. The honest-null path stays; nothing is ever invented.
+///
+/// This runs AFTER enrichment on the already-ranked results, mutating only
+/// `price`/`currency`/their provenance fields. It never reorders, reselects, or
+/// re-scores, so the no-manipulation / order-invariance guarantee is untouched.
+///
+/// Pure + offline-testable: it reads only the `commerce` block the enrichment
+/// pass already attached, so a unit test exercises it with zero network.
+fn reconcile_top_level_price(r: &mut serde_json::Value) {
+    if !r.is_object() {
+        return;
+    }
+    // The ONLY price we are willing to assert is one extracted from this exact
+    // row's page during this request. Read via `json_get_f64` so a schema.org
+    // `"price": "399.99"` (string) is handled the same as a numeric one.
+    let verified = r.pointer("/commerce/data/price").and_then(json_get_f64);
+    match verified {
+        Some(p) => {
+            r["price"] = serde_json::Value::String(p.to_string());
+            r["currency"] = r
+                .pointer("/commerce/data/currency")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            r["price_observed_at"] = r
+                .pointer("/commerce/observed_at")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            r["price_source"] = serde_json::Value::String("page".to_string());
+        }
+        None => {
+            // Unverified: a crawl-time price is not a page fact. Null it rather
+            // than present a value we cannot attribute to this page right now.
+            r["price"] = serde_json::Value::Null;
+            r["currency"] = serde_json::Value::Null;
+            r["price_observed_at"] = serde_json::Value::Null;
+            r["price_source"] = serde_json::Value::Null;
+        }
+    }
+}
+
+/// Reconcile the top-level price of every result in an already-enriched slice.
+/// Presentation-only post-rank pass; order is untouched.
+fn reconcile_prices(results: &mut [serde_json::Value]) {
+    for r in results.iter_mut() {
+        reconcile_top_level_price(r);
     }
 }
 
@@ -4402,6 +4563,14 @@ async fn enrich_with_commerce_par<F, Fut>(
             r["commerce_provenance"] = provenance;
         }
     }
+
+    // 5) HONESTY GATE (final, unconditional pass over EVERY row). A crawl-time
+    //    index price must never be served next to `commerce: null` as if it
+    //    were a fact observed on that page. Rows that were fetched keep the
+    //    extracted price + its `observed_at`; rows that were not (or that
+    //    exposed no structured product data) get a null top-level price.
+    //    Presentation-only: it runs after ranking and never reorders.
+    reconcile_prices(results);
 }
 
 /// Max concurrent page fetches during parallel enrichment. Tuned so that
@@ -4467,6 +4636,39 @@ fn is_commercial_intent(
         >= 0.50
 }
 
+/// Read the already-resolved commercial verdict off a SERIALIZED response.
+///
+/// The response is passed as `serde_json::Value` (not `UnifiedResponse`) because
+/// `handle_shopping` receives the already-serialized `/search` body. Every value
+/// read here was produced upstream by the classifier or the constraint parser —
+/// nothing is re-derived, and no new keyword heuristic is introduced. Each read
+/// is a plain field access on the same response the shopping path is built from.
+fn commercial_intent_of(r: &serde_json::Value) -> bool {
+    let label = r.get("intent").and_then(|v| v.as_str()).unwrap_or("");
+    if label == "transactional" {
+        return true;
+    }
+    // A parsed price bound is the strongest single commercial signal.
+    let bound = r
+        .get("structured_constraints")
+        .map(|sc| {
+            ["price_lt", "price_max", "price_min", "price_gt"]
+                .iter()
+                .any(|k| sc.get(*k).map(|v| !v.is_null()).unwrap_or(false))
+        })
+        .unwrap_or(false);
+    if bound {
+        return true;
+    }
+    // Strong transactional distribution is commercial even when the argmax label
+    // is something else (e.g. "comparison"). Same threshold as the main path.
+    r.get("distribution")
+        .and_then(|d| d.get("transactional"))
+        .and_then(|v| v.as_f64())
+        .map(|p| p >= 0.50)
+        .unwrap_or(false)
+}
+
 /// GET /shopping — the user-facing commerce search endpoint (ROADMAP item 2).
 ///
 /// DESIGN CONTRACT: this endpoint MUST reuse the EXACT same ranking pipeline as
@@ -4495,6 +4697,10 @@ async fn handle_shopping(
     //    in place. We operate at the JSON level (not full Deserialize) so the
     //    enrichment is robust to every other field on UnifiedResponse.
     let mut value = body.0.clone();
+    // Commercial half of the affiliate gate, read off the SAME serialized
+    // response the shopping block is built from. No new classifier, no keyword
+    // heuristic — these are the facts `/search` already produced.
+    let commercial = commercial_intent_of(&body.0);
     let results_attached = match value.get_mut("results").and_then(|v| v.as_array_mut()) {
         Some(arr) => {
             // ROADMAP item 1/2: attach honest product facts onto already-ranked results.
@@ -4519,8 +4725,9 @@ async fn handle_shopping(
             )
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
-            // Sacred policy: only exact-model queries may receive affiliate metadata.
-            decorate_affiliate_for_query(arr, &state.affiliate_ctx, &commerce_query);
+            // Sacred policy: only exact-model queries that the intent engine ALSO
+            // classified as commercial may receive affiliate metadata.
+            decorate_affiliate_for_query(arr, &state.affiliate_ctx, &commerce_query, commercial);
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
             // already-attached `commerce` blocks. Never reorders/reselects results.
             if let Some(arr_ref) = value.get("results").and_then(|v| v.as_array()) {
@@ -4597,15 +4804,143 @@ fn default_priority() -> i64 {
 #[derive(Clone)]
 struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
-    /// Regex sources for the exact-product-model eligibility policy. These stay
-    /// as data (compiled at startup) so a new product family can be monetized by
-    /// editing JSON only — never by adding a brand/query branch in Rust.
-    exact_model_patterns: Vec<String>,
+    /// Structural SHAPE of an exact-product-model designator, loaded from
+    /// `eligibility.model_shape` in the data file. It is a shape description
+    /// (how long a designator must be, which words may follow a bare number),
+    /// NOT a brand roster and NOT a list of example queries: any product family
+    /// is admitted by the same rule, so monetizing a new family requires no
+    /// edit here and no recompile.
+    model_shape: ModelShape,
+}
+
+/// The structural description of "this token names a specific product model".
+///
+/// DESIGN NOTE (why this is not a regex over the raw query): the previous
+/// policy was a fitted alternation whose first branch degenerated to "any
+/// single token containing a digit" (so `1984 Orwell book` was monetized) and
+/// whose model branch could not span hyphens or multi-token models (so
+/// `sony wh-1000xm5` was NOT monetized). A shape test is the honest middle: it
+/// describes what a model designator LOOKS LIKE, and it generalizes to product
+/// families nobody has enumerated yet.
+#[derive(Clone, Debug, serde::Deserialize)]
+struct ModelShape {
+    /// Minimum characters for an alphanumeric compound designator (`wh-1000xm5`,
+    /// `ps5`). Two-character compounds (`f1`) are too weak a signal on their own.
+    #[serde(default = "default_min_designator_len")]
+    min_designator_len: usize,
+    /// Maximum digits in a bare-number designator (`3310`, `iphone 16`). Longer
+    /// digit runs are measurements, quantities, or years, not model numbers.
+    #[serde(default = "default_max_number_len")]
+    max_number_len: usize,
+    /// Words that may FOLLOW a bare-number designator as a product variant
+    /// (`iphone 16 pro`, `node 20 lts`).
+    #[serde(default)]
+    variant_suffixes: Vec<String>,
+    /// Words that may FOLLOW a bare-number designator as the commercial act
+    /// (`iphone 16 price`) — these are exactly the words the request is asking
+    /// a merchant about, so a number followed by one is a model reference.
+    #[serde(default)]
+    commerce_words: Vec<String>,
+    /// Words that turn a following number into a QUANTITY or bound rather than a
+    /// model number (`under 50 dollars`, `2 minute ...`). Prevents a price or
+    /// duration from being read as a designator.
+    #[serde(default)]
+    quantity_markers: Vec<String>,
+}
+
+fn default_min_designator_len() -> usize {
+    3
+}
+fn default_max_number_len() -> usize {
+    4
+}
+
+impl Default for ModelShape {
+    fn default() -> Self {
+        Self {
+            min_designator_len: default_min_designator_len(),
+            max_number_len: default_max_number_len(),
+            variant_suffixes: Vec::new(),
+            commerce_words: Vec::new(),
+            quantity_markers: Vec::new(),
+        }
+    }
+}
+
+impl ModelShape {
+    /// Structural test: does this query name a specific product model?
+    ///
+    /// A token qualifies as a model designator when EITHER
+    ///   * it is an alphanumeric compound — a letter run that begins before the
+    ///     first digit and is at least `min_designator_len` characters
+    ///     (`wh-1000xm5`, `ps5`, `m3`). Requiring the letter to come FIRST is
+    ///     what keeps year/decade forms (`1920s`, `1984s`) out: those are digits
+    ///     with a trailing letter, i.e. a date, not a product code; or
+    ///   * it is a bare number of at most `max_number_len` digits that is not
+    ///     introduced by a quantity marker and that either ends the query or is
+    ///     followed by a variant suffix or a commerce word (`nokia 3310`,
+    ///     `iphone 16 pro`, `pixel 9 pro max`).
+    ///
+    /// A number followed by an ordinary noun (`2 minute chess`,
+    /// `1984 Orwell book`, `buy 2 pairs of socks`) is a quantity, a title, or a
+    /// year — none of which is a product model, so it is not eligible.
+    fn has_model_designator(&self, query: &str) -> bool {
+        let tokens: Vec<String> = query
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '-').to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        for (i, tok) in tokens.iter().enumerate() {
+            if self.is_compound_designator(tok) {
+                return true;
+            }
+            let digits = tok.chars().filter(|c| c.is_ascii_digit()).count();
+            if digits == 0 || digits != tok.chars().count() {
+                continue; // not a bare number
+            }
+            if tok.len() > self.max_number_len {
+                continue;
+            }
+            // `under 50 dollars` / `above 1000` is a bound, not a model number.
+            if i > 0 && self.quantity_markers.iter().any(|m| m == &tokens[i - 1]) {
+                continue;
+            }
+            match tokens.get(i + 1) {
+                None => return true, // the query ENDS with the number: a model
+                Some(next) => {
+                    if self.variant_suffixes.iter().any(|s| s == next)
+                        || self.commerce_words.iter().any(|w| w == next)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// A compound designator: letters AND digits, at least `min_designator_len`
+    /// characters, with a letter BEFORE the first digit (`wh-1000xm5`, `ps5`).
+    /// `1920s` and `1984` fail — digits first, or no letter at all.
+    fn is_compound_designator(&self, tok: &str) -> bool {
+        if tok.chars().count() < self.min_designator_len {
+            return false;
+        }
+        // `char_indices` — we compare POSITIONS, so the letter must occur at a
+        // lower index than the first digit. (`chars().find` yields the char
+        // itself, so `a < d` would compare 'w' < '1' and reject every code.)
+        let first_alpha = tok.char_indices().find(|(_, c)| c.is_ascii_alphabetic());
+        let first_digit = tok.char_indices().find(|(_, c)| c.is_ascii_digit());
+        match (first_alpha, first_digit) {
+            (Some((a, _)), Some((d, _))) => a < d,
+            _ => false,
+        }
+    }
 }
 
 impl Default for AffiliateCtx {
     fn default() -> Self {
-        Self { networks: Vec::new(), exact_model_patterns: Vec::new() }
+        Self { networks: Vec::new(), model_shape: ModelShape::default() }
     }
 }
 
@@ -4616,7 +4951,7 @@ impl AffiliateCtx {
     /// decoration is best-effort and must never break search.
     fn load() -> Self {
         let mut networks: Vec<AffiliateNetwork> = Vec::new();
-        let mut exact_model_patterns: Vec<String> = Vec::new();
+        let mut model_shape = ModelShape::default();
         // Resolve the data path relative to the process cwd (container WORKDIR is
         // /app, app binary at /app/gateway; data baked at /app/data/commerce).
         let candidates = [
@@ -4634,15 +4969,10 @@ impl AffiliateCtx {
                             }
                         }
                     }
-                    if let Some(arr) = v
-                        .get("eligibility")
-                        .and_then(|e| e.get("exact_model_patterns"))
-                        .and_then(|p| p.as_array())
-                    {
-                        exact_model_patterns = arr
-                            .iter()
-                            .filter_map(|p| p.as_str().map(|s| s.to_string()))
-                            .collect();
+                    if let Some(ms) = v.get("eligibility").and_then(|e| e.get("model_shape")) {
+                        if let Ok(shape) = serde_json::from_value::<ModelShape>(ms.clone()) {
+                            model_shape = shape;
+                        }
                     }
                 }
                 if !networks.is_empty() {
@@ -4650,31 +4980,36 @@ impl AffiliateCtx {
                 }
             }
         }
-        // Ignore malformed policy patterns rather than taking the gateway down;
-        // monetization is strictly best-effort. Every valid regex is a generic
-        // matcher over runtime data, not a per-query branch in compiled code.
-        let valid_pattern_count = exact_model_patterns
-            .iter()
-            .filter(|p| regex::Regex::new(p).is_ok())
-            .count();
         networks.sort_by(|a, b| b.priority.cmp(&a.priority));
         tracing::info!(
-            "affiliate: loaded {} network(s) and {} exact-model pattern(s) from data file",
+            "affiliate: loaded {} network(s) and the exact-model shape (min_len {}, max_digits {})",
             networks.len(),
-            valid_pattern_count
+            model_shape.min_designator_len,
+            model_shape.max_number_len
         );
-        Self { networks, exact_model_patterns }
+        Self { networks, model_shape }
     }
 
-    /// Sacred monetization gate: affiliate decoration is allowed only for an
-    /// exact product-model query. Broad category/product queries remain free and
-    /// receive no affiliate metadata. The policy is entirely data-driven; this
-    /// method only compiles and matches the regex sources.
+    /// Sacred monetization gate, half 1: does the query NAME a specific product
+    /// model? Structural only — see `ModelShape::has_model_designator`.
     fn is_exact_model_query(&self, query: &str) -> bool {
-        self.exact_model_patterns
-            .iter()
-            .filter_map(|p| regex::Regex::new(p).ok())
-            .any(|re| re.is_match(query))
+        self.model_shape.has_model_designator(query)
+    }
+
+    /// Sacred monetization gate, full: an exact-model query that the intent
+    /// engine ALSO classified as commercial. Two independent conditions:
+    ///
+    ///   1. the query names a specific product model (`is_exact_model_query`),
+    ///   2. the request carries a commercial signal the classifier already
+    ///      produced (`is_commercial_intent`: transactional label, strong
+    ///      transactional distribution, or a parsed price bound).
+    ///
+    /// Condition 1 alone still admits `1984 Orwell book` (a bare number that
+    /// ends a title). Condition 2 alone still admits `best wireless earbuds
+    /// under 50 dollars`. Together they admit `iphone 16 pro max price` and
+    /// `sony wh-1000xm5` and reject both classes.
+    fn is_monetizable(&self, query: &str, commercial: bool) -> bool {
+        commercial && self.is_exact_model_query(query)
     }
 
     /// The first enabled network that has its required key present in the env.
@@ -4806,12 +5141,20 @@ fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> 
 /// itself remains always free; this gate controls monetization metadata only.
 /// Broad category/product searches receive no affiliate decoration even when a
 /// valid network key is configured.
+///
+/// `commercial` is the caller's `is_commercial_intent(...)` verdict — derived
+/// from the intent label, the intent distribution, and any parsed price bound,
+/// all of which the request already carries. Passing it in (rather than
+/// re-deriving it here) keeps the monetization gate on the SAME signal the
+/// shopping block is built from, and keeps this function free of any keyword
+/// list of its own.
 fn decorate_affiliate_for_query(
     results: &mut [serde_json::Value],
     ctx: &AffiliateCtx,
     query: &str,
+    commercial: bool,
 ) {
-    if ctx.is_exact_model_query(query) {
+    if ctx.is_monetizable(query, commercial) {
         decorate_affiliate(results, ctx);
     }
 }
@@ -7071,6 +7414,111 @@ fn is_negated_source_entity(q_orig: &str, compound: &str) -> bool {
     false
 }
 
+/// Markers that introduce a CONTENT exclusion — something the user says the
+/// result must NOT contain. A bare topical "not" is deliberately absent: "healthy
+/// recipes not spicy" is a preference, not a hard filter, and stays declined.
+const CONTENT_NEGATION_MARKERS: &[&str] = &[
+    "without", "no", "minus", "excluding", "except", "devoid", "lacking", "free",
+    "avoiding", "avoid",
+];
+
+/// Tokens that end the noun phrase a content marker governs. Structural
+/// vocabulary (prepositions, conjunctions, subordinators, comparison frames) —
+/// no per-query literals.
+const NEG_SCOPE_BOUNDARIES: &[&str] = &[
+    "for", "in", "on", "at", "to", "with", "from", "by", "of", "that", "which",
+    "who", "whom", "whose", "when", "while", "if", "after", "before", "during",
+    "under", "over", "into", "onto", "than", "as", "about", "near", "per", "via",
+    "but", "so", "then", "vs", "versus", "because", "although", "though",
+];
+
+/// Connectors that CONTINUE the same negated list: "without django or flask"
+/// negates both targets, so each conjunct is its own scope head under the same
+/// marker.
+const NEG_SCOPE_LIST_CONNECTORS: &[&str] = &["or", "and", "nor"];
+
+/// Determiners that may sit between a marker and its head ("without A dedicated
+/// gpu").
+const NEG_SCOPE_DETERMINERS: &[&str] = &[
+    "a", "an", "the", "any", "some", "my", "your", "their", "its", "his", "her",
+    "our", "this", "that", "these", "those", "such", "much", "many", "more", "less",
+];
+
+/// Is `compound` the HEAD of a noun phrase governed by a content-negation marker
+/// in the same query?
+///
+/// This is the clause-binding signal that `is_real_exclusion` needs and did not
+/// have. The old rule asked "does the query contain `without`/`no` ANYWHERE?"
+/// and therefore declared EVERY candidate compound a hard exclusion, which
+/// filtered out the topical nouns the user actually searched for:
+///   * "best no code platform for beginners" — the negation governs the head
+///     "platform"; "code" is a modifier, so excluding it drops the very results
+///     the query is about.
+///   * "compare diesel vs petrol without changing my car insurance" — the
+///     governed head is "insurance"; "car" is inside the object phrase.
+///
+/// A compound qualifies only when it ENDS its governed scope (after skipping
+/// determiners and list conjuncts), i.e. it is the noun the user actually
+/// negated: "dessert recipes without artificial sweeteners" → "artificial
+/// sweeteners" ✓, "best laptop for gaming without a dedicated gpu" → "dedicated
+/// gpu" ✓, "without django or flask" → "django" ✓ and "flask" ✓.
+///
+/// Same shape as `term_in_negating_context` (marker in a bounded look-back
+/// window), extended with the scope-head requirement; structural vocabulary
+/// only, no per-query literals and no query-global boolean.
+fn compound_is_negation_scope_head(q_orig: &str, compound: &str) -> bool {
+    let comp: Vec<String> = compound
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect();
+    if comp.is_empty() {
+        return false;
+    }
+    let toks: Vec<String> = q_orig
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect();
+    for (i, t) in toks.iter().enumerate() {
+        if !CONTENT_NEGATION_MARKERS.contains(&t.as_str()) {
+            continue;
+        }
+        // Collect every scope governed by this marker: one per list conjunct.
+        let mut scopes: Vec<Vec<String>> = vec![Vec::new()];
+        for w in &toks[i + 1..] {
+            if NEG_SCOPE_BOUNDARIES.contains(&w.as_str()) {
+                break;
+            }
+            if NEG_SCOPE_LIST_CONNECTORS.contains(&w.as_str()) {
+                scopes.push(Vec::new());
+                continue;
+            }
+            scopes.last_mut().expect("at least one scope").push(w.clone());
+        }
+        for scope in scopes {
+            // Drop leading determiners so "without a dedicated gpu" binds "gpu".
+            let mut head = scope.as_slice();
+            while let Some((first, rest)) = head.split_first() {
+                if NEG_SCOPE_DETERMINERS.contains(&first.as_str()) {
+                    head = rest;
+                } else {
+                    break;
+                }
+            }
+            if head.len() < comp.len() {
+                continue;
+            }
+            if head[head.len() - comp.len()..] == comp[..] {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// A negated compound is a real search EXCLUSION (not a manner qualifier) when at
 /// least one holds:
 ///  - (a) the compound names a recognized entity (protected brand/tech term — a
@@ -7156,17 +7604,19 @@ fn is_real_exclusion(
             }
         }
     }
-    // "without X" / "no X" is an explicit user constraint even when X is a
-    // generic noun (e.g. "dessert recipes without artificial sweeteners").
-    // Unlike a bare "not X", the preposition form is unambiguous: it names
-    // something the user does not want in the result. Keep the manner guard
-    // above so "without using a library" remains a HOW qualifier.
-    let q_tokens: Vec<String> = q_orig
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_lowercase())
-        .collect();
-    if q_tokens.iter().any(|t| t == "without" || t == "no") {
+    // "without X" / "no X" is an explicit user CONTENT constraint even when X is
+    // a generic noun ("dessert recipes without artificial sweeteners"). Unlike a
+    // bare "not X" (declined — "healthy recipes not spicy"), the preposition form
+    // names something the user does not want in the result.
+    //
+    // The binding is to the COMPOUND's own negation scope, not to the query: the
+    // compound must be the HEAD of the phrase governed by a content-negation
+    // marker. A query-global "contains without/no" test is wrong because the
+    // marker says nothing about which noun it governs — it made "code" an
+    // exclusion in "best no code platform" (the negation attaches to the head
+    // "platform") and "car" an exclusion in "compare diesel vs petrol without
+    // changing my car insurance" (the head is "insurance").
+    if compound_is_negation_scope_head(q_orig, compound) {
         return true;
     }
     // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
@@ -7180,10 +7630,17 @@ fn is_real_exclusion(
     // ("without soap", "recipes not spicy") were wrongly extracted as hard-filter
     // exclusions, breaking the manner/attribute tests and degrading result sets. It
     // had no unit test of its own and cannot distinguish "spicy" from "systemd" without
-    // a hardcoded allow-list (which the no-hardcoding doctrine forbids). The pre-c4317bc
-    // behavior — decline generic nouns unless they are protected terms, capitalized
-    // proper nouns, or in contrastive framing — is the correct contract (covered by the
-    // existing manner/attribute tests), so this path is intentionally NOT taken.
+    // a hardcoded allow-list (which the no-hardcoding doctrine forbids).
+    //
+    // That path stays intentionally NOT taken, in both of its spellings: the
+    // unconditional object test, and the later query-global
+    // `q_tokens.contains("without"|"no")` variant (round 181c1e8), which declared
+    // EVERY candidate compound in a "without"/"no" query a real exclusion. The
+    // acceptance that IS correct is clause-bound: `compound_is_negation_scope_head`
+    // above requires the compound to be the head of the noun phrase its own marker
+    // governs. Everything else — generic nouns that no marker binds to their own
+    // scope — falls through to `false` here, which is the pre-c4317bc contract
+    // covered by the manner/attribute tests.
     false
 }
 
@@ -17353,11 +17810,12 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // so the order-invariance guarantee holds: affiliate decoration runs strictly
     // AFTER the order is fixed and cannot move a result. No external call, no
     // keyword list — the commercial signal comes purely from in-process intent.
-    let shopping_block: Option<Vec<serde_json::Value>> = if is_commercial_intent(
+    let commercial = is_commercial_intent(
         &intent.intent,
         &intent.distribution,
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
-    ) {
+    );
+    let shopping_block: Option<Vec<serde_json::Value>> = if commercial {
         // Clone only the top-N ranked results into a JSON array we can enrich in
         // place. `serde_json::to_value` on `MergedResult` is lossless/Serialize.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
@@ -17385,8 +17843,10 @@ let mut results = match tokio::task::spawn_blocking(move || {
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             // Sacred policy: broad shopping queries remain free; only exact
-            // product-model queries receive affiliate metadata.
-            decorate_affiliate_for_query(&mut shop_arr, &state.affiliate_ctx, &q);
+            // product-model queries receive affiliate metadata. `commercial`
+            // is the verdict that gated this whole block, so the commercial
+            // half of the gate holds by construction.
+            decorate_affiliate_for_query(&mut shop_arr, &state.affiliate_ctx, &q, commercial);
             // Only concrete product offers belong on the main-path shopping array.
             // Keep the enriched order and drop rows with no real commerce block;
             // this is presentation filtering over a clone, never selection or
@@ -18251,6 +18711,87 @@ mod negation_scope_tests {
             "dessert recipes without artificial sweeteners",
             false
         ));
+    }
+
+    /// Clause-bound negation, table-driven. A content-negation marker
+    /// ("without", "no", …) binds only the noun phrase it governs — the head of
+    /// that scope. It is NOT a query-global switch. Each row asserts the bucket
+    /// the compound lands in, so the test survives any helper rename.
+    #[test]
+    fn content_negation_is_bound_to_the_compounds_own_scope() {
+        // (query, compound, contrastive, expected kept, expected manner)
+        let cases: &[(&str, &str, bool, bool, bool)] = &[
+            // Bound to its own scope → real content exclusion.
+            (
+                "dessert recipes without artificial sweeteners",
+                "artificial sweeteners",
+                false,
+                true,
+                false,
+            ),
+            (
+                "best laptop for gaming without a dedicated gpu",
+                "dedicated gpu",
+                false,
+                true,
+                false,
+            ),
+            // A list conjunct is a scope head under the same marker.
+            ("python web frameworks without django or flask", "flask", false, true, false),
+            // NOT the head of the marker's scope → declined. "code" modifies
+            // "platform" in "no code platform"; the user wants no-CODE results.
+            ("best no code platform for beginners", "code", false, false, false),
+            // The governed head is "insurance"; "car" sits inside its object
+            // phrase, so filtering on "car" would drop the fuel/car results the
+            // comparison query is about.
+            (
+                "compare diesel vs petrol without changing my car insurance",
+                "car",
+                false,
+                false,
+                false,
+            ),
+            // Manner qualifiers never become exclusions (pre-existing contract).
+            (
+                "how to clean a cast iron skillet without soap after cooking eggs",
+                "soap",
+                false,
+                false,
+                true,
+            ),
+            (
+                "a tutorial with no music background",
+                "music background",
+                false,
+                false,
+                true,
+            ),
+            // A bare topical "not" is a preference, not a hard filter.
+            ("healthy recipes not spicy", "spicy", false, false, false),
+        ];
+
+        for (query, compound, contrastive, want_kept, want_manner) in cases {
+            let (kept, dropped, manner) = extract_query_negative_terms_with_dropped(query);
+            let in_kept = kept.iter().any(|t| t.contains(compound));
+            let in_manner = manner.iter().any(|t| t.contains(compound));
+            assert_eq!(
+                (in_kept, in_manner),
+                (*want_kept, *want_manner),
+                "bucket mismatch for {compound:?} in {query:?}: kept={kept:?} dropped={dropped:?} manner={manner:?}"
+            );
+            assert_eq!(
+                is_real_exclusion(compound, query, *contrastive),
+                *want_kept,
+                "is_real_exclusion disagreed with the extraction bucket for {compound:?} in {query:?}"
+            );
+            if !*want_kept {
+                assert!(
+                    !dropped.iter().any(|t| t.contains(compound))
+                        || *want_manner,
+                    "{compound:?} must be declined (not silently dropped as a hard filter) in {query:?}: dropped={dropped:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -20226,6 +20767,166 @@ mod spellcheck_endpoint_tests {
         assert_eq!(d.price, Some(49.99));
         assert_eq!(d.rating, None, "rating must NOT be extracted from text");
         assert_eq!(d.availability, None, "availability must NOT be extracted from text");
+    }
+
+    // ── Multi-price honesty on the HTML-pattern fallback (audit t_5b3dc912) ──
+    // The live defect: an Amazon `/s?k=` SEARCH page (66 products, 40 distinct
+    // prices) served `price: 1886.0` — a number that exists only inside an ad
+    // placementId UUID, because the fallback returned the FIRST regex hit as
+    // "the page's price". The same defect class: a listing page with 3 tiles
+    // must never present one tile's price as the page's canonical price.
+
+    /// A minimal but faithful multi-product listing page: three product tiles,
+    /// each with its own price container, exactly as a search/listing page
+    /// renders them. No merchant- or site-specific markup is relied on.
+    const HTML_LISTING_THREE_PRICES: &str = r#"<!doctype html><html><body>
+<div class="s-results">
+  <div class="s-result-item" data-asin="AAA111">
+    <span class="a-price"><span class="a-offscreen">$27.99</span>
+      <span class="a-price-whole">27</span><span class="a-price-fraction">.99</span></span>
+  </div>
+  <div class="s-result-item" data-asin="BBB222">
+    <span class="a-price"><span class="a-offscreen">$1,199.00</span>
+      <span class="a-price-whole">1,199</span><span class="a-price-fraction">.00</span></span>
+  </div>
+  <div class="s-result-item" data-asin="CCC333">
+    <span class="a-price"><span class="a-offscreen">$8.50</span>
+      <span class="a-price-whole">8</span><span class="a-price-fraction">.50</span></span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn html_pattern_fallback_listing_page_never_picks_one_price_as_canonical() {
+        let o = extract_commerce_offer(HTML_LISTING_THREE_PRICES, "https://shop.example.com/s?k=bottle");
+        let d = o.data.as_ref().unwrap();
+        // THE REGRESSION: before the fix this was Some(27.99) — the first tile's
+        // price presented as the whole page's price.
+        assert_eq!(d.price, None, "a multi-price listing page must have NO canonical price");
+        assert_eq!(d.price_low, Some(8.50));
+        assert_eq!(d.price_high, Some(1199.00));
+        assert_eq!(d.offer_count, Some(3));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_split_whole_fraction_fragments_are_not_prices() {
+        // A page whose only "prices" are the bare whole-parts of split
+        // whole/fraction widgets ("27", "17", "79") exposes no price we can
+        // assert — the fragments are halves of numbers, not numbers.
+        let html = r#"<!doctype html><html><body>
+<span class="a-price-whole">27</span><span class="a-price-fraction">.99</span>
+<span class="a-price-whole">17</span><span class="a-price-fraction">.49</span>
+<span class="a-price-whole">79</span><span class="a-price-fraction">.99</span>
+</body></html>"#;
+        assert!(
+            collect_prices_from_html_patterns(html).is_empty(),
+            "bare 1-2 digit whole-part fragments must never be collected as prices"
+        );
+        let o = extract_commerce_offer(html, "https://shop.example.com/frag");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None, "must not serve \"27\" as a price");
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
+        assert_eq!(d.offer_count, None);
+    }
+
+    #[test]
+    fn html_pattern_fallback_single_product_page_still_yields_canonical_price() {
+        // No regression on the honest case: ONE product, one price, rendered in
+        // the split whole/fraction widget. The offscreen span is the real
+        // decimal price; the whole/fraction halves are the same number and must
+        // deduplicate to a single canonical value.
+        let html = r#"<!doctype html><html><body>
+<h1>Insulated Bottle 1L</h1>
+<span class="a-price"><span class="a-offscreen">$24.50</span>
+  <span class="a-price-whole">24</span><span class="a-price-fraction">.50</span></span>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/bottle");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(24.50));
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
+        assert_eq!(d.offer_count, Some(1));
+        assert_eq!(d.currency.as_deref(), Some("USD"));
+        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+    }
+
+    #[test]
+    fn html_pattern_fallback_two_data_price_attributes_surface_a_range() {
+        // Two `data-price` attributes (a variant switcher on one product page):
+        // the same multi-offer contract as two JSON-LD offers.
+        let html = r#"<!doctype html><html><body>
+<div class="product" data-price="129.00"></div>
+<div class="product" data-price="159.00"></div>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/variants");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None);
+        assert_eq!(d.price_low, Some(129.00));
+        assert_eq!(d.price_high, Some(159.00));
+        assert_eq!(d.offer_count, Some(2));
+    }
+
+    #[test]
+    fn html_pattern_fallback_mixed_currencies_assert_no_currency() {
+        // Two tiles priced in different currencies: the range is still honest,
+        // but a single currency string would be a guess, so it stays null.
+        let html = r#"<!doctype html><html><body>
+<span class="price">$19.99</span>
+<span class="price">€24.00</span>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/mixed");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None);
+        assert_eq!(d.price_low, Some(19.99));
+        assert_eq!(d.price_high, Some(24.00));
+        assert_eq!(d.currency, None, "mixed currencies must not be asserted as one");
+    }
+
+    #[test]
+    fn html_pattern_fallback_whole_part_of_a_split_widget_is_not_a_second_offer() {
+        // A split widget emits the integer whole next to the real decimal price.
+        // `1,405` here is the whole half of `1,405.73`, so it must not be counted
+        // as a second offer and must not widen the range.
+        let html = r#"<!doctype html><html><body>
+<span class="a-price"><span class="a-offscreen">$1,405.73</span>
+  <span class="a-price-whole">1,405</span><span class="a-price-fraction">.73</span></span>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/split");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, Some(1405.73));
+        assert_eq!(d.price_low, None);
+        assert_eq!(d.price_high, None);
+        assert_eq!(d.offer_count, Some(1));
+    }
+
+    #[test]
+    fn html_pattern_fallback_integer_price_is_kept_when_it_is_nobodys_floor() {
+        // `299` written on its own is an honest price: nothing else on the page
+        // has 299 as its whole part, so the suppression rule must not eat it.
+        let html = r#"<!doctype html><html><body>
+<span class="price">$299</span>
+<span class="price">$1,405.73</span>
+</body></html>"#;
+        let o = extract_commerce_offer(html, "https://shop.example.com/mixed-int");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None, "two distinct offers still means no canonical price");
+        assert_eq!(d.price_low, Some(299.0));
+        assert_eq!(d.price_high, Some(1405.73));
+        assert_eq!(d.offer_count, Some(2));
+    }
+
+    #[test]
+    fn structural_price_token_accepts_written_prices_rejects_widget_fragments() {
+        // The token rule is about the NUMBER'S FORM, not a merchant or a query.
+        for ok in ["27.99", "8.50", "1199.00", "1,199", "299", "29,999", "0.99"] {
+            assert!(is_structural_price_token(ok), "{ok} is a written price");
+        }
+        for bad in ["27", "8", "99", "79", "0", "1.9", "27.", ".99"] {
+            assert!(!is_structural_price_token(bad), "{bad} is not a written price");
+        }
     }
 
         #[test]
