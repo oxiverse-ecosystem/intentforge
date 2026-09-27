@@ -3056,6 +3056,21 @@ struct OfferFacts {
     /// structured signals, never guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image: Option<String>,
+    /// True when `merchant` was OBSERVED on the page (JSON-LD `seller` /
+    /// `publisher` / `developer` / `provider`, microdata `itemprop="seller"|"brand"`,
+    /// MF2 `p-brand`, OG brand) rather than derived from the URL host by the
+    /// last-resort fallback in `extract_commerce_offer`.
+    ///
+    /// This is the discriminator that keeps the honesty invariant honest: a host
+    /// label is a coarse DISPLAY identifier, not a product fact, so it must not
+    /// make `data_has_fact` true. Without it, every result with a URL (i.e. every
+    /// result) got a `commerce` block and the honest-null branch was dead code.
+    ///
+    /// Deliberately NOT serialized: it is internal provenance bookkeeping for the
+    /// attach decision, not a fact about the page, and the wire shape of
+    /// `commerce.data` is a public contract. Defaults to false on deserialize.
+    #[serde(default, skip_serializing)]
+    merchant_observed: bool,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3642,6 +3657,13 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
 
     // 6) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
+    //
+    //    Whether a merchant was OBSERVED is recorded BEFORE the fallback runs, so
+    //    `data_has_fact` can tell a real seller name (JSON-LD / microdata / MF2 /
+    //    OG) from a host label it derived. Capturing it here — rather than at each
+    //    of the ~6 places that set `merchant` — means a future new signal can
+    //    never silently ship a host label as an extracted fact.
+    facts.merchant_observed = facts.merchant.is_some();
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
@@ -4320,12 +4342,18 @@ async fn enrich_with_commerce<F, Fut>(
 /// True when an `OfferFacts` carries at least one meaningful structured fact.
 /// Used to decide whether to surface a `commerce` block at all (honest: no facts =>
 /// no block, never a placeholder).
+///
+/// A merchant counts ONLY when it was observed on the page. Step 6 of
+/// `extract_commerce_offer` derives a host label for every URL that has no seller
+/// name, so counting any merchant made this predicate true for EVERY result and
+/// rendered the honest-null branch unreachable — a blog post shipped a `commerce`
+/// block whose "seller" was never on the page.
 fn data_has_fact(d: &OfferFacts) -> bool {
     d.price.is_some()
         || d.price_low.is_some()
         || d.currency.is_some()
         || d.availability.is_some()
-        || d.merchant.is_some()
+        || (d.merchant.is_some() && d.merchant_observed)
         || d.condition.is_some()
         || d.sku.is_some()
         || d.gtin.is_some()
@@ -21616,6 +21644,52 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(p["source"].is_null(), "no source claimed for a null fact");
         assert!(p["data"].is_null(), "no data claimed for a null fact");
         assert_eq!(p["url"].as_str().unwrap(), "https://blog.example.com/post");
+    }
+
+    /// REGRESSION (this card): the host-derived merchant must not count as a fact
+    /// on its own, or EVERY result with a URL ships a `commerce` block and the
+    /// honest-null branch above is dead code. `data_has_fact` used to test
+    /// `merchant.is_some()`, which step 6 makes true for every URL.
+    #[test]
+    fn host_derived_merchant_alone_is_not_a_fact() {
+        let offer = extract_commerce_offer(HTML_NO_H_PRODUCT, "https://blog.example.com/post");
+        let d = offer.data.as_ref().unwrap();
+        // The display label is still derived — the fallback keeps working...
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        // ...but it is marked as NOT observed, so it cannot be a fact.
+        assert!(!d.merchant_observed, "host label is not an observed merchant");
+        assert!(!data_has_fact(d), "host label alone must not count as a product fact");
+    }
+
+    /// The inverse guard: a page whose ONLY structured fact is a real seller name
+    /// (JSON-LD `seller`, no price) MUST still get a `commerce` block. This locks
+    /// the root-cause fix against a "weaker" variant that simply dropped `merchant`
+    /// from `data_has_fact`.
+    #[test]
+    fn observed_merchant_alone_still_counts_as_a_fact() {
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{ "@context": "https://schema.org/", "@type": "Product",
+  "name": "Seller Only",
+  "seller": { "@type": "Organization", "name": "Acme Seller" } }
+</script></head><body></body></html>"#;
+        let offer = extract_commerce_offer(html, "https://shop.example.com/p/1");
+        let d = offer.data.as_ref().unwrap();
+        assert_eq!(d.merchant.as_deref(), Some("Acme Seller"));
+        assert!(d.merchant_observed, "JSON-LD seller is an observed merchant");
+        assert!(
+            data_has_fact(d),
+            "an observed seller name alone is still a real product fact"
+        );
+    }
+
+    /// A page that DOES expose product facts alongside a host fallback still
+    /// attaches its block (the fix must not over-correct into dropping facts).
+    #[test]
+    fn real_fact_with_host_fallback_still_attaches() {
+        let offer = extract_commerce_offer(HTML_SINGLE_OFFER, "https://shop.example.com/p/widget");
+        let d = offer.data.as_ref().unwrap();
+        assert!(data_has_fact(d), "a real price must still count as a fact");
     }
 
     /// REGRESSION (real bug, 2026-09-26): `commerce` was null on 100% of live
