@@ -49,6 +49,68 @@ jobs:
         working-directory: services/gateway
         run: cargo test --locked
 
+      # RESTORED (was lost when the round branch's ci.yml was overwritten by
+      # 00f6a1f): the no-manipulation guarantee is only real if the
+      # order-invariance tests actually RUN. This repo has twice reported a
+      # green build while those tests were absent from the branch, and the
+      # price-honesty guard (card t_6be23d48) is worthless if a future edit
+      # renames or drops the tests that prove it.
+      #
+      # `if: always()`, NOT the default `success()`: the step is skipped
+      # whenever the step before it fails, and the failure that matters here is
+      # exactly a red suite. A guard that only speaks up on green is no guard.
+      - name: Assert the order-invariance + price-honesty guards actually ran
+        if: always()
+        working-directory: services/gateway
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          { cargo test --locked real_data_ 2>&1 || true; } | tee "$log"
+
+          missing=0
+          for t in \
+            real_data_order_is_invariant_for_every_network_key_on_and_off \
+            real_data_whole_config_order_invariant_keys_present_vs_absent \
+            real_data_broad_queries_never_decorate_and_never_reorder \
+            real_data_model_shape_accepts_models_and_rejects_non_model_numbers
+          do
+            if ! grep -q "$t" "$log"; then
+              echo "::error::order-invariance test '$t' did not run — the no-reorder guarantee is UNENFORCED on this branch"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          # A zero-match run is a vacuous pass, not a pass.
+          ran=$(grep -cE '^test real_data_.* \.\.\. ok$' "$log" || true)
+          if [ "$ran" -lt 4 ]; then
+            echo "::error::expected 4 real_data_ tests to pass, saw ${ran} — the commerce config is probably empty and the comparison is vacuous"
+            exit 1
+          fi
+          echo "order-invariance guard: ${ran}/4 tests executed and passed"
+
+          # The price-honesty contract (card t_6be23d48): the gateway must never
+          # serve a top-level price that its own page extraction did not verify.
+          log2=$(mktemp)
+          { cargo test --locked commerce_contract_tests:: 2>&1 || true; } | tee "$log2"
+          honesty_missing=0
+          for t in \
+            unverified_index_price_is_not_serialised \
+            verified_page_price_replaces_conflicting_index_price \
+            kept_price_always_carries_an_observation_timestamp \
+            price_range_never_collapses_to_a_single_top_level_price \
+            reconcile_never_reorders_or_drops_results \
+            shopping_enrichment_nulls_the_unverified_stale_price \
+            shopping_enrichment_serves_the_page_price_when_the_fetch_succeeds
+          do
+            if ! grep -qE "^test commerce_contract_tests::${t} \.\.\. ok$" "$log2"; then
+              echo "::error::price-honesty test '$t' did not PASS — an unverified crawl-index price can be served as a page fact"
+              honesty_missing=1
+            fi
+          done
+          [ "$honesty_missing" -eq 0 ] || exit 1
+          echo "price-honesty guard: 7/7 tests executed and passed"
+
   schema-regression:
     name: API schema regression (live gateway contract)
     runs-on: ubuntu-latest
