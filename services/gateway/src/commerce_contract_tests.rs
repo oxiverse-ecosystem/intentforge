@@ -554,11 +554,7 @@ fn item6_bid_floor_and_fallback_appended_and_reported() {
         assert!(lower.contains("bf=0.10"), "bid floor must be appended: {}", u);
         assert!(
             lower.contains("fbu=https%3a%2f%2fshop.acme-electronics.com%2ffallback")
-<<<<<<< HEAD
                 || lower.contains("fbu=https%3A%2F%2Fshop.acme-electronics.com%2Ffallback"),
-=======
-                            || lower.contains("fbu=https%3A%2F%2Fshop.acme-electronics.com%2Ffallback"),
->>>>>>> efeae13 (fix(commerce): never send a user to a documentation host on a bid miss)
             "fallback url must be url-encoded and appended: {}",
             u
         );
@@ -713,7 +709,6 @@ fn item5_no_comparison_without_shared_id() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-<<<<<<< HEAD
 // NO-MISREPRESENTATION: a fallback destination must never be a placeholder.
 //
 // `fallback_url` (Sovrn `fbu`) is where a user is SENT when a link's bid does
@@ -770,108 +765,20 @@ fn reserved_documentation_domains_are_never_valid_fallbacks() {
             !is_reserved_placeholder_url(good),
             "must NOT reject a genuine fallback: {:?}",
             good
-=======
-// HONESTY GUARD — a bid-miss fallback may never point at a documentation host.
-//
-// LIVE DEFECT this locks (measured against localhost:4000 before the fix, not
-// assumed): data/commerce/affiliate.json shipped
-//   "fallback_url": "https://www.example-merchant.com/"
-// `fbu` is the destination a user is actually SENT to when a link's bid does not
-// clear `bf`, so 10/10 results of GET /shopping?q=buy+iphone+15+pro carried
-// fbu=https%3A%2F%2Fwww.example-merchant.com%2F and "fallback": the same value
-// — routing real clicks to a fabricated merchant. `www.example-merchant.com` is
-// IANA documentation space (RFC 2606 §2 / RFC 6761 §6), not a shop.
-//
-// Two layers: the shipped config now says null, and `AffiliateCtx::load()` drops
-// any fallback whose host is in documentation space. These tests cover both, and
-// the last one asserts against the RAW file on disk so it cannot be tautological
-// with the loader guard (reading it through the loader would strip the field
-// before the assertion and stay green no matter what the file says).
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The guard must reject documentation space AND must not over-reject real
-/// merchants that merely contain a reserved word. A guard that disabled
-/// legitimate fallbacks would be a silent monetization regression.
-#[test]
-fn reserved_documentation_domains_are_never_valid_fallbacks() {
-    // Rejected — RFC 2606 §2 / RFC 6761 §6 reserved names and the `example`
-    // documentation prefix (this is the exact shipped placeholder's host).
-    for host in [
-        "www.example-merchant.com",
-        "example.com",
-        "shop.example.com",
-        "example-merchant.co.uk",
-        "example_shop.example.net",
-        "test.example.com",
-        "something.test",
-        "invalid.example.com",
-        "shop.invalid",
-        "localhost",
-        "EXAMPLE.COM",
-        "www.example-merchant.com.",
-    ] {
-        assert!(
-            is_reserved_documentation_host(host),
-            "documentation host must be rejected as a fallback destination: {}",
-            host
-        );
-    }
-
-    // Accepted — real hosts that merely CONTAIN a reserved word, or use it as
-    // part of a longer label. Over-rejecting these would silently strip a
-    // legitimate merchant's fallback.
-    for host in [
-        "notexample.com",
-        "testosterone-shop.com",
-        "invalid-syntax.co.uk",
-        "exampleshop.com",
-        "shop.acme-electronics.com",
-        "myexample-domain.co.uk",
-    ] {
-        assert!(
-            !is_reserved_documentation_host(host),
-            "real merchant host must NOT be rejected: {}",
-            host
->>>>>>> efeae13 (fix(commerce): never send a user to a documentation host on a bid miss)
         );
     }
 }
 
-<<<<<<< HEAD
 /// The end-to-end regression: a network configured with a placeholder fallback
 /// must emit NO `fbu` param and NO `fallback` field, while still decorating the
 /// result normally (graceful degradation, never a crash, never a dead link).
-=======
-/// `url_host` must isolate the authority from scheme/userinfo/port/path, or the
-/// guard above would compare against the wrong string.
-#[test]
-fn url_host_extracts_the_authority() {
-    assert_eq!(url_host("https://www.example-merchant.com/"), "www.example-merchant.com");
-    assert_eq!(url_host("http://Shop.ACME.com:8443/deal?id=1"), "shop.acme.com");
-    assert_eq!(url_host("https://user:pw@example.net/x"), "example.net");
-    assert_eq!(url_host("example.org"), "example.org");
-    // A reserved name in the PATH or QUERY must not condemn a real host.
-    assert!(!is_reserved_documentation_host(&url_host(
-        "https://shop.acme.com/p/example-deals"
-    )));
-}
-
-/// End-to-end through the real `decorate_affiliate`: a network carrying a
-/// documentation-space fallback must decorate WITHOUT `fbu`, and must still be
-/// wrapped, still carry `bf`, and still be disclosed. The FIELD is dropped, the
-/// network is not.
->>>>>>> efeae13 (fix(commerce): never send a user to a documentation host on a bid miss)
 #[test]
 fn placeholder_fallback_never_reaches_a_decorated_result() {
     std::env::set_var("CONTRACT_PLACEHOLDER_FBU_KEY", "CONTRACT_PLACEHOLDER_FBU_KEY");
     let mut params = HashMap::new();
     params.insert("cuid".to_string(), "{subid}".to_string());
 
-<<<<<<< HEAD
     // Sanitize exactly as `AffiliateCtx::load()` does for a data-file row.
-=======
-    // Reproduce the loader guard, then prove the decorated output is clean.
->>>>>>> efeae13 (fix(commerce): never send a user to a documentation host on a bid miss)
     let mut net = contract_net_with_bf(
         "wrap",
         "https://sovrn.co?key={key}&u={url}",
@@ -880,7 +787,6 @@ fn placeholder_fallback_never_reaches_a_decorated_result() {
         Some("0.10"),
         Some("https://www.example-merchant.com/"),
     );
-<<<<<<< HEAD
     if net
         .fallback_url
         .as_deref()
@@ -892,31 +798,16 @@ fn placeholder_fallback_never_reaches_a_decorated_result() {
     let ctx = AffiliateCtx { networks: vec![net] };
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
-=======
-    if let Some(fbu) = net.fallback_url.clone() {
-        if is_reserved_documentation_host(&url_host(&fbu)) {
-            net.fallback_url = None;
-        }
-    }
-    let ctx = AffiliateCtx { networks: vec![net] };
-
-    let mut payload = representative_shopping_payload("buy wireless earbuds under 200");
->>>>>>> efeae13 (fix(commerce): never send a user to a documentation host on a bid miss)
     if let Some(arr) = payload.get_mut("results").and_then(|v| v.as_array_mut()) {
         decorate_affiliate(arr, &ctx);
     }
 
     let urls = collect_affiliate_urls(&payload);
-<<<<<<< HEAD
     assert!(!urls.is_empty(), "decoration must still happen (graceful, not broken)");
-=======
-    assert!(!urls.is_empty(), "decoration must still have happened");
->>>>>>> efeae13 (fix(commerce): never send a user to a documentation host on a bid miss)
     for u in &urls {
         let lower = u.to_lowercase();
         assert!(
             !lower.contains("fbu="),
-<<<<<<< HEAD
             "a placeholder fallback must NEVER be appended as fbu: {}",
             u
         );
@@ -962,75 +853,10 @@ fn shipped_affiliate_data_file_has_no_placeholder_fallback() {
                 "shipped network {:?} configures a documentation-placeholder fallback {:?}; \
                  it would route real clicks to a non-existent merchant",
                 net.id,
-=======
-            "no fbu may reach a decorated result: {}",
-            u
-        );
-        assert!(
-            !lower.contains("example-merchant"),
-            "no documentation host may reach a decorated result: {}",
-            u
-        );
-        // Nothing else regressed: wrapping + bid floor + disclosure all survive.
-        assert!(lower.contains("bf=0.10"), "bf must survive: {}", u);
-    }
-    for r in payload["results"].as_array().unwrap() {
-        let aff = r.get("affiliate").expect("affiliate block present");
-        assert_eq!(
-            aff.get("disclosed").and_then(|v| v.as_bool()),
-            Some(true),
-            "disclosure must stay true when the fallback is dropped"
-        );
-        assert_eq!(
-            aff.get("bid_floor").and_then(|v| v.as_str()),
-            Some("0.10"),
-            "bid_floor still surfaced for reporting"
-        );
-        assert!(
-            aff.get("fallback").is_none(),
-            "no fallback field may be reported for a dropped placeholder"
-        );
-    }
-}
-
-/// The SHIPPED data file must not reintroduce a documentation destination. This
-/// reads the raw file on disk — deliberately NOT through `AffiliateCtx::load()`,
-/// which is the very thing being guarded, so the assertion can fail.
-/// Guarded non-vacuous: if the file is absent the test fails loudly rather than
-/// silently passing.
-#[test]
-fn shipped_affiliate_data_file_has_no_placeholder_fallback() {
-    let candidates = [
-        "services/gateway/data/commerce/affiliate.json",
-        "data/commerce/affiliate.json",
-        "/app/data/commerce/affiliate.json",
-    ];
-    let found = candidates
-        .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok())
-        .expect("shipped data/commerce/affiliate.json must exist for this test to mean anything");
-    let v: Value = serde_json::from_str(&found).expect("affiliate.json must be valid JSON");
-    let networks = v
-        .get("networks")
-        .and_then(|n| n.as_array())
-        .expect("affiliate.json must contain a networks array");
-    assert!(!networks.is_empty(), "shipped file must ship networks");
-
-    for n in networks {
-        let id = n.get("id").and_then(|i| i.as_str()).unwrap_or("<no id>");
-        if let Some(fbu) = n.get("fallback_url").and_then(|f| f.as_str()) {
-            assert!(
-                !is_reserved_documentation_host(&url_host(fbu)),
-                "network '{}' ships a fallback_url ({}) inside IANA documentation space — \
-                 fbu is where a user is SENT on a bid miss, so it must be a real merchant \
-                 or null",
-                id,
->>>>>>> efeae13 (fix(commerce): never send a user to a documentation host on a bid miss)
                 fbu
             );
         }
     }
-<<<<<<< HEAD
     // And the loader itself must have stripped any such value, so nothing
     // downstream (URL building OR the reported block) can ever see it.
     assert!(
@@ -1039,7 +865,5 @@ fn shipped_affiliate_data_file_has_no_placeholder_fallback() {
             .all(|n| n.fallback_url.as_deref().map(|u| !is_reserved_placeholder_url(u)).unwrap_or(true)),
         "AffiliateCtx::load() must strip reserved placeholder fallbacks"
     );
-=======
->>>>>>> efeae13 (fix(commerce): never send a user to a documentation host on a bid miss)
 }
 

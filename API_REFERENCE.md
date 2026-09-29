@@ -1657,7 +1657,6 @@ Top result (truncated):
 > from the network's data-configured `bid_floor` / `fallback_url` fields and are for
 > reporting / fallback only — they never affect ranking.
 
-<<<<<<< HEAD
 > **No fabricated fallback destinations.** `fbu` is where a user is *sent* when a
 > link's bid does not clear `bf`. A fallback pointing at an IANA-reserved
 > documentation domain (RFC 2606/6761 — `example.com`, `*.example`, `.test`,
@@ -1669,40 +1668,6 @@ Top result (truncated):
 > passes through untouched. Locked in CI by
 > `shipped_affiliate_data_file_has_no_placeholder_fallback` and
 > `placeholder_fallback_never_reaches_a_decorated_result`.
-=======
-#### `fbu` may never point at a documentation host (honesty guard)
-
-`fbu` is the destination a user is **actually sent to** when a link's bid does not
-clear `bf`. It is therefore a user-facing merchant destination, and it is held to the
-same honesty standard as any other product fact: it must be a real merchant.
-
-At load time (`AffiliateCtx::load()`) any network's `fallback_url` whose **host** is in
-IANA-reserved documentation space (RFC 2606 §2 / RFC 6761 §6) is **dropped** — the
-field, not the network. Wrapping, `bf`, and `disclosed: true` all keep working, and the
-result is still decorated and returned.
-
-- Rejected: a label exactly equal to a reserved name (`example`, `test`, `invalid`,
-  `localhost`), or a label beginning with the `example` documentation prefix plus a
-  separator (`example-merchant`, `example_shop`).
-- Matching is **label-boundary**, never substring, and the prefix rule applies **only**
-  to `example` (the one documented prefix). `test` and `invalid` are reserved *names*,
-  so real hosts that merely contain them — `testosterone-shop.com`,
-  `invalid-syntax.co.uk`, `notexample.com` — are accepted. Over-rejecting a legitimate
-  merchant's fallback would itself be a monetization defect.
-
-Consequences visible in the API: a result decorated by a network whose `fallback_url`
-was dropped carries **no** `fbu=` query param and **no** `fallback` field on its
-`affiliate` block. `bf` and `disclosed` are unaffected.
-
-The shipped `data/commerce/affiliate.json` sets `"fallback_url": null` for every
-network. The guard exists so an *edit to the data file* (the supported way to configure
-a network) cannot silently reintroduce a fabricated destination. Locked in CI by
-`reserved_documentation_domains_are_never_valid_fallbacks`,
-`url_host_extracts_the_authority`, `placeholder_fallback_never_reaches_a_decorated_result`,
-and `shipped_affiliate_data_file_has_no_placeholder_fallback` (the last asserts against
-the **raw file on disk**, not through the loader, so it cannot be tautological with the
-guard it verifies).
->>>>>>> efeae13 (fix(commerce): never send a user to a documentation host on a bid miss)
 
 **No-manipulation guarantee (verified live):** the ranked URL order from
 `/shopping` is byte-identical to `/search` for the same query. This is locked in CI
