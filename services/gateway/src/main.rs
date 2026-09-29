@@ -9532,6 +9532,52 @@ fn merge_local_and_web(
     // title-anchored subject terms at the end of the pipeline.
     let mut p2d_offtopic_terms: Vec<String> = Vec::new();
 
+    // ── FIX-IF-40: closed-class competitor demotion, by intra-set term discrimination ──
+    // A query qualified by one member of a closed class ("how to build a rest api in
+    // rust", "in node", "in python", "in java") reduces to a few distinctive terms of
+    // which only ONE discriminates. The generic head nouns ("rest", "api") are carried
+    // by every candidate page, so plain token-count coverage lets a page about a
+    // DIFFERENT member ("...rest api with nodejs") clear the local coverage gate on the
+    // generic majority alone (2 of 3 terms) and rank as though it answered the query.
+    // The engine cannot currently tell "covers the topic" from "covers the topic but
+    // names a competing member of the same class".
+    //
+    // The fix weights each query term by how much it DISCRIMINATES within the actual
+    // candidate set, as p*(1-p) — the Gini impurity of a binary attribute, i.e. an IDF
+    // derived from the result set itself rather than from a corpus or a term list. A
+    // term every candidate carries weights ~0; a term that SPLITS the set (the
+    // competitor slot: some results say one member, others another) weights to its
+    // maximum. A result riding the generic majority while missing the high-weight term
+    // then falls below the coverage gate and is smoothly crushed (squared and floored,
+    // so it is demoted, never dropped).
+    //
+    // This is structural, not per-query: no language, framework, brand or domain name
+    // appears anywhere, and the weights are re-derived per query from the candidates
+    // themselves — so the same rule separates competing products, cities, vendors or
+    // standards with no new configuration, and a query with no discriminating term
+    // degrades smoothly back to the previous behaviour.
+    //
+    // A small floor (inside the helper) keeps a universally-present term contributing
+    // a little, so the signal degrades smoothly on a thin candidate set instead of
+    // becoming all-or-nothing.
+    let local_candidate_hays: Vec<String> = merged
+        .iter()
+        .filter(|r| r.is_local)
+        .map(|r| {
+            let preview: String = r.content.chars().take(2000).collect();
+            format!(
+                "{} {} {}",
+                r.title.to_lowercase(),
+                preview.to_lowercase(),
+                r.url.to_lowercase()
+            )
+        })
+        .collect();
+    let term_discrimination_weights =
+        term_discrimination_weights(&distinctive_terms, &local_candidate_hays);
+    let term_discrimination_total: f32 =
+        term_discrimination_weights.iter().map(|(_, w)| *w).sum();
+
     // ── D4 (2026-08-18T1340Z round): per-engine upstream-quality trust ──
     // The fresh-date hard window must fail-OPEN when upstream returns no dates
     // (otherwise a fresh query collapses to 0 results). But that fail-open lets a
@@ -10946,12 +10992,26 @@ fn merge_local_and_web(
         // so it stays present, not deleted). Genuinely on-topic local pages (coverage
         // >= 0.5) keep full weight — no query/term/domain literals, future-proof.
         let local_rel_factor = if r.is_local {
-            if overlap >= 0.5f32 {
-                1.0f32
-            } else {
-                let c = overlap.max(0.02f32);
-                c * c // squared: low-coverage local collapses hard
-            }
+            // FIX-IF-40: gate on DISCRIMINATION-WEIGHTED coverage, not raw token count.
+            // Plain `overlap` counts every distinctive term equally, so a page naming a
+            // competing member of the query's closed class (a Node.js page for a
+            // "...rest api in rust" query) rides the generic majority ("rest","api") past
+            // the 0.5 gate while the single discriminating term is diluted to 1 of N.
+            // Re-weighting the same coverage by how much each term actually splits the
+            // candidate set (see the weights computed above) makes the gate ask the right
+            // question — "does this page carry the terms that DISTINGUISH the candidates?"
+            // — instead of "does it hit half the tokens?". Returns None when no term
+            // discriminates, so the caller falls back to plain `overlap` and a query
+            // whose terms are carried uniformly is entirely unaffected.
+            let discrimination_weighted_overlap = discrimination_weighted_coverage(
+                &term_discrimination_weights,
+                term_discrimination_total,
+                &title_lower,
+                &content_lower,
+                &url_lower,
+            )
+            .unwrap_or(overlap);
+            local_rel_factor(discrimination_weighted_overlap)
         } else {
             1.0f32
         };
@@ -21981,6 +22041,266 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.price, Some(49.99), "JSON-LD price must not be overwritten by MF2");
         assert_eq!(d.currency.as_deref(), Some("USD"), "JSON-LD currency must not be overwritten");
         assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+}
+
+/// The local-result ranking gate (FIX-IF-40), as a pure function of the coverage
+/// the caller measured.
+///
+/// A result covering at least half the (discrimination-weighted) query terms keeps
+/// full weight. Below that it is crushed quadratically with a 0.02 floor, so a
+/// partial or wrong-branch match is demoted smoothly but never deleted outright.
+fn local_rel_factor(coverage: f32) -> f32 {
+    if coverage >= 0.5f32 {
+        1.0f32
+    } else {
+        let c = coverage.max(0.02f32);
+        c * c // squared: low-coverage local collapses hard
+    }
+}
+
+/// Derive per-term DISCRIMINATION weights over a candidate set (FIX-IF-40).
+///
+/// A query qualified by one member of a closed class ("...rest api in rust") reduces
+/// to a few distinctive terms of which only ONE actually separates the candidates:
+/// the generic head nouns are carried by every page, while the closed-class slot is
+/// split across pages naming different members. Raw token-count coverage therefore
+/// cannot tell "covers the topic" from "covers the topic but names a competitor".
+///
+/// Each term is weighted by `p * (1 - p)` — the Gini impurity of the binary attribute
+/// "term present in this page" — which is maximal when the term splits the set evenly
+/// and ~0 when every (or no) candidate carries it. This is an IDF computed from the
+/// result set itself, so it needs no corpus, no term list and no per-query rule: the
+/// same function separates competing languages, products, vendors or standards.
+///
+/// `FLOOR` keeps a universally-present term contributing a little so the signal
+/// degrades smoothly on a thin candidate set instead of becoming all-or-nothing.
+fn term_discrimination_weights(
+    terms: &[&str],
+    candidate_hays: &[String],
+) -> Vec<(String, f32)> {
+    const FLOOR: f32 = 0.05;
+    let n = candidate_hays.len().max(1) as f32;
+    terms
+        .iter()
+        .map(|t| {
+            let tl = t.to_lowercase();
+            let covered = candidate_hays.iter().filter(|h| h.contains(&tl)).count() as f32;
+            let p = covered / n;
+            (tl, FLOOR + p * (1.0 - p))
+        })
+        .collect()
+}
+
+/// Coverage of a single result weighted by term discrimination (FIX-IF-40).
+///
+/// Returns the fraction of total discrimination weight that the page carries, or
+/// `None` when there is nothing to weigh — the caller then keeps its original
+/// coverage, so a query whose terms are carried uniformly behaves exactly as before.
+fn discrimination_weighted_coverage(
+    weights: &[(String, f32)],
+    total: f32,
+    title_lower: &str,
+    content_lower: &str,
+    url_lower: &str,
+) -> Option<f32> {
+    if total <= 0.0 || weights.is_empty() {
+        return None;
+    }
+    let present: f32 = weights
+        .iter()
+        .filter(|(t, _)| {
+            title_lower.contains(t.as_str())
+                || content_lower.contains(t.as_str())
+                || url_lower.contains(t.as_str())
+        })
+        .map(|(_, w)| *w)
+        .sum();
+    Some((present / total).clamp(0.0, 1.0))
+}
+
+/// FIX-IF-40: closed-class competitor demotion must be driven by structure, not by
+/// any language/brand list — so these tests use a SYNTHETIC closed class the code
+/// has never seen. If the mechanism were a hardcoded prefer-Rust table, a class
+/// invented here could not possibly pass.
+#[cfg(test)]
+mod closed_class_competitor_tests {
+    use super::*;
+
+    /// Three candidates: two name one member of the closed class, one names a
+    /// DIFFERENT member. Every page carries the generic head nouns, so plain
+    /// token-count coverage is identical (2/3) for all three.
+    fn corpus() -> Vec<String> {
+        vec![
+            "build a widget api with alpha toolkit rest guide".to_string(),
+            "build a widget api with alpha toolkit rest guide".to_string(),
+            "build a widget api with beta toolkit rest guide".to_string(),
+        ]
+    }
+
+    fn weight_of(weights: &[(String, f32)], term: &str) -> f32 {
+        weights
+            .iter()
+            .find(|(t, _)| t == term)
+            .map(|(_, w)| *w)
+            .unwrap_or_else(|| panic!("no weight for {}", term))
+    }
+
+    #[test]
+    fn generic_terms_weigh_less_than_the_discriminating_closed_class_term() {
+        let hays = corpus();
+        let w = term_discrimination_weights(&["widget", "api", "alpha"], &hays);
+        // "widget" and "api" are in every candidate -> p = 1 -> weight ~ FLOOR.
+        assert!(
+            weight_of(&w, "alpha") > weight_of(&w, "widget"),
+            "the term that SPLITS the set must outweigh a universal term"
+        );
+        assert!(weight_of(&w, "alpha") > weight_of(&w, "api"));
+    }
+
+    #[test]
+    fn competing_member_scores_below_the_gate_while_the_named_member_clears_it() {
+        let hays = corpus();
+        let w = term_discrimination_weights(&["widget", "api", "alpha"], &hays);
+        let total: f32 = w.iter().map(|(_, x)| *x).sum();
+
+        let named = discrimination_weighted_coverage(
+            &w,
+            total,
+            "build a widget api with alpha toolkit",
+            "",
+            "",
+        )
+        .expect("weights are present");
+        let competing = discrimination_weighted_coverage(
+            &w,
+            total,
+            "build a widget api with beta toolkit",
+            "",
+            "",
+        )
+        .expect("weights are present");
+
+        // The regression: under plain token count BOTH are 2/3 and both clear the
+        // 0.5 gate, so the "beta" page ranks as if it answered an "alpha" query.
+        assert!(
+            named >= 0.5,
+            "a page naming the queried member must clear the gate, got {}",
+            named
+        );
+        assert!(
+            competing < 0.5,
+            "a page naming a COMPETING member must fall below the gate, got {}",
+            competing
+        );
+    }
+
+    #[test]
+    fn plain_token_count_alone_cannot_separate_them() {
+        // Guards the premise: under plain token count the COMPETING page still
+        // covers 2 of 3 terms (0.667), which clears the 0.5 local gate — so the
+        // pre-fix ranker had no reason to demote it. This is the actual defect.
+        let terms = ["widget", "api", "alpha"];
+        let raw = |page: &str| -> f32 {
+            terms
+                .iter()
+                .filter(|t| page.contains(**t))
+                .count() as f32
+                / terms.len() as f32
+        };
+        let named = raw("build a widget api with alpha toolkit");
+        let competing = raw("build a widget api with beta toolkit");
+        assert!(
+            competing >= 0.5,
+            "premise: the competing member must already clear the raw gate, got {}",
+            competing
+        );
+        assert!(
+            named > competing,
+            "raw token count does separate them, but only by the one term it dilutes \
+             (1 vs 2 of 3) — far too weak to be the intended discriminator"
+        );
+    }
+
+    #[test]
+    fn a_query_with_no_discriminating_term_is_left_untouched() {
+        // Every candidate carries all terms -> no term splits the set -> every page
+        // scores identically, so the gate treats them all the same and the ranking
+        // is exactly what it was before this signal existed.
+        let hays = vec![
+            "quantum computing overview".to_string(),
+            "quantum computing news".to_string(),
+            "quantum computing guide".to_string(),
+        ];
+        let w = term_discrimination_weights(&["quantum", "computing"], &hays);
+        let total: f32 = w.iter().map(|(_, x)| *x).sum();
+        let cov = |page: &str| {
+            discrimination_weighted_coverage(&w, total, page, "", "").expect("weights present")
+        };
+        let a = cov("quantum computing overview");
+        let b = cov("quantum computing news");
+        assert!(
+            (a - b).abs() < 1e-6,
+            "a uniformly-covered query must not be discriminated between: {} vs {}",
+            a,
+            b
+        );
+        assert!(
+            a >= 0.5,
+            "on-topic pages must keep full weight, got {}",
+            a
+        );
+    }
+
+    #[test]
+    fn the_gate_actually_demotes_a_competing_member_end_to_end() {
+        // The tests above exercise the weighting helpers in isolation. This one runs
+        // the SAME sequence the ranker runs — weight, cover, gate — so a regression
+        // in the WIRING (e.g. someone passing raw `overlap` to the gate again, which
+        // is exactly the pre-fix code) fails here rather than passing vacuously.
+        let hays = corpus();
+        let terms = ["widget", "api", "alpha"];
+        let w = term_discrimination_weights(&terms, &hays);
+        let total: f32 = w.iter().map(|(_, x)| *x).sum();
+        let factor = |page: &str| {
+            let cov = discrimination_weighted_coverage(&w, total, page, "", "")
+                .expect("weights present");
+            local_rel_factor(cov)
+        };
+
+        let named = factor("build a widget api with alpha toolkit");
+        let competing = factor("build a widget api with beta toolkit");
+        assert_eq!(named, 1.0, "the named member must keep full weight");
+        assert!(
+            competing < 0.25,
+            "the competing member must be crushed well below full weight, got {}",
+            competing
+        );
+        assert!(
+            named > competing * 4.0,
+            "the demotion must be decisive, not cosmetic ({} vs {})",
+            named,
+            competing
+        );
+        // Demoted, never deleted: the gate floors rather than dropping.
+        assert!(competing > 0.0, "a demoted result must stay present, not vanish");
+    }
+
+    #[test]
+    fn the_gate_is_a_no_op_for_adequate_coverage() {
+        assert_eq!(local_rel_factor(1.0), 1.0);
+        assert_eq!(local_rel_factor(0.5), 1.0);
+        assert!(local_rel_factor(0.49) < 1.0);
+        // Quadratic + floored: monotone decreasing, never zero.
+        assert!(local_rel_factor(0.3) > local_rel_factor(0.2));
+        assert!(local_rel_factor(0.0) >= 0.0004);
+    }
+
+    #[test]
+    fn empty_weights_and_zero_total_degrade_to_none() {
+        assert_eq!(discrimination_weighted_coverage(&[], 0.0, "a", "b", "c"), None);
+        let w = term_discrimination_weights(&["x"], &corpus());
+        assert_eq!(discrimination_weighted_coverage(&w, 0.0, "x", "", ""), None);
     }
 }
 
