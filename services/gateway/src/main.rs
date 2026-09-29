@@ -9118,6 +9118,24 @@ fn is_weak_anchor_word(w: &str) -> bool {
         "students", "dog", "cat", "phone", "computer", "shoe", "watch", "tv",
         "car", "bike", "exercise", "workout", "sleep", "skin", "hair", "plant",
         "garden", "window", "door", "wall", "floor", "paint", "wood", "metal",
+        // Comparative/selection framing words (round auto/round-2026-09-29T1239Z).
+        // These name the SHAPE of a question, never its subject: in "what is the
+        // difference between optimistic and pessimistic locking", "difference" is
+        // the interrogative frame while "optimistic"/"pessimistic"/"locking" are
+        // the topic. Allowed to anchor, a page that merely DEFINES the word
+        // outranks every page about the real subject -- the round's top hits for
+        // that query were four Japanese-English dictionary entries for the word
+        // "difference" (kotobank, Weblio, nativecamp), and "how to choose a
+        // message queue" surfaced Weblio entries for "choose". Same class as the
+        // other weak anchors above. General question-framing vocabulary; no
+        // query- or domain-specific entries.
+        "difference", "differences", "compare", "compares", "compared",
+        "comparison", "comparisons", "versus", "vs", "distinction",
+        "distinctions", "choose", "choosing", "chosen", "choice", "choices",
+        "select", "selecting", "selected", "selection", "pick", "picking",
+        "meaning", "meanings", "definition", "definitions", "define",
+        "defined", "explained", "explain", "explains", "alternative",
+        "alternatives", "overview", "introduction", "summary", "summaries",
     ];
     WEAK.contains(&w)
 }
@@ -9426,6 +9444,10 @@ fn merge_local_and_web(
         "warning", "warnings", "sign", "signs", "symptom", "symptoms",
         "cause", "causes", "reason", "reasons", "effect", "effects",
         "impact", "impacts", "solution", "solutions", "problem", "problems",
+        // Comparative/selection framing words (difference/choose/compare/...) are
+        // seeded once in is_weak_anchor_word, which is the gate that decides the
+        // strong topic anchor. They are not repeated here so the two lists cannot
+        // drift apart.
     ].iter().copied().collect();
 
     // Temporal / recency framing words: carry NO topical signal — they express WHEN
@@ -22684,6 +22706,39 @@ mod kb_gibberish_mixed_tests {
             last_attempt_start + ATTEMPT_BUDGET_MS <= overall,
             "final attempt must finish inside the overall budget"
         );
+    }
+
+    // QUESTION-FRAMING ANCHORS (round auto/round-2026-09-29T1239Z). A
+    // comparative/selection word names the SHAPE of the question, not its
+    // subject. When such a word is allowed to act as a topic anchor, pages
+    // that merely DEFINE that word outrank every page about the real subject:
+    // "what is the difference between optimistic and pessimistic locking"
+    // returned four Japanese-English dictionary entries for "difference" at
+    // the top. These must be excluded from the mandatory topic gate, exactly
+    // like the existing warning/sign framing words.
+    #[test]
+    fn comparative_framing_words_are_not_topic_anchors() {
+        // The words that must never anchor relevance on their own.
+        for w in [
+            "difference", "differences", "compare", "comparison", "versus", "vs",
+            "distinction", "choose", "choice", "select", "selection", "meaning",
+            "definition", "explain", "explained", "alternative", "alternatives",
+        ] {
+            assert!(
+                is_weak_anchor_word(w),
+                "'{}' is question framing, not a topic: it must not anchor relevance",
+                w
+            );
+        }
+        // Guard against over-reach: the actual SUBJECT terms of those queries
+        // must remain valid anchors, or the fix would gut real relevance.
+        for w in ["optimistic", "pessimistic", "locking", "databases", "queue", "message"] {
+            assert!(
+                !is_weak_anchor_word(w),
+                "'{}' is a real subject term and must stay a valid anchor",
+                w
+            );
+        }
     }
 }
 
