@@ -7444,6 +7444,103 @@ const NEG_SCOPE_DETERMINERS: &[&str] = &[
     "our", "this", "that", "these", "those", "such", "much", "many", "more", "less",
 ];
 
+/// PROX (this round): PROXIMITY DEIXIS — closed-class locative markers that bind
+/// a noun phrase to the SPEAKER'S CURRENT LOCATION rather than to the result's
+/// properties. They are the grammatical form of "in my area": the phrase
+/// "no charging point nearby" asserts that no charging point exists around the
+/// user, so the pages that answer the question are precisely the ones that
+/// DISCUSS charging points nearby. Hard-excluding that phrase removes the answer
+/// and leaves noise.
+///
+/// This is a closed grammatical class (spatial deixis adverbs and prepositions),
+/// not a per-query vocabulary: it is the same kind of structural seed as
+/// `CONTENT_NEGATION_MARKERS` / `NEG_SCOPE_DETERMINERS` next to it, and the
+/// search over the negated scope below — not a keyword list — decides whether it
+/// fires. Multi-word markers are stored space-separated and matched against the
+/// token window.
+const PROXIMITY_DEIXIS_MARKERS: &[&str] = &[
+    "nearby", "near", "close", "around", "local", "locally", "neighbourhood",
+    "neighborhood", "vicinity", "area", "district", "surroundings", "street",
+    "block", "walking", "commute", "here", "there", "downtown", "suburb",
+];
+
+/// Multi-word proximity-deixis markers, matched as a contiguous token run
+/// inside the negated scope.
+const PROXIMITY_DEIXIS_PHRASES: &[&str] = &[
+    "walking distance", "close to home", "close to me", "near me", "near my",
+    "near the", "around here", "around my", "in this area", "in my area",
+    "in the area", "in my city", "in this city", "close by", "closeby",
+    "in the vicinity", "around this", "around us", "near us", "near here",
+    "in this neighbourhood", "in my neighbourhood", "in this neighborhood",
+    "in my neighborhood", "short walk", "short drive", "on my street",
+];
+
+/// Does the noun phrase governed by a content-negation marker in `q_orig` carry
+/// a proximity-deixis marker? If it does, the negation is a statement about the
+/// user's surroundings (a situational/contextual qualifier) rather than a
+/// constraint on the content of the result, so it must not become a hard
+/// search exclusion.
+///
+/// The scan mirrors `compound_is_negation_scope_head`: for each content-negation
+/// marker it collects the governed scope up to a boundary, then looks for a
+/// deixis marker inside that window. Requiring the marker to be INSIDE the scope
+/// is what keeps the guard honest — "a restaurant with no parking, somewhere
+/// nearby" has its deixis outside the negated phrase and keeps its exclusion.
+fn negated_scope_is_proximal(q_orig: &str, compound: &str) -> bool {
+    let toks: Vec<String> = q_orig
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect();
+    let comp_lc = compound.to_lowercase();
+    let comp: Vec<&str> = comp_lc
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if comp.is_empty() {
+        return false;
+    }
+    for (i, t) in toks.iter().enumerate() {
+        if !CONTENT_NEGATION_MARKERS.contains(&t.as_str()) {
+            continue;
+        }
+        // One scope per list conjunct, exactly as the head-binding scan models it.
+        let mut scopes: Vec<Vec<&str>> = vec![Vec::new()];
+        for w in &toks[i + 1..] {
+            if NEG_SCOPE_BOUNDARIES.contains(&w.as_str()) {
+                break;
+            }
+            if NEG_SCOPE_LIST_CONNECTORS.contains(&w.as_str()) {
+                scopes.push(Vec::new());
+                continue;
+            }
+            scopes.last_mut().expect("at least one scope").push(w.as_str());
+        }
+        for scope in scopes {
+            // Only the conjunct this compound actually belongs to can be
+            // downgraded. Without this binding, one proximal conjunct
+            // ("no parking nearby") would suppress a genuine sibling exclusion
+            // in the same query ("shoes with no leather and no parking nearby").
+            if scope.len() < comp.len() || scope[scope.len() - comp.len()..] != comp[..] {
+                continue;
+            }
+            for (j, w) in scope.iter().enumerate() {
+                if PROXIMITY_DEIXIS_MARKERS.contains(w) {
+                    return true;
+                }
+                for phrase in PROXIMITY_DEIXIS_PHRASES {
+                    let p: Vec<&str> = phrase.split_whitespace().collect();
+                    if scope[j..].starts_with(&p[..]) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Is `compound` the HEAD of a noun phrase governed by a content-negation marker
 /// in the same query?
 ///
@@ -7617,6 +7714,16 @@ fn is_real_exclusion(
     // "platform") and "car" an exclusion in "compare diesel vs petrol without
     // changing my car insurance" (the head is "insurance").
     if compound_is_negation_scope_head(q_orig, compound) {
+        // PROX (this round): a negation whose scope carries PROXIMITY DEIXIS
+        // ("no charging point nearby", "no parking within walking distance")
+        // states a fact about the user's surroundings, not a constraint on the
+        // result's content — the pages that answer the question are exactly the
+        // ones discussing it. This is checked HERE, at the clause-binding
+        // acceptance that promoted these phrases to hard exclusions, so a bare
+        // "no X" (no deixis, e.g. "shoes with no leather") is untouched.
+        if negated_scope_is_proximal(q_orig, compound) {
+            return false;
+        }
         return true;
     }
     // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
@@ -19307,6 +19414,81 @@ mod constraint_fix_tests {
                 _ => {}
             }
         }
+    }
+
+    /// PROX (this round): a negated noun phrase carrying a PROXIMITY DEIXIS
+    /// marker ("nearby", "near me", "around here", "in this area", "close to
+    /// home", "within walking distance") states a fact about the USER'S
+    /// SURROUNDINGS, not a property the RESULT must lack. Hard-excluding it
+    /// deletes exactly the pages that answer the question: "an electric scooter
+    /// in chennai traffic with no charging point nearby" excluded the phrase
+    /// "charging point nearby", which removed every page mentioning a charging
+    /// point and collapsed the result set to 1.
+    ///
+    /// The separation is structural: the deictic marker must be INSIDE the
+    /// negated scope (between the negation marker and the end of the noun
+    /// phrase). A bare "no X" is still a genuine content constraint
+    /// ("shoes with no leather" excludes leather), so the existing
+    /// `compound_is_negation_scope_head` acceptance is untouched.
+    #[test]
+    fn proximity_deixis_negation_is_situational_not_a_content_exclusion() {
+        for q in [
+            "is it worth buying an electric scooter in chennai traffic with no charging point nearby",
+            "a cafe with no wifi nearby",
+            "an office with no parking nearby",
+            "cars with no service centre around here",
+            "a flat with no lift close to home",
+            "a restaurant with no parking within walking distance",
+        ] {
+            let (kept, _declined, _manner) = extract_query_negative_terms_with_dropped(q);
+            assert!(
+                kept.is_empty(),
+                "a negation carrying proximity deixis describes the user's surroundings, \
+                 not a content filter; it must not become a hard exclusion. q={:?} kept={:?}",
+                q,
+                kept
+            );
+        }
+    }
+
+    /// PROX counter-test: the fix must not weaken a bare content negation that
+    /// has no deictic marker, nor a deictic phrase that is not inside the
+    /// negated scope. Pins both directions so the guard cannot be widened.
+    #[test]
+    fn bare_content_negation_and_out_of_scope_deixis_still_exclude() {
+        for q in [
+            "shoes with no leather",
+            "laptop with no dedicated gpu",
+            "sql query with no join",
+        ] {
+            let (kept, _declined, _manner) = extract_query_negative_terms_with_dropped(q);
+            assert!(
+                !kept.is_empty(),
+                "a bare 'no <noun>' is a genuine content constraint and must survive. q={:?}",
+                q
+            );
+        }
+        // Deixis in a DIFFERENT clause than the negation must not downgrade the
+        // excluded term: "near the station" precedes the negation entirely, so
+        // the negation scope ("parking") carries no deictic marker.
+        let q = "near the station a restaurant with no parking";
+        let (kept, _declined, _manner) = extract_query_negative_terms_with_dropped(q);
+        assert!(
+            kept.iter().any(|k| k.contains("parking")),
+            "deixis outside the negated scope must not downgrade the exclusion. q={:?} kept={:?}",
+            q,
+            kept
+        );
+        // A proximal conjunct must not suppress a genuine sibling conjunct in
+        // the same list — the guard is bound to the compound's own scope.
+        let q = "shoes with no leather and no parking nearby";
+        let (kept, _declined, _manner) = extract_query_negative_terms_with_dropped(q);
+        assert!(
+            kept.iter().any(|k| k.contains("leather")),
+            "a proximal conjunct must not downgrade a non-proximal sibling exclusion. q={:?} kept={:?}",
+            q,
+            kept
+        );
     }
 
     #[test]
