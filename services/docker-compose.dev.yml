@@ -40,7 +40,11 @@ services:
       - "18888:8888/tcp"
       - "8388:8388/tcp"
       - "8080:8080"
-      - "5000:5000"
+      # crawler binds 0.0.0.0:5001 (crawler/src/main.rs, EXPOSE 5001).  The
+      # old "5000:5000" mapping published a port nothing listens on, so every
+      # host-side crawler probe got an empty reply and looked like a crawler
+      # outage.  Map the host port to the port the service actually binds.
+      - "5000:5001"
       - "3000:3000"
       - "4000:4000"
       - "6000:6000"
