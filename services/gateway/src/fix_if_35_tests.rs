@@ -179,6 +179,84 @@ mod fix_if_35_score_normalization_tests {
         );
     }
 
+    #[test]
+    fn answer_page_with_interrogative_title_is_not_demoted() {
+        // OVER-CAPTURE GUARD for fix (B). Plenty of genuine answer pages restate
+        // the question in the title in order to answer it. Demoting on title shape
+        // alone ties them with the question thread — measured 2026-09-30, this
+        // broke the pre-existing `naming_question_forum_thread_demoted_below_answer`
+        // guard. An answer page that carries the full relation must survive.
+        let q = "why is dallas called the big d";
+        let thread = web_res(
+            "https://www.reddit.com/r/Dallas/comments/5kdox1/why_is_dallas_called_the_big_d",
+            "r/Dallas on Reddit: Why is Dallas called the Big D?",
+            "A thread asking why the city is called the Big D.",
+        );
+        let answer = web_res(
+            "https://example.com/dallas-big-d-origin",
+            "Why Is Dallas Called the Big D? The Origin Explained",
+            "Dallas is called the Big D because each letter of the city name was doubled when the railroad came to town in the 1870s.",
+        );
+        let out = merge_local_and_web(
+            vec![],
+            vec![thread, answer],
+            q,
+            "informational",
+            &cst(),
+            None,
+            None,
+            &empty_sem(),
+        );
+        let t = out.iter().find(|r| r.url.contains("reddit.com")).expect("thread missing");
+        let a = out.iter().find(|r| r.url.contains("dallas-big-d-origin")).expect("answer missing");
+        assert!(
+            a.score > t.score,
+            "an interrogative-TITLED answer page was demoted below the question thread: answer={} thread={}",
+            a.score, t.score
+        );
+    }
+
+    #[test]
+    fn question_page_missing_one_side_of_the_relation_is_demoted() {
+        // The general structural test: a naming question names a RELATION, so a page
+        // carrying only one side of it is asking or writing about the namesake for
+        // unrelated reasons. Uses invented entities so the test is not query-tuned.
+        let q = "why is zorblax named after kevren mardell";
+        let asks_only = web_res(
+            "https://example-mag.com/what-famous-engineer-named-zorblax",
+            "What famous engineer is Zorblax named after?",
+            "Readers keep asking us who the district of Zorblax was named for.",
+        );
+        let answer = web_res(
+            "https://example.com/zorblax-name-origin",
+            "Zorblax Name Origin",
+            "Zorblax was named after Kevren Mardell, the engineer who founded the workshop in 1904.",
+        );
+        let out = merge_local_and_web(
+            vec![],
+            vec![asks_only, answer],
+            q,
+            "informational",
+            &cst(),
+            None,
+            None,
+            &empty_sem(),
+        );
+        let bad = out
+            .iter()
+            .find(|r| r.url.contains("example-mag.com"))
+            .expect("question page missing");
+        let a = out
+            .iter()
+            .find(|r| r.url.contains("zorblax-name-origin"))
+            .expect("answer missing");
+        assert!(
+            a.score > bad.score,
+            "a page naming only one side of the relation outranked the answer: answer={} question={}",
+            a.score, bad.score
+        );
+    }
+
     // ── (C) The naming PREDICATE is query structure, not a topic term ─────────
 
     #[test]
@@ -261,7 +339,7 @@ mod fix_if_35_score_normalization_tests {
         );
         let out = merge_local_and_web(
             vec![],
-            vec![server, heli],
+            vec![server.clone(), heli.clone()],
             q,
             "informational",
             &cst(),
@@ -281,7 +359,7 @@ mod fix_if_35_score_normalization_tests {
         let q2 = "why is the ah-64 apache helicopter named apache";
         let out2 = merge_local_and_web(
             vec![],
-            vec![heli, server],
+            vec![heli.clone(), server.clone()],
             q2,
             "informational",
             &cst(),

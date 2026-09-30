@@ -8896,6 +8896,77 @@ fn is_naming_predicate_word(w: &str) -> bool {
 ///   (2) a page that matches the query's dominant proper noun but none of the
 ///       query's OTHER content tokens (an incidental entity mention — e.g. a crime
 ///       story about a person with the surname, or a dealer page for the brand).
+/// Closed-class interrogative (wh-) vocabulary. In a natural-language question the
+/// interrogative word introduces the clause that actually states the REQUEST, so
+/// everything before it is framing (see `first_interrogative_index`). Purely
+/// function-word class — names no entity, brand or topic, and is deliberately the
+/// same closed set `is_naming_question` already keys off, so the two cannot drift.
+const INTERROGATIVES: &[&str] = &[
+    "what", "why", "how", "when", "where", "who", "which", "whom", "whose",
+];
+
+/// Index of the first interrogative token in `words`, if any.
+///
+/// This is the structural anchor for conversational queries (FIX-IF-39). A spoken-style
+/// question wraps the real request in discourse preamble: "hey so my friend asked me the
+/// other day about this whole thing and i was wondering if you could tell me WHAT actually
+/// happens when the water cycle goes through its various stages". The subject of the
+/// question lives in the interrogative clause; the preamble is framing, not topic.
+fn first_interrogative_index(words: &[&str]) -> Option<usize> {
+    words
+        .iter()
+        .position(|w| INTERROGATIVES.contains(&w.to_lowercase().as_str()))
+}
+
+/// Closed-class DISCOURSE-FILLER vocabulary (FIX-IF-39).
+///
+/// Greetings, interjections, back-channel and politeness tokens that a spoken-style
+/// question is padded with. They are grammatical glue with ZERO topical content, and
+/// they are also the highest-collision tokens on the open web: "hey" appears in the
+/// brand names HeyGen / hey.com / Hey Jimmy, "hi" in countless domains, "yo", "wow",
+/// "hmm", "please", "thanks", "well", "just", "literally", "honestly"....
+///
+/// Why they must not be TOPIC terms: a filler token is a lexically real, high-frequency
+/// string, so token-overlap rewards a page merely for CONTAINING it. Measured live
+/// 2026-09-30 on a conversational water-cycle question, a camera shop matching only
+/// "hey" and a video-avatar brand matching "hey"+"you" tied the genuine NOAA/Wikipedia
+/// answers inside the top-5 — the filler WAS the entire lexical overlap of those pages.
+///
+/// Closed-class function-word list: it names no brand, domain or query. Deliberately
+/// separate from `stop_words` (which is grammatical function words) because a filler is
+/// NOT grammatically required — removing it from the query would change its meaning —
+/// but it is equally non-topical for ranking. Adding to the lexicon generalises the rule
+/// to every future conversational query; the engine never had to see one to benefit.
+const DISCOURSE_FILLERS: &[&str] = &[
+    // greetings / vocatives
+    "hey", "hi", "hii", "hello", "yo", "hiya", "greetings", "heya", "howdy",
+    // interjections / back-channel
+    "wow", "oh", "ah", "eh", "hm", "hmm", "huh", "ugh", "oops", "oof", "yikes",
+    "yay", "yep", "yup", "nope", "nah", "uh", "um", "umm", "er",
+    // politeness
+    "please", "thanks", "thank",
+    // intensifiers / hedges: emphasis, not subject matter
+    "really", "honestly", "frankly", "literally", "basically", "essentially",
+    "definitely", "absolutely", "totally", "seriously", "obviously", "clearly",
+    "simply", "quite", "rather", "pretty", "kinda", "sorta", "somewhat",
+];
+
+/// True when `w` is a discourse filler (see DISCOURSE_FILLERS).
+fn is_discourse_filler(w: &str) -> bool {
+    DISCOURSE_FILLERS.contains(&w)
+}
+
+/// Minimum number of tokens that must precede the interrogative before the query is
+/// treated as having a conversational preamble. A short lead-in ("so what is X",
+/// "ok how does Y work") is normal phrasing, not a conversational wrap, and must not
+/// trigger clause narrowing — otherwise every ordinary question would be re-scoped.
+const MIN_CONVERSATIONAL_PREAMBLE_TOKENS: usize = 4;
+
+/// Minimum number of topic terms the interrogative clause must retain for narrowing to
+/// be meaningful. If the clause is mostly framing too, the full-query term set is kept
+/// (fail-open: never narrow away a query's only subject).
+const MIN_CLAUSE_TOPIC_TERMS: usize = 2;
+
 fn is_naming_question(query: &str) -> bool {
     let q = query.to_lowercase();
     let words: Vec<&str> = q.split(|c: char| !c.is_alphanumeric() && c != '\'').collect();
@@ -9268,6 +9339,11 @@ fn merge_local_and_web(
                 && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
                 && !temporal_fillers.contains(lower.as_str())
+                // FIX-IF-39: a discourse filler is non-topical glue, and it is the
+                // single highest-collision token class on the web ("hey" alone
+                // matches HeyGen / hey.com / Hey Jimmy). Leaving it here lets a page
+                // whose ENTIRE overlap is one filler tie the genuine answers.
+                && !is_discourse_filler(&lower)
                 // FIX-IF-35: same exclusion as core_topic_terms. `overlap` is the
                 // fraction of distinctive terms a page contains, and the >=2-of-3
                 // weak-match cap counts them too — so a naming predicate sitting in
@@ -9457,6 +9533,23 @@ fn merge_local_and_web(
                 && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
                 && !temporal_fillers.contains(lower.as_str())
+                // FIX-IF-39: THE fix for filler-token brand collisions. `core_matches`
+                // below requires EVERY core term to be present, so a filler left in
+                // this set is not merely noisy — it makes the gate UNSATISFIABLE for
+                // every real page. Measured live 2026-09-30 on the conversational
+                // water-cycle question: core terms included "hey"/"actually"/"you",
+                // so core_matches was false for ALL 23 results, `overlap` collapsed
+                // to 0, the BERT gate (which only runs when overlap > 0) switched
+                // off, and the gateway logged "Relevance distribution: best=0.041,
+                // mean=0.018, var=0.000, garbage_cluster=true" — the absolute
+                // relevance signal was DEAD and every result tied at the same 0.04
+                // post-calibration cap. Ranking was then decided by residual noise,
+                // which is how a camera shop matching only "hey" landed in the top-5
+                // beside NOAA and Wikipedia. Same failure mode as FIX-IF-35 one
+                // layer up: a non-topical token in the mandatory set kills the
+                // signal for the whole result set. Closed-class vocabulary; names
+                // no brand, domain or query.
+                && !is_discourse_filler(&lower)
                 // FIX-IF-35: a naming PREDICATE is query structure, not a topic.
                 // `core_matches` below requires EVERY core term to be present, so
                 // leaving "named"/"called"/"etymology" in this set made
@@ -9474,6 +9567,69 @@ fn merge_local_and_web(
         })
         .copied()
         .collect();
+
+    // ── Conversational-preamble narrowing (FIX-IF-39) ──
+    // A spoken-style question wraps the real request in discourse preamble: "hey so my
+    // friend asked me the other day about this whole thing and i was wondering if you
+    // could tell me WHAT actually happens when the water cycle goes through its various
+    // stages". The interrogative word introduces the clause that STATES THE ASK, so the
+    // subject of the question lives at-or-after it; everything before is framing. The
+    // preamble tokens ("hey"/"friend"/"asked"/"day"/"thing"/"wondering"/"tell") are not
+    // merely noise here — because `core_matches` demands EVERY core term, each one makes
+    // the gate harder to satisfy, and the filler exclusion alone still leaves the
+    // conversational scaffolding ("friend", "asked", "wondering") in the MANDATORY set.
+    // Measured live 2026-09-30: `core_matches` was false for all 23 results, relevance
+    // logged var=0.000 / garbage_cluster=true, and everything tied at 0.04 so a camera
+    // shop matching only "hey" ranked beside NOAA and Wikipedia.
+    //
+    // STRUCTURAL RULE, no per-query literals: when the query is long AND the interrogative
+    // clause on its own still yields a usable number of topic terms, restrict the core-topic
+    // set to that clause. Both guards keep short/topic queries ("what is quantum computing",
+    // "best laptop for programming 2026") completely untouched — there is no preamble to
+    // strip, or the clause would not retain enough terms to be meaningful.
+    let conversational_clause_start: Option<usize> = {
+        let idx = first_interrogative_index(&q_words);
+        match idx {
+            // Only when the preamble is substantial (a real conversational wrap, not a
+            // 1-2 word lead-in) does narrowing apply.
+            Some(i) if i >= MIN_CONVERSATIONAL_PREAMBLE_TOKENS => Some(i),
+            _ => None,
+        }
+    };
+    let core_topic_terms: Vec<&str> = match conversational_clause_start {
+        Some(start) => {
+            let clause_terms: Vec<&str> = q_words[start..]
+                .iter()
+                .copied()
+                .filter(|w| {
+                    let lower = w.to_lowercase();
+                    lower.len() >= 3
+                        && !stop_words.contains(lower.as_str())
+                        && !generic_web_terms.contains(lower.as_str())
+                        && !meta_action_terms.contains(lower.as_str())
+                        && !unit_terms.contains(lower.as_str())
+                        && !role_descriptor_terms.contains(lower.as_str())
+                        && !weak_discriminative.contains(lower.as_str())
+                        && !temporal_fillers.contains(lower.as_str())
+                        && !is_discourse_filler(&lower)
+                        && !is_naming_predicate_word(&lower)
+                        && !lower.chars().all(|c| c.is_ascii_digit())
+                })
+                .collect();
+            // The clause must retain enough topic terms to be a meaningful narrower
+            // description of the query; otherwise fall back to the full query.
+            if clause_terms.len() >= MIN_CLAUSE_TOPIC_TERMS {
+                tracing::info!(
+                    "CONVERSATIONAL QUERY: narrowing core topic terms to the interrogative clause ({} of {} query tokens): {:?}",
+                    clause_terms.len(), q_words.len(), clause_terms
+                );
+                clause_terms
+            } else {
+                core_topic_terms
+            }
+        }
+        None => core_topic_terms,
+    };
 
     // Multi-word phrase entities (P1): adjacent non-stopword runs of length >= 2 in the
     // raw query. These are the terms most prone to FALSE-POSITIVE token overlap — e.g.
@@ -11590,11 +11746,46 @@ fn merge_local_and_web(
                 // ("What famous helicopter was named for its marker?",
                 // "Have You Ever Wondered Why The AH-64 Is Called Apache"). A forum
                 // path is neither necessary nor sufficient for question shape; the
-                // interrogative title is the whole signal. Requiring a host/path
-                // shape here is the same "structural signal that looks alive and is
-                // not" class as the dead forum gate in the phrase-entity block.
-                // Deliberately host-agnostic: no domain list, no query literals.
-                let is_question_shaped = interrogative_title;
+                // TITLE SHAPE ALONE IS NOT SUFFICIENT, and using it alone is a real
+                // over-capture: many genuine ANSWER pages carry an interrogative
+                // title precisely because they restate the question in order to
+                // answer it ("Why Is Dallas Called the Big D? The Origin Explained",
+                // "Why Zorblax Was Named After Kevren Mardell"), and those pages DO
+                // address the subject. Measured 2026-09-30: title-shape alone tied
+                // such an answer page with the question thread at 0.04, breaking the
+                // pre-existing naming-question guards.
+                //
+                // A naming question asks about a RELATION between the entities it
+                // names, so a page answers it only if it carries the WHOLE relation
+                // — the thing AND its namesake. A page naming just one side is
+                // anchored on that side alone: it is either asking the question or
+                // writing about the namesake for unrelated reasons. That is the
+                // general, structural test, and it is what the live offenders fail:
+                // "What famous helicopter was named for its marker?" names
+                // "helicopter" but never the thing being named.
+                //
+                // Two sufficient signals, both structural, neither a host list:
+                //   (i)  a Q&A/forum path whose title is interrogative — that is
+                //        definitionally the asker's post (the original, correct gate,
+                //        retained); or
+                //   (ii) an interrogative title on a page that does not carry the
+                //        full relation (any anchor missing, or — when the query has
+                //        too few anchors for a relation test — no subject term at all).
+                let carries_full_relation = if naming_anchor_terms.len() >= 2 {
+                    naming_anchor_terms.iter().all(|a| {
+                        rl.contains(a.as_str()) || cl.contains(a.as_str()) || ul.contains(a.as_str())
+                    })
+                } else {
+                    !strong_topics.is_empty()
+                        && strong_topics.iter().any(|t| {
+                            rl.contains(t) || cl.contains(t) || ul.contains(t)
+                        })
+                };
+                let forum_path = ul.contains("/r/") || ul.contains("/comments/")
+                    || ul.contains("/forum/") || ul.contains("/question/")
+                    || ul.contains("/q/") || ul.contains("/ask");
+                let is_question_shaped = interrogative_title
+                    && (forum_path || !carries_full_relation);
 
                 // (2) Incidental single-entity match: a naming question that names
                 // TWO OR MORE rare entities (the thing and its namesake/source) is
