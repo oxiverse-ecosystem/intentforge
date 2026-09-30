@@ -7996,33 +7996,61 @@ fn simple_negation_strip(query: &str) -> Option<String> {
         "that", "which", "who", "where",
     ].iter().copied().collect();
 
-    for w in &words {
-        let w_lower = w.to_lowercase();
-        let clean_w = w_lower.trim_matches(|c: char| !c.is_alphanumeric());
+    for (i, w) in words.iter().enumerate() {
+            let w_lower = w.to_lowercase();
+            let clean_w = w_lower.trim_matches(|c: char| !c.is_alphanumeric());
 
-        let is_neg_trigger = neg_triggers.contains(w_lower.as_str()) || w_lower.starts_with("-");
-        if is_neg_trigger {
-            in_negation = true;
-            continue;
-        }
-
-        if in_negation {
-            // A new clause begins: the negation scope is over. This word is a
-            // boundary word itself (kept as ordinary structure, not topic), and
-            // everything AFTER it is back in normal scope.
-            if clause_boundary.contains(w_lower.as_str()) {
-                in_negation = false;
-                continue; // boundary word itself is not topical content
+            let is_neg_trigger = neg_triggers.contains(w_lower.as_str()) || w_lower.starts_with("-");
+            if is_neg_trigger {
+                in_negation = true;
+                continue;
             }
-            if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                in_negation = false;
-                result.push(w);
-            }
-            continue;
-        }
 
-        result.push(w);
-    }
+            if in_negation {
+                // A new clause begins: the negation scope is over. This word is a
+                // boundary word itself (kept as ordinary structure, not topic), and
+                // everything AFTER it is back in normal scope.
+                if clause_boundary.contains(w_lower.as_str()) {
+                    in_negation = false;
+                    continue; // boundary word itself is not topical content
+                }
+                // PRESERVED-WORD CARVE-OUT (round auto/round-2026-09-30T1031Z).
+                // A word in `preserved_words` ends the negation scope so genuine
+                // topical nouns survive ("…without node express server" keeps
+                // "server"). But the carve-out was UNCONDITIONAL, so a preserved
+                // word appearing merely as a MODIFIER inside the negated noun
+                // phrase terminated the scope early and RE-INJECTED the rest of the
+                // negated phrase as if it were the topic: "…to the internet without
+                // a cloud firewall" -> "…to the internet cloud firewall" (observed
+                // live, log line "ONLY NEGATIVE: stripped query … -> '… cloud
+                // firewall'"). The engine then went upstream looking for firewall
+                // explainers and returned 17 "What is a Firewall?" pages for a query
+                // about securing an nginx server — the exact pages the user
+                // negated.
+                //
+                // Fix, structural and language-general: a preserved word only
+                // terminates the negation scope when it is the LAST word of the
+                // negated clause (end of query, or a clause boundary follows). If
+                // ordinary content follows it, the preserved word is a modifier
+                // INSIDE the negated phrase ("cloud firewall", "server room") and
+                // must stay in scope so the whole phrase is dropped together.
+                // No per-query or per-domain literals — pure positional grammar.
+                if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
+                    let next_is_boundary = words
+                        .get(i + 1)
+                        .map(|n| clause_boundary.contains(n.to_lowercase().as_str()))
+                        .unwrap_or(true); // end of query counts as clause end
+                    if next_is_boundary {
+                        in_negation = false;
+                        result.push(w);
+                    }
+                    // else: modifier inside the negated phrase -> stay in scope, drop it.
+                }
+                continue;
+            }
+
+            result.push(w);
+        }
 
     if result.len() == words.len() {
         return None; // nothing stripped
@@ -18070,10 +18098,65 @@ mod negation_scope_tests {
     }
 
     #[test]
-    fn plain_query_returns_none() {
-        assert_eq!(simple_negation_strip("best laptop for programming"), None);
+        fn plain_query_returns_none() {
+            assert_eq!(simple_negation_strip("best laptop for programming"), None);
+        }
+
+        // ── A preserved word MODIFYING the negated noun must not end the scope ──
+        // Round auto/round-2026-09-30T1031Z. "cloud" is in `preserved_words`, so the
+        // carve-out fired mid-phrase and re-injected the negated noun as the topic:
+        //   "…without a cloud firewall" -> "…cloud firewall"
+        // Live symptom: 17 "What is a Firewall?" pages for a query about securing an
+        // nginx server — the exact topic the user negated.
+        #[test]
+        fn preserved_modifier_inside_negated_phrase_stays_in_scope() {
+            let stripped = simple_negation_strip(
+                "how do i secure an nginx server exposed directly to the internet without a cloud firewall",
+            )
+            .expect("negated phrase should still produce a stripped query");
+            assert!(
+                !stripped.contains("firewall"),
+                "negated head noun must be stripped, got: {:?}",
+                stripped
+            );
+            assert!(
+                !stripped.contains("cloud"),
+                "negated modifier must be stripped with its head noun, got: {:?}",
+                stripped
+            );
+            assert!(
+                stripped.contains("nginx") && stripped.contains("internet"),
+                "the retained topic must survive, got: {:?}",
+                stripped
+            );
+        }
+
+        // The carve-out still exists for its ORIGINAL purpose: a preserved word that
+        // is genuinely the last content word of the negated clause is the topic the
+        // user kept, not part of what they excluded.
+        #[test]
+        fn trailing_preserved_word_still_ends_negation_scope() {
+            let stripped = simple_negation_strip("hosting plans without a dedicated server");
+            assert_eq!(
+                stripped,
+                Some("hosting plans server".to_string()),
+                "a preserved word at the end of the negated clause must be kept"
+            );
+        }
+
+        // A clause boundary after a preserved word restores normal scope (existing
+        // 2026-08 round contract must not regress).
+        #[test]
+        fn preserved_word_before_clause_boundary_ends_scope() {
+            let stripped =
+                simple_negation_strip("serverless hosting without a managed runtime for small teams");
+            assert!(
+                stripped.contains("small teams"),
+                "trailing clause must survive, got: {:?}",
+                stripped
+            );
+        }
     }
-}
 
 #[cfg(test)]
 mod constraint_fix_tests {
