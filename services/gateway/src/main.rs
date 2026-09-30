@@ -18148,14 +18148,14 @@ mod negation_scope_tests {
         // 2026-08 round contract must not regress).
         #[test]
         fn preserved_word_before_clause_boundary_ends_scope() {
-            let stripped =
-                simple_negation_strip("serverless hosting without a managed runtime for small teams");
-            assert!(
-                stripped.contains("small teams"),
-                "trailing clause must survive, got: {:?}",
-                stripped
-            );
-        }
+                let stripped = simple_negation_strip("serverless hosting without a managed runtime for small teams")
+                    .expect("negated clause should still produce a stripped query");
+                assert!(
+                    stripped.contains("small teams"),
+                    "trailing clause must survive, got: {:?}",
+                    stripped
+                );
+            }
     }
 
 #[cfg(test)]
