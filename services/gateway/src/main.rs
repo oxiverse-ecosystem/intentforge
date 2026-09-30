@@ -4402,6 +4402,64 @@ fn enrich_single_commerce(
     r["commerce_provenance"] = provenance;
 }
 
+/// Reuse commerce facts that `handle_search` already fetched for the main-path
+/// `shopping` block, replaying them onto matching URLs in the results array.
+///
+/// `handle_search` builds the shopping block from a CLONE of the top-N ranked
+/// results and enriches THAT clone on the full 22s wall. `/shopping` then
+/// receives the response body and — before this helper — re-fetched the SAME
+/// top-N pages in a SECOND `enrich_with_commerce_par` pass, consuming another
+/// 22s and blowing past the 30s `TimeoutLayer` (every /shopping request
+/// returned 408 once a rolling window made the second pass run to the wall).
+///
+/// This helper eliminates that double fetch: it copies the already-attached
+/// `commerce` + `commerce_provenance` from `shopping` results onto the same
+/// URLs in the main `results` array. `enrich_with_commerce_par` then sees those
+/// results as already enriched and SKIPS them — fetching only the pages
+/// `handle_search` could NOT reach (the safety net). No ordering, no ranking,
+/// no selection changes: pure fact replay, byte-for-byte order preserved.
+///
+/// PURE + offline-testable (works on raw JSON, no network).
+fn copy_commerce_facts_from_shopping_block(
+    results: &mut [serde_json::Value],
+    shopping_value: Option<&serde_json::Value>,
+) {
+    // Build a URL -> (commerce, provenance) lookup from the shopping block.
+    let facts_by_url: HashMap<String, (serde_json::Value, serde_json::Value)> =
+        shopping_value
+            .and_then(|s| s.get("results"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| {
+                        let url = s.get("url").and_then(|v| v.as_str())?.to_owned();
+                        let commerce = s.get("commerce")?.clone();
+                        let prov = s.get("commerce_provenance")?.clone();
+                        Some((url, (commerce, prov)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+    if facts_by_url.is_empty() {
+        return;
+    }
+
+    // Replay facts onto matching results WITHOUT clobbering any result that
+    // already has commerce from a prior step.
+    for r in results.iter_mut() {
+        if r.get("commerce").is_some() {
+            continue;
+        }
+        if let Some(url) = r.get("url").and_then(|v| v.as_str()) {
+            if let Some((c, p)) = facts_by_url.get(url) {
+                r["commerce"] = c.clone();
+                r["commerce_provenance"] = p.clone();
+            }
+        }
+    }
+}
+
 /// Parallel variant of `enrich_with_commerce` — bounded-concurrency fetch + 22s wall cap.
 ///
 /// Fetches up to MAX_PARALLEL_FETCH result pages concurrently. Results that still
@@ -4637,17 +4695,34 @@ async fn handle_shopping(
     //    in place. We operate at the JSON level (not full Deserialize) so the
     //    enrichment is robust to every other field on UnifiedResponse.
     let mut value = body.0.clone();
+
+    // Clone the shopping block (already enriched by handle_search on the full 22s
+    // wall) BEFORE the mutable borrow below, so we can replay its facts onto the
+    // results array WITHOUT re-fetching the same top-N pages — a second
+    // `enrich_with_commerce_par` pass would consume another 22s and blow past
+    // the 30s TimeoutLayer. handle_search only mutates a CLONE (shop_arr) for the
+    // shopping block, so `results` arrives here WITHOUT commerce and we must
+    // copy it back.
+    let shopping_value = value.get("shopping").cloned();
+
     let results_attached = match value.get_mut("results").and_then(|v| v.as_array_mut()) {
         Some(arr) => {
             // ROADMAP item 1/2: attach honest product facts onto already-ranked results.
-            // The closure receives an OWNED String (generic bound `FnMut(String) -> Fut`),
-            // matching the `fetch(url.clone())` call inside `enrich_with_commerce`.
-            // We clone the reqwest client out of `state` BEFORE the closure so `state`
-            // stays usable afterward (for `decorate_affiliate`). Crucially, the returned
-            // future must OWN its inputs: returning a future that merely borrows the
-            // closure's `url` local would be a self-referential closure (E0515). Wrapping
-            // the call in `async move` moves the cloned client and the owned `url` into the
-            // future, so no borrow escapes.
+            // REUSE: replay commerce facts handle_search already fetched for the
+            // shopping block — eliminates the double-fetch that starved the
+            // /shopping enrichment of wall-clock budget.
+            copy_commerce_facts_from_shopping_block(arr, shopping_value.as_ref());
+            // Then enrich ONLY results that still lack commerce (the safety net
+            // for pages handle_search could not reach). The closure receives an
+            // OWNED String (generic bound `FnMut(String) -> Fut`), matching the
+            // `fetch(url.clone())` call inside `enrich_with_commerce`. We clone
+            // the reqwest client out of `state` BEFORE the closure so `state`
+            // stays usable afterward (for `decorate_affiliate`). Crucially, the
+            // returned future must OWN its inputs: returning a future that merely
+            // borrows the closure's `url` local would be a self-referential
+            // closure (E0515). Wrapping the call in `async move` moves the
+            // cloned client and the owned `url` into the future, so no borrow
+            // escapes.
             let http_client = state.http_client.clone();
             enrich_with_commerce_par(
                 arr,
@@ -21984,6 +22059,110 @@ structured product data, so nothing must be extracted from the body.</p></body><
                 "every result still gets provenance (honest null), fast or slow"
             );
         }
+    }
+
+    /// REGRESSION (this card): handle_search enriches a CLONE of the top-N for
+    /// the main-path shopping block; /shopping then reused to re-fetch those
+    /// SAME pages in a second 22s pass, blowing past the 30s TimeoutLayer.
+    /// `copy_commerce_facts_from_shopping_block` replays the already-fetched
+    /// facts instead. This test proves facts are copied without re-fetching,
+    /// order is preserved, and existing commerce is never clobbered.
+    #[test]
+    fn copy_commerce_facts_from_shopping_block_replays_not_refetches() {
+        // 4 results: two without commerce, two already carrying facts.
+        let mut results: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
+            serde_json::json!({
+                "url": "https://store.example.com/p/2", "score": 8.5,
+                "commerce": { "price": 99.0, "currency": "USD" },
+                "commerce_provenance": { "url": "https://store.example.com/p/2",
+                    "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
+                    "data": { "price": 99.0 } }
+            }),
+            serde_json::json!({ "url": "https://store.example.com/p/3", "score": 8.0 }),
+            serde_json::json!({ "url": "https://store.example.com/p/4", "score": 7.5 }),
+        ];
+
+        // Shopping block has facts for URLs 1, 2, and 3 — but NOT 4.
+        let shopping = serde_json::json!({
+            "results": [
+                { "url": "https://store.example.com/p/3",
+                  "commerce": { "price": 49.99, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/3",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
+                      "data": { "price": 49.99 } } },
+                { "url": "https://store.example.com/p/1",
+                  "commerce": { "price": 199.0, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/1",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "extracted_from_text",
+                      "data": { "price": 199.0 } } },
+                // URL 2 is in the shopping block too — must NOT overwrite its
+                // existing commerce (no clobbering).
+                { "url": "https://store.example.com/p/2",
+                  "commerce": { "price": 1.0, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/2",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
+                      "data": { "price": 1.0 } } },
+            ]
+        });
+
+        let before_urls: Vec<String> = results
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+
+        copy_commerce_facts_from_shopping_block(&mut results, Some(&shopping));
+
+        // Order preserved.
+        let after_urls: Vec<String> = results
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(before_urls, after_urls, "order must be byte-identical");
+
+        // URL 1: fact copied from shopping block.
+        assert_eq!(
+            results[0]["commerce"]["price"], 199.0,
+            "URL 1 should get the shopping block's fact"
+        );
+
+        // URL 2: existing commerce NOT clobbered by shopping block.
+        assert_eq!(
+            results[1]["commerce"]["price"], 99.0,
+            "URL 2 existing commerce must not be overwritten"
+        );
+
+        // URL 3: fact copied from shopping block.
+        assert_eq!(
+            results[2]["commerce"]["price"], 49.99,
+            "URL 3 should get the shopping block's fact"
+        );
+
+        // URL 4: no fact in shopping block → stays null.
+        assert!(
+            results[3].get("commerce").is_none(),
+            "URL 4 has no shopping-block fact → must stay null"
+        );
+
+        // Provenance copied for enriched results (honesty invariant).
+        assert_eq!(
+            results[0]["commerce_provenance"]["source"], "extracted_from_text"
+        );
+        assert_eq!(
+            results[2]["commerce_provenance"]["source"], "json-ld"
+        );
+    }
+
+    /// When the shopping block is absent (non-commercial intent, handle_search
+    /// skipped it), the helper is a no-op — no panic, no fabrication.
+    #[test]
+    fn copy_commerce_facts_none_shopping_block_is_noop() {
+        let mut results: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1" }),
+        ];
+        let before = serde_json::to_value(&results).unwrap();
+        copy_commerce_facts_from_shopping_block(&mut results, None);
+        assert_eq!(before, serde_json::to_value(&results).unwrap(), "no-op when shopping is None");
     }
 
     // ── Microformats2 h-product extraction ───────────────────────────────
