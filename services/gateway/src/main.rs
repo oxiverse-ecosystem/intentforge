@@ -20,6 +20,8 @@ mod clean;
 mod goals;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
+// FIX-IF-35: absolute score normalization + question-shaped-page demotion.
+mod fix_if_35_tests;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -6260,6 +6262,56 @@ fn calibrate_scores(scores: &mut [f32]) {
     }
 }
 
+/// Phase 1 (FIX-IF-35): ABSOLUTE merit ceiling applied AFTER positional calibration.
+///
+/// `calibrate_scores` is purely positional — it maps the set's [min,max] onto
+/// [0.05,1.0], so the set maximum is forced onto exactly 1.0 by construction, every
+/// query, no matter how weak the evidence. That makes `s=1.000` a RANKING number
+/// wearing a CONFIDENCE number's clothes: it means "first of this set", and carries
+/// no information about whether the page actually answers the query. It also
+/// launders junk: when the raw max is an off-topic page, the rescale promotes it to
+/// a perfect-looking 1.000 that no downstream penalty can reach, because every
+/// in-loop penalty is applied to `base` BEFORE the rescale and is divided straight
+/// back out.
+///
+/// The invariant this restores: reaching the TOP of the scale requires earning it in
+/// ABSOLUTE terms, not merely being the best of a bad set. A result may only be
+/// lifted to `abs_ceil` if its own absolute relevance clears `abs_floor`; below
+/// that it keeps its calibrated rank but is bounded away from the top of the scale.
+/// This is a property of the SCORE SCALE, not of any host, brand or query string —
+/// no page list and no query literal is involved.
+///
+/// Both bounds are dimensionless ratios in [0,1] over the relevance signal that
+/// already drives `r.score`, so this introduces no new tuning surface of its own.
+fn apply_absolute_merit_ceiling(relevance: &[f32], scores: &mut [f32]) {
+    /// Absolute relevance a result must reach to be allowed near the top of the
+    /// scale. Below this the result is, by the ranker's own absolute measure, not a
+    /// confident match for the query — it may appear, but not as a 1.000.
+    const ABS_FLOOR: f32 = 0.35;
+    /// Ceiling applied to a result that clears ABS_FLOOR. Below ABS_FLOOR the
+    /// ceiling is interpolated down to LOW_CEIL, so the penalty is continuous
+    /// rather than a cliff.
+    const HIGH_CEIL: f32 = 1.0;
+    const LOW_CEIL: f32 = 0.55;
+
+    if scores.is_empty() || relevance.len() != scores.len() {
+        return;
+    }
+    for (score, rel) in scores.iter_mut().zip(relevance.iter()) {
+        // Only ever LOWER a score: this must never promote a result or reorder the
+        // set, only stop a weak result from claiming the top of the scale.
+        let ceiling = if *rel >= ABS_FLOOR {
+            HIGH_CEIL
+        } else {
+            let frac = (*rel / ABS_FLOOR).clamp(0.0, 1.0);
+            LOW_CEIL + frac * (HIGH_CEIL - LOW_CEIL)
+        };
+        if *score > ceiling {
+            *score = ceiling;
+        }
+    }
+}
+
 // ─── Search URL Builder with Location Support ──────────────────────
 
 fn map_lang_to_country(lang: &str) -> Option<&'static str> {
@@ -8805,6 +8857,29 @@ fn is_weak_anchor_word(w: &str) -> bool {
     WEAK.contains(&w)
 }
 
+/// Closed-class vocabulary describing the NAMING PREDICATE of a naming/etymology
+/// question — the verb that asserts a NAME relation ("named after", "called",
+/// "etymology"). These words are shared by `is_naming_question` (query shape) and
+/// the term-extraction filters (topic terms), so the two can never drift apart.
+///
+/// Why they must not be TOPIC terms: a naming question's subject is the pair of
+/// entities, not the verb. "why is the apache web server named after a helicopter"
+/// has core topic terms apache + helicopter; requiring the literal token "named" as
+/// well means `core_matches` is false for essentially every real page, so `overlap`
+/// collapses to 0, BERT is gated off (it only runs when overlap > 0), and
+/// `relevance` becomes 0.000 for the WHOLE set — the absolute relevance signal dies
+/// and ranking is decided by residual noise (measured live 2026-09-30: rel=0.000 on
+/// all 21 results, including the correct apache.org/apache-name page).
+const NAMING_PREDICATE_VERBS: &[&str] = &[
+    "named", "naming", "called", "etymology", "etymological", "entitled",
+    "chose", "chosen", "picked", "nickname", "surname", "codename",
+];
+
+/// True when `w` is a naming-predicate verb (see NAMING_PREDICATE_VERBS).
+fn is_naming_predicate_word(w: &str) -> bool {
+    NAMING_PREDICATE_VERBS.contains(&w)
+}
+
 /// Detects a NAMING / ETYMOLOGY question shape: an interrogative frame plus a
 /// naming predicate ("named after", "called", "choose that name", "where does the
 /// name X come from", "etymology", "origin of the name").
@@ -8838,10 +8913,7 @@ fn is_naming_question(query: &str) -> bool {
     // river come from"), so they only count alongside a name-ish noun.
     // This is closed-class vocabulary describing the QUESTION FORM — it names no
     // entity, brand or topic.
-    const STRONG_NAMING_PREDICATES: &[&str] = &[
-        "named", "naming", "called", "etymology", "etymological", "entitled",
-        "chose", "chosen", "picked", "nickname", "surname", "codename",
-    ];
+    let has_strong = words.iter().any(|w| is_naming_predicate_word(w));
     const WEAK_NAMING_PREDICATES: &[&str] = &[
         "name", "names", "title", "word", "words", "term", "call", "calls",
         "choose", "mean", "means", "meaning", "refer", "refs", "derived",
@@ -8851,7 +8923,6 @@ fn is_naming_question(query: &str) -> bool {
         "come from", "comes from", "came from", "derived from", "derives from",
         "name origin", "origin of the name",
     ];
-    let has_strong = words.iter().any(|w| STRONG_NAMING_PREDICATES.contains(w));
     let has_weak = words.iter().any(|w| WEAK_NAMING_PREDICATES.contains(w));
     let has_name_noun = words.iter().any(|w| {
         matches!(*w, "name" | "names" | "naming" | "word" | "words" | "term" | "title")
@@ -9197,6 +9268,13 @@ fn merge_local_and_web(
                 && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
                 && !temporal_fillers.contains(lower.as_str())
+                // FIX-IF-35: same exclusion as core_topic_terms. `overlap` is the
+                // fraction of distinctive terms a page contains, and the >=2-of-3
+                // weak-match cap counts them too — so a naming predicate sitting in
+                // this set both dilutes overlap and lets an off-topic page that
+                // happens to contain the verb look like a good match. The predicate
+                // describes the question FORM; the entities describe the subject.
+                && !is_naming_predicate_word(&lower)
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
@@ -9379,6 +9457,19 @@ fn merge_local_and_web(
                 && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
                 && !temporal_fillers.contains(lower.as_str())
+                // FIX-IF-35: a naming PREDICATE is query structure, not a topic.
+                // `core_matches` below requires EVERY core term to be present, so
+                // leaving "named"/"called"/"etymology" in this set made
+                // core_matches false for essentially every real page: overlap
+                // collapsed to 0, the BERT gate (which only runs when overlap > 0)
+                // switched off, and `relevance` was 0.000 for the entire result
+                // set — the absolute signal the ranker depends on was dead, and the
+                // surviving ordering was residual noise. Measured live
+                // 2026-09-30 on "why is the apache web server named after a
+                // helicopter": rel=0.000 on all 21 results. Excluding the predicate
+                // leaves the real subject pair (apache, helicopter) to carry the
+                // match. Closed-class vocabulary; names no entity or topic.
+                && !is_naming_predicate_word(&lower)
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
@@ -11140,6 +11231,15 @@ fn merge_local_and_web(
     // 5. Calibrate scores onto [0.05, 1.0] preserving real distribution (Phase 0)
     let mut scores: Vec<f32> = merged.iter().map(|r| r.score).collect();
     calibrate_scores(&mut scores);
+    // 5b. FIX-IF-35: bound the top of the scale by ABSOLUTE merit. Phase 0 above is
+    // purely positional, so it forces the set max onto 1.0 by construction; this
+    // restores the invariant that a result reaches the top of the scale only by
+    // earning it absolutely, not by being the best of a weak set. Runs BEFORE the
+    // post-calibration structural caps so those still see and cap these values.
+    {
+        let abs_relevance: Vec<f32> = relevance_vec.iter().copied().collect();
+        apply_absolute_merit_ceiling(&abs_relevance, &mut scores);
+    }
     for (i, r) in merged.iter_mut().enumerate() {
         r.score = scores[i];
     }
@@ -11483,10 +11583,18 @@ fn merge_local_and_web(
                     || rl.starts_with("did ")
                     || rl.starts_with("can ")
                     || rl.ends_with('?');
-                let forum_path = ul.contains("/r/") || ul.contains("/comments/")
-                    || ul.contains("/forum/") || ul.contains("/question/")
-                    || ul.contains("/q/") || ul.contains("/ask");
-                let is_question_shaped = forum_path && interrogative_title;
+                // FIX-IF-35: question-SHAPE is a property of the TITLE, not of the
+                // host. The previous gate required a forum/Q&A path, which missed
+                // every real offender measured live on 2026-09-30 — a plain editorial
+                // article whose title merely poses the question
+                // ("What famous helicopter was named for its marker?",
+                // "Have You Ever Wondered Why The AH-64 Is Called Apache"). A forum
+                // path is neither necessary nor sufficient for question shape; the
+                // interrogative title is the whole signal. Requiring a host/path
+                // shape here is the same "structural signal that looks alive and is
+                // not" class as the dead forum gate in the phrase-entity block.
+                // Deliberately host-agnostic: no domain list, no query literals.
+                let is_question_shaped = interrogative_title;
 
                 // (2) Incidental single-entity match: a naming question that names
                 // TWO OR MORE rare entities (the thing and its namesake/source) is
