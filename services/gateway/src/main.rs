@@ -4318,7 +4318,7 @@ async fn enrich_with_commerce<F, Fut>(
                 let offer: CommerceOffer = extract_commerce_offer(&h, &url);
                 // Only attach a `commerce` block when the page actually exposed
                 // structured product data — never a guessed/fabricated fact.
-                if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
+                if offer.data.as_ref().map(|d| data_has_fact(d, &url)).unwrap_or(false) {
                     match serde_json::to_value(&offer) {
                         Ok(v) => {
                             r["commerce"] = v;
@@ -4403,20 +4403,61 @@ fn reconcile_prices(results: &mut [serde_json::Value]) {
     }
 }
 
+/// The comparable host of a URL, or `None` when the URL has no parseable host.
+///
+/// Case-folded, with a leading `www.` and any trailing root dot removed, so the
+/// trivial spellings of one host compare equal. Returns `None` rather than `""`
+/// for an unparseable URL, so callers can fail closed on a genuinely unknown
+/// host instead of comparing against an empty string that would match nothing.
+fn normalized_host(u: &str) -> Option<String> {
+    let p = reqwest::Url::parse(u).ok()?;
+    let raw = p.host_str()?.to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let lowered = raw.to_lowercase();
+    let stripped = lowered.trim_start_matches("www.");
+    Some(stripped.trim_end_matches('.').to_string())
+}
+
 /// True when an `OfferFacts` carries at least one meaningful structured fact.
 /// Used to decide whether to surface a `commerce` block at all (honest: no facts =>
 /// no block, never a placeholder).
-fn data_has_fact(d: &OfferFacts) -> bool {
-    d.price.is_some()
+///
+/// `result_url` is that result's OWN url, and it is required because `merchant`
+/// is not a plain fact field: `extract_commerce_offer` falls back to the URL's
+/// host label as a last-resort IDENTIFIER when the page exposes no seller name.
+/// Counting that as a fact meant every page that returned any HTML produced a
+/// `commerce` block whose only content was its own hostname — which defeats
+/// `has_any_commerce_block`, the gate that exists to keep bare affiliate cards
+/// off the main-path `shopping` strip.
+///
+/// So `merchant` counts ONLY when it differs from the result's own host, i.e.
+/// when the page's own markup supplied a seller name. When the host cannot be
+/// resolved there is nothing to compare against, so the label is not trusted —
+/// this fails closed, per the honesty contract.
+fn data_has_fact(d: &OfferFacts, result_url: &str) -> bool {
+    let page_fact = d.price.is_some()
         || d.price_low.is_some()
         || d.currency.is_some()
         || d.availability.is_some()
-        || d.merchant.is_some()
         || d.condition.is_some()
         || d.sku.is_some()
         || d.gtin.is_some()
         || d.rating.is_some()
         || d.image.is_some()
+        // `name` was extracted and serialized but never gated on, so a page
+        // that exposed only a structured product name was dropped from the
+        // strip. It is a real page fact; count it.
+        || d.name.is_some();
+    if page_fact {
+        return true;
+    }
+    match (d.merchant.as_deref(), normalized_host(result_url)) {
+        (Some(m), Some(host)) => m.trim().to_lowercase() != host,
+        // No merchant, or no host to check it against: unverifiable, so not a fact.
+        _ => false,
+    }
 }
 
 /// Apply the same single-result enrichment (extract_commerce_offer → optional commerce +
@@ -4441,7 +4482,7 @@ fn enrich_single_commerce(
         "data": null,
     });
     let offer: CommerceOffer = extract_commerce_offer(html, &url);
-    if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
+    if offer.data.as_ref().map(|d| data_has_fact(d, &url)).unwrap_or(false) {
         if let Ok(v) = serde_json::to_value(&offer) {
             r["commerce"] = v;
         }
@@ -22563,5 +22604,138 @@ mod kb_gibberish_mixed_tests {
         // digit garbage; a lone kb run with a real word must stay searchable.
         let (flag, _) = query_quality_flag("qwerty vs dvorak", &index);
         assert_ne!(flag, "junk");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D1 — the URL host label is an IDENTIFIER, not a product fact.
+//
+// `extract_commerce_offer` fills `merchant` from the result's OWN URL host as a
+// last-resort label when the page exposes no seller name (see the "merchant
+// fallback" block). That is correct as an identifier. It is NOT a product fact.
+//
+// But `data_has_fact` counted `merchant.is_some()` as a fact, so EVERY page that
+// returned any HTML produced a `commerce` block — a block whose only content is
+// the result's own hostname. That defeats `has_any_commerce_block`, the gate
+// whose stated purpose is to keep bare affiliate cards off the main-path
+// `shopping` strip: with D1 the gate could never say "no facts here".
+//
+// The fix is a granularity fix, not a threshold: `merchant` counts as a fact
+// ONLY when it differs from the result's own host, which is exactly the case
+// where the page's own markup supplied a seller name. Fails closed.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod commerce_fact_provenance_tests {
+    use super::*;
+
+    /// A page with NO structured product markup at all — just prose and a nav.
+    /// This is the shape that D1 promoted to a "commerce block".
+    const HTML_NO_PRODUCT_DATA: &str = r#"<!doctype html><html><head>
+<title>Acme Widget Pro — our story</title>
+</head><body>
+<nav><a href="/">home</a><a href="/blog">blog</a></nav>
+<h1>Acme Widget Pro</h1>
+<p>We have been making widgets since 1998. Read our blog for news.</p>
+</body></html>"#;
+
+    /// A page that DOES supply a seller name distinct from its own host.
+    const HTML_WITH_SELLER: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{"@context":"https://schema.org/","@type":"Product","name":"Widget",
+ "offers":{"@type":"Offer","price":"10.00","priceCurrency":"USD",
+ "seller":{"@type":"Organization","name":"Acme Retail Group"}}}
+</script></head><body></body></html>"#;
+
+    #[test]
+    fn a_page_with_no_product_markup_must_attach_no_commerce_block() {
+        // The defect, stated directly: a page that exposed NOTHING structured.
+        let offer = extract_commerce_offer(HTML_NO_PRODUCT_DATA, "https://acme-shop.example/p/widget");
+        let d = offer.data.expect("extractor returns a facts struct");
+        // The host fallback DID run — that is the pre-existing, intended
+        // identifier behaviour, and this test must not silently forbid it.
+        assert_eq!(
+            d.merchant.as_deref(),
+            Some("acme-shop.example"),
+            "the host fallback should still populate the identifier"
+        );
+        // But it must NOT be promotable to a product fact.
+        assert!(
+            !data_has_fact(&d, "https://acme-shop.example/p/widget"),
+            "D1: a page with zero structured product markup was promoted to a \
+             commerce block on the strength of its own URL host"
+        );
+    }
+
+    #[test]
+    fn a_page_supplied_seller_name_still_counts_as_a_fact() {
+        // Must-not-over-reject direction. A real seller name is a real fact and
+        // rejecting it would be the opposite defect.
+        let offer = extract_commerce_offer(HTML_WITH_SELLER, "https://acme-shop.example/p/widget");
+        let d = offer.data.expect("facts");
+        assert_eq!(d.merchant.as_deref(), Some("Acme Retail Group"));
+        assert!(
+            data_has_fact(&d, "https://acme-shop.example/p/widget"),
+            "a page-supplied seller name distinct from the host must still count"
+        );
+    }
+
+    #[test]
+    fn every_real_product_field_still_attaches_for_a_factless_page() {
+        // Each concrete fact is sufficient on its own. Guards against the fix
+        // becoming an accidental blanket rejection.
+        let url = "https://acme-shop.example/p/widget";
+        let mut d = OfferFacts::default();
+        for (label, mutator) in [
+            ("price", (|d: &mut OfferFacts| d.price = Some(9.99)) as fn(&mut OfferFacts)),
+            ("price_low", |d: &mut OfferFacts| d.price_low = Some(5.0)),
+            ("currency", |d: &mut OfferFacts| d.currency = Some("USD".into())),
+            ("availability", |d: &mut OfferFacts| d.availability = Some("InStock".into())),
+            ("condition", |d: &mut OfferFacts| d.condition = Some("New".into())),
+            ("sku", |d: &mut OfferFacts| d.sku = Some("A1".into())),
+            ("gtin", |d: &mut OfferFacts| d.gtin = Some("0123456789012".into())),
+            ("rating", |d: &mut OfferFacts| d.rating = Some(4.5)),
+            ("image", |d: &mut OfferFacts| d.image = Some("https://cdn.example/i.png".into())),
+            ("name", |d: &mut OfferFacts| d.name = Some("Widget".into())),
+        ] {
+            d = OfferFacts::default();
+            mutator(&mut d);
+            assert!(data_has_fact(&d, url), "{label} alone must count as a fact");
+        }
+    }
+
+    #[test]
+    fn host_derivation_is_recognised_through_case_and_www_variation() {
+        // The identifier is compared against the URL, so the comparison must
+        // tolerate the trivial spellings of the same host, or a factless page
+        // would sneak back in as a "seller".
+        for u in [
+            "https://WWW.Acme-Shop.Example./p/widget",
+            "http://acme-shop.example/p/widget",
+        ] {
+            let mut d = OfferFacts::default();
+            d.merchant = Some("acme-shop.example".to_string());
+            assert!(
+                !data_has_fact(&d, u),
+                "host-derived merchant for {u} was counted as a page fact"
+            );
+        }
+    }
+
+    #[test]
+    fn a_completely_empty_offer_is_never_a_fact() {
+        let d = OfferFacts::default();
+        assert!(!data_has_fact(&d, "https://acme-shop.example/p/widget"));
+    }
+
+    #[test]
+    fn an_unparseable_url_cannot_vouch_for_a_merchant() {
+        // If we cannot read the result's own host, a merchant label is
+        // unverifiable. Fails closed, per the honesty contract.
+        let mut d = OfferFacts::default();
+        d.merchant = Some("Acme Store".into());
+        assert!(
+            !data_has_fact(&d, "not a url"),
+            "with no readable host, a merchant label must not be trusted as a page fact"
+        );
     }
 }
