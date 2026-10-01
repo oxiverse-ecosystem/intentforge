@@ -1728,13 +1728,34 @@ would attach, or in tests/fixtures.
 { "html": "<html>…schema.org/Product JSON-LD or OG meta…</html>", "url": "https://store.example.com/p/1" }
 ```
 
-**Response** — a `CommerceOffer` JSON object (`price`, `currency`, `availability`,
-`merchant`, `condition`, `sku`, `gtin`, `rating`, `price_low`, `price_high`,
-`offer_count`, `author`, `isbn`, `event_start`, `event_location`, `observed_at`, `source`).
-All fields `Optional`. If the page has no structured product data, the returned object
-carries `null` for every fact (no guess). For an `Event` page, `event_start` (ISO 8601
-`startDate`) and `event_location` (`location.name` or `location.address`) are extracted
-from the same typed structured signals.
+**Response** — a `CommerceBlock` **provenance envelope**, the same shape the rest of
+the commerce surface uses (`commerce_provenance` / `commerce` on `GET /shopping`):
+
+```json
+{
+  "url": "https://store.example.com/p/1",
+  "observed_at": "1790420068",
+  "source": "json-ld",
+  "data": {
+    "price": 29.99,
+    "currency": "USD",
+    "availability": "https://schema.org/InStock",
+    "merchant": "TestStore",
+    "name": "Test Widget"
+  }
+}
+```
+
+- Top level = **provenance**: `url` (the page the facts came from), `observed_at`
+  (Unix seconds, UTC — lets a client label a stale price instead of presenting it as
+  current), `source` (`"json-ld"` / `"og"` / `"none"`), and `data` (the typed facts).
+- `data` = the typed fact fields: `price`, `currency`, `availability`, `merchant`,
+  `condition`, `sku`, `gtin`, `rating`, `price_low`, `price_high`, `offer_count`,
+  `author`, `isbn`, `event_start`, `event_location`.
+- All fact fields are `Optional`. If the page has no structured product data, `data`
+  is `null` (no guess). For an `Event` page, `event_start` (ISO 8601 `startDate`) and
+  `event_location` (`location.name` or `location.address`) are extracted from the same
+  typed structured signals.
 
 **Honesty properties (locked by unit tests):**
 

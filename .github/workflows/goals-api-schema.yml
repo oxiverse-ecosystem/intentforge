@@ -1,53 +1,48 @@
 name: goals-api-schema-tests
 
 # Schema regression tests for the Goals API (round 2026-08-15T0326Z).
-# These hit a RUNNING dev gateway (default http://localhost:4000). They are
-# designed to be driven by the oxiverse-qa loop, which brings the stack up
-# first. On a bare runner with no stack, the suite self-skips (the tests
-# call pytest.skip when /health is unreachable), so this job never turns the
-# main Rust CI red on its own.
+#
+# RETIRED (2026-09-26) — merged into the `schema-regression` job in ci.yml.
+#
+# Both jobs below had the same defect that made the old ci.yml job worthless:
+# they ran on a bare `ubuntu-latest` with no IntentForge stack, and the suites
+# self-skipped when /health was unreachable. Both therefore reported `success`
+# while executing ZERO assertions. The
+# `secrets.INTENTFORGE_BASE_URL || 'http://localhost:4000'` fallback cannot
+# rescue this — on a runner with no gateway, localhost:4000 is never reachable,
+# so that expression is never satisfied in practice.
+#
+# The contract assertions now live in ONE place: the `schema-regression` job in
+# ci.yml, which builds the real gateway image, runs it, waits for health, then
+# runs `pytest tests/ -m "not requires_upstream"` with
+# INTENTFORGE_REQUIRE_GATEWAY=1. That job also asserts a non-zero pass count, so
+# it cannot conclude green while asserting nothing.
+#
+# Keeping a second, weaker copy of the same contract in a separate workflow is
+# the "three overlapping suites, three sources of truth" trap: a fix landing in
+# one file leaves the other silently unverified. One suite, one job, one signal.
+#
+# The needs-upstream tests this workflow used to pretend to run are exercised by
+# the QA loop against the full local stack.
 
 on:
-  push:
-    branches: [master, main]
-  pull_request:
-    branches: [master, main]
+  workflow_dispatch:
 
 jobs:
-  goals-api-schema:
-    name: Goals API schema regression (live gateway)
+  retired:
+    name: "retired — contract regression now runs in ci.yml"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Explain
+        run: |
+          echo "This workflow was retired. The API contract regression runs in"
+          echo "ci.yml as the 'schema-regression' job, which brings up a real"
+          echo "gateway and fails if the documented contract drifts."
+          echo "See .github/workflows/ci.yml for the rationale."
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+# Historical body of the retired jobs, kept here as the record of what was
+# replaced (do not restore — both were green no-ops):
+#
+#   goals-api-schema:  pytest tests/test_goals_api_schema.py -v
+#   api-schema:        pytest tests/test_api_schema.py -v
 
-      - name: Install test deps
-        run: pip install -r requirements-tests.txt
-
-      - name: Run Goals-API schema tests
-        env:
-          INTENTFORGE_BASE_URL: ${{ secrets.INTENTFORGE_BASE_URL || 'http://localhost:4000' }}
-        run: pytest tests/test_goals_api_schema.py -v
-
-  api-schema:
-    name: Non-Goals API schema regression (live gateway)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install test deps
-        run: pip install -r requirements-tests.txt
-
-      - name: Run non-Goals API schema tests
-        env:
-          INTENTFORGE_BASE_URL: ${{ secrets.INTENTFORGE_BASE_URL || 'http://localhost:4000' }}
-        run: pytest tests/test_api_schema.py -v

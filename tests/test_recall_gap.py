@@ -33,16 +33,13 @@ COVERED_QUERY = "rust web framework"
 
 
 @pytest.fixture(scope="module")
-def session():
-    s = requests.Session()
-    try:
-        r = s.get(f"{BASE}/health", timeout=5)
-        assert r.status_code == 200, f"gateway /health -> {r.status_code}"
-    except Exception as e:
-        pytest.skip(f"IntentForge gateway not reachable at {BASE}: {e}")
-    return s
+def session(gateway_or_skip):
+    """See tests/conftest.py: the shared guard fails instead of skipping when
+    INTENTFORGE_REQUIRE_GATEWAY=1."""
+    return requests.Session()
 
 
+@pytest.mark.requires_upstream
 def test_recall_gap_detects_missing_distinctive_term(session):
     """A query with a rare distinctive term must surface that term in recall_gap_terms."""
     r = session.get(f"{BASE}/search", params={"q": GAP_QUERY}, timeout=40)

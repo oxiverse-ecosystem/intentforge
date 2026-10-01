@@ -1,3 +1,12 @@
-# API schema regression suite (tests/goals_api_schema.py)
-# No heavy deps — only pytest. urllib is stdlib.
+# Test dependencies for the IntentForge API contract suites.
+#
+# CI installs the repo-root requirements-tests.txt, which is the superset
+# (pytest + requests) covering every suite in tests/. This file is kept so a
+# bare `pip install -r tests/requirements.txt` still works.
+#
+# The suites are run BY DIRECTORY (pytest tests/), never by naming one file —
+# see .github/workflows/ci.yml. A file named without a `test_` prefix is skipped
+# by directory collection, which is how tests/goals_api_schema.py (renamed to
+# tests/test_goals_contract.py on 2026-09-26) went invisible to every run.
+requests>=2.31
 pytest>=8

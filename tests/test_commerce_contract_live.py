@@ -34,20 +34,17 @@ INFORMATIONAL_Q = "rust ownership"
 
 
 @pytest.fixture(scope="module")
-def session():
-    s = requests.Session()
-    try:
-        r = s.get(f"{BASE}/health", timeout=5)
-        assert r.status_code == 200, f"gateway /health -> {r.status_code}"
-    except Exception as e:
-        pytest.skip(f"IntentForge gateway not reachable at {BASE}: {e}")
-    return s
+def session(gateway_or_skip):
+    """See tests/conftest.py: the shared guard fails instead of skipping when
+    INTENTFORGE_REQUIRE_GATEWAY=1."""
+    return requests.Session()
 
 
 # ──────────────────────────────────────────────────────────────────────
 # (A) GET /shopping endpoint — always enriches + decorates
 # ──────────────────────────────────────────────────────────────────────
 
+@pytest.mark.requires_upstream
 def test_shopping_endpoint_returns_results_with_provenance_and_affiliate(session):
     """GET /shopping must return results, each with `commerce_provenance` and an
     `affiliate` block carrying `disclosed: true`."""
