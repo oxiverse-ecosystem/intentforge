@@ -5,6 +5,15 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 RUN mkdir src && echo "fn main(){}" > src/main.rs
 RUN cargo build --release
 COPY src ./src
+# Commerce config is RUNTIME-LOADED data, not compiled-in. Without it in the image
+# `AffiliateCtx::load()` returns zero networks, so every test that exercises the
+# real shipped config -- including the MANDATORY no-manipulation order-invariance
+# test in real_data_order_tests.rs -- is vacuous. The suite has an explicit
+# self-guard ("yielded no networks - invariance tests would be vacuous") that
+# turns this into a hard failure rather than a silent pass, which is how the
+# defect was found. Verified: without this line 6 commerce tests FAIL, including
+# both order-invariance tests. Keep it.
+COPY data ./data
 # Rebuild the bin (release) then run the test suite against the same deps cache.
 RUN touch src/main.rs && cargo build --release
 CMD ["cargo", "test", "--release"]
