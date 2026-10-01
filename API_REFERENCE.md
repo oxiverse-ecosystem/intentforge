@@ -152,6 +152,41 @@ Full search endpoint. Queries multiple backends (SearXNG via VPN, local index) i
 > Optionally present: `applied_constraints` (when operators/negations are applied), `spell_corrected_query` (when a correction fired), `query_quality` (only on `low`/`junk` queries), `deep_result`, `price_verified` (transactional), `recall_gap_terms` (when a distinctive query term is absent from every returned result — an honest upstream recall-gap signal; see [below](#honest-recall-gap-signal)).
 > `geo_location`, `warnings`, `ignored_constraints` were **absent** from all observed successful responses (declared-but-omitted `None` fields).
 > **`shopping`** (ROADMAP item 7, main-path commercial intent): present **only** when the resolved intent is commercial (the `transactional` label, a strong `transactional` distribution ≥ 0.50, or a stated price bound) **and** at least one top-ranked result page exposes a concrete `commerce` block. It is a direct JSON array; every entry is cloned from the already-ranked `results`, preserves that order, and carries real `commerce` facts plus post-rank `affiliate` metadata. Rows without structured product facts are omitted rather than shown as bare affiliate cards. The main `results` array is never touched, so `shopping` is purely additive. An informational query (`rust ownership`, `how do black holes work`) returns **no** `shopping` field. Detection is SIGNAL-based — reuses the existing intent distribution + price constraints, no keyword list, no third-party call.
+
+#### What counts as a "fact" on a `shopping` card (honesty contract)
+
+A card appears in `shopping` only when at least one field was extracted **from that
+card's own page**. Deliberately **not** counted as a fact:
+
+- **the result's own URL host.** The extractor fills `merchant` from the host as a
+  last-resort *identifier* when a page names no seller. Both spellings of one host
+  (`www.amazon.com`, `amazon.com`) are canonicalised before that host is compared
+  against the card's own URL, so an identifier can never be promoted into a
+  seller fact — otherwise every page returning any HTML would open the gate.
+- Any field the page did not expose. Missing is `null`, never inferred.
+
+A page-supplied seller name that genuinely differs from the host **does** count, and
+so does any concrete product field (price, price_low, currency, availability,
+condition, sku, gtin, rating, image, name). The gate fails closed.
+
+Consequence, measured live: `buy sony wh-1000xm5` and `buy iphone 15 pro` currently
+return **no** `shopping` block at all, because the retail pages that rank first
+(Amazon, Newegg) expose no structured product markup through this path. That is the
+contract working — previously those queries returned monetised cards whose entire
+`commerce` payload was the page's own hostname. It is an enrichment **recall**
+limitation, not a ranking or policy change; the honest fix is a provenance-carrying
+snippet fallback, never a looser gate.
+
+#### `fbu` / fallback destinations
+
+`fallback` (Sovrn `fbu`) is where a user is **sent** when a link's bid misses `bf`.
+The shipped config sets it to `null`, and the config loader **drops any `fallback_url`
+whose host is IANA reserved/special-use name space** (RFC 2606 §2, RFC 6761 §6 — e.g.
+`example.com`, `*.example`, `*.test`, `*.invalid`, `localhost`) because such a host is
+not a merchant and would route real clicks nowhere. The **field** is dropped, never the
+network: wrapping, `bf` and `disclosed: true` keep working. A fallback pointing at a
+real merchant is never rejected, including hosts that merely contain a reserved word
+(`invalid-syntax.co.uk`) or carry an interior reserved label (`localhost.acme-store.io`).
 > **`confidence` is a real float in ~0.30–0.90**, not always `0.75` — the value depends on the query and the intent engine.
 
 Example (real response truncated; full body in `docs/_generated/api-transcript.md` block 12 — `python web framework not django`):
