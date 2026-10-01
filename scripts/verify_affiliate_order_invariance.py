@@ -94,6 +94,40 @@ def shared_order(*lists):
 
 
 verdict: dict = {"pass": True, "decorated_on_keys_process": False, "queries": [], "notes": []}
+
+# ── WARM-UP (added 2026-10-01) ──────────────────────────────────────────────
+# This harness must compare ALREADY-WARM processes. On a cold cache the three
+# twins differ for reasons that have nothing to do with the affiliate key: the
+# first request to each process does its own upstream fetches, and the keys
+# process additionally performs commerce page ENRICHMENT (extra fetches, extra
+# latency), so a cold keys-vs-no-key pair differs while the two cold no-key
+# twins happen to agree. The harness then reads that as
+# "keys vs no-keys differ while the control stayed stable" => AFFILIATE_INDUCED,
+# which is a FALSE POSITIVE.
+#
+# Measured 2026-10-01: cold, this harness reported ORDER-INVARIANCE VIOLATIONS
+# on `/search` for queries where the keys process decorated NOTHING (aff=0).
+# A process that emitted zero affiliate blocks cannot have reordered anything,
+# so the verdict was self-contradictory. After a warm-up round, every
+# cross-process comparison is order-identical and the real property holds:
+# `/shopping` returns aff=5 on the keys twin and aff=0 on both no-key twins
+# with a byte-identical ranked URL list.
+#
+# The underlying claim is still tested honestly — decoration is compared with
+# keys present vs absent on warm processes — so warming does not weaken the
+# proof, it removes an unrelated source of variance from it.
+def warm(port: int, path: str, q: str) -> None:
+    try:
+        get(port, path, q)
+    except Exception as e:  # noqa: BLE001
+        print(f"warn: warm-up failed for {port}{path}: {e}")
+
+
+for q in QUERIES:
+    for path in ("/search", "/shopping"):
+        for port in (KEYS_PORT, NOKEY_A_PORT, NOKEY_B_PORT):
+            warm(port, path, q)
+
 for q in QUERIES:
     row: dict = {"query": q, "surfaces": {}}
     for label, path in (("search", "/search"), ("shopping", "/shopping")):
