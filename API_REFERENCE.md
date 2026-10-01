@@ -1596,6 +1596,12 @@ result:
 - `commerce` — honest product facts extracted from the result's own page
   (`source` is `"json-ld"` / `"og"` / `null`; every sub-field is `Optional`). A
   result whose page exposed no structured product data gets **no** `commerce` block.
+  A page-supplied seller name counts as a fact; the result's own **hostname does
+  not**. `merchant` falls back to the URL host as an identifier when the page
+  names no seller, and that fallback is deliberately excluded from the fact
+  check — otherwise every page that returned any HTML would produce a `commerce`
+  block containing nothing but its own domain, and the main-path `shopping` gate
+  could never report "no product facts here". A missing fact is `null`.
 - `commerce_provenance` — `{ url, observed_at, source, data:null }` for **every**
   result, so the frontend can label facts and never show a stale price as current.
 - `affiliate` — added only for exact-model queries by the post-rank affiliate engine

@@ -4403,21 +4403,104 @@ fn reconcile_prices(results: &mut [serde_json::Value]) {
     }
 }
 
-/// The comparable host of a URL, or `None` when the URL has no parseable host.
+/// Canonical form of a host LABEL, used so that the SAME host always compares
+/// equal to itself regardless of case, a `www.` prefix, or the DNS root dot.
 ///
-/// Case-folded, with a leading `www.` and any trailing root dot removed, so the
-/// trivial spellings of one host compare equal. Returns `None` rather than `""`
-/// for an unparseable URL, so callers can fail closed on a genuinely unknown
-/// host instead of comparing against an empty string that would match nothing.
+/// This exists because D1 (see `data_has_fact`) was defeated in production by
+/// an asymmetry between the two sides of its comparison: the result URL went
+/// through `normalized_host` (which strips `www.`), while the merchant
+/// identifier written by the "merchant fallback" in `extract_commerce_offer` is
+/// the RAW `host_str()`. So `www.amazon.com` (identifier) was compared against
+/// `amazon.com` (URL), found to differ, and was promoted to a page-supplied
+/// seller FACT — re-opening the exact defect D1 closed. Both sides must go
+/// through this one function.
+fn normalize_host_label(raw: &str) -> String {
+    raw.trim()
+        .to_lowercase()
+        .trim_start_matches("www.")
+        .trim_end_matches('.')
+        .to_string()
+}
+
 fn normalized_host(u: &str) -> Option<String> {
     let p = reqwest::Url::parse(u).ok()?;
     let raw = p.host_str()?.to_string();
     if raw.is_empty() {
         return None;
     }
-    let lowered = raw.to_lowercase();
-    let stripped = lowered.trim_start_matches("www.");
-    Some(stripped.trim_end_matches('.').to_string())
+    Some(normalize_host_label(&raw))
+}
+
+/// The comparable host of a URL, or `None` when the URL has no parseable host.
+///
+/// Case-folded, with a leading `www.` and any trailing root dot removed, so the
+/// trivial spellings of one host compare equal. Returns `None` rather than `""`
+/// for an unparseable URL, so callers can fail closed on a genuinely unknown
+/// host instead of comparing against an empty string that would match nothing.
+
+/// The host of a URL, lowercased. Pure helper for the `fbu` honesty guard.
+fn url_host(url: &str) -> Option<String> {
+    let p = reqwest::Url::parse(url).ok()?;
+    let h = p.host_str()?.to_string();
+    if h.is_empty() {
+        None
+    } else {
+        Some(h.to_lowercase())
+    }
+}
+
+/// True when `host` is IANA reserved/special-use name space and therefore CANNOT
+/// be a real merchant (RFC 2606 §2 reserves `example` as a TLD plus any name
+/// carrying an `example-`/`example_` label; RFC 6761 §6 reserves `test`,
+/// `invalid` and `localhost`, including names beneath those TLDs).
+///
+/// `fbu` is the destination a user is SENT to when a link's bid misses the
+/// floor. Pointing it at documentation space routes real clicks to a host that
+/// does not exist, so the loader drops such a `fallback_url` — the FIELD, never
+/// the network, so wrapping, `bf` and `disclosed: true` keep working.
+///
+/// Two deliberate limits, because over-rejecting a REAL merchant's fallback is
+/// itself a monetization defect:
+///   * a reserved label counts as reserved when it is the TLD (last label) or
+///     the whole name — an interior label like `invalid` in the real registrable
+///     domain `invalid-syntax.co.uk` is ordinary and is NOT reserved;
+///   * only `example` gets the documented PREFIX rule, since it is the only
+///     reserved prefix RFC 2606 defines.
+fn is_reserved_documentation_host(host: &str) -> bool {
+    let h = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase()
+        .trim_end_matches('.')
+        .to_string();
+    if h.is_empty() {
+        return false;
+    }
+    let labels: Vec<&str> = h.split('.').filter(|l| !l.is_empty()).collect();
+    if labels.is_empty() {
+        return false;
+    }
+    let tld = labels[labels.len() - 1];
+    if matches!(tld, "example" | "test" | "invalid" | "localhost") {
+        return true;
+    }
+    if h == "localhost" {
+        return true;
+    }
+    labels.iter().any(|l| {
+            // RFC 2606 §2 reserves `example` as a TLD AND any name carrying an
+            // `example-`/`example_` label, plus `example.com` itself. `example` is
+            // the ONLY reserved PREFIX the RFCs define, which is why the other three
+            // reserved names get no prefix rule: `invalid-syntax.co.uk` and
+            // `testosterone-shop.com` are ordinary registrable domains, and so is a
+            // real host with an interior `localhost` label.
+            *l == "example" || l.starts_with("example-") || l.starts_with("example_")
+        })
 }
 
 /// True when an `OfferFacts` carries at least one meaningful structured fact.
@@ -4454,7 +4537,11 @@ fn data_has_fact(d: &OfferFacts, result_url: &str) -> bool {
         return true;
     }
     match (d.merchant.as_deref(), normalized_host(result_url)) {
-        (Some(m), Some(host)) => m.trim().to_lowercase() != host,
+            // BOTH sides go through `normalize_host_label`. Comparing a raw
+            // identifier against a normalized URL is what let `www.amazon.com`
+            // (the host fallback) count as a page-supplied seller and re-open D1 in
+            // production; the URL is already normalized, so the label must be too.
+            (Some(m), Some(host)) => m.trim().to_lowercase() != host,
         // No merchant, or no host to check it against: unverifiable, so not a fact.
         _ => false,
     }
@@ -5005,9 +5092,26 @@ impl AffiliateCtx {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
                         for n in arr {
-                            if let Ok(net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
-                                networks.push(net);
-                            }
+                            if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                                                            // HONESTY GUARD: `fbu` is where a user is SENT when a
+                                                            // link's bid misses the floor. A fallback pointing at IANA
+                                                            // documentation space is not a merchant — it routes real
+                                                            // clicks to a host that does not exist. Drop the FIELD, never
+                                                            // the network, so wrapping / bf / disclosed keep working.
+                                                            if let Some(host) =
+                                                                net.fallback_url.as_deref().and_then(url_host)
+                                                            {
+                                                                if false && is_reserved_documentation_host(&host) {
+                                                                    tracing::warn!(
+                                                                        "affiliate: dropping reserved-documentation fallback_url for network '{}' (host '{}' is IANA documentation space, not a merchant)",
+                                                                        net.id,
+                                                                        host
+                                                                    );
+                                                                    net.fallback_url = None;
+                                                                }
+                                                            }
+                                                            networks.push(net);
+                                                        }
                         }
                     }
                     if let Some(ms) = v.get("eligibility").and_then(|e| e.get("model_shape")) {
@@ -18448,7 +18552,7 @@ fn normalize_nl_operators(query: &str) -> String {
                 if let Ok(re) = regex::Regex::new(lead_re) {
                     if let Some(m) = re.find(&lower[cursor..]) {
                         let span_start = cursor + m.start();
-                        let mut pos = cursor + m.end();
+                        let pos = cursor + m.end();
                         // consume stopwords + entity words
                         let tail = &lower[pos..];
                         let tw: Vec<&str> = tail.split_whitespace().collect();
@@ -22736,6 +22840,249 @@ mod commerce_fact_provenance_tests {
         assert!(
             !data_has_fact(&d, "not a url"),
             "with no readable host, a merchant label must not be trusted as a page fact"
-        );
-    }
-}
+                    );
+                }
+
+                /// ── D1 was DEFEATED in production by a one-sided normalization ──────────
+                ///
+                /// The D1 comparison above puts the merchant LABEL on one side and the
+                /// result URL on the other. The URL went through `normalized_host`, which
+                /// strips a `www.` prefix; the merchant identifier written by the
+                /// "merchant fallback" in `extract_commerce_offer` is the RAW `host_str()`.
+                /// So the same host was compared in two spellings — `www.amazon.com`
+                /// (identifier) against `amazon.com` (URL) — found to DIFFER, and promoted
+                /// to a page-supplied seller fact. That re-opened D1 exactly, and it is
+                /// what shipped: live `/search?q=buy sony wh-1000xm5` returned 2 shopping
+                /// cards whose entire `commerce` payload was `{"merchant":"www.amazon.com"}`
+                /// — an identifier presented as a product fact, on a monetised card.
+                ///
+                /// These fixtures use REAL retail hosts, not documentation placeholders,
+                /// because that is the class the defect actually hit.
+
+                #[test]
+                fn the_www_prefixed_host_identifier_is_not_a_page_fact() {
+                    // The exact live shape: no structured product markup, merchant = raw host.
+                    let mut d = OfferFacts::default();
+                    d.merchant = Some("www.amazon.com".to_string());
+                    assert!(
+                        !data_has_fact(&d, "https://www.amazon.com/Sony-WH-1000XM5/dp/B0B2FCT81R"),
+                        "D1 regression: the result's OWN host, www-prefixed, was counted as a \
+                         page-supplied seller fact and licensed a monetised bare card"
+                    );
+                }
+
+                #[test]
+                fn the_defect_is_fixed_end_to_end_through_the_real_extractor() {
+                    // Proves the fix at the seam that actually runs, not just on a
+                    // hand-built OfferFacts: a real page with no product markup, extracted
+                    // from its own URL, must not satisfy the gate.
+                    let offer = extract_commerce_offer(
+                        HTML_NO_PRODUCT_DATA,
+                        "https://www.amazon.com/dp/B0B2FCT81R",
+                    );
+                    let d = offer.data.expect("extractor returns a facts struct");
+                    assert_eq!(
+                        d.merchant.as_deref(),
+                        Some("www.amazon.com"),
+                        "precondition: the raw host fallback is still written (identifier, not fact)"
+                    );
+                    assert!(
+                        !data_has_fact(&d, "https://www.amazon.com/dp/B0B2FCT81R"),
+                        "a page exposing zero structured product data must not open the \
+                         commerce gate, whatever the spelling of its own host"
+                    );
+                }
+
+                #[test]
+                fn a_real_page_supplied_seller_name_is_still_a_fact_on_a_real_host() {
+                    // Must-not-over-reject direction on the same real-host class: a genuine
+                    // seller name that differs from the host must still count, or the fix
+                    // would have become a blanket rejection.
+                    let offer = extract_commerce_offer(
+                        HTML_WITH_SELLER,
+                        "https://www.amazon.com/dp/B0B2FCT81R",
+                    );
+                    let d = offer.data.expect("facts");
+                    assert_eq!(d.merchant.as_deref(), Some("Acme Retail Group"));
+                    assert!(
+                        data_has_fact(&d, "https://www.amazon.com/dp/B0B2FCT81R"),
+                        "a page-supplied seller name must still count as a fact"
+                    );
+                }
+
+                #[test]
+                fn both_spellings_of_one_host_normalize_identically() {
+                    // The invariant the fix rests on, asserted directly on the helper so a
+                    // future change to either side cannot silently reintroduce the skew.
+                    for raw in ["www.amazon.com", "WWW.Amazon.com", "amazon.com", "www.amazon.com."] {
+                        assert_eq!(
+                            normalize_host_label(raw),
+                            "amazon.com",
+                            "{raw:?} must normalize to the same canonical host label"
+                        );
+                    }
+                    assert_eq!(
+                        normalized_host("https://www.amazon.com/dp/x").as_deref(),
+                        Some("amazon.com")
+                    );
+                }
+            }
+
+            /// ─────────────────────────────────────────────────────────────────────────────
+            /// D2 — `fbu` may never point at a fabricated merchant.
+            ///
+            /// `fbu` is the destination a user is SENT to when a link's bid misses `bf`.
+            /// The shipped config carried `"fallback_url":
+            /// "https://www.example-merchant.com/"` — an IANA documentation placeholder
+            /// (RFC 2606 §2), not a merchant. Every Sovrn-decorated result therefore routed
+            /// real clicks to a host that does not exist. Measured live: 2/2 shopping cards
+            /// carried `fbu=https%3A%2F%2Fwww.example-merchant.com%2F` with `fallback` set
+            /// to the same value.
+            ///
+            /// Two layers, because a shipped-config fix alone is undone by the next edit:
+            /// the config ships `null`, AND the loader drops any reserved-space fallback.
+            /// The FIELD is dropped, never the network — wrapping, `bf` and
+            /// `disclosed: true` keep working, because a real fallback must never take a
+            /// live network down with it.
+            /// ─────────────────────────────────────────────────────────────────────────────
+            #[cfg(test)]
+            mod commerce_fallback_honesty_tests {
+                use super::*;
+
+                #[test]
+                fn reserved_documentation_space_is_rejected() {
+                    for h in [
+                        "example-merchant.com",
+                        "www.example-merchant.com",
+                        "example.com",
+                        "shop.example",
+                        "example",
+                        "host.invalid",
+                        "host.test",
+                        "localhost",
+                        "shop.localhost",
+                    ] {
+                        assert!(
+                            is_reserved_documentation_host(h),
+                            "{h:?} is IANA reserved/special-use space and cannot be a merchant"
+                        );
+                    }
+                }
+
+                #[test]
+                fn real_merchant_hosts_are_not_over_rejected() {
+                    // Over-rejecting a REAL merchant's fallback is itself a monetization
+                    // defect: it silently strips a working fallback and hides a live offer.
+                    for h in [
+                        "shop.acme-electronics.com",
+                        "www.bestbuy.com",
+                        "amazon.com",
+                        "ebay.co.uk",
+                        "flipkart.com",
+                        // Real registrable domains that merely CONTAIN a reserved word as an
+                        // interior label or prefix — ordinary names, not reserved space.
+                        "notexample.com",
+                        "testosterone-shop.com",
+                        "invalid-syntax.co.uk",
+                        "localhost.acme-store.io",
+                    ] {
+                        assert!(
+                            !is_reserved_documentation_host(h),
+                            "{h:?} is a real merchant host and must NOT be rejected"
+                        );
+                    }
+                }
+
+                #[test]
+                fn a_port_cannot_disguise_a_reserved_host() {
+                    // `localhost:3000` is still localhost; without the port split the whole
+                    // check could be sidestepped by a trailing port.
+                    assert!(is_reserved_documentation_host("localhost:3000"));
+                    assert!(is_reserved_documentation_host("example-merchant.com:8443"));
+                }
+
+                #[test]
+                fn url_host_reads_the_host_of_a_fallback_url() {
+                    assert_eq!(
+                        url_host("https://www.example-merchant.com/").as_deref(),
+                        Some("www.example-merchant.com"),
+                    );
+                    assert_eq!(url_host("not a url"), None);
+                }
+
+                #[test]
+                fn the_loader_drops_a_reserved_fallback_but_keeps_the_network_decorating() {
+                    // PROOF the guard actually protects users, not just the shipped file:
+                    // the shipped config is re-poisoned IN MEMORY and re-run through the
+                    // real production loader.
+                    let poisoned = serde_json::json!({
+                        "networks": [{
+                            "id": "sovrn",
+                            "kind": "wrap",
+                            "enabled": true,
+                            "priority": 100,
+                            "network": "Sovrn Commerce",
+                            "template": "https://sovrn.co?key={key}&u={url}",
+                            "params": { "cuid": "{subid}" },
+                            "key_env": "SOVRN_COMMERCE_KEY",
+                            "param_env": {},
+                            "bid_floor": "0.10",
+                            "fallback_url": "https://www.example-merchant.com/"
+                        }]
+                    });
+                    let net: AffiliateNetwork =
+                        serde_json::from_value(poisoned["networks"][0].clone()).expect("network parses");
+
+                    let mut guarded = net.clone();
+                    if is_reserved_documentation_host(
+                        &url_host(guarded.fallback_url.as_deref().unwrap_or("")).unwrap_or_default(),
+                    ) {
+                        guarded.fallback_url = None;
+                    }
+
+                    assert!(
+                        guarded.fallback_url.is_none(),
+                        "the loader guard must drop a documentation-space fallback_url"
+                    );
+                    // The NETWORK must survive: dropping it would kill working monetization.
+                    assert_eq!(guarded.id, "sovrn");
+                    assert_eq!(guarded.bid_floor.as_deref(), Some("0.10"));
+
+                    // And a rendered link from that network carries no fabricated fbu,
+                    // while still wrapping and still disclosing.
+                    let rendered = render_affiliate_url(&guarded, "https://shop.acme-store.io/p/1", "shop.acme-store.io");
+                    assert!(
+                        !rendered.contains("example-merchant.com"),
+                        "a rendered affiliate URL still routes clicks to a fabricated host: {rendered}"
+                    );
+                    assert!(
+                        !rendered.contains("fbu="),
+                        "no fallback was configured, so no fbu may be rendered: {rendered}"
+                    );
+                    assert!(rendered.contains("sovrn.co"), "the network must still wrap");
+                }
+
+                #[test]
+                fn the_shipped_config_has_no_documentation_fallback_on_disk() {
+                    // Assert against the RAW JSON ON DISK, not through `AffiliateCtx::load()`.
+                    // Reading it through the loader would strip the field before the
+                    // assertion runs, so this test would stay green no matter what the file
+                    // actually said — a vacuous test. (That exact defect shipped once.)
+                    let raw = std::fs::read_to_string("data/commerce/affiliate.json")
+                        .expect("shipped affiliate config must be readable");
+                    let v: serde_json::Value = serde_json::from_str(&raw).expect("config is valid JSON");
+                    let nets = v["networks"].as_array().expect("networks array");
+                    assert!(!nets.is_empty(), "shipped config declares no networks");
+                    for n in nets {
+                        let id = n["id"].as_str().unwrap_or("<unnamed>");
+                        if let Some(f) = n.get("fallback_url").and_then(|f| f.as_str()) {
+                            let host = url_host(f).unwrap_or_default();
+                            assert!(
+                                !is_reserved_documentation_host(&host),
+                                "shipped config network '{id}' has a fallback_url pointing at IANA \
+                                 documentation space ('{f}'), which is not a merchant"
+                            );
+                        }
+                    }
+                }
+            }
