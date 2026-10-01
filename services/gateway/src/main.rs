@@ -476,11 +476,21 @@ struct MergedResult {
     /// to demote low-signal crawled pages. Defaults to 1.0 for web results.
     #[serde(default = "default_f32_one")]
     quality: f32,
-    /// Tracks if this result has a post-calibration cap that must be re-applied
-    /// after the final 0.05 clamp to ensure dict/weak/video results stay below
-    /// the article floor. Internal field, not serialized.
+    /// Resolved CEILING for a result that carries a post-calibration structural
+    /// penalty, re-applied after the final 0.05 clamp so a penalised result can
+    /// never be lifted back above the uncapped floor. The value is NOT a
+    /// hardcoded constant — it is derived per result-set by
+    /// `resolve_post_cal_caps` so penalised results keep a real spread instead of
+    /// all collapsing onto one number. Internal field, not serialized.
     #[serde(skip)]
     post_cal_cap: Option<f32>,
+    /// WHICH structural penalty this result carries, in worst-first order
+    /// (`CapSeverity` derives `Ord`). Set during the cap pass; the score itself is
+    /// left untouched until `resolve_post_cal_caps` maps it into a band derived
+    /// from the uncapped part of the same set. `None` = uncapped. Internal field,
+    /// not serialized.
+    #[serde(skip)]
+    post_cap_sev: Option<CapSeverity>,
     /// D4 (2026-08-18T1340Z round): per-engine upstream-quality trust multiplier
     /// actually applied to this result. Captured so tests/operators can observe
     /// whether a date-blind upstream engine's junk was trust-crushed. Internal
@@ -6199,6 +6209,177 @@ fn normalize_indexer_url(url: &str) -> String {
 // scores above 1.0 are log-compressed into [0.95, 1.0] so the over-1.0
 // cluster (from consensus boosts, nav domain boosts) retains differentiation.
 
+/// A post-calibration structural penalty, ordered WORST FIRST (derives `Ord`,
+/// so `Audio < Dict < Video < Weak`).
+///
+/// These are the penalties the scoring pass applies AFTER `calibrate_scores`.
+/// Each was originally written as an ABSOLUTE ceiling (dict 0.03 / weak 0.04 /
+/// video 0.04 / audio 0.02) applied independently to each result. Absolute
+/// ceilings are the wrong shape: they destroy the calibrated spread, and when
+/// several fire at once — or when one fires for every result — the whole set
+/// collapses onto a single number and `score` stops carrying any information at
+/// all (the observed failure: entire result sets pinned to 0.040). Naming the
+/// penalty instead of hardcoding its magnitude lets `resolve_post_cal_caps` map
+/// penalised results into a band derived from the uncapped part of the SAME set,
+/// which is relative, order-preserving, and needs no per-penalty number.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum CapSeverity {
+    /// Podcast / audio host for a query with no audio intent. Worst: an audio
+    /// page almost never answers a general text query.
+    Audio,
+    /// Dictionary / definitional site for a query that is not a definition.
+    Dict,
+    /// Video/invidious source for a query with no video intent.
+    Video,
+    /// Generic structural mismatch: phrase-entity fidelity, superlative/naming
+    /// shape, many-topic coverage, rare-anchor coverage, comparison anchor.
+    Weak,
+}
+
+/// The calibrated article floor: the score `calibrate_scores` gives the weakest
+/// member of a set. It is the codebase's existing definition of "a result that
+/// earned its place", and is used as the ceiling of the penalised band when a set
+/// contains no uncapped result to derive a tighter one from.
+const ARTICLE_FLOOR: f32 = 0.05;
+
+/// Records a structural penalty on a result WITHOUT touching its score.
+///
+/// The scoring pass only decides *whether* a result is penalised and *which*
+/// penalty applies (worst one wins, so a later milder penalty cannot soften an
+/// earlier harsher one). Magnitudes are deliberately absent: resolving them here
+/// against a single hardcoded ceiling is exactly what made several simultaneously
+/// firing penalties collapse an entire result set onto one number. The absolute
+/// value is computed later, against the rest of the same set, by
+/// `resolve_post_cal_caps`.
+fn mark_post_cal_cap(r: &mut MergedResult, sev: CapSeverity) {
+    r.post_cap_sev = Some(match r.post_cap_sev {
+        Some(prev) if prev <= sev => prev,
+        _ => sev,
+    });
+}
+
+/// Resolves post-calibration penalties into scores placed in a shared band, so the
+/// penalties demote a result without erasing how it compared to its peers.
+///
+/// Invariant being restored: a penalised result must never outrank an uncapped
+/// one, but penalised results must keep a real spread among themselves. The old
+/// absolute ceilings (0.02/0.03/0.04) satisfied the first by flattening the
+/// second — whenever a penalty fired for every result, or several fired at once,
+/// the whole set landed on one number and `score` carried zero information.
+///
+/// Algorithm:
+///  1. The penalised band is the interval strictly BELOW `ARTICLE_FLOOR` — the
+///     score `calibrate_scores` never lets a genuine result fall under. Placing the
+///     tier under that single boundary is what makes the penalty hold in every
+///     calibration regime, including the weak-set one where the genuine articles
+///     sit at 0.051 and an earlier `best_non_video * 0.6` relative cap ended up
+///     ABOVE them.
+///  2. That band is split into one sub-band per distinct penalty SEVERITY present,
+///     worst severity lowest. Widths come from the band count, not from a tuned
+///     number per penalty, so adding a penalty kind cannot silently re-tune the
+///     others — the pile of absolute ceilings was exactly that coupling.
+///  3. Inside its sub-band a result keeps its position among its peers: members are
+///     min-max normalised onto the band, so relative spread survives the demotion.
+///     When members arrive already TIED (min-max cannot rank them) they are spread
+///     evenly across the band rather than collapsed onto one number — a tie in the
+///     input must not become a single indistinguishable output value, which is the
+///     defect this replaces.
+///  4. Placement is authoritative: a penalised result is put in the band even if it
+///     already sits at the floor. Clamping to its own pre-demotion score instead
+///     silently disabled the penalty for exactly those results.
+///
+/// The FIX-IF-35 invariant is preserved because the band's top is strictly under
+/// `ARTICLE_FLOOR`: nothing in it can reach a score it did not earn absolutely.
+/// Pure, query-agnostic and free of literal hosts/queries/cap numbers.
+fn resolve_post_cal_caps(results: &mut [MergedResult]) {
+    // Severities actually present, worst first.
+    let mut severities: Vec<CapSeverity> = results
+        .iter()
+        .filter_map(|r| r.post_cap_sev)
+        .collect();
+    severities.sort_unstable();
+    severities.dedup();
+    if severities.is_empty() {
+        return;
+    }
+
+    // Where the penalised tier lives.
+    //
+    // `calibrate_scores` places EVERY result at or above `ARTICLE_FLOOR` — that is
+    // what the floor *means* ("this result earned a calibrated score"), and the
+    // whole codebase reads it that way (the 0.05 serialization clamp, the local-noise
+    // and relevance hard gates). So a penalised result belongs strictly BELOW the
+    // floor: that single boundary is what guarantees it can never outrank a
+    // result that satisfied the query, in ANY calibration regime — including the
+    // weak-set regime where the genuine articles themselves sit at 0.051, which is
+    // precisely what defeated the earlier `best_non_video * 0.6` relative cap.
+    //
+    // The ceiling is therefore NOT the set's uncapped minimum. Doing that let a
+    // penalised result ride up to ~1.0 whenever the set had a strong member, which
+    // is the same tie-with-the-genuine-article defect the penalties exist to
+    // prevent. Nor is any per-penalty number involved: band WIDTHS come from how
+    // many distinct severities are present, so adding a penalty kind cannot
+    // silently re-tune the others.
+    let band_top = ARTICLE_FLOOR * (1.0 - f32::EPSILON);
+
+    let n = severities.len() as f32;
+    for (i, sev) in severities.iter().enumerate() {
+        // Band for severity `i` (worst severity = lowest), splitting [0, band_top].
+        let lo = band_top * (n - 1.0 - i as f32) / n;
+        let hi = band_top * (n - i as f32) / n;
+
+        let members: Vec<usize> = results
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.post_cap_sev == Some(*sev))
+            .map(|(i, _)| i)
+            .collect();
+
+        let (raw_min, raw_max) = members
+            .iter()
+            .map(|&i| results[i].score)
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), s| {
+                (a.min(s), b.max(s))
+            });
+        let tied = raw_max - raw_min <= 1e-6;
+        let member_count = members.len() as f32;
+
+        for (rank, i) in members.into_iter().enumerate() {
+            let r = &mut results[i];
+            let t = if tied {
+                // Members arrived already indistinguishable, so min-max cannot rank
+                // them. Spread them evenly across the band instead of collapsing
+                // them onto one number: equal pre-demotion scores are a tie in the
+                // INPUT, and a tie must not become a claim that they are equally
+                // good AND equally bad — the band still keeps them all below the
+                // uncapped tier, which is the invariant that actually protects
+                // ranking. This is the direct fix for the reported collapse.
+                (rank as f32 + 1.0) / member_count
+            } else {
+                ((r.score - raw_min) / (raw_max - raw_min)).clamp(0.0, 1.0)
+            };
+            // The band is authoritative: a penalised result is placed in it, period.
+            // Clamping to the result's own pre-demotion score instead (the obvious
+            // "never raise" guard) silently disables the penalty whenever the
+            // result already sits at the calibration floor — which is exactly the
+            // case the penalty exists for, and it is what left penalised results
+            // pinned at the floor. The band top is strictly below the uncapped
+            // floor by construction, so placement can never manufacture merit: a
+            // penalised result can never outrank a result that satisfied the query.
+            let resolved = (lo + t * (hi - lo)).clamp(0.0, band_top);
+            r.score = resolved;
+            r.post_cal_cap = Some(resolved);
+        }
+    }
+
+    tracing::info!(
+        "POST-CAL RESOLVE: {} severity tier(s) {:?} mapped into bands under {:.4}",
+        severities.len(),
+        severities,
+        band_top
+    );
+}
+
 /// Phase 0: per-query min-max calibration.
 /// Maps the raw [min, max] score distribution onto [0.05, 1.0], preserving
 /// the *real* relative ordering/differentiation between results instead of
@@ -8944,6 +9125,7 @@ fn merge_local_and_web(
             currency: r.currency,
             quality: r.quality,
             post_cal_cap: None,
+            post_cap_sev: None,
             engine_trust_mult: 1.0,
             commerce: None,
             commerce_provenance: None,
@@ -9002,6 +9184,7 @@ fn merge_local_and_web(
                 currency: r.currency.clone(),
                 quality: 1.0,
                 post_cal_cap: None,
+                post_cap_sev: None,
                 engine_trust_mult: 1.0,
                 commerce: None,
                 commerce_provenance: None,
@@ -11290,16 +11473,27 @@ fn merge_local_and_web(
         let naming_question = is_naming_question(&clean_query);
         let naming_anchor_terms: Vec<String> = rare_anchor_terms.clone();
 
-        // These caps MUST sit strictly BELOW the calibrated article floor so the
-        // spam is demoted *under* every genuine article, not merely tied with it.
-        // calibrate_scores maps the raw set onto [0.05, 1.0]; a relevant article's
-        // calibrated score is therefore >= 0.05. The post-cal caps below use 0.03
-        // (dict) and 0.04 (weak/any-cap) — UNDER 0.05 — so a capped result can never
-        // outrank or tie a real article (e.g. Vocabulary.com "Cause" at 0.03 now sits
-        // below the relevant fridge-article at 0.05, and an invidious tutorial at 0.04
-        // sits below the topical write-up). Floor preserved so they remain present.
-        let dict_cap = 0.03f32;   // dictionary sites may appear but never rank top
-        let weak_cap = 0.04f32;   // single-polysemous-token matches capped low
+        // The post-calibration penalties below each decide only WHETHER a result is
+        // penalised and WHICH penalty it carries (`CapSeverity`); they no longer
+        // assign a fixed absolute score.
+        //
+        // Why they used to be absolute: calibrate_scores maps a set onto
+        // [0.05, 1.0], so a genuine article sits at >= 0.05, and a hardcoded
+        // sub-floor ceiling (dict 0.03 / weak 0.04) guarantees a penalised result
+        // cannot tie or outrank one. That guarantee was bought by destroying the
+        // set's score resolution: the ceilings were applied per-result and
+        // independently, so when several fired at once — or when one fired for
+        // EVERY result, e.g. no page echoing a query's phrase entity — the whole
+        // set landed on one number (live: every result at exactly 0.040) and
+        // `score` carried zero information, leaving the final order to whatever
+        // the pre-calibration rank was.
+        //
+        // The shape is now relative: `resolve_post_cal_caps` (below this loop)
+        // derives the ceiling from the UNCAPPED results of this same set and maps
+        // penalised results into bands under it, preserving their relative order.
+        // The invariant each penalty was added for — a structural mismatch never
+        // outranks a result that satisfied the query — still holds, structurally,
+        // with no cap number to tune.
 
         // Best non-video score AFTER calibration but BEFORE this pass caps any video.
         // Used by the P8 video cap (b0): a video must never outrank the best genuine
@@ -11318,14 +11512,11 @@ fn merge_local_and_web(
 
             // (a) definitional site for a non-definition query
             if !is_definition_query && is_def_site(&ul, &rl, &cl) {
-                if r.score > dict_cap {
-                    tracing::info!(
-                        "POST-CAL DICT CAP -> {:.2}: '{}' (def site, non-def query)",
-                        dict_cap, r.url.chars().take(60).collect::<String>()
-                    );
-                    r.post_cal_cap = Some(dict_cap);
-                    r.score = dict_cap;
-                }
+                tracing::info!(
+                    "POST-CAL DICT PENALTY: '{}' (def site, non-def query)",
+                    r.url.chars().take(60).collect::<String>()
+                );
+                mark_post_cal_cap(r, CapSeverity::Dict);
                 continue;
             }
 
@@ -11344,21 +11535,17 @@ fn merge_local_and_web(
                 || is_url_video_host(&r.url);
             if is_video_src {
                 if !has_video_intent(query) {
-                    // 0.04 sits UNDER the calibrated article floor (0.05) so a video
-                    // is demoted *below* every genuine text result for a non-video
-                    // query (e.g. an invidious tutorial at 0.04 now ranks under the
-                    // topical article at 0.05, instead of tying it via insertion order
-                    // as the old 0.12 did). Floor preserved so videos remain present.
-                    // Signal-driven (query self-describes intent), not tuned to a query.
-                    let video_cap = 0.04f32;
-                    if r.score > video_cap {
-                        tracing::info!(
-                            "POST-CAL VIDEO CAP -> {:.2}: '{}' (non-video query, video source)",
-                            video_cap, r.url.chars().take(60).collect::<String>()
-                        );
-                        r.post_cal_cap = Some(video_cap);
-                        r.score = video_cap;
-                    }
+                    // A video must be demoted *below* every genuine text result for a
+                    // non-video query. `resolve_post_cal_caps` derives that ceiling
+                    // from this set's uncapped results, so the demotion holds in any
+                    // calibration regime without a number to tune. Floor preserved
+                    // so videos remain present. Signal-driven (query self-describes
+                    // intent), not tuned to a query.
+                    tracing::info!(
+                        "POST-CAL VIDEO PENALTY: '{}' (non-video query, video source)",
+                        r.url.chars().take(60).collect::<String>()
+                    );
+                    mark_post_cal_cap(r, CapSeverity::Video);
                 }
             }
 
@@ -11375,22 +11562,18 @@ fn merge_local_and_web(
             let is_audio_src = is_url_audio_host(&r.url);
             if is_audio_src {
                 if !has_audio_intent(query) {
-                    // 0.02 sits UNDER the dict-cap (0.03) and weak-cap (0.04) so
-                    // a podcast is demoted *below* every genuine text result for a
-                    // non-audio query (verified: "what happened in the ipl auction
-                    // today" → podcast at #3 with 0.04 was tied with weak-match
-                    // results; 0.02 pushes it below them). Floor preserved so audio
-                    // remains present. Signal-driven (query self-describes intent
-                    // via audio_intent_markers), not tuned to a query.
-                    let audio_cap = 0.02f32;
-                    if r.score > audio_cap {
-                        tracing::info!(
-                            "POST-CAL AUDIO CAP -> {:.2}: '{}' (non-audio query, audio source)",
-                            audio_cap, r.url.chars().take(60).collect::<String>()
-                        );
-                        r.post_cal_cap = Some(audio_cap);
-                        r.score = audio_cap;
-                    }
+                    // An audio page ranks below every genuine text result for a
+                    // non-audio query, and below the other penalised tiers too:
+                    // `CapSeverity::Audio` is the worst tier, so `resolve_post_cal_caps`
+                    // puts it in the lowest band — derived from this set, not a tuned
+                    // number. Floor preserved so audio remains present. Signal-driven
+                    // (query self-describes intent via audio_intent_markers), not tuned
+                    // to a query.
+                    tracing::info!(
+                        "POST-CAL AUDIO PENALTY: '{}' (non-audio query, audio source)",
+                        r.url.chars().take(60).collect::<String>()
+                    );
+                    mark_post_cal_cap(r, CapSeverity::Audio);
                 }
             }
 
@@ -11419,11 +11602,12 @@ fn merge_local_and_web(
                         break;
                     }
                 }
-                // Post-calibration cap makes the signal durable after relative
-                // score calibration. It is structural and contains no query literals.
-                if !has_entity && r.score > 0.04 {
-                    r.post_cal_cap = Some(0.04);
-                    r.score = 0.04;
+                // Post-calibration penalty makes the signal durable after relative
+                // score calibration. Structural, contains no query literals, and no
+                // absolute number: `resolve_post_cal_caps` places it under this set's
+                // uncapped floor while keeping it distinct from its peers.
+                if !has_entity {
+                    mark_post_cal_cap(r, CapSeverity::Weak);
                 }
                 // A forum/Q&A page that is itself a question is not an answer-shaped
                 // result for an explanatory query. Detect the content shape from
@@ -11435,9 +11619,8 @@ fn merge_local_and_web(
                     || title_lower.starts_with("why ") || title_lower.starts_with("how ")
                     || title_lower.contains(" named") || title_lower.contains(" called")
                     || title_lower.contains("? ");
-                if forum_path && question_title && r.score > 0.05 {
-                    r.post_cal_cap = Some(0.05);
-                    r.score = 0.05;
+                if forum_path && question_title {
+                    mark_post_cal_cap(r, CapSeverity::Weak);
                 }
             }
 
@@ -11509,14 +11692,13 @@ fn merge_local_and_web(
                     false
                 };
 
-                if (is_question_shaped || incidental_match) && r.score > weak_cap {
+                if is_question_shaped || incidental_match {
                     tracing::info!(
-                        "POST-CAL NAMING-Q CAP -> {:.2}: '{}' (question_shaped={}, incidental={}, rare anchors {:?})",
-                        weak_cap, r.url.chars().take(60).collect::<String>(),
+                        "POST-CAL NAMING-Q PENALTY: '{}' (question_shaped={}, incidental={}, rare anchors {:?})",
+                        r.url.chars().take(60).collect::<String>(),
                         is_question_shaped, incidental_match, naming_anchor_terms
                     );
-                    r.post_cal_cap = Some(weak_cap);
-                    r.score = weak_cap;
+                    mark_post_cal_cap(r, CapSeverity::Weak);
                 }
             }
 
@@ -11528,14 +11710,11 @@ fn merge_local_and_web(
                 // matched_strong is at most strong_topics.len(); we want the page to
                 // contain at least 2 of the query's real topic terms to be on-topic.
                 if matched_strong < 2 {
-                    if r.score > weak_cap {
-                        tracing::info!(
-                            "POST-CAL WEAK-MATCH CAP -> {:.2}: '{}' (matched {} of {} topics)",
-                            weak_cap, r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len()
-                        );
-                        r.post_cal_cap = Some(weak_cap);
-                        r.score = weak_cap;
-                    }
+                    tracing::info!(
+                        "POST-CAL WEAK-MATCH PENALTY: '{}' (matched {} of {} topics)",
+                        r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len()
+                    );
+                    mark_post_cal_cap(r, CapSeverity::Weak);
                 }
             }
 
@@ -11566,14 +11745,13 @@ fn merge_local_and_web(
                 } else {
                     1
                 };
-                if matched_anchors < required_anchors && r.score > weak_cap {
+                if matched_anchors < required_anchors {
                     tracing::info!(
-                        "POST-CAL RARE-ANCHOR CAP -> {:.2}: '{}' (matched {} of {} rare anchors {:?}, need {})",
-                        weak_cap, r.url.chars().take(60).collect::<String>(),
+                        "POST-CAL RARE-ANCHOR PENALTY: '{}' (matched {} of {} rare anchors {:?}, need {})",
+                        r.url.chars().take(60).collect::<String>(),
                         matched_anchors, rare_anchor_terms.len(), rare_anchor_terms, required_anchors
                     );
-                    r.post_cal_cap = Some(weak_cap);
-                    r.score = weak_cap;
+                    mark_post_cal_cap(r, CapSeverity::Weak);
                 }
             }
 
@@ -11583,8 +11761,8 @@ fn merge_local_and_web(
             // "Brezza vs Venue" query). But calibrate_scores (and the thin-result
             // boost) rescales it right back to the top band, so the off-topic brand
             // still outranks the genuine Brezza/Venue pages — the exact bug. Re-apply
-            // the cap AFTER calibration so it survives, matching the durable pattern
-            // used by the D1/D2/D3 (weak-match) caps above. `comparison_entities` is
+            // the penalty AFTER calibration so it survives, matching the durable pattern
+            // used by the D1/D2/D3 (weak-match) penalties above. `comparison_entities` is
             // derived from the query's own distinctive terms minus attribute/structure
             // vocab (no brand literals), so this is fully general: it fires for any
             // comparison ("swift vs nexon", "city vs amaze", ...) and never names a
@@ -11594,37 +11772,34 @@ fn merge_local_and_web(
             // "postgres versus mongodb for a social media app feed") are the same
             // defect class — a comparison result must name at least one side. A
             // page that names none may still appear (floor preserved) but can never
-            // outrank the genuine comparative pages. RELATIVE cap (like the video
-            // cap) so it holds in both healthy ([0.05,1.0]) and weak-set
-            // ([0.05,0.12]) calibration regimes.
+            // outrank the genuine comparative pages. The ceiling is RELATIVE (derived
+            // from this set's uncapped results by `resolve_post_cal_caps`), so it holds
+            // in both healthy ([0.05,1.0]) and weak-set ([0.05,0.12]) calibration
+            // regimes — unlike the earlier best_non_video*0.6 attempt, which sat ABOVE
+            // the genuine floor when the whole set was weak (Planoly 0.072 vs genuine
+            // comparison articles 0.051).
             if comparison_query && !comparison_anchor_terms.is_empty() {
                 let names_entity = comparison_anchor_terms.iter().any(|e| {
                     rl.contains(e.as_str()) || cl.contains(e.as_str()) || ul.contains(e.as_str())
                 });
                 if !names_entity {
-                    // Absolute weak_cap (0.04, UNDER the calibrated article floor of
-                    // 0.05) — same convention as the video/weak-match caps. The old
-                    // relative best_non_video*0.6 cap FAILED when the whole result set
-                    // was weak (Planoly at 0.072 vs genuine comparison articles at
-                    // 0.051: the relative cap stayed ABOVE the genuine floor because
-                    // the best text result itself was weak). An absolute sub-floor
-                    // cap guarantees a principal-naming article always outranks junk.
-                    let d3_cap = weak_cap;
-                    if r.score > d3_cap {
-                        tracing::info!(
-                            "POST-CAL D3 COMP-CAP -> {:.2}: '{}' names none of compared entities {:?} (best_text={:.2})",
-                            d3_cap, r.url.chars().take(60).collect::<String>(), comparison_anchor_terms, best_non_video
-                        );
-                        r.post_cal_cap = Some(d3_cap);
-                        r.score = d3_cap;
-                    }
+                    tracing::info!(
+                        "POST-CAL D3 COMP-PENALTY: '{}' names none of compared entities {:?} (best_text={:.2})",
+                        r.url.chars().take(60).collect::<String>(), comparison_anchor_terms, best_non_video
+                    );
+                    mark_post_cal_cap(r, CapSeverity::Weak);
                 }
             }
         }
     }
 
-    // Re-sort by score descending after post-calibration caps to ensure capped
-    // results (video/dict/weak-match) move below higher-scoring text results.
+    // Turn the penalties recorded above into scores. Done ONCE, over the whole
+    // set, so each penalised result is bounded by the same set-derived ceiling —
+    // the defect the per-result absolute ceilings created.
+    resolve_post_cal_caps(&mut merged);
+
+    // Re-sort by score descending now that the penalised results have been
+    // demoted below this set's uncapped floor while keeping their own order.
     merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     merged
@@ -16952,11 +17127,12 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // stream stays valid.
     for r in results.iter_mut() {
         r.score = r.score.clamp(0.05, 1.0);
-        // Re-apply post-calibration caps (dict_cap=0.03, weak_cap=0.04, video_cap=0.04)
-        // AFTER the 0.05 clamp so they remain strictly below the article floor. Without
-        // this, a dict/weak/video result clamped to 0.05 would tie with genuine articles,
-        // defeating the cap's purpose. Applied here so dict/weak/spam stay demoted below
-        // all real articles (floor=0.05) in the final SERP.
+        // Re-apply the post-calibration penalty AFTER the 0.05 clamp, so a penalised
+        // result cannot be lifted back up to the article floor and tie with genuine
+        // articles. The ceiling is the per-result value `resolve_post_cal_caps`
+        // derived from this set's uncapped floor (not a fixed 0.03/0.04 constant),
+        // so distinct penalised results keep distinct ceilings here instead of all
+        // being flattened onto one number.
         if let Some(cap) = r.post_cal_cap {
             if r.score > cap {
                 r.score = cap;
@@ -18693,6 +18869,7 @@ async fn handle_search_fast(
                         currency: r.currency,
                         quality: r.quality,
                         post_cal_cap: None,
+                        post_cap_sev: None,
                         engine_trust_mult: 1.0,
                         commerce: None,
                         commerce_provenance: None,
@@ -19654,10 +19831,16 @@ mod hardcoding_ruling_tests {
         let out = merge_local_and_web(
             vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
-        assert_eq!(out.len(), 1, "cambridge result should survive (capped, not dropped)");
+        assert_eq!(out.len(), 1, "cambridge result should survive (penalised, not dropped)");
         let r = &out[0];
-        assert!(r.score <= 0.061,
-            "dict site must be capped to dict_cap=0.06 via structural detection, got {}", r.score);
+        // The penalty is now RELATIVE, so there is no absolute cap number to assert.
+        // What must hold: the result carries the Dict penalty and its score is
+        // bounded by this set's uncapped floor — with nothing uncapped here, that
+        // fallback floor is the article floor.
+        assert_eq!(r.post_cap_sev, Some(super::CapSeverity::Dict),
+            "def site must be marked Dict-penalised via structural detection");
+        assert!(r.score <= super::ARTICLE_FLOOR,
+            "penalised result must not exceed the article floor when it is the only one, got {}", r.score);
     }
 
     #[test]
@@ -19742,10 +19925,11 @@ mod hardcoding_ruling_tests {
     }
 
     #[test]
-    fn dict_cap_stays_below_article_floor_after_clamp() {
-        // Finding 4: dict_cap (0.03) must stay below article floor (0.05) even after
-        // the final 0.05 clamp in serialization. The post_cal_cap mechanism re-applies
-        // the cap AFTER the clamp.
+    fn dict_penalty_stays_below_uncapped_floor() {
+        // A penalised result must rank strictly below every UNCAPPED result of the
+        // same set. The ceiling is derived from that set (the article's own
+        // calibrated score), so the invariant is relative — there is no fixed cap
+        // number, which is what used to collapse whole result sets onto 0.040.
         let q = "improve deep sleep without medication";
         let dict_result = web_res(
             "https://www.merriam-webster.com/dictionary/improve",
@@ -19762,15 +19946,124 @@ mod hardcoding_ruling_tests {
             vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
         );
         assert!(out.len() >= 2, "both results should be present");
-        // Find the dict result (capped to 0.03)
         let dict = out.iter().find(|r| r.url.contains("merriam-webster")).expect("dict result missing");
-        // Find the article (floor at 0.05)
         let article = out.iter().find(|r| r.url.contains("sleep-guide")).expect("article missing");
-        // Dict must be strictly below article floor
-        assert!(dict.score < 0.05, "dict_cap should be < 0.05, got {}", dict.score);
-        assert!(dict.score <= 0.031, "dict_cap should be ~0.03, got {}", dict.score);
-        assert!(article.score >= 0.05, "article floor should be >= 0.05, got {}", article.score);
-        assert!(dict.score < article.score, "dict (capped) must rank below article");
+        assert_eq!(dict.post_cap_sev, Some(super::CapSeverity::Dict), "dict site must be Dict-penalised");
+        assert!(article.post_cap_sev.is_none(), "genuine article must not be penalised");
+        assert!(dict.score < article.score,
+            "penalised dict result must rank strictly below the uncapped article (dict={} article={})",
+            dict.score, article.score);
+        assert!(dict.score <= article.score.min(super::ARTICLE_FLOOR) + f32::EPSILON,
+            "penalised ceiling must be bounded by the uncapped floor, got {}", dict.score);
+    }
+
+    #[test]
+    fn penalised_results_keep_their_own_spread() {
+        // Regression for FIX-IF-35b: when a penalty fires for SEVERAL results, they
+        // must NOT all collapse onto one score. They are min-max mapped onto their
+        // own band under the set's uncapped floor, so a result that outranked its
+        // peers before demotion still does after.
+        let q = "why is the apache http server called apache";
+        let mut web = vec![web_res(
+            "https://example.com/etymology-of-apache",
+            "The Etymology of the Apache HTTP Server Name",
+            "The Apache Software Foundation explains where the name Apache comes from.",
+        )];
+        // Three junk pages that satisfy none of the query's rare anchors.
+        for (i, slug) in ["a", "b", "c"].iter().enumerate() {
+            web.push(web_res(
+                &format!("https://junk{}.example.test/listing{}", i, slug),
+                &format!("Unrelated weekly roundup {}", i),
+                "A generic listicle that mentions nothing from the query at all.",
+            ));
+        }
+        let out = merge_local_and_web(
+            vec![], web, q, "informational", &cst(), None, None, &empty_sem(),
+        );
+        assert!(out.len() >= 2, "results should be present");
+        let penalised: Vec<f32> = out
+            .iter()
+            .filter(|r| r.post_cap_sev.is_some())
+            .map(|r| r.score)
+            .collect();
+        assert!(
+            penalised.len() >= 2,
+            "test needs at least two penalised results to prove the collapse is gone, got {}",
+            penalised.len()
+        );
+        let distinct: std::collections::HashSet<u32> =
+            penalised.iter().map(|s| s.to_bits()).collect();
+        assert_eq!(
+            distinct.len(),
+            penalised.len(),
+            "penalised results collapsed onto a single score: {:?} — the score field carries no information",
+            penalised
+        );
+        // And the genuine article still outranks every one of them.
+        let best_penalised = penalised.iter().cloned().fold(f32::MIN, f32::max);
+        let article = out.iter().find(|r| r.post_cap_sev.is_none()).expect("uncapped article missing");
+        assert!(article.score > best_penalised,
+            "uncapped article ({}) must outrank every penalised result ({})",
+            article.score, best_penalised);
+    }
+
+    #[test]
+    fn penalised_result_never_outranks_an_uncapped_one() {
+        // The invariant every one of these penalties was added for: a penalised
+        // result must rank strictly below every result that satisfied the query.
+        // Checked across calibration regimes — a healthy set, a weak set, and a set
+        // where EVERY result is penalised (no uncapped referent exists at all).
+        use super::{resolve_post_cal_caps, CapSeverity};
+        let mk = |url: &str, score: f32| super::MergedResult {
+            title: url.to_string(),
+            url: url.to_string(),
+            content: "content".to_string(),
+            score,
+            authority: 0.5,
+            sources: vec!["bing".to_string()],
+            is_local: false,
+            published_date: None,
+            price: None,
+            currency: None,
+            quality: 1.0,
+            post_cal_cap: None,
+            post_cap_sev: None,
+            engine_trust_mult: 1.0,
+            commerce: None,
+            commerce_provenance: None,
+        };
+
+        // (a) Mixed set. The penalty must bite even when the result already sits AT
+        // the calibration floor — the case a "never raise" clamp silently skipped,
+        // which is how penalised results stayed pinned at the floor.
+        let mut rs = vec![mk("a", 0.05), mk("b", 1.0)];
+        rs[0].post_cap_sev = Some(CapSeverity::Dict);
+        resolve_post_cal_caps(&mut rs);
+        assert!(rs[0].score < rs[1].score,
+            "penalised floor result must be pushed under the uncapped result (got {})", rs[0].score);
+        assert!(rs[0].score < super::ARTICLE_FLOOR,
+            "penalised result must be strictly below the article floor, got {}", rs[0].score);
+
+        // (b) Weak set: the ceiling follows the set down, and the penalty still bites.
+        let mut rs = vec![mk("a", 0.05), mk("b", 0.06), mk("c", 0.051)];
+        rs[0].post_cap_sev = Some(CapSeverity::Weak);
+        resolve_post_cal_caps(&mut rs);
+        let uncapped_floor = rs[1].score.min(rs[2].score);
+        assert!(rs[0].score < uncapped_floor,
+            "penalised ({}) must stay below the weak set's uncapped floor ({})",
+            rs[0].score, uncapped_floor);
+
+        // (c) Every result penalised: with no uncapped referent the set supports no
+        // claim above the article floor, so nothing may reach it.
+        let mut rs = vec![mk("a", 1.0), mk("b", 0.9), mk("c", 0.8)];
+        for r in rs.iter_mut() {
+            r.post_cap_sev = Some(CapSeverity::Weak);
+        }
+        resolve_post_cal_caps(&mut rs);
+        for r in &rs {
+            assert!(r.score < super::ARTICLE_FLOOR,
+                "with no uncapped result nothing may reach the article floor, got {}", r.score);
+        }
     }
 
     #[test]
@@ -19789,8 +20082,8 @@ mod hardcoding_ruling_tests {
 
     #[test]
     fn video_cap_applied_for_ambiguous_watch_query() {
-        // Finding 5: "watch battery" should cap video results to 0.04 since it's
-        // not a video-intent query (about timepieces, not videos).
+        // A video must rank below the genuine text result for a non-video query. The
+        // ceiling is derived from this set, so the invariant is relative.
         use super::SearxResult;
         let q = "watch battery replacement";
         let video_result = SearxResult {
@@ -19816,9 +20109,12 @@ mod hardcoding_ruling_tests {
         assert!(out.len() >= 2, "both results should be present");
         let video = out.iter().find(|r| r.sources.iter().any(|s| s == "invidious")).expect("video missing");
         let article = out.iter().find(|r| r.url.contains("watch-battery-guide")).expect("article missing");
-        // Video should be capped to 0.04 (below article floor 0.05)
-        assert!(video.score <= 0.041, "video for non-video query should be capped to ~0.04, got {}", video.score);
-        assert!(article.score >= 0.05, "article should be at floor 0.05+, got {}", article.score);
+        // Video is penalised; the article is not; the invariant is the ORDER.
+        assert_eq!(video.post_cap_sev, Some(super::CapSeverity::Video),
+            "video for a non-video query must carry the Video penalty");
+        assert!(article.post_cap_sev.is_none(), "genuine article must not be penalised");
+        assert!(video.score <= article.score.min(super::ARTICLE_FLOOR) + f32::EPSILON,
+            "video ceiling must be bounded by the uncapped floor, got {}", video.score);
         assert!(video.score < article.score, "video must rank below article for non-video query");
     }
 
