@@ -4201,6 +4201,71 @@ async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> 
     }
 }
 
+/// What the enrichment pass actually managed to do with ONE result's page.
+///
+/// The provenance block used to collapse all three of these states into a single
+/// stamped `observed_at: now()`, which asserts "we looked at this page just now".
+/// That is a fabrication for every result whose page was never fetched (past the
+/// fetch budget) or whose fetch failed/timed out — a client that trusts the
+/// timestamp labels an unobserved page as freshly observed. Separating the
+/// states lets provenance carry a real observation time ONLY when an observation
+/// exists, and a machine-readable reason when it does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CommerceFetchOutcome {
+    /// The page was fetched in THIS request and the HTML was handed to the
+    /// extractor. `observed_at` is a real observation time — even when the page
+    /// exposed no structured facts ("we looked, there was nothing there").
+    Fetched,
+    /// A fetch was issued but produced no HTML (network error, non-2xx, timeout,
+    /// or the wave was abandoned when the wall budget expired). No observation.
+    FetchFailed,
+    /// No fetch was ever issued for this result (outside the fetch budget, or it
+    /// was not eligible for enrichment). No observation.
+    NotFetched,
+}
+
+impl CommerceFetchOutcome {
+    /// True only when a real page observation backs this provenance block.
+    fn fetched(self) -> bool {
+        matches!(self, CommerceFetchOutcome::Fetched)
+    }
+
+    /// Stable, machine-readable reason string. This is an ENUM of pipeline
+    /// states, not prose: a client switches on it to tell "we looked and found
+    /// nothing" apart from "we never looked".
+    fn reason(self) -> &'static str {
+        match self {
+            CommerceFetchOutcome::Fetched => "fetched",
+            CommerceFetchOutcome::FetchFailed => "fetch_failed",
+            CommerceFetchOutcome::NotFetched => "not_fetched",
+        }
+    }
+}
+
+/// Build the honest `commerce_provenance` block for one result.
+///
+/// `observed_at` is present ONLY for `Fetched`. For the other two states it is an
+/// explicit JSON `null` — the field the client already reads stays in place, so
+/// this is a metadata-only change — plus `fetched: false` and a `reason` so the
+/// absence is explained rather than ambiguous. `source`/`data` remain null here:
+/// the extracted facts (when a page really exposed them) live on the `commerce`
+/// block, which is attached only from real HTML.
+fn commerce_provenance_block(url: &str, outcome: CommerceFetchOutcome) -> serde_json::Value {
+    let observed_at = if outcome.fetched() {
+        serde_json::Value::String(now_unix_string())
+    } else {
+        serde_json::Value::Null
+    };
+    serde_json::json!({
+        "url": url,
+        "observed_at": observed_at,
+        "fetched": outcome.fetched(),
+        "reason": outcome.reason(),
+        "source": serde_json::Value::Null,
+        "data": serde_json::Value::Null,
+    })
+}
+
 /// PURE, OFFLINE-TESTABLE enrichment: attach honest product facts to already-ranked
 /// results. This is the ONLY place commerce facts are attached, and it takes results
 /// that have ALREADY been ranked/scored by the main `/search` pipeline — it never
@@ -4234,13 +4299,11 @@ async fn enrich_with_commerce<F, Fut>(
         if r.get("commerce").is_some() {
             continue; // already enriched by an earlier step
         }
-        let provenance = serde_json::json!({
-            "url": url,
-            "observed_at": now_unix_string(),
-            "source": null,
-            "data": null,
-        });
-        match fetch(url.clone()).await {
+        // The outcome is only known AFTER the fetch resolves, so provenance is
+        // built at the end. A `None` fetch means no page was observed, so its
+        // `observed_at` must be null — stamping the response-build time there
+        // would claim an observation that never happened.
+        let outcome = match fetch(url.clone()).await {
             Some(h) => {
                 let offer: CommerceOffer = extract_commerce_offer(&h, &url);
                 // Only attach a `commerce` block when the page actually exposed
@@ -4253,10 +4316,14 @@ async fn enrich_with_commerce<F, Fut>(
                         Err(_) => {}
                     }
                 }
+                // Real HTML was observed. The page may still expose no facts —
+                // that is the honest "we looked, nothing there" state and it
+                // DOES carry a real observation time.
+                CommerceFetchOutcome::Fetched
             }
-            None => {}
-        }
-        r["commerce_provenance"] = provenance;
+            None => CommerceFetchOutcome::FetchFailed,
+        };
+        r["commerce_provenance"] = commerce_provenance_block(&url, outcome);
     }
 }
 
@@ -4291,19 +4358,18 @@ fn enrich_single_commerce(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let provenance = serde_json::json!({
-        "url": url,
-        "observed_at": now_unix_string(),
-        "source": null,
-        "data": null,
-    });
     let offer: CommerceOffer = extract_commerce_offer(html, &url);
     if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
         if let Ok(v) = serde_json::to_value(&offer) {
             r["commerce"] = v;
         }
     }
-    r["commerce_provenance"] = provenance;
+    // `html` is real page content handed to the extractor, so this row genuinely
+    // WAS observed and keeps a real `observed_at` — including the honest
+    // "fetched, page exposed no structured facts" case. Reaching this function at
+    // all IS the proof of observation: the parallel caller only routes rows here
+    // for which a fetch actually returned HTML, so this is always `Fetched`.
+    r["commerce_provenance"] = commerce_provenance_block(&url, CommerceFetchOutcome::Fetched);
 }
 
 /// Parallel variant of `enrich_with_commerce` — bounded-concurrency fetch + 22s wall cap.
@@ -4311,7 +4377,10 @@ fn enrich_single_commerce(
 /// Fetches up to MAX_PARALLEL_FETCH result pages concurrently. Results that still
 /// lack structured commerce facts after their page is fetched (or whose fetch fails
 /// / times out) keep commerce: null but ALWAYS carry commerce_provenance (honest:
-/// we never fabricate).
+/// we never fabricate). Crucially, `observed_at` is populated ONLY for a page that
+/// was actually fetched in this request — a row we never asked about, or whose fetch
+/// yielded nothing, reports `observed_at: null` plus `fetched: false` and a
+/// `reason`, so no client can mistake "never looked" for "just observed".
 ///
 /// Order is preserved byte-for-byte — enrichment is a strict post-rank decoration
 /// pass. The fetch closure must be Clone + Send because it is spawned into
@@ -4351,8 +4420,15 @@ async fn enrich_with_commerce_par<F, Fut>(
     //    /search must stay inside its 30s TimeoutLayer budget) — on expiry the
     //    remaining fetches are abandoned and those results keep commerce: null
     //    but still receive provenance in step 4 (honest, never fabricated).
+    //
+    //    `attempted` records which rows actually had a fetch ISSUED for them.
+    //    This is what separates "we looked and the page gave us nothing"
+    //    (Fetched) from "we looked and it failed" (FetchFailed) from "we never
+    //    even asked" (NotFetched). Without it every non-fetched row would carry
+    //    a fabricated observation time.
     let deadline = std::time::Instant::now() + wall_timeout;
     let mut fetched: Vec<(usize, String)> = Vec::new();
+    let mut attempted: Vec<usize> = Vec::new();
     for wave in eligible.chunks(max_par.max(1)) {
         let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(usize, String)>>)> = wave
             .iter()
@@ -4372,6 +4448,9 @@ async fn enrich_with_commerce_par<F, Fut>(
                 (idx, handle)
             })
             .collect();
+        // Every row in a wave we REACHED has a live fetch handle, so a fetch was
+        // genuinely issued for it — even if the wave below is then abandoned.
+        attempted.extend(wave.iter().copied());
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             // Budget exhausted — abandon pending waves (handles are dropped;
@@ -4403,21 +4482,28 @@ async fn enrich_with_commerce_par<F, Fut>(
         }
     }
 
-    // 4) Attach provenance to any result we didn't fetch (idempotent path).
-    for r in results.iter_mut() {
+    // 4) Attach provenance to any result that did NOT come back with real HTML
+    //    (idempotent path). The outcome is derived from what actually happened to
+    //    this row in step 2, so a row we never asked about — or whose fetch
+    //    yielded nothing — reports `observed_at: null` with an explanatory
+    //    `reason`, never a fabricated observation time.
+    for (idx, r) in results.iter_mut().enumerate() {
         if r.is_object() && r.get("commerce_provenance").is_none() {
             let url = r
                 .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let provenance = serde_json::json!({
-                "url": url,
-                "observed_at": now_unix_string(),
-                "source": null,
-                "data": null,
-            });
-            r["commerce_provenance"] = provenance;
+            let outcome = if attempted.contains(&idx) {
+                // A fetch was issued for this row but produced no HTML: network
+                // error, non-2xx, timeout, or an abandoned wave.
+                CommerceFetchOutcome::FetchFailed
+            } else {
+                // No fetch was ever issued (ineligible, or a later wave was never
+                // reached before the wall budget expired).
+                CommerceFetchOutcome::NotFetched
+            };
+            r["commerce_provenance"] = commerce_provenance_block(&url, outcome);
         }
     }
 }
@@ -9741,19 +9827,42 @@ fn merge_local_and_web(
         let content_lower = r.content.to_lowercase();
         let url_lower = r.url.to_lowercase();
 
+        // How many core topic terms a page must satisfy.
+        //
+        // The original rule demanded ALL of them, which is only coherent when the core
+        // set is a genuine multi-word ENTITY ("fantasy novel", "microservices
+        // architecture") where every token is part of the name. It is incoherent for a
+        // longer natural-language description: no page contains every token of a
+        // six-term clause, so the gate is unsatisfiable and `core_matches` is false
+        // for the WHOLE result set. That is not a mild demotion — `overlap` is forced
+        // to 0, the BERT gate (which only runs when overlap > 0) switches off, and
+        // `relevance` collapses to ~0 for everyone, logging var=0.000 /
+        // garbage_cluster=true. Ranking then falls through to the post-calibration
+        // caps, which floor EVERY result at the same value, so the order is decided by
+        // residual noise. Measured live 2026-09-30 on the conversational water-cycle
+        // question that is exactly what happened, and it is how a camera shop matching
+        // only the filler "hey" ended up beside NOAA and Wikipedia.
+        //
+        // STRUCTURAL FIX: keep the strict all-match for short, entity-like core sets
+        // (the case it was designed for), and require only a genuine multi-term topic
+        // match once the set is long enough that all-match cannot be satisfied. The
+        // "at least 2" bar is not a tuned constant — it is the same on-topic threshold
+        // the existing POST-CAL weak-match cap already uses for multi-topic queries.
+        let required_core_matches = if core_topic_terms.len() <= 2 {
+            core_topic_terms.len()
+        } else {
+            2
+        };
         let core_matches = if core_topic_terms.is_empty() {
             true
         } else {
-            // Require matching all core topic terms (or their stemmed versions).
-            // For multi-term topic queries (e.g. "fantasy novel", "microservices architecture"),
-            // matching only "fantasy" (like ESPN Fantasy Football) or only "architecture" (Quantum Architecture)
-            // is off-topic. All core topic terms must be present.
-            core_topic_terms.iter().all(|t| {
+            let matched_core = core_topic_terms.iter().filter(|t| {
                 let tl = t.to_lowercase();
                 let stemmed = tl.trim_end_matches('s');
                 title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
                     || title_lower.contains(stemmed) || content_lower.contains(stemmed) || url_lower.contains(stemmed)
-            })
+            }).count();
+            matched_core >= required_core_matches
         };
 
         let overlap = if distinctive_terms.is_empty() || !core_matches {
@@ -21934,6 +22043,264 @@ structured product data, so nothing must be extracted from the body.</p></body><
                 r.get("commerce").is_none(),
                 "no commerce block when fetch returns None"
             );
+        }
+    }
+
+    // ── FIX: `commerce_provenance.observed_at` must never be a FABRICATION ────
+    //
+    // The defect these lock: `enrich_with_commerce_par` step 4 stamped
+    // `observed_at: now_unix_string()` onto EVERY result that did not come back
+    // with real HTML. A live /shopping response showed all 10 rows carrying the
+    // identical response-build timestamp with `commerce: null` — asserting "we
+    // looked at this page just now" for pages that were never fetched (past
+    // COMMERCE_MAINPATH_TOP_N) or whose fetch 403'd/timed out. A client that
+    // trusts that field labels an unobservable page as freshly observed.
+    //
+    // The contract locked here: `observed_at` is present ONLY for a row whose page
+    // was actually fetched in this request. Everything else reports
+    // `observed_at: null` + `fetched: false` + a machine-readable `reason`.
+    // Crucially the third case — fetched, page had no structured facts — MUST
+    // still carry a real `observed_at`, so the fix is not an over-correction that
+    // throws away the honest "we looked and there was nothing there" signal.
+
+    /// Assert a provenance block is the honest "we have no observation" shape for
+    /// a given reason. Shared by the two no-observation tests so the contract is
+    /// stated once.
+    fn assert_no_observation(prov: &serde_json::Value, expected_reason: &str) {
+        assert_eq!(
+            prov["observed_at"],
+            serde_json::Value::Null,
+            "row must NOT carry an observation time (reason={}), got {}",
+            expected_reason,
+            prov["observed_at"]
+        );
+        assert_eq!(
+            prov["fetched"],
+            serde_json::json!(false),
+            "a row with no observation must report fetched=false"
+        );
+        assert_eq!(
+            prov["reason"],
+            serde_json::json!(expected_reason),
+            "provenance must explain WHY there is no observation time"
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_observed_at_is_null_when_fetch_was_never_issued() {
+        // Results whose page was never fetched must not claim an observation.
+        // We force "never fetched" the only way the pipeline can — the wall budget
+        // expires before the later wave is ever dispatched. MAX_PARALLEL_FETCH
+        // rows fit in the first wave; the rest are never asked about.
+        let wave = MAX_PARALLEL_FETCH;
+        let total = wave * 3;
+        let mut ranked: Vec<serde_json::Value> = (0..total)
+            .map(|i| serde_json::json!({ "url": format!("https://s{}.example.com/p", i) }))
+            .collect();
+
+        // A fetch slower than the whole wall budget: wave 1 is issued and
+        // abandoned, waves 2+ are never reached.
+        let fetch = |_url: String| async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            None
+        };
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        for (i, r) in ranked.iter().enumerate() {
+            let prov = r
+                .get("commerce_provenance")
+                .unwrap_or_else(|| panic!("row {} must still carry provenance", i));
+            // Wave 1 had a fetch issued and lost it to the wall clock; waves 2+
+            // were never dispatched at all. Both are honest no-observation states
+            // and neither may carry a time — the specific reason differs, which is
+            // exactly what `reason` exists to express.
+            let expected_reason = if i < wave { "fetch_failed" } else { "not_fetched" };
+            assert_no_observation(prov, expected_reason);
+            assert!(
+                r.get("commerce").is_none(),
+                "row {} must not get a commerce block without a real page",
+                i
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provenance_observed_at_is_null_when_fetch_fails() {
+        // A fetch that IS issued but returns None (403 / connection refused /
+        // timeout — pbtech.co.nz and electronics.sony.com both 403 a direct fetch)
+        // is still not an observation. Distinguish it from "never asked" via
+        // `reason`, and never stamp a time on it.
+        let mut ranked = vec![serde_json::json!({
+            "url": "https://blocked.example.com/product/1"
+        })];
+        let fetch = |_url: String| async { None };
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        let prov = &ranked[0]["commerce_provenance"];
+        // A FAILED fetch must not report an observation time, and must be
+        // distinguishable from a row we never looked at.
+        assert_no_observation(prov, "fetch_failed");
+    }
+
+    #[tokio::test]
+    async fn provenance_observed_at_is_real_when_page_fetched_but_had_no_facts() {
+        // The anti-over-correction case, and the one an over-eager fix breaks
+        // first. This page WAS fetched — real HTML reached the extractor — but it
+        // exposes no structured product markup at all. That is a REAL observation
+        // and MUST keep a real `observed_at`; nulling it here would be lying in the
+        // other direction ("we looked but cannot say when"), destroying the
+        // client's ability to distinguish a stale price from a current one.
+        // (Whether a `commerce` block is attached is a separate contract — the
+        // extractor's coarse host-label `merchant` fallback means a bare host can
+        // still count as a fact — and is deliberately NOT asserted here.)
+        let mut ranked = vec![serde_json::json!({
+            "url": "https://blog.example.com/a-long-article-about-headphones"
+        })];
+        let plain = "<!doctype html><html><head><title>A Long Article</title></head>\
+                     <body><p>Prose with no product markup whatsoever.</p></body></html>"
+            .to_string();
+        let fetch = move |_url: String| {
+            let html = plain.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        let r = &ranked[0];
+        let prov = &r["commerce_provenance"];
+        assert_eq!(prov["fetched"], serde_json::json!(true), "the page WAS fetched");
+        assert_eq!(prov["reason"], serde_json::json!("fetched"));
+        let observed = prov["observed_at"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a genuinely fetched page must carry a real observed_at, got {}", prov["observed_at"]));
+        assert!(
+            observed.chars().all(|c| c.is_ascii_digit()) && observed.len() >= 9,
+            "observed_at must be unix seconds, got {:?}",
+            observed
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_honesty_does_not_reorder_results() {
+        // The metadata-only guarantee: mixing fetched / failed / never-fetched
+        // rows must leave the ranked order byte-identical. Enrichment is a strict
+        // post-rank decoration pass, so changing provenance must not move a result.
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://a.example.com/1", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/2", "score": 8.0 }),
+            serde_json::json!({ "url": "https://c.example.com/3", "score": 7.0 }),
+            serde_json::json!({ "url": "https://d.example.com/4", "score": 6.0 }),
+        ];
+        let before: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+
+        let ok = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |url: String| {
+            let html = ok.clone();
+            async move {
+                if url.contains("/1") {
+                    Some(html) // real facts
+                } else {
+                    None // fetched, failed
+                }
+            }
+        };
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        let after: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(before, after, "provenance honesty must never reorder results");
+
+        // Row 1 was genuinely observed; the rest were attempted and failed.
+        assert!(ranked[0]["commerce_provenance"]["observed_at"].is_string());
+        for r in ranked.iter().skip(1) {
+            assert!(r["commerce_provenance"]["observed_at"].is_null());
+            assert_eq!(r["commerce_provenance"]["reason"], serde_json::json!("fetch_failed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sequential_enrichment_nulls_observed_at_on_failed_fetch() {
+        // The sequential path had the identical defect (it built its provenance
+        // block BEFORE awaiting the fetch, so it could not know the outcome).
+        // Lock the same contract there so the two paths cannot drift apart.
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://ok.example.com/1" }),
+            serde_json::json!({ "url": "https://bad.example.com/2" }),
+        ];
+        let ok = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |url: String| {
+            let html = ok.clone();
+            async move {
+                if url.contains("ok.example") {
+                    Some(html)
+                } else {
+                    None
+                }
+            }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+
+        assert!(
+            ranked[0]["commerce_provenance"]["observed_at"].is_string(),
+            "a successfully fetched page keeps a real observed_at"
+        );
+        assert_eq!(ranked[0]["commerce_provenance"]["fetched"], serde_json::json!(true));
+        assert_eq!(
+            ranked[1]["commerce_provenance"]["observed_at"],
+            serde_json::Value::Null,
+            "a failed fetch must not report an observation time"
+        );
+        assert_eq!(ranked[1]["commerce_provenance"]["fetched"], serde_json::json!(false));
+        assert_eq!(ranked[1]["commerce_provenance"]["reason"], serde_json::json!("fetch_failed"));
+    }
+
+    #[test]
+    fn provenance_block_shapes_are_one_to_one_with_outcomes() {
+        // The builder is the single source of truth for provenance shape. Only
+        // `Fetched` may carry a time; the reason enum is stable and distinct for
+        // each state so a client can tell the two "no observation" cases apart.
+        let fetched = commerce_provenance_block("https://x.example/p", CommerceFetchOutcome::Fetched);
+        assert!(fetched["observed_at"].is_string());
+        assert_eq!(fetched["fetched"], serde_json::json!(true));
+        assert_eq!(fetched["reason"], serde_json::json!("fetched"));
+        assert_eq!(fetched["url"], serde_json::json!("https://x.example/p"));
+
+        for (outcome, reason) in [
+            (CommerceFetchOutcome::FetchFailed, "fetch_failed"),
+            (CommerceFetchOutcome::NotFetched, "not_fetched"),
+        ] {
+            let p = commerce_provenance_block("https://x.example/p", outcome);
+            assert!(p["observed_at"].is_null(), "{} must not stamp a time", reason);
+            assert_eq!(p["fetched"], serde_json::json!(false));
+            assert_eq!(p["reason"], serde_json::json!(reason));
+            // source/data stay null: facts only ever come from real HTML and
+            // live on the `commerce` block.
+            assert!(p["source"].is_null());
+            assert!(p["data"].is_null());
         }
     }
 
