@@ -4541,7 +4541,7 @@ fn data_has_fact(d: &OfferFacts, result_url: &str) -> bool {
             // identifier against a normalized URL is what let `www.amazon.com`
             // (the host fallback) count as a page-supplied seller and re-open D1 in
             // production; the URL is already normalized, so the label must be too.
-            (Some(m), Some(host)) => m.trim().to_lowercase() != host,
+            (Some(m), Some(host)) => normalize_host_label(m) != host,
         // No merchant, or no host to check it against: unverifiable, so not a fact.
         _ => false,
     }
@@ -5101,7 +5101,7 @@ impl AffiliateCtx {
                                                             if let Some(host) =
                                                                 net.fallback_url.as_deref().and_then(url_host)
                                                             {
-                                                                if false && is_reserved_documentation_host(&host) {
+                                                                if is_reserved_documentation_host(&host) {
                                                                     tracing::warn!(
                                                                         "affiliate: dropping reserved-documentation fallback_url for network '{}' (host '{}' is IANA documentation space, not a merchant)",
                                                                         net.id,
