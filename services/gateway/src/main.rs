@@ -20,6 +20,8 @@ mod clean;
 mod goals;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
+// FIX-IF-35: absolute score normalization + question-shaped-page demotion.
+mod fix_if_35_tests;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -4259,6 +4261,71 @@ async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> 
     }
 }
 
+/// What the enrichment pass actually managed to do with ONE result's page.
+///
+/// The provenance block used to collapse all three of these states into a single
+/// stamped `observed_at: now()`, which asserts "we looked at this page just now".
+/// That is a fabrication for every result whose page was never fetched (past the
+/// fetch budget) or whose fetch failed/timed out — a client that trusts the
+/// timestamp labels an unobserved page as freshly observed. Separating the
+/// states lets provenance carry a real observation time ONLY when an observation
+/// exists, and a machine-readable reason when it does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CommerceFetchOutcome {
+    /// The page was fetched in THIS request and the HTML was handed to the
+    /// extractor. `observed_at` is a real observation time — even when the page
+    /// exposed no structured facts ("we looked, there was nothing there").
+    Fetched,
+    /// A fetch was issued but produced no HTML (network error, non-2xx, timeout,
+    /// or the wave was abandoned when the wall budget expired). No observation.
+    FetchFailed,
+    /// No fetch was ever issued for this result (outside the fetch budget, or it
+    /// was not eligible for enrichment). No observation.
+    NotFetched,
+}
+
+impl CommerceFetchOutcome {
+    /// True only when a real page observation backs this provenance block.
+    fn fetched(self) -> bool {
+        matches!(self, CommerceFetchOutcome::Fetched)
+    }
+
+    /// Stable, machine-readable reason string. This is an ENUM of pipeline
+    /// states, not prose: a client switches on it to tell "we looked and found
+    /// nothing" apart from "we never looked".
+    fn reason(self) -> &'static str {
+        match self {
+            CommerceFetchOutcome::Fetched => "fetched",
+            CommerceFetchOutcome::FetchFailed => "fetch_failed",
+            CommerceFetchOutcome::NotFetched => "not_fetched",
+        }
+    }
+}
+
+/// Build the honest `commerce_provenance` block for one result.
+///
+/// `observed_at` is present ONLY for `Fetched`. For the other two states it is an
+/// explicit JSON `null` — the field the client already reads stays in place, so
+/// this is a metadata-only change — plus `fetched: false` and a `reason` so the
+/// absence is explained rather than ambiguous. `source`/`data` remain null here:
+/// the extracted facts (when a page really exposed them) live on the `commerce`
+/// block, which is attached only from real HTML.
+fn commerce_provenance_block(url: &str, outcome: CommerceFetchOutcome) -> serde_json::Value {
+    let observed_at = if outcome.fetched() {
+        serde_json::Value::String(now_unix_string())
+    } else {
+        serde_json::Value::Null
+    };
+    serde_json::json!({
+        "url": url,
+        "observed_at": observed_at,
+        "fetched": outcome.fetched(),
+        "reason": outcome.reason(),
+        "source": serde_json::Value::Null,
+        "data": serde_json::Value::Null,
+    })
+}
+
 /// PURE, OFFLINE-TESTABLE enrichment: attach honest product facts to already-ranked
 /// results. This is the ONLY place commerce facts are attached, and it takes results
 /// that have ALREADY been ranked/scored by the main `/search` pipeline — it never
@@ -4292,13 +4359,11 @@ async fn enrich_with_commerce<F, Fut>(
         if r.get("commerce").is_some() {
             continue; // already enriched by an earlier step
         }
-        let provenance = serde_json::json!({
-            "url": url,
-            "observed_at": now_unix_string(),
-            "source": null,
-            "data": null,
-        });
-        match fetch(url.clone()).await {
+        // The outcome is only known AFTER the fetch resolves, so provenance is
+        // built at the end. A `None` fetch means no page was observed, so its
+        // `observed_at` must be null — stamping the response-build time there
+        // would claim an observation that never happened.
+        let outcome = match fetch(url.clone()).await {
             Some(h) => {
                 let offer: CommerceOffer = extract_commerce_offer(&h, &url);
                 // Only attach a `commerce` block when the page actually exposed
@@ -4311,10 +4376,14 @@ async fn enrich_with_commerce<F, Fut>(
                         Err(_) => {}
                     }
                 }
+                // Real HTML was observed. The page may still expose no facts —
+                // that is the honest "we looked, nothing there" state and it
+                // DOES carry a real observation time.
+                CommerceFetchOutcome::Fetched
             }
-            None => {}
-        }
-        r["commerce_provenance"] = provenance;
+            None => CommerceFetchOutcome::FetchFailed,
+        };
+        r["commerce_provenance"] = commerce_provenance_block(&url, outcome);
     }
 }
 
@@ -4349,19 +4418,18 @@ fn enrich_single_commerce(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let provenance = serde_json::json!({
-        "url": url,
-        "observed_at": now_unix_string(),
-        "source": null,
-        "data": null,
-    });
     let offer: CommerceOffer = extract_commerce_offer(html, &url);
     if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
         if let Ok(v) = serde_json::to_value(&offer) {
             r["commerce"] = v;
         }
     }
-    r["commerce_provenance"] = provenance;
+    // `html` is real page content handed to the extractor, so this row genuinely
+    // WAS observed and keeps a real `observed_at` — including the honest
+    // "fetched, page exposed no structured facts" case. Reaching this function at
+    // all IS the proof of observation: the parallel caller only routes rows here
+    // for which a fetch actually returned HTML, so this is always `Fetched`.
+    r["commerce_provenance"] = commerce_provenance_block(&url, CommerceFetchOutcome::Fetched);
 }
 
 /// Parallel variant of `enrich_with_commerce` — bounded-concurrency fetch + 22s wall cap.
@@ -4369,7 +4437,10 @@ fn enrich_single_commerce(
 /// Fetches up to MAX_PARALLEL_FETCH result pages concurrently. Results that still
 /// lack structured commerce facts after their page is fetched (or whose fetch fails
 /// / times out) keep commerce: null but ALWAYS carry commerce_provenance (honest:
-/// we never fabricate).
+/// we never fabricate). Crucially, `observed_at` is populated ONLY for a page that
+/// was actually fetched in this request — a row we never asked about, or whose fetch
+/// yielded nothing, reports `observed_at: null` plus `fetched: false` and a
+/// `reason`, so no client can mistake "never looked" for "just observed".
 ///
 /// Order is preserved byte-for-byte — enrichment is a strict post-rank decoration
 /// pass. The fetch closure must be Clone + Send because it is spawned into
@@ -4409,8 +4480,15 @@ async fn enrich_with_commerce_par<F, Fut>(
     //    /search must stay inside its 30s TimeoutLayer budget) — on expiry the
     //    remaining fetches are abandoned and those results keep commerce: null
     //    but still receive provenance in step 4 (honest, never fabricated).
+    //
+    //    `attempted` records which rows actually had a fetch ISSUED for them.
+    //    This is what separates "we looked and the page gave us nothing"
+    //    (Fetched) from "we looked and it failed" (FetchFailed) from "we never
+    //    even asked" (NotFetched). Without it every non-fetched row would carry
+    //    a fabricated observation time.
     let deadline = std::time::Instant::now() + wall_timeout;
     let mut fetched: Vec<(usize, String)> = Vec::new();
+    let mut attempted: Vec<usize> = Vec::new();
     for wave in eligible.chunks(max_par.max(1)) {
         let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(usize, String)>>)> = wave
             .iter()
@@ -4430,6 +4508,9 @@ async fn enrich_with_commerce_par<F, Fut>(
                 (idx, handle)
             })
             .collect();
+        // Every row in a wave we REACHED has a live fetch handle, so a fetch was
+        // genuinely issued for it — even if the wave below is then abandoned.
+        attempted.extend(wave.iter().copied());
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             // Budget exhausted — abandon pending waves (handles are dropped;
@@ -4461,21 +4542,28 @@ async fn enrich_with_commerce_par<F, Fut>(
         }
     }
 
-    // 4) Attach provenance to any result we didn't fetch (idempotent path).
-    for r in results.iter_mut() {
+    // 4) Attach provenance to any result that did NOT come back with real HTML
+    //    (idempotent path). The outcome is derived from what actually happened to
+    //    this row in step 2, so a row we never asked about — or whose fetch
+    //    yielded nothing — reports `observed_at: null` with an explanatory
+    //    `reason`, never a fabricated observation time.
+    for (idx, r) in results.iter_mut().enumerate() {
         if r.is_object() && r.get("commerce_provenance").is_none() {
             let url = r
                 .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let provenance = serde_json::json!({
-                "url": url,
-                "observed_at": now_unix_string(),
-                "source": null,
-                "data": null,
-            });
-            r["commerce_provenance"] = provenance;
+            let outcome = if attempted.contains(&idx) {
+                // A fetch was issued for this row but produced no HTML: network
+                // error, non-2xx, timeout, or an abandoned wave.
+                CommerceFetchOutcome::FetchFailed
+            } else {
+                // No fetch was ever issued (ineligible, or a later wave was never
+                // reached before the wall budget expired).
+                CommerceFetchOutcome::NotFetched
+            };
+            r["commerce_provenance"] = commerce_provenance_block(&url, outcome);
         }
     }
 }
@@ -6320,6 +6408,56 @@ fn calibrate_scores(scores: &mut [f32]) {
     for score in scores.iter_mut() {
         let t = (*score - raw_min) / norm;
         *score = (floor + t * span).clamp(floor, ceil);
+    }
+}
+
+/// Phase 1 (FIX-IF-35): ABSOLUTE merit ceiling applied AFTER positional calibration.
+///
+/// `calibrate_scores` is purely positional — it maps the set's [min,max] onto
+/// [0.05,1.0], so the set maximum is forced onto exactly 1.0 by construction, every
+/// query, no matter how weak the evidence. That makes `s=1.000` a RANKING number
+/// wearing a CONFIDENCE number's clothes: it means "first of this set", and carries
+/// no information about whether the page actually answers the query. It also
+/// launders junk: when the raw max is an off-topic page, the rescale promotes it to
+/// a perfect-looking 1.000 that no downstream penalty can reach, because every
+/// in-loop penalty is applied to `base` BEFORE the rescale and is divided straight
+/// back out.
+///
+/// The invariant this restores: reaching the TOP of the scale requires earning it in
+/// ABSOLUTE terms, not merely being the best of a bad set. A result may only be
+/// lifted to `abs_ceil` if its own absolute relevance clears `abs_floor`; below
+/// that it keeps its calibrated rank but is bounded away from the top of the scale.
+/// This is a property of the SCORE SCALE, not of any host, brand or query string —
+/// no page list and no query literal is involved.
+///
+/// Both bounds are dimensionless ratios in [0,1] over the relevance signal that
+/// already drives `r.score`, so this introduces no new tuning surface of its own.
+fn apply_absolute_merit_ceiling(relevance: &[f32], scores: &mut [f32]) {
+    /// Absolute relevance a result must reach to be allowed near the top of the
+    /// scale. Below this the result is, by the ranker's own absolute measure, not a
+    /// confident match for the query — it may appear, but not as a 1.000.
+    const ABS_FLOOR: f32 = 0.35;
+    /// Ceiling applied to a result that clears ABS_FLOOR. Below ABS_FLOOR the
+    /// ceiling is interpolated down to LOW_CEIL, so the penalty is continuous
+    /// rather than a cliff.
+    const HIGH_CEIL: f32 = 1.0;
+    const LOW_CEIL: f32 = 0.55;
+
+    if scores.is_empty() || relevance.len() != scores.len() {
+        return;
+    }
+    for (score, rel) in scores.iter_mut().zip(relevance.iter()) {
+        // Only ever LOWER a score: this must never promote a result or reorder the
+        // set, only stop a weak result from claiming the top of the scale.
+        let ceiling = if *rel >= ABS_FLOOR {
+            HIGH_CEIL
+        } else {
+            let frac = (*rel / ABS_FLOOR).clamp(0.0, 1.0);
+            LOW_CEIL + frac * (HIGH_CEIL - LOW_CEIL)
+        };
+        if *score > ceiling {
+            *score = ceiling;
+        }
     }
 }
 
@@ -8985,6 +9123,29 @@ fn is_weak_anchor_word(w: &str) -> bool {
     WEAK.contains(&w)
 }
 
+/// Closed-class vocabulary describing the NAMING PREDICATE of a naming/etymology
+/// question — the verb that asserts a NAME relation ("named after", "called",
+/// "etymology"). These words are shared by `is_naming_question` (query shape) and
+/// the term-extraction filters (topic terms), so the two can never drift apart.
+///
+/// Why they must not be TOPIC terms: a naming question's subject is the pair of
+/// entities, not the verb. "why is the apache web server named after a helicopter"
+/// has core topic terms apache + helicopter; requiring the literal token "named" as
+/// well means `core_matches` is false for essentially every real page, so `overlap`
+/// collapses to 0, BERT is gated off (it only runs when overlap > 0), and
+/// `relevance` becomes 0.000 for the WHOLE set — the absolute relevance signal dies
+/// and ranking is decided by residual noise (measured live 2026-09-30: rel=0.000 on
+/// all 21 results, including the correct apache.org/apache-name page).
+const NAMING_PREDICATE_VERBS: &[&str] = &[
+    "named", "naming", "called", "etymology", "etymological", "entitled",
+    "chose", "chosen", "picked", "nickname", "surname", "codename",
+];
+
+/// True when `w` is a naming-predicate verb (see NAMING_PREDICATE_VERBS).
+fn is_naming_predicate_word(w: &str) -> bool {
+    NAMING_PREDICATE_VERBS.contains(&w)
+}
+
 /// Detects a NAMING / ETYMOLOGY question shape: an interrogative frame plus a
 /// naming predicate ("named after", "called", "choose that name", "where does the
 /// name X come from", "etymology", "origin of the name").
@@ -9001,6 +9162,77 @@ fn is_weak_anchor_word(w: &str) -> bool {
 ///   (2) a page that matches the query's dominant proper noun but none of the
 ///       query's OTHER content tokens (an incidental entity mention — e.g. a crime
 ///       story about a person with the surname, or a dealer page for the brand).
+/// Closed-class interrogative (wh-) vocabulary. In a natural-language question the
+/// interrogative word introduces the clause that actually states the REQUEST, so
+/// everything before it is framing (see `first_interrogative_index`). Purely
+/// function-word class — names no entity, brand or topic, and is deliberately the
+/// same closed set `is_naming_question` already keys off, so the two cannot drift.
+const INTERROGATIVES: &[&str] = &[
+    "what", "why", "how", "when", "where", "who", "which", "whom", "whose",
+];
+
+/// Index of the first interrogative token in `words`, if any.
+///
+/// This is the structural anchor for conversational queries (FIX-IF-39). A spoken-style
+/// question wraps the real request in discourse preamble: "hey so my friend asked me the
+/// other day about this whole thing and i was wondering if you could tell me WHAT actually
+/// happens when the water cycle goes through its various stages". The subject of the
+/// question lives in the interrogative clause; the preamble is framing, not topic.
+fn first_interrogative_index(words: &[&str]) -> Option<usize> {
+    words
+        .iter()
+        .position(|w| INTERROGATIVES.contains(&w.to_lowercase().as_str()))
+}
+
+/// Closed-class DISCOURSE-FILLER vocabulary (FIX-IF-39).
+///
+/// Greetings, interjections, back-channel and politeness tokens that a spoken-style
+/// question is padded with. They are grammatical glue with ZERO topical content, and
+/// they are also the highest-collision tokens on the open web: "hey" appears in the
+/// brand names HeyGen / hey.com / Hey Jimmy, "hi" in countless domains, "yo", "wow",
+/// "hmm", "please", "thanks", "well", "just", "literally", "honestly"....
+///
+/// Why they must not be TOPIC terms: a filler token is a lexically real, high-frequency
+/// string, so token-overlap rewards a page merely for CONTAINING it. Measured live
+/// 2026-09-30 on a conversational water-cycle question, a camera shop matching only
+/// "hey" and a video-avatar brand matching "hey"+"you" tied the genuine NOAA/Wikipedia
+/// answers inside the top-5 — the filler WAS the entire lexical overlap of those pages.
+///
+/// Closed-class function-word list: it names no brand, domain or query. Deliberately
+/// separate from `stop_words` (which is grammatical function words) because a filler is
+/// NOT grammatically required — removing it from the query would change its meaning —
+/// but it is equally non-topical for ranking. Adding to the lexicon generalises the rule
+/// to every future conversational query; the engine never had to see one to benefit.
+const DISCOURSE_FILLERS: &[&str] = &[
+    // greetings / vocatives
+    "hey", "hi", "hii", "hello", "yo", "hiya", "greetings", "heya", "howdy",
+    // interjections / back-channel
+    "wow", "oh", "ah", "eh", "hm", "hmm", "huh", "ugh", "oops", "oof", "yikes",
+    "yay", "yep", "yup", "nope", "nah", "uh", "um", "umm", "er",
+    // politeness
+    "please", "thanks", "thank",
+    // intensifiers / hedges: emphasis, not subject matter
+    "really", "honestly", "frankly", "literally", "basically", "essentially",
+    "definitely", "absolutely", "totally", "seriously", "obviously", "clearly",
+    "simply", "quite", "rather", "pretty", "kinda", "sorta", "somewhat",
+];
+
+/// True when `w` is a discourse filler (see DISCOURSE_FILLERS).
+fn is_discourse_filler(w: &str) -> bool {
+    DISCOURSE_FILLERS.contains(&w)
+}
+
+/// Minimum number of tokens that must precede the interrogative before the query is
+/// treated as having a conversational preamble. A short lead-in ("so what is X",
+/// "ok how does Y work") is normal phrasing, not a conversational wrap, and must not
+/// trigger clause narrowing — otherwise every ordinary question would be re-scoped.
+const MIN_CONVERSATIONAL_PREAMBLE_TOKENS: usize = 4;
+
+/// Minimum number of topic terms the interrogative clause must retain for narrowing to
+/// be meaningful. If the clause is mostly framing too, the full-query term set is kept
+/// (fail-open: never narrow away a query's only subject).
+const MIN_CLAUSE_TOPIC_TERMS: usize = 2;
+
 fn is_naming_question(query: &str) -> bool {
     let q = query.to_lowercase();
     let words: Vec<&str> = q.split(|c: char| !c.is_alphanumeric() && c != '\'').collect();
@@ -9018,10 +9250,7 @@ fn is_naming_question(query: &str) -> bool {
     // river come from"), so they only count alongside a name-ish noun.
     // This is closed-class vocabulary describing the QUESTION FORM — it names no
     // entity, brand or topic.
-    const STRONG_NAMING_PREDICATES: &[&str] = &[
-        "named", "naming", "called", "etymology", "etymological", "entitled",
-        "chose", "chosen", "picked", "nickname", "surname", "codename",
-    ];
+    let has_strong = words.iter().any(|w| is_naming_predicate_word(w));
     const WEAK_NAMING_PREDICATES: &[&str] = &[
         "name", "names", "title", "word", "words", "term", "call", "calls",
         "choose", "mean", "means", "meaning", "refer", "refs", "derived",
@@ -9031,7 +9260,6 @@ fn is_naming_question(query: &str) -> bool {
         "come from", "comes from", "came from", "derived from", "derives from",
         "name origin", "origin of the name",
     ];
-    let has_strong = words.iter().any(|w| STRONG_NAMING_PREDICATES.contains(w));
     let has_weak = words.iter().any(|w| WEAK_NAMING_PREDICATES.contains(w));
     let has_name_noun = words.iter().any(|w| {
         matches!(*w, "name" | "names" | "naming" | "word" | "words" | "term" | "title")
@@ -9377,6 +9605,18 @@ fn merge_local_and_web(
                 && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
                 && !temporal_fillers.contains(lower.as_str())
+                // FIX-IF-39: a discourse filler is non-topical glue, and it is the
+                // single highest-collision token class on the web ("hey" alone
+                // matches HeyGen / hey.com / Hey Jimmy). Leaving it here lets a page
+                // whose ENTIRE overlap is one filler tie the genuine answers.
+                && !is_discourse_filler(&lower)
+                // FIX-IF-35: same exclusion as core_topic_terms. `overlap` is the
+                // fraction of distinctive terms a page contains, and the >=2-of-3
+                // weak-match cap counts them too — so a naming predicate sitting in
+                // this set both dilutes overlap and lets an off-topic page that
+                // happens to contain the verb look like a good match. The predicate
+                // describes the question FORM; the entities describe the subject.
+                && !is_naming_predicate_word(&lower)
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
@@ -9559,10 +9799,103 @@ fn merge_local_and_web(
                 && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
                 && !temporal_fillers.contains(lower.as_str())
+                // FIX-IF-39: THE fix for filler-token brand collisions. `core_matches`
+                // below requires EVERY core term to be present, so a filler left in
+                // this set is not merely noisy — it makes the gate UNSATISFIABLE for
+                // every real page. Measured live 2026-09-30 on the conversational
+                // water-cycle question: core terms included "hey"/"actually"/"you",
+                // so core_matches was false for ALL 23 results, `overlap` collapsed
+                // to 0, the BERT gate (which only runs when overlap > 0) switched
+                // off, and the gateway logged "Relevance distribution: best=0.041,
+                // mean=0.018, var=0.000, garbage_cluster=true" — the absolute
+                // relevance signal was DEAD and every result tied at the same 0.04
+                // post-calibration cap. Ranking was then decided by residual noise,
+                // which is how a camera shop matching only "hey" landed in the top-5
+                // beside NOAA and Wikipedia. Same failure mode as FIX-IF-35 one
+                // layer up: a non-topical token in the mandatory set kills the
+                // signal for the whole result set. Closed-class vocabulary; names
+                // no brand, domain or query.
+                && !is_discourse_filler(&lower)
+                // FIX-IF-35: a naming PREDICATE is query structure, not a topic.
+                // `core_matches` below requires EVERY core term to be present, so
+                // leaving "named"/"called"/"etymology" in this set made
+                // core_matches false for essentially every real page: overlap
+                // collapsed to 0, the BERT gate (which only runs when overlap > 0)
+                // switched off, and `relevance` was 0.000 for the entire result
+                // set — the absolute signal the ranker depends on was dead, and the
+                // surviving ordering was residual noise. Measured live
+                // 2026-09-30 on "why is the apache web server named after a
+                // helicopter": rel=0.000 on all 21 results. Excluding the predicate
+                // leaves the real subject pair (apache, helicopter) to carry the
+                // match. Closed-class vocabulary; names no entity or topic.
+                && !is_naming_predicate_word(&lower)
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
         .collect();
+
+    // ── Conversational-preamble narrowing (FIX-IF-39) ──
+    // A spoken-style question wraps the real request in discourse preamble: "hey so my
+    // friend asked me the other day about this whole thing and i was wondering if you
+    // could tell me WHAT actually happens when the water cycle goes through its various
+    // stages". The interrogative word introduces the clause that STATES THE ASK, so the
+    // subject of the question lives at-or-after it; everything before is framing. The
+    // preamble tokens ("hey"/"friend"/"asked"/"day"/"thing"/"wondering"/"tell") are not
+    // merely noise here — because `core_matches` demands EVERY core term, each one makes
+    // the gate harder to satisfy, and the filler exclusion alone still leaves the
+    // conversational scaffolding ("friend", "asked", "wondering") in the MANDATORY set.
+    // Measured live 2026-09-30: `core_matches` was false for all 23 results, relevance
+    // logged var=0.000 / garbage_cluster=true, and everything tied at 0.04 so a camera
+    // shop matching only "hey" ranked beside NOAA and Wikipedia.
+    //
+    // STRUCTURAL RULE, no per-query literals: when the query is long AND the interrogative
+    // clause on its own still yields a usable number of topic terms, restrict the core-topic
+    // set to that clause. Both guards keep short/topic queries ("what is quantum computing",
+    // "best laptop for programming 2026") completely untouched — there is no preamble to
+    // strip, or the clause would not retain enough terms to be meaningful.
+    let conversational_clause_start: Option<usize> = {
+        let idx = first_interrogative_index(&q_words);
+        match idx {
+            // Only when the preamble is substantial (a real conversational wrap, not a
+            // 1-2 word lead-in) does narrowing apply.
+            Some(i) if i >= MIN_CONVERSATIONAL_PREAMBLE_TOKENS => Some(i),
+            _ => None,
+        }
+    };
+    let core_topic_terms: Vec<&str> = match conversational_clause_start {
+        Some(start) => {
+            let clause_terms: Vec<&str> = q_words[start..]
+                .iter()
+                .copied()
+                .filter(|w| {
+                    let lower = w.to_lowercase();
+                    lower.len() >= 3
+                        && !stop_words.contains(lower.as_str())
+                        && !generic_web_terms.contains(lower.as_str())
+                        && !meta_action_terms.contains(lower.as_str())
+                        && !unit_terms.contains(lower.as_str())
+                        && !role_descriptor_terms.contains(lower.as_str())
+                        && !weak_discriminative.contains(lower.as_str())
+                        && !temporal_fillers.contains(lower.as_str())
+                        && !is_discourse_filler(&lower)
+                        && !is_naming_predicate_word(&lower)
+                        && !lower.chars().all(|c| c.is_ascii_digit())
+                })
+                .collect();
+            // The clause must retain enough topic terms to be a meaningful narrower
+            // description of the query; otherwise fall back to the full query.
+            if clause_terms.len() >= MIN_CLAUSE_TOPIC_TERMS {
+                tracing::info!(
+                    "CONVERSATIONAL QUERY: narrowing core topic terms to the interrogative clause ({} of {} query tokens): {:?}",
+                    clause_terms.len(), q_words.len(), clause_terms
+                );
+                clause_terms
+            } else {
+                core_topic_terms
+            }
+        }
+        None => core_topic_terms,
+    };
 
     // Multi-word phrase entities (P1): adjacent non-stopword runs of length >= 2 in the
     // raw query. These are the terms most prone to FALSE-POSITIVE token overlap — e.g.
@@ -9674,19 +10007,42 @@ fn merge_local_and_web(
         let content_lower = r.content.to_lowercase();
         let url_lower = r.url.to_lowercase();
 
+        // How many core topic terms a page must satisfy.
+        //
+        // The original rule demanded ALL of them, which is only coherent when the core
+        // set is a genuine multi-word ENTITY ("fantasy novel", "microservices
+        // architecture") where every token is part of the name. It is incoherent for a
+        // longer natural-language description: no page contains every token of a
+        // six-term clause, so the gate is unsatisfiable and `core_matches` is false
+        // for the WHOLE result set. That is not a mild demotion — `overlap` is forced
+        // to 0, the BERT gate (which only runs when overlap > 0) switches off, and
+        // `relevance` collapses to ~0 for everyone, logging var=0.000 /
+        // garbage_cluster=true. Ranking then falls through to the post-calibration
+        // caps, which floor EVERY result at the same value, so the order is decided by
+        // residual noise. Measured live 2026-09-30 on the conversational water-cycle
+        // question that is exactly what happened, and it is how a camera shop matching
+        // only the filler "hey" ended up beside NOAA and Wikipedia.
+        //
+        // STRUCTURAL FIX: keep the strict all-match for short, entity-like core sets
+        // (the case it was designed for), and require only a genuine multi-term topic
+        // match once the set is long enough that all-match cannot be satisfied. The
+        // "at least 2" bar is not a tuned constant — it is the same on-topic threshold
+        // the existing POST-CAL weak-match cap already uses for multi-topic queries.
+        let required_core_matches = if core_topic_terms.len() <= 2 {
+            core_topic_terms.len()
+        } else {
+            2
+        };
         let core_matches = if core_topic_terms.is_empty() {
             true
         } else {
-            // Require matching all core topic terms (or their stemmed versions).
-            // For multi-term topic queries (e.g. "fantasy novel", "microservices architecture"),
-            // matching only "fantasy" (like ESPN Fantasy Football) or only "architecture" (Quantum Architecture)
-            // is off-topic. All core topic terms must be present.
-            core_topic_terms.iter().all(|t| {
+            let matched_core = core_topic_terms.iter().filter(|t| {
                 let tl = t.to_lowercase();
                 let stemmed = tl.trim_end_matches('s');
                 title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
                     || title_lower.contains(stemmed) || content_lower.contains(stemmed) || url_lower.contains(stemmed)
-            })
+            }).count();
+            matched_core >= required_core_matches
         };
 
         let overlap = if distinctive_terms.is_empty() || !core_matches {
@@ -11329,6 +11685,15 @@ fn merge_local_and_web(
     // 5. Calibrate scores onto [0.05, 1.0] preserving real distribution (Phase 0)
     let mut scores: Vec<f32> = merged.iter().map(|r| r.score).collect();
     calibrate_scores(&mut scores);
+    // 5b. FIX-IF-35: bound the top of the scale by ABSOLUTE merit. Phase 0 above is
+    // purely positional, so it forces the set max onto 1.0 by construction; this
+    // restores the invariant that a result reaches the top of the scale only by
+    // earning it absolutely, not by being the best of a weak set. Runs BEFORE the
+    // post-calibration structural caps so those still see and cap these values.
+    {
+        let abs_relevance: Vec<f32> = relevance_vec.iter().copied().collect();
+        apply_absolute_merit_ceiling(&abs_relevance, &mut scores);
+    }
     for (i, r) in merged.iter_mut().enumerate() {
         r.score = scores[i];
     }
@@ -11672,10 +12037,53 @@ fn merge_local_and_web(
                     || rl.starts_with("did ")
                     || rl.starts_with("can ")
                     || rl.ends_with('?');
+                // FIX-IF-35: question-SHAPE is a property of the TITLE, not of the
+                // host. The previous gate required a forum/Q&A path, which missed
+                // every real offender measured live on 2026-09-30 — a plain editorial
+                // article whose title merely poses the question
+                // ("What famous helicopter was named for its marker?",
+                // "Have You Ever Wondered Why The AH-64 Is Called Apache"). A forum
+                // path is neither necessary nor sufficient for question shape; the
+                // TITLE SHAPE ALONE IS NOT SUFFICIENT, and using it alone is a real
+                // over-capture: many genuine ANSWER pages carry an interrogative
+                // title precisely because they restate the question in order to
+                // answer it ("Why Is Dallas Called the Big D? The Origin Explained",
+                // "Why Zorblax Was Named After Kevren Mardell"), and those pages DO
+                // address the subject. Measured 2026-09-30: title-shape alone tied
+                // such an answer page with the question thread at 0.04, breaking the
+                // pre-existing naming-question guards.
+                //
+                // A naming question asks about a RELATION between the entities it
+                // names, so a page answers it only if it carries the WHOLE relation
+                // — the thing AND its namesake. A page naming just one side is
+                // anchored on that side alone: it is either asking the question or
+                // writing about the namesake for unrelated reasons. That is the
+                // general, structural test, and it is what the live offenders fail:
+                // "What famous helicopter was named for its marker?" names
+                // "helicopter" but never the thing being named.
+                //
+                // Two sufficient signals, both structural, neither a host list:
+                //   (i)  a Q&A/forum path whose title is interrogative — that is
+                //        definitionally the asker's post (the original, correct gate,
+                //        retained); or
+                //   (ii) an interrogative title on a page that does not carry the
+                //        full relation (any anchor missing, or — when the query has
+                //        too few anchors for a relation test — no subject term at all).
+                let carries_full_relation = if naming_anchor_terms.len() >= 2 {
+                    naming_anchor_terms.iter().all(|a| {
+                        rl.contains(a.as_str()) || cl.contains(a.as_str()) || ul.contains(a.as_str())
+                    })
+                } else {
+                    !strong_topics.is_empty()
+                        && strong_topics.iter().any(|t| {
+                            rl.contains(t) || cl.contains(t) || ul.contains(t)
+                        })
+                };
                 let forum_path = ul.contains("/r/") || ul.contains("/comments/")
                     || ul.contains("/forum/") || ul.contains("/question/")
                     || ul.contains("/q/") || ul.contains("/ask");
-                let is_question_shaped = forum_path && interrogative_title;
+                let is_question_shaped = interrogative_title
+                    && (forum_path || !carries_full_relation);
 
                 // (2) Incidental single-entity match: a naming question that names
                 // TWO OR MORE rare entities (the thing and its namesake/source) is
@@ -22246,6 +22654,264 @@ structured product data, so nothing must be extracted from the body.</p></body><
                 r.get("commerce").is_none(),
                 "no commerce block when fetch returns None"
             );
+        }
+    }
+
+    // ── FIX: `commerce_provenance.observed_at` must never be a FABRICATION ────
+    //
+    // The defect these lock: `enrich_with_commerce_par` step 4 stamped
+    // `observed_at: now_unix_string()` onto EVERY result that did not come back
+    // with real HTML. A live /shopping response showed all 10 rows carrying the
+    // identical response-build timestamp with `commerce: null` — asserting "we
+    // looked at this page just now" for pages that were never fetched (past
+    // COMMERCE_MAINPATH_TOP_N) or whose fetch 403'd/timed out. A client that
+    // trusts that field labels an unobservable page as freshly observed.
+    //
+    // The contract locked here: `observed_at` is present ONLY for a row whose page
+    // was actually fetched in this request. Everything else reports
+    // `observed_at: null` + `fetched: false` + a machine-readable `reason`.
+    // Crucially the third case — fetched, page had no structured facts — MUST
+    // still carry a real `observed_at`, so the fix is not an over-correction that
+    // throws away the honest "we looked and there was nothing there" signal.
+
+    /// Assert a provenance block is the honest "we have no observation" shape for
+    /// a given reason. Shared by the two no-observation tests so the contract is
+    /// stated once.
+    fn assert_no_observation(prov: &serde_json::Value, expected_reason: &str) {
+        assert_eq!(
+            prov["observed_at"],
+            serde_json::Value::Null,
+            "row must NOT carry an observation time (reason={}), got {}",
+            expected_reason,
+            prov["observed_at"]
+        );
+        assert_eq!(
+            prov["fetched"],
+            serde_json::json!(false),
+            "a row with no observation must report fetched=false"
+        );
+        assert_eq!(
+            prov["reason"],
+            serde_json::json!(expected_reason),
+            "provenance must explain WHY there is no observation time"
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_observed_at_is_null_when_fetch_was_never_issued() {
+        // Results whose page was never fetched must not claim an observation.
+        // We force "never fetched" the only way the pipeline can — the wall budget
+        // expires before the later wave is ever dispatched. MAX_PARALLEL_FETCH
+        // rows fit in the first wave; the rest are never asked about.
+        let wave = MAX_PARALLEL_FETCH;
+        let total = wave * 3;
+        let mut ranked: Vec<serde_json::Value> = (0..total)
+            .map(|i| serde_json::json!({ "url": format!("https://s{}.example.com/p", i) }))
+            .collect();
+
+        // A fetch slower than the whole wall budget: wave 1 is issued and
+        // abandoned, waves 2+ are never reached.
+        let fetch = |_url: String| async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            None
+        };
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        for (i, r) in ranked.iter().enumerate() {
+            let prov = r
+                .get("commerce_provenance")
+                .unwrap_or_else(|| panic!("row {} must still carry provenance", i));
+            // Wave 1 had a fetch issued and lost it to the wall clock; waves 2+
+            // were never dispatched at all. Both are honest no-observation states
+            // and neither may carry a time — the specific reason differs, which is
+            // exactly what `reason` exists to express.
+            let expected_reason = if i < wave { "fetch_failed" } else { "not_fetched" };
+            assert_no_observation(prov, expected_reason);
+            assert!(
+                r.get("commerce").is_none(),
+                "row {} must not get a commerce block without a real page",
+                i
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provenance_observed_at_is_null_when_fetch_fails() {
+        // A fetch that IS issued but returns None (403 / connection refused /
+        // timeout — pbtech.co.nz and electronics.sony.com both 403 a direct fetch)
+        // is still not an observation. Distinguish it from "never asked" via
+        // `reason`, and never stamp a time on it.
+        let mut ranked = vec![serde_json::json!({
+            "url": "https://blocked.example.com/product/1"
+        })];
+        let fetch = |_url: String| async { None };
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        let prov = &ranked[0]["commerce_provenance"];
+        // A FAILED fetch must not report an observation time, and must be
+        // distinguishable from a row we never looked at.
+        assert_no_observation(prov, "fetch_failed");
+    }
+
+    #[tokio::test]
+    async fn provenance_observed_at_is_real_when_page_fetched_but_had_no_facts() {
+        // The anti-over-correction case, and the one an over-eager fix breaks
+        // first. This page WAS fetched — real HTML reached the extractor — but it
+        // exposes no structured product markup at all. That is a REAL observation
+        // and MUST keep a real `observed_at`; nulling it here would be lying in the
+        // other direction ("we looked but cannot say when"), destroying the
+        // client's ability to distinguish a stale price from a current one.
+        // (Whether a `commerce` block is attached is a separate contract — the
+        // extractor's coarse host-label `merchant` fallback means a bare host can
+        // still count as a fact — and is deliberately NOT asserted here.)
+        let mut ranked = vec![serde_json::json!({
+            "url": "https://blog.example.com/a-long-article-about-headphones"
+        })];
+        let plain = "<!doctype html><html><head><title>A Long Article</title></head>\
+                     <body><p>Prose with no product markup whatsoever.</p></body></html>"
+            .to_string();
+        let fetch = move |_url: String| {
+            let html = plain.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        let r = &ranked[0];
+        let prov = &r["commerce_provenance"];
+        assert_eq!(prov["fetched"], serde_json::json!(true), "the page WAS fetched");
+        assert_eq!(prov["reason"], serde_json::json!("fetched"));
+        let observed = prov["observed_at"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a genuinely fetched page must carry a real observed_at, got {}", prov["observed_at"]));
+        assert!(
+            observed.chars().all(|c| c.is_ascii_digit()) && observed.len() >= 9,
+            "observed_at must be unix seconds, got {:?}",
+            observed
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_honesty_does_not_reorder_results() {
+        // The metadata-only guarantee: mixing fetched / failed / never-fetched
+        // rows must leave the ranked order byte-identical. Enrichment is a strict
+        // post-rank decoration pass, so changing provenance must not move a result.
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://a.example.com/1", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/2", "score": 8.0 }),
+            serde_json::json!({ "url": "https://c.example.com/3", "score": 7.0 }),
+            serde_json::json!({ "url": "https://d.example.com/4", "score": 6.0 }),
+        ];
+        let before: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+
+        let ok = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |url: String| {
+            let html = ok.clone();
+            async move {
+                if url.contains("/1") {
+                    Some(html) // real facts
+                } else {
+                    None // fetched, failed
+                }
+            }
+        };
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        let after: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(before, after, "provenance honesty must never reorder results");
+
+        // Row 1 was genuinely observed; the rest were attempted and failed.
+        assert!(ranked[0]["commerce_provenance"]["observed_at"].is_string());
+        for r in ranked.iter().skip(1) {
+            assert!(r["commerce_provenance"]["observed_at"].is_null());
+            assert_eq!(r["commerce_provenance"]["reason"], serde_json::json!("fetch_failed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sequential_enrichment_nulls_observed_at_on_failed_fetch() {
+        // The sequential path had the identical defect (it built its provenance
+        // block BEFORE awaiting the fetch, so it could not know the outcome).
+        // Lock the same contract there so the two paths cannot drift apart.
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://ok.example.com/1" }),
+            serde_json::json!({ "url": "https://bad.example.com/2" }),
+        ];
+        let ok = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |url: String| {
+            let html = ok.clone();
+            async move {
+                if url.contains("ok.example") {
+                    Some(html)
+                } else {
+                    None
+                }
+            }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+
+        assert!(
+            ranked[0]["commerce_provenance"]["observed_at"].is_string(),
+            "a successfully fetched page keeps a real observed_at"
+        );
+        assert_eq!(ranked[0]["commerce_provenance"]["fetched"], serde_json::json!(true));
+        assert_eq!(
+            ranked[1]["commerce_provenance"]["observed_at"],
+            serde_json::Value::Null,
+            "a failed fetch must not report an observation time"
+        );
+        assert_eq!(ranked[1]["commerce_provenance"]["fetched"], serde_json::json!(false));
+        assert_eq!(ranked[1]["commerce_provenance"]["reason"], serde_json::json!("fetch_failed"));
+    }
+
+    #[test]
+    fn provenance_block_shapes_are_one_to_one_with_outcomes() {
+        // The builder is the single source of truth for provenance shape. Only
+        // `Fetched` may carry a time; the reason enum is stable and distinct for
+        // each state so a client can tell the two "no observation" cases apart.
+        let fetched = commerce_provenance_block("https://x.example/p", CommerceFetchOutcome::Fetched);
+        assert!(fetched["observed_at"].is_string());
+        assert_eq!(fetched["fetched"], serde_json::json!(true));
+        assert_eq!(fetched["reason"], serde_json::json!("fetched"));
+        assert_eq!(fetched["url"], serde_json::json!("https://x.example/p"));
+
+        for (outcome, reason) in [
+            (CommerceFetchOutcome::FetchFailed, "fetch_failed"),
+            (CommerceFetchOutcome::NotFetched, "not_fetched"),
+        ] {
+            let p = commerce_provenance_block("https://x.example/p", outcome);
+            assert!(p["observed_at"].is_null(), "{} must not stamp a time", reason);
+            assert_eq!(p["fetched"], serde_json::json!(false));
+            assert_eq!(p["reason"], serde_json::json!(reason));
+            // source/data stay null: facts only ever come from real HTML and
+            // live on the `commerce` block.
+            assert!(p["source"].is_null());
+            assert!(p["data"].is_null());
         }
     }
 

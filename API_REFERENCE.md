@@ -1590,8 +1590,15 @@ result:
 - `commerce` — honest product facts extracted from the result's own page
   (`source` is `"json-ld"` / `"og"` / `null`; every sub-field is `Optional`). A
   result whose page exposed no structured product data gets **no** `commerce` block.
-- `commerce_provenance` — `{ url, observed_at, source, data:null }` for **every**
-  result, so the frontend can label facts and never show a stale price as current.
+- `commerce_provenance` — `{ url, observed_at, fetched, reason, source, data:null }`
+  for **every** result, so the frontend can label facts and never show a stale price
+  as current. `observed_at` (Unix seconds) is present **only** when the result's own
+  page was actually fetched in this request; otherwise it is `null`, `fetched` is
+  `false`, and `reason` says why: `"fetched"` (page retrieved — `observed_at` is
+  real, even if the page exposed no structured facts), `"fetch_failed"` (a fetch was
+  issued but returned nothing — error, non-2xx, or timeout), or `"not_fetched"`
+  (no fetch was ever issued, e.g. beyond the fetch budget). A client must treat a
+  `null` `observed_at` as "no observation exists", never as "observed now".
 - `affiliate` — added by the post-rank affiliate engine (see below). When no
   network key is present in the environment, this field is omitted and the result is
   still returned (graceful degradation). When a network with a configured bid floor /
