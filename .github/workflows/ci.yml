@@ -45,8 +45,17 @@ jobs:
         working-directory: services/gateway
         run: cargo test --no-run --locked
 
+      # `fix_if_32_intent_confidence_tests` is a HARNESS-PRECONDITION test, not a
+      # regression: it panics with "a scored label must be reported as calibrated"
+      # unless it can load the calibration artifact. The author harness
+      # (scripts/gateway_test_container.sh) sets this; CI never did, so these two
+      # tests failed on every run and left `ci` permanently red on master.
+      # The artifact IS tracked in git (services/intent-engine/config/), so the
+      # path resolves after checkout -- no download step is needed.
       - name: Run gateway unit tests
         working-directory: services/gateway
+        env:
+          INTENT_CALIBRATION_PATH: ${{ github.workspace }}/services/intent-engine/config/intent_calibration.json
         run: cargo test --locked
 
   schema-regression:
