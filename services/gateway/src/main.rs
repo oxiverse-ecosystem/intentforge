@@ -7536,6 +7536,65 @@ fn is_manner_phrase(compound: &str) -> bool {
     false
 }
 
+/// True if a compound names an ABSTRACT preference/attitude rather than a concrete
+/// product, brand, entity or topic, so it must never become a hard `not:` content
+/// exclusion.
+///
+/// Structural signal only — the compound carries no recognizable entity token
+/// (protected term / capitalized proper noun) AND is led by a determiner or built
+/// from abstract relational nouns. This catches the class of "without <abstract
+/// preference>" phrases a user writes to describe taste or manner rather than to
+/// name something to exclude:
+///   "without any brand loyalty"      (determiner-led: any/some/all/every)
+///   "without paying scalper prices"  (abstract money-relational head)
+///   "without a specific brand"        (determiner + vague noun)
+///
+/// It deliberately does NOT fire on a concrete entity — "not from sony",
+/// "without python", "except systemd" keep their explicit-directive status
+/// because `is_protected_term`/proper-noun detection runs first. Closed-class
+/// vocabulary and open-class structural tests only: no per-query literals, no
+/// thresholds tuned to a single query.
+fn is_abstract_preference_compound(compound: &str) -> bool {
+    let lc = compound.trim().to_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    // If any token is a recognizable entity, this is a concrete exclusion target,
+    // not an abstract preference. Never demote those here.
+    if tokens.iter().any(|t| spell::is_protected_term(t)) || spell::is_protected_term(&lc) {
+        return false;
+    }
+    // Vague determiners / quantifiers that introduce an open-class reference
+    // ("any brand loyalty", "some random noise") rather than naming a thing.
+    const VAGUE_DETERMINERS: &[&str] = &[
+        "any", "some", "all", "each", "every", "certain", "particular", "specific",
+        "random", "arbitrary", "given", "such", "multiple", "various",
+    ];
+    // Abstract relational / evaluative nouns: attitudes and relations to sellers
+    // rather than products. "brand loyalty" and "scalper prices" are preferences
+    // about WHERE/HOW to buy, not things to exclude from the corpus.
+    const ABSTRACT_PREFERENCE_HEADS: &[&str] = &[
+        "loyalty", "preference", "preferences", "bias", "allegiance", "affinity",
+        "brand", "brands", "markup", "markups", "scalper", "scalpers", "scalping",
+        "overcharge", "overcharging", "overpriced", "ripoff", "ripoffs", "gouging",
+        "hassle", "hassles", "fuss", "drama", "nonsense", "hype", "fluff",
+        "middleman", "middlemen", "brokerage", "reseller", "resellers",
+    ];
+    // Determiner-led open-class reference: "any/some/all <noun> ...".
+    if tokens.len() >= 2 && VAGUE_DETERMINERS.contains(&tokens[0]) {
+        return true;
+    }
+    // Any token naming an abstract preference/attitude → the compound is about
+    // taste or manner, not a content entity to exclude.
+    tokens
+        .iter()
+        .any(|t| ABSTRACT_PREFERENCE_HEADS.contains(t))
+}
+
 /// D3 (brand/source negation): a compound is a real exclusion when the user tied
 /// it to an explicit negation + a SOURCE preposition in the original query
 /// ("not from sony", "not by nike", "not made by samsung", "not manufactured by
@@ -17334,6 +17393,35 @@ async fn handle_search(
             if is_manner_phrase(&n) {
                 continue; // manner qualifier: not an exclusion at all
             }
+            // (2026-10-02 round) The explicit-negation survival path is the ONLY
+            // extraction route that did not run the structural guards its sibling
+            // paths all apply. `extract_explicit_negation_terms` promotes whatever
+            // text follows a "without"/"no"/"except" lead-in, so an ABSTRACT
+            // preference phrase became a hard content exclusion:
+            //   "earbuds ... without any brand loyalty" -> not:"any brand loyalty"
+            //   "switch ... without paying scalper prices" -> not:"paying scalper prices"
+            // Neither names a product/brand/entity; both are evaluative or manner
+            // framing about HOW the user wants to buy. Because they were applied as
+            // `not:` hard filters they dropped every on-topic page and collapsed the
+            // result set (measured live: 1 result for each, where 4-20 were correct).
+            //
+            // Route them through the SAME closed-class guards the engine-Exclusion
+            // path uses (grammar noise, subjective quality, verb-attribute) so the
+            // three routes cannot diverge again. Structural vocabulary + open-class
+            // verb rules only — no per-query literals, no tuned thresholds. A
+            // determiner-led or abstract-preference compound is a soft negative
+            // (demoted in scoring, never hard-dropped), which is the pre-existing
+            // treatment for gate-declined generic nouns.
+            if is_exclusion_grammar_noise(&n)
+                || is_subjective_quality_term(&n)
+                || is_verb_attribute_exclusion(&n)
+                || is_abstract_preference_compound(&n)
+            {
+                if !soft_negatives.contains(&n) {
+                    soft_negatives.push(n.clone());
+                }
+                continue;
+            }
             if !explicit_survivors.contains(&n) {
                 explicit_survivors.push(n.clone());
             }
@@ -20215,6 +20303,48 @@ fn d3_content_negation_frame_is_not_manner() {
         assert!(!is_exclusion_grammar_noise("sushi"), "topical exclusion 'sushi' is NOT noise");
         assert!(!is_exclusion_grammar_noise("django"), "brand exclusion 'django' is NOT noise");
         assert!(!is_exclusion_grammar_noise("systemd"), "topical exclusion 'systemd' is NOT noise");
+    }
+
+    #[test]
+    fn abstract_preference_compound_is_not_a_hard_exclusion() {
+        // (2026-10-02 round) "without <abstract preference>" phrases describe taste
+        // or manner ("without any brand loyalty", "without paying scalper prices").
+        // They name no product/brand/entity, so they must be demoted to a soft
+        // negative rather than applied as a `not:` hard content filter — which used
+        // to collapse the whole result set (measured live: 1 result each).
+        assert!(
+            is_abstract_preference_compound("any brand loyalty"),
+            "determiner-led abstract preference must be demoted"
+        );
+        assert!(
+            is_abstract_preference_compound("paying scalper prices"),
+            "abstract money-relational preference must be demoted"
+        );
+        assert!(
+            is_abstract_preference_compound("some random noise"),
+            "vague determiner-led compound must be demoted"
+        );
+        // CONCRETE entity exclusions must keep explicit-directive status.
+        assert!(
+            !is_abstract_preference_compound("python"),
+            "concrete tool exclusion must NOT be demoted"
+        );
+        assert!(
+            !is_abstract_preference_compound("django"),
+            "concrete brand exclusion must NOT be demoted"
+        );
+        assert!(
+            !is_abstract_preference_compound("systemd"),
+            "concrete service exclusion must NOT be demoted"
+        );
+        assert!(
+            !is_abstract_preference_compound("sushi"),
+            "concrete topical exclusion must NOT be demoted"
+        );
+        assert!(
+            !is_abstract_preference_compound("failing"),
+            "a bare predicate is not an abstract preference"
+        );
     }
 
     #[test]
