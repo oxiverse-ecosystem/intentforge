@@ -7619,10 +7619,33 @@ fn is_abstract_preference_compound(compound: &str) -> bool {
     }
     // Any token naming an abstract preference/attitude → the compound is about
     // taste or manner, not a content entity to exclude.
-    tokens
-        .iter()
-        .any(|t| ABSTRACT_PREFERENCE_HEADS.contains(t))
+    if tokens.iter().any(|t| ABSTRACT_PREFERENCE_HEADS.contains(t)) {
+        return true;
+    }
+    // Participle-as-adjective compound: the user often writes the adjectival
+    // form of the head noun ("marked up prices" for "markup prices"). The head
+    // list holds the noun, so also compare a past participle + particle
+    // collapsed to its noun form: "marked" + "up" -> "markup". This is
+    // morphology, not a literal — every abstract head gains its participial
+    // surface form for free.
+    for i in 0..tokens.len().saturating_sub(1) {
+        let (head, particle) = (tokens[i], tokens[i + 1]);
+        if !PARTICIPLE_PARTICLES.contains(&particle) {
+            continue;
+        }
+        if let Some(stem) = head.strip_suffix("ed") {
+            let collapsed = format!("{}{}", stem, particle);
+            if ABSTRACT_PREFERENCE_HEADS.contains(&collapsed.as_str()) {
+                return true;
+            }
+        }
+    }
+    false
 }
+
+    /// Particles that attach to a past participle to form an attributive compound
+    /// ("marked up", "marked down"). Closed-class vocabulary, structural only.
+    const PARTICIPLE_PARTICLES: &[&str] = &["up", "down", "over", "off"];
 
 /// True when a bare money-verb exclusion (`pay`/`paying`) governs an ABSTRACT
 /// object in the query rather than a concrete purchase ("without paying scalper
