@@ -7595,6 +7595,54 @@ fn is_abstract_preference_compound(compound: &str) -> bool {
         .any(|t| ABSTRACT_PREFERENCE_HEADS.contains(t))
 }
 
+/// True when a bare money-verb exclusion (`pay`/`paying`) governs an ABSTRACT
+/// object in the query rather than a concrete purchase ("without paying scalper
+/// prices", "without paying over the odds"). The intent engine emits the bare verb
+/// as an `Exclusion`, losing the object; this recovers the object from the QUERY
+/// context — the clause the verb governs — and asks the same closed-class
+/// `is_abstract_preference_compound` test, so the vocabulary has one source of
+/// truth. A genuine money exclusion ("without paying for a course") names a real
+/// purchase and is unaffected.
+///
+/// Structural verb+object-class pattern, matching `pay_exclusion_is_money`: closed
+/// class vocabulary only, no per-query literals, no tuned thresholds.
+fn pay_governs_abstract_object(verb_term: &str, q_orig: &str) -> bool {
+    let v = verb_term.trim().to_lowercase();
+    if v != "pay" && v != "paying" && v != "paid" {
+        return false;
+    }
+    let lc = q_orig.to_lowercase();
+    let toks: Vec<&str> = lc.split_whitespace().collect();
+    for (i, t) in toks.iter().enumerate() {
+        if *t != "pay" && *t != "paying" && *t != "paid" {
+            continue;
+        }
+        // The governed clause runs from the verb to the next preposition/conjunction
+        // ("paying scalper prices in bangalore" -> "scalper prices").
+        let mut clause: Vec<&str> = Vec::new();
+        for w in toks.iter().skip(i + 1) {
+            if CLAUSE_BOUNDARIES.contains(w) {
+                break;
+            }
+            clause.push(w);
+        }
+        if clause.is_empty() {
+            continue;
+        }
+        if is_abstract_preference_compound(&clause.join(" ")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Function words that terminate the object clause governed by a money-verb.
+/// Closed-class vocabulary, structural only.
+const CLAUSE_BOUNDARIES: &[&str] = &[
+    "in", "at", "on", "for", "with", "from", "to", "and", "or", "but", "near",
+    "without", "buy", "bought", "purchase", "purchasing",
+];
+
 /// D3 (brand/source negation): a compound is a real exclusion when the user tied
 /// it to an explicit negation + a SOURCE preposition in the original query
 /// ("not from sony", "not by nike", "not made by samsung", "not manufactured by
@@ -17365,6 +17413,16 @@ async fn handle_search(
                 true
             }
         })
+        // (2026-10-02 round) Same abstract-preference class as the explicit-negation
+        // path: the engine tags "paying" in "without paying scalper prices" as an
+        // Exclusion, and `pay_exclusion_is_money` accepts it because "prices" is a
+        // monetary object — but the user is describing a buying ATTITUDE (don't
+        // overpay), not naming a product to exclude. Applied as a hard `not:` it
+        // collapsed the result set to 1. The engine emits the BARE verb here, so the
+        // abstract-preference test is run against the QUERY context (the clause the
+        // verb governs) exactly as `pay_exclusion_is_money` already does — the same
+        // open-class "verb + object class" pattern, no per-query literals.
+        .filter(|t| !is_abstract_preference_compound(t) && !pay_governs_abstract_object(t, &q_orig))
         .collect();
     let explicit_neg: Vec<String> = extract_explicit_negation_terms(&q_orig);
     for en in &explicit_neg {
@@ -20345,6 +20403,37 @@ fn d3_content_negation_frame_is_not_manner() {
             !is_abstract_preference_compound("failing"),
             "a bare predicate is not an abstract preference"
         );
+    }
+
+    #[test]
+    fn pay_governing_abstract_object_is_demoted() {
+        // "paying scalper prices" — the engine emits the bare verb; the object is
+        // an overpaying ATTITUDE, not a purchase to exclude.
+        assert!(pay_governs_abstract_object(
+            "paying",
+            "where can i buy a used nintendo switch in bangalore without paying scalper prices"
+        ));
+        assert!(pay_governs_abstract_object(
+            "paying",
+            "cheapest flight without paying marked up prices"
+        ));
+        // A GENUINE money exclusion names a concrete purchase and must be honored.
+        assert!(!pay_governs_abstract_object(
+            "paying",
+            "how to learn programming without paying for a course"
+        ));
+        assert!(!pay_governs_abstract_object(
+            "paying",
+            "online courses without paying a subscription fee"
+        ));
+        // Non-pay verbs are never routed through this test.
+        assert!(!pay_governs_abstract_object(
+            "django",
+            "python web framework without django"
+        ));
+        // Boundary check: the clause stops at "in", so "paying" is not read as
+        // governing the whole remainder of the query.
+        assert!(!pay_governs_abstract_object("paying", "paying in bangalore"));
     }
 
     #[test]
