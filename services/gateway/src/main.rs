@@ -4714,8 +4714,17 @@ const ENRICHMENT_HEADROOM_SECS: u64 = 2;
 /// `enrich_with_commerce_par` starts no fetch at a zero wall and
 /// `has_any_commerce_block` suppresses the empty strip, so the user still gets
 /// their ranked results — just without the optional commerce cards.
-fn commerce_wall_for_elapsed(_elapsed: std::time::Duration) -> std::time::Duration {
-    std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS)
+fn commerce_wall_for_elapsed(elapsed: std::time::Duration) -> std::time::Duration {
+    // What is LEFT of the transport budget after the time already spent...
+    let remaining = std::time::Duration::from_secs(REQUEST_BUDGET_SECS)
+        .saturating_sub(elapsed)
+        // ...minus the headroom reserved for serialisation and the hop.
+        .saturating_sub(std::time::Duration::from_secs(ENRICHMENT_HEADROOM_SECS));
+    // ...capped by the recall ceiling. The ceiling exists so a fast request does
+    // not spend the whole remaining budget on an OPTIONAL pass; the derived term
+    // exists so a slow request cannot overrun the transport. `min`, because both
+    // are upper bounds and neither alone is sufficient.
+    remaining.min(std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS))
 }
 
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
