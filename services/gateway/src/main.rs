@@ -4378,7 +4378,12 @@ async fn enrich_with_commerce<F, Fut>(
                 let offer: CommerceOffer = extract_commerce_offer(&h, &url);
                 // Only attach a `commerce` block when the page actually exposed
                 // structured product data — never a guessed/fabricated fact.
-                if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
+                if offer
+                    .data
+                    .as_ref()
+                    .map(|d| data_has_fact(d, &url))
+                    .unwrap_or(false)
+                {
                     match serde_json::to_value(&offer) {
                         Ok(v) => {
                             r["commerce"] = v;
@@ -4397,20 +4402,97 @@ async fn enrich_with_commerce<F, Fut>(
     }
 }
 
+/// Canonical form of a host LABEL, used to decide whether a `merchant` value
+/// came from the PAGE or is just the result's own address.
+///
+/// `extract_commerce_offer` fills `merchant` from the URL host as a last-resort
+/// IDENTIFIER when the page names no seller. That identifier is legitimate to
+/// *carry*, but it is NOT a product fact — counting it as one makes every page
+/// that returned HTML look like a fact-bearing product page, which defeats
+/// `has_any_commerce_block` (the gate whose whole purpose is to keep a strip of
+/// bare affiliate links off the main-path surface) and puts an identifier on
+/// screen dressed as a fact.
+///
+/// Normalisation must be applied to BOTH sides of the comparison. Comparing a
+/// `www.`-stripped result host against a RAW host string (or vice-versa) makes
+/// the same host look like two different labels and manufactures a fake seller
+/// — so this is the single canonical form for the whole codebase.
+///
+/// Pure + offline-testable. Returns `None` when the label cannot be interpreted
+/// as a host at all, which callers must treat as "not trusted" (fail closed).
+fn normalize_host_label(raw: &str) -> Option<String> {
+    let mut h = raw.trim().to_lowercase();
+    // Accept either a bare host or a full URL (callers pass both kinds).
+    if h.contains("://") {
+        h = reqwest::Url::parse(&h).ok()?.host_str()?.to_string();
+    }
+    // Strip any userinfo/port/path a caller may have pasted in.
+    if let Some(at) = h.rfind('@') {
+        h = h[at + 1..].to_string();
+    }
+    h = h.split('/').next().unwrap_or("").to_string();
+    if let Some(colon) = h.rfind(':') {
+        if h[colon + 1..].chars().all(|c| c.is_ascii_digit()) && !h[colon + 1..].is_empty() {
+            h = h[..colon].to_string();
+        }
+    }
+    // DNS root dot (`www.walmart.com.`) is not part of the label.
+    while h.ends_with('.') {
+        h.pop();
+    }
+    // `www.` is an alias, not a different merchant.
+    if let Some(rest) = h.strip_prefix("www.") {
+        if !rest.is_empty() {
+            h = rest.to_string();
+        }
+    }
+    if h.is_empty() {
+        None
+    } else {
+        Some(h)
+    }
+}
+
+/// The result's OWN host, in the same canonical form as `normalize_host_label`.
+/// `None` when the URL is unparseable — which callers treat as untrusted.
+fn result_url_host(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    normalize_host_label(parsed.host_str()?)
+}
+
 /// True when an `OfferFacts` carries at least one meaningful structured fact.
-/// Used to decide whether to surface a `commerce` block at all (honest: no facts =>
-/// no block, never a placeholder).
-fn data_has_fact(d: &OfferFacts) -> bool {
-    d.price.is_some()
+/// Used to decide whether to surface a `commerce` block at all (honest: no facts
+/// => no block, never a placeholder).
+///
+/// `result_url` is the URL the facts were extracted FROM. It is required because
+/// `merchant` alone is not proof of anything: the extractor back-fills it from
+/// that very URL's host. A `merchant` identical to the result's own host is
+/// therefore an IDENTIFIER, not a page-supplied fact, and is not counted.
+/// Every other field (price, availability, condition, sku/gtin, rating, image,
+/// `name`) came from the page's own markup and always counts.
+///
+/// Pure + offline-testable. Fails closed: an unparseable result host means the
+/// merchant claim cannot be verified, so it does not count.
+fn data_has_fact(d: &OfferFacts, result_url: &str) -> bool {
+    if d.price.is_some()
         || d.price_low.is_some()
         || d.currency.is_some()
         || d.availability.is_some()
-        || d.merchant.is_some()
         || d.condition.is_some()
         || d.sku.is_some()
         || d.gtin.is_some()
         || d.rating.is_some()
         || d.image.is_some()
+        || d.name.is_some()
+    {
+        return true;
+    }
+    // `merchant` counts ONLY when it differs from the result's own host — i.e.
+    // the page itself named a seller.
+    match (&d.merchant, result_url_host(result_url)) {
+        (Some(m), Some(host)) => normalize_host_label(m).map(|mh| mh != host).unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// Apply the same single-result enrichment (extract_commerce_offer → optional commerce +
