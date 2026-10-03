@@ -44,7 +44,12 @@ server:
   secret_key: "intentforge_v2_searxng2_secret_key_987654321"
 
 search:
-  safe_search: 0
+  # 1 = moderate. This shipped as 0 (off), which let engines return adult
+  # results for benign queries (verified live: an xHamster page ranked #2 for
+  # "how do noise cancelling headphones work" over this Tor path).
+  # The gateway additionally sends an explicit `safesearch` per request; this
+  # default is the backstop for direct hits on the JSON API.
+  safe_search: 1
   autocomplete: "google"
   formats:
     - html

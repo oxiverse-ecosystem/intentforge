@@ -6656,6 +6656,25 @@ fn map_lang_to_country(lang: &str) -> Option<&'static str> {
     }
 }
 
+/// Resolve the safe-search level to request from SearXNG.
+///
+///   0 = off, 1 = moderate (default), 2 = strict
+///
+/// `SEARXNG_SAFE_SEARCH` overrides the default. Any value that is not a
+/// number, or is above 2, is rejected in favour of the default so a typo can
+/// neither disable filtering nor send a level SearXNG would mishandle.
+/// `0` is honoured when explicitly set: the default is a policy an operator
+/// can override, not a hardcoded rule.
+fn resolve_safe_search_level(env_override: Option<&str>) -> u8 {
+    match env_override.map(str::trim) {
+        None => 1,
+        Some(raw) => match raw.parse::<u8>() {
+            Ok(v @ 0..=2) => v,
+            _ => 1,
+        },
+    }
+}
+
 /// Build a SearXNG search URL with optional geolocation parameters.
 /// Appends `source_country` and `language` when location data is available.
 fn searxng_url(base: &str, query: &str, geo: Option<&geoloc::GeoLocation>, lang: Option<&str>) -> String {
@@ -6673,7 +6692,17 @@ fn searxng_url_with_categories(
     let encoded = urlencoding::encode(query);
     let cat = if categories.is_empty() { String::new() } else { format!("&categories={}", categories) };
     let mut url = format!("{}/search?q={}&format=json{}&pageno=1", base, encoded, cat);
-    
+
+    // Safe-search level. Without this the upstream default applies, and both
+        // bundled SearXNG instances ship `safe_search: 0`, so engines are free to
+        // return adult results for entirely benign queries (verified: "how do
+        // noise cancelling headphones work" surfaced xHamster pages at rank 1-2 via
+        // the Tor instance). This is a per-REQUEST policy read from the
+        // environment, so the default is changeable at runtime without a rebuild.
+        let safe_level = resolve_safe_search_level(std::env::var("SEARXNG_SAFE_SEARCH").ok().as_deref());
+        url.push_str(&format!("&safesearch={}", safe_level));
+
+
     if let Some(l) = lang {
         url.push_str(&format!("&language={}", l));
         if let Some(ref cc) = map_lang_to_country(l) {
@@ -24320,4 +24349,95 @@ mod geo_scope_intent_tests {
         let no_evidence = resp("local", &[("local", 0.9)]);
         assert_eq!(best_non_local_label(&no_evidence), "informational");
     }
+}
+
+#[cfg(test)]
+mod searxng_safesearch_tests {
+    use super::*;
+
+    /// Regression: the URL builder must always carry an explicit `safesearch`
+    /// parameter. Both bundled SearXNG instances ship `safe_search: 0`, so
+    /// omitting the param let adult results reach the top of benign queries
+    /// (verified live: "how do noise cancelling headphones work" returned
+    /// xHamster pages at rank 1-2 through the Tor instance).
+    #[test]
+    fn searxng_url_always_sets_safesearch() {
+        let url = searxng_url("http://localhost:8080", "how do noise cancelling headphones work", None, None);
+        assert!(
+            url.contains("safesearch="),
+            "searxng URL must carry an explicit safesearch param, got: {}",
+            url
+        );
+    }
+
+    /// The category-carrying builder is the same chokepoint used by
+    /// /images, /videos and /news — it must not bypass the setting.
+    #[test]
+    fn searxng_url_with_categories_also_sets_safesearch() {
+        for cat in ["", "images", "videos", "news"] {
+            let url = searxng_url_with_categories("http://localhost:8080", "best laptop", cat, None, None);
+            assert!(
+                url.contains("safesearch="),
+                "category {:?} lost the safesearch param: {}",
+                cat,
+                url
+            );
+        }
+    }
+
+    /// The level must be one of the values SearXNG actually understands, and it
+    /// must not be the permissive default the instances are configured with —
+    /// otherwise the param is present but ineffective.
+    #[test]
+    fn safesearch_level_is_valid_and_not_left_permissive() {
+        let url = searxng_url("http://localhost:8080", "test query", None, None);
+        let level = url
+            .split("safesearch=")
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ["0", "1", "2"].contains(&level.as_str()),
+            "safesearch level must be 0/1/2, got {:?} in {}",
+            level,
+            url
+        );
+        assert_ne!(level, "0", "default must not be the permissive 0 (off)");
+    }
+
+    /// The override must be clamped: a typo like `SEARXNG_SAFE_SEARCH=99`, a
+        /// non-numeric value, or surrounding whitespace must not produce an
+        /// out-of-range level that SearXNG would reject (or silently treat as off).
+        /// Exercised through the pure resolver — these tests run in parallel
+        /// threads, so mutating the process environment here would race.
+        #[test]
+        fn safesearch_override_is_clamped_to_valid_range() {
+            for raw in ["0", "1", "2"] {
+                assert_eq!(
+                    resolve_safe_search_level(Some(raw)),
+                    raw.parse::<u8>().unwrap(),
+                    "valid override {:?} must be honoured verbatim",
+                    raw
+                );
+            }
+            for raw in ["3", "99", "notanumber", "", "  ", "-1", "1.5"] {
+                assert_eq!(
+                    resolve_safe_search_level(Some(raw)),
+                    1,
+                    "invalid override {:?} must fall back to the moderate default",
+                    raw
+                );
+            }
+            assert_eq!(resolve_safe_search_level(None), 1, "unset must default to moderate");
+        }
+
+        /// An explicit `0` is honoured — the default is a policy an operator can
+        /// override, not a hardcoded rule.
+        #[test]
+        fn safesearch_override_of_zero_is_honoured() {
+            assert_eq!(resolve_safe_search_level(Some("0")), 0);
+            // Whitespace tolerance, so a padded .env value still parses.
+            assert_eq!(resolve_safe_search_level(Some(" 2 ")), 2);
+        }
 }
