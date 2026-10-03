@@ -20,6 +20,9 @@ mod clean;
 mod goals;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
+// D5: the commerce enrichment wall must be DERIVED from the request budget
+// (the 408-outage class), not chosen as a flat constant.
+mod commerce_wall_tests;
 // FIX-IF-35: absolute score normalization + question-shaped-page demotion.
 mod fix_if_35_tests;
 // ─── API Types ───────────────────────────────────────────────────────
@@ -4675,6 +4678,52 @@ const MAX_PARALLEL_FETCH: usize = 4;
 /// top-N results must complete well before it fires. 22s leaves ~8s headroom.
 const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 22;
 
+/// The transport-level request budget the router enforces via `TimeoutLayer`.
+/// Enrichment must never push the response past this, or an OPTIONAL commerce
+/// pass costs the user the entire result set (HTTP 408, no results at all).
+const REQUEST_BUDGET_SECS: u64 = 30;
+
+/// Slack reserved inside `REQUEST_BUDGET_SECS` for response serialisation and
+/// the transport hop. Data-free: it only shrinks the optional enrichment
+/// window, never the ranking pipeline.
+const ENRICHMENT_HEADROOM_SECS: u64 = 2;
+
+/// Derive the commerce enrichment wall from how much of the request budget has
+/// ALREADY been spent.
+///
+/// DEFECT THIS FIXES (measured live, 12 cold `GET /shopping` samples on this
+/// lineage): the wall used to be a FLAT 22s at both call sites, against a 30s
+/// `TimeoutLayer`. But the two budgets are independent — `handle_search` spends
+/// 3-10s on upstreams BEFORE enrichment runs, and `/shopping` then layers a
+/// SECOND 22s enrichment pass on top of `/search`'s own 22s one. Worst case
+/// therefore reaches 44s+ of decoration against a 30s ceiling, and the
+/// measurement confirmed it: one sample returned in **29.48s**, i.e. sitting on
+/// the cliff edge where a slightly slower upstream turns into a total outage.
+///
+/// TUNING THRESHOLDS DO NOT FIX THIS. Lowering the constant trades recall for
+/// latency and still leaves the invariant unenforced. The invariant that must
+/// hold is "the total never exceeds the transport budget", so the wall is
+/// DERIVED from elapsed time rather than chosen.
+///
+/// Both call sites MUST measure from the same request-relative origin:
+/// `handle_search` from its own entry, and `handle_shopping` from BEFORE it
+/// invoked `handle_search` — otherwise each pass claims a full budget and the
+/// pair overruns again, which is precisely the bug.
+///
+/// Returns ZERO when the budget is already spent. That needs no special case:
+/// `enrich_with_commerce_par` starts no fetch at a zero wall and
+/// `has_any_commerce_block` suppresses the empty strip, so the user still gets
+/// their ranked results — just without the optional commerce cards.
+fn commerce_wall_for_elapsed(elapsed: std::time::Duration) -> std::time::Duration {
+    let budget = std::time::Duration::from_secs(REQUEST_BUDGET_SECS);
+    let headroom = std::time::Duration::from_secs(ENRICHMENT_HEADROOM_SECS);
+    let left = budget
+        .saturating_sub(elapsed)
+        .saturating_sub(headroom)
+        .min(std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS));
+    std::time::Duration::from_secs(left.as_secs())
+}
+
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
 /// page exposed structured product data, attached by `enrich_with_commerce`).
 /// Powers the main-path `shopping` gate: the strip is only surfaced when at
@@ -4794,6 +4843,15 @@ async fn handle_shopping(
     Query(params): Query<SearchParams>,
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    // Clock for the DERIVED enrichment wall. This MUST start BEFORE
+    // `handle_search` is invoked, not after it returns: `/shopping` delegates
+    // the whole ranking pipeline to `handle_search` (upstream fan-out PLUS its
+    // own main-path enrichment), and all of that time is spent out of the SAME
+    // 30s transport budget. Measuring from here — the true request origin — is
+    // what makes the two passes share one budget. Starting the clock after
+    // `handle_search` would hand this pass a fresh 22s and re-create the
+    // original overrun (see `commerce_wall_for_elapsed`).
+    let request_started = std::time::Instant::now();
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
     let (status, body) = handle_search(
         state.clone(),
@@ -4825,7 +4883,7 @@ async fn handle_shopping(
                         fetch_page_html(&client, &url).await
                     }
                 },
-                Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+                commerce_wall_for_elapsed(request_started.elapsed()),
             )
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
@@ -14942,6 +15000,11 @@ async fn handle_search(
     Query(params): Query<SearchParams>,
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    // Request-relative clock for the DERIVED enrichment wall
+    // (`commerce_wall_for_elapsed`). Started at the very top of the handler so
+    // the elapsed it reports INCLUDES the upstream fan-out below — which is the
+    // whole point: the wall has to know what has already been spent.
+    let request_started = std::time::Instant::now();
     // 0. Validate query — reject empty or whitespace-only queries
     let q_trimmed = params.q.as_deref().unwrap_or("").trim();
     // Phase 8: empty / 1-char / stopword-only handling (graceful, never 400).
@@ -18669,16 +18732,19 @@ let mut results = match tokio::task::spawn_blocking(move || {
             let http_client = client.clone();
             // Parallel enrichment (bounded concurrency) for the main /search path.
             // Sequential enrichment of 8 product pages (~36s) exceeds the 30s
-            // TimeoutLayer budget. Parallel fetches complete in ~4.5s with a 22s
-            // wall cap, leaving 8s headroom. Order is byte-identical to the
-            // sequential variant (proven by the order-invariance regression test).
+            // TimeoutLayer budget. The wall is DERIVED from what this request has
+            // already spent (see `commerce_wall_for_elapsed`), so a slow upstream
+            // fan-out automatically shortens enrichment instead of stacking on top
+            // of it and overrunning the transport budget.
+            // Order is byte-identical to the sequential variant (proven by the
+            // order-invariance regression test).
             enrich_with_commerce_par(
                 &mut shop_arr,
                 move |url: String| {
                     let c = http_client.clone();
                     async move { fetch_page_html(&c, &url).await }
                 },
-                Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+                commerce_wall_for_elapsed(request_started.elapsed()),
             )
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
