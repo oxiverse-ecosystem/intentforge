@@ -4714,14 +4714,8 @@ const ENRICHMENT_HEADROOM_SECS: u64 = 2;
 /// `enrich_with_commerce_par` starts no fetch at a zero wall and
 /// `has_any_commerce_block` suppresses the empty strip, so the user still gets
 /// their ranked results — just without the optional commerce cards.
-fn commerce_wall_for_elapsed(elapsed: std::time::Duration) -> std::time::Duration {
-    let budget = std::time::Duration::from_secs(REQUEST_BUDGET_SECS);
-    let headroom = std::time::Duration::from_secs(ENRICHMENT_HEADROOM_SECS);
-    let left = budget
-        .saturating_sub(elapsed)
-        .saturating_sub(headroom)
-        .min(std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS));
-    std::time::Duration::from_secs(left.as_secs())
+fn commerce_wall_for_elapsed(_elapsed: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS)
 }
 
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
