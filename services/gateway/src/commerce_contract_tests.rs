@@ -708,3 +708,361 @@ fn item5_no_comparison_without_shared_id() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// COMMERCE HONESTY — three live defects measured on this lineage on 2026-10-03.
+//
+// Every test below uses the SAME real-world shape the defect actually had. That
+// is deliberate: a regression test for a normalisation defect built on a
+// placeholder fixture (`acme-shop.example`, where the bare host happens to equal
+// the normalised host) returns the right answer BY LUCK and cannot catch the
+// bug. So the host fixtures here are `www.`-prefixed real retail hosts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D1 — `extract_commerce_offer` back-fills `merchant` from the result's own URL
+/// host when the page names no seller. That is an IDENTIFIER, not a product fact.
+/// Counting it as a fact made every HTML-returning page look fact-bearing, which
+/// defeats `has_any_commerce_block` (the gate whose stated purpose is to keep a
+/// strip of bare affiliate links off the main path).
+#[test]
+fn d1_the_www_prefixed_host_identifier_is_not_a_page_fact() {
+    let url = "https://www.amazon.com/dp/B0EXAMPLE";
+    // Exactly what the extractor produces for a page with NO seller markup:
+    // merchant = the raw host, everything else null.
+    let d = OfferFacts {
+        merchant: Some("www.amazon.com".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        !data_has_fact(&d, url),
+        "a merchant that IS the result's own host is an identifier, not a fact"
+    );
+}
+
+/// The defect was ONE-SIDED normalisation: the result host went through
+/// normalisation (stripping `www.`) while the merchant label did not, so the same
+/// host compared as two different labels and was promoted to a page-supplied
+/// seller. Both sides must go through the SAME canonical form.
+#[test]
+fn d1_both_sides_of_the_comparison_are_normalised_identically() {
+    for merchant in [
+        "www.amazon.com",
+        "amazon.com",
+        "AMAZON.COM",
+        " www.amazon.com ",
+        "www.amazon.com.",
+        "https://www.amazon.com/dp/B0EXAMPLE",
+    ] {
+        let url = "https://www.amazon.com/dp/B0EXAMPLE";
+        let d = OfferFacts {
+            merchant: Some(merchant.to_string()),
+            ..Default::default()
+        };
+        assert!(
+            !data_has_fact(&d, url),
+            "merchant {merchant:?} is the result's own host and must not count as a fact"
+        );
+    }
+}
+
+/// MUST-NOT-OVER-REJECT: when the page DOES name a seller, that seller is a real
+/// fact and must still open the commerce block — even if it happens to be spelled
+/// with a `www.` prefix.
+#[test]
+fn d1_a_page_supplied_seller_name_still_counts_as_a_fact() {
+    let url = "https://www.cheap-electronics.example/products/xm5";
+    let d = OfferFacts {
+        merchant: Some("Acme Retail Group".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        data_has_fact(&d, url),
+        "a seller name that came from the PAGE is a real fact and must attach"
+    );
+
+    // And the must-not-over-reject direction that matters most: when the seller
+    // name IS the host, a real PRICE still carries the block. Otherwise the fix
+    // would silently drop every merchant page that exposes only a price.
+    let priced = OfferFacts {
+        merchant: Some("cheap-electronics.example".to_string()),
+        price: Some(49.99),
+        currency: Some("USD".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        data_has_fact(&priced, url),
+        "a real price must carry the block even when merchant == host"
+    );
+}
+
+/// Every other field is extracted from the page's own markup and must count
+/// unconditionally — including `name`, which the extractor populated but the old
+/// gate never counted (so a page exposing only a structured product name was
+/// being dropped).
+#[test]
+fn d1_each_real_page_fact_is_gated_on() {
+    let url = "https://shop.acme-electronics.example/p/1";
+    let cases: Vec<(&str, OfferFacts)> = vec![
+        ("price", OfferFacts { price: Some(9.99), ..Default::default() }),
+        ("price_low", OfferFacts { price_low: Some(9.99), ..Default::default() }),
+        ("currency", OfferFacts { currency: Some("USD".into()), ..Default::default() }),
+        ("availability", OfferFacts { availability: Some("InStock".into()), ..Default::default() }),
+        ("condition", OfferFacts { condition: Some("NewCondition".into()), ..Default::default() }),
+        ("sku", OfferFacts { sku: Some("SKU1".into()), ..Default::default() }),
+        ("gtin", OfferFacts { gtin: Some("0123456789".into()), ..Default::default() }),
+        ("rating", OfferFacts { rating: Some(4.5), ..Default::default() }),
+        ("name", OfferFacts { name: Some("Sony WH-1000XM5".into()), ..Default::default() }),
+    ];
+    for (field, d) in cases {
+        assert!(
+            data_has_fact(&d, url),
+            "{field} came from the page and must count as a fact"
+        );
+    }
+}
+
+/// Fails closed: an unparseable result URL means the merchant claim cannot be
+/// checked against anything, so it is not trusted.
+#[test]
+fn d1_unresolvable_result_host_is_not_trusted() {
+    let d = OfferFacts {
+        merchant: Some("Acme Retail Group".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        !data_has_fact(&d, "not a url at all"),
+        "unresolvable result host => merchant claim unverified => not a fact"
+    );
+}
+
+/// The defect end-to-end through the REAL extractor, on the real shape: a page
+/// that returns HTML but exposes no product markup must produce NO `commerce`
+/// block, because its only "fact" is its own hostname.
+#[test]
+fn d1_the_defect_is_fixed_end_to_end_through_the_real_extractor() {
+    let url = "https://www.amazon.com/dp/B0EXAMPLE";
+    // Real-world shape: a bot-check / consent page. HTML, no product markup.
+    let html = "<html><head><title>Robot Check</title></head><body>\
+               <p>Enter the characters you see below</p></body></html>";
+    let offer = extract_commerce_offer(html, url);
+    // The identifier may still be CARRIED (it is useful context) …
+    assert_eq!(
+        offer.data.as_ref().and_then(|d| d.merchant.clone()),
+        Some("www.amazon.com".to_string()),
+        "the host identifier is still carried for context"
+    );
+    // … but it must not be enough to surface a commerce block.
+    assert!(
+        !offer
+            .data
+            .as_ref()
+            .map(|d| data_has_fact(d, url))
+            .unwrap_or(false),
+        "a bot-check page must NOT be presented as a fact-bearing product page"
+    );
+}
+
+/// D2 — `fbu` is where a user is SENT when a bid misses `bf`, so a fallback
+/// pointing at IANA documentation space routes real clicks to a host that does
+/// not exist. The shipped config had exactly that.
+#[test]
+fn d2_shipped_config_has_no_documentation_fallback_on_disk() {
+    // Assert against the RAW JSON ON DISK, never through AffiliateCtx::load():
+    // the loader strips the field BEFORE the assertion could read it, so a
+    // loader-based test is tautological with the guard and stays green whatever
+    // the file says. That vacuous-test defect has already shipped once.
+    let raw = std::fs::read_to_string("data/commerce/affiliate.json")
+        .expect("shipped affiliate config must exist on disk");
+    let v: Value = serde_json::from_str(&raw).expect("shipped config must be valid JSON");
+    let nets = v["networks"].as_array().expect("networks array");
+    assert!(!nets.is_empty(), "the shipped config must actually have networks");
+    for n in nets {
+        let id = n["id"].as_str().unwrap_or("<no id>");
+        if let Some(fbu) = n.get("fallback_url").and_then(|f| f.as_str()) {
+            assert!(
+                !is_reserved_documentation_host(
+                    reqwest::Url::parse(fbu).unwrap().host_str().unwrap_or("")
+                ),
+                "network {id} ships a fallback_url pointing at reserved documentation space: {fbu}"
+            );
+        }
+    }
+}
+
+/// The loader guard itself — and the must-not-over-reject direction, because
+/// rejecting a REAL merchant's fallback is itself a monetization defect.
+#[test]
+fn d2_loader_drops_reserved_fallback_but_keeps_the_network_decorating() {
+    let mut poisoned = contract_net(
+        "wrap",
+        "https://sovrn.co?key={key}&u={url}",
+        HashMap::new(),
+        Some("D2_POISON_KEY"),
+    );
+    poisoned.fallback_url = Some("https://www.example-merchant.com/".to_string());
+    drop_reserved_fallback(&mut poisoned);
+    assert!(
+        poisoned.fallback_url.is_none(),
+        "a documentation-space fallback must be dropped"
+    );
+    // The NETWORK survives — a bad fallback must never take a live network down.
+    assert!(poisoned.enabled);
+    assert!(poisoned.template.contains("sovrn.co"));
+
+    // MUST-NOT-OVER-REJECT: real merchants survive, including ones that merely
+    // CONTAIN a reserved word and ones with a reserved word as an interior label.
+    for real in [
+        "https://shop.acme-electronics.example/",
+        "https://notexample.com/fallback",
+        "https://testosterone-shop.com/",
+        "https://invalid-syntax.co.uk/fb",
+        "https://localhost.acme-store.io/fb",
+    ] {
+        let mut n = contract_net(
+            "wrap",
+            "https://sovrn.co?key={key}&u={url}",
+            HashMap::new(),
+            Some("D2_REAL_KEY"),
+        );
+        n.fallback_url = Some(real.to_string());
+        drop_reserved_fallback(&mut n);
+        assert_eq!(
+            n.fallback_url.as_deref(),
+            Some(real),
+            "real merchant fallback {real} must NOT be dropped"
+        );
+    }
+}
+
+/// The shipped guard would otherwise reject a real host like
+/// `invalid-syntax.co.uk` (prefix-matching `invalid`), which the RFCs do not
+/// license — only `example` has a documented PREFIX form.
+#[test]
+fn d2_only_example_gets_the_prefix_rule() {
+    assert!(is_reserved_documentation_host("www.example-merchant.com"));
+    assert!(is_reserved_documentation_host("example.com"));
+    assert!(is_reserved_documentation_host("shop.example"));
+    assert!(is_reserved_documentation_host("foo.test"));
+    assert!(is_reserved_documentation_host("foo.invalid"));
+    assert!(!is_reserved_documentation_host("invalid-syntax.co.uk"));
+    assert!(!is_reserved_documentation_host("testosterone-shop.com"));
+    assert!(!is_reserved_documentation_host("shop.acme-electronics.example"));
+}
+
+/// D3 — the main-path gate asked only whether ANY candidate had a `commerce`
+/// block, then shipped the WHOLE window. Measured live, the strip carried cards
+/// with NO `commerce` key at all: monetised outbound links with nothing honest
+/// behind them — exactly the surface the gate's own comment says it prevents.
+#[test]
+fn d3_strip_never_ships_a_factless_card() {
+    let candidates = vec![
+        json!({"url": "https://shop.acme-electronics.example/p/1",
+               "commerce": {"data": {"price": 99.0}}}),
+        json!({"url": "https://blog.acme-electronics.example/review",
+               "commerce_provenance": {"fetched": false, "reason": "fetch_failed"}}),
+        json!({"url": "https://news.example/story"}),
+    ];
+    let strip = select_shopping_strip(&candidates, COMMERCE_MAINPATH_TOP_N)
+        .expect("one fact-bearing candidate qualifies");
+    assert_eq!(strip.len(), 1, "only the fact-bearing card may ship");
+    assert!(
+        strip.iter().all(|c| c.get("commerce").is_some()),
+        "EVERY shipped card must carry a real commerce block"
+    );
+}
+
+/// A factless card must not be MONETISED at all. Stripping must therefore happen
+/// BEFORE `decorate_affiliate`, not after — otherwise the bare card still leaves
+/// with a live affiliate link attached.
+#[test]
+fn d3_a_factless_card_is_never_monetised() {
+    std::env::set_var("D3_KEY", "D3_KEY");
+    let ctx = AffiliateCtx {
+        networks: vec![contract_net(
+            "wrap",
+            "https://sovrn.co?key={key}&u={url}",
+            HashMap::new(),
+            Some("D3_KEY"),
+        )],
+    };
+    let candidates = vec![
+        json!({"url": "https://blog.acme-electronics.example/review"}),
+        json!({"url": "https://shop.acme-electronics.example/p/1",
+               "commerce": {"data": {"price": 99.0}}}),
+    ];
+    // The production order: strip first, then decorate.
+    let mut strip = select_shopping_strip(&candidates, COMMERCE_MAINPATH_TOP_N).unwrap();
+    decorate_affiliate(&mut strip, &ctx);
+    assert_eq!(strip.len(), 1);
+    let aff = strip[0]["affiliate"].as_object().expect("the fact card monetises");
+    assert_eq!(aff.get("disclosed"), Some(&json!(true)));
+
+    // And the factless card, had it survived, would have been monetised — which
+    // is precisely why the strip has to run first.
+    let mut unstripped = candidates.clone();
+    decorate_affiliate(&mut unstripped, &ctx);
+    assert!(
+        unstripped[0].get("affiliate").map(|a| a.is_object()).unwrap_or(false),
+        "decoration alone does NOT protect a factless card — ordering is load-bearing"
+    );
+}
+
+/// The output must be a strict SUBSEQUENCE of the ranked input: the fix removes
+/// cards, it never promotes a lower-ranked result above a higher-ranked one.
+#[test]
+fn d3_strip_is_a_strict_subsequence_in_ranked_order() {
+    let candidates = vec![
+        json!({"url": "https://a.example/1"}),
+        json!({"url": "https://b.example/2", "commerce": {"data": {"price": 1.0}}}),
+        json!({"url": "https://c.example/3"}),
+        json!({"url": "https://d.example/4", "commerce": {"data": {"price": 2.0}}}),
+        json!({"url": "https://e.example/5", "commerce": {"data": {"price": 3.0}}}),
+    ];
+    let strip = select_shopping_strip(&candidates, COMMERCE_MAINPATH_TOP_N).unwrap();
+    let got: Vec<&str> = strip.iter().filter_map(|c| c["url"].as_str()).collect();
+    assert_eq!(got, vec!["https://b.example/2", "https://d.example/4", "https://e.example/5"]);
+
+    // Indices must be strictly increasing in the input — a subsequence, never a
+    // re-sort.
+    let idx: Vec<usize> = got
+        .iter()
+        .map(|u| candidates.iter().position(|c| c["url"].as_str() == Some(u)).unwrap())
+        .collect();
+    assert!(idx.windows(2).all(|w| w[0] < w[1]), "ranked order preserved");
+}
+
+/// The display cap and the enrich window must not be re-conflated. When they were
+/// the same constant, the cap also decided how far down the ranking we looked for
+/// facts — and for commercial queries the top rows are bot-checked merchant pages,
+/// so facts at ranks 8-12 were never fetched.
+#[test]
+fn d3_enrich_window_is_wider_than_the_display_cap() {
+    assert!(
+        COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N,
+        "the enrich window must be wider than the display cap, or facts below the cap are never fetched"
+    );
+    // And the display cap must still bound the strip.
+    let candidates: Vec<Value> = (0..40)
+        .map(|i| json!({"url": format!("https://x.example/{i}"), "commerce": {"data": {"price": 1.0}}}))
+        .collect();
+    assert_eq!(
+        select_shopping_strip(&candidates, COMMERCE_MAINPATH_TOP_N).unwrap().len(),
+        COMMERCE_MAINPATH_TOP_N,
+        "the display cap must still bound the shipped strip"
+    );
+}
+
+/// The gate returns None (block OMITTED) rather than an empty strip, and it must
+/// do so when nothing qualifies.
+#[test]
+fn d3_no_facts_means_no_block_at_all() {
+    let factless = vec![
+        json!({"url": "https://a.example/1"}),
+        json!({"url": "https://b.example/2"}),
+    ];
+    assert!(
+        select_shopping_strip(&factless, COMMERCE_MAINPATH_TOP_N).is_none(),
+        "with no fact-bearing candidate the shopping block must be omitted entirely"
+    );
+}
+

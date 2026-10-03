@@ -4511,7 +4511,12 @@ fn enrich_single_commerce(
         .unwrap_or("")
         .to_string();
     let offer: CommerceOffer = extract_commerce_offer(html, &url);
-    if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
+    if offer
+        .data
+        .as_ref()
+        .map(|d| data_has_fact(d, &url))
+        .unwrap_or(false)
+    {
         if let Ok(v) = serde_json::to_value(&offer) {
             r["commerce"] = v;
         }
@@ -4686,6 +4691,56 @@ fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
 /// it only changes how many enriched shopping cards show, never their order.
 const COMMERCE_MAINPATH_TOP_N: usize = 8;
 
+/// How many of the ALREADY-RANKED results are FETCHED for commerce enrichment.
+///
+/// This is deliberately WIDER than `COMMERCE_MAINPATH_TOP_N`. They used to be the
+/// same constant, which meant the display cap also decided how far down the
+/// ranking we were willing to look for real product facts — and for a commercial
+/// query the top few rows are overwhelmingly bot-checked merchant pages with no
+/// structured markup, so the strip was empty even though facts existed at ranks
+/// 8-12. Enriching a wider window and DISPLAYING a narrower one separates the two
+/// concerns. Data-free, and it cannot reorder anything: the window is a prefix of
+/// the already-ranked slice.
+const COMMERCE_ENRICH_WINDOW: usize = 24;
+
+/// Choose which already-enriched candidates may appear in the main-path
+/// `shopping` strip, and in what order.
+///
+/// DEFECT THIS FIXES (measured live, `/search?q=buy sony wh-1000xm5 headphones`):
+/// the gate only asked whether ANY candidate had a `commerce` block, then shipped
+/// the WHOLE window. Live, the strip carried 8 cards of which several had NO
+/// `commerce` key at all — monetised outbound links with nothing honest behind
+/// them, which is exactly the link-farm surface the gate's own comment says it
+/// exists to prevent.
+///
+/// CONTRACT:
+///   * keeps only candidates that carry a `commerce` block (real page facts);
+///   * keeps them in their EXISTING ranked order — the output is a strict
+///     SUBSEQUENCE, so a lower-ranked candidate can never be promoted above a
+///     higher-ranked one;
+///   * caps at `max_cards` (the display cap, not the enrich window);
+///   * returns `None` when nothing qualifies, so the block is OMITTED rather than
+///     shipped empty.
+///
+/// Pure + offline-testable. It reads the CLONE the main path already built and
+/// never touches the real `results` array.
+fn select_shopping_strip(
+    candidates: &[serde_json::Value],
+    max_cards: usize,
+) -> Option<Vec<serde_json::Value>> {
+    let strip: Vec<serde_json::Value> = candidates
+        .iter()
+        .filter(|r| r.get("commerce").is_some())
+        .take(max_cards)
+        .cloned()
+        .collect();
+    if strip.is_empty() {
+        None
+    } else {
+        Some(strip)
+    }
+}
+
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
 /// Returns true when the in-process intent signals indicate the user wants to buy.
@@ -4853,6 +4908,67 @@ struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
 }
 
+/// PURE: is this host in IANA reserved / special-use space (RFC 2606 §2,
+/// RFC 6761 §6) rather than a real merchant?
+///
+/// `fbu` is where a user is SENT when a link's bid misses `bf`, so a fallback
+/// pointing at documentation space routes real clicks to a host that does not
+/// exist. Label-boundary matching, never substring — a merchant merely CONTAINING
+/// a reserved word (`notexample.com`, `testosterone-shop.com`) is a real
+/// merchant and must be accepted, because over-rejecting a real fallback is
+/// itself a monetization defect.
+///
+/// The documented PREFIX rule (`example-`, `example.`) applies ONLY to `example`,
+/// which is the only reserved prefix the RFCs define: `invalid` and `test` are
+/// reserved as whole NAMES/TLDs, so prefix-matching them would wrongly reject
+/// real hosts such as `invalid-syntax.co.uk`.
+fn is_reserved_documentation_host(raw_host: &str) -> bool {
+    let host = match normalize_host_label(raw_host) {
+        Some(h) => h,
+        None => return true, // unparseable => fail closed
+    };
+    const RESERVED_NAMES: [&str; 4] = ["test", "invalid", "localhost", "example"];
+    const RESERVED_TLDS: [&str; 2] = ["test", "invalid"];
+    host.split('.')
+        .filter(|l| !l.is_empty())
+        .any(|label| {
+            if RESERVED_NAMES.contains(&label) {
+                return true;
+            }
+            // Prefix form: `example-merchant`, `example_shop` (documented by RFC 2606).
+            label.starts_with("example-") || label.starts_with("example_")
+        })
+        || RESERVED_TLDS.contains(&host.rsplit('.').next().unwrap_or(""))
+}
+
+/// `AffiliateCtx::load()` would otherwise decorate a search with a fallback
+/// destination that is not a merchant. Drop the FIELD, never the NETWORK:
+/// wrapping, `bf` and `disclosed: true` must keep working, because a bad
+/// fallback must never take a live affiliate network down with it.
+fn drop_reserved_fallback(net: &mut AffiliateNetwork) {
+    let drop_it = net
+        .fallback_url
+        .as_deref()
+        .and_then(|f| reqwest::Url::parse(f).ok())
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .map(|h| is_reserved_documentation_host(&h))
+        .unwrap_or(false);
+    if drop_it {
+        let host = net
+            .fallback_url
+            .clone()
+            .and_then(|f| reqwest::Url::parse(&f).ok())
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_default();
+        tracing::warn!(
+            "affiliate: dropping reserved-documentation fallback_url for network '{}' (host '{}' is IANA documentation space, not a merchant)",
+            net.id,
+            host
+        );
+        net.fallback_url = None;
+    }
+}
+
 impl AffiliateCtx {
     /// Load networks from the data file. An empty/missing file is NOT fatal: the
     /// engine simply has no networks and every result degrades to `affiliate:
@@ -4872,7 +4988,9 @@ impl AffiliateCtx {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
                         for n in arr {
-                            if let Ok(net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                            if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone())
+                            {
+                                drop_reserved_fallback(&mut net);
                                 networks.push(net);
                             }
                         }
@@ -18529,7 +18647,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         // place. `serde_json::to_value` on `MergedResult` is lossless/Serialize.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
             .iter()
-            .take(COMMERCE_MAINPATH_TOP_N)
+            .take(COMMERCE_ENRICH_WINDOW)
             .filter_map(|r| serde_json::to_value(r).ok())
             .collect();
         if shop_arr.is_empty() {
@@ -18551,30 +18669,36 @@ let mut results = match tokio::task::spawn_blocking(move || {
             )
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
-            decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
-            // ROADMAP item 7 (refinement): only surface the main-path `shopping`
-            // strip when at least one of the top-N ranked results actually exposed
-            // structured product data (a `commerce` block). A commercial-intent
-            // query whose top results are articles/reviews/guides with no product
-            // schema would otherwise render an empty strip of cards carrying only
-            // affiliate links — a low-value, link-farm-like surface that invites
-            // misuse of the affiliate thesis. Gating on a REAL `commerce` block
-            // keeps the block honest: it appears only when we have product facts to
-            // show. Pure post-enrichment signal, no query-specific logic, and the
+            // HONESTY ORDER MATTERS: the strip is selected FIRST so a factless
+            // card is never monetised at all. Decorating the whole window and
+            // filtering afterwards would still hand a live affiliate link to a
+            // card with no product facts behind it.
+            //
+            // ROADMAP item 7 (refinement): only surface cards that actually
+            // exposed structured product data. A commercial-intent query whose
+            // results are articles/reviews/guides with no product schema would
+            // otherwise render an empty strip of cards carrying only affiliate
+            // links — a low-value, link-farm-like surface that invites misuse of
+            // the affiliate thesis. Gating on a REAL `commerce` block keeps the
+            // block honest: it appears only when we have product facts to show.
+            // Pure post-enrichment signal, no query-specific logic, and the
             // `results` ordering is untouched either way (no-manipulation holds).
-            if !shop_arr.iter().any(|r| r.get("commerce").is_some()) {
-                None
-            } else {
-                // Read-only multi-merchant offer comparison from the attached facts.
-                let mut block = serde_json::json!({ "results": shop_arr });
-                if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                    let comparisons = build_offer_comparisons(arr_ref);
-                    if !comparisons.is_empty() {
-                        block["offer_comparisons"] =
-                            serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+            let stripped = select_shopping_strip(&shop_arr, COMMERCE_MAINPATH_TOP_N);
+            match stripped {
+                None => None,
+                Some(mut strip) => {
+                    decorate_affiliate(&mut strip, &state.affiliate_ctx);
+                    // ROADMAP item 5: read-only multi-merchant offer comparison from the attached facts.
+                    let mut block = serde_json::json!({ "results": strip });
+                    if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                        let comparisons = build_offer_comparisons(arr_ref);
+                        if !comparisons.is_empty() {
+                            block["offer_comparisons"] =
+                                serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+                        }
                     }
+                    Some(block)
                 }
-                Some(block)
             }
         }
     } else {

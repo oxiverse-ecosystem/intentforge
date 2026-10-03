@@ -5,6 +5,12 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 RUN mkdir src && echo "fn main(){}" > src/main.rs
 RUN cargo build --release
 COPY src ./src
+# The commerce affiliate config is RUNTIME-LOADED (AffiliateCtx::load() reads
+# data/commerce/affiliate.json relative to cwd). Without this COPY the test image
+# has NO data directory, the loader returns zero networks, and every test that
+# exercises the shipped config — including the mandatory order-invariance proof
+# that monetisation never touches ranking — passes VACUOUSLY against nothing.
+COPY data ./data
 # Rebuild the bin (release) then run the test suite against the same deps cache.
 RUN touch src/main.rs && cargo build --release
 CMD ["cargo", "test", "--release"]
