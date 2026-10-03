@@ -334,6 +334,28 @@ impl SymSpellIndex {
         let best_dist = self.compute_edit_distance(word, best);
         let absent = !self.exact_map.contains_key(&word.to_lowercase())
             && !self.is_known_misspelling(word);
+        // DERIVATIONAL MORPHOLOGY GUARD (logger->longer, 2026-10-03).
+        // An absent word that decomposes into a DICTIONARY stem plus a
+        // closed-class derivational suffix is a REAL word the 15k list happens to
+        // lack, not a typo. Live offender: "logger" = "log" (freq 0.413) + "-er".
+        // Its doubled "gg" scores as an unnatural bigram, so is_genuine_dist1_typo
+        // reads the scar as a typo and rewrites a user's term to "longer" —
+        // collapsing a 9-result SERP to 2 irrelevant hits (a Microsoft Windows
+        // support page and a YouTube video).
+        //
+        // Why morphology rather than a word list or a threshold: a per-word
+        // exception list is unbounded (logger/builders/walkers/teachers/...),
+        // and raising the perplexity bar re-opens the housr->house class. The
+        // stem-in-dictionary test generalises to every agentive/nominal the
+        // dictionary omits and needs no tuning per query.
+        //
+        // This cannot suppress a genuine typo fix: seeded misspellings
+        // (programing, recieve, pythn, housr, ngnix) are already excluded by
+        // `absent` via is_known_misspelling, and an unseeded typo has no
+        // dictionary stem to derive from.
+        if absent && self.has_dictionary_stem(word) {
+            return None;
+        }
         if absent && best_dist >= 1 && best_dist <= 2 {
             if best_dist >= 2 {
                 // Allow the doubled-letter typo exception (embaras->embarrass etc.)
@@ -434,6 +456,50 @@ impl SymSpellIndex {
         input_perp > natural_threshold
             && cand_perp <= natural_threshold * 1.5
             && ratio >= 1.4
+    }
+
+    /// Closed-class English derivational suffixes. A morphological CLASS, not a
+    /// word list: every member is a productive affix, so the decomposition rule
+    /// below generalises to any stem the dictionary happens to contain. Listed
+    /// longest-first so a suffix is preferred over a shorter one that also
+    /// matches (e.g. "ability" before "ity" before "ly").
+    const DERIVATIONAL_SUFFIXES: &'static [&'static str] = &[
+        "ability", "ibility", "ization", "isation", "iveness",
+        "fulness", "ousness", "lessness", "ation", "ition", "ution", "ement",
+        "ments", "ment", "ness", "less", "able", "ible", "ings", "ing", "ers",
+        "er", "ors", "or", "ists", "ist", "isms", "ism", "ally", "ily", "ly",
+        "al", "ial", "ic", "ical", "ity", "ties", "ty", "ry", "ship", "hood",
+        "ward", "wise", "like", "ful", "some", "let",
+    ];
+
+    /// True when `word` is a real derivational form: a dictionary word plus one
+    /// closed-class derivational suffix, leaving a stem of at least 3 characters.
+    ///
+    /// The minimum stem length is what stops a short suffix from "deriving" a
+    /// nonsense stem out of a genuine short typo (e.g. "hou"+"r"-less forms,
+    /// or a 1-2 letter stem). "logger" -> ("logg"+"er") and ("log"+"ger" fail)
+    /// so BOTH the raw stem and the double-collapsed stem are tested: English
+    /// spells the stem "log" but the derivation surface-stresses it to "logger",
+    /// which is exactly the doubled-letter case the bigram model misreads.
+    fn has_dictionary_stem(&self, word: &str) -> bool {
+        const MIN_STEM: usize = 3;
+        for suffix in Self::DERIVATIONAL_SUFFIXES {
+            let Some(stem) = word.strip_suffix(suffix) else {
+                continue;
+            };
+            if stem.len() < MIN_STEM {
+                continue;
+            }
+            if self.exact_map.contains_key(stem) {
+                return true;
+            }
+            // Surface-stressed derivation: "logger" -> stem "logg" -> "log".
+            let collapsed = Self::collapse_doubles(stem);
+            if collapsed.len() >= MIN_STEM && self.exact_map.contains_key(&collapsed) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Collapse each run of identical consecutive chars to a single char.
@@ -1474,5 +1540,66 @@ mod tests {
         // a known-misspelling entry, exempt from the absent-word block.
         let index = SymSpellIndex::build();
         assert_eq!(index.correct("ngnix"), Some("nginx".to_string()));
+    }
+
+    // ── Derivational morphology guard (logger -> longer, 2026-10-03) ─────────
+
+    #[test]
+    fn test_logger_not_corrected_to_longer() {
+        // THE live offender. "logger" is absent from the 15k dictionary but is a
+        // real English word: "log" + agentive "-er". Its doubled "gg" scores as an
+        // unnatural bigram, so the dist-1 typo heuristic read the scar as a typo
+        // and rewrote it to "longer", collapsing a 9-result SERP to 2 irrelevant
+        // hits (a Microsoft Windows support page and a YouTube video).
+        let index = SymSpellIndex::build();
+        assert_eq!(
+            index.correct("logger"),
+            None,
+            "a dictionary stem + '-er' is a real derivation, not a typo"
+        );
+    }
+
+    #[test]
+    fn test_derivational_guard_preserves_seeded_typos() {
+        // COUNTER-GUARD, and the one that decides whether this fix is safe: the
+        // morphology guard must not swallow the genuine typo classes the
+        // absent-word guard was written to keep. Every one of these is a seeded
+        // misspelling (freq 0.0010), so `absent` is already false and the new
+        // guard never runs — pinned here so a future change to the seeding or to
+        // the guard's ordering cannot silently disable typo correction.
+        let index = SymSpellIndex::build();
+        for (typo, expected) in [
+            ("pythn", "python"),
+            ("housr", "house"),
+            ("ngnix", "nginx"),
+            ("recieve", "receive"),
+        ] {
+            assert_eq!(
+                index.correct(typo),
+                Some(expected.to_string()),
+                "genuine typo '{}' -> '{}' must survive the morphology guard",
+                typo,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_derivational_guard_does_not_suppress_bare_stems() {
+        // The guard is anchored on a REAL dictionary stem, so it must not fire on
+        // an absent word that merely ends in a suffix-looking string with no stem
+        // behind it. "xyzzyr" is not a word and derives from nothing; it is also
+        // not in the dictionary, so this asserts the guard is not simply
+        // "any word ending in -er/-ing/-ed is exempt" (which would be a much
+        // broader and wrong exemption than the one implemented).
+        let index = SymSpellIndex::build();
+        assert!(
+            !index.has_dictionary_stem("xyzzyr"),
+            "a suffix-shaped string with no dictionary stem must not count as a derivation"
+        );
+        assert!(
+            index.has_dictionary_stem("logger"),
+            "logger must decompose to the dictionary stem 'log'"
+        );
     }
 }
