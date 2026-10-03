@@ -1641,9 +1641,8 @@ Top result (truncated):
   "affiliate": {
     "disclosed": true,
     "network": "Sovrn Commerce",
-    "url": "https://sovrn.co?key=dummy-test-key-do-not-use&u=https%3A%2F%2Fpowersof10.com%2Fbest-wireless-earbuds-under-50%2F&cuid=powersof10.com&bf=0.10&fbu=https%3A%2F%2Fwww.example-merchant.com%2F",
-    "bid_floor": "0.10",
-    "fallback": "https://www.example-merchant.com/"
+    "url": "https://sovrn.co?key=dummy-test-key-do-not-use&u=https%3A%2F%2Fpowersof10.com%2Fbest-wireless-earbuds-under-50%2F&cuid=powersof10.com&bf=0.10",
+    "bid_floor": "0.10"
   }
 ```
 
@@ -1654,6 +1653,26 @@ Top result (truncated):
 > parameter. `bf` (bid floor) and `fbu` (fallback URL) are appended as query params
 > from the network's data-configured `bid_floor` / `fallback_url` fields and are for
 > reporting / fallback only — they never affect ranking.
+>
+> **`fbu` and `fallback` are omitted unless the configured `fallback_url` is a real
+> merchant.** `fbu` is where a user is *sent* when a bid misses `bf`, so shipping a
+> placeholder routes real clicks to a host that does not exist. Two independent layers
+> prevent that: the shipped `data/commerce/affiliate.json` sets `fallback_url: null`,
+> and `AffiliateCtx::load()` drops any `fallback_url` whose host is IANA
+> reserved/special-use space (RFC 2606 §2, RFC 6761 §6). The **field** is dropped,
+> never the network — wrapping, `bf` and `disclosed: true` keep working, because a bad
+> fallback must never take a live affiliate network down with it.
+>
+> Reserved words are matched **by position, not by value**. Only `example` has a
+> documented interior-label form (RFC 2606 §2 names `example.com`/`.net`/`.org`, plus
+> the `example-`/`example_` prefix form). `test`, `invalid` and `localhost` are reserved
+> as whole names and as TLDs only. So `www.example-merchant.com`, `foo.test`,
+> `shop.example` and bare `localhost` are rejected, while real registrable hosts that
+> merely contain a reserved word — `localhost.acme-store.io`, `invalid-syntax.co.uk`,
+> `testosterone-shop.com`, `notexample.com` — are accepted. Over-rejecting a real
+> merchant's fallback is itself a monetization defect: the click is simply lost.
+> Locked by `d4_reserved_names_are_matched_by_position_not_by_value` and
+> `d4_a_real_merchant_fallback_survives_the_loader`.
 
 **No-manipulation guarantee (verified live):** the ranked URL order from
 `/shopping` is byte-identical to `/search` for the same query. This is locked in CI
