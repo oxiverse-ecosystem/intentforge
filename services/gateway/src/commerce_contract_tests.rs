@@ -911,8 +911,11 @@ fn d2_loader_drops_reserved_fallback_but_keeps_the_network_decorating() {
 
     // MUST-NOT-OVER-REJECT: real merchants survive, including ones that merely
     // CONTAIN a reserved word and ones with a reserved word as an interior label.
+    // NOTE the `.example` TLD is itself reserved, so no `.example` host may appear
+    // in this accept-list — a fixture using one would assert the opposite of the
+    // RFC and would happily "prove" the guard wrong.
     for real in [
-        "https://shop.acme-electronics.example/",
+        "https://shop.acme-electronics.com/",
         "https://notexample.com/fallback",
         "https://testosterone-shop.com/",
         "https://invalid-syntax.co.uk/fb",
@@ -946,7 +949,10 @@ fn d2_only_example_gets_the_prefix_rule() {
     assert!(is_reserved_documentation_host("foo.invalid"));
     assert!(!is_reserved_documentation_host("invalid-syntax.co.uk"));
     assert!(!is_reserved_documentation_host("testosterone-shop.com"));
-    assert!(!is_reserved_documentation_host("shop.acme-electronics.example"));
+    assert!(!is_reserved_documentation_host("shop.acme-electronics.com"));
+    // `.example` is a reserved TLD in its own right, so this IS documentation
+    // space even though no label equals `example`.
+    assert!(is_reserved_documentation_host("shop.acme-electronics.example"));
 }
 
 /// D3 — the main-path gate asked only whether ANY candidate had a `commerce`

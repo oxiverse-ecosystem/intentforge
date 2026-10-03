@@ -4928,17 +4928,26 @@ fn is_reserved_documentation_host(raw_host: &str) -> bool {
         None => return true, // unparseable => fail closed
     };
     const RESERVED_NAMES: [&str; 4] = ["test", "invalid", "localhost", "example"];
-    const RESERVED_TLDS: [&str; 2] = ["test", "invalid"];
-    host.split('.')
-        .filter(|l| !l.is_empty())
-        .any(|label| {
-            if RESERVED_NAMES.contains(&label) {
-                return true;
-            }
-            // Prefix form: `example-merchant`, `example_shop` (documented by RFC 2606).
-            label.starts_with("example-") || label.starts_with("example_")
-        })
-        || RESERVED_TLDS.contains(&host.rsplit('.').next().unwrap_or(""))
+        const RESERVED_TLDS: [&str; 2] = ["test", "invalid"];
+        let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+        let tld = labels.last().copied().unwrap_or("");
+        labels
+            .iter()
+            .take(labels.len().saturating_sub(1)) // never the TLD — handled below
+            .any(|label| {
+                // Interior label that IS a reserved name -> still documentation space
+                // (`example-merchant.com`, the form RFC 2606 documents).
+                if RESERVED_NAMES.contains(label) {
+                    return true;
+                }
+                // Prefix form: `example-`, `example_shop` (documented by RFC 2606).
+                label.starts_with("example-") || label.starts_with("example_")
+            })
+            // Whole-name match: `example`, `test`, `localhost` (single-label hosts).
+            || labels.len() == 1 && RESERVED_NAMES.contains(&labels[0])
+            || RESERVED_TLDS.contains(&tld)
+            || tld == "example"
+            || tld == "localhost"
 }
 
 /// `AffiliateCtx::load()` would otherwise decorate a search with a fallback
