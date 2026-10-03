@@ -955,6 +955,85 @@ fn d2_only_example_gets_the_prefix_rule() {
     assert!(is_reserved_documentation_host("shop.acme-electronics.example"));
 }
 
+/// D4 — a reserved name is reserved in a POSITION, not everywhere.
+///
+/// The guard applied its whole reserved-name list to INTERIOR labels as well as
+/// the TLD and the whole name. Only `example` has a documented interior form
+/// (RFC 2606 §2 names example.com/.net/.org); `test`, `invalid` and `localhost`
+/// are reserved as whole names and as TLDs only. Matching them in interior
+/// position therefore rejected real registrable hosts — measured here on
+/// `localhost.acme-store.io`, whose fallback the loader silently dropped.
+///
+/// This is a MONETIZATION defect, not a cosmetic one, and it is the exact
+/// inverse of the guard's purpose: the fallback is where a user is sent when a
+/// bid misses `bf`, so dropping a real merchant's fallback loses the click
+/// outright rather than routing it anywhere wrong.
+///
+/// Fixtures are registrable `.com`/`.io`/`.co.uk` hosts — a reserved-TLD
+/// placeholder could not distinguish the two positions at all.
+#[test]
+fn d4_reserved_names_are_matched_by_position_not_by_value() {
+    // Rejected — the documented positions.
+    for reserved in [
+        "example.com",             // interior `example` (RFC 2606 §2)
+        "example-merchant.com",    // documented `example-` prefix form
+        "example_shop.io",         // documented `example_` prefix form
+        "foo.test",                // reserved TLD
+        "foo.invalid",             // reserved TLD
+        "shop.example",            // `.example` TLD
+        "shop.localhost",          // `.localhost` TLD
+        "localhost",               // whole name
+        "test",                    // whole name
+        "invalid",                 // whole name
+    ] {
+        assert!(
+            is_reserved_documentation_host(reserved),
+            "{reserved} is IANA reserved/special-use space and must be rejected"
+        );
+    }
+
+    // ACCEPTED — real registrable hosts that merely CONTAIN a reserved word as
+    // an interior label. The RFCs reserve these words in name/TLD position only.
+    for real in [
+        "localhost.acme-store.io",
+        "invalid-syntax.co.uk",
+        "testosterone-shop.com",
+        "notexample.com",
+        "shop.acme-electronics.com",
+    ] {
+        assert!(
+            !is_reserved_documentation_host(real),
+            "{real} is a real registrable host; over-rejecting it loses a real \
+             affiliate fallback, which is itself a monetization defect"
+        );
+    }
+}
+
+/// The must-not-over-reject direction end-to-end through the loader: a REAL
+/// merchant's fallback survives a network whose reserved fallback was dropped.
+/// Guards the production entry point, not just the pure predicate.
+#[test]
+fn d4_a_real_merchant_fallback_survives_the_loader() {
+    let real = "https://localhost.acme-store.io/fallback";
+    let mut n = contract_net(
+        "wrap",
+        "https://sovrn.co?key={key}&u={url}",
+        HashMap::new(),
+        Some("D4_REAL_KEY"),
+    );
+    n.fallback_url = Some(real.to_string());
+    drop_reserved_fallback(&mut n);
+    assert_eq!(
+        n.fallback_url.as_deref(),
+        Some(real),
+        "a real merchant fallback must survive; only documentation space is dropped"
+    );
+    assert!(
+        n.enabled && n.template.contains("sovrn.co"),
+        "and the network itself must be untouched either way"
+    );
+}
+
 /// D3 — the main-path gate asked only whether ANY candidate had a `commerce`
 /// block, then shipped the WHOLE window. Measured live, the strip carried cards
 /// with NO `commerce` key at all: monetised outbound links with nothing honest

@@ -4927,27 +4927,31 @@ fn is_reserved_documentation_host(raw_host: &str) -> bool {
         Some(h) => h,
         None => return true, // unparseable => fail closed
     };
+    // Reserved as a WHOLE NAME or a TLD. RFC 2606 §2 and RFC 6761 §6 define
+    // these only in those two positions — NOT as an interior label.
     const RESERVED_NAMES: [&str; 4] = ["test", "invalid", "localhost", "example"];
-        const RESERVED_TLDS: [&str; 2] = ["test", "invalid"];
-        let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
-        let tld = labels.last().copied().unwrap_or("");
-        labels
-            .iter()
-            .take(labels.len().saturating_sub(1)) // never the TLD — handled below
-            .any(|label| {
-                // Interior label that IS a reserved name -> still documentation space
-                // (`example-merchant.com`, the form RFC 2606 documents).
-                if RESERVED_NAMES.contains(label) {
-                    return true;
-                }
-                // Prefix form: `example-`, `example_shop` (documented by RFC 2606).
-                label.starts_with("example-") || label.starts_with("example_")
-            })
-            // Whole-name match: `example`, `test`, `localhost` (single-label hosts).
-            || labels.len() == 1 && RESERVED_NAMES.contains(&labels[0])
-            || RESERVED_TLDS.contains(&tld)
-            || tld == "example"
-            || tld == "localhost"
+    // The ONLY label with a documented INTERIOR form: RFC 2606 §2 names
+    // example.com/.net/.org, so `example` (and its `example-`/`example_` prefix
+    // form) legitimately appears before the TLD. `test`, `invalid` and
+    // `localhost` have no such form, so treating them as interior labels would
+    // reject real registrable hosts such as `localhost.acme-store.io` and
+    // `invalid-syntax.co.uk` — and dropping a REAL merchant's fallback is
+    // itself a monetization defect (the click is simply lost).
+    const INTERIOR_RESERVED: [&str; 1] = ["example"];
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    let tld = labels.last().copied().unwrap_or("");
+    // Interior labels only, never the TLD (handled below).
+    let interior_reserved = labels
+        .iter()
+        .take(labels.len().saturating_sub(1))
+        .any(|label| {
+            INTERIOR_RESERVED.contains(label)
+                || label.starts_with("example-")
+                || label.starts_with("example_")
+        });
+    // Whole-name match: a single-label host that IS one of the reserved names.
+    let whole_name_reserved = labels.len() == 1 && RESERVED_NAMES.contains(&labels[0]);
+    interior_reserved || whole_name_reserved || RESERVED_NAMES.contains(&tld)
 }
 
 /// `AffiliateCtx::load()` would otherwise decorate a search with a fallback
