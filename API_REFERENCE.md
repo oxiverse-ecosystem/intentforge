@@ -1817,8 +1817,8 @@ sets `bid_floor: "0.10"` on the Sovrn row.
 decoration ON with the dev key):
 
 ```
-affiliate sample keys: ['bid_floor', 'disclosed', 'fallback', 'network', 'url']
-bid_floor = 0.10   fallback = https://www.example-merchant.com/   disclosed = true
+affiliate sample keys: ['bid_floor', 'disclosed', 'network', 'url']
+bid_floor = 0.10   disclosed = true   (no `fallback`/`fbu`: shipped fallback_url is null)
 ```
 
 #### Offer comparison (item 5, 2026-08-29)
