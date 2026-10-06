@@ -9288,17 +9288,7 @@ fn merge_local_and_web(
                 && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
                 && !temporal_fillers.contains(lower.as_str())
-                // FIX-IF-39: a discourse filler is non-topical glue, and it is the
-                // single highest-collision token class on the web ("hey" alone
-                // matches HeyGen / hey.com / Hey Jimmy). Leaving it here lets a page
-                // whose ENTIRE overlap is one filler tie the genuine answers.
                 && !is_discourse_filler(&lower)
-                // FIX-IF-35: same exclusion as core_topic_terms. `overlap` is the
-                // fraction of distinctive terms a page contains, and the >=2-of-3
-                // weak-match cap counts them too — so a naming predicate sitting in
-                // this set both dilutes overlap and lets an off-topic page that
-                // happens to contain the verb look like a good match. The predicate
-                // describes the question FORM; the entities describe the subject.
                 && !is_naming_predicate_word(&lower)
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
@@ -9471,7 +9461,6 @@ fn merge_local_and_web(
         comparison_principals
     };
 
-    // ── Conversational-preamble narrowing (FIX-IF-39) ──
     // A spoken-style question wraps the real request in discourse preamble: "hey so my
     // friend asked me the other day about this whole thing and i was wondering if you
     // could tell me WHAT actually happens when the water cycle goes through its various
@@ -9499,11 +9488,27 @@ fn merge_local_and_web(
             _ => None,
         }
     };
+    let core_topic_terms_base: Vec<&str> = q_words.iter()
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            lower.len() >= 3
+                && !stop_words.contains(lower.as_str())
+                && !generic_web_terms.contains(lower.as_str())
+                && !meta_action_terms.contains(lower.as_str())
+                && !unit_terms.contains(lower.as_str())
+                && !role_descriptor_terms.contains(lower.as_str())
+                && !weak_discriminative.contains(lower.as_str())
+                && !temporal_fillers.contains(lower.as_str())
+                && !is_discourse_filler(&lower)
+                && !is_naming_predicate_word(&lower)
+                && !lower.chars().all(|c| c.is_ascii_digit())
+        })
+        .copied()
+        .collect();
     let core_topic_terms: Vec<&str> = match conversational_clause_start {
         Some(start) => {
             let clause_terms: Vec<&str> = q_words[start..]
                 .iter()
-                .copied()
                 .filter(|w| {
                     let lower = w.to_lowercase();
                     lower.len() >= 3
@@ -9514,38 +9519,11 @@ fn merge_local_and_web(
                         && !role_descriptor_terms.contains(lower.as_str())
                         && !weak_discriminative.contains(lower.as_str())
                         && !temporal_fillers.contains(lower.as_str())
-                        // FIX-IF-39: THE fix for filler-token brand collisions. `core_matches`
-                        // below requires EVERY core term to be present, so a filler left in
-                        // this set is not merely noisy — it makes the gate UNSATISFIABLE for
-                        // every real page. Measured live 2026-09-30 on the conversational
-                        // water-cycle question: core terms included "hey"/"actually"/"you",
-                        // so core_matches was false for ALL 23 results, `overlap` collapsed
-                        // to 0, the BERT gate (which only runs when overlap > 0) switched
-                        // off, and the gateway logged "Relevance distribution: best=0.041,
-                        // mean=0.018, var=0.000, garbage_cluster=true" — the absolute
-                        // relevance signal was DEAD and every result tied at the same 0.04
-                        // post-calibration cap. Ranking was then decided by residual noise,
-                        // which is how a camera shop matching only "hey" landed in the top-5
-                        // beside NOAA and Wikipedia. Same failure mode as FIX-IF-35 one
-                        // layer up: a non-topical token in the mandatory set kills the
-                        // signal for the whole result set. Closed-class vocabulary; names
-                        // no brand, domain or query.
                         && !is_discourse_filler(&lower)
-                        // FIX-IF-35: a naming PREDICATE is query structure, not a topic.
-                        // `core_matches` below requires EVERY core term to be present, so
-                        // leaving "named"/"called"/"etymology" in this set made
-                        // core_matches false for essentially every real page: overlap
-                        // collapsed to 0, the BERT gate (which only runs when overlap > 0)
-                        // switched off, and `relevance` was 0.000 for the entire result
-                        // set — the absolute signal the ranker depends on was dead, and the
-                        // surviving ordering was residual noise. Measured live
-                        // 2026-09-30 on "why is the apache web server named after a
-                        // helicopter": rel=0.000 on all 21 results. Excluding the predicate
-                        // leaves the real subject pair (apache, helicopter) to carry the
-                        // match. Closed-class vocabulary; names no entity or topic.
                         && !is_naming_predicate_word(&lower)
                         && !lower.chars().all(|c| c.is_ascii_digit())
                 })
+                .copied()
                 .collect();
             // The clause must retain enough topic terms to be a meaningful narrower
             // description of the query; otherwise fall back to the full query.
@@ -9556,10 +9534,10 @@ fn merge_local_and_web(
                 );
                 clause_terms
             } else {
-                core_topic_terms
+                core_topic_terms_base
             }
         }
-        None => core_topic_terms,
+        None => core_topic_terms_base,
     };
 
     // Multi-word phrase entities (P1): adjacent non-stopword runs of length >= 2 in the
