@@ -8122,6 +8122,42 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     if ent.is_empty() && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
                         break;
                     }
+                    // List connector ("or"/"and"/",") between exclusion targets: the
+                    // current target is finalised and pushed, then we start a new one.
+                    // MUST precede the trailing-stopword break below — "or"/"and" are
+                    // themselves stopwords, so checking them second made this branch
+                    // unreachable and every compound exclusion ("without oven or
+                    // microwave") silently degraded to its first half, which
+                    // substring-matches no page and no-ops as a filter.
+                    let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
+                    if !ent.is_empty() && (bare == "or" || bare == "and") {
+                        let entity = ent.join(" ");
+                        if !out.contains(&entity) {
+                            out.push(entity);
+                        }
+                        ent.clear();
+                        idx += 1;
+                        continue;
+                    }
+                    if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break; // trailing stopword ends the entity
+                    }
+                    // A function word arriving when NO target is being collected
+                    // means the exclusion list has ended and a new, independent
+                    // clause has begun. "not from chinese brands AND have usb c
+                    // charging" splits on "and", then "have" (an auxiliary) used
+                    // to be pushed as the head of a fresh target, producing the
+                    // phantom exclusion "have usb c charging" — a verb phrase
+                    // that substring-matches no product page and wrongly penalises
+                    // every charger result. The leading-skip loop above already
+                    // handles function words directly after the lead-in
+                    // ("not from X"); this is the in-list counterpart: after a
+                    // connector, a function word terminates the clause instead of
+                    // seeding a new target. Structural (closed-class stopword
+                    // list already in scope), no per-query literals.
+                    if ent.is_empty() && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break;
+                    }
                     ent.push(wc);
                     idx += 1;
                 }
@@ -9301,7 +9337,8 @@ fn is_naming_question(query: &str) -> bool {
     // "refer to") are also used in ordinary non-naming questions ("where does the
     // river come from"), so they only count alongside a name-ish noun.
     // This is closed-class vocabulary describing the QUESTION FORM — it names no
-    // entity, brand or topic.
+    // entity, brand or topic. Uses `is_naming_predicate_word` (shared constant) so
+    // this classification and the term-extraction filters cannot drift apart.
     let has_strong = words.iter().any(|w| is_naming_predicate_word(w));
     const WEAK_NAMING_PREDICATES: &[&str] = &[
         "name", "names", "title", "word", "words", "term", "call", "calls",
@@ -9320,6 +9357,7 @@ fn is_naming_question(query: &str) -> bool {
     has_strong || (has_weak && (has_name_noun || has_from_construction))
         || has_from_construction
 }
+
 
 /// Detects video intent in a query. Uses token-aware detection for "watch" to avoid
 /// false positives on queries like "watch battery" or "watch repair" which are about
@@ -9840,7 +9878,34 @@ fn merge_local_and_web(
         comparison_principals
     };
 
-    let core_topic_terms: Vec<&str> = q_words.iter()
+    // A spoken-style question wraps the real request in discourse preamble: "hey so my
+    // friend asked me the other day about this whole thing and i was wondering if you
+    // could tell me WHAT actually happens when the water cycle goes through its various
+    // stages". The interrogative word introduces the clause that STATES THE ASK, so the
+    // subject of the question lives at-or-after it; everything before is framing. The
+    // preamble tokens ("hey"/"friend"/"asked"/"day"/"thing"/"wondering"/"tell") are not
+    // merely noise here — because `core_matches` demands EVERY core term, each one makes
+    // the gate harder to satisfy, and the filler exclusion alone still leaves the
+    // conversational scaffolding ("friend", "asked", "wondering") in the MANDATORY set.
+    // Measured live 2026-09-30: `core_matches` was false for all 23 results, relevance
+    // logged var=0.000 / garbage_cluster=true, and everything tied at 0.04 so a camera
+    // shop matching only "hey" ranked beside NOAA and Wikipedia.
+    //
+    // STRUCTURAL RULE, no per-query literals: when the query is long AND the interrogative
+    // clause on its own still yields a usable number of topic terms, restrict the core-topic
+    // set to that clause. Both guards keep short/topic queries ("what is quantum computing",
+    // "best laptop for programming 2026") completely untouched — there is no preamble to
+    // strip, or the clause would not retain enough terms to be meaningful.
+    let conversational_clause_start: Option<usize> = {
+        let idx = first_interrogative_index(&q_words);
+        match idx {
+            // Only when the preamble is substantial (a real conversational wrap, not a
+            // 1-2 word lead-in) does narrowing apply.
+            Some(i) if i >= MIN_CONVERSATIONAL_PREAMBLE_TOKENS => Some(i),
+            _ => None,
+        }
+    };
+    let core_topic_terms_base: Vec<&str> = q_words.iter()
         .filter(|w| {
             let lower = w.to_lowercase();
             lower.len() >= 3
@@ -9885,6 +9950,40 @@ fn merge_local_and_web(
         })
         .copied()
         .collect();
+    let core_topic_terms: Vec<&str> = match conversational_clause_start {
+        Some(start) => {
+            let clause_terms: Vec<&str> = q_words[start..]
+                .iter()
+                .filter(|w| {
+                    let lower = w.to_lowercase();
+                    lower.len() >= 3
+                        && !stop_words.contains(lower.as_str())
+                        && !generic_web_terms.contains(lower.as_str())
+                        && !meta_action_terms.contains(lower.as_str())
+                        && !unit_terms.contains(lower.as_str())
+                        && !role_descriptor_terms.contains(lower.as_str())
+                        && !weak_discriminative.contains(lower.as_str())
+                        && !temporal_fillers.contains(lower.as_str())
+                        && !is_discourse_filler(&lower)
+                        && !is_naming_predicate_word(&lower)
+                        && !lower.chars().all(|c| c.is_ascii_digit())
+                })
+                .copied()
+                .collect();
+            // The clause must retain enough topic terms to be a meaningful narrower
+            // description of the query; otherwise fall back to the full query.
+            if clause_terms.len() >= MIN_CLAUSE_TOPIC_TERMS {
+                tracing::info!(
+                    "CONVERSATIONAL QUERY: narrowing core topic terms to the interrogative clause ({} of {} query tokens): {:?}",
+                    clause_terms.len(), q_words.len(), clause_terms
+                );
+                clause_terms
+            } else {
+                core_topic_terms_base
+            }
+        }
+        None => core_topic_terms_base,
+    };
 
     // ── Conversational-preamble narrowing (FIX-IF-39) ──
     // A spoken-style question wraps the real request in discourse preamble: "hey so my
