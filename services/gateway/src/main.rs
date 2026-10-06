@@ -9301,7 +9301,8 @@ fn is_naming_question(query: &str) -> bool {
     // "refer to") are also used in ordinary non-naming questions ("where does the
     // river come from"), so they only count alongside a name-ish noun.
     // This is closed-class vocabulary describing the QUESTION FORM — it names no
-    // entity, brand or topic.
+    // entity, brand or topic. Uses `is_naming_predicate_word` (shared constant) so
+    // this classification and the term-extraction filters cannot drift apart.
     let has_strong = words.iter().any(|w| is_naming_predicate_word(w));
     const WEAK_NAMING_PREDICATES: &[&str] = &[
         "name", "names", "title", "word", "words", "term", "call", "calls",
@@ -9320,6 +9321,77 @@ fn is_naming_question(query: &str) -> bool {
     has_strong || (has_weak && (has_name_noun || has_from_construction))
         || has_from_construction
 }
+
+/// Closed-class interrogative (wh-) vocabulary. In a natural-language question the
+/// interrogative word introduces the clause that actually states the REQUEST, so
+/// everything before it is framing (see `first_interrogative_index`). Purely
+/// function-word class — names no entity, brand or topic, and is deliberately the
+/// same closed set `is_naming_question` already keys off, so the two cannot drift.
+const INTERROGATIVES: &[&str] = &[
+    "what", "why", "how", "when", "where", "who", "which", "whom", "whose",
+];
+
+/// Index of the first interrogative token in `words`, if any.
+///
+/// This is the structural anchor for conversational queries (FIX-IF-39). A spoken-style
+/// question wraps the real request in discourse preamble: "hey so my friend asked me the
+/// other day about this whole thing and i was wondering if you could tell me WHAT actually
+/// happens when the water cycle goes through its various stages". The subject of the
+/// question lives in the interrogative clause; the preamble is framing, not topic.
+fn first_interrogative_index(words: &[&str]) -> Option<usize> {
+    words
+        .iter()
+        .position(|w| INTERROGATIVES.contains(&w.to_lowercase().as_str()))
+}
+
+/// Closed-class DISCOURSE-FILLER vocabulary (FIX-IF-39).
+///
+/// Greetings, interjections, back-channel and politeness tokens that a spoken-style
+/// question is padded with. They are grammatical glue with ZERO topical content, and
+/// they are also the highest-collision tokens on the open web: "hey" appears in the
+/// brand names HeyGen / hey.com / Hey Jimmy, "hi" in countless domains, "yo", "wow",
+/// "hmm", "please", "thanks", "well", "just", "literally", "honestly"....
+///
+/// Why they must not be TOPIC terms: a filler token is a lexically real, high-frequency
+/// string, so token-overlap rewards a page merely for CONTAINING it. Measured live
+/// 2026-09-30 on a conversational water-cycle question, a camera shop matching only
+/// "hey" and a video-avatar brand matching "hey"+"you" tied the genuine NOAA/Wikipedia
+/// answers inside the top-5 — the filler WAS the entire lexical overlap of those pages.
+///
+/// Closed-class function-word list: it names no brand, domain or query. Deliberately
+/// separate from `stop_words` (which is grammatical function words) because a filler is
+/// NOT grammatically required — removing it from the query would change its meaning —
+/// but it is equally non-topical for ranking. Adding to the lexicon generalises the rule
+/// to every future conversational query; the engine never had to see one to benefit.
+const DISCOURSE_FILLERS: &[&str] = &[
+    // greetings / vocatives
+    "hey", "hi", "hii", "hello", "yo", "hiya", "greetings", "heya", "howdy",
+    // interjections / back-channel
+    "wow", "oh", "ah", "eh", "hm", "hmm", "huh", "ugh", "oops", "oof", "yikes",
+    "yay", "yep", "yup", "nope", "nah", "uh", "um", "umm", "er",
+    // politeness
+    "please", "thanks", "thank",
+    // intensifiers / hedges: emphasis, not subject matter
+    "really", "honestly", "frankly", "literally", "basically", "essentially",
+    "definitely", "absolutely", "totally", "seriously", "obviously", "clearly",
+    "simply", "quite", "rather", "pretty", "kinda", "sorta", "somewhat",
+];
+
+/// True when `w` is a discourse filler (see DISCOURSE_FILLERS).
+fn is_discourse_filler(w: &str) -> bool {
+    DISCOURSE_FILLERS.contains(&w)
+}
+
+/// Minimum number of tokens that must precede the interrogative before the query is
+/// treated as having a conversational preamble. A short lead-in ("so what is X",
+/// "ok how does Y work") is normal phrasing, not a conversational wrap, and must not
+/// trigger clause narrowing — otherwise every ordinary question would be re-scoped.
+const MIN_CONVERSATIONAL_PREAMBLE_TOKENS: usize = 4;
+
+/// Minimum number of topic terms the interrogative clause must retain for narrowing to
+/// be meaningful. If the clause is mostly framing too, the full-query term set is kept
+/// (fail-open: never narrow away a query's only subject).
+const MIN_CLAUSE_TOPIC_TERMS: usize = 2;
 
 /// Detects video intent in a query. Uses token-aware detection for "watch" to avoid
 /// false positives on queries like "watch battery" or "watch repair" which are about
@@ -9840,7 +9912,34 @@ fn merge_local_and_web(
         comparison_principals
     };
 
-    let core_topic_terms: Vec<&str> = q_words.iter()
+    // A spoken-style question wraps the real request in discourse preamble: "hey so my
+    // friend asked me the other day about this whole thing and i was wondering if you
+    // could tell me WHAT actually happens when the water cycle goes through its various
+    // stages". The interrogative word introduces the clause that STATES THE ASK, so the
+    // subject of the question lives at-or-after it; everything before is framing. The
+    // preamble tokens ("hey"/"friend"/"asked"/"day"/"thing"/"wondering"/"tell") are not
+    // merely noise here — because `core_matches` demands EVERY core term, each one makes
+    // the gate harder to satisfy, and the filler exclusion alone still leaves the
+    // conversational scaffolding ("friend", "asked", "wondering") in the MANDATORY set.
+    // Measured live 2026-09-30: `core_matches` was false for all 23 results, relevance
+    // logged var=0.000 / garbage_cluster=true, and everything tied at 0.04 so a camera
+    // shop matching only "hey" ranked beside NOAA and Wikipedia.
+    //
+    // STRUCTURAL RULE, no per-query literals: when the query is long AND the interrogative
+    // clause on its own still yields a usable number of topic terms, restrict the core-topic
+    // set to that clause. Both guards keep short/topic queries ("what is quantum computing",
+    // "best laptop for programming 2026") completely untouched — there is no preamble to
+    // strip, or the clause would not retain enough terms to be meaningful.
+    let conversational_clause_start: Option<usize> = {
+        let idx = first_interrogative_index(&q_words);
+        match idx {
+            // Only when the preamble is substantial (a real conversational wrap, not a
+            // 1-2 word lead-in) does narrowing apply.
+            Some(i) if i >= MIN_CONVERSATIONAL_PREAMBLE_TOKENS => Some(i),
+            _ => None,
+        }
+    };
+    let core_topic_terms_base: Vec<&str> = q_words.iter()
         .filter(|w| {
             let lower = w.to_lowercase();
             lower.len() >= 3
@@ -9885,6 +9984,40 @@ fn merge_local_and_web(
         })
         .copied()
         .collect();
+    let core_topic_terms: Vec<&str> = match conversational_clause_start {
+        Some(start) => {
+            let clause_terms: Vec<&str> = q_words[start..]
+                .iter()
+                .filter(|w| {
+                    let lower = w.to_lowercase();
+                    lower.len() >= 3
+                        && !stop_words.contains(lower.as_str())
+                        && !generic_web_terms.contains(lower.as_str())
+                        && !meta_action_terms.contains(lower.as_str())
+                        && !unit_terms.contains(lower.as_str())
+                        && !role_descriptor_terms.contains(lower.as_str())
+                        && !weak_discriminative.contains(lower.as_str())
+                        && !temporal_fillers.contains(lower.as_str())
+                        && !is_discourse_filler(&lower)
+                        && !is_naming_predicate_word(&lower)
+                        && !lower.chars().all(|c| c.is_ascii_digit())
+                })
+                .copied()
+                .collect();
+            // The clause must retain enough topic terms to be a meaningful narrower
+            // description of the query; otherwise fall back to the full query.
+            if clause_terms.len() >= MIN_CLAUSE_TOPIC_TERMS {
+                tracing::info!(
+                    "CONVERSATIONAL QUERY: narrowing core topic terms to the interrogative clause ({} of {} query tokens): {:?}",
+                    clause_terms.len(), q_words.len(), clause_terms
+                );
+                clause_terms
+            } else {
+                core_topic_terms_base
+            }
+        }
+        None => core_topic_terms_base,
+    };
 
     // ── Conversational-preamble narrowing (FIX-IF-39) ──
     // A spoken-style question wraps the real request in discourse preamble: "hey so my
