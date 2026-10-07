@@ -45,18 +45,51 @@ jobs:
         working-directory: services/gateway
         run: cargo test --no-run --locked
 
-      # `fix_if_32_intent_confidence_tests` is a HARNESS-PRECONDITION test, not a
-      # regression: it panics with "a scored label must be reported as calibrated"
-      # unless it can load the calibration artifact. The author harness
-      # (scripts/gateway_test_container.sh) sets this; CI never did, so these two
-      # tests failed on every run and left `ci` permanently red on master.
-      # The artifact IS tracked in git (services/intent-engine/config/), so the
-      # path resolves after checkout -- no download step is needed.
       - name: Run gateway unit tests
         working-directory: services/gateway
-        env:
-          INTENT_CALIBRATION_PATH: ${{ github.workspace }}/services/intent-engine/config/intent_calibration.json
         run: cargo test --locked
+
+      # The no-manipulation guarantee ("affiliate links, no search manipulation")
+      # is only real if the order-invariance tests actually RUN. This repo has
+      # twice reported a green build while those tests were absent from the
+      # branch entirely, and once more while they ran against an empty affiliate
+      # config — both times concluding "order invariance holds" having compared
+      # two no-op runs. A green `cargo test` alone cannot distinguish that from a
+      # real pass, so assert the test NAMES are in the log, the same way the
+      # schema-regression job asserts a non-zero executed count.
+      - name: Assert the order-invariance guard actually ran
+        # `always()`, NOT the default `success()`: this step is skipped whenever
+        # the step before it fails, and the failure that matters here is exactly
+        # a red suite. A guard that only speaks up on green is no guard — it
+        # would stay silent through every regression it exists to catch, and
+        # silently-skipped is the failure mode this whole card is about.
+        if: always()
+        working-directory: services/gateway
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked real_data_ 2>&1 | tee "$log"
+
+          missing=0
+          for t in \
+            real_data_order_is_invariant_for_every_network_key_on_and_off \
+            real_data_whole_config_order_invariant_keys_present_vs_absent \
+            real_data_decoration_touches_no_field_except_affiliate
+          do
+            if ! grep -q "$t" "$log"; then
+              echo "::error::order-invariance test '$t' did not run — the no-reorder guarantee is UNENFORCED on this branch"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          # A zero-match run is a vacuous pass, not a pass.
+          ran=$(grep -cE '^test real_data_.* \.\.\. ok$' "$log" || true)
+          if [ "$ran" -lt 3 ]; then
+            echo "::error::expected 3 real_data_ tests to pass, saw ${ran} — the commerce config is probably empty and the comparison is vacuous"
+            exit 1
+          fi
+          echo "order-invariance guard: ${ran}/3 tests executed and passed"
 
   schema-regression:
     name: API contract regression (real gateway in CI)
@@ -75,8 +108,9 @@ jobs:
     #   2. Collection is BY DIRECTORY over the whole tests/ tree. The old job
     #      pinned `pytest tests/goals_api_schema.py`, and because that file had
     #      no `test_` prefix, directory collection silently MISSED it — those
-    #      assertions were invisible to every run. The file is now
-    #      tests/test_goals_contract.py so `pytest tests/` actually collects it.
+    #      assertions were invisible to every run. It is now
+    #      tests/test_goals_api_schema.py, and a gate fails the job if ANY file
+    #      in tests/ ever loses the prefix again.
     #   3. A non-vacuity check runs afterwards and fails the job if too few
     #      tests pass. A green conclusion with no executed assertions is no
     #      longer expressible.
@@ -129,26 +163,12 @@ jobs:
         # renamed/moved/prefix-stripped file that silently drops out of
         # collection, leaving the suite green because nothing ran.
         #
-        # This compares the collected set against a floor recorded in the repo,
-        # not a hand-tuned magic number: tests/EXPECTED_COLLECTION records the
-        # count that a full `pytest tests/` collection produces today (44). Any
-        # file that stops being collected moves this number DOWN, which fails
-        # here. Verified: renaming test_goals_contract.py back to its old
-        # prefix-less name drops collection to 29 and this gate fires.
-        run: |
-          # Last non-comment line is the number; the rest of the file is rationale.
-          expected=$(grep -E '^[0-9]+$' tests/EXPECTED_COLLECTION | tail -1)
-          if [ -z "$expected" ]; then
-            echo "::error::could not read a count from tests/EXPECTED_COLLECTION"; exit 1
-          fi
-          summary=$(pytest tests/ --collect-only -q | tail -1)
-          echo "expected >= $expected ; summary: $summary"
-          count=$(echo "$summary" | grep -oE '^[0-9]+' || echo 0)
-          if [ "$count" -lt "$expected" ]; then
-            echo "::error::directory collection found $count tests, expected at least $expected."
-            echo "::error::A test file has likely stopped being collected (renamed without a test_ prefix, moved, or deleted)."
-            exit 1
-          fi
+        # The logic lives in scripts/ci-assert-collection.sh, NOT inline here,
+        # so that scripts/_ci_guard_selftest.sh can break the tree on purpose
+        # and prove this gate goes RED. A copy of the logic inside the workflow
+        # could only be verified by pushing a branch and burning a CI run,
+        # which is precisely why the original version was never checked.
+        run: bash scripts/ci-assert-collection.sh
 
       - name: Run API contract regression
         env:
@@ -161,18 +181,13 @@ jobs:
 
       - name: Assert the run was non-vacuous
         # Final gate: a `success` conclusion must imply real assertions ran.
-        # Parses the pytest summary line and fails when too few tests passed, so
-        # a suite that silently stops executing cannot report green.
-        run: |
-          set -o pipefail
-          pytest tests/ -m "not requires_upstream" -q -rs 2>&1 | tee /tmp/pytest-summary.txt
-          line=$(grep -E '^[0-9]+ (passed|failed)' /tmp/pytest-summary.txt | tail -1)
-          echo "summary: ${line:-<none>}"
-          passed=$(echo "$line" | grep -oE '^[0-9]+' || echo 0)
-          if [ "$passed" -lt 20 ]; then
-            echo "::error::contract run executed fewer than 20 assertions (got $passed) — refusing to report success"
-            exit 1
-          fi
+        # Also a script (scripts/ci-assert-run-non-vacuous.sh) for the same
+        # reason: it compares the passed count against the SAME CONTRACT floor
+        # gate 1 verified is selectable, so the two gates cannot drift into
+        # disagreeing about what "enough" means, and it catches what gate 1
+        # cannot see — a blanket skip added to a fixture, or a gateway that
+        # answers 200 on /health but not on the endpoints.
+        run: bash scripts/ci-assert-run-non-vacuous.sh
 
       - name: Gateway logs on failure
         if: failure()

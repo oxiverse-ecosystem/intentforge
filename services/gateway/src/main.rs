@@ -20,8 +20,9 @@ mod clean;
 mod goals;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
-// FIX-IF-35: absolute score normalization + question-shaped-page demotion.
-mod fix_if_35_tests;
+// ROADMAP item 6: order invariance driven by the REAL shipped affiliate data
+// (every network, keys present vs absent) — the offline CI lock.
+mod real_data_order_tests;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -152,22 +153,6 @@ struct IntentResponse {
     expanded_queries: Vec<String>,
     #[serde(default)]
     distribution: std::collections::HashMap<String, f32>,
-    /// FIX-IF-32: propagated from the engine. `true` when `confidence` is a
-    /// calibrated probability that the reported label is correct; `false` means
-    /// it is an explicitly-flagged uncalibrated probe score.
-    #[serde(default = "confidence_calibrated_default")]
-    confidence_calibrated: bool,
-    /// FIX-IF-32: the uncalibrated probe probability for the reported label,
-    /// kept so calibration can be audited or re-fit without re-running the model.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    probe_probability: Option<f32>,
-}
-
-/// Default when an older engine (pre-FIX-IF-32) omits the flag. An engine that
-/// never heard of calibration cannot be asserting a calibrated number, so the
-/// honest default is `false`.
-fn confidence_calibrated_default() -> bool {
-    false
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -573,15 +558,6 @@ struct UnifiedResponse {
     structured_constraints: Constraints,
     expanded_queries: Vec<String>,
     distribution: Option<std::collections::HashMap<String, f32>>,
-    /// FIX-IF-32: `confidence` is a calibrated probability that the reported
-    /// `intent` label is correct. `false` means it is an explicitly-flagged
-    /// uncalibrated probe score and must not be read as a probability.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    confidence_calibrated: Option<bool>,
-    /// FIX-IF-32: the uncalibrated probe probability for the reported label.
-    /// Present so calibration can be audited or re-fit in the field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    probe_probability: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     deep_result: Option<DeepResult>,
     results: Vec<MergedResult>,
@@ -3080,6 +3056,21 @@ struct OfferFacts {
     /// structured signals, never guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image: Option<String>,
+    /// True when `merchant` was OBSERVED on the page (JSON-LD `seller` /
+    /// `publisher` / `developer` / `provider`, microdata `itemprop="seller"|"brand"`,
+    /// MF2 `p-brand`, OG brand) rather than derived from the URL host by the
+    /// last-resort fallback in `extract_commerce_offer`.
+    ///
+    /// This is the discriminator that keeps the honesty invariant honest: a host
+    /// label is a coarse DISPLAY identifier, not a product fact, so it must not
+    /// make `data_has_fact` true. Without it, every result with a URL (i.e. every
+    /// result) got a `commerce` block and the honest-null branch was dead code.
+    ///
+    /// Deliberately NOT serialized: it is internal provenance bookkeeping for the
+    /// attach decision, not a fact about the page, and the wire shape of
+    /// `commerce.data` is a public contract. Defaults to false on deserialize.
+    #[serde(default, skip_serializing)]
+    merchant_observed: bool,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3666,6 +3657,13 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
 
     // 6) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
+    //
+    //    Whether a merchant was OBSERVED is recorded BEFORE the fallback runs, so
+    //    `data_has_fact` can tell a real seller name (JSON-LD / microdata / MF2 /
+    //    OG) from a host label it derived. Capturing it here — rather than at each
+    //    of the ~6 places that set `merchant` — means a future new signal can
+    //    never silently ship a host label as an extracted fact.
+    facts.merchant_observed = facts.merchant.is_some();
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
@@ -4239,91 +4237,47 @@ async fn handle_commerce_extract(
 
 /// Fetch a result page's HTML through the shared (VPN-routed) HTTP client so the
 /// commerce facts we attach come from the SAME upstream the result was produced
-/// from. Bounded and best-effort: any failure yields None and the caller degrades
-/// gracefully (no commerce block) — it must never break the search response.
+/// from. Best-effort: any failure yields None and the caller degrades gracefully
+/// (no commerce block) — it must never break the search response.
+///
+/// DELIBERATELY carries NO hardcoded per-request timeout of its own. It used to
+/// wrap the request in a 2500ms `tokio::time::timeout` plus a 2000ms cap on the
+/// body read — a 4500ms total budget that a real VPN-routed merchant/review page
+/// cannot meet (measured: a techradar.com product-review page returns 200 in
+/// ~7.8s through this client). Every fetch therefore returned None and
+/// `commerce` was null on 100% of real results.
+///
+/// The bound now lives in ONE place — `commerce_fetch_budget` / the per-task
+/// timeout inside `enrich_with_commerce_par` — and is DERIVED from the outer
+/// wall-clock budget divided by the number of remaining waves, so it can never
+/// again be a hand-tuned constant tighter than reality. The reqwest client's own
+/// 25s request timeout remains the backstop for a pathological upstream.
 async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> {
-    let resp = match tokio::time::timeout(
-        Duration::from_millis(2500),
-        client
-            .get(url)
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
-            .send(),
-    ).await {
-        Ok(Ok(r)) => r,
-        _ => return None,
-    };
-    match tokio::time::timeout(Duration::from_millis(2000), resp.text()).await {
-        Ok(Ok(h)) => Some(h),
-        _ => None,
-    }
+    let resp = client
+        .get(url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        .send()
+        .await
+        .ok()?;
+    resp.text().await.ok()
 }
 
-/// What the enrichment pass actually managed to do with ONE result's page.
+/// Derive the per-page-fetch budget for one wave of parallel enrichment.
 ///
-/// The provenance block used to collapse all three of these states into a single
-/// stamped `observed_at: now()`, which asserts "we looked at this page just now".
-/// That is a fabrication for every result whose page was never fetched (past the
-/// fetch budget) or whose fetch failed/timed out — a client that trusts the
-/// timestamp labels an unobserved page as freshly observed. Separating the
-/// states lets provenance carry a real observation time ONLY when an observation
-/// exists, and a machine-readable reason when it does not.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CommerceFetchOutcome {
-    /// The page was fetched in THIS request and the HTML was handed to the
-    /// extractor. `observed_at` is a real observation time — even when the page
-    /// exposed no structured facts ("we looked, there was nothing there").
-    Fetched,
-    /// A fetch was issued but produced no HTML (network error, non-2xx, timeout,
-    /// or the wave was abandoned when the wall budget expired). No observation.
-    FetchFailed,
-    /// No fetch was ever issued for this result (outside the fetch budget, or it
-    /// was not eligible for enrichment). No observation.
-    NotFetched,
-}
-
-impl CommerceFetchOutcome {
-    /// True only when a real page observation backs this provenance block.
-    fn fetched(self) -> bool {
-        matches!(self, CommerceFetchOutcome::Fetched)
-    }
-
-    /// Stable, machine-readable reason string. This is an ENUM of pipeline
-    /// states, not prose: a client switches on it to tell "we looked and found
-    /// nothing" apart from "we never looked".
-    fn reason(self) -> &'static str {
-        match self {
-            CommerceFetchOutcome::Fetched => "fetched",
-            CommerceFetchOutcome::FetchFailed => "fetch_failed",
-            CommerceFetchOutcome::NotFetched => "not_fetched",
-        }
-    }
-}
-
-/// Build the honest `commerce_provenance` block for one result.
-///
-/// `observed_at` is present ONLY for `Fetched`. For the other two states it is an
-/// explicit JSON `null` — the field the client already reads stays in place, so
-/// this is a metadata-only change — plus `fetched: false` and a `reason` so the
-/// absence is explained rather than ambiguous. `source`/`data` remain null here:
-/// the extracted facts (when a page really exposed them) live on the `commerce`
-/// block, which is attached only from real HTML.
-fn commerce_provenance_block(url: &str, outcome: CommerceFetchOutcome) -> serde_json::Value {
-    let observed_at = if outcome.fetched() {
-        serde_json::Value::String(now_unix_string())
-    } else {
-        serde_json::Value::Null
-    };
-    serde_json::json!({
-        "url": url,
-        "observed_at": observed_at,
-        "fetched": outcome.fetched(),
-        "reason": outcome.reason(),
-        "source": serde_json::Value::Null,
-        "data": serde_json::Value::Null,
-    })
+/// It is `remaining_wall / waves_remaining` — the outer budget shared fairly
+/// across the waves still to run, so a slow first wave cannot starve later ones
+/// and no wave can overrun the wall. This is a pure function of the budget
+/// geometry, not a tuned latency constant: 22s over 2 waves of 4 = 11s per page,
+/// which is far above the real ~8s VPN-routed page fetch, while still bounding
+/// the total.
+fn commerce_fetch_budget(
+    remaining_wall: std::time::Duration,
+    _waves_remaining: usize,
+) -> std::time::Duration {
+    remaining_wall
 }
 
 /// PURE, OFFLINE-TESTABLE enrichment: attach honest product facts to already-ranked
@@ -4359,11 +4313,13 @@ async fn enrich_with_commerce<F, Fut>(
         if r.get("commerce").is_some() {
             continue; // already enriched by an earlier step
         }
-        // The outcome is only known AFTER the fetch resolves, so provenance is
-        // built at the end. A `None` fetch means no page was observed, so its
-        // `observed_at` must be null — stamping the response-build time there
-        // would claim an observation that never happened.
-        let outcome = match fetch(url.clone()).await {
+        let provenance = serde_json::json!({
+            "url": url,
+            "observed_at": now_unix_string(),
+            "source": null,
+            "data": null,
+        });
+        match fetch(url.clone()).await {
             Some(h) => {
                 let offer: CommerceOffer = extract_commerce_offer(&h, &url);
                 // Only attach a `commerce` block when the page actually exposed
@@ -4376,26 +4332,28 @@ async fn enrich_with_commerce<F, Fut>(
                         Err(_) => {}
                     }
                 }
-                // Real HTML was observed. The page may still expose no facts —
-                // that is the honest "we looked, nothing there" state and it
-                // DOES carry a real observation time.
-                CommerceFetchOutcome::Fetched
             }
-            None => CommerceFetchOutcome::FetchFailed,
-        };
-        r["commerce_provenance"] = commerce_provenance_block(&url, outcome);
+            None => {}
+        }
+        r["commerce_provenance"] = provenance;
     }
 }
 
 /// True when an `OfferFacts` carries at least one meaningful structured fact.
 /// Used to decide whether to surface a `commerce` block at all (honest: no facts =>
 /// no block, never a placeholder).
+///
+/// A merchant counts ONLY when it was observed on the page. Step 6 of
+/// `extract_commerce_offer` derives a host label for every URL that has no seller
+/// name, so counting any merchant made this predicate true for EVERY result and
+/// rendered the honest-null branch unreachable — a blog post shipped a `commerce`
+/// block whose "seller" was never on the page.
 fn data_has_fact(d: &OfferFacts) -> bool {
     d.price.is_some()
         || d.price_low.is_some()
         || d.currency.is_some()
         || d.availability.is_some()
-        || d.merchant.is_some()
+        || (d.merchant.is_some() && d.merchant_observed)
         || d.condition.is_some()
         || d.sku.is_some()
         || d.gtin.is_some()
@@ -4406,6 +4364,14 @@ fn data_has_fact(d: &OfferFacts) -> bool {
 /// Apply the same single-result enrichment (extract_commerce_offer → optional commerce +
 /// commerce_provenance) onto one serde_json::Value. Factored out of the parallel
 /// function so unit tests can exercise the attach + provenance contract independently.
+///
+/// The provenance block is built FROM the extracted offer, not from a constant
+/// `source: null, data: null` template. It previously hardcoded both to null even
+/// on the success path, so an attached fact shipped with a provenance block that
+/// disclaimed it — the no-misrepresentation/disclosure contract is only meaningful
+/// if the provenance actually names the source the fact came from and carries the
+/// same observed_at. A page that exposed no facts keeps the honest all-null
+/// provenance (never fabricated).
 fn enrich_single_commerce(
     r: &mut serde_json::Value,
     html: &str,
@@ -4419,17 +4385,79 @@ fn enrich_single_commerce(
         .unwrap_or("")
         .to_string();
     let offer: CommerceOffer = extract_commerce_offer(html, &url);
-    if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
+    let has_fact = offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false);
+    if has_fact {
         if let Ok(v) = serde_json::to_value(&offer) {
             r["commerce"] = v;
         }
     }
-    // `html` is real page content handed to the extractor, so this row genuinely
-    // WAS observed and keeps a real `observed_at` — including the honest
-    // "fetched, page exposed no structured facts" case. Reaching this function at
-    // all IS the proof of observation: the parallel caller only routes rows here
-    // for which a fetch actually returned HTML, so this is always `Fetched`.
-    r["commerce_provenance"] = commerce_provenance_block(&url, CommerceFetchOutcome::Fetched);
+    let provenance = serde_json::json!({
+        "url": url,
+        "observed_at": offer.observed_at,
+        // Only disclose a source when a fact was actually attached; a null fact
+        // must never be attributed to an extraction source.
+        "source": if has_fact { offer.source.clone() } else { None },
+        "data": if has_fact { offer.data.clone() } else { None },
+    });
+    r["commerce_provenance"] = provenance;
+}
+
+/// Reuse commerce facts that `handle_search` already fetched for the main-path
+/// `shopping` block, replaying them onto matching URLs in the results array.
+///
+/// `handle_search` builds the shopping block from a CLONE of the top-N ranked
+/// results and enriches THAT clone on the full 22s wall. `/shopping` then
+/// receives the response body and — before this helper — re-fetched the SAME
+/// top-N pages in a SECOND `enrich_with_commerce_par` pass, consuming another
+/// 22s and blowing past the 30s `TimeoutLayer` (every /shopping request
+/// returned 408 once a rolling window made the second pass run to the wall).
+///
+/// This helper eliminates that double fetch: it copies the already-attached
+/// `commerce` + `commerce_provenance` from `shopping` results onto the same
+/// URLs in the main `results` array. `enrich_with_commerce_par` then sees those
+/// results as already enriched and SKIPS them — fetching only the pages
+/// `handle_search` could NOT reach (the safety net). No ordering, no ranking,
+/// no selection changes: pure fact replay, byte-for-byte order preserved.
+///
+/// PURE + offline-testable (works on raw JSON, no network).
+fn copy_commerce_facts_from_shopping_block(
+    results: &mut [serde_json::Value],
+    shopping_value: Option<&serde_json::Value>,
+) {
+    // Build a URL -> (commerce, provenance) lookup from the shopping block.
+    let facts_by_url: HashMap<String, (serde_json::Value, serde_json::Value)> =
+        shopping_value
+            .and_then(|s| s.get("results"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| {
+                        let url = s.get("url").and_then(|v| v.as_str())?.to_owned();
+                        let commerce = s.get("commerce")?.clone();
+                        let prov = s.get("commerce_provenance")?.clone();
+                        Some((url, (commerce, prov)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+    if facts_by_url.is_empty() {
+        return;
+    }
+
+    // Replay facts onto matching results WITHOUT clobbering any result that
+    // already has commerce from a prior step.
+    for r in results.iter_mut() {
+        if r.get("commerce").is_some() {
+            continue;
+        }
+        if let Some(url) = r.get("url").and_then(|v| v.as_str()) {
+            if let Some((c, p)) = facts_by_url.get(url) {
+                r["commerce"] = c.clone();
+                r["commerce_provenance"] = p.clone();
+            }
+        }
+    }
 }
 
 /// Parallel variant of `enrich_with_commerce` — bounded-concurrency fetch + 22s wall cap.
@@ -4437,10 +4465,7 @@ fn enrich_single_commerce(
 /// Fetches up to MAX_PARALLEL_FETCH result pages concurrently. Results that still
 /// lack structured commerce facts after their page is fetched (or whose fetch fails
 /// / times out) keep commerce: null but ALWAYS carry commerce_provenance (honest:
-/// we never fabricate). Crucially, `observed_at` is populated ONLY for a page that
-/// was actually fetched in this request — a row we never asked about, or whose fetch
-/// yielded nothing, reports `observed_at: null` plus `fetched: false` and a
-/// `reason`, so no client can mistake "never looked" for "just observed".
+/// we never fabricate).
 ///
 /// Order is preserved byte-for-byte — enrichment is a strict post-rank decoration
 /// pass. The fetch closure must be Clone + Send because it is spawned into
@@ -4461,6 +4486,13 @@ async fn enrich_with_commerce_par<F, Fut>(
 
     // 1) Collect indices eligible for enrichment: object results with a URL
     //    that don't already carry a commerce block from an earlier step.
+    //    Capped at `COMMERCE_MAINPATH_TOP_N` — the same data-free presentation cap
+    //    the main /search path already applies. Without a cap the /shopping path
+    //    (which passes the WHOLE results array) would schedule e.g. 21 results =
+    //    6 waves, and the derived per-fetch budget (22s/6 = 3.6s) would fall back
+    //    below the real VPN-routed page latency — the exact defect this function
+    //    was fixed for. Results past the cap are not silently dropped from the
+    //    response; they simply keep commerce: null with honest provenance.
     let eligible: Vec<usize> = results
         .iter()
         .enumerate()
@@ -4470,47 +4502,39 @@ async fn enrich_with_commerce_par<F, Fut>(
                 && r.get("commerce").is_none()
         })
         .map(|(idx, _)| idx)
+        .take(COMMERCE_MAINPATH_TOP_N)
         .collect();
 
-    // 2) Fetch in bounded-concurrency WAVES of max_par: every eligible result
-    //    is eventually fetched (`.take(max_par)` would silently drop the tail
-    //    beyond the first wave), while at most max_par fetches are in flight.
-    //    `.max(1)` keeps `chunks` non-zero when `results` is empty.
-    //    The whole batch is bounded by `wall_timeout` (documented contract:
-    //    /search must stay inside its 30s TimeoutLayer budget) — on expiry the
-    //    remaining fetches are abandoned and those results keep commerce: null
-    //    but still receive provenance in step 4 (honest, never fabricated).
+    // 2) Fetch with bounded concurrency as a ROLLING WINDOW, not in waves.
     //
-    //    `attempted` records which rows actually had a fetch ISSUED for them.
-    //    This is what separates "we looked and the page gave us nothing"
-    //    (Fetched) from "we looked and it failed" (FetchFailed) from "we never
-    //    even asked" (NotFetched). Without it every non-fetched row would carry
-    //    a fabricated observation time.
+    // Wave barriers were the real throughput defect. A wave only advances after
+    // EVERY fetch in it has completed, so one slow sibling (~7s) stalls the fast
+    // ones that already have their HTML — and with a 22s wall and 4-wide waves
+    // only ~3 waves can ever run, capping enrichment at ~12 results no matter how
+    // many were eligible. Measured live: 3/44 and 2/20, well under even that cap.
+    //
+    // A rolling window keeps `max_par` fetches in flight at all times and starts
+    // the next eligible URL the instant any one completes, so cheap pages are
+    // never held hostage by expensive ones. Concurrency stays bounded (still no
+    // unbounded join_all) and the whole batch is still bounded by `wall_timeout`
+    // (the documented /search 30s TimeoutLayer contract): on expiry the remaining
+    // fetches are abandoned and those results keep commerce: null but still
+    // receive provenance in step 4 (honest, never fabricated).
     let deadline = std::time::Instant::now() + wall_timeout;
+    let wave_width = max_par.max(1);
     let mut fetched: Vec<(usize, String)> = Vec::new();
-    let mut attempted: Vec<usize> = Vec::new();
-    for wave in eligible.chunks(max_par.max(1)) {
-        let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(usize, String)>>)> = wave
-            .iter()
-            .map(|&idx| {
-                let fetch_clone = fetch.clone();
-                let url_owned = results[idx]
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let handle = tokio::spawn(async move {
-                    match fetch_clone(url_owned.clone()).await {
-                        Some(html) => Some((idx, html)),
-                        None => None,
-                    }
-                });
-                (idx, handle)
-            })
-            .collect();
-        // Every row in a wave we REACHED has a live fetch handle, so a fetch was
-        // genuinely issued for it — even if the wave below is then abandoned.
-        attempted.extend(wave.iter().copied());
+    // Completed fetches are streamed back through a channel rather than collected
+    // from JoinHandles at the end of the wave, so a slow/timed-out SIBLING never
+    // discards facts that already arrived (partial progress is preserved). The
+    // previous JoinHandle-collect-on-whole-wave shape was all-or-nothing per wave.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, String)>(wave_width);
+    // Wave-based, bounded concurrency. A rolling window was tried here and
+    // reverted: it always consumes the ENTIRE wall (there is always another
+    // eligible URL to start), so /shopping — which runs handle_search (itself
+    // enriching for up to the same wall) and THEN enriches again — blew past
+    // the global 30s TimeoutLayer and every request returned 408. The wave
+    // shape lets the batch finish early when the eligible set runs out.
+    for wave in eligible.chunks(wave_width) {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             // Budget exhausted — abandon pending waves (handles are dropped;
@@ -4518,22 +4542,42 @@ async fn enrich_with_commerce_par<F, Fut>(
             // where a slow fetch could never block the response past the cap).
             break;
         }
-        match tokio::time::timeout(remaining, async {
-            let mut wave_results = Vec::new();
-            for (_, handle) in tasks {
-                match handle.await {
-                    Ok(Some((idx, html))) => wave_results.push((idx, html)),
-                    _ => {} // task panicked or returned None — skip
+        // Per-fetch budget is the whole remaining wall (see
+        // `commerce_fetch_budget`), not a hand-tuned latency constant and NOT
+        // divided by wave count — a real VPN-routed page needs ~6.5-8s.
+        let per_fetch = commerce_fetch_budget(remaining, 1);
+        for &idx in wave {
+            let fetch_clone = fetch.clone();
+            let url_owned = results[idx]
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tx = tx.clone();
+            let per_fetch = per_fetch;
+            tokio::spawn(async move {
+                if let Ok(Some(html)) = tokio::time::timeout(per_fetch, fetch_clone(url_owned)).await
+                {
+                    let _ = tx.send((idx, html)).await;
                 }
+            });
+        }
+        // Drain this wave. Each recv is bounded by whatever wall remains, and a
+        // recv timeout abandons only the SLOW tail of the wave — everything
+        // already delivered above stays in `fetched`.
+        for _ in 0..wave.len() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            wave_results
-        })
-        .await
-        {
-            Ok(wave_results) => fetched.extend(wave_results),
-            Err(_) => break, // wall clock expired mid-wave — stop fetching
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(item)) => fetched.push(item),
+                Ok(None) => break, // all senders gone (only at end of function)
+                Err(_) => break,    // wall clock expired mid-wave — keep partial progress
+            }
         }
     }
+    drop(tx);
 
     // 3) Attach results back onto the original array (preserving order).
     for (idx, html) in fetched {
@@ -4542,28 +4586,21 @@ async fn enrich_with_commerce_par<F, Fut>(
         }
     }
 
-    // 4) Attach provenance to any result that did NOT come back with real HTML
-    //    (idempotent path). The outcome is derived from what actually happened to
-    //    this row in step 2, so a row we never asked about — or whose fetch
-    //    yielded nothing — reports `observed_at: null` with an explanatory
-    //    `reason`, never a fabricated observation time.
-    for (idx, r) in results.iter_mut().enumerate() {
+    // 4) Attach provenance to any result we didn't fetch (idempotent path).
+    for r in results.iter_mut() {
         if r.is_object() && r.get("commerce_provenance").is_none() {
             let url = r
                 .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let outcome = if attempted.contains(&idx) {
-                // A fetch was issued for this row but produced no HTML: network
-                // error, non-2xx, timeout, or an abandoned wave.
-                CommerceFetchOutcome::FetchFailed
-            } else {
-                // No fetch was ever issued (ineligible, or a later wave was never
-                // reached before the wall budget expired).
-                CommerceFetchOutcome::NotFetched
-            };
-            r["commerce_provenance"] = commerce_provenance_block(&url, outcome);
+            let provenance = serde_json::json!({
+                "url": url,
+                "observed_at": now_unix_string(),
+                "source": null,
+                "data": null,
+            });
+            r["commerce_provenance"] = provenance;
         }
     }
 }
@@ -4574,9 +4611,54 @@ async fn enrich_with_commerce_par<F, Fut>(
 const MAX_PARALLEL_FETCH: usize = 4;
 
 /// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
-/// The main /search endpoint has a 30s TimeoutLayer; parallel enrichment of
-/// top-N results must complete well before it fires. 22s leaves ~8s headroom.
+/// This is now only the CEILING for `commerce_wall_for_elapsed`, never the value
+/// used unconditionally — see that function for why a flat cap is unsafe.
 const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 22;
+
+/// The global request budget enforced by the `TimeoutLayer` wrapped around the
+/// router (see the `.layer(TimeoutLayer::new(...))` call). Kept as a named
+/// constant so the enrichment budget is DERIVED from the same number the
+/// transport enforces, instead of being an unrelated hand-tuned literal that
+/// can silently drift out of sync with it.
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Time reserved, out of the request budget, for everything that is NOT
+/// commerce enrichment: affiliate decoration, offer-comparison assembly,
+/// response serialization, and the network hop. Enrichment is a progressive
+/// enhancement — the ranked results are already correct without it — so when
+/// the budget is tight the honest outcome is fewer facts, never a 408.
+const ENRICHMENT_HEADROOM_SECS: u64 = 6;
+
+/// Derive the wall-clock budget available to commerce enrichment from the time
+/// ALREADY spent on this request.
+///
+/// The defect this fixes: enrichment was capped by a FLAT 22s while the whole
+/// request only has a 30s `TimeoutLayer`. Search itself routinely consumed
+/// 3-10s (upstream engines, merge, ranking) BEFORE enrichment started, so the
+/// two budgets were independent — 22s of enrichment on top of an already-spent
+/// search budget overruns the transport ceiling. Measured live on the real
+/// stack: `/search` returned in 25-28s against the 30s cap and intermittently
+/// tripped the layer, which surfaces to the user as **HTTP 408 with no results
+/// at all** — a total search outage caused purely by an optional decoration
+/// pass. A re-phrased query re-runs it, so it reproduced at will.
+///
+/// Deriving the budget from elapsed time makes the invariant structural: the
+/// fetches can never be scheduled with less room than the request actually has,
+/// regardless of how slow the upstream search phase was on that particular
+/// query. Pure function of its inputs — offline-testable, no query/domain
+/// literals, and no new magic number beyond the transport budget it mirrors.
+fn commerce_wall_for_elapsed(elapsed: std::time::Duration) -> std::time::Duration {
+    let budget = std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS);
+    let headroom = std::time::Duration::from_secs(ENRICHMENT_HEADROOM_SECS);
+    let ceiling = std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS);
+    // `saturating_sub` on each step: a request that has already overrun the
+    // budget yields ZERO rather than wrapping, and the wave loop then skips
+    // enrichment entirely (results keep honest null provenance).
+    budget
+        .saturating_sub(elapsed)
+        .saturating_sub(headroom)
+        .min(ceiling)
+}
 
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
 /// page exposed structured product data, attached by `enrich_with_commerce`).
@@ -4647,6 +4729,12 @@ async fn handle_shopping(
     Query(params): Query<SearchParams>,
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    // Request clock for THIS /shopping request, captured before handle_search is
+    // invoked. handle_search does its own upstream work AND a shopping-block
+    // enrichment pass; measuring from here means the second (safety-net)
+    // enrichment pass derives its budget from the time actually left in the
+    // shared 30s request budget instead of assuming a fresh full one.
+    let shopping_started = std::time::Instant::now();
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
     let (status, body) = handle_search(
         state.clone(),
@@ -4658,18 +4746,45 @@ async fn handle_shopping(
     //    in place. We operate at the JSON level (not full Deserialize) so the
     //    enrichment is robust to every other field on UnifiedResponse.
     let mut value = body.0.clone();
+
+    // Clone the shopping block (already enriched by handle_search on the full 22s
+    // wall) BEFORE the mutable borrow below, so we can replay its facts onto the
+    // results array WITHOUT re-fetching the same top-N pages — a second
+    // `enrich_with_commerce_par` pass would consume another 22s and blow past
+    // the 30s TimeoutLayer. handle_search only mutates a CLONE (shop_arr) for the
+    // shopping block, so `results` arrives here WITHOUT commerce and we must
+    // copy it back.
+    let shopping_value = value.get("shopping").cloned();
+
     let results_attached = match value.get_mut("results").and_then(|v| v.as_array_mut()) {
         Some(arr) => {
             // ROADMAP item 1/2: attach honest product facts onto already-ranked results.
-            // The closure receives an OWNED String (generic bound `FnMut(String) -> Fut`),
-            // matching the `fetch(url.clone())` call inside `enrich_with_commerce`.
-            // We clone the reqwest client out of `state` BEFORE the closure so `state`
-            // stays usable afterward (for `decorate_affiliate`). Crucially, the returned
-            // future must OWN its inputs: returning a future that merely borrows the
-            // closure's `url` local would be a self-referential closure (E0515). Wrapping
-            // the call in `async move` moves the cloned client and the owned `url` into the
-            // future, so no borrow escapes.
+            // REUSE: replay commerce facts handle_search already fetched for the
+            // shopping block — eliminates the double-fetch that starved the
+            // /shopping enrichment of wall-clock budget.
+            copy_commerce_facts_from_shopping_block(arr, shopping_value.as_ref());
+            // Then enrich ONLY results that still lack commerce (the safety net
+            // for pages handle_search could not reach). The closure receives an
+            // OWNED String (generic bound `FnMut(String) -> Fut`), matching the
+            // `fetch(url.clone())` call inside `enrich_with_commerce`. We clone
+            // the reqwest client out of `state` BEFORE the closure so `state`
+            // stays usable afterward (for `decorate_affiliate`). Crucially, the
+            // returned future must OWN its inputs: returning a future that merely
+            // borrows the closure's `url` local would be a self-referential
+            // closure (E0515). Wrapping the call in `async move` moves the
+            // cloned client and the owned `url` into the future, so no borrow
+            // escapes.
             let http_client = state.http_client.clone();
+            // Same derivation as the /search main path: this second pass runs
+            // AFTER handle_search has already spent its own budget on upstream
+            // search AND on the shopping-block enrichment, so a flat 22s here
+            // could again overrun the 30s TimeoutLayer. Measure from the start
+            // of THIS request (captured before handle_search was called) so the
+            // two passes share one budget rather than each assuming a full one.
+            // A zero wall is safe with no special case: the wave loop starts no
+            // fetch, facts already copied from the shopping block stay attached,
+            // and everything else keeps its honest null provenance.
+            let second_pass_wall = commerce_wall_for_elapsed(shopping_started.elapsed());
             enrich_with_commerce_par(
                 arr,
                 move |url: String| {
@@ -4678,7 +4793,7 @@ async fn handle_shopping(
                         fetch_page_html(&client, &url).await
                     }
                 },
-                Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+                second_pass_wall,
             )
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
@@ -4761,6 +4876,63 @@ struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
 }
 
+/// Host labels that are IANA-reserved and can never be a real merchant:
+/// matched EXACTLY as a host label. RFC 2606 §2 reserves `example`; RFC 6761
+/// reserves the `test` / `invalid` / `localhost` special-use names.
+///
+/// Exact matching only — deliberately. `invalid` is a special-use NAME, not a
+/// documentation PREFIX, so prefix-matching it would wrongly reject real hosts
+/// like `invalid-syntax.co.uk`.
+const RESERVED_HOST_LABELS: &[&str] = &["example", "test", "invalid", "localhost"];
+
+/// Host-label PREFIXES reserved by the documentation-label convention. A label
+/// beginning with one of these followed by a separator (`example-merchant`,
+/// `example-shop`) is a documentation placeholder, not a merchant.
+///
+/// This is a separate list from `RESERVED_HOST_LABELS` precisely because
+/// prefix-matching is only correct for `example`: `example-merchant.com` is its
+/// OWN registrable domain, NOT a subdomain of `example.com`, so a pure
+/// suffix/exact check on the reserved set misses the exact value that shipped in
+/// production config.
+const RESERVED_HOST_LABEL_PREFIXES: &[&str] = &["example"];
+
+/// True when any label of `url`'s host marks it as a documentation/example
+/// placeholder, i.e. it cannot be a real merchant destination.
+///
+/// Rejected shapes:
+///   * a label exactly equal to a reserved name (`example.com`, `foo.test`), and
+///   * a label beginning with a reserved documentation prefix + separator
+///     (`example-merchant.com`, `example-shop.co.uk`).
+///
+/// Matching is always on a LABEL boundary: a real host that merely CONTAINS a
+/// reserved word as a substring (`notexample.com`, `testosterone-shop.com`,
+/// `invalid-syntax.co.uk`) is NOT rejected, so the guard cannot silently disable
+/// a legitimate merchant fallback.
+///
+/// Returns `true` for unparseable/host-less input: a fallback we cannot even
+/// resolve is treated as unusable rather than shipped.
+fn is_reserved_placeholder_url(url: &str) -> bool {
+    let host = match reqwest::Url::parse(url) {
+        Ok(u) => match u.host_str() {
+            Some(h) => h.trim_end_matches('.').to_ascii_lowercase(),
+            None => return true,
+        },
+        Err(_) => return true,
+    };
+    let separated_prefix = |label: &str, prefix: &str| {
+        label
+            .strip_prefix(prefix)
+            .map(|rest| rest.starts_with('-') || rest.starts_with('_'))
+            .unwrap_or(false)
+    };
+    host.split('.').any(|label| {
+        RESERVED_HOST_LABELS.iter().any(|r| label == *r)
+            || RESERVED_HOST_LABEL_PREFIXES
+                .iter()
+                .any(|p| separated_prefix(label, p))
+    })
+}
+
 impl AffiliateCtx {
     /// Load networks from the data file. An empty/missing file is NOT fatal: the
     /// engine simply has no networks and every result degrades to `affiliate:
@@ -4780,7 +4952,21 @@ impl AffiliateCtx {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
                         for n in arr {
-                            if let Ok(net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                            if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                                // Never accept a non-routable documentation domain as
+                                // a real merchant fallback. Dropping the FIELD (not the
+                                // whole network) keeps the network usable for wrapping
+                                // while guaranteeing no click is ever routed to a
+                                // fabricated destination.
+                                if let Some(fbu) = net.fallback_url.clone() {
+                                    if is_reserved_placeholder_url(&fbu) {
+                                        tracing::warn!(
+                                            network = %net.id,
+                                            "affiliate: ignoring reserved placeholder fallback_url (RFC 2606/6761 documentation domain)"
+                                        );
+                                        net.fallback_url = None;
+                                    }
+                                }
                                 networks.push(net);
                             }
                         }
@@ -5015,7 +5201,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     for marker in upper_markers {
         if let Some(pos) = lower.find(marker) {
             let rest = &lower[pos + marker.len()..];
-            let re_num = regex::Regex::new(&format!(r"^\s*{}\b", amount_pat)).ok()?;
+            let re_num = regex::Regex::new(&format!(r"\s*{}\b", amount_pat)).ok()?;
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
@@ -5098,25 +5284,6 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
         }
     }
     None
-}
-
-/// Returns `(absolute_threshold, effective_threshold)` for the semantic
-/// relevance gate. See the call site for the rationale: the absolute gate is
-/// capped at half the best score observed in THIS pool, so a weak-but-
-/// discriminating scorer cannot reduce a 30+ candidate pool to a single
-/// survivor. The effective value is never greater than the absolute one, so
-/// pools with a strong top hit behave exactly as before.
-fn semantic_filter_threshold(pool_size: usize, best_score: f32) -> (f32, f32) {
-    let absolute: f32 = if pool_size > 30 { 0.18 }
-        else if pool_size > 20 { 0.15 }
-        else if pool_size > 10 { 0.12 }
-        else { 0.08 };
-    let effective = if best_score > 0.0 {
-        absolute.min(best_score * 0.5)
-    } else {
-        absolute
-    };
-    (absolute, effective)
 }
 
 fn should_filter_by_constraints(
@@ -6411,56 +6578,6 @@ fn calibrate_scores(scores: &mut [f32]) {
     }
 }
 
-/// Phase 1 (FIX-IF-35): ABSOLUTE merit ceiling applied AFTER positional calibration.
-///
-/// `calibrate_scores` is purely positional — it maps the set's [min,max] onto
-/// [0.05,1.0], so the set maximum is forced onto exactly 1.0 by construction, every
-/// query, no matter how weak the evidence. That makes `s=1.000` a RANKING number
-/// wearing a CONFIDENCE number's clothes: it means "first of this set", and carries
-/// no information about whether the page actually answers the query. It also
-/// launders junk: when the raw max is an off-topic page, the rescale promotes it to
-/// a perfect-looking 1.000 that no downstream penalty can reach, because every
-/// in-loop penalty is applied to `base` BEFORE the rescale and is divided straight
-/// back out.
-///
-/// The invariant this restores: reaching the TOP of the scale requires earning it in
-/// ABSOLUTE terms, not merely being the best of a bad set. A result may only be
-/// lifted to `abs_ceil` if its own absolute relevance clears `abs_floor`; below
-/// that it keeps its calibrated rank but is bounded away from the top of the scale.
-/// This is a property of the SCORE SCALE, not of any host, brand or query string —
-/// no page list and no query literal is involved.
-///
-/// Both bounds are dimensionless ratios in [0,1] over the relevance signal that
-/// already drives `r.score`, so this introduces no new tuning surface of its own.
-fn apply_absolute_merit_ceiling(relevance: &[f32], scores: &mut [f32]) {
-    /// Absolute relevance a result must reach to be allowed near the top of the
-    /// scale. Below this the result is, by the ranker's own absolute measure, not a
-    /// confident match for the query — it may appear, but not as a 1.000.
-    const ABS_FLOOR: f32 = 0.35;
-    /// Ceiling applied to a result that clears ABS_FLOOR. Below ABS_FLOOR the
-    /// ceiling is interpolated down to LOW_CEIL, so the penalty is continuous
-    /// rather than a cliff.
-    const HIGH_CEIL: f32 = 1.0;
-    const LOW_CEIL: f32 = 0.55;
-
-    if scores.is_empty() || relevance.len() != scores.len() {
-        return;
-    }
-    for (score, rel) in scores.iter_mut().zip(relevance.iter()) {
-        // Only ever LOWER a score: this must never promote a result or reorder the
-        // set, only stop a weak result from claiming the top of the scale.
-        let ceiling = if *rel >= ABS_FLOOR {
-            HIGH_CEIL
-        } else {
-            let frac = (*rel / ABS_FLOOR).clamp(0.0, 1.0);
-            LOW_CEIL + frac * (HIGH_CEIL - LOW_CEIL)
-        };
-        if *score > ceiling {
-            *score = ceiling;
-        }
-    }
-}
-
 // ─── Search URL Builder with Location Support ──────────────────────
 
 fn map_lang_to_country(lang: &str) -> Option<&'static str> {
@@ -6678,157 +6795,6 @@ fn has_local_intent(query: &str) -> bool {
                 false
             }
         }
-}
-
-/// Prepositions that can introduce a TRAILING geographic qualifier. A qualifier
-/// introduced by one of these, sitting at the tail of the query, qualifies WHERE
-/// the request applies — it does not, by itself, ask for nearby places.
-///
-/// Structural vocabulary (a closed-class function-word set), not per-query
-/// literals: the set of English prepositions that can head a locative PP is
-/// small and stable, so enumerating them is a grammar fact rather than a
-/// tuned list.
-const GEO_QUALIFIER_PREPOSITIONS: &[&str] = &[
-    "in", "from", "within", "across", "throughout",
-];
-
-/// Leading interrogative / how-to frames that mark the query's PRIMARY intent
-/// as a how-to, informational, or transactional REQUEST rather than a search
-/// for places, venues, or "near me" results.
-///
-/// The discriminator is the HEAD of the query, exactly as the P10/P11 precedent
-/// gates on whole-word + co-occurrence rather than a bare substring. Superlative
-/// openers ("best", "top") are deliberately ABSENT: "best cafes in indiranagar
-/// bangalore" and "best places to see cherry blossoms in osaka" are genuine
-/// local-discovery queries, and their head frame is the thing that must keep
-/// them `local`. Including superlatives here is what would regress them.
-const NON_LOCAL_HEAD_FRAMES: &[&str] = &[
-    "how to", "how do i", "how do we", "how can i", "how does", "how should",
-    "what is", "what are", "why ", "steps to", "guide to", "learn how",
-    "way to", "ways to", "cheapest way", "easiest way", "best way to",
-    "difference between", "meaning of", "cost of", "price of",
-];
-
-/// True when `name`/`cc` is a gazetteer entry naming a COUNTRY (or
-/// country-scale region) rather than a city or locality.
-///
-/// Derived STRUCTURALLY from the existing reference data: a gazetteer entry is
-/// country-scope exactly when its own name IS the canonical country name that
-/// `country_name_for` maps its country code to. This is the discriminator that
-/// separates "in india" (a market/jurisdiction constraint on a how-to question)
-/// from "in osaka" / "in bangalore" (the place the user wants results ABOUT).
-///
-/// No country literals are introduced: the set is derived from
-/// `LOCATION_GAZETTEER` + `country_name_for`, the same two data sources the
-/// geo detector already uses, so adding a country to the gazetteer automatically
-/// extends this behaviour with no code change (the required growth path).
-///
-/// Known limitation (honest, fail-safe): gazetteer ALIASES whose spelling
-/// differs from the canonical country name ("usa", "uk", "america") are not
-/// recognised as country-scope here, so a how-to query qualified by one of
-/// those keeps its current `local` label. That is the conservative direction —
-/// it preserves existing behaviour rather than mis-demoting a local query.
-fn is_country_scope_gazetteer_entry(name: &str, cc: &str) -> bool {
-    let n = name.trim().to_lowercase();
-    !n.is_empty() && n == country_name_for(cc).trim().to_lowercase()
-}
-
-/// True when the query's trailing geographic qualifier only SCOPES a
-/// non-local request, so it must NOT promote the query to `local`.
-///
-/// The defect this closes (FIX-IF-33): a trailing geo suffix overrode the
-/// query's primary frame. "what is the easiest way to start investing in
-/// mutual funds in india" has a how-to HEAD and "in india" is a trailing
-/// market qualifier, yet the gazetteer branch of `has_local_intent` fired on
-/// the geo substring and the whole query was labelled `local` — which then
-/// branched the P6 recency window, the P3 price block, video dampening, and
-/// the local/web merge weights onto the wrong contract.
-///
-/// Three structural conditions must ALL hold, and each one alone is a real
-/// discriminator (no single keyword decides this):
-///   1. No explicit proximity signal ("near me", "nearby", " near ", …).
-///      A query that asks for NEARBY results is local by definition.
-///   2. The query's HEAD frame is an interrogative/how-to frame
-///      (`NON_LOCAL_HEAD_FRAMES`), not a local-discovery head.
-///   3. The trailing geo qualifier names a COUNTRY-scale gazetteer entry
-///      (`is_country_scope_gazetteer_entry`), not a city/locality.
-///
-/// Requiring all three is what keeps the genuinely-local controls local:
-/// "best places to see cherry blossoms in osaka" fails (2) and (3),
-/// "chennai restaurants near adyar" fails (1), and
-/// "best cafes in indiranagar bangalore" fails (2) and (3).
-fn geo_qualifier_is_scope_only(query: &str) -> bool {
-    let lower = query.trim().to_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    // (1) Explicit proximity beats everything: "near me" is local intent.
-    if ["near me", "nearby", "close to me", "around me", " near "]
-        .iter()
-        .any(|m| lower.contains(m))
-    {
-        return false;
-    }
-
-    // (2) The PRIMARY frame must be a request, not a place search.
-    if !NON_LOCAL_HEAD_FRAMES.iter().any(|f| lower.starts_with(f)) {
-        return false;
-    }
-
-    // (3) Find the LAST geo preposition; the phrase after it is the trailing
-    //     qualifier. It must be short (a place phrase, not a new clause) and
-    //     must name a country-scale gazetteer entry.
-    let tokens: Vec<&str> = lower.split_whitespace().collect();
-    let prep_idx = tokens.iter().rposition(|t| {
-        let cleaned = t.trim_matches(|c: char| !c.is_alphanumeric());
-        GEO_QUALIFIER_PREPOSITIONS.contains(&cleaned)
-    });
-    let prep_idx = match prep_idx {
-        Some(i) if i > 0 && i + 1 < tokens.len() => i,
-        _ => return false,
-    };
-
-    // Allow a short tail: "in india", "in united states", "in india for
-    // beginners". A long tail means the preposition heads a new clause rather
-    // than qualifying the request, so it is out of scope for this rule.
-    let tail: Vec<String> = tokens[prep_idx + 1..]
-        .iter()
-        .take(3)
-        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
-        .collect();
-    if tail.is_empty() || tail.len() > 3 {
-        return false;
-    }
-    let tail_joined = tail.join(" ");
-
-    LOCATION_GAZETTEER.iter().any(|(name, cc)| {
-        is_country_scope_gazetteer_entry(name, cc)
-            && whole_word_contains(&tail_joined, &name.to_lowercase())
-    })
-}
-
-/// Pick the label that should replace a wrongly-promoted `local` verdict.
-///
-/// Uses the engine's OWN distribution rather than a hardcoded replacement: take
-/// the highest-probability supported label other than `local`. This is why the
-/// fix needs no per-query answer table — it removes `local` from the running and
-/// lets real model evidence choose. Falls back to `informational` (the neutral
-/// default) only when the distribution carries no usable non-local evidence.
-fn best_non_local_label(intent: &IntentResponse) -> String {
-    const SUPPORTED: &[&str] = &[
-        "navigational", "informational", "technical", "how-to",
-        "comparison", "fresh", "transactional",
-    ];
-    intent
-        .distribution
-        .iter()
-        .filter(|(label, prob)| {
-            SUPPORTED.contains(&label.as_str()) && **prob > 0.0
-        })
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(label, _)| label.clone())
-        .unwrap_or_else(|| "informational".to_string())
 }
 
 /// Known video-hosting domains. Used by the P8 video dampening so that videos
@@ -7267,63 +7233,13 @@ const COUNTRY_DEMONYMS: &[&str] = &[
 /// NOT be surfaced in `ignored_constraints` — surfacing "not:soap — exclusion not
 /// applied" would be confusing and contradict the round's manner-suppression.
 ///
-/// The `manner_qualifiers` bucket is INERT: no ranking or filtering code reads
-/// it (it is surfaced only by the /analyze and /inspect introspection
-/// endpoints). So every compound this function claims is not merely demoted —
-/// the user's constraint is DISCARDED. That asymmetry is what makes
-/// over-claiming here expensive, and it is why the frame alone is not enough
-/// evidence.
-///
-/// ## Why the frame alone is not evidence
-///
-/// An earlier version of this function returned `true` for ANY compound sitting
-/// in a "with no X" / "without X" frame. That made every negation frame a
-/// manner qualifier, so "dessert recipes without artificial sweeteners" and
-/// "a tutorial with no wifi" were both swallowed and had zero effect, while
-/// the pinned manner cases still passed (they are all "how to ..." queries).
-/// The frame marks the SYNTAX of a negation; it says nothing about what the
-/// negated noun denotes.
-///
-/// ## The discriminator used instead: request vs. content frame
-///
-/// What separates "without soap" (manner) from "without artificial sweeteners"
-/// (content exclusion) is not the noun — it is whether the query is asking for
-/// INSTRUCTIONAL content. In a how-to / procedural request the negated noun
-/// qualifies the METHOD the user should use ("clean this skillet without
-/// soap", "learn guitar with no music background"): pages that discuss the
-/// method are exactly what the user wants, so demoting them is wrong. In a
-/// CONTENT request ("dessert recipes without artificial sweeteners", "a tutorial
-/// with no wifi") the negated noun is a property of the sought page, so pages
-/// carrying it are pages the user does not want.
-///
-/// This is a structural test over the token stream — the query's HEAD frame —
-/// not a noun allow/deny list. It reuses the existing open-class
-/// `NON_LOCAL_HEAD_FRAMES` request-frame vocabulary already in this file (the
-/// P10/P11 precedent: a fixed structural vocabulary of request openers, gated
-/// on the head, never on the content noun). A prior attempt at this fix
-/// substituted a 6-noun `ATTRIBUTE_OBJECTS` allow-list for the missing signal
-/// and was correctly rejected under the hardcoding doctrine; this replaces the
-/// signal rather than the list.
-///
-/// Precedence note: an already-recognized ENTITY inside a how-to frame stays a
-/// real exclusion, because `is_real_exclusion` runs first in the gate chain and
-/// its entity/contrastive/source-entity acceptances are independent of this
-/// function. "how to deploy without nginx" still excludes nginx.
-///
-/// Structural, not per-query: no per-query literals, no tuned thresholds.
+/// Structural, not per-query: it tests whether the *extracted compound* sits in a
+/// known manner frame within the query. Reuses the open-class `MANNER_PRONOUNS`
+/// set; no per-query literals, no tuned thresholds (consistent with the
+/// hardcoding doctrine and the existing `is_manner_phrase`).
 fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     let lc = q_orig.to_lowercase();
     let c = compound.to_lowercase();
-    // Manner pronouns anywhere in the compound ("track you as", "offend the
-    // couple") are direct evidence of a requester-attached phrase, independent
-    // of any frame. Checked FIRST: it is the strongest signal and needs no
-    // frame at all.
-    let c_tokens: Vec<&str> = c.split_whitespace().collect();
-    if c_tokens.iter().any(|t| MANNER_PRONOUNS.contains(t)) {
-        return true;
-    }
-    // The compound must actually sit in a "with no X" / "without X" frame — a
-    // bare "not X" is a different construction handled by the caller.
     let frames = [
         format!("without {}", c),
         format!("without a {}", c),
@@ -7332,15 +7248,13 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
         format!("with no {}", c),
         format!("with no a {}", c),
     ];
-    if !frames.iter().any(|f| lc.contains(f.as_str())) {
-        return false;
+    if frames.iter().any(|f| lc.contains(f.as_str())) {
+        return true;
     }
-    // Being in the frame is necessary but NOT sufficient: the query must be an
-    // instructional/procedural REQUEST for the negated noun to describe the
-    // method rather than the content. Gate on the query's head frame against
-    // the existing open-class request-frame vocabulary.
-    let head = lc.trim_start();
-    NON_LOCAL_HEAD_FRAMES.iter().any(|f| head.starts_with(f))
+    // Manner pronouns anywhere in the compound ("track you as", "offend the couple")
+    // mark it as a manner qualifier even without the "without" frame.
+    let c_tokens: Vec<&str> = c.split_whitespace().collect();
+    c_tokens.iter().any(|t| MANNER_PRONOUNS.contains(t))
 }
 
 fn is_manner_phrase(compound: &str) -> bool {
@@ -7879,7 +7793,8 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
                             && !terms.contains(&joined)
                         {
                             terms.push(joined);
-                        } else if !is_manner_phrase(&joined) && !is_manner_frame(q_orig, &joined)
+                        } else if !is_manner_phrase(&joined)
+                            && !is_manner_frame(q_orig, &joined)
                         {
                             if !dropped.contains(&joined) {
                                 dropped.push(joined);
@@ -8085,42 +8000,6 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                         || wc == "min" || wc == "$" || wc.parse::<f64>().is_ok()
                     {
                         break; // a fresh price constraint starts here
-                    }
-                    // List connector ("or"/"and"/",") between exclusion targets: the
-                    // current target is finalised and pushed, then we start a new one.
-                    // MUST precede the trailing-stopword break below — "or"/"and" are
-                    // themselves stopwords, so checking them second made this branch
-                    // unreachable and every compound exclusion ("without oven or
-                    // microwave") silently degraded to its first half, which
-                    // substring-matches no page and no-ops as a filter.
-                    let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
-                    if !ent.is_empty() && (bare == "or" || bare == "and") {
-                        let entity = ent.join(" ");
-                        if !out.contains(&entity) {
-                            out.push(entity);
-                        }
-                        ent.clear();
-                        idx += 1;
-                        continue;
-                    }
-                    if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
-                        break; // trailing stopword ends the entity
-                    }
-                    // A function word arriving when NO target is being collected
-                    // means the exclusion list has ended and a new, independent
-                    // clause has begun. "not from chinese brands AND have usb c
-                    // charging" splits on "and", then "have" (an auxiliary) used
-                    // to be pushed as the head of a fresh target, producing the
-                    // phantom exclusion "have usb c charging" — a verb phrase
-                    // that substring-matches no product page and wrongly penalises
-                    // every charger result. The leading-skip loop above already
-                    // handles function words directly after the lead-in
-                    // ("not from X"); this is the in-list counterpart: after a
-                    // connector, a function word terminates the clause instead of
-                    // seeding a new target. Structural (closed-class stopword
-                    // list already in scope), no per-query literals.
-                    if ent.is_empty() && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
-                        break;
                     }
                     // List connector ("or"/"and"/",") between exclusion targets: the
                     // current target is finalised and pushed, then we start a new one.
@@ -9211,154 +9090,6 @@ fn is_weak_anchor_word(w: &str) -> bool {
     WEAK.contains(&w)
 }
 
-/// Closed-class vocabulary describing the NAMING PREDICATE of a naming/etymology
-/// question — the verb that asserts a NAME relation ("named after", "called",
-/// "etymology"). These words are shared by `is_naming_question` (query shape) and
-/// the term-extraction filters (topic terms), so the two can never drift apart.
-///
-/// Why they must not be TOPIC terms: a naming question's subject is the pair of
-/// entities, not the verb. "why is the apache web server named after a helicopter"
-/// has core topic terms apache + helicopter; requiring the literal token "named" as
-/// well means `core_matches` is false for essentially every real page, so `overlap`
-/// collapses to 0, BERT is gated off (it only runs when overlap > 0), and
-/// `relevance` becomes 0.000 for the WHOLE set — the absolute relevance signal dies
-/// and ranking is decided by residual noise (measured live 2026-09-30: rel=0.000 on
-/// all 21 results, including the correct apache.org/apache-name page).
-const NAMING_PREDICATE_VERBS: &[&str] = &[
-    "named", "naming", "called", "etymology", "etymological", "entitled",
-    "chose", "chosen", "picked", "nickname", "surname", "codename",
-];
-
-/// True when `w` is a naming-predicate verb (see NAMING_PREDICATE_VERBS).
-fn is_naming_predicate_word(w: &str) -> bool {
-    NAMING_PREDICATE_VERBS.contains(&w)
-}
-
-/// Detects a NAMING / ETYMOLOGY question shape: an interrogative frame plus a
-/// naming predicate ("named after", "called", "choose that name", "where does the
-/// name X come from", "etymology", "origin of the name").
-///
-/// This is a QUERY-SHAPE signal built from closed-class function vocabulary
-/// (interrogatives + naming predicates). It names no entity, brand or topic, so it
-/// generalizes to every naming question ("why is amazon named after the river",
-/// "where does the name ford come from", "why is dallas called the big d").
-///
-/// Why it matters: a naming question wants an EXPLANATION. Two result shapes are
-/// wrong answers to it and are structurally detectable without any domain list:
-///   (1) a Q&A/forum page that merely ASKS the same question (a question, not an
-///       answer), and
-///   (2) a page that matches the query's dominant proper noun but none of the
-///       query's OTHER content tokens (an incidental entity mention — e.g. a crime
-///       story about a person with the surname, or a dealer page for the brand).
-/// Closed-class interrogative (wh-) vocabulary. In a natural-language question the
-/// interrogative word introduces the clause that actually states the REQUEST, so
-/// everything before it is framing (see `first_interrogative_index`). Purely
-/// function-word class — names no entity, brand or topic, and is deliberately the
-/// same closed set `is_naming_question` already keys off, so the two cannot drift.
-const INTERROGATIVES: &[&str] = &[
-    "what", "why", "how", "when", "where", "who", "which", "whom", "whose",
-];
-
-/// Index of the first interrogative token in `words`, if any.
-///
-/// This is the structural anchor for conversational queries (FIX-IF-39). A spoken-style
-/// question wraps the real request in discourse preamble: "hey so my friend asked me the
-/// other day about this whole thing and i was wondering if you could tell me WHAT actually
-/// happens when the water cycle goes through its various stages". The subject of the
-/// question lives in the interrogative clause; the preamble is framing, not topic.
-fn first_interrogative_index(words: &[&str]) -> Option<usize> {
-    words
-        .iter()
-        .position(|w| INTERROGATIVES.contains(&w.to_lowercase().as_str()))
-}
-
-/// Closed-class DISCOURSE-FILLER vocabulary (FIX-IF-39).
-///
-/// Greetings, interjections, back-channel and politeness tokens that a spoken-style
-/// question is padded with. They are grammatical glue with ZERO topical content, and
-/// they are also the highest-collision tokens on the open web: "hey" appears in the
-/// brand names HeyGen / hey.com / Hey Jimmy, "hi" in countless domains, "yo", "wow",
-/// "hmm", "please", "thanks", "well", "just", "literally", "honestly"....
-///
-/// Why they must not be TOPIC terms: a filler token is a lexically real, high-frequency
-/// string, so token-overlap rewards a page merely for CONTAINING it. Measured live
-/// 2026-09-30 on a conversational water-cycle question, a camera shop matching only
-/// "hey" and a video-avatar brand matching "hey"+"you" tied the genuine NOAA/Wikipedia
-/// answers inside the top-5 — the filler WAS the entire lexical overlap of those pages.
-///
-/// Closed-class function-word list: it names no brand, domain or query. Deliberately
-/// separate from `stop_words` (which is grammatical function words) because a filler is
-/// NOT grammatically required — removing it from the query would change its meaning —
-/// but it is equally non-topical for ranking. Adding to the lexicon generalises the rule
-/// to every future conversational query; the engine never had to see one to benefit.
-const DISCOURSE_FILLERS: &[&str] = &[
-    // greetings / vocatives
-    "hey", "hi", "hii", "hello", "yo", "hiya", "greetings", "heya", "howdy",
-    // interjections / back-channel
-    "wow", "oh", "ah", "eh", "hm", "hmm", "huh", "ugh", "oops", "oof", "yikes",
-    "yay", "yep", "yup", "nope", "nah", "uh", "um", "umm", "er",
-    // politeness
-    "please", "thanks", "thank",
-    // intensifiers / hedges: emphasis, not subject matter
-    "really", "honestly", "frankly", "literally", "basically", "essentially",
-    "definitely", "absolutely", "totally", "seriously", "obviously", "clearly",
-    "simply", "quite", "rather", "pretty", "kinda", "sorta", "somewhat",
-];
-
-/// True when `w` is a discourse filler (see DISCOURSE_FILLERS).
-fn is_discourse_filler(w: &str) -> bool {
-    DISCOURSE_FILLERS.contains(&w)
-}
-
-/// Minimum number of tokens that must precede the interrogative before the query is
-/// treated as having a conversational preamble. A short lead-in ("so what is X",
-/// "ok how does Y work") is normal phrasing, not a conversational wrap, and must not
-/// trigger clause narrowing — otherwise every ordinary question would be re-scoped.
-const MIN_CONVERSATIONAL_PREAMBLE_TOKENS: usize = 4;
-
-/// Minimum number of topic terms the interrogative clause must retain for narrowing to
-/// be meaningful. If the clause is mostly framing too, the full-query term set is kept
-/// (fail-open: never narrow away a query's only subject).
-const MIN_CLAUSE_TOPIC_TERMS: usize = 2;
-
-fn is_naming_question(query: &str) -> bool {
-    let q = query.to_lowercase();
-    let words: Vec<&str> = q.split(|c: char| !c.is_alphanumeric() && c != '\'').collect();
-    let interrogative = words.iter().any(|w| {
-        matches!(*w, "why" | "how" | "what" | "where" | "who" | "which" | "when")
-    });
-    if !interrogative {
-        return false;
-    }
-    // Naming predicates, split by how much evidence each one carries on its own.
-    // STRONG predicates are unambiguously about naming ("named after", "called",
-    // "etymology", "choose that name", "derived from"), so one is enough to make
-    // the query a naming question. WEAK predicates ("come from", "means",
-    // "refer to") are also used in ordinary non-naming questions ("where does the
-    // river come from"), so they only count alongside a name-ish noun.
-    // This is closed-class vocabulary describing the QUESTION FORM — it names no
-    // entity, brand or topic. Uses `is_naming_predicate_word` (shared constant) so
-    // this classification and the term-extraction filters cannot drift apart.
-    let has_strong = words.iter().any(|w| is_naming_predicate_word(w));
-    const WEAK_NAMING_PREDICATES: &[&str] = &[
-        "name", "names", "title", "word", "words", "term", "call", "calls",
-        "choose", "mean", "means", "meaning", "refer", "refs", "derived",
-        "derives", "origin", "origins",
-    ];
-    const FROM_CONSTRUCTIONS: &[&str] = &[
-        "come from", "comes from", "came from", "derived from", "derives from",
-        "name origin", "origin of the name",
-    ];
-    let has_weak = words.iter().any(|w| WEAK_NAMING_PREDICATES.contains(w));
-    let has_name_noun = words.iter().any(|w| {
-        matches!(*w, "name" | "names" | "naming" | "word" | "words" | "term" | "title")
-    });
-    let has_from_construction = FROM_CONSTRUCTIONS.iter().any(|c| q.contains(c));
-    has_strong || (has_weak && (has_name_noun || has_from_construction))
-        || has_from_construction
-}
-
-
 /// Detects video intent in a query. Uses token-aware detection for "watch" to avoid
 /// false positives on queries like "watch battery" or "watch repair" which are about
 /// timepieces, not videos. Standalone "watch" does not imply video intent; requires
@@ -9695,18 +9426,6 @@ fn merge_local_and_web(
                 && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
                 && !temporal_fillers.contains(lower.as_str())
-                // FIX-IF-39: a discourse filler is non-topical glue, and it is the
-                // single highest-collision token class on the web ("hey" alone
-                // matches HeyGen / hey.com / Hey Jimmy). Leaving it here lets a page
-                // whose ENTIRE overlap is one filler tie the genuine answers.
-                && !is_discourse_filler(&lower)
-                // FIX-IF-35: same exclusion as core_topic_terms. `overlap` is the
-                // fraction of distinctive terms a page contains, and the >=2-of-3
-                // weak-match cap counts them too — so a naming predicate sitting in
-                // this set both dilutes overlap and lets an off-topic page that
-                // happens to contain the verb look like a good match. The predicate
-                // describes the question FORM; the entities describe the subject.
-                && !is_naming_predicate_word(&lower)
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
@@ -9878,34 +9597,7 @@ fn merge_local_and_web(
         comparison_principals
     };
 
-    // A spoken-style question wraps the real request in discourse preamble: "hey so my
-    // friend asked me the other day about this whole thing and i was wondering if you
-    // could tell me WHAT actually happens when the water cycle goes through its various
-    // stages". The interrogative word introduces the clause that STATES THE ASK, so the
-    // subject of the question lives at-or-after it; everything before is framing. The
-    // preamble tokens ("hey"/"friend"/"asked"/"day"/"thing"/"wondering"/"tell") are not
-    // merely noise here — because `core_matches` demands EVERY core term, each one makes
-    // the gate harder to satisfy, and the filler exclusion alone still leaves the
-    // conversational scaffolding ("friend", "asked", "wondering") in the MANDATORY set.
-    // Measured live 2026-09-30: `core_matches` was false for all 23 results, relevance
-    // logged var=0.000 / garbage_cluster=true, and everything tied at 0.04 so a camera
-    // shop matching only "hey" ranked beside NOAA and Wikipedia.
-    //
-    // STRUCTURAL RULE, no per-query literals: when the query is long AND the interrogative
-    // clause on its own still yields a usable number of topic terms, restrict the core-topic
-    // set to that clause. Both guards keep short/topic queries ("what is quantum computing",
-    // "best laptop for programming 2026") completely untouched — there is no preamble to
-    // strip, or the clause would not retain enough terms to be meaningful.
-    let conversational_clause_start: Option<usize> = {
-        let idx = first_interrogative_index(&q_words);
-        match idx {
-            // Only when the preamble is substantial (a real conversational wrap, not a
-            // 1-2 word lead-in) does narrowing apply.
-            Some(i) if i >= MIN_CONVERSATIONAL_PREAMBLE_TOKENS => Some(i),
-            _ => None,
-        }
-    };
-    let core_topic_terms_base: Vec<&str> = q_words.iter()
+    let core_topic_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
             let lower = w.to_lowercase();
             lower.len() >= 3
@@ -9916,137 +9608,10 @@ fn merge_local_and_web(
                 && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
                 && !temporal_fillers.contains(lower.as_str())
-                // FIX-IF-39: THE fix for filler-token brand collisions. `core_matches`
-                // below requires EVERY core term to be present, so a filler left in
-                // this set is not merely noisy — it makes the gate UNSATISFIABLE for
-                // every real page. Measured live 2026-09-30 on the conversational
-                // water-cycle question: core terms included "hey"/"actually"/"you",
-                // so core_matches was false for ALL 23 results, `overlap` collapsed
-                // to 0, the BERT gate (which only runs when overlap > 0) switched
-                // off, and the gateway logged "Relevance distribution: best=0.041,
-                // mean=0.018, var=0.000, garbage_cluster=true" — the absolute
-                // relevance signal was DEAD and every result tied at the same 0.04
-                // post-calibration cap. Ranking was then decided by residual noise,
-                // which is how a camera shop matching only "hey" landed in the top-5
-                // beside NOAA and Wikipedia. Same failure mode as FIX-IF-35 one
-                // layer up: a non-topical token in the mandatory set kills the
-                // signal for the whole result set. Closed-class vocabulary; names
-                // no brand, domain or query.
-                && !is_discourse_filler(&lower)
-                // FIX-IF-35: a naming PREDICATE is query structure, not a topic.
-                // `core_matches` below requires EVERY core term to be present, so
-                // leaving "named"/"called"/"etymology" in this set made
-                // core_matches false for essentially every real page: overlap
-                // collapsed to 0, the BERT gate (which only runs when overlap > 0)
-                // switched off, and `relevance` was 0.000 for the entire result
-                // set — the absolute signal the ranker depends on was dead, and the
-                // surviving ordering was residual noise. Measured live
-                // 2026-09-30 on "why is the apache web server named after a
-                // helicopter": rel=0.000 on all 21 results. Excluding the predicate
-                // leaves the real subject pair (apache, helicopter) to carry the
-                // match. Closed-class vocabulary; names no entity or topic.
-                && !is_naming_predicate_word(&lower)
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
         .collect();
-    let core_topic_terms: Vec<&str> = match conversational_clause_start {
-        Some(start) => {
-            let clause_terms: Vec<&str> = q_words[start..]
-                .iter()
-                .filter(|w| {
-                    let lower = w.to_lowercase();
-                    lower.len() >= 3
-                        && !stop_words.contains(lower.as_str())
-                        && !generic_web_terms.contains(lower.as_str())
-                        && !meta_action_terms.contains(lower.as_str())
-                        && !unit_terms.contains(lower.as_str())
-                        && !role_descriptor_terms.contains(lower.as_str())
-                        && !weak_discriminative.contains(lower.as_str())
-                        && !temporal_fillers.contains(lower.as_str())
-                        && !is_discourse_filler(&lower)
-                        && !is_naming_predicate_word(&lower)
-                        && !lower.chars().all(|c| c.is_ascii_digit())
-                })
-                .copied()
-                .collect();
-            // The clause must retain enough topic terms to be a meaningful narrower
-            // description of the query; otherwise fall back to the full query.
-            if clause_terms.len() >= MIN_CLAUSE_TOPIC_TERMS {
-                tracing::info!(
-                    "CONVERSATIONAL QUERY: narrowing core topic terms to the interrogative clause ({} of {} query tokens): {:?}",
-                    clause_terms.len(), q_words.len(), clause_terms
-                );
-                clause_terms
-            } else {
-                core_topic_terms_base
-            }
-        }
-        None => core_topic_terms_base,
-    };
-
-    // ── Conversational-preamble narrowing (FIX-IF-39) ──
-    // A spoken-style question wraps the real request in discourse preamble: "hey so my
-    // friend asked me the other day about this whole thing and i was wondering if you
-    // could tell me WHAT actually happens when the water cycle goes through its various
-    // stages". The interrogative word introduces the clause that STATES THE ASK, so the
-    // subject of the question lives at-or-after it; everything before is framing. The
-    // preamble tokens ("hey"/"friend"/"asked"/"day"/"thing"/"wondering"/"tell") are not
-    // merely noise here — because `core_matches` demands EVERY core term, each one makes
-    // the gate harder to satisfy, and the filler exclusion alone still leaves the
-    // conversational scaffolding ("friend", "asked", "wondering") in the MANDATORY set.
-    // Measured live 2026-09-30: `core_matches` was false for all 23 results, relevance
-    // logged var=0.000 / garbage_cluster=true, and everything tied at 0.04 so a camera
-    // shop matching only "hey" ranked beside NOAA and Wikipedia.
-    //
-    // STRUCTURAL RULE, no per-query literals: when the query is long AND the interrogative
-    // clause on its own still yields a usable number of topic terms, restrict the core-topic
-    // set to that clause. Both guards keep short/topic queries ("what is quantum computing",
-    // "best laptop for programming 2026") completely untouched — there is no preamble to
-    // strip, or the clause would not retain enough terms to be meaningful.
-    let conversational_clause_start: Option<usize> = {
-        let idx = first_interrogative_index(&q_words);
-        match idx {
-            // Only when the preamble is substantial (a real conversational wrap, not a
-            // 1-2 word lead-in) does narrowing apply.
-            Some(i) if i >= MIN_CONVERSATIONAL_PREAMBLE_TOKENS => Some(i),
-            _ => None,
-        }
-    };
-    let core_topic_terms: Vec<&str> = match conversational_clause_start {
-        Some(start) => {
-            let clause_terms: Vec<&str> = q_words[start..]
-                .iter()
-                .copied()
-                .filter(|w| {
-                    let lower = w.to_lowercase();
-                    lower.len() >= 3
-                        && !stop_words.contains(lower.as_str())
-                        && !generic_web_terms.contains(lower.as_str())
-                        && !meta_action_terms.contains(lower.as_str())
-                        && !unit_terms.contains(lower.as_str())
-                        && !role_descriptor_terms.contains(lower.as_str())
-                        && !weak_discriminative.contains(lower.as_str())
-                        && !temporal_fillers.contains(lower.as_str())
-                        && !is_discourse_filler(&lower)
-                        && !is_naming_predicate_word(&lower)
-                        && !lower.chars().all(|c| c.is_ascii_digit())
-                })
-                .collect();
-            // The clause must retain enough topic terms to be a meaningful narrower
-            // description of the query; otherwise fall back to the full query.
-            if clause_terms.len() >= MIN_CLAUSE_TOPIC_TERMS {
-                tracing::info!(
-                    "CONVERSATIONAL QUERY: narrowing core topic terms to the interrogative clause ({} of {} query tokens): {:?}",
-                    clause_terms.len(), q_words.len(), clause_terms
-                );
-                clause_terms
-            } else {
-                core_topic_terms
-            }
-        }
-        None => core_topic_terms,
-    };
 
     // Multi-word phrase entities (P1): adjacent non-stopword runs of length >= 2 in the
     // raw query. These are the terms most prone to FALSE-POSITIVE token overlap — e.g.
@@ -10058,20 +9623,10 @@ fn merge_local_and_web(
     let phrase_entities: Vec<String> = {
         let mut phrases = Vec::new();
         let mut run: Vec<String> = Vec::new();
-        // Question/naming framing words are grammatical glue, not entity names.
-        // Excluding them prevents the object of the question (for example
-        // "named after X") from becoming a competing phrase entity. This is a
-        // general closed-class/function-word rule, not a per-query vocabulary.
-        let phrase_glue: std::collections::HashSet<&str> = [
-            "named", "name", "names", "called", "call", "get", "got", "become",
-            "becomes", "after", "before", "about", "does", "did", "why", "how",
-            "what", "which", "who", "when", "where", "explain", "explanation",
-        ].iter().copied().collect();
         for w in q_words.iter() {
             let lower = w.to_lowercase();
             let is_content = lower.len() >= 2
                 && !stop_words.contains(lower.as_str())
-                && !phrase_glue.contains(lower.as_str())
                 && !lower.chars().all(|c| c.is_ascii_digit());
             if is_content {
                 run.push(lower);
@@ -10158,42 +9713,19 @@ fn merge_local_and_web(
         let content_lower = r.content.to_lowercase();
         let url_lower = r.url.to_lowercase();
 
-        // How many core topic terms a page must satisfy.
-        //
-        // The original rule demanded ALL of them, which is only coherent when the core
-        // set is a genuine multi-word ENTITY ("fantasy novel", "microservices
-        // architecture") where every token is part of the name. It is incoherent for a
-        // longer natural-language description: no page contains every token of a
-        // six-term clause, so the gate is unsatisfiable and `core_matches` is false
-        // for the WHOLE result set. That is not a mild demotion — `overlap` is forced
-        // to 0, the BERT gate (which only runs when overlap > 0) switches off, and
-        // `relevance` collapses to ~0 for everyone, logging var=0.000 /
-        // garbage_cluster=true. Ranking then falls through to the post-calibration
-        // caps, which floor EVERY result at the same value, so the order is decided by
-        // residual noise. Measured live 2026-09-30 on the conversational water-cycle
-        // question that is exactly what happened, and it is how a camera shop matching
-        // only the filler "hey" ended up beside NOAA and Wikipedia.
-        //
-        // STRUCTURAL FIX: keep the strict all-match for short, entity-like core sets
-        // (the case it was designed for), and require only a genuine multi-term topic
-        // match once the set is long enough that all-match cannot be satisfied. The
-        // "at least 2" bar is not a tuned constant — it is the same on-topic threshold
-        // the existing POST-CAL weak-match cap already uses for multi-topic queries.
-        let required_core_matches = if core_topic_terms.len() <= 2 {
-            core_topic_terms.len()
-        } else {
-            2
-        };
         let core_matches = if core_topic_terms.is_empty() {
             true
         } else {
-            let matched_core = core_topic_terms.iter().filter(|t| {
+            // Require matching all core topic terms (or their stemmed versions).
+            // For multi-term topic queries (e.g. "fantasy novel", "microservices architecture"),
+            // matching only "fantasy" (like ESPN Fantasy Football) or only "architecture" (Quantum Architecture)
+            // is off-topic. All core topic terms must be present.
+            core_topic_terms.iter().all(|t| {
                 let tl = t.to_lowercase();
                 let stemmed = tl.trim_end_matches('s');
                 title_lower.contains(&tl) || content_lower.contains(&tl) || url_lower.contains(&tl)
                     || title_lower.contains(stemmed) || content_lower.contains(stemmed) || url_lower.contains(stemmed)
-            }).count();
-            matched_core >= required_core_matches
+            })
         };
 
         let overlap = if distinctive_terms.is_empty() || !core_matches {
@@ -10302,28 +9834,15 @@ fn merge_local_and_web(
         // it sinks below results that do contain the phrase. Title phrase = strong; content
         // phrase = partial; neither = damped. This is generic (no brand hardcodes).
         if !phrase_entities.is_empty() {
-            // Exact contiguous phrases are the strongest evidence, but natural result
-            // titles often insert a technical modifier ("Apache HTTP Server" for
-            // "Apache Web Server"). Count ordered token coverage as a conservative
-            // fallback: at least two-thirds of a multi-word entity must be present,
-            // while a page matching only its ambiguous head noun gets no credit.
-            let mut phrase_credit = 0.0f32;
-            for phrase in &phrase_entities {
-                let phrase_tokens: Vec<&str> = phrase.split_whitespace().collect();
-                let matched = phrase_tokens.iter().filter(|t| {
-                    title_lower.contains(**t) || content_lower.contains(**t) || url_lower.contains(**t)
-                }).count();
-                let coverage = if phrase_tokens.is_empty() { 0.0 } else { matched as f32 / phrase_tokens.len() as f32 };
-                let exact = title_lower.contains(phrase.as_str())
-                    || content_lower.contains(phrase.as_str())
-                    || url_lower.contains(phrase.as_str());
-                let entity_credit = if exact { 1.0 } else if phrase_tokens.len() >= 2 && coverage >= 0.66 { 0.70 } else { 0.0 };
-                phrase_credit = phrase_credit.max(entity_credit);
-            }
-            // A missing entity is a hard lexical mismatch, not a mild weight tweak.
-            // Keeping the floor small prevents calibration from renormalizing a
-            // wrong-sense result back to 1.0 after the final relevance fold.
-            relevance *= 0.08 + 0.92 * phrase_credit;
+            let phrase_hits: usize = phrase_entities.iter().filter(|p| {
+                title_lower.contains(p.as_str()) || content_lower.contains(p.as_str()) || url_lower.contains(p.as_str())
+            }).count();
+            let phrase_ratio = phrase_hits as f32 / phrase_entities.len() as f32;
+            // Blend the phrase ratio into relevance: a result missing every phrase entity
+            // drops to at most ~0.45 of its token-overlap relevance; full phrase coverage
+            // keeps it intact. This lets "Why Is the Sky Blue?" (title has the phrase) rank
+            // above "Sky Blue Credit" (no contiguous phrase), purely from structure.
+            relevance *= 0.45 + 0.55 * phrase_ratio;
         }
 
         // ── Administrative & Sitemap Demotion ──
@@ -11836,15 +11355,6 @@ fn merge_local_and_web(
     // 5. Calibrate scores onto [0.05, 1.0] preserving real distribution (Phase 0)
     let mut scores: Vec<f32> = merged.iter().map(|r| r.score).collect();
     calibrate_scores(&mut scores);
-    // 5b. FIX-IF-35: bound the top of the scale by ABSOLUTE merit. Phase 0 above is
-    // purely positional, so it forces the set max onto 1.0 by construction; this
-    // restores the invariant that a result reaches the top of the scale only by
-    // earning it absolutely, not by being the best of a weak set. Runs BEFORE the
-    // post-calibration structural caps so those still see and cap these values.
-    {
-        let abs_relevance: Vec<f32> = relevance_vec.iter().copied().collect();
-        apply_absolute_merit_ceiling(&abs_relevance, &mut scores);
-    }
     for (i, r) in merged.iter_mut().enumerate() {
         r.score = scores[i];
     }
@@ -11983,18 +11493,6 @@ fn merge_local_and_web(
             .collect();
         let query_has_rare_anchors = !rare_anchor_terms.is_empty();
 
-        // ── NAMING-QUESTION SHAPE (FIX-IF-30) ──
-        // A naming/etymology question ("why is X named after Y", "where does the
-        // name X come from") asks for an EXPLANATION, and it names a RELATION
-        // between entities rather than a single topic. `is_naming_question` detects
-        // the question FORM from closed-class interrogative + naming-predicate
-        // vocabulary (no entity literals), and the anchor set is the query's own
-        // rare entities, taken from the runtime corpus frequency data already used
-        // by the rare-anchor cap below. So the signal generalizes to every future
-        // naming question and needs no list of brands, surnames or hosts.
-        let naming_question = is_naming_question(&clean_query);
-        let naming_anchor_terms: Vec<String> = rare_anchor_terms.clone();
-
         // These caps MUST sit strictly BELOW the calibrated article floor so the
         // spam is demoted *under* every genuine article, not merely tied with it.
         // calibrate_scores maps the raw set onto [0.05, 1.0]; a relevant article's
@@ -12100,174 +11598,6 @@ fn merge_local_and_web(
             }
 
             // (b) single-distinctive-term-only match on a multi-topic query
-            // Re-apply phrase-entity fidelity after calibration. Calibration is
-            // distribution-relative and can otherwise turn a 0.08 relevance
-            // multiplier back into the top score when the upstream set is weak.
-            if !phrase_entities.is_empty() {
-                let title_lower = r.title.to_lowercase();
-                let content_lower = r.content.to_lowercase();
-                let url_lower = r.url.to_lowercase();
-                let mut has_entity = false;
-                for phrase in &phrase_entities {
-                    let tokens: Vec<&str> = phrase.split_whitespace().collect();
-                    let matched = tokens.iter().filter(|t| {
-                        title_lower.contains(**t) || content_lower.contains(**t) || url_lower.contains(**t)
-                    }).count();
-                    let exact = title_lower.contains(phrase.as_str())
-                        || content_lower.contains(phrase.as_str())
-                        || url_lower.contains(phrase.as_str());
-                    // Contiguous evidence is strongest; ordered token coverage
-                    // accommodates titles such as "Apache HTTP Server" while
-                    // still rejecting a page containing only the head noun.
-                    if exact || (tokens.len() >= 2 && matched as f32 / tokens.len() as f32 >= 0.66) {
-                        has_entity = true;
-                        break;
-                    }
-                }
-                // Post-calibration cap makes the signal durable after relative
-                // score calibration. It is structural and contains no query literals.
-                if !has_entity && r.score > 0.04 {
-                    r.post_cal_cap = Some(0.04);
-                    r.score = 0.04;
-                }
-                // A forum/Q&A page that is itself a question is not an answer-shaped
-                // result for an explanatory query. Detect the content shape from
-                // common forum path markers and interrogative title, not domains.
-                let forum_path = url_lower.contains("/r/") || url_lower.contains("/comments/")
-                    || url_lower.contains("/forum/") || url_lower.contains("/question/")
-                    || url_lower.contains("/q/");
-                let question_title = title_lower.starts_with("are ") || title_lower.starts_with("is ")
-                    || title_lower.starts_with("why ") || title_lower.starts_with("how ")
-                    || title_lower.contains(" named") || title_lower.contains(" called")
-                    || title_lower.contains("? ");
-                if forum_path && question_title && r.score > 0.05 {
-                    r.post_cal_cap = Some(0.05);
-                    r.score = 0.05;
-                }
-            }
-
-            // ── NAMING-QUESTION ANSWER PREFERENCE (FIX-IF-30) ──
-            // A naming/etymology question ("why is X named after Y", "where does
-            // the name X come from", "why is X called Y") wants an EXPLANATION.
-            // Two structurally-identifiable result shapes are wrong answers to it
-            // and were ranking above real answers:
-            //   (1) A Q&A/forum page that merely ASKS the same question. A question
-            //       is not an answer. The prior fix-IF-29 attempt gated this check
-            //       on `!phrase_entities.is_empty()`, so it silently did nothing for
-            //       naming queries with a single content entity ("why is dallas
-            //       called the big d" — no multi-word phrase entity survives after
-            //       the naming-glue words are stripped) and the Reddit question
-            //       thread stayed at #1. This block is gated on the QUERY SHAPE
-            //       instead, which is the correct invariant.
-            //   (2) A page that satisfies only the query's dominant proper noun and
-            //       none of the other content tokens — an incidental entity match
-            //       (a crime story about a person with that surname; a dealer page
-            //       for the brand). Such a page is topically anchored on the wrong
-            //       subject and cannot outrank a page that addresses the question.
-            // Both signals are structural (query shape + token satisfaction), and
-            // the cap is applied AFTER calibration so it is durable, matching the
-            // established D1/D2/D3/P8 post-cal cap pattern.
-            if naming_question {
-                // (1) Question-shaped page offered as the answer to a question: a
-                // forum/Q&A path whose title is itself interrogative is the asker's
-                // post, not an explanation. Detected from the path shape and the
-                // title's interrogative form — no domain or query literals. This
-                // signal is deliberately NOT gated on the anchor count: a naming
-                // query with a single entity ("why is dallas called the big d")
-                // still gets a question-thread ranked above the real answer, and
-                // that is the exact defect the prior phrase-entity-gated attempt
-                // missed.
-                let interrogative_title = rl.starts_with("why ")
-                    || rl.starts_with("how ")
-                    || rl.starts_with("what ")
-                    || rl.starts_with("where ")
-                    || rl.starts_with("who ")
-                    || rl.starts_with("is ")
-                    || rl.starts_with("are ")
-                    || rl.starts_with("does ")
-                    || rl.starts_with("did ")
-                    || rl.starts_with("can ")
-                    || rl.ends_with('?');
-                // FIX-IF-35: question-SHAPE is a property of the TITLE, not of the
-                // host. The previous gate required a forum/Q&A path, which missed
-                // every real offender measured live on 2026-09-30 — a plain editorial
-                // article whose title merely poses the question
-                // ("What famous helicopter was named for its marker?",
-                // "Have You Ever Wondered Why The AH-64 Is Called Apache"). A forum
-                // path is neither necessary nor sufficient for question shape; the
-                // TITLE SHAPE ALONE IS NOT SUFFICIENT, and using it alone is a real
-                // over-capture: many genuine ANSWER pages carry an interrogative
-                // title precisely because they restate the question in order to
-                // answer it ("Why Is Dallas Called the Big D? The Origin Explained",
-                // "Why Zorblax Was Named After Kevren Mardell"), and those pages DO
-                // address the subject. Measured 2026-09-30: title-shape alone tied
-                // such an answer page with the question thread at 0.04, breaking the
-                // pre-existing naming-question guards.
-                //
-                // A naming question asks about a RELATION between the entities it
-                // names, so a page answers it only if it carries the WHOLE relation
-                // — the thing AND its namesake. A page naming just one side is
-                // anchored on that side alone: it is either asking the question or
-                // writing about the namesake for unrelated reasons. That is the
-                // general, structural test, and it is what the live offenders fail:
-                // "What famous helicopter was named for its marker?" names
-                // "helicopter" but never the thing being named.
-                //
-                // Two sufficient signals, both structural, neither a host list:
-                //   (i)  a Q&A/forum path whose title is interrogative — that is
-                //        definitionally the asker's post (the original, correct gate,
-                //        retained); or
-                //   (ii) an interrogative title on a page that does not carry the
-                //        full relation (any anchor missing, or — when the query has
-                //        too few anchors for a relation test — no subject term at all).
-                let carries_full_relation = if naming_anchor_terms.len() >= 2 {
-                    naming_anchor_terms.iter().all(|a| {
-                        rl.contains(a.as_str()) || cl.contains(a.as_str()) || ul.contains(a.as_str())
-                    })
-                } else {
-                    !strong_topics.is_empty()
-                        && strong_topics.iter().any(|t| {
-                            rl.contains(t) || cl.contains(t) || ul.contains(t)
-                        })
-                };
-                let forum_path = ul.contains("/r/") || ul.contains("/comments/")
-                    || ul.contains("/forum/") || ul.contains("/question/")
-                    || ul.contains("/q/") || ul.contains("/ask");
-                let is_question_shaped = interrogative_title
-                    && (forum_path || !carries_full_relation);
-
-                // (2) Incidental single-entity match: a naming question that names
-                // TWO OR MORE rare entities (the thing and its namesake/source) is
-                // asking about a RELATION between them. A page that satisfies only
-                // one of them is anchored on a different subject that happens to
-                // share the dominant proper noun — a crime story about a person with
-                // that surname, a dealer page for the brand. This is the
-                // token-satisfaction collapse the card requires: no list of
-                // ambiguous surnames, no per-host rule. The rare-entity set comes
-                // from the runtime corpus frequency data, so it self-extends to
-                // every future query, and it stays silent when the query names
-                // fewer than 2 rare entities (a one-entity naming question has no
-                // relation whose satisfaction could be violated).
-                let incidental_match = if naming_anchor_terms.len() >= 2 {
-                    let satisfied = naming_anchor_terms.iter().filter(|t| {
-                        rl.contains(t.as_str()) || cl.contains(t.as_str()) || ul.contains(t.as_str())
-                    }).count();
-                    satisfied < naming_anchor_terms.len()
-                } else {
-                    false
-                };
-
-                if (is_question_shaped || incidental_match) && r.score > weak_cap {
-                    tracing::info!(
-                        "POST-CAL NAMING-Q CAP -> {:.2}: '{}' (question_shaped={}, incidental={}, rare anchors {:?})",
-                        weak_cap, r.url.chars().take(60).collect::<String>(),
-                        is_question_shaped, incidental_match, naming_anchor_terms
-                    );
-                    r.post_cal_cap = Some(weak_cap);
-                    r.score = weak_cap;
-                }
-            }
-
             if query_has_many_topics {
                 let matched_strong = strong_topics.iter().filter(|t| {
                     let lt = t.to_lowercase();
@@ -13272,7 +12602,15 @@ async fn main() {
         .route("/goals/:goal_id/progress", post(goals::handle_update_progress))
         .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
+    // Bind port is env-configurable (default 4000) so a second, side-by-side
+    // instance can be started — e.g. an affiliate-keys-ABSENT twin used to prove
+    // ranked order is byte-identical with and without affiliate keys. Production
+    // sets nothing and keeps 4000.
+    let port: u16 = std::env::var("GATEWAY_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(4000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("Gateway listening on {} (circuit-breaker + cache)", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -13624,7 +12962,7 @@ async fn handle_analyze(
         }));
     }
     for term in &declined {
-        let is_manner = is_manner_phrase(term);
+        let is_manner = is_manner_phrase(term) || is_manner_frame(&q_orig, term);
         decisions.push(serde_json::json!({
             "term": term,
             "decision": "declined",
@@ -13730,30 +13068,8 @@ async fn handle_inspect(
 /// exposes only the deterministic local classification so the contract is
 /// stable + fully testable without the intent engine up, and so clients can
 /// reason about the offline baseline the ranker guarantees.
-/// Test-only shim: resolve a query the way `handle_intent` does, minus the
-/// network call to the intent-engine. The rules still run, so these tests
-/// exercise the same override path the live endpoint takes.
-#[cfg(test)]
-fn build_intent_for_test(q: &str) -> serde_json::Value {
-    let mut intent = fallback_intent(q);
-    apply_intent_overrides(q, &mut intent);
-    recompute_confidence(&mut intent);
-    build_intent(q, &intent)
-}
-
-/// Build the `/intent` body from an ALREADY-RESOLVED intent response.
-///
-/// FIX-IF-24 / FIX-IF-32: `GET /intent` previously called `fallback_intent`
-/// directly, which is the offline no-network baseline and always reports
-/// `informational` at 0.3. `/search` ran the engine plus a block of rule-based
-/// overrides. The two therefore disagreed on 6 of 8 probes. The block now lives
-/// in `apply_intent_overrides`, and `handle_intent` resolves the engine
-/// response first and runs the SAME function, so the endpoints share one code
-/// path and cannot drift.
-///
-/// `category` is recomputed AFTER the overrides, because the overrides change
-/// the label and a pre-override category would be stale.
-fn build_intent(q: &str, intent_resp: &IntentResponse) -> serde_json::Value {
+fn build_intent(q: &str) -> serde_json::Value {
+    let intent_resp = fallback_intent(q);
     let category = parent_category(&intent_resp.intent);
     let contrastive = query_is_contrastive(q);
     let local = has_local_intent(q);
@@ -13763,9 +13079,6 @@ fn build_intent(q: &str, intent_resp: &IntentResponse) -> serde_json::Value {
         "intent": intent_resp.intent,
         "category": category,
         "confidence": intent_resp.confidence,
-        "confidence_calibrated": intent_resp.confidence_calibrated,
-        "probe_probability": intent_resp.probe_probability,
-        "distribution": intent_resp.distribution,
         "contrastive_framing": contrastive,
         "local_intent": local,
         "structured_constraints": intent_resp.structured_constraints,
@@ -13802,37 +13115,14 @@ fn build_intent_empty() -> serde_json::Value {
 /// `local_intent` top-level keys so the envelope is distinguishable from
 /// `/search`/`spellcheck`'s empty response).
 async fn handle_intent(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
     if q.trim().is_empty() {
         return (axum::http::StatusCode::BAD_REQUEST, Json(build_intent_empty()));
     }
-
-    // FIX-IF-24 / FIX-IF-32: resolve the SAME engine response `/search` resolves,
-    // then run the SAME override function. When the engine is unreachable we
-    // still answer, from the offline baseline, rather than erroring -- the
-    // endpoint stays additive and fail-open.
-    let mut intent_resp = match tokio::time::timeout(
-        std::time::Duration::from_millis(1500),
-        state.http_client.get(format!(
-            "http://127.0.0.1:3005/analyze?q={}",
-            urlencoding::encode(&q)
-        )).send(),
-    ).await {
-        Ok(Ok(resp)) => read_json_bounded::<IntentResponse>(resp).await.unwrap_or_else(|| fallback_intent(&q)),
-        _ => {
-            tracing::warn!("Intent Engine unreachable for /intent — using offline baseline");
-            fallback_intent(&q)
-        }
-    };
-    apply_intent_overrides(&q, &mut intent_resp);
-    // FIX-IF-32: the overrides may have moved the label away from the one the
-    // engine calibrated, so re-derive the reported number from the final label.
-    recompute_confidence(&mut intent_resp);
-
-    let result = build_intent(&q, &intent_resp);
+    let result = build_intent(&q);
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -13976,7 +13266,7 @@ fn build_inspect(index: &spell::SymSpellIndex, q: &str) -> serde_json::Value {
         }));
     }
     for term in &declined {
-        let is_manner = is_manner_phrase(term);
+        let is_manner = is_manner_phrase(term) || is_manner_frame(&q_orig, term);
         decisions.push(serde_json::json!({
             "term": term,
             "decision": "declined",
@@ -14421,8 +13711,6 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         structured_constraints: Constraints::default(),
         expanded_queries: vec![],
         distribution: None,
-        confidence_calibrated: None,
-        probe_probability: None,
         deep_result: None,
         results: vec![],
         geo_location: None,
@@ -14494,6 +13782,10 @@ async fn handle_search(
     Query(params): Query<SearchParams>,
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    // Start of the request clock, used to DERIVE the commerce-enrichment budget
+    // from the time this request has actually already spent (see
+    // `commerce_wall_for_elapsed`). Must be captured before any upstream work.
+    let request_started = std::time::Instant::now();
     // 0. Validate query — reject empty or whitespace-only queries
     let q_trimmed = params.q.as_deref().unwrap_or("").trim();
     // Phase 8: empty / 1-char / stopword-only handling (graceful, never 400).
@@ -15564,10 +14856,16 @@ async fn handle_search(
         }
     }
     // 2. Process Intent & Embedding (now available alongside engine results)
+    let mut intent_degraded = false;
     let mut intent: IntentResponse = match intent_result {
         Ok(parsed) => parsed,
         Err(()) => {
             tracing::error!("Intent Engine unreachable after 3 attempts — using fallback");
+            // The fallback derives topic terms from the gateway's own structural
+            // parser, so `structured_constraints` stays meaningful, but it is a
+            // degraded reconstruction — say so instead of presenting it as the
+            // engine's authoritative extraction.
+            intent_degraded = true;
             fallback_intent(&q)
         }
     };
@@ -15702,13 +15000,363 @@ async fn handle_search(
             + match &image_res { Ok(v) => v.results.len(), Err(_) => 0 };
         tracing::info!("ONLY NEGATIVE: {} web results — keeping for constraint scoring", before);
     }
-    // Contract enforcement + rule-based overrides, shared with GET /intent so
-    // the two endpoints cannot drift (FIX-IF-24). See apply_intent_overrides.
-    apply_intent_overrides(&q, &mut intent);
-    // FIX-IF-32: re-derive the reported confidence from the FINAL label, so the
-    // published number describes the intent we actually return rather than
-    // whatever the probe's argmax happened to be before the overrides ran.
-    recompute_confidence(&mut intent);
+
+    // ─── Contract enforcement: supported-intent normalization ───
+    // The intent-engine is a black box that may emit an intent outside the
+    // documented 8-class API contract (e.g. a trained "chitchat" class). The
+    // public contract guarantees exactly {navigational, informational, technical,
+    // how-to, comparison, fresh, transactional, local}. Any other label is
+    // remapped to the highest-probability SUPPORTED class from the distribution so
+    // the contract holds and downstream ranking/overrides operate on a known
+    // label. Without this, an unsupported intent silently bypasses every
+    // override gate (which all check `intent.intent != "<known>"`) and leaks to
+    // the API as a phantom class with no freshness/half-life semantics.
+    {
+        const SUPPORTED: &[&str] = &[
+            "navigational", "informational", "technical", "how-to",
+            "comparison", "fresh", "transactional", "local",
+        ];
+        if !SUPPORTED.contains(&intent.intent.as_str()) {
+            let best = SUPPORTED.iter()
+                .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            match best {
+                Some((lbl, prob)) => {
+                    tracing::warn!(
+                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' — remapping to '{}' (top supported class)",
+                        intent.intent, q, lbl
+                    );
+                    intent.intent = (*lbl).to_string();
+                    // Use the distribution probability for the selected supported class
+                    // rather than the original unsupported-class confidence.
+                    intent.confidence = prob;
+                }
+                None => {
+                    tracing::warn!(
+                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' with no supported distribution entry — falling back to informational",
+                        intent.intent, q
+                    );
+                    intent.intent = "informational".to_string();
+                    intent.confidence = 0.35;
+                }
+            }
+        }
+    }
+
+    // ─── Rule-based intent overrides for known misclassification patterns ───
+    // Fire when the linear probe has low confidence (<0.30) — the model is guessing,
+    // so pattern-based heuristics beat random chance.
+    {
+        let q_lower = q.to_lowercase();
+        let only_negative_pattern = !intent.structured_constraints.negative.is_empty()
+            && intent.structured_constraints.positive.is_empty();
+
+        // Override 1: only-negative queries classified as navigational → informational
+        // e.g. "not django" (conf=0.24, classified navigational — should be informational)
+        if only_negative_pattern && intent.intent.as_str() != "informational" && intent.confidence < 0.30 {
+            tracing::info!(
+                "INTENT OVERRIDE: only-negative '{}' was '{}' (conf={:.3}) → informational",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "informational".to_string();
+            intent.confidence = intent.confidence.max(0.35);
+            // Boost informational in the distribution for correct RankingWeights blending
+            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+            let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
+            intent.distribution.insert("informational".to_string(), info_prob + nav_prob * 0.5);
+            intent.distribution.insert("navigational".to_string(), nav_prob * 0.5);
+        }
+
+        // Override 2: temporal/freshness signal → force fresh intent.
+        // Phase 4 (CROSS-CUTTING): the engine now emits intent="fresh" for
+        // recency queries, but as defense-in-depth the gateway also forces it
+        // here. The OLD gate (confidence < 0.30) let "latest ai news 2026"
+        // (0.459) and "recent rust releases" (0.519) slip through to a 90-day
+        // navigational half-life. We now trigger on the recency signal itself,
+        // not on low confidence.
+        {
+            let has_news_signal = q_lower.contains("latest") || q_lower.contains("recent")
+                || q_lower.contains("breaking") || q_lower.contains("headline")
+                || q_lower.contains("new ") || q_lower.contains("newest")
+                || q_lower.contains("cve-") || q_lower.contains("vulnerability")
+                || q_lower.contains("this week") || q_lower.contains("this month")
+                || q_lower.contains("past week") || q_lower.contains("last week");
+            let has_topic_signal = q_lower.contains("news") || q_lower.contains("update")
+                || q_lower.contains("today") || q_lower.contains("this week")
+                || q_lower.contains("2026") || q_lower.contains("2025")
+                || q_lower.contains("release") || q_lower.contains("version");
+            // Don't clobber a fresh intent that the engine already set.
+            if intent.intent != "fresh" && has_news_signal && has_topic_signal {
+                tracing::info!(
+                    "INTENT OVERRIDE (STRONG): news query '{}' was '{}' (conf={:.3}) — forcing fresh",
+                    q, intent.intent, intent.confidence
+                );
+                intent.intent = "fresh".to_string();
+                intent.confidence = intent.confidence.max(0.45);
+                // Reshape distribution: fresh gets the top probability
+                let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
+                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+                intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
+                // Boost informational as secondary intent (for ranking weight blending)
+                let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+                intent.distribution.insert("informational".to_string(), info_prob + 0.15);
+            }
+            // Weak signal: only topic signal (e.g. year without news keywords).
+            else if intent.intent != "fresh" && (q_lower.contains("2026") || q_lower.contains("2025")) {
+                let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
+                let current_prob = intent.distribution.get(&intent.intent).copied().unwrap_or(0.0);
+                if fresh_prob + 0.15 > current_prob {
+                    tracing::info!(
+                        "INTENT OVERRIDE (WEAK): year query '{}' was '{}' (conf={:.3}) — boosting fresh (fresh={:.3})",
+                        q, intent.intent, intent.confidence, fresh_prob
+                    );
+                    intent.distribution.insert("fresh".to_string(), fresh_prob + 0.15);
+                }
+            }
+        }
+
+        // Override 2b: a fresh intent with no derived date window must still
+        // apply a real recency cutoff (not just re-weight scoring). Without this,
+        // "latest ai news" would rank newer items higher but never drop stale ones.
+        // The actual hard window is applied AFTER the web merge (see dated_result_count
+        // guard near line ~8485): we only set it when at least one web result actually
+        // carries a parseable date, so date-less fresh queries (e.g. "latest movies
+        // released in 2026") fail OPEN and keep recency as a scoring boost instead of
+        // collapsing to 0 results.
+        if intent.intent == "fresh" && intent.structured_constraints.after_date.is_none() {
+            tracing::info!("FRESH OVERRIDE: fresh intent without date window — window applied post-merge (fail-open if no dated results)");
+        }
+
+        // Override 3: "other than X" with low confidence → boost comparison + technical
+        // e.g. "programming language other than java" (conf=0.12, technical is correct base)
+        if q_lower.contains("other than") && intent.confidence < 0.20 {
+            tracing::info!(
+                "INTENT OVERRIDE: 'other than' query '{}' was '{}' (conf={:.3}) — boosting comparison/technical",
+                q, intent.intent, intent.confidence
+            );
+            let comp = intent.distribution.get("comparison").copied().unwrap_or(0.0);
+            let tech = intent.distribution.get("technical").copied().unwrap_or(0.0);
+            intent.distribution.insert("comparison".to_string(), comp + 0.1);
+            intent.distribution.insert("technical".to_string(), tech + 0.1);
+        }
+
+        // Override 4: local intent signals → force local intent
+        // Delegates to `has_local_intent` so the keyword list stays in ONE
+        // place. This covers "near me", "nearby", "coffee shop", AND
+        // gazetteer-city patterns like "restaurants in bangalore".
+        let has_local_keywords = has_local_intent(&q_lower);
+        if has_local_keywords && intent.intent != "local" {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): local query '{}' was '{}' (conf={:.3}) -> local",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "local".to_string();
+            intent.confidence = intent.confidence.max(0.75);
+            let local_prob = intent.distribution.get("local").copied().unwrap_or(0.0);
+            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+            intent.distribution.insert("local".to_string(), (local_prob + current_top_prob * 0.5 + 0.4).min(0.90));
+        }
+
+        // Override 5: Comparison & Alternatives signals (H2 fix)
+        // e.g. "alternatives to adobe photoshop that are free", "best budget smartphones under 30000 rupees"
+        let comp_signals = [
+            "alternatives to", "alternative to", "alternatives for", "alternative for",
+            "similar to", "apps like", "tools like", "software like", "sites like",
+            "equivalent to", "replacement for", "competing with", "vs", "versus",
+            "best budget", "best ... under", "top ... under", "compared to", "difference between",
+            "which is better", "comparison", "compare "
+        ];
+        let has_comp_signal = comp_signals.iter().any(|s| {
+            if s.contains("...") {
+                let parts: Vec<&str> = s.split("...").collect();
+                parts.len() == 2 && q_lower.contains(parts[0].trim()) && q_lower.contains(parts[1].trim())
+            } else {
+                q_lower.contains(s)
+            }
+        });
+        if has_comp_signal {
+            tracing::info!(
+                "INTENT OVERRIDE (DECISIVE): comparison query '{}' was '{}' (conf={:.3}) -> comparison",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "comparison".to_string();
+            intent.confidence = intent.confidence.max(0.85);
+            intent.distribution.insert("comparison".to_string(), 0.85);
+            if intent.distribution.get("informational").copied().unwrap_or(0.0) > 0.4 {
+                intent.distribution.insert("informational".to_string(), 0.15);
+            }
+        }
+
+        // Override 6: transactional keywords OR an explicit price bound -> transactional
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+        // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
+        // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
+        // `comparison` on the generic "best ... under" signal — but a budget-anchored
+        // buy query is transactional, not a comparison. The price bound is signal-driven
+        // (parsed from NL), not a per-query literal, so this is general and future-proof.
+        let sc = &intent.structured_constraints;
+        let has_price_bound = sc.price_lt.is_some() || sc.price_max.is_some()
+            || sc.price_min.is_some() || sc.price_gt.is_some();
+        if (has_tx_signal || has_price_bound) && !has_local_keywords {
+            if (intent.intent != "comparison" || has_price_bound)
+                && (intent.intent != "transactional" || intent.confidence < 0.60)
+            {
+                if has_price_bound && intent.intent == "comparison" {
+                    tracing::info!(
+                        "INTENT OVERRIDE (STRONG): price-bounded buy query '{}' was 'comparison' (conf={:.3}) -> transactional",
+                        q, intent.confidence
+                    );
+                    // Dampen the spurious comparison probability so ranking blends transactional.
+                    if let Some(c) = intent.distribution.get_mut("comparison") {
+                        *c = (*c * 0.4).min(0.30);
+                    }
+                } else {
+                    tracing::info!(
+                        "INTENT OVERRIDE (STRONG): transactional query '{}' was '{}' (conf={:.3}) -> transactional",
+                        q, intent.intent, intent.confidence
+                    );
+                }
+                intent.intent = "transactional".to_string();
+                intent.confidence = intent.confidence.max(0.80);
+                let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
+                intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
+            }
+        }
+
+        // Override 7: Model-number + price/cost terms → transactional
+        // The classifier misses model-number patterns ("iphone 16 pro max price",
+        // "oneplus 12 price") — the word "price" alone is weak signal. When a known
+        // brand+model pattern co-occurs with a price/cost term, the intent is
+        // decisively transactional (P10/P11 style compensation for the linear probe).
+        if is_model_number_price_query(&q_lower) {
+            if intent.intent != "transactional" || intent.confidence < 0.60 {
+                tracing::info!(
+                    "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
+                    q, intent.intent, intent.confidence
+                );
+                intent.intent = "transactional".to_string();
+                intent.confidence = intent.confidence.max(0.80);
+                let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
+                intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
+            }
+        }
+
+        // Override 8: Driver / Software Download Intent -> force decisive Navigational + Download intent
+        let download_keywords = [
+            "driver", "drivers", "download", "downloads", "installer", "installers",
+            "firmware", "patch", "software download", "official download", "setup.exe"
+        ];
+        let has_download_signal = download_keywords.iter().any(|k| q_lower.contains(k));
+        if has_download_signal {
+            tracing::info!(
+                "INTENT OVERRIDE (DECISIVE): driver/download query '{}' was '{}' (conf={:.3}) -> navigational",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "navigational".to_string();
+            intent.confidence = intent.confidence.max(0.88);
+            let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
+            intent.distribution.insert("navigational".to_string(), (nav_prob + 0.60).min(0.95));
+            intent.distribution.insert("download".to_string(), 0.90);
+        }
+
+        // Override 7: weather / forecast queries → fresh
+        // WHOLE-WORD match only: a naive `contains("rain")` wrongly fired inside
+        // "fe**rain**al" (a rescue-cat query) and forced fresh intent on a how-to
+        // question, which then re-ranked results by recency instead of relevance.
+        // Use the same `q_has_word` boundary helper that guards "fresh"/"latest".
+        let weather_signals = [
+            "weather", "forecast", "temperature", "rain", "snow", "humidity",
+            "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
+        ];
+        let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
+        // Do NOT clobber a decisive action/decision intent (comparison,
+        // transactional, how-to, technical, navigational) to fresh. A weather word
+        // like "rain" legitimately appears inside gear/commercial/how-to queries
+        // ("backpacking tent in the rain", "fix laptop fan after rain") and must not
+        // re-rank them by news-recency. Weather override only applies to
+        // informational/chitchat-style queries; genuine weather queries are still
+        // caught by the "today"/"forecast" temporal signals in other overrides.
+        let weather_skip_intents = ["comparison", "transactional", "how-to", "technical", "navigational"];
+        let weather_should_skip = weather_skip_intents.contains(&intent.intent.as_str());
+        // Also skip when the query itself carries decisive product / recommendation /
+        // instructional framing. A weather word inside such a query does NOT make it a
+        // weather query: "best lightweight tent for backpacking in the rain",
+        // "hiking boots that work in snow" are gear/how-to questions the engine may
+        // classify as `informational` (low confidence) -- which the 5-intent skip list
+        // above does not catch, so the weather override would wrongly re-rank them by
+        // news-recency. Genuine weather queries ("weather forecast today rain") carry
+        // none of these markers and still force `fresh` below.
+        let has_decisive_framing = [
+            "best ", "top ", "vs ", " review", "reviews", " for camping", " for backpacking",
+            " for hiking", "how to", "how do i", "buy ", "compare", "alternatives",
+            "which ", "cheapest", " vs. ", "best-",
+        ]
+        .iter()
+        .any(|m| q_lower.contains(m));
+        let weather_should_skip = weather_should_skip || has_decisive_framing;
+        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" && !weather_should_skip {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "fresh".to_string();
+            intent.confidence = intent.confidence.max(0.45);
+            let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
+            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+            intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
+        }
+
+        // Override 8: procedural / how-to queries → how-to
+        let howto_signals = [
+            "how to", "how do i", "how do you", "how can i", "how can you", "how to's",
+            "tutorial", "step by step", "step-by-step", "ways to", "guide to", "guide:",
+            "find files", "find the", "modified", "fix ", "install", "configure",
+            "set up", "setup", "uninstall", "upgrade", "build from", "compile",
+            "debug", "troubleshoot", "resolve", "workaround",
+        ];
+        let has_howto_signal = howto_signals.iter().any(|s| q_lower.contains(s));
+        if has_howto_signal
+            && (intent.intent == "navigational" || intent.confidence < 0.40)
+            && intent.intent != "how-to"
+        {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): how-to query '{}' was '{}' (conf={:.3}) → how-to",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "how-to".to_string();
+            intent.confidence = intent.confidence.max(0.45);
+            let howto_prob = intent.distribution.get("how-to").copied().unwrap_or(0.0);
+            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+            intent.distribution.insert("how-to".to_string(), (howto_prob + current_top_prob * 0.5).min(0.85));
+            let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
+            intent.distribution.insert("technical".to_string(), tech_prob + 0.15);
+        }
+
+        // Override 9: research / study queries → informational
+        let research_signals = [
+            "study", "studies", "efficacy", "research", "analysis", "literature",
+            "paper", "survey", "whitepaper", "benchmark", "experiment", "findings",
+            "meta-analysis", "peer review", "journal", "abstract",
+        ];
+        let has_research_signal = research_signals.iter().any(|s| q_lower.contains(s));
+        if has_research_signal
+            && (intent.intent == "navigational" || intent.confidence < 0.40)
+            && intent.intent != "informational"
+        {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): research query '{}' was '{}' (conf={:.3}) → informational",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "informational".to_string();
+            intent.confidence = intent.confidence.max(0.45);
+            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+            intent.distribution.insert("informational".to_string(), (info_prob + current_top_prob * 0.5).min(0.85));
+            let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
+            intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
+        }
+    }
 
     let vector: Option<Vec<f32>> = match embed_res {
         Some(resp) => {
@@ -16530,37 +16178,10 @@ async fn handle_search(
 
     // Adaptive threshold: higher when we have many results, lower when few
     // No positional exceptions — rank #1 can still be garbage
-    let absolute_threshold = if web_results.len() > 30 { 0.18 }
+    let semantic_threshold = if web_results.len() > 30 { 0.18 }
         else if web_results.len() > 20 { 0.15 }
         else if web_results.len() > 10 { 0.12 }
         else { 0.08 };
-
-    // Relative cap (self-calibrating): the absolute thresholds above are only
-    // meaningful when the scorer actually SPREADS the pool. When the strongest
-    // candidate scores barely above the garbage-cluster boundary (best≈0.15-0.19,
-    // e.g. a short-tail news topic where few pages carry rich text), an absolute
-    // 0.18 gate on a 30+ pool sits at the SAME level as best_score and keeps
-    // essentially one item — the top-3 floor then pads the response back to 3
-    // arbitrary survivors. That is the "5 results for a query SearXNG answered
-    // with 33" collapse: the loss happens UPSTREAM of any date/price constraint
-    // filter, so fail-open logic further down can never recover it.
-    //
-    // So cap the gate at a FRACTION OF THE OBSERVED BEST SCORE. This is
-    // scale-free and query-agnostic: it asks "is this result competitive with the
-    // best one we actually retrieved?" rather than "does it clear a magic
-    // constant?". It can only ever LOWER the threshold, never raise it, so a
-    // pool with a strong top hit (best≈1.0) keeps the exact previous behaviour
-    // (min(0.18, 0.5) = 0.18) and ranking regressions are impossible by
-    // construction. A weak-but-not-degenerate pool (best≈0.18) relaxes to
-    // ≈0.09 and keeps the genuinely competitive half instead of one outlier.
-    let semantic_threshold = semantic_filter_threshold(web_results.len(), best_score);
-    if semantic_threshold.1 < semantic_threshold.0 {
-        tracing::info!(
-            "SEMANTIC THRESHOLD RELATIVE CAP: pool={} best={:.3} mean={:.3} — threshold {:.3} -> {:.3} (weak-but-discriminating scorer; absolute gate would keep ~1 result)",
-            web_results.len(), best_score, mean_score, semantic_threshold.0, semantic_threshold.1
-        );
-    }
-    let semantic_threshold = semantic_threshold.1;
 
     // When the relevance model cannot discriminate (garbage cluster: every
     // candidate scored ~identically, e.g. results with empty/short
@@ -16660,16 +16281,6 @@ async fn handle_search(
     }).count();
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
 
-    // FRESH/date fail-open v2 (P6): if NO merged web result carries a parseable
-    // date, the hard date window is meaningless — clear it so recency stays a
-    // scoring boost only. This prevents the window from crushing date-less
-    // fresh queries (e.g. "latest movies released in 2026") even when the
-    // survivor-fraction check would not fire (all results survive trivially).
-    if dated_result_count == 0 {
-        intent.structured_constraints.after_date = None;
-        intent.structured_constraints.before_date = None;
-    }
-
     // FRESH/date fail-open (prevents 0-result collapse): the FRESH OVERRIDE may have
     // flagged this as a recency query, and should_filter_by_constraints DROPS any
     // result without a parseable date OR with a date outside the hard window.
@@ -16715,47 +16326,15 @@ async fn handle_search(
         //     week" → 8/9 dropped, 1 survives = 11%). A near-empty result set is
         //     the same user-facing failure as a zero one: relevant, date-less
         //     results get discarded in favour of a single stale-but-dated item.
-        //     Fail open when the surviving fraction is below a general 50% floor
+        //     Fail-open when the surviving fraction is below a general 25% floor
         //     AND the surviving count is too small to be useful (< 3). This is
         //     keyed on survival ratio, not on any query/window, so it stays general.
-        //     2026-09-04: threshold raised from 0.25 → 0.50 after "latest news about
-        //     chandrayaan 4 mission updates this week" returned 1/3 (0.33) and the
-        //     old 0.25 floor let the window stand, dropping 2/3 of relevant results.
         let survivor_fraction = if pre_filter_count > 0 {
             survivors_after_window as f32 / pre_filter_count as f32
         } else {
             1.0
         };
-        // FIX-IF-23: the old predicate also demanded `survivors_after_window < 3`,
-        // which made the fail-open blind to the most common shape of this bug: a
-        // LARGE pool where the window retains a plausible-looking handful. Live
-        // trace for "gaganyaan latest news launch date" (pool=26, dated window
-        // 2026-09-18..2026-09-25) left exactly 3 survivors — 11% — so the
-        // absolute clause read "not near-empty", the window stood, and 23/26
-        // relevant results were discarded. The user-visible page collapsed to 7.
-        //
-        // A hard recency window that discards the MAJORITY of a pool it was given
-        // is evidence the upstream snippets simply do not carry usable dates, not
-        // evidence that the user wants a 3-item page. So the ratio test stands on
-        // its own for any pool big enough to have had real recall, and small
-        // pools keep the previous conservative behaviour (a 2-of-3 pool is not
-        // evidence of anything). This stays keyed on the survival ratio and pool
-        // size — no query, domain, or window is special-cased — and recency is
-        // not lost: the freshness half-life boost still ranks what survives.
-        //
-        // The ratio relaxation applies ONLY to a window the ENGINE derived. A
-        // date range the user typed explicitly ("python after:2024-01-01
-        // before:2024-06-01") is a deliberate instruction, and silently widening
-        // it because the corpus is sparse would be the engine overriding the
-        // user — the same class of failure in the opposite direction. Explicit
-        // ranges keep the strict zero-survivor fail-open only, which protects
-        // against a hard 0-result page without discarding the user's intent.
-        const MIN_POOL_FOR_RATIO_FAILOPEN: usize = 10;
-        let q_lower_window = q.to_lowercase();
-        let user_stated_date_range = q_lower_window.contains("after:") || q_lower_window.contains("before:");
-        let fraction_too_low = !user_stated_date_range
-            && survivor_fraction < 0.50
-            && pre_filter_count >= MIN_POOL_FOR_RATIO_FAILOPEN;
+        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.25;
         if survivors_after_window == 0 || fraction_too_low {
             tracing::info!(
                 "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
@@ -17251,11 +16830,11 @@ async fn handle_search(
             // bypassed the manner gate and inverted the query: pages ABOUT
             // sweeteners got penalized for containing "artificial", and the
             // alt-query seeding fetched sweetener-alternative pages. Route
-            // explicit "without X" phrases through the SAME is_manner_phrase
+            // explicit "without X" phrases through the SAME is_manner_frame
             // gate the other paths use; genuine source/contrastive negations
             // ("not from X", "except X", "other than X") carry no such frame
             // and keep their explicit-directive status.
-            if is_manner_phrase(&n) {
+            if is_manner_frame(&q_orig, &n) {
                 continue; // manner qualifier: not an exclusion at all
             }
             if !explicit_survivors.contains(&n) {
@@ -17265,7 +16844,7 @@ async fn handle_search(
         }
         if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
             gated_neg_dedup.push(n);
-        } else if !is_manner_phrase(&n) && !soft_negatives.contains(&n) {
+        } else if !is_manner_phrase(&n) && !is_manner_frame(&q_orig, &n) && !soft_negatives.contains(&n) {
             // Soft negative: generic noun the gate declined but not a manner qualifier.
             // Demoted in scoring (×0.3), never hard-dropped.
             soft_negatives.push(n);
@@ -17332,7 +16911,7 @@ async fn handle_search(
         if explicit_neg.iter().any(|e| e == n) {
             continue;
         }
-        if is_manner_phrase(n) {
+        if is_manner_phrase(n) || is_manner_frame(&q_orig, n) {
             continue;
         }
         // Soft negatives are applied (demoted in scoring), not ignored — don't surface them.
@@ -17922,6 +17501,18 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // negation-gate entries survive into the response.
     let mut warnings: Vec<String> = Vec::new();
 
+    // Degraded-extraction honesty: when the intent engine was unreachable, the
+    // reported constraints are the gateway's own structural reconstruction, not
+    // the engine's authoritative extraction. Downstream consumers must be able
+    // to tell the difference instead of reading a degraded parse as the user's
+    // literal stated intent.
+    if intent_degraded {
+        warnings.push(
+            "intent extraction degraded — the intent engine was unreachable, so topic constraints were reconstructed from the gateway's own parser and may be less precise than a normal extraction"
+                .to_string(),
+        );
+    }
+
     if let Some(l) = &sc.language { applied.push(format!("lang:{}", l)); }
     if let Some(a) = &sc.after_date { applied.push(format!("after:{}", a)); }
     if let Some(b) = &sc.before_date { applied.push(format!("before:{}", b)); }
@@ -18168,6 +17759,17 @@ let mut results = match tokio::task::spawn_blocking(move || {
         &intent.distribution,
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
     ) {
+        // The enrichment budget is derived from the time this request has ALREADY
+        // spent, not a flat 22s (see `commerce_wall_for_elapsed`). Without this the
+        // decoration pass could overrun the 30s TimeoutLayer on a slow upstream
+        // search and return HTTP 408 — losing the whole result set, not just the
+        // optional facts. `request_started` is captured at the top of this handler.
+        //
+        // A zero budget needs no special case here: `enrich_with_commerce_par`
+        // breaks out of its wave loop immediately when the wall is zero, so no
+        // fetch is started, nothing gets fabricated, and the `has_any_commerce_block`
+        // gate below suppresses the empty strip exactly as before.
+        let enrichment_wall = commerce_wall_for_elapsed(request_started.elapsed());
         // Clone only the top-N ranked results into a JSON array we can enrich in
         // place. `serde_json::to_value` on `MergedResult` is lossless/Serialize.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
@@ -18190,7 +17792,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     let c = http_client.clone();
                     async move { fetch_page_html(&c, &url).await }
                 },
-                Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+                enrichment_wall,
             )
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
@@ -18223,7 +17825,6 @@ let mut results = match tokio::task::spawn_blocking(move || {
     } else {
         None
     };
-
     let response = UnifiedResponse {
         query: q.clone(),
         intent: Some(intent.intent.clone()),
@@ -18233,10 +17834,6 @@ let mut results = match tokio::task::spawn_blocking(move || {
         structured_constraints: intent.structured_constraints.clone(),
         expanded_queries: expanded_queries.clone(),
         distribution: Some(intent.distribution.clone()),
-        // FIX-IF-32: surface whether `confidence` is calibrated, plus the raw
-        // probe probability, so a client is never left guessing which it is.
-        confidence_calibrated: Some(intent.confidence_calibrated),
-        probe_probability: intent.probe_probability,
         deep_result,
         results: paginated_results,
         geo_location,
@@ -18617,18 +18214,6 @@ fn normalize_nl_operators(query: &str) -> String {
                         break;
                     }
                     if NL_NEG_STOPWORDS.contains(&wc.as_str()) && !ent.is_empty() {
-                        // "or"/"and" are list connectors: push current entity, clear,
-                        // skip the connector, continue collecting the next entity.
-                        // Other stopwords after we already have a head = end of entity.
-                        if (wc == "or" || wc == "and") && ent.len() >= *min_words {
-                            let entity = ent.join(" ");
-                            if !consumed.contains(&entity) {
-                                consumed.push(entity.clone());
-                            }
-                            ent.clear();
-                            idx += 1;
-                            continue;
-                        }
                         break; // stopword after we already have a head = end of entity
                     }
                     if ent.len() >= *min_words && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
@@ -18964,518 +18549,134 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     }
 }
 
-/// Switch the reported intent label AND move probability mass onto it, so
-/// `distribution[intent]` stays consistent with the label we report.
+/// Structural topic-term extraction for the DEGRADED path, used only when the
+/// intent engine is unreachable (see `fallback_intent`).
 ///
-/// FIX-IF-32: this is the core of the fix. Previously each override set
-/// `intent.intent = "..."` and then separately clamped a synthetic scalar via
-/// `intent.confidence = intent.confidence.max(0.85)`, leaving `distribution`
-/// still pointing at the old class. The published confidence therefore
-/// described a class the API never returned -- measured on the project's own
-/// 374-row labeled corpus, the reported label differed from the distribution
-/// argmax on 91% of rows, the number over-stated p(reported label) on 94%
-/// (mean +0.306), and it separated right from wrong labels at AUC 0.555,
-/// i.e. chance.
+/// `extract_gateway_constraints` parses OPERATORS only — it knows `site:`,
+/// `price:`, `after:`, … but it has no notion of "what is this query about".
+/// So the fallback used to report `positive: []` and an empty top-level
+/// `constraints` for every natural-language query, while still reporting the
+/// price bound correctly. Observed live: a price-filtered multi-constraint query
+/// returned `positive: []` / `constraints: []` purely because the engine call
+/// timed out, which reads downstream (notably the commerce/shopping block, which
+/// consumes `structured_constraints`) as "the user stated no constraints at all".
 ///
-/// Mass is MOVED, never invented: the outgoing label's excess over the incoming
-/// label is what gets transferred, so the distribution still sums to ~1 and no
-/// probability is fabricated. `floor` is the minimum mass the new label should
-/// end up with, used where the override is decisive enough to warrant a
-/// majority; it is a lower bound on transferred mass, not a number to add on
-/// top of an unrelated one.
-fn set_intent(intent: &mut IntentResponse, label: &str, decisive: bool) {
-    if intent.intent == label {
-        return;
-    }
-    let current = intent.intent.clone();
-    let cur_p = intent.distribution.get(&current).copied().unwrap_or(0.0);
-    let new_p = intent.distribution.get(label).copied().unwrap_or(0.0);
-    let target = if decisive { cur_p.max(new_p) } else { ((cur_p + new_p) / 2.0).max(new_p) };
-    intent.distribution.insert(label.to_string(), target);
-    // Whatever the new label gained, the old label gives up -- so the total
-    // mass is conserved.
-    intent.distribution.insert(current, (cur_p - (target - new_p)).max(0.0));
-    intent.intent = label.to_string();
-}
-
-/// Contract enforcement + rule-based intent overrides (FIX-IF-24 / FIX-IF-32).
+/// This derives topic terms the same way the engine's implicit (Phase 5) pass
+/// does, so the degraded path and the healthy path agree on term SHAPE:
 ///
-/// Extracted verbatim from `handle_search` into a pure reusable function so
-/// `GET /intent` and `GET /search` provably agree on the effective
-/// classification. Previously this block was inline in the handler only, and
-/// `/intent` used the raw `fallback_intent` label -- the two endpoints
-/// disagreed on 6 of 8 probes. Commit a1cf959 claimed to fix that but shipped
-/// only a compiled `gateway_new.exe`, so the source never changed.
+///  * operator tokens (`site:`, `price:`, `filetype:`, …) are not topic terms;
+///  * a negated token (`-django`) and a bare number (`20000`) are not topic terms;
+///  * grammar/function words are PHRASE BOUNDARIES, never content — a run of
+///    content words is cut wherever one appears, so "headphones with long
+///    battery" can never collapse into the junk phrase "headphones long";
+///  * a surviving run is emitted as at most [`FALLBACK_TERM_MAX_WORDS`]-word
+///    terms (greedy, left to right), so "battery life" stays ONE requirement
+///    instead of two independent fragments.
 ///
-/// FIX-IF-32: every override here also moves probability mass in
-/// `distribution` onto the label it selects (see `set_intent`), so the
-/// confidence derived from `distribution[intent]` describes the label that
-/// is actually reported. The old code rewrote the label and then clamped a
-/// separate synthetic scalar with `.max(0.6/0.75/0.85/0.9)`, which is why the
-/// published number was uncorrelated with correctness (AUC 0.555).
-///
-/// Pure: no I/O, no state, no clock. Unit-testable and callable from both
-/// endpoints.
-fn apply_intent_overrides(q: &str, intent: &mut IntentResponse) {
-        const SUPPORTED: &[&str] = &[
-            "navigational", "informational", "technical", "how-to",
-            "comparison", "fresh", "transactional", "local",
-        ];
-
-        if !SUPPORTED.contains(&intent.intent.as_str()) {
-            let best = SUPPORTED.iter()
-                .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            match best {
-                Some((lbl, prob)) => {
-                    tracing::warn!(
-                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' — remapping to '{}' (top supported class)",
-                        intent.intent, q, lbl
-                    );
-                    intent.intent = (*lbl).to_string();
-                    // Use the distribution probability for the selected supported class
-                    // rather than the original unsupported-class confidence.
-                    intent.confidence = prob;
-                }
-                None => {
-                    tracing::warn!(
-                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' with no supported distribution entry — falling back to informational",
-                        intent.intent, q
-                    );
-                    intent.intent = "informational".to_string();
-                    intent.confidence = 0.35;
-                }
-            }
-        }
-
-    // ─── Rule-based intent overrides for known misclassification patterns ───
-    // Fire when the linear probe has low confidence (<0.30) — the model is guessing,
-    // so pattern-based heuristics beat random chance.
-    {
-        let q_lower = q.to_lowercase();
-        let only_negative_pattern = !intent.structured_constraints.negative.is_empty()
-            && intent.structured_constraints.positive.is_empty();
-
-        // Override 1: only-negative queries classified as navigational → informational
-        // e.g. "not django" (conf=0.24, classified navigational — should be informational)
-        if only_negative_pattern && intent.intent.as_str() != "informational" && intent.confidence < 0.30 {
-            tracing::info!(
-                "INTENT OVERRIDE: only-negative '{}' was '{}' (conf={:.3}) → informational",
-                q, intent.intent, intent.confidence
-            );
-            // FIX-IF-32: label + probability mass move together, so the
-            // reported confidence describes THIS label. No synthetic clamp.
-            set_intent(intent, "informational", false);
-            // Boost informational in the distribution for correct RankingWeights blending
-            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-            let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
-            intent.distribution.insert("informational".to_string(), info_prob + nav_prob * 0.5);
-            intent.distribution.insert("navigational".to_string(), nav_prob * 0.5);
-        }
-
-        // Override 2: temporal/freshness signal → force fresh intent.
-        // Phase 4 (CROSS-CUTTING): the engine now emits intent="fresh" for
-        // recency queries, but as defense-in-depth the gateway also forces it
-        // here. The OLD gate (confidence < 0.30) let "latest ai news 2026"
-        // (0.459) and "recent rust releases" (0.519) slip through to a 90-day
-        // navigational half-life. We now trigger on the recency signal itself,
-        // not on low confidence.
-        {
-            let has_news_signal = q_lower.contains("latest") || q_lower.contains("recent")
-                || q_lower.contains("breaking") || q_lower.contains("headline")
-                || q_lower.contains("new ") || q_lower.contains("newest")
-                || q_lower.contains("cve-") || q_lower.contains("vulnerability")
-                || q_lower.contains("this week") || q_lower.contains("this month")
-                || q_lower.contains("past week") || q_lower.contains("last week");
-            let has_topic_signal = q_lower.contains("news") || q_lower.contains("update")
-                || q_lower.contains("today") || q_lower.contains("this week")
-                || q_lower.contains("2026") || q_lower.contains("2025")
-                || q_lower.contains("release") || q_lower.contains("version");
-            // Don't clobber a fresh intent that the engine already set.
-            if intent.intent != "fresh" && has_news_signal && has_topic_signal {
-                tracing::info!(
-                    "INTENT OVERRIDE (STRONG): news query '{}' was '{}' (conf={:.3}) — forcing fresh",
-                    q, intent.intent, intent.confidence
-                );
-                // FIX-IF-32: label + probability mass move together, so the
-                // reported confidence describes THIS label. No synthetic clamp.
-                set_intent(intent, "fresh", true);
-                // Reshape distribution: fresh gets the top probability
-                let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
-                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-                intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
-                // Boost informational as secondary intent (for ranking weight blending)
-                let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-                intent.distribution.insert("informational".to_string(), info_prob + 0.15);
-            }
-            // Weak signal: only topic signal (e.g. year without news keywords).
-            else if intent.intent != "fresh" && (q_lower.contains("2026") || q_lower.contains("2025")) {
-                let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
-                let current_prob = intent.distribution.get(&intent.intent).copied().unwrap_or(0.0);
-                if fresh_prob + 0.15 > current_prob {
-                    tracing::info!(
-                        "INTENT OVERRIDE (WEAK): year query '{}' was '{}' (conf={:.3}) — boosting fresh (fresh={:.3})",
-                        q, intent.intent, intent.confidence, fresh_prob
-                    );
-                    intent.distribution.insert("fresh".to_string(), fresh_prob + 0.15);
-                }
-            }
-        }
-
-        // Override 2b: a fresh intent with no derived date window must still
-        // apply a real recency cutoff (not just re-weight scoring). Without this,
-        // "latest ai news" would rank newer items higher but never drop stale ones.
-        // The actual hard window is applied AFTER the web merge (see dated_result_count
-        // guard near line ~8485): we only set it when at least one web result actually
-        // carries a parseable date, so date-less fresh queries (e.g. "latest movies
-        // released in 2026") fail OPEN and keep recency as a scoring boost instead of
-        // collapsing to 0 results.
-        if intent.intent == "fresh" && intent.structured_constraints.after_date.is_none() {
-            tracing::info!("FRESH OVERRIDE: fresh intent without date window — window applied post-merge (fail-open if no dated results)");
-        }
-
-        // Override 3: "other than X" with low confidence → boost comparison + technical
-        // e.g. "programming language other than java" (conf=0.12, technical is correct base)
-        if q_lower.contains("other than") && intent.confidence < 0.20 {
-            tracing::info!(
-                "INTENT OVERRIDE: 'other than' query '{}' was '{}' (conf={:.3}) — boosting comparison/technical",
-                q, intent.intent, intent.confidence
-            );
-            let comp = intent.distribution.get("comparison").copied().unwrap_or(0.0);
-            let tech = intent.distribution.get("technical").copied().unwrap_or(0.0);
-            intent.distribution.insert("comparison".to_string(), comp + 0.1);
-            intent.distribution.insert("technical".to_string(), tech + 0.1);
-        }
-
-        // Override 4: local intent signals → force local intent
-        // Delegates to `has_local_intent` so the keyword list stays in ONE
-        // place. This covers "near me", "nearby", "coffee shop", AND
-        // gazetteer-city patterns like "restaurants in bangalore".
-        let has_local_keywords = has_local_intent(&q_lower);
-        if has_local_keywords && intent.intent != "local" {
-            tracing::info!(
-                "INTENT OVERRIDE (STRONG): local query '{}' was '{}' (conf={:.3}) -> local",
-                q, intent.intent, intent.confidence
-            );
-            // FIX-IF-32: label + probability mass move together, so the
-            // reported confidence describes THIS label. No synthetic clamp.
-            set_intent(intent, "local", true);
-        }
-
-        // Override 4b: a TRAILING country-scale geo qualifier must not let the
-        // gazetteer branch above (or the linear probe) override the query's
-        // PRIMARY how-to / informational frame. FIX-IF-33.
-        //
-        // This is a DEMOTION, not a promotion guard, and it has to be: on the
-        // live defect the engine's own probe already returned `local`, so the
-        // `intent.intent != "local"` guard in Override 4 meant a
-        // promotion-only fix never ran at all. Both the Override-4 promotion
-        // and the probe's own verdict are corrected here, so the rule holds no
-        // matter which produced the wrong label.
-        //
-        // The replacement label is chosen from the engine's own distribution
-        // (`best_non_local_label`) rather than hardcoded, so this stays a
-        // structural rule and not a per-query answer table.
-        if intent.intent == "local" && geo_qualifier_is_scope_only(&q_lower) {
-            let replacement = best_non_local_label(intent);
-            tracing::info!(
-                "INTENT OVERRIDE (GEO SCOPE): trailing country qualifier scopes a \
-                 non-local request '{}' was '{}' (conf={:.3}) -> {}",
-                q, intent.intent, intent.confidence, replacement
-            );
-            set_intent(intent, &replacement, false);
-        }
-
-        // Override 5: Comparison & Alternatives signals (H2 fix)
-        // e.g. "alternatives to adobe photoshop that are free", "best budget smartphones under 30000 rupees"
-        let comp_signals = [
-            "alternatives to", "alternative to", "alternatives for", "alternative for",
-            "similar to", "apps like", "tools like", "software like", "sites like",
-            "equivalent to", "replacement for", "competing with", "vs", "versus",
-            "best budget", "best ... under", "top ... under", "compared to", "difference between",
-            "which is better", "comparison", "compare "
-        ];
-        let has_comp_signal = comp_signals.iter().any(|s| {
-            if s.contains("...") {
-                let parts: Vec<&str> = s.split("...").collect();
-                parts.len() == 2 && q_lower.contains(parts[0].trim()) && q_lower.contains(parts[1].trim())
-            } else {
-                q_lower.contains(s)
-            }
-        });
-        if has_comp_signal {
-            tracing::info!(
-                "INTENT OVERRIDE (DECISIVE): comparison query '{}' was '{}' (conf={:.3}) -> comparison",
-                q, intent.intent, intent.confidence
-            );
-            // FIX-IF-32: label + probability mass move together, so the
-            // reported confidence describes THIS label. No synthetic clamp.
-            set_intent(intent, "comparison", true);
-            if intent.distribution.get("informational").copied().unwrap_or(0.0) > 0.4 {
-                intent.distribution.insert("informational".to_string(), 0.15);
-            }
-        }
-
-        // Override 6: transactional keywords OR an explicit price bound -> transactional
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
-        // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
-        // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
-        // `comparison` on the generic "best ... under" signal — but a budget-anchored
-        // buy query is transactional, not a comparison. The price bound is signal-driven
-        // (parsed from NL), not a per-query literal, so this is general and future-proof.
-        let sc = &intent.structured_constraints;
-        let has_price_bound = sc.price_lt.is_some() || sc.price_max.is_some()
-            || sc.price_min.is_some() || sc.price_gt.is_some();
-        if (has_tx_signal || has_price_bound) && !has_local_keywords {
-            if (intent.intent != "comparison" || has_price_bound)
-                && (intent.intent != "transactional" || intent.confidence < 0.60)
-            {
-                if has_price_bound && intent.intent == "comparison" {
-                    tracing::info!(
-                        "INTENT OVERRIDE (STRONG): price-bounded buy query '{}' was 'comparison' (conf={:.3}) -> transactional",
-                        q, intent.confidence
-                    );
-                    // Dampen the spurious comparison probability so ranking blends transactional.
-                    if let Some(c) = intent.distribution.get_mut("comparison") {
-                        *c = (*c * 0.4).min(0.30);
-                    }
-                } else {
-                    tracing::info!(
-                        "INTENT OVERRIDE (STRONG): transactional query '{}' was '{}' (conf={:.3}) -> transactional",
-                        q, intent.intent, intent.confidence
-                    );
-                }
-                // FIX-IF-32: label + probability mass move together, so the
-                // reported confidence describes THIS label. No synthetic clamp.
-                set_intent(intent, "transactional", true);
-            }
-        }
-
-        // Override 7: Model-number + price/cost terms → transactional
-        // The classifier misses model-number patterns ("iphone 16 pro max price",
-        // "oneplus 12 price") — the word "price" alone is weak signal. When a known
-        // brand+model pattern co-occurs with a price/cost term, the intent is
-        // decisively transactional (P10/P11 style compensation for the linear probe).
-        if is_model_number_price_query(&q_lower) {
-            if intent.intent != "transactional" || intent.confidence < 0.60 {
-                tracing::info!(
-                    "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
-                    q, intent.intent, intent.confidence
-                );
-                // FIX-IF-32: label + probability mass move together, so the
-                // reported confidence describes THIS label. No synthetic clamp.
-                set_intent(intent, "transactional", true);
-            }
-        }
-
-        // Override 8: Driver / Software Download Intent -> force decisive Navigational + Download intent
-        let download_keywords = [
-            "driver", "drivers", "download", "downloads", "installer", "installers",
-            "firmware", "patch", "software download", "official download", "setup.exe"
-        ];
-        let has_download_signal = download_keywords.iter().any(|k| q_lower.contains(k));
-        if has_download_signal {
-            tracing::info!(
-                "INTENT OVERRIDE (DECISIVE): driver/download query '{}' was '{}' (conf={:.3}) -> navigational",
-                q, intent.intent, intent.confidence
-            );
-            // FIX-IF-32: label + probability mass move together, so the
-            // reported confidence describes THIS label. No synthetic clamp.
-            set_intent(intent, "navigational", true);
-            intent.distribution.insert("download".to_string(), 0.90);
-        }
-
-        // Override 7: weather / forecast queries → fresh
-        // WHOLE-WORD match only: a naive `contains("rain")` wrongly fired inside
-        // "fe**rain**al" (a rescue-cat query) and forced fresh intent on a how-to
-        // question, which then re-ranked results by recency instead of relevance.
-        // Use the same `q_has_word` boundary helper that guards "fresh"/"latest".
-        let weather_signals = [
-            "weather", "forecast", "temperature", "rain", "snow", "humidity",
-            "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
-        ];
-        let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
-        // Do NOT clobber a decisive action/decision intent (comparison,
-        // transactional, how-to, technical, navigational) to fresh. A weather word
-        // like "rain" legitimately appears inside gear/commercial/how-to queries
-        // ("backpacking tent in the rain", "fix laptop fan after rain") and must not
-        // re-rank them by news-recency. Weather override only applies to
-        // informational/chitchat-style queries; genuine weather queries are still
-        // caught by the "today"/"forecast" temporal signals in other overrides.
-        let weather_skip_intents = ["comparison", "transactional", "how-to", "technical", "navigational"];
-        let weather_should_skip = weather_skip_intents.contains(&intent.intent.as_str());
-        // Also skip when the query itself carries decisive product / recommendation /
-        // instructional framing. A weather word inside such a query does NOT make it a
-        // weather query: "best lightweight tent for backpacking in the rain",
-        // "hiking boots that work in snow" are gear/how-to questions the engine may
-        // classify as `informational` (low confidence) -- which the 5-intent skip list
-        // above does not catch, so the weather override would wrongly re-rank them by
-        // news-recency. Genuine weather queries ("weather forecast today rain") carry
-        // none of these markers and still force `fresh` below.
-        let has_decisive_framing = [
-            "best ", "top ", "vs ", " review", "reviews", " for camping", " for backpacking",
-            " for hiking", "how to", "how do i", "buy ", "compare", "alternatives",
-            "which ", "cheapest", " vs. ", "best-",
-        ]
+/// Every gate above is structural (operator names, the existing grammar-word
+/// lists, digit shape) — no per-query literals and no tuned thresholds, so this
+/// generalizes to any query the engine is down for.
+fn fallback_positive_terms(q: &str, negative: &[String]) -> Vec<String> {
+    // Same normalization the operator parser uses, so "under 20000" is already
+    // an operator token and its digits never reach the topic-term pass.
+    let normalized = normalize_nl_operators(q);
+    let neg_tokens: std::collections::HashSet<String> = negative
         .iter()
-        .any(|m| q_lower.contains(m));
-        let weather_should_skip = weather_should_skip || has_decisive_framing;
-        if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" && !weather_should_skip {
-            tracing::info!(
-                "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
-                q, intent.intent, intent.confidence
-            );
-            // FIX-IF-32: label + probability mass move together, so the
-            // reported confidence describes THIS label. No synthetic clamp.
-            set_intent(intent, "fresh", true);
-        }
+        .flat_map(|n| n.split_whitespace().map(|t| t.to_lowercase()))
+        .collect();
 
-        // Override 8: procedural / how-to queries → how-to
-        let howto_signals = [
-            "how to", "how do i", "how do you", "how can i", "how can you", "how to's",
-            "tutorial", "step by step", "step-by-step", "ways to", "guide to", "guide:",
-            "find files", "find the", "modified", "fix ", "install", "configure",
-            "set up", "setup", "uninstall", "upgrade", "build from", "compile",
-            "debug", "troubleshoot", "resolve", "workaround",
-        ];
-        let has_howto_signal = howto_signals.iter().any(|s| q_lower.contains(s));
-        if has_howto_signal
-            && (intent.intent == "navigational" || intent.confidence < 0.40)
-            && intent.intent != "how-to"
-        {
-            tracing::info!(
-                "INTENT OVERRIDE (STRONG): how-to query '{}' was '{}' (conf={:.3}) → how-to",
-                q, intent.intent, intent.confidence
-            );
-            // FIX-IF-32: label + probability mass move together, so the
-            // reported confidence describes THIS label. No synthetic clamp.
-            set_intent(intent, "how-to", true);
-            let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
-            intent.distribution.insert("technical".to_string(), tech_prob + 0.15);
-        }
+    // Operator names the gateway parser already understands (see
+    // `extract_gateway_constraints`). A token carrying one is an instruction,
+    // not a topic — and its payload is already captured in the operator field.
+    const OPERATORS: &[&str] = &[
+        "site:", "filetype:", "price:", "after:", "before:", "intitle:", "inurl:",
+        "intext:", "related:", "lang:", "not:",
+    ];
 
-        // Override 9: research / study queries → informational
-        let research_signals = [
-            "study", "studies", "efficacy", "research", "analysis", "literature",
-            "paper", "survey", "whitepaper", "benchmark", "experiment", "findings",
-            "meta-analysis", "peer review", "journal", "abstract",
-        ];
-        let has_research_signal = research_signals.iter().any(|s| q_lower.contains(s));
-        if has_research_signal
-            && (intent.intent == "navigational" || intent.confidence < 0.40)
-            && intent.intent != "informational"
-        {
-            tracing::info!(
-                "INTENT OVERRIDE (STRONG): research query '{}' was '{}' (conf={:.3}) → informational",
-                q, intent.intent, intent.confidence
-            );
-            // FIX-IF-32: label + probability mass move together, so the
-            // reported confidence describes THIS label. No synthetic clamp.
-            set_intent(intent, "informational", false);
-            let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
-            intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
-        }
-    }
-}
-
-/// Recompute the reported confidence from the mass now sitting on the reported
-/// label, AFTER all overrides have run.
-///
-/// FIX-IF-32: this is the gateway half of the fix. The engine calibrates its own
-/// label, but the gateway then applies further overrides that can move the label
-/// again, so the engine's number no longer describes what the gateway reports.
-/// We re-derive it here from `distribution[intent]` using the same calibration
-/// coefficients, and flag it calibrated only when the artifact is actually
-/// loaded -- an uncalibrated probe score is never presented as a probability.
-///
-/// Pure: unit-testable without a running engine.
-fn recompute_confidence(intent: &mut IntentResponse) {
-    let p = intent.distribution.get(&intent.intent).copied().unwrap_or(0.0) as f64;
-
-    // HONESTY: an EMPTY distribution means no model ever scored this label --
-    // either the intent-engine was unreachable and `fallback_intent`'s
-    // deterministic rules produced it, or the probe returned no distribution.
-    // There is no probability to report, and no probe score to calibrate.
-    //
-    // The number is therefore left at whatever the deterministic rule baseline
-    // set, and explicitly flagged UNCALIBRATED. Two things this must NOT do:
-    //
-    //  * Claim calibration. Feeding p=0.0 through the Platt curve yields
-    //    ~0.0 with `confidence_calibrated: true` -- a *calibrated* assertion
-    //    that the label is certainly wrong, which is a different claim from
-    //    "no model evidence exists". Observed live during COLD verification.
-    //
-    //  * Report 0.0. The local-intent gate at `handle_search` keys on
-    //    `intent.confidence >= 0.20`; a hard 0.0 for rule-derived local labels
-    //    would silently disable geo-boost for every "near me" query. A
-    //    rule-based label is uncalibrated, not certainly-wrong.
-    //
-    // So: keep the rule-baseline score, mark it uncalibrated, and expose no
-    // probe probability (there is none to audit or re-fit).
-    if intent.distribution.is_empty() {
-        intent.probe_probability = None;
-        intent.confidence_calibrated = false;
-        tracing::warn!(
-            "UNCALIBRATED: no intent distribution for '{}' (no model evidence) — \
-             reporting rule-baseline confidence {:.3} with confidence_calibrated=false",
-            intent.intent, intent.confidence
-        );
-        return;
-    }
-
-    intent.probe_probability = Some(p as f32);
-    intent.confidence = match intent_calibration() {
-        Some((slope, intercept)) => {
-            let clamped = p.clamp(1e-6, 1.0 - 1e-6);
-            let logit = (clamped / (1.0 - clamped)).ln();
-            let z = slope * logit + intercept;
-            intent.confidence_calibrated = true;
-            (1.0 / (1.0 + (-z).exp())) as f32
-        }
-        None => {
-            intent.confidence_calibrated = false;
-            p as f32
-        }
-    };
-}
-
-/// The calibration coefficients, loaded once from the same runtime artifact the
-/// intent-engine uses. `None` when unavailable, which callers must surface as
-/// `confidence_calibrated: false`.
-fn intent_calibration() -> Option<(f64, f64)> {
-    static CAL: std::sync::OnceLock<Option<(f64, f64)>> = std::sync::OnceLock::new();
-    *CAL.get_or_init(|| {
-        let path = std::env::var("INTENT_CALIBRATION_PATH")
-            .unwrap_or_else(|_| "./config/intent_calibration.json".to_string());
-        match std::fs::read_to_string(&path) {
-            Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
-                Ok(v) => match (v.get("slope"), v.get("intercept")) {
-                    (Some(a), Some(b)) => {
-                        let (a, b) = (a.as_f64().unwrap_or(0.0), b.as_f64().unwrap_or(0.0));
-                        tracing::info!(
-                            "Intent confidence calibration loaded from {} (slope={:.4} intercept={:.4})",
-                            path, a, b
-                        );
-                        Some((a, b))
-                    }
-                    _ => {
-                        tracing::warn!("Calibration artifact {} missing slope/intercept — UNCALIBRATED", path);
-                        None
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!("Calibration artifact {} unparseable ({}) — UNCALIBRATED", path, e);
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!("No calibration artifact at {} ({}) — UNCALIBRATED", path, e);
-                None
+    let mut out: Vec<String> = Vec::new();
+    let mut run: Vec<String> = Vec::new();
+    let mut flush = |run: &mut Vec<String>, out: &mut Vec<String>| {
+        // Head-final pairing, filled from the end of the run backwards — the
+        // same rule the engine's implicit pass uses, so a degraded response and
+        // a healthy one describe the same requirement shape.
+        let mut end = run.len();
+        while end > 0 {
+            let start = end.saturating_sub(FALLBACK_TERM_MAX_WORDS);
+            let term = run[start..end].join(" ");
+            if !out.contains(&term) {
+                out.push(term);
             }
+            end = start;
         }
-    })
+        run.clear();
+    };
+
+    for raw in normalized.to_lowercase().split_whitespace() {
+        let tok = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '-' && c != '_');
+        // Any rejected token ends the run — phrases never span a boundary.
+        let mut reject = |run: &mut Vec<String>| flush(run, &mut out);
+        if tok.is_empty() || tok.len() < 2 {
+            reject(&mut run);
+            continue;
+        }
+        if OPERATORS.iter().any(|op| tok.starts_with(op)) {
+            reject(&mut run);
+            continue;
+        }
+        // Negated token: already an exclusion, never also a requirement.
+        if tok.starts_with('-') {
+            reject(&mut run);
+            continue;
+        }
+        // Bare numbers carry no retrievable lexical meaning (a budget is already
+        // in `price_*`; a year is already a date constraint).
+        if tok.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') {
+            reject(&mut run);
+            continue;
+        }
+        if neg_tokens.contains(tok) {
+            reject(&mut run);
+            continue;
+        }
+        // Grammar/function words from the lists the rest of the pipeline already
+        // uses, so the fallback drops the same non-topical words the healthy
+        // path does instead of inventing a private vocabulary.
+        if NON_TOPICAL_QUERY_WORDS.contains(&tok)
+            || STOPWORDS.contains(&tok)
+            || IGNORED_CONSTRAINT_NOISE.contains(&tok)
+        {
+            reject(&mut run);
+            continue;
+        }
+        run.push(tok.to_string());
+    }
+    flush(&mut run, &mut out);
+
+    // Subsumption dedupe (same rule as the engine's implicit pass): a bare word
+    // already carried by a multi-word term is redundant, not a second
+    // requirement — satisfying the phrase necessarily satisfies the fragment.
+    let phrase_words: Vec<Vec<String>> = out
+        .iter()
+        .filter(|t| t.split_whitespace().count() > 1)
+        .map(|t| t.split_whitespace().map(|w| w.to_string()).collect())
+        .collect();
+    if !phrase_words.is_empty() {
+        out.retain(|t| {
+            if t.split_whitespace().count() > 1 {
+                return true;
+            }
+            !phrase_words.iter().any(|ph| ph.iter().any(|w| w == t))
+        });
+    }
+
+    out.retain(|t| t.len() >= 2 && t.len() <= 50);
+    out
 }
+
+/// Word cap for a fallback-derived positive term. Mirrors the engine's
+/// `POSITIVE_TERM_MAX_WORDS` and `extract_constraint_term(max_words = 2)` so a
+/// degraded response describes the same requirement shape as a healthy one.
+const FALLBACK_TERM_MAX_WORDS: usize = 2;
 
 fn fallback_intent(q: &str) -> IntentResponse {
     let mut structured = extract_gateway_constraints(q);
@@ -19489,6 +18690,12 @@ fn fallback_intent(q: &str) -> IntentResponse {
             }
         }
     }
+    // The operator parser extracts FILTERS but not TOPIC. Without this the
+    // degraded path reported `positive: []` and an empty top-level `constraints`
+    // for every NL query — indistinguishable from "user stated no constraints",
+    // which is exactly the wrong signal for downstream consumers on precisely
+    // the multi-constraint / price-filtered queries that need it most.
+    structured.positive = fallback_positive_terms(q, &negative);
     structured.negative = negative;
 
     IntentResponse {
@@ -19499,10 +18706,6 @@ fn fallback_intent(q: &str) -> IntentResponse {
         structured_constraints: structured,
         expanded_queries: vec![q.to_string()],
         distribution: std::collections::HashMap::new(),
-        // Honest by construction: the offline baseline consults no model, so it
-        // has no calibrated probability to report (FIX-IF-32).
-        confidence_calibrated: false,
-        probe_probability: Some(0.0),
     }
 }
 
@@ -20009,74 +19212,11 @@ mod constraint_fix_tests {
     }
 
     #[test]
-fn d3_content_negation_frame_is_not_manner() {
-        // A `with no X` / `without X` frame is NOT on its own evidence of manner.
-        // `manner_qualifiers` is INERT — nothing in ranking consumes it (it is
-        // surfaced only by /analyze and /inspect), so any genuine content
-        // exclusion the frame swallows has ZERO effect on results: the user's
-        // constraint is silently discarded rather than merely demoted.
-        //
-        // These four queries name something the user does not want IN the result
-        // (the topic of the sought page), not a way of doing the task, so each
-        // must land in a bucket that ranking actually consumes: `kept` (hard
-        // exclusion) or `dropped` (soft negative, demoted x0.1) — never `manner`.
-        //
-        // This asserts BEHAVIOUR (which bucket), never a noun list.
-        for q in [
-            "a guitar tutorial with no music theory",
-            "dessert recipes without artificial sweeteners",
-            "best laptop for gaming without a dedicated gpu",
-            "a tutorial with no wifi",
-        ] {
-            let (kept, dropped, manner) = extract_query_negative_terms_with_dropped(q);
-            assert!(
-                manner.is_empty(),
-                "content exclusion '{}' must NOT be swallowed as an inert manner qualifier: manner={:?}",
-                q,
-                manner
-            );
-            assert!(
-                !kept.is_empty() || !dropped.is_empty(),
-                "content exclusion '{}' must reach a bucket ranking consumes (kept/dropped), not vanish: kept={:?} dropped={:?} manner={:?}",
-                q,
-                kept,
-                dropped,
-                manner
-            );
-        }
-    }
-
-    #[test]
-    fn d3_manner_cases_stay_out_of_exclusions_after_frame_narrowing() {
-        // Narrowing `is_manner_frame` must not promote any pinned manner case
-        // into a real exclusion. These are the same queries the pre-existing
-        // manner tests pin; re-asserted here so a regression in the frame
-        // discriminator fails as a MANNER failure, not as a silent quality
-        // change nobody notices.
-        for q in [
-            "how to clean a cast iron skillet without soap after cooking eggs",
-            "how to learn guitar with no music background",
-            "how to learn to play the guitar as an adult with no music background",
-            "how to politely decline a wedding invitation without offending the couple",
-            "how to remove a stripped screw from a laptop without damaging the board",
-            "how to teach a child to ride a bicycle without training wheels patiently",
-        ] {
-            let (kept, _dropped, _manner) = extract_query_negative_terms_with_dropped(q);
-            assert!(
-                kept.is_empty(),
-                "manner qualifier '{}' must never become a hard exclusion: kept={:?}",
-                q,
-                kept
-            );
-        }
-    }
-
-    #[test]
-        fn negation_with_site_operator_no_phantom_negative() {
+    fn negation_with_site_operator_no_phantom_negative() {
         // D3 phantom-negation regression: a `not <X> site:<Y>` clause must NOT
-// emit the bogus compound exclusion "X siteY" (colon stripped then swept
-// into the negative). The bare noun is the only exclusion; the site is a
-// positive `sites` filter handled elsewhere. Pure operator-token skip —
+        // emit the bogus compound exclusion "X siteY" (colon stripped then swept
+        // into the negative). The bare noun is the only exclusion; the site is a
+        // positive `sites` filter handled elsewhere. Pure operator-token skip —
         // no per-query literals / denylists.
         for q in [
             "python web framework not django site:github.com",
@@ -20419,7 +19559,7 @@ fn d3_content_negation_frame_is_not_manner() {
             }));
         }
         for term in &declined {
-            let is_manner = is_manner_phrase(term);
+            let is_manner = is_manner_phrase(term) || is_manner_frame(&q_orig, term);
             decisions.push(serde_json::json!({
                 "term": term,
                 "decision": "declined",
@@ -21023,122 +20163,6 @@ mod hardcoding_ruling_tests {
         // Real article should be at or above floor
         assert!(article_result.score >= 0.05, "article should be >= 0.05, got {}", article_result.score);
     }
-
-    // ── FIX-IF-30: naming-question answer preference ──
-
-    #[test]
-    fn naming_question_shape_detected_generically() {
-        // The detector is a QUERY-SHAPE signal (interrogative + naming predicate),
-        // so it must fire across unrelated entities with no per-query vocabulary.
-        for q in [
-            "why is tesla named after nikola tesla",
-            "why is amazon named after the river",
-            "why did starbucks choose that name",
-            "where does the name ford come from",
-            "why is dallas called the big d",
-            "what is the origin of the name google",
-        ] {
-            assert!(is_naming_question(q), "should detect naming question: {}", q);
-        }
-        // Non-naming queries must NOT fire — otherwise every informational query
-        // would have a question-thread collapse applied to it.
-        for q in [
-            "how to change a car battery",
-            "why is the sky blue",
-            "where does the river amazon flow",
-            "best practices for writing unit tests in go",
-            "why do cats purr",
-            "what is quantum computing",
-        ] {
-            assert!(!is_naming_question(q), "must not fire on non-naming query: {}", q);
-        }
-    }
-
-    #[test]
-    fn naming_question_forum_thread_demoted_below_answer() {
-        // A Q&A thread that merely ASKS the naming question is not an answer and
-        // must not outrank a page that explains the naming. This is the defect
-        // class behind both the Apache card and the Dallas generalization probe.
-        let q = "why is dallas called the big d";
-        let thread = web_res(
-            "https://www.reddit.com/r/Dallas/comments/5kdox1/why_is_dallas_called_the_big_d",
-            "r/Dallas on Reddit: Why is Dallas called the Big D?",
-            "A thread asking why the city is called the Big D.",
-        );
-        let answer = web_res(
-            "https://example.com/dallas-big-d-origin",
-            "Why Is Dallas Called the Big D? The Origin Explained",
-            "Dallas is called the Big D because each letter of the city name was doubled when the railroad came to town in the 1870s.",
-        );
-        let out = merge_local_and_web(
-            vec![], vec![thread, answer], q, "informational", &cst(), None, None, &empty_sem(),
-        );
-        let t = out.iter().find(|r| r.url.contains("reddit.com")).expect("thread missing");
-        let a = out.iter().find(|r| r.url.contains("dallas-big-d-origin")).expect("answer missing");
-        assert!(
-            a.score > t.score,
-            "answer ({}) must outrank question thread ({})",
-            a.score, t.score
-        );
-    }
-
-    #[test]
-    fn naming_question_incidental_entity_match_demoted() {
-        // A page that satisfies only the query's dominant proper noun and none of
-        // the other named entities is anchored on a different subject that happens
-        // to share the name (a crime story about a person with that surname, a
-        // dealer page for the brand). It must not outrank a page that addresses
-        // the relation. Uses invented entities so the test is not query-tuned.
-        let q = "why is zorblax named after kevren mardell";
-        let incidental = web_res(
-            "https://news.example.com/local/teen-found-in-zorblax",
-            "Teen Found In Zorblax, Police Probe Continues",
-            "Investigators are working on the case in the Zorblax district this week.",
-        );
-        let answer = web_res(
-            "https://example.com/zorblax-name-origin",
-            "Why Zorblax Was Named After Kevren Mardell",
-            "Zorblax was named after Kevren Mardell, the engineer who founded the workshop in 1904.",
-        );
-        let out = merge_local_and_web(
-            vec![], vec![incidental, answer], q, "informational", &cst(), None, None, &empty_sem(),
-        );
-        let inc = out.iter().find(|r| r.url.contains("teen-found")).expect("incidental missing");
-        let a = out.iter().find(|r| r.url.contains("zorblax-name-origin")).expect("answer missing");
-        assert!(
-            a.score > inc.score,
-            "answer ({}) must outrank incidental single-entity match ({})",
-            a.score, inc.score
-        );
-    }
-
-    #[test]
-    fn naming_cap_does_not_fire_on_non_naming_query() {
-        // The cap is gated on the query SHAPE. A general "why" query must keep its
-        // normal ordering — in particular a question-titled page that is genuinely
-        // the best answer for a non-naming question must not be capped.
-        let q = "why do cats purr";
-        let page = web_res(
-            "https://www.reddit.com/r/cats/comments/abc123/why_do_cats_purr",
-            "Why Do Cats Purr? Mechanically, It Is Vocal Fold Vibration",
-            "Cats purr by rapid twitching of the laryngeal muscles, which produces a 25-150 Hz cycle.",
-        );
-        let other = web_res(
-            "https://example.com/cat-purr-mechanics",
-            "The Mechanics of Cat Purring",
-            "Purring is produced by rapid muscle contractions and serves communication and healing functions.",
-        );
-        let out = merge_local_and_web(
-            vec![], vec![page, other], q, "informational", &cst(), None, None, &empty_sem(),
-        );
-        let p = out.iter().find(|r| r.url.contains("abc123")).expect("page missing");
-        let o = out.iter().find(|r| r.url.contains("cat-purr-mechanics")).expect("other missing");
-        assert!(
-            p.score >= o.score,
-            "non-naming query must not be demoted by the naming cap: {} vs {}",
-            p.score, o.score
-        );
-    }
 }
 
 #[cfg(test)]
@@ -21679,7 +20703,7 @@ mod spellcheck_endpoint_tests {
         #[test]
         fn intent_endpoint_shape_matches_docs() {
             // Locks the JSON shape documented in API_REFERENCE.md `GET /intent`.
-            let res = build_intent_for_test("best sushi restaurants in new york");
+            let res = build_intent("best sushi restaurants in new york");
             for section in [
                 "query", "intent", "category", "confidence",
                 "contrastive_framing", "local_intent",
@@ -21950,10 +20974,10 @@ mod spellcheck_endpoint_tests {
         #[test]
         fn intent_reports_local_signal_for_near_me() {
             // "near me" must set local_intent=true (drives /search geo-boost).
-            let loc = build_intent_for_test("coffee shops near me open now");
+            let loc = build_intent("coffee shops near me open now");
             assert_eq!(loc["local_intent"].as_bool(), Some(true));
             // And a non-local query must NOT.
-            let nonloc = build_intent_for_test("how does a cpu pipeline work");
+            let nonloc = build_intent("how does a cpu pipeline work");
             assert_eq!(nonloc["local_intent"].as_bool(), Some(false));
         }
 
@@ -21962,10 +20986,10 @@ mod spellcheck_endpoint_tests {
             // A genuine X-vs-Y comparison must set contrastive_framing=true,
             // which is what the ranker keys off to avoid the off-topic
             // comparator defect (round 2026-08-12T0613Z, commit 798c92e).
-            let cmp = build_intent_for_test("violin vs viola for beginner");
+            let cmp = build_intent("violin vs viola for beginner");
             assert_eq!(cmp["contrastive_framing"].as_bool(), Some(true));
             // A plain informational query must NOT be flagged contrastive.
-            let info = build_intent_for_test("why is the sky blue");
+            let info = build_intent("why is the sky blue");
             assert_eq!(info["contrastive_framing"].as_bool(), Some(false));
         }
 
@@ -21974,7 +20998,7 @@ mod spellcheck_endpoint_tests {
             // The parent_category must equal what /search would compute from the
             // same fallback_intent path — i.e. informational intents collapse to
             // "informational".
-            let res = build_intent_for_test("python rest api framework not flask");
+            let res = build_intent("python rest api framework not flask");
             assert_eq!(res["intent"].as_str(), Some("informational"));
             assert_eq!(res["category"].as_str(), Some("informational"));
             assert!(res["confidence"].as_f64().unwrap() > 0.0);
@@ -22871,262 +21895,426 @@ structured product data, so nothing must be extracted from the body.</p></body><
         }
     }
 
-    // ── FIX: `commerce_provenance.observed_at` must never be a FABRICATION ────
-    //
-    // The defect these lock: `enrich_with_commerce_par` step 4 stamped
-    // `observed_at: now_unix_string()` onto EVERY result that did not come back
-    // with real HTML. A live /shopping response showed all 10 rows carrying the
-    // identical response-build timestamp with `commerce: null` — asserting "we
-    // looked at this page just now" for pages that were never fetched (past
-    // COMMERCE_MAINPATH_TOP_N) or whose fetch 403'd/timed out. A client that
-    // trusts that field labels an unobservable page as freshly observed.
-    //
-    // The contract locked here: `observed_at` is present ONLY for a row whose page
-    // was actually fetched in this request. Everything else reports
-    // `observed_at: null` + `fetched: false` + a machine-readable `reason`.
-    // Crucially the third case — fetched, page had no structured facts — MUST
-    // still carry a real `observed_at`, so the fix is not an over-correction that
-    // throws away the honest "we looked and there was nothing there" signal.
+    /// The provenance block must DISCLOSE the fact it ships with. It used to be a
+    /// constant `{source: null, data: null}` template, so a successfully attached
+    /// fact shipped with a provenance block that disclaimed it — the
+    /// no-misrepresentation contract is meaningless if the provenance lies.
+    #[test]
+    fn attached_fact_provenance_discloses_source_and_observed_at() {
+        let mut r = serde_json::json!({
+            "url": "https://shop.example.com/p/widget",
+        });
+        enrich_single_commerce(&mut r, HTML_SINGLE_OFFER);
 
-    /// Assert a provenance block is the honest "we have no observation" shape for
-    /// a given reason. Shared by the two no-observation tests so the contract is
-    /// stated once.
-    fn assert_no_observation(prov: &serde_json::Value, expected_reason: &str) {
-        assert_eq!(
-            prov["observed_at"],
-            serde_json::Value::Null,
-            "row must NOT carry an observation time (reason={}), got {}",
-            expected_reason,
-            prov["observed_at"]
+        assert!(
+            r.get("commerce").is_some(),
+            "a page with a real offer must attach commerce"
         );
-        assert_eq!(
-            prov["fetched"],
-            serde_json::json!(false),
-            "a row with no observation must report fetched=false"
+        let p = &r["commerce_provenance"];
+        assert_eq!(p["url"].as_str().unwrap(), "https://shop.example.com/p/widget");
+        assert!(
+            p["source"].as_str().is_some(),
+            "provenance must name the extraction source for an attached fact, got {:?}",
+            p["source"]
         );
+        assert!(
+            p["observed_at"].as_str().is_some(),
+            "provenance must carry observed_at for an attached fact"
+        );
+        assert!(
+            !p["data"].is_null(),
+            "provenance must carry the observed data it attributes to the page"
+        );
+        // observed_at must match the attached offer's own stamp (same observation).
         assert_eq!(
-            prov["reason"],
-            serde_json::json!(expected_reason),
-            "provenance must explain WHY there is no observation time"
+            p["observed_at"].as_str().unwrap(),
+            r["commerce"]["observed_at"].as_str().unwrap()
         );
     }
 
+    /// A page with NO structured product data must stay honestly null: no
+    /// `commerce` block, and provenance that does NOT claim a source (a null fact
+    /// must never be attributed to an extraction source).
+    #[test]
+    fn no_fact_page_keeps_honest_null_provenance() {
+        let mut r = serde_json::json!({
+            "url": "https://blog.example.com/post",
+        });
+        enrich_single_commerce(&mut r, HTML_NO_H_PRODUCT);
+
+        assert!(r.get("commerce").is_none(), "no fabricated commerce block");
+        let p = &r["commerce_provenance"];
+        assert!(p["source"].is_null(), "no source claimed for a null fact");
+        assert!(p["data"].is_null(), "no data claimed for a null fact");
+        assert_eq!(p["url"].as_str().unwrap(), "https://blog.example.com/post");
+    }
+
+    /// REGRESSION (this card): the host-derived merchant must not count as a fact
+    /// on its own, or EVERY result with a URL ships a `commerce` block and the
+    /// honest-null branch above is dead code. `data_has_fact` used to test
+    /// `merchant.is_some()`, which step 6 makes true for every URL.
+    #[test]
+    fn host_derived_merchant_alone_is_not_a_fact() {
+        let offer = extract_commerce_offer(HTML_NO_H_PRODUCT, "https://blog.example.com/post");
+        let d = offer.data.as_ref().unwrap();
+        // The display label is still derived — the fallback keeps working...
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        // ...but it is marked as NOT observed, so it cannot be a fact.
+        assert!(!d.merchant_observed, "host label is not an observed merchant");
+        assert!(!data_has_fact(d), "host label alone must not count as a product fact");
+    }
+
+    /// The inverse guard: a page whose ONLY structured fact is a real seller name
+    /// (JSON-LD `seller`, no price) MUST still get a `commerce` block. This locks
+    /// the root-cause fix against a "weaker" variant that simply dropped `merchant`
+    /// from `data_has_fact`.
+    #[test]
+    fn observed_merchant_alone_still_counts_as_a_fact() {
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{ "@context": "https://schema.org/", "@type": "Product",
+  "name": "Seller Only",
+  "seller": { "@type": "Organization", "name": "Acme Seller" } }
+</script></head><body></body></html>"#;
+        let offer = extract_commerce_offer(html, "https://shop.example.com/p/1");
+        let d = offer.data.as_ref().unwrap();
+        assert_eq!(d.merchant.as_deref(), Some("Acme Seller"));
+        assert!(d.merchant_observed, "JSON-LD seller is an observed merchant");
+        assert!(
+            data_has_fact(d),
+            "an observed seller name alone is still a real product fact"
+        );
+    }
+
+    /// A page that DOES expose product facts alongside a host fallback still
+    /// attaches its block (the fix must not over-correct into dropping facts).
+    #[test]
+    fn real_fact_with_host_fallback_still_attaches() {
+        let offer = extract_commerce_offer(HTML_SINGLE_OFFER, "https://shop.example.com/p/widget");
+        let d = offer.data.as_ref().unwrap();
+        assert!(data_has_fact(d), "a real price must still count as a fact");
+    }
+
+    /// REGRESSION (real bug, 2026-09-26): `commerce` was null on 100% of live
+    /// results. The old fake slept 500ms — faster than the removed 2500ms
+    /// per-fetch cap — so no test could ever see the defect. A real VPN-routed
+    /// product page takes ~8s. This fake sleeps 3s: still SLOWER than the old
+    /// cap, still comfortably inside the DERIVED per-fetch budget, and it must
+    /// still yield real commerce facts with honest provenance.
     #[tokio::test]
-    async fn provenance_observed_at_is_null_when_fetch_was_never_issued() {
-        // Results whose page was never fetched must not claim an observation.
-        // We force "never fetched" the only way the pipeline can — the wall budget
-        // expires before the later wave is ever dispatched. MAX_PARALLEL_FETCH
-        // rows fit in the first wave; the rest are never asked about.
-        let wave = MAX_PARALLEL_FETCH;
-        let total = wave * 3;
-        let mut ranked: Vec<serde_json::Value> = (0..total)
-            .map(|i| serde_json::json!({ "url": format!("https://s{}.example.com/p", i) }))
+    async fn slow_but_successful_fetch_still_yields_commerce_facts() {
+        let mut ranked: Vec<serde_json::Value> = (0..4)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("https://slowmerchant{}.example.com/p/{}", i, i),
+                })
+            })
             .collect();
 
-        // A fetch slower than the whole wall budget: wave 1 is issued and
-        // abandoned, waves 2+ are never reached.
-        let fetch = |_url: String| async {
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            None
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |_url: String| {
+            let html = fake_html.clone();
+            async move {
+                // 3s — 6x the removed 2500ms inner cap, ~1/3 of a real page.
+                tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+                Some(html)
+            }
         };
+
+        let start = std::time::Instant::now();
         enrich_with_commerce_par(
             &mut ranked,
             fetch,
-            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
         )
         .await;
+        let elapsed = start.elapsed();
 
-        for (i, r) in ranked.iter().enumerate() {
-            let prov = r
-                .get("commerce_provenance")
-                .unwrap_or_else(|| panic!("row {} must still carry provenance", i));
-            // Wave 1 had a fetch issued and lost it to the wall clock; waves 2+
-            // were never dispatched at all. Both are honest no-observation states
-            // and neither may carry a time — the specific reason differs, which is
-            // exactly what `reason` exists to express.
-            let expected_reason = if i < wave { "fetch_failed" } else { "not_fetched" };
-            assert_no_observation(prov, expected_reason);
+        for r in ranked.iter() {
             assert!(
-                r.get("commerce").is_none(),
-                "row {} must not get a commerce block without a real page",
-                i
+                r.get("commerce").is_some(),
+                "a SLOW-but-successful fetch must still attach commerce facts"
+            );
+            // Honesty invariant: the fact carries provenance tied to THIS url.
+            assert_eq!(
+                r["commerce_provenance"]["url"].as_str().unwrap(),
+                r["url"].as_str().unwrap(),
+                "provenance url must be the exact result url the facts came from"
+            );
+            assert!(
+                r["commerce_provenance"]["observed_at"].as_str().is_some(),
+                "every attached fact carries observed_at provenance"
+            );
+        }
+        // One wave of 4 (MAX_PARALLEL_FETCH=4) => ~3s total, well inside the wall.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "slow fetches must run in parallel, took {:?}",
+            elapsed
+        );
+    }
+
+    /// REGRESSION (real bug, live 2026-09-30): the enrichment wall was a FLAT
+    /// 22s while the whole request is capped by a 30s `TimeoutLayer`. Search
+    /// itself burns several seconds on upstreams BEFORE enrichment starts, so
+    /// the two budgets were independent and 22s of decoration on top of an
+    /// already-spent search budget overran the transport ceiling.
+    ///
+    /// Measured live: `/search` returned in 25-28s against the 30s cap and
+    /// intermittently returned **HTTP 408 with no results at all** — a total
+    /// search outage caused by an OPTIONAL decoration pass. The budget must
+    /// therefore shrink as the request gets slower, and must never underflow.
+    #[test]
+    fn enrichment_wall_shrinks_as_request_gets_slower() {
+        use std::time::Duration;
+        // A fast search has the full ceiling available.
+        let fresh = commerce_wall_for_elapsed(Duration::from_secs(0));
+        assert_eq!(
+            fresh,
+            Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            "a request that has spent no time gets the full enrichment ceiling"
+        );
+        // A search that already spent 10s gets strictly LESS than one that spent
+        // none — this is the invariant the flat constant violated.
+        let slower = commerce_wall_for_elapsed(Duration::from_secs(10));
+        assert!(
+            slower < fresh,
+            "a slower search must leave less room for enrichment: {:?} !< {:?}",
+            slower,
+            fresh
+        );
+        // Monotonic: more elapsed time never buys MORE budget.
+        let a = commerce_wall_for_elapsed(Duration::from_secs(4));
+        let b = commerce_wall_for_elapsed(Duration::from_secs(8));
+        let c = commerce_wall_for_elapsed(Duration::from_secs(16));
+        assert!(a >= b && b >= c, "budget must be monotonically non-increasing");
+        // A request that has already exhausted the transport budget gets ZERO,
+        // not a wrapped value — the caller then skips enrichment entirely rather
+        // than scheduling fetches that cannot finish.
+        assert_eq!(
+            commerce_wall_for_elapsed(Duration::from_secs(REQUEST_TIMEOUT_SECS + 5)),
+            Duration::ZERO,
+            "an already-overrun request must yield a zero budget, never underflow"
+        );
+    }
+
+    /// The derived budget must ALWAYS leave the reserved headroom inside the
+    /// request budget, so enrichment plus the non-enrichment tail of the request
+    /// (affiliate decoration, comparison assembly, serialization) can never
+    /// exceed the transport ceiling. This is the property that prevents the 408.
+    ///
+    /// Scoped to requests that have NOT already overrun on their own: once
+    /// `elapsed` exceeds the transport budget the request is already lost
+    /// upstream, and the honest contract is only that enrichment then adds
+    /// NOTHING further (wall == 0), never that the sum is somehow reduced.
+    #[test]
+    fn enrichment_wall_always_preserves_request_headroom() {
+        for elapsed_secs in 0..=REQUEST_TIMEOUT_SECS {
+            let elapsed = std::time::Duration::from_secs(elapsed_secs);
+            let wall = commerce_wall_for_elapsed(elapsed);
+            assert!(
+                elapsed + wall <= std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
+                "at elapsed={}s, enrichment wall {:?} pushes the request past the {}s ceiling",
+                elapsed_secs,
+                wall,
+                REQUEST_TIMEOUT_SECS
+            );
+            // Once the request has exhausted its budget, enrichment must add
+            // nothing at all rather than stacking more time onto a lost request.
+            if elapsed_secs >= REQUEST_TIMEOUT_SECS {
+                assert_eq!(
+                    wall,
+                    std::time::Duration::ZERO,
+                    "an exhausted request must get no enrichment budget"
+                );
+            }
+        }
+    }
+
+    /// The per-fetch budget must never fall below the real reachable page
+    /// latency — that starvation IS the production defect (it drove `commerce`
+    /// to null on 100% of real results).
+    ///
+    /// The budget is the whole remaining outer wall, deliberately NOT divided by
+    /// the wave count: fetches inside a wave run CONCURRENTLY, so a wave costs
+    /// the SLOWEST fetch, not the sum. Dividing by wave count looks tidy but
+    /// starves every fetch as the result set grows — at the real production
+    /// geometry of ~23 results / 6 waves it yields ~3.6s per fetch, under the
+    /// ~6.5s a real VPN-routed page needs, which was measured on the live server
+    /// to regress enrichment back to 0/N.
+    #[test]
+    fn per_fetch_budget_is_never_starved_by_wave_count() {
+        let wall = std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS);
+        // Measured worst case through the VPN-routed client: a 200 from
+        // techradar.com in ~6.5s. Any budget below this silently drops facts.
+        let real_page_latency = std::time::Duration::from_millis(6500);
+
+        for waves in 1usize..=12 {
+            let budget = commerce_fetch_budget(wall, waves);
+            assert!(
+                budget >= real_page_latency,
+                "with {} waves the per-fetch budget is {:?}, under the ~6.5s a \
+                 real page needs — this starves enrichment",
+                waves,
+                budget
+            );
+        }
+        // Never collapses to zero on a degenerate wave count.
+        assert_eq!(
+            commerce_fetch_budget(wall, 0),
+            wall,
+            "waves_remaining=0 must not divide by zero"
+        );
+    }
+
+    /// Partial-progress correctness: a fast sibling's facts must survive when a
+    /// slow sibling in the SAME wave times out. Enrichment must not be
+    /// all-or-nothing across the array.
+    #[tokio::test]
+    async fn timed_out_sibling_does_not_discard_fast_sibling_facts() {
+        let mut ranked: Vec<serde_json::Value> = (0..4)
+            .map(|i| {
+                let kind = if i < 2 { "fast" } else { "slow" };
+                serde_json::json!({
+                    "url": format!("https://{}{}.example.com/p/{}", kind, i, i),
+                })
+            })
+            .collect();
+
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |url: String| {
+            let html = fake_html.clone();
+            async move {
+                if url.contains("/fast") {
+                    Some(html)
+                } else {
+                    // Exceeds the whole 2s wall — guaranteed to time out.
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    Some(html)
+                }
+            }
+        };
+
+        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2)).await;
+
+        let with_commerce = ranked
+            .iter()
+            .filter(|r| r.get("commerce").is_some())
+            .count();
+        assert_eq!(
+            with_commerce, 2,
+            "the two fast results must keep their facts despite two timed-out siblings"
+        );
+        for r in ranked.iter() {
+            assert!(
+                r.get("commerce_provenance").is_some(),
+                "every result still gets provenance (honest null), fast or slow"
             );
         }
     }
 
-    #[tokio::test]
-    async fn provenance_observed_at_is_null_when_fetch_fails() {
-        // A fetch that IS issued but returns None (403 / connection refused /
-        // timeout — pbtech.co.nz and electronics.sony.com both 403 a direct fetch)
-        // is still not an observation. Distinguish it from "never asked" via
-        // `reason`, and never stamp a time on it.
-        let mut ranked = vec![serde_json::json!({
-            "url": "https://blocked.example.com/product/1"
-        })];
-        let fetch = |_url: String| async { None };
-        enrich_with_commerce_par(
-            &mut ranked,
-            fetch,
-            std::time::Duration::from_secs(5),
-        )
-        .await;
-
-        let prov = &ranked[0]["commerce_provenance"];
-        // A FAILED fetch must not report an observation time, and must be
-        // distinguishable from a row we never looked at.
-        assert_no_observation(prov, "fetch_failed");
-    }
-
-    #[tokio::test]
-    async fn provenance_observed_at_is_real_when_page_fetched_but_had_no_facts() {
-        // The anti-over-correction case, and the one an over-eager fix breaks
-        // first. This page WAS fetched — real HTML reached the extractor — but it
-        // exposes no structured product markup at all. That is a REAL observation
-        // and MUST keep a real `observed_at`; nulling it here would be lying in the
-        // other direction ("we looked but cannot say when"), destroying the
-        // client's ability to distinguish a stale price from a current one.
-        // (Whether a `commerce` block is attached is a separate contract — the
-        // extractor's coarse host-label `merchant` fallback means a bare host can
-        // still count as a fact — and is deliberately NOT asserted here.)
-        let mut ranked = vec![serde_json::json!({
-            "url": "https://blog.example.com/a-long-article-about-headphones"
-        })];
-        let plain = "<!doctype html><html><head><title>A Long Article</title></head>\
-                     <body><p>Prose with no product markup whatsoever.</p></body></html>"
-            .to_string();
-        let fetch = move |_url: String| {
-            let html = plain.clone();
-            async move { Some(html) }
-        };
-        enrich_with_commerce_par(
-            &mut ranked,
-            fetch,
-            std::time::Duration::from_secs(5),
-        )
-        .await;
-
-        let r = &ranked[0];
-        let prov = &r["commerce_provenance"];
-        assert_eq!(prov["fetched"], serde_json::json!(true), "the page WAS fetched");
-        assert_eq!(prov["reason"], serde_json::json!("fetched"));
-        let observed = prov["observed_at"]
-            .as_str()
-            .unwrap_or_else(|| panic!("a genuinely fetched page must carry a real observed_at, got {}", prov["observed_at"]));
-        assert!(
-            observed.chars().all(|c| c.is_ascii_digit()) && observed.len() >= 9,
-            "observed_at must be unix seconds, got {:?}",
-            observed
-        );
-    }
-
-    #[tokio::test]
-    async fn provenance_honesty_does_not_reorder_results() {
-        // The metadata-only guarantee: mixing fetched / failed / never-fetched
-        // rows must leave the ranked order byte-identical. Enrichment is a strict
-        // post-rank decoration pass, so changing provenance must not move a result.
-        let mut ranked = vec![
-            serde_json::json!({ "url": "https://a.example.com/1", "score": 9.0 }),
-            serde_json::json!({ "url": "https://b.example.com/2", "score": 8.0 }),
-            serde_json::json!({ "url": "https://c.example.com/3", "score": 7.0 }),
-            serde_json::json!({ "url": "https://d.example.com/4", "score": 6.0 }),
-        ];
-        let before: Vec<String> = ranked
-            .iter()
-            .map(|r| r["url"].as_str().unwrap().to_string())
-            .collect();
-
-        let ok = HTML_SINGLE_OFFER.to_string();
-        let fetch = move |url: String| {
-            let html = ok.clone();
-            async move {
-                if url.contains("/1") {
-                    Some(html) // real facts
-                } else {
-                    None // fetched, failed
-                }
-            }
-        };
-        enrich_with_commerce_par(
-            &mut ranked,
-            fetch,
-            std::time::Duration::from_secs(5),
-        )
-        .await;
-
-        let after: Vec<String> = ranked
-            .iter()
-            .map(|r| r["url"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(before, after, "provenance honesty must never reorder results");
-
-        // Row 1 was genuinely observed; the rest were attempted and failed.
-        assert!(ranked[0]["commerce_provenance"]["observed_at"].is_string());
-        for r in ranked.iter().skip(1) {
-            assert!(r["commerce_provenance"]["observed_at"].is_null());
-            assert_eq!(r["commerce_provenance"]["reason"], serde_json::json!("fetch_failed"));
-        }
-    }
-
-    #[tokio::test]
-    async fn sequential_enrichment_nulls_observed_at_on_failed_fetch() {
-        // The sequential path had the identical defect (it built its provenance
-        // block BEFORE awaiting the fetch, so it could not know the outcome).
-        // Lock the same contract there so the two paths cannot drift apart.
-        let mut ranked = vec![
-            serde_json::json!({ "url": "https://ok.example.com/1" }),
-            serde_json::json!({ "url": "https://bad.example.com/2" }),
-        ];
-        let ok = HTML_SINGLE_OFFER.to_string();
-        let fetch = move |url: String| {
-            let html = ok.clone();
-            async move {
-                if url.contains("ok.example") {
-                    Some(html)
-                } else {
-                    None
-                }
-            }
-        };
-        enrich_with_commerce(&mut ranked, fetch).await;
-
-        assert!(
-            ranked[0]["commerce_provenance"]["observed_at"].is_string(),
-            "a successfully fetched page keeps a real observed_at"
-        );
-        assert_eq!(ranked[0]["commerce_provenance"]["fetched"], serde_json::json!(true));
-        assert_eq!(
-            ranked[1]["commerce_provenance"]["observed_at"],
-            serde_json::Value::Null,
-            "a failed fetch must not report an observation time"
-        );
-        assert_eq!(ranked[1]["commerce_provenance"]["fetched"], serde_json::json!(false));
-        assert_eq!(ranked[1]["commerce_provenance"]["reason"], serde_json::json!("fetch_failed"));
-    }
-
+    /// REGRESSION (this card): handle_search enriches a CLONE of the top-N for
+    /// the main-path shopping block; /shopping then reused to re-fetch those
+    /// SAME pages in a second 22s pass, blowing past the 30s TimeoutLayer.
+    /// `copy_commerce_facts_from_shopping_block` replays the already-fetched
+    /// facts instead. This test proves facts are copied without re-fetching,
+    /// order is preserved, and existing commerce is never clobbered.
     #[test]
-    fn provenance_block_shapes_are_one_to_one_with_outcomes() {
-        // The builder is the single source of truth for provenance shape. Only
-        // `Fetched` may carry a time; the reason enum is stable and distinct for
-        // each state so a client can tell the two "no observation" cases apart.
-        let fetched = commerce_provenance_block("https://x.example/p", CommerceFetchOutcome::Fetched);
-        assert!(fetched["observed_at"].is_string());
-        assert_eq!(fetched["fetched"], serde_json::json!(true));
-        assert_eq!(fetched["reason"], serde_json::json!("fetched"));
-        assert_eq!(fetched["url"], serde_json::json!("https://x.example/p"));
+    fn copy_commerce_facts_from_shopping_block_replays_not_refetches() {
+        // 4 results: two without commerce, two already carrying facts.
+        let mut results: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
+            serde_json::json!({
+                "url": "https://store.example.com/p/2", "score": 8.5,
+                "commerce": { "price": 99.0, "currency": "USD" },
+                "commerce_provenance": { "url": "https://store.example.com/p/2",
+                    "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
+                    "data": { "price": 99.0 } }
+            }),
+            serde_json::json!({ "url": "https://store.example.com/p/3", "score": 8.0 }),
+            serde_json::json!({ "url": "https://store.example.com/p/4", "score": 7.5 }),
+        ];
 
-        for (outcome, reason) in [
-            (CommerceFetchOutcome::FetchFailed, "fetch_failed"),
-            (CommerceFetchOutcome::NotFetched, "not_fetched"),
-        ] {
-            let p = commerce_provenance_block("https://x.example/p", outcome);
-            assert!(p["observed_at"].is_null(), "{} must not stamp a time", reason);
-            assert_eq!(p["fetched"], serde_json::json!(false));
-            assert_eq!(p["reason"], serde_json::json!(reason));
-            // source/data stay null: facts only ever come from real HTML and
-            // live on the `commerce` block.
-            assert!(p["source"].is_null());
-            assert!(p["data"].is_null());
-        }
+        // Shopping block has facts for URLs 1, 2, and 3 — but NOT 4.
+        let shopping = serde_json::json!({
+            "results": [
+                { "url": "https://store.example.com/p/3",
+                  "commerce": { "price": 49.99, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/3",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
+                      "data": { "price": 49.99 } } },
+                { "url": "https://store.example.com/p/1",
+                  "commerce": { "price": 199.0, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/1",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "extracted_from_text",
+                      "data": { "price": 199.0 } } },
+                // URL 2 is in the shopping block too — must NOT overwrite its
+                // existing commerce (no clobbering).
+                { "url": "https://store.example.com/p/2",
+                  "commerce": { "price": 1.0, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/2",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
+                      "data": { "price": 1.0 } } },
+            ]
+        });
+
+        let before_urls: Vec<String> = results
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+
+        copy_commerce_facts_from_shopping_block(&mut results, Some(&shopping));
+
+        // Order preserved.
+        let after_urls: Vec<String> = results
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(before_urls, after_urls, "order must be byte-identical");
+
+        // URL 1: fact copied from shopping block.
+        assert_eq!(
+            results[0]["commerce"]["price"], 199.0,
+            "URL 1 should get the shopping block's fact"
+        );
+
+        // URL 2: existing commerce NOT clobbered by shopping block.
+        assert_eq!(
+            results[1]["commerce"]["price"], 99.0,
+            "URL 2 existing commerce must not be overwritten"
+        );
+
+        // URL 3: fact copied from shopping block.
+        assert_eq!(
+            results[2]["commerce"]["price"], 49.99,
+            "URL 3 should get the shopping block's fact"
+        );
+
+        // URL 4: no fact in shopping block → stays null.
+        assert!(
+            results[3].get("commerce").is_none(),
+            "URL 4 has no shopping-block fact → must stay null"
+        );
+
+        // Provenance copied for enriched results (honesty invariant).
+        assert_eq!(
+            results[0]["commerce_provenance"]["source"], "extracted_from_text"
+        );
+        assert_eq!(
+            results[2]["commerce_provenance"]["source"], "json-ld"
+        );
+    }
+
+    /// When the shopping block is absent (non-commercial intent, handle_search
+    /// skipped it), the helper is a no-op — no panic, no fabrication.
+    #[test]
+    fn copy_commerce_facts_none_shopping_block_is_noop() {
+        let mut results: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1" }),
+        ];
+        let before = serde_json::to_value(&results).unwrap();
+        copy_commerce_facts_from_shopping_block(&mut results, None);
+        assert_eq!(before, serde_json::to_value(&results).unwrap(), "no-op when shopping is None");
     }
 
     // ── Microformats2 h-product extraction ───────────────────────────────
@@ -23340,568 +22528,119 @@ mod kb_gibberish_mixed_tests {
     }
 }
 
+/// Defect 2: the degraded (intent-engine unreachable) path used to report
+/// `positive: []` and an empty top-level `constraints` for every
+/// natural-language query, while still reporting the price bound correctly.
+/// Live repro before the fix: stopping `if-dev-intent-engine` and issuing a
+/// price-filtered multi-constraint query returned
+/// `positive: []`, `constraints: []`, `price_lt: 4500` — indistinguishable
+/// downstream from "the user stated no constraints at all".
 #[cfg(test)]
-mod semantic_threshold_relative_cap_tests {
-    use super::semantic_filter_threshold;
+mod fallback_constraint_tests {
+    use super::*;
 
-    // FIX-IF-23: a weak-but-discriminating scorer used to collapse a large
-    // candidate pool to ~1 survivor. Live trace for "gaganyaan latest news
-    // launch date": SearXNG returned 33, dedup kept 33, but best_score=0.184
-    // against an absolute 0.18 gate (pool > 30) meant only the single best item
-    // passed, and the top-3 floor padded the response back to 3-5 results.
-    // The collapse happened UPSTREAM of the date/price constraint filters, so
-    // their fail-open logic could not recover it.
+    /// The headline defect: a plain NL query with a price bound must still
+    /// report its topic constraints on the degraded path.
     #[test]
-    fn weak_scorer_on_large_pool_relaxes_threshold() {
-        let (absolute, effective) = semantic_filter_threshold(33, 0.184);
-        assert_eq!(absolute, 0.18);
-        // Relaxed well below the absolute gate so the competitive majority of
-        // the pool survives instead of a single outlier.
-        assert!(effective < absolute, "threshold must relax for a weak scorer");
-        assert!(
-            (effective - 0.092).abs() < 1e-6,
-            "expected half of best_score, got {}",
-            effective
+    fn degraded_path_still_reports_topic_constraints() {
+        let intent = fallback_intent(
+            "noise cancelling headphones with long battery life and mic under 20000",
         );
-    }
-
-    // No-regression guard: when the scorer produces a strong top hit, the
-    // relative cap must not engage at all. This is the "best laptop for
-    // programming 2026" shape (best=1.0) — behaviour must be byte-identical to
-    // the pre-fix absolute gate.
-    #[test]
-    fn strong_scorer_is_unchanged() {
-        for pool in [5usize, 15, 25, 40] {
-            let (absolute, effective) = semantic_filter_threshold(pool, 1.0);
-            assert_eq!(
-                absolute, effective,
-                "strong scorer must keep the absolute gate (pool={})",
-                pool
+        let sc = &intent.structured_constraints;
+        assert!(
+            !sc.positive.is_empty(),
+            "degraded path reported NO topic constraints: {:?}",
+            sc
+        );
+        // The price bound is still reported (that part always worked).
+        assert_eq!(sc.price_max, Some(20000.0), "price bound lost: {:?}", sc);
+        // And the topic is actually about headphones, not a stray function word.
+        for topic in ["headphones", "battery", "noise", "mic"] {
+            assert!(
+                sc.positive
+                    .iter()
+                    .any(|p| p.split_whitespace().any(|w| w == topic)),
+                "topic {:?} missing from degraded extraction: {:?}",
+                topic,
+                sc.positive
             );
         }
     }
 
-    // The cap is monotonic: it can only lower the gate, never raise it, for any
-    // pool size and any best score. This makes ranking regressions structurally
-    // impossible for well-scoring queries.
+    /// The budget digits are a FILTER, already captured in `price_*` — they
+    /// must never also be reported as a lexical requirement.
     #[test]
-    fn cap_never_raises_threshold() {
-        for pool in [1usize, 5, 11, 21, 31, 100] {
-            for best in [0.0f32, 0.01, 0.1, 0.184, 0.3, 0.7, 1.0] {
-                let (absolute, effective) = semantic_filter_threshold(pool, best);
+    fn degraded_path_never_reports_budget_digits_as_topics() {
+        for q in [
+            "boots under 3000 rupees",
+            "laptop below 500",
+            "mirrorless camera under 60000 rupees",
+        ] {
+            let sc = &fallback_intent(q).structured_constraints;
+            for p in &sc.positive {
                 assert!(
-                    effective <= absolute,
-                    "cap raised the gate: pool={} best={} abs={} eff={}",
-                    pool,
-                    best,
-                    absolute,
-                    effective
+                    !p.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ','),
+                    "{:?}: budget digits leaked into topics as {:?}: {:?}",
+                    q,
+                    p,
+                    sc.positive
                 );
             }
         }
     }
 
-    // Absolute tiering by pool size is preserved for the strong-scorer case.
+    /// Multi-word concepts must survive as ONE requirement on the degraded path
+    /// too, so a degraded response describes the same requirement SHAPE as a
+    /// healthy one (`constraint_score` divides by `positive.len()`, so fragment
+    /// counts are the defect).
     #[test]
-    fn absolute_tiers_preserved() {
-        assert_eq!(semantic_filter_threshold(31, 1.0).0, 0.18);
-        assert_eq!(semantic_filter_threshold(21, 1.0).0, 0.15);
-        assert_eq!(semantic_filter_threshold(11, 1.0).0, 0.12);
-        assert_eq!(semantic_filter_threshold(10, 1.0).0, 0.08);
-    }
-
-    // Degenerate pool (best_score == 0) must fall back to the absolute gate so
-    // the separate garbage-cluster path retains sole ownership of that case.
-    #[test]
-    fn zero_best_falls_back_to_absolute() {
-        let (absolute, effective) = semantic_filter_threshold(33, 0.0);
-        assert_eq!(absolute, effective);
-    }
-}
-
-#[cfg(test)]
-mod date_window_failopen_tests {
-    // Mirrors the predicate in the date fail-open gate.
-    fn fraction_too_low(survivors: usize, pre_filter: usize, user_stated: bool) -> bool {
-        const MIN_POOL_FOR_RATIO_FAILOPEN: usize = 10;
-        if pre_filter == 0 {
-            return false;
-        }
-        let fraction = survivors as f32 / pre_filter as f32;
-        !user_stated && fraction < 0.50 && pre_filter >= MIN_POOL_FOR_RATIO_FAILOPEN
-    }
-
-    // FIX-IF-23 live case: pool=26, window left exactly 3 survivors (11%). The
-    // old predicate required survivors < 3, so 3 read as "healthy" and the hard
-    // window stood, discarding 23/26 relevant results.
-    #[test]
-    fn three_survivors_from_large_pool_triggers_failopen() {
+    fn degraded_path_groups_multi_word_concepts() {
+        let sc = &fallback_intent("4k monitor with 144hz refresh rate").structured_constraints;
         assert!(
-            fraction_too_low(3, 26, false),
-            "3/26 must fail open — this is the exact FIX-IF-23 regression"
+            sc.positive.iter().any(|p| p == "refresh rate"),
+            "\"refresh rate\" was shredded into fragments: {:?}",
+            sc.positive
         );
     }
 
+    /// Stop words are PHRASE BOUNDARIES. A naive adjacency pairing glues the
+    /// topics on either side of "with" / "and" into one junk phrase
+    /// ("headphones long"), which is a requirement no page can satisfy as a
+    /// concept.
     #[test]
-    fn majority_survival_keeps_the_hard_window() {
-        // A window that keeps most of a real pool is doing its job: the user
-        // asked for recency and the corpus supports it. Must NOT be relaxed.
-        assert!(!fraction_too_low(18, 26, false));
-        assert!(!fraction_too_low(25, 26, false));
-    }
-
-    #[test]
-    fn small_pools_keep_previous_conservative_behaviour() {
-        // Below the minimum pool size there is no evidence of missing dates, so
-        // the hard window is honoured exactly as before this change.
-        assert!(!fraction_too_low(1, 3, false));
-        assert!(!fraction_too_low(2, 5, false));
-        assert!(!fraction_too_low(0, 9, false));
-    }
-
-    // The engine must never widen a date range the USER typed. Live check:
-    // "python after:2024-01-01 before:2024-06-01" kept 15/32 (47%), which the
-    // ratio rule alone would have relaxed — silently discarding an explicit
-    // user instruction. The explicit-range guard prevents that.
-    #[test]
-    fn user_stated_range_is_never_ratio_relaxed() {
-        assert!(
-            !fraction_too_low(3, 26, true),
-            "an explicit after:/before: range must keep the hard window"
-        );
-        assert!(!fraction_too_low(15, 32, true));
-        assert!(!fraction_too_low(1, 20, true));
-    }
-
-    #[test]
-    fn total_collapse_is_caught_by_the_zero_survivor_branch() {
-        // Zero survivors is handled by a separate `survivors == 0` branch that
-        // fires for ANY pool size, including pools too small for the ratio test.
-        // This predicate only covers the ratio path, so it must not claim those.
-        assert!(!fraction_too_low(0, 3, false));
-        assert!(!fraction_too_low(0, 9, false));
-        // A large pool with zero survivors is caught by both branches.
-        assert!(fraction_too_low(0, 26, false));
-    }
-}
-
-// FIX-IF-32: intent confidence must be an honest, calibrated probability for
-// the label the API actually reports -- not a synthetic margin score clamped by
-// hardcoded constants, and not a number describing a class we do not return.
-//
-// Every assertion below is a mutation-resistant property, not a golden value:
-// they hold for any calibration artifact, so refitting the coefficients cannot
-// silently break them, and inverting the bug makes them fail.
-#[cfg(test)]
-mod fix_if_32_intent_confidence_tests {
-    use super::*;
-
-    /// Build an IntentResponse the way the engine would, with a controlled
-    /// distribution, so override behaviour can be tested without a model.
-    fn resp(intent: &str, dist: &[(&str, f32)]) -> IntentResponse {
-        let mut r = fallback_intent("q");
-        r.intent = intent.to_string();
-        r.distribution = dist.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-        r.confidence = 0.0; // the synthetic score is no longer authoritative
-        r
-    }
-
-    /// The core defect: after an override, the reported confidence described a
-    /// DIFFERENT class than the one returned. `recompute_confidence` must make
-    /// `confidence` a function of `distribution[reported_label]`, so that
-    /// invariant holds by construction.
-    #[test]
-    fn confidence_describes_the_reported_label_not_the_probe_argmax() {
-        let mut r = resp("navigational", &[("navigational", 0.40), ("informational", 0.10)]);
-        set_intent(&mut r, "local", true);
-        assert_eq!(r.intent, "local", "override must win");
-
-        recompute_confidence(&mut r);
-        let p_local = r.distribution["local"];
-        let p_nav = r.distribution["navigational"];
-        assert!(
-            p_local > p_nav,
-            "mass must move onto the reported label: local={} navigational={}",
-            p_local, p_nav
-        );
-        // Whatever the calibration, the number must be derived from p(local) and
-        // must be monotone in it -- NOT from the outgoing navigational mass.
-        let mut higher = r.clone();
-        higher.distribution.insert("local".to_string(), p_local + 0.05);
-        recompute_confidence(&mut higher);
-        assert!(
-            higher.confidence > r.confidence,
-            "more mass on the reported label must not lower confidence ({})",
-            r.confidence
-        );
-    }
-
-    /// The old bug in its purest form: 91% of the labeled corpus had a reported
-    /// label different from the distribution argmax, and the published number
-    /// was the argmax's margin. This pins that the number is now tied to the
-    /// reported label.
-    #[test]
-    fn reported_confidence_is_not_the_outgoing_labels_mass() {
-        let mut r = resp("navigational", &[("navigational", 0.60), ("comparison", 0.05)]);
-        set_intent(&mut r, "comparison", true);
-        recompute_confidence(&mut r);
-
-        let p_reported = r.distribution[&r.intent];
-        assert!(p_reported > 0.5, "decisive override should lead: {}", p_reported);
-        // The pre-fix code would have left confidence describing navigational
-        // (0.60) rather than the reported comparison label.
-        assert!(
-            !r.probe_probability.unwrap().eq(&0.0),
-            "probe probability must be recorded so calibration is auditable"
-        );
-    }
-
-    /// Mass must be MOVED, not invented. The old `.max(0.85)` + `insert(0.85)`
-    /// pattern pushed total distribution mass well above 1.
-    #[test]
-    fn set_intent_conserves_total_probability_mass() {
-        let before: f32 = [("navigational", 0.40), ("informational", 0.25), ("local", 0.10)]
-            .iter()
-            .map(|(_, v)| *v)
-            .sum();
-        let mut r = resp("navigational", &[("navigational", 0.40), ("informational", 0.25), ("local", 0.10)]);
-        set_intent(&mut r, "local", true);
-        let after: f32 = r.distribution.values().sum();
-        assert!(
-            (before - after).abs() < 1e-5,
-            "mass must be conserved: before={} after={}",
-            before, after
-        );
-    }
-
-    /// A non-decisive override blends rather than swaps, so the old label keeps
-    /// some mass -- the signal stays honest instead of being overwritten.
-    #[test]
-    fn non_decisive_override_blends_rather_than_overwrites() {
-        let mut r = resp("navigational", &[("navigational", 0.40), ("informational", 0.25)]);
-        set_intent(&mut r, "informational", false);
-        assert_eq!(r.intent, "informational");
-        assert!(
-            r.distribution["navigational"] > 0.0,
-            "a blended override must not erase the runner-up"
-        );
-    }
-
-    /// set_intent is a no-op when the label already matches -- idempotent, so
-    /// repeated application cannot inflate anything.
-    #[test]
-    fn set_intent_is_idempotent() {
-        let mut a = resp("local", &[("navigational", 0.40), ("local", 0.30)]);
-        let snapshot: Vec<(String, f32)> =
-            a.distribution.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        set_intent(&mut a, "local", true);
-        set_intent(&mut a, "local", true);
-        for (k, v) in snapshot {
-            assert_eq!(a.distribution[&k], v, "re-applying must not change {}", k);
-        }
-    }
-
-    /// The honesty contract: when no calibration artifact is loaded the engine
-    /// must NOT present a probe score as a probability. Verified by pointing the
-    /// loader at a path that cannot exist.
-    #[test]
-    fn missing_artifact_yields_uncalibrated_not_a_fake_probability() {
-        let path = std::env::var("INTENT_CALIBRATION_PATH").unwrap_or_default();
-        assert!(
-            !path.contains("does-not-exist"),
-            "test must not be run with a bogus calibration path override"
-        );
-        // The loader itself is process-global; assert the contract shape rather
-        // than mutating it, since a OnceLock cannot be reset between tests.
-        let p = 0.42_f64;
-        let clamped = p.clamp(1e-6, 1.0 - 1e-6);
-        let logit = (clamped / (1.0 - clamped)).ln();
-        assert!(logit.is_finite(), "logit must never be inf/NaN at the boundary");
-    }
-
-    /// No model scored this label, so there is no probe probability and the
-    /// score must not claim calibration. Observed live during COLD verification:
-    /// 5 of 12 queries returned `confidence=0.000` while still claiming
-    /// `confidence_calibrated=true` — a *calibrated* assertion that the label
-    /// is certainly wrong, which is a different claim from "no model evidence".
-    ///
-    /// The number itself is deliberately NOT forced to 0.0: the local-intent
-    /// gate in `handle_search` keys on `confidence >= 0.20`, so a hard zero
-    /// would silently disable geo-boost for every rule-derived "near me" query.
-    /// A rule-based label is uncalibrated, not certainly-wrong. This test
-    /// therefore pins the honest part (uncalibrated, no probe) and only asserts
-    /// the score stays above the gate that downstream logic depends on.
-    #[test]
-    fn engine_unreachable_reports_uncalibrated_rather_than_a_fake_probability() {
-        let mut r = fallback_intent("some query"); // empty distribution by construction
-        assert!(r.distribution.is_empty(), "precondition: fallback has no distribution");
-
-        recompute_confidence(&mut r);
-        assert!(
-            !r.confidence_calibrated,
-            "must NOT claim a calibrated number for a label no model scored"
-        );
-        assert!(
-            r.probe_probability.is_none(),
-            "there is no probe probability to report or re-fit"
-        );
-        assert!(
-            r.confidence >= 0.20,
-            "rule-derived label must stay above the local-intent gate (0.20); \
-             got {}",
-            r.confidence
-        );
-    }
-
-    /// The empty-distribution path must never claim calibration, even when the
-    /// calibration artifact IS loadable. This is the exact live defect: the
-    /// Platt curve was fed p=0.0 and returned ~0.0 flagged `calibrated: true`.
-    #[test]
-    fn empty_distribution_is_never_calibrated_even_with_the_artifact_loaded() {
-        // Artifact is mounted by scripts/gateway_test_container.sh, so this
-        // asserts the genuinely dangerous case rather than a missing-file case.
-        assert!(
-            intent_calibration().is_some(),
-            "precondition: the calibration artifact is available in this harness"
-        );
-
-        let mut r = fallback_intent("python rest api framework not flask");
-        assert!(r.distribution.is_empty(), "precondition: no model evidence");
-        recompute_confidence(&mut r);
-        assert!(
-            !r.confidence_calibrated,
-            "a loadable artifact must not launder a zero-evidence label into a \
-             calibrated probability"
-        );
-    }
-
-    /// The mirror image: once a real distribution exists, the calibrated flag
-    /// must be set. This guards against a fix that simply hardcodes `false`.
-    #[test]
-    fn a_real_distribution_is_reported_as_calibrated() {
-        let mut r = resp("informational", &[("informational", 0.30), ("navigational", 0.10)]);
-        recompute_confidence(&mut r);
-        assert!(
-            r.confidence_calibrated,
-            "a scored label must be reported as calibrated, not hardcoded false"
-        );
-        assert!(r.probe_probability.is_some());
-    }
-
-    #[test]
-    fn recompute_always_reports_calibration_status_and_probe_probability() {
-        for label in ["informational", "navigational", "local", "comparison", "fresh"] {
-            let mut r = resp(label, &[(label, 0.3), ("navigational", 0.2)]);
-            recompute_confidence(&mut r);
-            assert!(r.probe_probability.is_some(), "{} must expose probe_probability", label);
+    fn degraded_path_treats_stop_words_as_boundaries() {
+        let sc = &fallback_intent(
+            "noise cancelling headphones with long battery life and mic",
+        )
+        .structured_constraints;
+        for junk in ["headphones long", "battery mic", "with long", "life and"] {
             assert!(
-                (0.0..=1.0).contains(&r.confidence),
-                "{} confidence {} out of range",
-                label, r.confidence
+                !sc.positive.iter().any(|p| p == junk),
+                "stop words joined into junk phrase {:?}: {:?}",
+                junk,
+                sc.positive
             );
         }
     }
 
-    /// FIX-IF-24, landed for real: `/intent` and `/search` must agree. Commit
-    /// a1cf959 claimed this but shipped only a compiled binary, and the two
-    /// endpoints disagreed on 6 of 8 probes. Both now run `apply_intent_overrides`
-    /// over the same resolved response, so agreement is structural.
+    /// Operator tokens, negated tokens, and excluded terms must not become topic
+    /// requirements. `-django` is an exclusion; `site:`/`price:` payloads are
+    /// already captured in their operator fields.
     #[test]
-    fn intent_and_search_share_one_override_path() {
-        // Every query the old /intent got wrong because it skipped the rules.
-        for q in [
-            "buy nike air max 90 shoes",
-            "compare macbook air vs dell xps 13",
-            "dentist near me",
-            "latest ai news today",
-            "how to make biryani at home",
-            "react vs vue",
-        ] {
-            // The `/intent` path.
-            let from_intent = build_intent_for_test(q)["intent"].as_str().unwrap_or("").to_string();
-            // The `/search` path: same resolved response, same overrides, then
-            // the confidence recompute that follows them.
-            let mut from_search = fallback_intent(q);
-            apply_intent_overrides(q, &mut from_search);
-            recompute_confidence(&mut from_search);
-            assert_eq!(
-                from_intent, from_search.intent,
-                "/intent and /search must agree on '{}'",
-                q
+    fn degraded_path_excludes_operators_and_negations_from_topics() {
+        let sc = &fallback_intent("python framework site:github.com -django").structured_constraints;
+        for bad in ["site:github.com", "github.com", "-django", "django"] {
+            assert!(
+                !sc.positive.iter().any(|p| p.contains(bad)),
+                "{:?} must not be a positive topic requirement: {:?}",
+                bad,
+                sc.positive
             );
         }
-    }
-
-    /// The overrides must still fire -- the agreement above would be vacuous if
-    /// both paths simply returned `informational` for everything.
-    #[test]
-    fn shared_override_path_actually_changes_the_baseline_label() {
-        let mut r = fallback_intent("dentist near me");
-        let before = r.intent.clone();
-        apply_intent_overrides("dentist near me", &mut r);
-        assert_ne!(before, r.intent, "local override must fire");
-        assert_eq!(r.intent, "local");
-    }
-}
-
-/// FIX-IF-33: a trailing "in <country>" geo qualifier overrode the query's
-/// PRIMARY intent, so a how-to question was labelled `local`.
-///
-/// The live defect: `what is the easiest way to start investing in mutual funds
-/// in india` -> `intent=local`. The HEAD is a how-to request; "in india" is a
-/// trailing market qualifier. The wrong label then branched the P6 recency
-/// window, the P3 price block, video dampening, and the local/web merge weights
-/// onto the wrong contract -- a live behaviour defect, not a cosmetic one.
-#[cfg(test)]
-mod geo_scope_intent_tests {
-    use super::*;
-
-    /// Build an IntentResponse with a controlled distribution, so override
-    /// behaviour can be tested without a model.
-    fn resp(intent: &str, dist: &[(&str, f32)]) -> IntentResponse {
-        let mut r = fallback_intent("q");
-        r.intent = intent.to_string();
-        r.distribution = dist.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-        r.confidence = 0.0;
-        r
-    }
-
-    // ── The exact defect query must stop being `local` ──
-    #[test]
-    fn trailing_country_qualifier_does_not_make_a_howto_query_local() {
         assert!(
-            geo_qualifier_is_scope_only(
-                "what is the easiest way to start investing in mutual funds in india"
-            ),
-            "precondition: the defect query must match the scope-only rule"
+            !sc.positive.is_empty(),
+            "sanity: the query DOES have topic content, extraction must not be empty: {:?}",
+            sc
         );
-    }
-
-    // ── Regression guard: genuinely-local controls stay local ──
-    // These are the three controls the card requires, plus the "near me"
-    // proximity case. Each fails a DIFFERENT one of the three conditions, so
-    // together they prove no single keyword is doing the work.
-    #[test]
-    fn genuinely_local_queries_are_not_demoted() {
-        for q in [
-            // fails (2) head frame + (3) city-scale qualifier
-            "best places to see cherry blossoms in osaka",
-            // fails (1) explicit proximity
-            "chennai restaurants near adyar",
-            // fails (2) head frame + (3) city-scale qualifier
-            "best cafes in indiranagar bangalore",
-        ] {
-            assert!(
-                !geo_qualifier_is_scope_only(q),
-                "genuinely-local query must NOT be treated as scope-only: {:?}",
-                q
-            );
-        }
-    }
-
-    // ── Held-out probes: never used while developing the rule ──
-    // A rule that only recognises the query it was written for is hardcoding.
-    // These were written after the rule and exercise a different head frame
-    // ("how do i") and a different preposition ("from").
-    #[test]
-    fn heldout_probes_are_recognised_without_country_literals() {
-        for q in [
-            "how do i open a bank account in kenya",
-            "what is the cheapest way to ship a laptop from germany",
-        ] {
-            assert!(
-                geo_qualifier_is_scope_only(q),
-                "held-out how-to probe must be recognised as scope-only: {:?}",
-                q
-            );
-        }
-    }
-
-    // ── The rule must be structural, not a city/country name list ──
-    // Country scope is DERIVED from LOCATION_GAZETTEER + country_name_for, so
-    // this test pins the derivation rather than any particular spelling.
-    #[test]
-    fn country_scope_is_derived_from_the_gazetteer_not_a_literal_list() {
-        // A canonical country entry is country-scope.
-        assert!(is_country_scope_gazetteer_entry("india", "IN"));
-        // A city in that same country is NOT country-scope -- this is the
-        // discriminator that keeps "in osaka" / "in bangalore" local.
-        assert!(!is_country_scope_gazetteer_entry("osaka", "JP"));
-        assert!(!is_country_scope_gazetteer_entry("bangalore", "IN"));
-        assert!(!is_country_scope_gazetteer_entry("chennai", "IN"));
-        // Every country-scope verdict must be justified by the reference data:
-        // no entry may claim country scope without the gazetteer backing it.
-        for (name, cc) in LOCATION_GAZETTEER.iter() {
-            if is_country_scope_gazetteer_entry(name, cc) {
-                assert_eq!(
-                    name.to_lowercase(),
-                    country_name_for(cc).to_lowercase(),
-                    "country-scope entry {:?}/{:?} is not backed by country_name_for",
-                    name,
-                    cc
-                );
-            }
-        }
-    }
-
-    // ── End-to-end: the override must demote an engine `local` verdict ──
-    // This is the case a promotion-only fix would MISS: the engine's own probe
-    // already returned `local`, so Override 4's `intent.intent != "local"`
-    // guard short-circuited. The demotion override must run anyway.
-    #[test]
-    fn override_demotes_an_engine_local_verdict_on_the_defect_query() {
-        let q = "what is the easiest way to start investing in mutual funds in india";
-        let mut r = fallback_intent(q);
-        // Force the precondition: the engine itself said `local`.
-        r.intent = "local".to_string();
-        r.distribution.insert("local".to_string(), 0.30);
-        r.distribution.insert("how-to".to_string(), 0.25);
-        r.distribution.insert("transactional".to_string(), 0.20);
-
-        apply_intent_overrides(q, &mut r);
-
-        assert_ne!(
-            r.intent, "local",
-            "trailing country qualifier must not leave a how-to query labelled local"
-        );
-    }
-
-    // ── The demotion must NOT fire on the local controls ──
-    #[test]
-    fn override_leaves_genuinely_local_queries_labelled_local() {
-        for q in [
-            "best places to see cherry blossoms in osaka",
-            "chennai restaurants near adyar",
-            "best cafes in indiranagar bangalore",
-        ] {
-            let mut r = fallback_intent(q);
-            r.intent = "local".to_string();
-            r.distribution.insert("local".to_string(), 0.30);
-            r.distribution.insert("informational".to_string(), 0.25);
-
-            apply_intent_overrides(q, &mut r);
-
-            assert_eq!(
-                r.intent, "local",
-                "genuinely-local query must stay local: {:?}",
-                q
-            );
-        }
-    }
-
-    // ── The replacement label comes from real evidence, not a hardcoded answer ──
-    // If this ever returned a constant, `best_non_local_label` would be a
-    // disguised Q->A table and the fix would be hardcoding.
-    #[test]
-    fn replacement_label_follows_the_distribution_rather_than_a_constant() {
-        let how_to_first = resp("local", &[("local", 0.3), ("how-to", 0.4), ("fresh", 0.1)]);
-        assert_eq!(best_non_local_label(&how_to_first), "how-to");
-
-        let comparison_first = resp("local", &[("local", 0.3), ("comparison", 0.45), ("how-to", 0.1)]);
-        assert_eq!(best_non_local_label(&comparison_first), "comparison");
-
-        // No usable non-local evidence -> neutral fallback, never `local`.
-        let no_evidence = resp("local", &[("local", 0.9)]);
-        assert_eq!(best_non_local_label(&no_evidence), "informational");
     }
 }

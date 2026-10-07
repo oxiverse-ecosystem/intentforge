@@ -29,6 +29,9 @@ BASE = os.environ.get("INTENTFORGE_BASE_URL", "http://localhost:4000").rstrip("/
 
 # Commercial: exact-model + price-bearing — reliably transactional intent.
 COMMERCIAL_Q = "iphone 16 pro max price"
+# Broad product/category query — commerce signals may be transactional, but the
+# sacred affiliate policy must leave it free of monetized links.
+BROAD_PRODUCT_Q = "best wireless earbuds under 50 dollars"
 # Purely informational — language-concept lookup, no product/price.
 INFORMATIONAL_Q = "rust ownership"
 
@@ -132,4 +135,68 @@ def test_commercial_query_resolves_to_transactional_intent(session):
         f"commercial query {COMMERCIAL_Q!r} did not resolve to a commercial "
         f"intent signal — intent={intent!r}, transactional_prob={txn_prob:.3f}. "
         "The intent classifier or distribution regression broke the gate signal."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (D) Main-path response contract: concrete product offers only
+# ──────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.requires_upstream
+def test_commercial_search_shopping_is_non_empty_array_of_real_offers(session):
+    """Commercial /search responses expose `shopping` as a direct array. Every
+    entry must carry a real `commerce` block extracted from that exact URL;
+    article/review rows without product facts must never leak into the strip."""
+    r = session.get(
+        f"{BASE}/search",
+        params={"q": COMMERCIAL_Q, "count": 8},
+        timeout=120,
+    )
+    assert r.status_code == 200, f"GET /search -> {r.status_code} {r.text[:300]}"
+    body = r.json()
+    shopping = body.get("shopping")
+    assert isinstance(shopping, list) and shopping, (
+        "commercial /search response must contain a non-empty `shopping` array; "
+        f"got {shopping!r}"
+    )
+
+    ranked_urls = [entry.get("url") for entry in body.get("results", [])]
+    for i, entry in enumerate(shopping):
+        assert isinstance(entry, dict), f"shopping[{i}] must be an object"
+        assert entry.get("url") in ranked_urls, (
+            f"shopping[{i}] was not cloned from the main ranked result set"
+        )
+        commerce = entry.get("commerce")
+        assert isinstance(commerce, dict), (
+            f"shopping[{i}] has no concrete commerce block"
+        )
+        assert commerce.get("url") == entry["url"], (
+            f"shopping[{i}] commerce provenance URL differs from result URL"
+        )
+        assert commerce.get("observed_at"), (
+            f"shopping[{i}] commerce facts must carry observed_at provenance"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (E) Anti-broadening: monetization is exact-model-only
+# ──────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.requires_upstream
+def test_broad_product_query_has_no_affiliate_links(session):
+    """A broad product/category query may use /shopping, but monetization is
+    restricted to exact product-model queries. The ranked result URLs still run
+    normally; only `affiliate` must be absent."""
+    r = session.get(
+        f"{BASE}/shopping",
+        params={"q": BROAD_PRODUCT_Q, "count": 5},
+        timeout=120,
+    )
+    assert r.status_code == 200, f"GET /shopping -> {r.status_code} {r.text[:300]}"
+    results = r.json().get("results", [])
+    assert results, "broad product query should still return normal search results"
+    decorated = [entry for entry in results if isinstance(entry.get("affiliate"), dict)]
+    assert not decorated, (
+        f"broad product query {BROAD_PRODUCT_Q!r} received affiliate links: "
+        f"{decorated[:2]!r}; exact-model-only policy violated"
     )

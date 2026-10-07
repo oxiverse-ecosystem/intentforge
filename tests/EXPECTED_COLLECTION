@@ -1,18 +1,59 @@
-# Floor for directory collection, consumed by the "Assert collection is
-# non-vacuous" step in .github/workflows/ci.yml. It holds the number of tests
-# `pytest tests/` collects today (44). It exists because a file whose name lacks
-# a `test_` prefix is SILENTLY skipped by directory collection — that is how
-# tests/goals_api_schema.py (15 assertions) went invisible to every run for
-# months while CI stayed green. A bare `pytest tests/goals_api_schema.py` did
-# collect it, which is exactly why the bug was so easy to miss.
+# Collection floors, consumed by the "Assert collection is non-vacuous" and
+# "Assert the run was non-vacuous" steps in .github/workflows/ci.yml.
 #
-# RULES FOR MAINTAINING THIS NUMBER
-#   * Adding tests        -> raise it to the new total.
-#   * Deleting tests      -> lower it, and say why in the PR (a lower number
+# They exist because a file whose name lacks a `test_` prefix is SILENTLY
+# skipped by directory collection — that is how tests/goals_api_schema.py
+# (15 assertions) went invisible to every run for months while CI stayed green.
+# A bare `pytest tests/goals_api_schema.py` DID collect it, which is exactly why
+# the bug was so easy to miss: the one place that named the file worked, and the
+# place that would have caught it (the directory run) did not.
+#
+# RULES FOR MAINTAINING THESE NUMBERS
+#   * Adding tests        -> raise the number it affects.
+#   * Deleting tests      -> lower it, and say why in the PR. A lower number
 #                            with tests removed is legitimate; a lower number
-#                            with none removed is the bug this guards).
-#   * Renaming any file in tests/ -> re-run `pytest tests/ --collect-only -q`
-#                            and confirm the total before merging.
+#                            with none removed is the bug this guards.
+#   * Renaming/moving any file in tests/ -> re-run BOTH commands below and
+#                            update this file before merging.
 #
-# Current: 44 total = 35 gateway-contract + 9 requires_upstream.
-44
+#   pytest tests/ --collect-only -q                              -> TOTAL
+#   pytest tests/ --collect-only -q -m "not requires_upstream"  -> CONTRACT
+#
+# Ledger for the 2026-09-27 consolidation (46 -> 31 on the committed tree; 33
+# in a working tree that also carries 2 uncommitted commerce tests). The drop is
+# 13 DELETED duplicates, not lost coverage: tests/test_goals_contract.py asserted
+# the whole documented endpoint set a THIRD time, overlapping the two
+# per-concern files. Every one of its 15 test functions is accounted for:
+#
+#   13 removed as duplicates of an existing, equal-or-stronger assertion --
+#      8 plain endpoint duplicates of test_api_schema.py (root, health, search,
+#      search/fast, images, videos, news, spellcheck) and 5 Goals duplicates of
+#      test_goals_api_schema.py (create, answers roadmap, get status,
+#      leaderboard, quick roadmap), whose versions additionally submit REAL
+#      structured answers and assert the roadmap is non-degenerate.
+#    2 MOVED, not deleted: test_negation_not_from_sony and test_price_lt_parsed
+#      are search-contract assertions and now live in test_api_schema.py.
+#
+# Keeping that third copy was the "one contract, three sources of truth" trap:
+# a fix landing in one file leaves the others silently unverified, which is how
+# three real contract defects rode a green master on 2026-08-24.
+#
+# The floors were also STALE (44 recorded while the tree actually collected 46)
+# — a floor only catches shrinkage when it is correct.
+#
+# A third correction, and the one that proves this gate earns its keep: the
+# first version of this file was derived from a tree that had 2 UNCOMMITTED
+# tests in it (pending commerce-contract work from t_c7ba85d3), so it recorded
+# TOTAL=33 while the committed tree collects 31. The gate failed the very first
+# CI run with "collected 31, expected at least 33" — i.e. it caught a floor
+# derived from the wrong tree, which is precisely the failure mode a hand-typed
+# magic number invites and a recorded-from-the-committed-tree number does not.
+# These numbers therefore come from `git stash`-ed HEAD, not the working tree.
+#
+# NOTE for whoever commits the 2 pending commerce tests: raise TOTAL to 33 and
+# CONTRACT to 27, or the collection gate will (correctly) demand it.
+#
+# 31 = TOTAL collected by directory
+TOTAL=31
+# 25 = of which the CI gateway-contract run (`-m "not requires_upstream"`) must execute
+CONTRACT=25

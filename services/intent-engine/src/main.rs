@@ -27,6 +27,15 @@ const INTENT_CATEGORIES: &[&str] = &[
     "local",
 ];
 
+/// Maximum words in a POSITIVE constraint term produced by the implicit
+/// (Phase 5) topic-term pass. Matches the `max_words=2` the phrase-aware
+/// `extract_constraint_term` already uses for positives, so marker-derived and
+/// implicitly-derived positive terms have one consistent shape: a multi-word
+/// concept is ONE requirement, never a bag of independent fragments.
+/// `constraint_score` divides by `positive.len()`, so shredding "battery life"
+/// into two requirements wrongly demands two independent hits.
+const POSITIVE_TERM_MAX_WORDS: usize = 2;
+
 // ─── Entity Roles (Query Graph IR) ────────────────────────────────
 // Instead of flat positive/negative constraints, entities have semantic roles
 // that determine how they're used in expansion, retrieval, and ranking.
@@ -120,20 +129,6 @@ pub struct IntentResponse {
     pub expanded_queries: Vec<String>,
     #[serde(default)]
     pub distribution: std::collections::HashMap<String, f32>, // calibrated probability distribution
-    /// FIX-IF-32: whether `confidence` is a calibrated probability that the
-    /// reported `intent` label is correct, or an explicitly-flagged
-    /// uncalibrated probe score. Consumers must not treat the two alike.
-    #[serde(default = "default_true")]
-    pub confidence_calibrated: bool,
-    /// FIX-IF-32: the uncalibrated probe probability for the reported label
-    /// (`distribution[intent]`). Preserved so the calibration can be audited
-    /// or re-fit without re-running the model.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub probe_probability: Option<f32>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -178,98 +173,6 @@ struct ConfidenceConfig {
 }
 
 static CONFIG: OnceLock<IntentWeights> = OnceLock::new();
-
-// ─── Intent Confidence Calibration (FIX-IF-32) ─────────────────────
-//
-// The probe used to publish `confidence = base + margin*multiplier`, a
-// synthetic score that is NOT a probability of the label actually reported.
-// Measured against the project's own labeled corpus, the reported label
-// differed from the distribution argmax on 91% of rows and the number
-// separated right from wrong labels at AUC 0.555 -- chance.
-//
-// `IntentCalibration` is Platt scaling fitted by NLL against that corpus
-// (scripts/fit_intent_calibration.py) and stored as a runtime artifact, so it
-// is DATA, not a tuned constant, and can be refit as evidence grows. It maps
-// the engine's own p(reported label) onto the empirically measured probability
-// that the reported label is correct.
-//
-// HONESTY CONTRACT: when the artifact is missing or unreadable we do NOT fall
-// back to presenting the raw margin score as a probability. We report the
-// normalized probe score with `confidence_calibrated: false` so no consumer can
-// mistake an uncalibrated number for a calibrated one.
-#[derive(Debug, Deserialize, Clone)]
-struct IntentCalibration {
-    /// Platt slope on logit(p(reported label)).
-    slope: f64,
-    /// Platt intercept.
-    intercept: f64,
-}
-
-static CALIBRATION: OnceLock<Option<IntentCalibration>> = OnceLock::new();
-
-/// Logit, guarded away from the open interval so inf never reaches exp.
-fn safe_logit(p: f64) -> f64 {
-    let clamped = p.clamp(1e-6, 1.0 - 1e-6);
-    (clamped / (1.0 - clamped)).ln()
-}
-
-/// Map a probe probability to the calibrated probability that the label is
-/// correct. Returns `None` when no calibration artifact is loaded, which the
-/// caller must surface as `confidence_calibrated: false`.
-fn calibrated_confidence(p: f64) -> Option<f64> {
-    let cal = CALIBRATION.get()?.as_ref()?;
-    let z = cal.slope * safe_logit(p) + cal.intercept;
-    Some(1.0 / (1.0 + (-z).exp()))
-}
-
-/// The score the public API reports as `confidence`.
-///
-/// Calibrated when the artifact is present; otherwise the honest uncalibrated
-/// fallback (the raw probe probability) plus an explicit `false` flag. Never a
-/// synthetic margin formula dressed up as a probability.
-fn report_confidence(p: f64) -> (f32, bool) {
-    match calibrated_confidence(p) {
-        Some(v) => (v as f32, true),
-        None => (p as f32, false),
-    }
-}
-
-/// Apply a lexical override to the label AND the distribution, atomically.
-///
-/// FIX-IF-32: previously an override rewrote `intent` and then clamped a
-/// synthetic scalar with `.max(0.9)`, leaving `distribution` still pointing at
-/// the old class. That is why the reported number described a label the API
-/// never returned (91% of the labeled corpus). Moving probability mass to the
-/// new label keeps label and distribution consistent, so the confidence
-/// derived from `distribution[intent]` genuinely describes the label we report.
-///
-/// `decisive` marks a marker that is unambiguous on its own (an explicit "vs",
-/// a "how to" imperative). Decisive overrides swap the top label; non-decisive
-/// ones blend toward it. Mass is moved, never invented: the winner's excess
-/// over the newcomer is what gets transferred, so the distribution still sums
-/// to ~1 and no probability is fabricated.
-fn apply_lexical_override(
-    distribution: &mut std::collections::HashMap<String, f32>,
-    current: &str,
-    new_label: &str,
-    decisive: bool,
-) {
-    if current == new_label {
-        return;
-    }
-    let cur_p = distribution.get(current).copied().unwrap_or(0.0);
-    let new_p = distribution.get(new_label).copied().unwrap_or(0.0);
-    if decisive {
-        // The newcomer becomes the winner, inheriting the outgoing label's mass.
-        distribution.insert(new_label.to_string(), cur_p.max(new_p));
-        distribution.insert(current.to_string(), new_p);
-    } else {
-        // Blend: the newcomer closes most of the gap to the leader.
-        let target = (cur_p + new_p) / 2.0;
-        distribution.insert(new_label.to_string(), target.max(new_p));
-        distribution.insert(current.to_string(), cur_p - (target - new_p));
-    }
-}
 
 // ─── Constraint Extraction (Algorithmic) ────────────────────────────
 // Extracts positive and negative constraints from natural language queries.
@@ -1228,30 +1131,114 @@ fn extract_constraints(query: &str) -> Constraints {
             }
         }
 
-        // Extract candidate topic words from the query
-        // Prefer keeping phrase groups intact so hyphenated/slashed negative terms
-        // like "react/vue/nextjs" survive as whole phrases and won't leak back
-        // into positives after alnum-filtering.
+        // Extract candidate topic terms from the query, preserving PHRASE groups.
+        //
+        // This pass used to push every surviving whitespace token as its own
+        // single-word positive, which shredded multi-word concepts into
+        // independent requirements: "battery life", "noise cancelling" and
+        // "refresh rate" each became 2-3 separate positives. `constraint_score`
+        // scores coverage as `matched / positive_count`, so a page that
+        // discusses "battery life" perfectly still lost coverage pressure to a
+        // page that happened to echo the fragments "battery" AND "life" AND
+        // "long" separately. Multi-word positives are the same requirement the
+        // marker-based paths (negation / Reference) already produce via
+        // `extract_constraint_term(text, max_words=2)`, so grouping here makes
+        // the implicit path agree with the rest of the extractor.
+        //
+        // Segmentation is BOUNDARY-based, not adjacency-based: any token this
+        // pass does not emit (stop word, already-captured positive, negation
+        // member, consumed compound component) ENDS the current run. That is
+        // what keeps "with" / "for" / "and" from silently gluing two unrelated
+        // topics together ("headphones long") — the trap the previous
+        // `continue`-based loop walked straight into.
+        //
+        // Still preserved:
+        //  - hyphen/slashed/underscored tokens are one token ("react/vue/nextjs"),
+        //    so a whole slashed phrase survives as a single term;
+        //  - `alt_operands` (explicit "or"/"and" alternatives) are emitted as
+        //    INDEPENDENT single-word terms, because they are deliberate
+        //    alternatives, not one phrase — "best OR worst" must not become
+        //    the single constraint "best worst".
         let words: Vec<&str> = q_lower.split_whitespace().collect();
+        // Greedy pairing of a run into at most `POSITIVE_TERM_MAX_WORDS`-word
+        // terms, filled from the END of the run backwards. English noun phrases
+        // are head-final — the modifier binds to the noun that FOLLOWS it — so
+        // filling from the end is what keeps the concept intact: "long battery
+        // life" pairs as "battery life" (+ the bare modifier "long"), and
+        // "144hz refresh rate" pairs as "refresh rate". Filling from the start
+        // instead would produce the cross-concept junk "long battery" and
+        // "144hz refresh" — grammatically adjacent but semantically wrong, and
+        // the exact class of defect this pass existed to remove.
+        let mut run: Vec<String> = Vec::new();
+        let flush_run = |run: &mut Vec<String>, out: &mut Vec<String>| {
+            let mut end = run.len();
+            while end > 0 {
+                let start = end.saturating_sub(POSITIVE_TERM_MAX_WORDS);
+                let term = run[start..end].join(" ");
+                if !out.contains(&term) {
+                    out.push(term);
+                }
+                end = start;
+            }
+            run.clear();
+        };
         for w in &words {
             let mut w_clean: String = w.chars()
                 .map(|c| if c.is_alphanumeric() { c } else if c == '/' || c == '-' || c == '_' { c } else { ' ' })
                 .collect();
             w_clean = w_clean.split_whitespace().collect::<Vec<_>>().join(" ");
-            if w_clean.is_empty() { continue; }
-            if w_clean.len() < 2 { continue; }
-            // Explicit OR/AND operands survive the stop-word filter (see above).
-            if !alt_operands.contains(w_clean.as_str()) && stop_words.contains(w_clean.as_str()) { continue; }
+            if w_clean.is_empty() { flush_run(&mut run, &mut positive); continue; }
+            if w_clean.len() < 2 { flush_run(&mut run, &mut positive); continue; }
             // Use lowercase string forms for set lookups (HashSet<String>).
             let w_lower: String = w.to_lowercase();
-            if neg_set.contains(&w_lower) { continue; }
-            if pos_set.contains(&w_lower) { continue; }
-            if consumed_words.contains(&w_lower) { continue; }
-            // If the raw token matched a negative phrase exactly, skip adding it as a positive.
-            if negative.iter().any(|n| n == &w_lower) { continue; }
-            // Only add as implicit positive if it looks like a topic noun
-            // (not a generic adjective or verb)
-            positive.push(w_clean);
+            // Explicit OR/AND operands survive the stop-word filter (see above)
+            // but stay INDEPENDENT: they are alternatives, so they never join a
+            // neighbouring run and never absorb a following word.
+            let is_alt_operand = alt_operands.contains(w_clean.as_str());
+            let is_stop = !is_alt_operand && stop_words.contains(w_clean.as_str());
+            let excluded = is_stop
+                || neg_set.contains(&w_lower)
+                || pos_set.contains(&w_lower)
+                || consumed_words.contains(&w_lower)
+                // If the raw token matched a negative phrase exactly, skip adding
+                // it as a positive.
+                || negative.iter().any(|n| n == &w_lower);
+            if excluded {
+                // A dropped token is a phrase boundary — never glue across it.
+                flush_run(&mut run, &mut positive);
+                continue;
+            }
+            if is_alt_operand {
+                flush_run(&mut run, &mut positive);
+                if !positive.contains(&w_clean) {
+                    positive.push(w_clean);
+                }
+                continue;
+            }
+            run.push(w_clean);
+        }
+        flush_run(&mut run, &mut positive);
+
+        // Subsumption dedupe: a single-word term whose word already appears in a
+        // multi-word term is REDUNDANT, not an extra requirement. Multi-word
+        // matching requires every word of the phrase to be present in a result,
+        // so a result that satisfies "battery life" necessarily satisfies
+        // "battery" too — keeping both would count one concept twice in the
+        // coverage denominator (`matched / positive_count`) and quietly restore
+        // part of the fragment pressure this pass just removed. Multi-word terms
+        // are never dropped this way; only bare words they subsume.
+        let phrase_words: Vec<Vec<String>> = positive
+            .iter()
+            .filter(|p| p.split_whitespace().count() > 1)
+            .map(|p| p.split_whitespace().map(|w| w.to_string()).collect())
+            .collect();
+        if !phrase_words.is_empty() {
+            positive.retain(|p| {
+                if p.split_whitespace().count() > 1 {
+                    return true;
+                }
+                !phrase_words.iter().any(|ph| ph.iter().any(|w| w == p))
+            });
         }
     }
 
@@ -1649,12 +1636,7 @@ fn linear_classify(
     let intent = weights.labels[winner_idx].clone();
 
     let conf = &weights.confidence;
-    // The synthetic margin score `base + margin*multiplier` is RETAINED, but
-    // only as an internal decision signal for the override gates below -- it is
-    // NOT what the API reports as `confidence`. It is not a probability: it is
-    // unnormalized with respect to the 8-class softmax and, once lexical
-    // overrides rewrite the label, it describes a class the API never returns.
-    let margin_score = (conf.base as f32 + margin as f32 * conf.margin_multiplier as f32).clamp(0.0, 1.0);
+    let confidence = (conf.base as f32 + margin as f32 * conf.margin_multiplier as f32).clamp(0.0, 1.0);
 
     let mut intent = weights.labels[winner_idx].clone();
 
@@ -1664,21 +1646,17 @@ fn linear_classify(
     // Raised from 0.35 to 0.55: a navigational that wins at only 0.37 is a
     // weak over-prediction (see audit — "kubernetes ingress tls configuration"
     // was classified navigational @0.374 with how-to 0.24 right behind it).
-    //
-    // FIX-IF-32: this gate reads the MARGIN score, not the reported confidence,
-    // so moving the reported number onto a calibrated scale cannot silently
-    // change which queries get demoted to `informational`.
-    if margin_score < 0.55 && intent != "informational" {
+    if confidence < 0.55 && intent != "informational" {
         intent = "informational".to_string();
     }
 
     tracing::info!(
-        "linear_classify: intent={} (margin_score={:.3} margin={:.3} p_top1={:.3}) probs=[{}]",
-        intent, margin_score, margin, top1,
+        "linear_classify: intent={} (conf={:.3}) margin={:.3} probs=[{}]",
+        intent, confidence, margin,
         weights.labels.iter().enumerate().map(|(i, l)| format!("{}={:.3}", l, probs[i])).collect::<Vec<_>>().join(" ")
     );
 
-    (intent, margin_score, distribution)
+    (intent, confidence, distribution)
 }
 
 
@@ -2832,41 +2810,6 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("CONFIG already initialized"))?;
     tracing::info!("Linear probe weights loaded successfully");
 
-    // ── Load intent-confidence calibration (FIX-IF-32) ──
-    // Optional by design: a missing artifact must NOT crash the engine, and it
-    // must NOT silently degrade to reporting the old synthetic margin score as
-    // if it were a probability. Absent artifact => `confidence_calibrated:
-    // false` on every response, which is the honest state.
-    let calib_path = "./config/intent_calibration.json";
-    let calibration = match std::fs::File::open(calib_path) {
-        Ok(f) => match serde_json::from_reader::<_, IntentCalibration>(f) {
-            Ok(c) => {
-                tracing::info!(
-                    "Intent confidence calibration loaded from {} (slope={:.4} intercept={:.4})",
-                    calib_path, c.slope, c.intercept
-                );
-                Some(c)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Calibration artifact {} present but unparseable ({}) — reporting \
-                     UNCALIBRATED confidence (confidence_calibrated=false)",
-                    calib_path, e
-                );
-                None
-            }
-        },
-        Err(e) => {
-            tracing::warn!(
-                "No calibration artifact at {} ({}) — reporting UNCALIBRATED confidence \
-                 (confidence_calibrated=false). Run scripts/fit_intent_calibration.py to create it.",
-                calib_path, e
-            );
-            None
-        }
-    };
-    let _ = CALIBRATION.set(calibration);
-
     let device = Device::Cpu;
 
     let bert_path = "./models/model.safetensors";
@@ -2996,7 +2939,7 @@ async fn analyze_query(
     // ── Linear probe classification ──
     // Uses logistic regression weights trained on calibration_benchmark_200.csv
     let weights = CONFIG.get().expect("weights not loaded");
-    let (intent, margin_score, mut distribution) = query_embedding.as_ref()
+    let (intent, confidence, distribution) = query_embedding.as_ref()
         .map(|emb| linear_classify(emb, weights))
         .unwrap_or_else(|| {
             let mut d = std::collections::HashMap::new();
@@ -3011,10 +2954,7 @@ async fn analyze_query(
     // When a high-precision lexical marker is present we override/boost the
     // model so the API contract holds: "vs" ⇒ comparison, "how to" ⇒ how-to.
     let mut intent = intent;
-    // FIX-IF-32: this is the INTERNAL margin score, used only by the override
-    // gates below to decide when the probe is unsure enough for a lexical rule
-    // to take over. It is deliberately NOT the number the API reports.
-    let mut margin_score = margin_score;
+    let mut confidence = confidence;
     let ql = normalized.to_lowercase();
     let has_vs = ql.contains(" vs ") || ql.contains(" versus ")
         || ql.starts_with("vs ") || ql.starts_with("versus ");
@@ -3024,8 +2964,9 @@ async fn analyze_query(
     if has_vs || has_or_compare {
         if intent != "comparison" {
             tracing::info!("Lexical override: 'vs'/'or' marker ⇒ comparison (was {})", intent);
-            apply_lexical_override(&mut distribution, &intent, "comparison", true);
             intent = "comparison".to_string();
+            // High confidence: lexical comparison markers are unambiguous.
+            confidence = confidence.max(0.9);
         }
     }
     // "better than" / "worse than" / "faster than" ⇒ explicit comparison between
@@ -3046,24 +2987,25 @@ async fn analyze_query(
     let has_better_than = comparison_than_markers.iter().any(|m| ql.contains(m));
     if has_better_than && intent != "comparison" {
         tracing::info!("Lexical override: 'better/worse/faster than' marker ⇒ comparison (was {})", intent);
-        apply_lexical_override(&mut distribution, &intent, "comparison", true);
         intent = "comparison".to_string();
+        confidence = confidence.max(0.9);
     }
     // "how to" / "how do i" / "how can i" / "how do you" ⇒ how-to.
+    // Raise confidence so it isn't misranked behind informational/navigational.
     let howto_markers = ["how to ", "how do i ", "how do you ", "how can i ",
                          "how can i ", "how to", "steps to ", "tutorial for "];
     let is_howto = howto_markers.iter().any(|m| ql.contains(m))
         || ql.starts_with("how to") || ql.starts_with("how do");
     if is_howto && intent == "how-to" {
-        // FIX-IF-32: no `.max()` boost. The probe already put its mass on
-        // how-to; the reported confidence is derived from that mass, so there
-        // is nothing to inflate.
+        // Boost weak how-to confidence to a more usable level.
+        confidence = confidence.max(0.6);
+        tracing::info!("Lexical boost: how-to confidence raised to {:.3}", confidence);
     } else if is_howto && intent != "how-to" {
         // Model missed the how-to signal — override when the lexical marker is clear.
         if ql.contains("how to") || ql.starts_with("how do") || ql.contains("steps to ") {
             tracing::info!("Lexical override: how-to marker ⇒ how-to (was {})", intent);
-            apply_lexical_override(&mut distribution, &intent, "how-to", true);
             intent = "how-to".to_string();
+            confidence = confidence.max(0.6);
         }
     }
 
@@ -3087,8 +3029,8 @@ async fn analyze_query(
     if is_chitchat {
         if intent != "chitchat" {
             tracing::info!("Lexical override: chitchat marker ⇒ chitchat (was {})", intent);
-            apply_lexical_override(&mut distribution, &intent, "chitchat", true);
             intent = "chitchat".to_string();
+            confidence = confidence.max(0.7);
         }
     }
 
@@ -3110,21 +3052,8 @@ async fn analyze_query(
         .count();
     if has_temporal && topic_token_count >= 1 && intent != "fresh" {
         tracing::info!("Temporal override: recency marker + topic ⇒ fresh (was {})", intent);
-        apply_lexical_override(&mut distribution, &intent, "fresh", true);
         intent = "fresh".to_string();
-    }
-
-    // A freshness label without an explicit temporal signal is not a freshness
-    // request. The linear probe can confuse ordinary causal/how-to vocabulary
-    // with recency; use the question shape as a safe fallback intent.
-    if intent == "fresh" && !has_temporal {
-        if ql.starts_with("how ") || ql.starts_with("how to ") {
-            intent = "how-to".to_string();
-            confidence = confidence.max(0.6);
-        } else if ql.starts_with("why ") || ql.starts_with("what causes") {
-            intent = "informational".to_string();
-            confidence = confidence.max(0.6);
-        }
+        confidence = confidence.max(0.7);
     }
 
     // A freshness label without an explicit temporal signal is not a freshness
@@ -3185,8 +3114,8 @@ async fn analyze_query(
     let tech_trigger = code_token_count >= 1 && (has_tech_marker || token_count >= 2);
     if tech_trigger && intent != "technical" {
         tracing::info!("Lexical override: technical marker ⇒ technical (was {})", intent);
-        apply_lexical_override(&mut distribution, &intent, "technical", true);
         intent = "technical".to_string();
+        confidence = confidence.max(0.6);
     }
 
     // ── Step 2: Compress long queries before expansion ──
@@ -3200,19 +3129,7 @@ async fn analyze_query(
         tracing::info!("Query compressed: {:?} → {:?} (negation-aware)", normalized, expansion_input);
     }
 
-    // FIX-IF-32: derive the reported confidence from the probability mass that
-    // actually sits on the label we are about to report, AFTER every lexical
-    // override has moved that mass. This is the whole fix: previously the number
-    // was computed for the probe's argmax and then survived label rewrites, so
-    // on 91% of the labeled corpus it described a class the API never returned.
-    let probe_probability = distribution.get(&intent).copied().unwrap_or(0.0) as f64;
-    let (confidence, confidence_calibrated) = report_confidence(probe_probability);
-    tracing::info!(
-        "Reported intent={} probe_p={:.3} -> confidence={:.3} calibrated={}",
-        intent, probe_probability, confidence, confidence_calibrated
-    );
-
-    let expanded = expand_queries(&expansion_input, &intent, margin_score, contains_brand_or_proper_noun(&params.q), &structured);
+    let expanded = expand_queries(&expansion_input, &intent, confidence, contains_brand_or_proper_noun(&params.q), &structured);
     tracing::info!("Expanded to {} query variations", expanded.len());
 
     let result = IntentResponse {
@@ -3223,8 +3140,6 @@ async fn analyze_query(
         structured_constraints: structured,
         expanded_queries: expanded,
         distribution,
-        confidence_calibrated,
-        probe_probability: Some(probe_probability as f32),
     };
 
     state.intent_cache.insert(query_norm, result.clone()).await;
@@ -3452,10 +3367,19 @@ mod tests {
             "exclusion lost: negative={:?}",
             c.negative
         );
-        // 3. the attributes survive as topic constraints
-        for topic in ["headphones", "battery"] {
+        // 3. the attributes survive as topic constraints.
+        //    A topic may now be carried by a MULTI-WORD term ("battery life",
+        //    "cancelling headphones") rather than a standalone token — that is
+        //    the point of phrase grouping: the concept is ONE requirement, not
+        //    a bag of independent fragments. So the invariant is that every
+        //    topic word is still COVERED by some positive term, not that it is
+        //    still its own term. (Asserting `p == topic` here would lock the
+        //    shredding behaviour back in.)
+        for topic in ["headphones", "battery", "noise", "mic"] {
             assert!(
-                c.positive.iter().any(|p| p == topic),
+                c.positive
+                    .iter()
+                    .any(|p| p.split_whitespace().any(|w| w == topic)),
                 "topic {:?} lost: positive={:?}",
                 topic,
                 c.positive
@@ -3466,6 +3390,126 @@ mod tests {
             !c.positive.iter().any(|p| p.contains("20000")),
             "budget leaked into topics: {:?}",
             c.positive
+        );
+    }
+
+    /// Defect 1: the implicit (Phase 5) topic-term pass used to push every
+    /// surviving whitespace token as its OWN single-word positive, shredding
+    /// multi-word concepts into independent requirements. `constraint_score`
+    /// divides matched hits by `positive.len()`, so "battery life" demanded two
+    /// independent hits and a page that discussed the concept perfectly still
+    /// lost coverage pressure. A multi-word concept must survive as ONE term.
+    #[test]
+    fn implicit_topic_pass_keeps_multi_word_concepts_intact() {
+        let c = extract_constraints("noise cancelling headphones with long battery life and mic");
+        // "battery life" and "refresh rate"-style head-final pairs survive.
+        assert!(
+            c.positive.iter().any(|p| p == "battery life"),
+            "\"battery life\" was shredded into fragments: positive={:?}",
+            c.positive
+        );
+        let c2 = extract_constraints("4k monitor with 144hz refresh rate");
+        assert!(
+            c2.positive.iter().any(|p| p == "refresh rate"),
+            "\"refresh rate\" was shredded into fragments: positive={:?}",
+            c2.positive
+        );
+        // Grouping must genuinely REDUCE the requirement count — the whole point
+        // is that fewer, larger units carry the same topical demand — while
+        // still covering every content word the user actually typed. A fix that
+        // merely reshuffled the same number of terms would leave
+        // `matched / positive_count` exactly as demanding as before.
+        for (q, c, content_tokens) in [
+            (
+                "noise cancelling headphones with long battery life and mic",
+                &c,
+                vec!["noise", "cancelling", "headphones", "long", "battery", "life", "mic"],
+            ),
+            (
+                "4k monitor with 144hz refresh rate",
+                &c2,
+                vec!["4k", "monitor", "144hz", "refresh", "rate"],
+            ),
+        ] {
+            assert!(
+                c.positive.len() < content_tokens.len(),
+                "{:?}: grouping did not reduce the requirement count ({} terms for {} content words): {:?}",
+                q,
+                c.positive.len(),
+                content_tokens.len(),
+                c.positive
+            );
+            for t in content_tokens {
+                assert!(
+                    c.positive.iter().any(|p| p.split_whitespace().any(|w| w == t)),
+                    "{:?}: content word {:?} lost while grouping: {:?}",
+                    q,
+                    t,
+                    c.positive
+                );
+            }
+        }
+    }
+
+    /// Defect 1 (the trap the card calls out): the Phase 5 loop `continue`s over
+    /// stop words instead of breaking, so a naive "pair adjacent pushed tokens"
+    /// fix glues two unrelated topics together. "with" / "for" / "and" must be
+    /// PHRASE BOUNDARIES — the run before them and the run after them are
+    /// separate concepts and must never form one term.
+    #[test]
+    fn stop_words_are_phrase_boundaries_not_joins() {
+        // "with" separates the headphone concept from the battery concept, and
+        // "and" separates the battery concept from the mic.
+        let c = extract_constraints("noise cancelling headphones with long battery life and mic");
+        for junk in [
+            "headphones long",
+            "cancelling long",
+            "battery mic",
+            "life and",
+            "with long",
+        ] {
+            assert!(
+                !c.positive.iter().any(|p| p == junk),
+                "stop words were joined into the junk phrase {:?}: positive={:?}",
+                junk,
+                c.positive
+            );
+        }
+    }
+
+    /// Defect 1 (preservation clauses): the phrase-grouping rewrite must not
+    /// regress the two behaviours the Phase 5 block existed for.
+    ///  - a hyphenated/slashed/underscored token is ONE token, so a slashed
+    ///    NEGATIVE phrase stays intact in `negative` and none of its fragments
+    ///    leaks back into `positive`;
+    ///  - explicit OR/AND operands are deliberate ALTERNATIVES and must stay
+    ///    independent — never merged into one phrase like "best worst".
+    #[test]
+    fn phrase_grouping_preserves_slashed_phrases_and_alt_operands() {
+        let c = extract_constraints("rust not react/vue/nextjs");
+        assert!(
+            c.negative.iter().any(|n| n == "react/vue/nextjs"),
+            "slashed phrase was split in negative: negative={:?}",
+            c.negative
+        );
+        for fragment in ["react", "vue", "nextjs"] {
+            assert!(
+                !c.positive.iter().any(|p| p.split_whitespace().any(|w| w == fragment)),
+                "{:?} leaked back into positives from the slashed exclusion: {:?}",
+                fragment,
+                c.positive
+            );
+        }
+        let alt = extract_constraints("best OR worst language");
+        assert!(
+            alt.positive.iter().any(|p| p == "best") && alt.positive.iter().any(|p| p == "worst"),
+            "explicit OR operands were lost or merged: positive={:?}",
+            alt.positive
+        );
+        assert!(
+            !alt.positive.iter().any(|p| p == "best worst"),
+            "explicit OR alternatives were merged into one phrase: positive={:?}",
+            alt.positive
         );
     }
 
@@ -3481,5 +3525,4 @@ mod tests {
         assert_eq!(normalize_nl_operators("in title:guide"), "intitle:guide");
         assert_eq!(normalize_nl_operators("intext:foo"), "intext:foo");
     }
-
 }

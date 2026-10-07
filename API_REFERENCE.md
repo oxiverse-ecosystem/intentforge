@@ -1561,7 +1561,7 @@ All Goals errors return a JSON body with `error` + `message`.
 | `400` | `empty_goal` | `goal` missing or `< 3` characters (e.g. `{"goal":"ab"}`) |
 | `400` | `invalid_phase` | `phase_id` not in `1..total_phases`. Phase IDs are **1-indexed** — `phase_id:0` returns this (verified: `POST /goals/goal_0002/progress` with `{"phase_id":0}` → `invalid_phase`). Use the `id` field from each roadmap phase. |
 | `404` | `not_found` | Goal ID does not exist (e.g. `GET /goals/goal_does_not_exist`) |
-| `422` | `invalid_payload` | Malformed JSON body or missing required field (from the custom `AppJson` extractor) |
+| `422` | `invalid_payload` | Malformed JSON body or missing required field (from the custom `AppJson` extractor). Also fires on `POST /goals/:goal_id/answers` when `answers` is a flat string array instead of objects — `{"answers":["beginner"]}` → `answers[0]: invalid type: string "beginner", expected struct UserAnswer` (verified live 2026-09-27). See [POST /goals/:goal_id/answers](#post-goalsgoal_idanswers). |
 
 See `docs/_generated/_round_v2_raw.md` for the exact raw bodies (`GOALS update progress ...` and the corrected `phase_id:1` blocks).
 
@@ -1641,9 +1641,8 @@ Top result (truncated):
   "affiliate": {
     "disclosed": true,
     "network": "Sovrn Commerce",
-    "url": "https://sovrn.co?key=dummy-test-key-do-not-use&u=https%3A%2F%2Fpowersof10.com%2Fbest-wireless-earbuds-under-50%2F&cuid=powersof10.com&bf=0.10&fbu=https%3A%2F%2Fwww.example-merchant.com%2F",
-    "bid_floor": "0.10",
-    "fallback": "https://www.example-merchant.com/"
+    "url": "https://sovrn.co?key=dummy-test-key-do-not-use&u=https%3A%2F%2Fpowersof10.com%2Fbest-wireless-earbuds-under-50%2F&cuid=powersof10.com&bf=0.10",
+    "bid_floor": "0.10"
   }
 ```
 
@@ -1654,6 +1653,18 @@ Top result (truncated):
 > parameter. `bf` (bid floor) and `fbu` (fallback URL) are appended as query params
 > from the network's data-configured `bid_floor` / `fallback_url` fields and are for
 > reporting / fallback only — they never affect ranking.
+
+> **No fabricated fallback destinations.** `fbu` is where a user is *sent* when a
+> link's bid does not clear `bf`. A fallback pointing at an IANA-reserved
+> documentation domain (RFC 2606/6761 — `example.com`, `*.example`, `.test`,
+> `.invalid`, `localhost`, and their subdomains) is not a merchant, so the gateway
+> **rejects it at config load**: the `fallback_url` field is dropped, the network
+> still decorates normally, and no `fbu=` param and no `fallback` field is ever
+> emitted. The shipped config sets `"fallback_url": null`. This checks against a
+> published IANA standard, not a list of merchants — a genuine merchant fallback
+> passes through untouched. Locked in CI by
+> `shipped_affiliate_data_file_has_no_placeholder_fallback` and
+> `placeholder_fallback_never_reaches_a_decorated_result`.
 
 **No-manipulation guarantee (verified live):** the ranked URL order from
 `/shopping` is byte-identical to `/search` for the same query. This is locked in CI
@@ -1794,12 +1805,22 @@ after the ranked order is fixed, so they cannot move a result. Adding `bf`/`fbu`
 support for a new network is a pure data edit (no recompile); the dev config already
 sets `bid_floor: "0.10"` on the Sovrn row.
 
-**Verified live** (`GET /shopping?q=sony%20wh-1000xm5%20headphones`, 6 results,
-decoration ON with the dev key):
+**`fallback_url` is validated at config load (2026-09-25).** Because `fbu` is a
+destination a user is actually *sent* to, a placeholder value there is a
+fabricated merchant. `AffiliateCtx::load()` now drops any `fallback_url` whose
+host is an IANA-reserved documentation domain (RFC 2606/6761: `example.com`,
+`example.net`, `example.org`, `example`, `test`, `invalid`, `localhost`, and any
+subdomain of those). The network row itself is kept, so decoration and `bf`
+still work — only the unusable fallback is discarded. The shipped Sovrn row
+therefore sets `"fallback_url": null`.
+
+**Verified live** (`GET /shopping?q=sony%20wh-1000xm5%20headphones`, decoration ON
+with the dev key) — the `fbu=` param and the `fallback` field are both gone,
+`bf` and disclosure are unaffected:
 
 ```
-affiliate sample keys: ['bid_floor', 'disclosed', 'fallback', 'network', 'url']
-bid_floor = 0.10   fallback = https://www.example-merchant.com/   disclosed = true
+affiliate sample keys: ['bid_floor', 'disclosed', 'network', 'url']
+bid_floor = 0.10   disclosed = true   (no fbu=, no fallback)
 ```
 
 #### Offer comparison (item 5, 2026-08-29)
@@ -1915,6 +1936,24 @@ Submits answers to the questions from `POST /goals` and generates a personalized
 
 **Request Body**
 
+The body is a single `answers` key holding an **array of OBJECTS** — one object per answered
+question. A flat array of strings (e.g. `{"answers":["beginner","3 months"]}`) is rejected with
+`422 invalid_payload`.
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `answers` | array of objects | yes | One entry per answered question. May be empty (`[]`) — the server then applies `default_answers` (Q1 = timeline, Q2 = hours). |
+| `answers[].question_id` | integer | yes | The `id` of the question being answered, copied verbatim from the `questions[].id` field returned by `POST /goals`. **1-indexed** — the first question is `1`, never `0`. |
+| `answers[].answer` | any JSON value | yes | The answer itself. Normally a string; for `single_choice` questions pass one of the `options` labels verbatim. Free-form strings are accepted for open questions (e.g. `"build a production web service"`). |
+
+Server-side type (`services/gateway/src/goals.rs`):
+`AnswerSubmission { answers: Vec<UserAnswer> }` where
+`UserAnswer { question_id: usize, answer: serde_json::Value }`.
+
+The `next_step` object in the `POST /goals` response is the **machine-readable, authoritative**
+statement of this shape — it echoes `{"answers":[{"question_id":1,"answer":"..."}]}` and the
+`POST` path to use. Read the schema from there if the two ever disagree.
+
 ```json
 {
   "answers": [
@@ -1986,12 +2025,14 @@ Submits answers to the questions from `POST /goals` and generates a personalized
 | Code | Meaning |
 |------|---------|
 | 200  | Roadmap generated successfully |
+| 422  | Body is not the object-array shape above (e.g. `{"answers":["beginner"]}`) — see `invalid_payload` |
 
 **Error Codes**
 
 | Code | Meaning |
 |------|---------|
 | `not_found` | Goal ID does not exist. Create one first with `POST /goals`. |
+| `invalid_payload` | `422` — the JSON body does not deserialize into `AnswerSubmission`. The common case is a flat string array instead of objects: `{"answers":["beginner","3 months"]}` → `answers[0]: invalid type: string "beginner", expected struct UserAnswer`. Send `{"answers":[{"question_id":1,"answer":"..."}]}` instead. Also fires on malformed JSON or a missing `answers` key. |
 
 ---
 
