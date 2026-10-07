@@ -1212,6 +1212,11 @@ pub fn is_definition_site(title_lc: &str, content_lc: &str) -> bool {
 /// future-proof: any new adult domain whose page title/url carries these markers is
 /// filtered without a code change.
 pub fn is_adult_explicit(title_lc: &str, url_lc: &str) -> bool {
+    // Lowercase input so token comparison against the lowercase ADULT_TOKENS
+    // list is case-insensitive.  The `_lc` suffix documents the contract but
+    // callers may pass mixed-case strings (e.g. raw titles from upstream).
+    let title_lc = title_lc.to_lowercase();
+    let url_lc = url_lc.to_lowercase();
     // Adult lexical markers as whole-word tokens.
     const ADULT_TOKENS: &[&str] = &[
         "porn", "porno", "xxx", "xhamster", "xnxx", "xvideos", "pornhub", "youporn",
@@ -1226,6 +1231,9 @@ pub fn is_adult_explicit(title_lc: &str, url_lc: &str) -> bool {
         "adultvideo", "adult film", "adult movie", "adult content", "hardcore", "softcore",
         "lingerie model", "webcam model", "camgirl", "cam boy", "only fans",
     ];
+    // URL-only adult tokens: "adult" is too broad for titles (e.g. "Adult
+    // Education") but a strong signal in URL path segments (e.g. "/adult-games/").
+    const URL_ADULT_TOKENS: &[&str] = &["adult"];
     // Whole-word matching via boundaries so substrings of innocent words don't trip.
     // Split on ALL non-alphanumeric (including '-') so "porn-games" → ["porn", "games"].
     let tokenize = |s: &str| -> Vec<String> {
@@ -1234,28 +1242,17 @@ pub fn is_adult_explicit(title_lc: &str, url_lc: &str) -> bool {
             .map(|w| w.to_string())
             .collect()
     };
-    let title_tokens = tokenize(title_lc);
-    let url_tokens = tokenize(url_lc);
+    let title_tokens = tokenize(&title_lc);
+    let url_tokens = tokenize(&url_lc);
     for t in title_tokens.iter().chain(url_tokens.iter()) {
         if ADULT_TOKENS.contains(&t.as_str()) {
             return true;
         }
     }
-    // URL structural substring check: catches adult tokens embedded in hostname
-    // labels or hyphenated path segments that the whole-token match above misses.
-    // Examples: "futureofsex.net" (host label contains "sex"), "inxxx.com"
-    // (contains "xxx"), "fapvid.com" (contains "fap"), "/porn-games/" (path
-    // segment contains "porn"), "/virtual-sex/" (contains "sex").
-    // This is structural (pattern-based), NOT a domain denylist — it detects the
-    // *pattern* of adult-indicating substrings anywhere in the URL, so it
-    // generalises to any future domain that embeds an adult token in its host
-    // or path. Applied to URL only (not title) to avoid false positives on
-    // natural-language substrings like "Essex" or "cockpit".
-    for tok in ADULT_TOKENS.iter() {
-        if tok.contains(' ') {
-            continue;
-        }
-        if url_lc.contains(tok) {
+    // URL-only token check: catches "adult" in URL path segments without
+    // false-positiving on titles that legitimately contain the word "adult".
+    for t in url_tokens.iter() {
+        if URL_ADULT_TOKENS.contains(&t.as_str()) {
             return true;
         }
     }
