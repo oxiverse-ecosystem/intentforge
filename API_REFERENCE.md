@@ -1603,8 +1603,11 @@ result:
   network key is present in the environment, this field is omitted and the result is
   still returned (graceful degradation). When a network with a configured bid floor /
   fallback is used, the block also carries `bid_floor` (the configured floor, for
-  reporting) and `fallback` (the fallback URL), both `Optional` and **never**
-  influencing ranking — see *Bid-floor / fallback (item 6)* below.
+  reporting) and, when a fallback is configured AND its host is a real merchant,
+  `fallback` (the fallback URL). Both are `Optional` and **never** influence ranking —
+  see *Bid-floor / fallback (item 6)* and *`fbu` may never point at a documentation
+  host* below. A fallback whose host is IANA documentation space is dropped at load
+  time, so no `fallback` field and no `fbu=` param ever appear for it.
 - `offer_comparisons` — a top-level array (sibling of `results`) of multi-merchant
   offer groups for the same product, built **read-only** from already-attached
   `commerce` blocks (matched by shared `gtin`/`sku`). See *Offer comparison (item 5)*
