@@ -4516,13 +4516,15 @@ async fn enrich_with_commerce_par<F, Fut>(
 
     // 1) Collect indices eligible for enrichment: object results with a URL
     //    that don't already carry a commerce block from an earlier step.
-    //    Capped at `COMMERCE_MAINPATH_TOP_N` — the same data-free presentation cap
-    //    the main /search path already applies. Without a cap the /shopping path
-    //    (which passes the WHOLE results array) would schedule e.g. 21 results =
-    //    6 waves, and the derived per-fetch budget (22s/6 = 3.6s) would fall back
-    //    below the real VPN-routed page latency — the exact defect this function
-    //    was fixed for. Results past the cap are not silently dropped from the
-    //    response; they simply keep commerce: null with honest provenance.
+    //    Capped at `COMMERCE_ENRICH_WINDOW` — the data-free enrichment window
+    //    that lets the main /search path reach past bot-checked merchant pages
+    //    (top 8) to pages that DO carry product facts. Without a cap the
+    //    /shopping path (which passes the WHOLE results array) would schedule
+    //    e.g. 21 results = 6 waves, and the derived per-fetch budget (22s/6 =
+    //    3.6s) would fall back below the real VPN-routed page latency — the
+    //    exact defect this function was fixed for. Results past the cap are not
+    //    silently dropped from the response; they simply keep commerce: null
+    //    with honest provenance.
     let eligible: Vec<usize> = results
         .iter()
         .enumerate()
@@ -4532,7 +4534,7 @@ async fn enrich_with_commerce_par<F, Fut>(
                 && r.get("commerce").is_none()
         })
         .map(|(idx, _)| idx)
-        .take(COMMERCE_MAINPATH_TOP_N)
+        .take(COMMERCE_ENRICH_WINDOW)
         .collect();
 
     // 2) Fetch with bounded concurrency as a ROLLING WINDOW, not in waves.
@@ -18038,24 +18040,25 @@ let mut results = match tokio::task::spawn_blocking(move || {
             // EXISTING ranked order (strict subsequence — never promotes a
             // lower-ranked result). Returns None when no candidate has facts,
             // so the strip is omitted rather than shown empty.
-            let strip = match select_shopping_strip(&shop_arr, COMMERCE_MAINPATH_TOP_N) {
-                Some(s) => s,
-                None => return None,
-            };
-            // STRICT post-ranking affiliate decoration on the DISPLAY strip only
-            // (never reorders — decoration is a pure post-ranking pass).
-            let mut strip = strip;
-            decorate_affiliate(&mut strip, &state.affiliate_ctx);
-            // Read-only multi-merchant offer comparison from the attached facts.
-            let mut block = serde_json::json!({ "results": strip });
-            if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                let comparisons = build_offer_comparisons(arr_ref);
-                if !comparisons.is_empty() {
-                    block["offer_comparisons"] =
-                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+            let strip = select_shopping_strip(&shop_arr, COMMERCE_MAINPATH_TOP_N);
+            match strip {
+                None => None,
+                Some(mut strip) => {
+                    // STRICT post-ranking affiliate decoration on the DISPLAY strip only
+                    // (never reorders — decoration is a pure post-ranking pass).
+                    decorate_affiliate(&mut strip, &state.affiliate_ctx);
+                    // Read-only multi-merchant offer comparison from the attached facts.
+                    let mut block = serde_json::json!({ "results": strip });
+                    if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                        let comparisons = build_offer_comparisons(arr_ref);
+                        if !comparisons.is_empty() {
+                            block["offer_comparisons"] =
+                                serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+                        }
+                    }
+                    Some(block)
                 }
             }
-            Some(block)
         }
     } else {
         None
@@ -22997,5 +23000,106 @@ mod fallback_constraint_tests {
             "sanity: the query DOES have topic content, extraction must not be empty: {:?}",
             sc
         );
+    }
+}
+
+#[cfg(test)]
+mod mainpath_shopping_strip_tests {
+    use super::*;
+
+    fn result_with_commerce(url: &str, price: f64) -> serde_json::Value {
+        serde_json::json!({
+            "url": url,
+            "title": "Product",
+            "score": 0.9,
+            "commerce": {
+                "url": url,
+                "observed_at": "2026-10-08T00:00:00Z",
+                "source": "json-ld",
+                "data": { "price": price, "currency": "USD" }
+            }
+        })
+    }
+
+    fn result_without_commerce(url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "url": url,
+            "title": "Article",
+            "score": 0.8
+        })
+    }
+
+    #[test]
+    fn strip_keeps_only_fact_bearing_candidates_in_order() {
+        let enriched = vec![
+            result_without_commerce("https://a.example/1"),
+            result_with_commerce("https://b.example/2", 99.99),
+            result_without_commerce("https://c.example/3"),
+            result_with_commerce("https://d.example/4", 49.99),
+        ];
+        let strip = select_shopping_strip(&enriched, 8).expect("must find facts");
+        assert_eq!(strip.len(), 2);
+        assert_eq!(strip[0]["url"], "https://b.example/2");
+        assert_eq!(strip[1]["url"], "https://d.example/4");
+    }
+
+    #[test]
+    fn strip_returns_none_when_no_candidate_has_facts() {
+        let enriched = vec![
+            result_without_commerce("https://a.example/1"),
+            result_without_commerce("https://b.example/2"),
+        ];
+        assert!(select_shopping_strip(&enriched, 8).is_none());
+    }
+
+    #[test]
+    fn strip_respects_display_cap() {
+        let enriched: Vec<_> = (0..10)
+            .map(|i| result_with_commerce(&format!("https://m{}.example/p", i), 10.0 + i as f64))
+            .collect();
+        let strip = select_shopping_strip(&enriched, 3).expect("must find facts");
+        assert_eq!(strip.len(), 3);
+        assert_eq!(strip[0]["url"], "https://m0.example/p");
+        assert_eq!(strip[1]["url"], "https://m1.example/p");
+        assert_eq!(strip[2]["url"], "https://m2.example/p");
+    }
+
+    #[test]
+    fn strip_is_a_strict_subsequence_never_promotes() {
+        // Facts at ranks 2 and 4 (0-indexed: 1 and 3). The strip must keep
+        // them in that order, never promoting rank-4 above rank-2.
+        let enriched = vec![
+            result_without_commerce("https://a.example/1"),
+            result_with_commerce("https://b.example/2", 99.99),
+            result_without_commerce("https://c.example/3"),
+            result_with_commerce("https://d.example/4", 49.99),
+            result_without_commerce("https://e.example/5"),
+        ];
+        let strip = select_shopping_strip(&enriched, 8).expect("must find facts");
+        let urls: Vec<_> = strip.iter().map(|r| r["url"].as_str().unwrap()).collect();
+        assert_eq!(urls, vec!["https://b.example/2", "https://d.example/4"]);
+    }
+
+    #[test]
+    fn strip_surfaces_facts_beyond_the_first_eight_candidates() {
+        // The exact regression: facts only at ranks 9 and 10 (0-indexed: 8 and 9).
+        // With the old code (enrich window = display cap = 8), these would never
+        // be enriched. With COMMERCE_ENRICH_WINDOW = 24, they are.
+        let mut enriched: Vec<_> = (0..8)
+            .map(|i| result_without_commerce(&format!("https://m{}.example/p", i)))
+            .collect();
+        enriched.push(result_with_commerce("https://m8.example/p", 99.99));
+        enriched.push(result_with_commerce("https://m9.example/p", 49.99));
+
+        let strip = select_shopping_strip(&enriched, 8).expect("must find facts");
+        assert_eq!(strip.len(), 2);
+        assert_eq!(strip[0]["url"], "https://m8.example/p");
+        assert_eq!(strip[1]["url"], "https://m9.example/p");
+    }
+
+    #[test]
+    fn enrich_window_is_wider_than_display_cap() {
+        // Guards the constants from being re-conflated.
+        assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
     }
 }
