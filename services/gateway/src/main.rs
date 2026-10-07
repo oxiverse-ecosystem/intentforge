@@ -12078,7 +12078,7 @@ async fn handle_images(
     };
 
     let searx1_fut = async {
-        match fetch_text_budgeted(state.http_client.clone(), searx_url.clone(), 6000).await {
+        match fetch_text_budgeted(state.http_client.clone(), searx_url.clone(), 12000).await {
             Some(raw) => parse_images(raw),
             None => { tracing::warn!("SearXNG1 image timed out/failed — empty"); vec![] }
         }
@@ -12089,7 +12089,7 @@ async fn handle_images(
             Some(u) => u,
             None => return vec![],
         };
-        match fetch_text_budgeted(state.http_client.clone(), url.clone(), 6000).await {
+        match fetch_text_budgeted(state.http_client.clone(), url.clone(), 12000).await {
             Some(raw) => parse_images(raw),
             None => { tracing::warn!("SearXNG2 image timed out/failed — empty"); vec![] }
         }
@@ -12178,7 +12178,7 @@ async fn handle_videos(
     });
 
     let searx_fut = async {
-        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&searx_video_url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(15), state.http_client.get(&searx_video_url).send()).await {
             Ok(Ok(resp)) => match read_body_bounded(resp).await {
                 Some(bytes) => {
                     let raw = String::from_utf8_lossy(&bytes).into_owned();
@@ -12212,7 +12212,7 @@ async fn handle_videos(
                 None => { tracing::warn!("SearXNG video body read error / exceeded cap"); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG video request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG video timed out after 4s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG video timed out after 15s"); vec![] }
         }
     };
 
@@ -12221,7 +12221,7 @@ async fn handle_videos(
             Some(u) => u,
             None => return vec![],
         };
-        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(15), state.http_client.get(&url).send()).await {
             Ok(Ok(resp)) => match read_body_bounded(resp).await {
                 Some(bytes) => {
                     let raw = String::from_utf8_lossy(&bytes).into_owned();
@@ -12290,8 +12290,8 @@ async fn handle_videos(
     let invidious_deadline = async {
         tokio::select! {
             results = invidious_fut => results,
-            _ = tokio::time::sleep(Duration::from_secs(4)) => {
-                tracing::warn!("Invidious skipped to meet 4s target");
+            _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                tracing::warn!("Invidious skipped to meet 15s target");
                 vec![]
             }
         }
@@ -12413,7 +12413,7 @@ async fn handle_news(
     };
 
     let searx1_fut = async {
-        match tokio::time::timeout(Duration::from_secs(6), state.http_client.get(&searx_url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(12), state.http_client.get(&searx_url).send()).await {
             Ok(Ok(resp)) => match read_body_bounded(resp).await {
                 Some(bytes) => {
                     let raw = String::from_utf8_lossy(&bytes).into_owned();
@@ -12431,7 +12431,7 @@ async fn handle_news(
             Some(u) => u,
             None => return vec![],
         };
-        match tokio::time::timeout(Duration::from_secs(6), state.http_client.get(&url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(12), state.http_client.get(&url).send()).await {
             Ok(Ok(resp)) => match read_body_bounded(resp).await {
                 Some(bytes) => {
                     let raw = String::from_utf8_lossy(&bytes).into_owned();

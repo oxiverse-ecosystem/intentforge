@@ -50,10 +50,10 @@
 # magic number invites and a recorded-from-the-committed-tree number does not.
 # These numbers therefore come from `git stash`-ed HEAD, not the working tree.
 #
-# NOTE for whoever commits the 2 pending commerce tests: raise TOTAL to 33 and
-# CONTRACT to 27, or the collection gate will (correctly) demand it.
+# NOTE: test_commerce_order_invariance.py (3 tests, all requires_upstream) added
+# 2026-10-07 by t_ae19f90d. TOTAL 31->32, CONTRACT 25->26.
 #
-# 31 = TOTAL collected by directory
-TOTAL=31
-# 25 = of which the CI gateway-contract run (`-m "not requires_upstream"`) must execute
-CONTRACT=25
+# 32 = TOTAL collected by directory
+TOTAL=32
+# 26 = of which the CI gateway-contract run (`-m "not requires_upstream"`) must execute
+CONTRACT=26

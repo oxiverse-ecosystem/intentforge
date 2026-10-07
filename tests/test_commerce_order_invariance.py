@@ -134,7 +134,6 @@ def test_affiliate_disclosure_flag_present_on_all_decorated_results(session):
             )
 
 
-@pytest.mark.requires_upstream
 def test_graceful_degradation_when_commerce_key_unset(session):
     """With SOVRN_COMMERCE_KEY unset the gateway still returns 200 and
     decorated results degrade gracefully (affiliate field omitted or null).
