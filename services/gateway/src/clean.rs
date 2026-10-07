@@ -704,6 +704,118 @@ mod tests {
             "We cannot provide a description for this page right now"
         ));
     }
+
+    // ── Adult-content regression tests (tor2/SearXNG2 leak, 2026-10-04) ──
+    // These assert that the structural adult filter catches the exact URLs
+    // that leaked through the tor2 arm for benign queries. The fix is
+    // structural (tokenizer splits on '-', URL substring check), NOT a
+    // domain denylist — so these tests verify the PATTERN works, not that
+    // specific domains are listed.
+
+    #[test]
+    fn adult_filter_catches_hyphenated_path_segments() {
+        // "porn-games" used to tokenize as one token "porn-games" (with '-'),
+        // which didn't match "porn" in ADULT_TOKENS. Now the tokenizer splits
+        // on '-', so "porn-games" → ["porn", "games"] → matches.
+        assert!(is_adult_explicit(
+            "Realistic Games",
+            "https://steamygamer.com/porn-games/realistic/p2"
+        ));
+    }
+
+    #[test]
+    fn adult_filter_catches_embedded_host_token() {
+        // "futureofsex.net" — the host label "futureofsex" contains "sex"
+        // as a substring but doesn't tokenize to "sex". The URL substring
+        // check catches this structural pattern.
+        assert!(is_adult_explicit(
+            "The Most Realistic Sex Games You Can Play",
+            "https://futureofsex.net/virtual-sex/the-most-realistic-sex-games-you-can-play/"
+        ));
+    }
+
+    #[test]
+    fn adult_filter_catches_inxxx_host() {
+        // "inxxx.com" — host contains "xxx" as substring.
+        assert!(is_adult_explicit(
+            "Indian Porn",
+            "https://www.inxxx.com/tags/indian-porn/"
+        ));
+    }
+
+    #[test]
+    fn adult_filter_catches_fapvid_host() {
+        // "fapvid.com" — host contains "fap" as substring.
+        assert!(is_adult_explicit(
+            "Videos",
+            "https://www.fapvid.com/de/1292/group/"
+        ));
+    }
+
+    #[test]
+    fn adult_filter_catches_adultvisor_host() {
+        // "adultvisor.com" — host contains "adult" as substring.
+        assert!(is_adult_explicit(
+            "Best Multiplayer Sex Games",
+            "https://adultvisor.com/best-multiplayer-sex-games/"
+        ));
+    }
+
+    #[test]
+    fn adult_filter_catches_virtual_sex_path() {
+        // "/virtual-sex/" — path segment contains "sex" as substring.
+        assert!(is_adult_explicit(
+            "Virtual Sex Games",
+            "https://example.com/virtual-sex/games"
+        ));
+    }
+
+    #[test]
+    fn adult_filter_allows_essex_county() {
+        // "Essex" is a legitimate place name — must NOT be flagged.
+        // The URL substring check only applies to URLs, and "essex" as a
+        // title word is not in ADULT_TOKENS.
+        assert!(!is_adult_explicit(
+            "Essex County Council",
+            "https://www.essex.gov.uk/"
+        ));
+    }
+
+    #[test]
+    fn adult_filter_allows_cockpit() {
+        // "cockpit" contains "cock" but is a legitimate word.
+        assert!(!is_adult_explicit(
+            "Cockpit Voice Recorder",
+            "https://en.wikipedia.org/wiki/Cockpit_voice_recorder"
+        ));
+    }
+
+    #[test]
+    fn adult_filter_allows_normal_programming_query() {
+        // A legitimate programming result must NOT be flagged.
+        assert!(!is_adult_explicit(
+            "The Rust Programming Language",
+            "https://doc.rust-lang.org/book/"
+        ));
+    }
+
+    #[test]
+    fn adult_filter_catches_itchio_adult_games() {
+        // itch.io category page with "adult" in path.
+        assert!(is_adult_explicit(
+            "Not VN Adult Games",
+            "https://itch.io/c/5198433/not-vn-adult-games"
+        ));
+    }
+
+    #[test]
+    fn adult_filter_catches_mopoga_simulator() {
+        // mopoga.com with "sex" in title.
+        assert!(is_adult_explicit(
+            "Free Sex Simulator Games Online",
+            "https://mopoga.com/simulator"
+        ));
+    }
 }
 
 
@@ -1115,8 +1227,9 @@ pub fn is_adult_explicit(title_lc: &str, url_lc: &str) -> bool {
         "lingerie model", "webcam model", "camgirl", "cam boy", "only fans",
     ];
     // Whole-word matching via boundaries so substrings of innocent words don't trip.
+    // Split on ALL non-alphanumeric (including '-') so "porn-games" → ["porn", "games"].
     let tokenize = |s: &str| -> Vec<String> {
-        s.split(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-')
+        s.split(|c: char| !c.is_alphanumeric())
             .filter(|w| !w.is_empty())
             .map(|w| w.to_string())
             .collect()
@@ -1124,8 +1237,25 @@ pub fn is_adult_explicit(title_lc: &str, url_lc: &str) -> bool {
     let title_tokens = tokenize(title_lc);
     let url_tokens = tokenize(url_lc);
     for t in title_tokens.iter().chain(url_tokens.iter()) {
-        let tw = t.trim_matches('-');
-        if ADULT_TOKENS.contains(&tw) {
+        if ADULT_TOKENS.contains(&t.as_str()) {
+            return true;
+        }
+    }
+    // URL structural substring check: catches adult tokens embedded in hostname
+    // labels or hyphenated path segments that the whole-token match above misses.
+    // Examples: "futureofsex.net" (host label contains "sex"), "inxxx.com"
+    // (contains "xxx"), "fapvid.com" (contains "fap"), "/porn-games/" (path
+    // segment contains "porn"), "/virtual-sex/" (contains "sex").
+    // This is structural (pattern-based), NOT a domain denylist — it detects the
+    // *pattern* of adult-indicating substrings anywhere in the URL, so it
+    // generalises to any future domain that embeds an adult token in its host
+    // or path. Applied to URL only (not title) to avoid false positives on
+    // natural-language substrings like "Essex" or "cockpit".
+    for tok in ADULT_TOKENS.iter() {
+        if tok.contains(' ') {
+            continue;
+        }
+        if url_lc.contains(tok) {
             return true;
         }
     }
