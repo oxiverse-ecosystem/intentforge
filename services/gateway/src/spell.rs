@@ -65,6 +65,8 @@ const PROTECTED_TERMS: &[&str] = &[
     "github", "gitlab", "apple", "ubuntu", "debian", "alpine", "macos",
     "android", "linux", "windows", "aws", "gcp", "azure", "vim", "neovim",
     "emacs", "json", "yaml", "toml", "grpc", "graphql", "kafka", "duckdb",
+    // Media server / streaming brands (plex→alex, emby→ember corruption class)
+    "plex", "emby", "jellyfin", "kodi", "vlc", "roku", "firetv", "chromecast",
     // Food & cooking terms that collide with English words / tech terms
     "batter", "dosa", "idli", "vada", "poha", "upma", "biryani", "tandoori",
     "masala", "chutney", "achar", "ghee", "besan", "rava", "semolina",
