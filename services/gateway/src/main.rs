@@ -4706,6 +4706,19 @@ fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
 /// it only changes how many enriched shopping cards show, never their order.
 const COMMERCE_MAINPATH_TOP_N: usize = 8;
 
+/// How many already-ranked results are ENRICHED on the main `/search` path before
+/// the display cap (`COMMERCE_MAINPATH_TOP_N`) is applied. Decoupling the two is
+/// the main-path reachability fix: commercial queries often have bot-checked
+/// merchant pages (Amazon/Walmart/Flipkart) in the top 8 with no structured
+/// markup, so enriching only 8 finds nothing and the strip is suppressed. A wider
+/// window (24) lets the enrichment reach past those to pages that DO carry
+/// product facts, while the display cap keeps the strip at 8 cards.
+///
+/// This is NOT a ranking change: enrichment is a strict post-ranking decoration
+/// pass over a CLONE of the ranked results. The real `results` array is never
+/// mutated, reordered, or reselected.
+const COMMERCE_ENRICH_WINDOW: usize = 24;
+
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
 /// Returns true when the in-process intent signals indicate the user wants to buy.
@@ -4741,6 +4754,32 @@ fn is_commercial_intent(
         .copied()
         .unwrap_or(0.0)
         >= 0.50
+}
+
+/// Pure helper: from an already-enriched array of result JSON values, keep only
+/// the first `limit` candidates that carry a concrete `commerce` block, in their
+/// EXISTING order. Returns `None` when no candidate has facts, so the caller
+/// omits the strip rather than showing an empty one.
+///
+/// This is a STRICT SUBSEQUENCE operation: it never promotes a lower-ranked
+/// result, never reorders, never mutates the input. The real `results` array
+/// on `/search` is never touched — this runs on a CLONE. The no-manipulation
+/// guarantee holds: the strip is a pure post-enrichment filter.
+fn select_shopping_strip(
+    enriched: &[serde_json::Value],
+    limit: usize,
+) -> Option<Vec<serde_json::Value>> {
+    let strip: Vec<serde_json::Value> = enriched
+        .iter()
+        .filter(|r| r.get("commerce").is_some())
+        .take(limit)
+        .cloned()
+        .collect();
+    if strip.is_empty() {
+        None
+    } else {
+        Some(strip)
+    }
 }
 
 /// GET /shopping — the user-facing commerce search endpoint (ROADMAP item 2).
@@ -17965,11 +18004,16 @@ let mut results = match tokio::task::spawn_blocking(move || {
         // fetch is started, nothing gets fabricated, and the `has_any_commerce_block`
         // gate below suppresses the empty strip exactly as before.
         let enrichment_wall = commerce_wall_for_elapsed(request_started.elapsed());
-        // Clone only the top-N ranked results into a JSON array we can enrich in
-        // place. `serde_json::to_value` on `MergedResult` is lossless/Serialize.
+        // Clone the top COMMERCE_ENRICH_WINDOW ranked results into a JSON array we
+        // can enrich in place. The enrichment window is WIDER than the display cap
+        // (`COMMERCE_MAINPATH_TOP_N = 8`): commercial queries often have bot-checked
+        // merchant pages (Amazon/Walmart/Flipkart) in the top 8 with no structured
+        // markup, so enriching only 8 finds nothing and the strip is suppressed.
+        // A wider window (24) lets enrichment reach past those to pages that DO
+        // carry product facts. `serde_json::to_value` on `MergedResult` is lossless.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
             .iter()
-            .take(COMMERCE_MAINPATH_TOP_N)
+            .take(COMMERCE_ENRICH_WINDOW)
             .filter_map(|r| serde_json::to_value(r).ok())
             .collect();
         if shop_arr.is_empty() {
@@ -17990,32 +18034,28 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 enrichment_wall,
             )
             .await;
-            // STRICT post-ranking affiliate decoration (never reorders).
-            decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
-            // ROADMAP item 7 (refinement): only surface the main-path `shopping`
-            // strip when at least one of the top-N ranked results actually exposed
-            // structured product data (a `commerce` block). A commercial-intent
-            // query whose top results are articles/reviews/guides with no product
-            // schema would otherwise render an empty strip of cards carrying only
-            // affiliate links — a low-value, link-farm-like surface that invites
-            // misuse of the affiliate thesis. Gating on a REAL `commerce` block
-            // keeps the block honest: it appears only when we have product facts to
-            // show. Pure post-enrichment signal, no query-specific logic, and the
-            // `results` ordering is untouched either way (no-manipulation holds).
-            if !shop_arr.iter().any(|r| r.get("commerce").is_some()) {
-                None
-            } else {
-                // Read-only multi-merchant offer comparison from the attached facts.
-                let mut block = serde_json::json!({ "results": shop_arr });
-                if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                    let comparisons = build_offer_comparisons(arr_ref);
-                    if !comparisons.is_empty() {
-                        block["offer_comparisons"] =
-                            serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
-                    }
+            // Select only the fact-bearing candidates for display, in their
+            // EXISTING ranked order (strict subsequence — never promotes a
+            // lower-ranked result). Returns None when no candidate has facts,
+            // so the strip is omitted rather than shown empty.
+            let strip = match select_shopping_strip(&shop_arr, COMMERCE_MAINPATH_TOP_N) {
+                Some(s) => s,
+                None => return None,
+            };
+            // STRICT post-ranking affiliate decoration on the DISPLAY strip only
+            // (never reorders — decoration is a pure post-ranking pass).
+            let mut strip = strip;
+            decorate_affiliate(&mut strip, &state.affiliate_ctx);
+            // Read-only multi-merchant offer comparison from the attached facts.
+            let mut block = serde_json::json!({ "results": strip });
+            if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                let comparisons = build_offer_comparisons(arr_ref);
+                if !comparisons.is_empty() {
+                    block["offer_comparisons"] =
+                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
                 }
-                Some(block)
             }
+            Some(block)
         }
     } else {
         None
