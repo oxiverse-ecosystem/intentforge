@@ -1100,6 +1100,11 @@ pub fn is_definition_site(title_lc: &str, content_lc: &str) -> bool {
 /// future-proof: any new adult domain whose page title/url carries these markers is
 /// filtered without a code change.
 pub fn is_adult_explicit(title_lc: &str, url_lc: &str) -> bool {
+    // Lowercase input so token comparison against the lowercase ADULT_TOKENS
+    // list is case-insensitive.  The `_lc` suffix documents the contract but
+    // callers may pass mixed-case strings (e.g. raw titles from upstream).
+    let title_lc = title_lc.to_lowercase();
+    let url_lc = url_lc.to_lowercase();
     // Adult lexical markers as whole-word tokens.
     const ADULT_TOKENS: &[&str] = &[
         "porn", "porno", "xxx", "xhamster", "xnxx", "xvideos", "pornhub", "youporn",
@@ -1114,18 +1119,48 @@ pub fn is_adult_explicit(title_lc: &str, url_lc: &str) -> bool {
         "adultvideo", "adult film", "adult movie", "adult content", "hardcore", "softcore",
         "lingerie model", "webcam model", "camgirl", "cam boy", "only fans",
     ];
+    // URL-only adult tokens: "adult" is too broad for titles (e.g. "Adult
+    // Education") but a strong signal in URL path segments (e.g. "/adult-games/").
+    const URL_ADULT_TOKENS: &[&str] = &["adult"];
+    // Tokens that are substrings of common English words — skip them in the
+    // URL substring check to avoid false positives like "essex" (contains "sex")
+    // or "cockpit" (contains "cock").  These tokens are still matched as
+    // whole-word tokens above.
+    const URL_SUBSTRING_SKIP: &[&str] = &["sex", "cock", "cum", "anal"];
     // Whole-word matching via boundaries so substrings of innocent words don't trip.
+    // Split on ALL non-alphanumeric (including '-') so "porn-games" → ["porn", "games"].
     let tokenize = |s: &str| -> Vec<String> {
-        s.split(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-')
+        s.split(|c: char| !c.is_alphanumeric())
             .filter(|w| !w.is_empty())
             .map(|w| w.to_string())
             .collect()
     };
-    let title_tokens = tokenize(title_lc);
-    let url_tokens = tokenize(url_lc);
+    let title_tokens = tokenize(&title_lc);
+    let url_tokens = tokenize(&url_lc);
     for t in title_tokens.iter().chain(url_tokens.iter()) {
-        let tw = t.trim_matches('-');
-        if ADULT_TOKENS.contains(&tw) {
+        if ADULT_TOKENS.contains(&t.as_str()) {
+            return true;
+        }
+    }
+    // URL-only token check: catches "adult" in URL path segments without
+    // false-positiving on titles that legitimately contain the word "adult".
+    for t in url_tokens.iter() {
+        if URL_ADULT_TOKENS.contains(&t.as_str()) {
+            return true;
+        }
+    }
+    // URL substring check: catches adult tokens embedded in hostname labels
+    // or hyphenated path segments that the whole-token match above misses.
+    // Skips tokens that are substrings of common English words to avoid
+    // false positives (e.g. "essex" contains "sex", "cockpit" contains "cock").
+    for tok in ADULT_TOKENS.iter() {
+        if tok.contains(' ') {
+            continue;
+        }
+        if URL_SUBSTRING_SKIP.contains(tok) {
+            continue;
+        }
+        if url_lc.contains(tok) {
             return true;
         }
     }
