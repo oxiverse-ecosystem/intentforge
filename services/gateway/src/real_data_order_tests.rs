@@ -275,3 +275,78 @@ fn real_data_decoration_touches_no_field_except_affiliate() {
         "decoration changed the ranked URL order"
     );
 }
+
+/// NON-VACUITY ASSERTION for the main path (card t_a46a53d3).
+///
+/// The main-path /search `shopping` strip is built from a CLONE of the
+/// top-N ranked results, enriched via `enrich_with_commerce`, then
+/// filtered to only rows with a `commerce` block. If enrichment attaches
+/// no commerce block (e.g. because every page fetch fails), the strip is
+/// empty and the main-path order-invariance comparison is VACUOUS — it
+/// compares two no-decoration runs.
+///
+/// This test proves the enrichment pipeline CAN attach commerce blocks
+/// when pages are fetchable, so a future regression that breaks the
+/// pipeline (e.g. a status-code check that rejects everything, or an
+/// extraction change that finds nothing) fails here rather than silently
+/// making the live comparison vacuous.
+#[tokio::test]
+async fn main_path_enrichment_is_non_vacuous_with_fetchable_pages() {
+    // Build a ranked fixture with a URL that the fake fetch will resolve.
+    let mut arr = vec![
+        serde_json::json!({"url": "https://merchant-a.example/p/1000xm5", "title": "Product A", "score": 0.97}),
+        serde_json::json!({"url": "https://merchant-b.example/p/1000xm5?ref=feed", "title": "Product B", "score": 0.91}),
+    ];
+
+    // Fake fetch: return a minimal product page with JSON-LD price.
+    // This exercises the REAL extract_commerce_offer path with zero network.
+    let fake_html = r#"<html><head><script type="application/ld+json">{"@type":"Product","offers":{"@type":"Offer","price":"99.99","priceCurrency":"USD"}}</script></head><body>Product</body></html>"#;
+    let fetch = |_url: String| async move { Some(fake_html.to_string()) };
+
+    // Enrich the array (same function the main path calls).
+    enrich_with_commerce(&mut arr, fetch).await;
+
+    // NON-VACUITY: at least one result must have a commerce block.
+    let with_commerce = arr.iter().filter(|r| r.get("commerce").is_some()).count();
+    assert!(
+        with_commerce > 0,
+        "enrichment attached zero commerce blocks to {} results — the main-path \
+         shopping strip would be vacuous (card t_a46a53d3)",
+        arr.len()
+    );
+
+    // The commerce block must carry honest provenance.
+    for r in &arr {
+        if let Some(c) = r.get("commerce") {
+            assert!(
+                c.get("observed_at").is_some(),
+                "commerce block missing observed_at provenance"
+            );
+        }
+    }
+
+    // Now decorate with keys present and verify the strip would be non-empty.
+    let networks = real_ctx();
+    let keyed_ctx = AffiliateCtx {
+        networks: remap_keys(&networks, "STRIP_PRESENT", true),
+    };
+    decorate_affiliate(&mut arr, &keyed_ctx);
+
+    // The concrete_offers filter (main path gate) must find at least one row.
+    let concrete_offers: Vec<_> = arr
+        .iter()
+        .filter(|r| r.get("commerce").is_some())
+        .collect();
+    assert!(
+        !concrete_offers.is_empty(),
+        "main-path concrete_offers filter found zero rows — the shopping strip \
+         would be None and the order-invariance comparison would be vacuous"
+    );
+
+    // And the decorated rows must carry affiliate blocks.
+    let with_affiliate = arr.iter().filter(|r| r.get("affiliate").is_some()).count();
+    assert!(
+        with_affiliate > 0,
+        "keys-present run decorated zero results — non-vacuity violated"
+    );
+}

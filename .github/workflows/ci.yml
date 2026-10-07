@@ -74,7 +74,8 @@ jobs:
           for t in \
             real_data_order_is_invariant_for_every_network_key_on_and_off \
             real_data_whole_config_order_invariant_keys_present_vs_absent \
-            real_data_decoration_touches_no_field_except_affiliate
+            real_data_decoration_touches_no_field_except_affiliate \
+            main_path_enrichment_is_non_vacuous_with_fetchable_pages
           do
             if ! grep -q "$t" "$log"; then
               echo "::error::order-invariance test '$t' did not run — the no-reorder guarantee is UNENFORCED on this branch"
@@ -85,11 +86,11 @@ jobs:
 
           # A zero-match run is a vacuous pass, not a pass.
           ran=$(grep -cE '^test real_data_.* \.\.\. ok$' "$log" || true)
-          if [ "$ran" -lt 3 ]; then
-            echo "::error::expected 3 real_data_ tests to pass, saw ${ran} — the commerce config is probably empty and the comparison is vacuous"
+          if [ "$ran" -lt 4 ]; then
+            echo "::error::expected 4 real_data_ tests to pass, saw ${ran} — the commerce config is probably empty and the comparison is vacuous"
             exit 1
           fi
-          echo "order-invariance guard: ${ran}/3 tests executed and passed"
+          echo "order-invariance guard: ${ran}/4 tests executed and passed"
 
   schema-regression:
     name: API contract regression (real gateway in CI)
