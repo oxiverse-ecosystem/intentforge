@@ -4313,12 +4313,7 @@ async fn enrich_with_commerce<F, Fut>(
         if r.get("commerce").is_some() {
             continue; // already enriched by an earlier step
         }
-        let provenance = serde_json::json!({
-            "url": url,
-            "observed_at": now_unix_string(),
-            "source": null,
-            "data": null,
-        });
+        let mut attached = false;
         match fetch(url.clone()).await {
             Some(h) => {
                 let offer: CommerceOffer = extract_commerce_offer(&h, &url);
@@ -4328,6 +4323,7 @@ async fn enrich_with_commerce<F, Fut>(
                     match serde_json::to_value(&offer) {
                         Ok(v) => {
                             r["commerce"] = v;
+                            attached = true;
                         }
                         Err(_) => {}
                     }
@@ -4335,6 +4331,40 @@ async fn enrich_with_commerce<F, Fut>(
             }
             None => {}
         }
+        // Snippet-based price fallback: when the page fetch failed or returned
+        // no structured data, try to extract a price from the search result
+        // snippet (title + content). This improves enrichment recall without
+        // fabricating facts — the price is marked with source="snippet_extracted"
+        // so the frontend can label it as less certain than structured data.
+        if !attached {
+            let snippet = format!(
+                "{} {}",
+                r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                r.get("content").and_then(|v| v.as_str()).unwrap_or("")
+            );
+            if let Some(price_info) = extract_price_from_text(&snippet) {
+                let facts = OfferFacts {
+                    price: Some(price_info.amount),
+                    currency: Some(price_info.currency),
+                    ..Default::default()
+                };
+                let offer = CommerceOffer {
+                    url: Some(url.clone()),
+                    observed_at: Some(now_unix_string()),
+                    source: Some("snippet_extracted".to_string()),
+                    data: Some(facts),
+                };
+                if let Ok(v) = serde_json::to_value(&offer) {
+                    r["commerce"] = v;
+                }
+            }
+        }
+        let provenance = serde_json::json!({
+            "url": url,
+            "observed_at": now_unix_string(),
+            "source": r.get("commerce").and_then(|c| c.get("source")).and_then(|s| s.as_str()),
+            "data": r.get("commerce").and_then(|c| c.get("data")),
+        });
         r["commerce_provenance"] = provenance;
     }
 }
@@ -12078,7 +12108,7 @@ async fn handle_images(
     };
 
     let searx1_fut = async {
-        match fetch_text_budgeted(state.http_client.clone(), searx_url.clone(), 6000).await {
+        match fetch_text_budgeted(state.http_client.clone(), searx_url.clone(), 12000).await {
             Some(raw) => parse_images(raw),
             None => { tracing::warn!("SearXNG1 image timed out/failed — empty"); vec![] }
         }
@@ -12089,7 +12119,7 @@ async fn handle_images(
             Some(u) => u,
             None => return vec![],
         };
-        match fetch_text_budgeted(state.http_client.clone(), url.clone(), 6000).await {
+        match fetch_text_budgeted(state.http_client.clone(), url.clone(), 12000).await {
             Some(raw) => parse_images(raw),
             None => { tracing::warn!("SearXNG2 image timed out/failed — empty"); vec![] }
         }
@@ -12178,7 +12208,7 @@ async fn handle_videos(
     });
 
     let searx_fut = async {
-        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&searx_video_url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(15), state.http_client.get(&searx_video_url).send()).await {
             Ok(Ok(resp)) => match read_body_bounded(resp).await {
                 Some(bytes) => {
                     let raw = String::from_utf8_lossy(&bytes).into_owned();
@@ -12212,7 +12242,7 @@ async fn handle_videos(
                 None => { tracing::warn!("SearXNG video body read error / exceeded cap"); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG video request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG video timed out after 4s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG video timed out after 15s"); vec![] }
         }
     };
 
@@ -12221,7 +12251,7 @@ async fn handle_videos(
             Some(u) => u,
             None => return vec![],
         };
-        match tokio::time::timeout(Duration::from_secs(4), state.http_client.get(&url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(15), state.http_client.get(&url).send()).await {
             Ok(Ok(resp)) => match read_body_bounded(resp).await {
                 Some(bytes) => {
                     let raw = String::from_utf8_lossy(&bytes).into_owned();
@@ -12255,7 +12285,7 @@ async fn handle_videos(
                 None => { tracing::warn!("SearXNG2 video body read error / exceeded cap"); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG2 video request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG2 video timed out after 4s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG2 video timed out after 15s"); vec![] }
         }
     };
 
@@ -12290,8 +12320,8 @@ async fn handle_videos(
     let invidious_deadline = async {
         tokio::select! {
             results = invidious_fut => results,
-            _ = tokio::time::sleep(Duration::from_secs(4)) => {
-                tracing::warn!("Invidious skipped to meet 4s target");
+            _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                tracing::warn!("Invidious skipped to meet 15s target");
                 vec![]
             }
         }
@@ -12413,7 +12443,7 @@ async fn handle_news(
     };
 
     let searx1_fut = async {
-        match tokio::time::timeout(Duration::from_secs(6), state.http_client.get(&searx_url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(12), state.http_client.get(&searx_url).send()).await {
             Ok(Ok(resp)) => match read_body_bounded(resp).await {
                 Some(bytes) => {
                     let raw = String::from_utf8_lossy(&bytes).into_owned();
@@ -12422,7 +12452,7 @@ async fn handle_news(
                 None => { tracing::warn!("SearXNG1 news body read error / exceeded cap"); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG1 news request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG1 news timed out after 6s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG1 news timed out after 12s"); vec![] }
         }
     };
 
@@ -12431,7 +12461,7 @@ async fn handle_news(
             Some(u) => u,
             None => return vec![],
         };
-        match tokio::time::timeout(Duration::from_secs(6), state.http_client.get(&url).send()).await {
+        match tokio::time::timeout(Duration::from_secs(12), state.http_client.get(&url).send()).await {
             Ok(Ok(resp)) => match read_body_bounded(resp).await {
                 Some(bytes) => {
                     let raw = String::from_utf8_lossy(&bytes).into_owned();
@@ -12440,7 +12470,7 @@ async fn handle_news(
                 None => { tracing::warn!("SearXNG2 news body read error / exceeded cap"); vec![] }
             },
             Ok(Err(e)) => { tracing::warn!("SearXNG2 news request error: {}", e); vec![] }
-            Err(_) => { tracing::warn!("SearXNG2 news timed out after 6s"); vec![] }
+            Err(_) => { tracing::warn!("SearXNG2 news timed out after 12s"); vec![] }
         }
     };
 
