@@ -4870,6 +4870,77 @@ fn default_priority() -> i64 {
     0
 }
 
+/// HOST component of a URL, lowercased, without scheme/port/userinfo/path.
+/// Pure; falls back to the raw string when the value has no `://` scheme.
+fn url_host(value: &str) -> String {
+    let after_scheme = match value.find("://") {
+        Some(i) => &value[i + 3..],
+        None => value,
+    };
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    // Strip userinfo (`user:pass@host`) then any `:port`.
+    let host = match authority.rfind('@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    let host = match host.rfind(':') {
+        Some(i) if host[i + 1..].chars().all(|c| c.is_ascii_digit()) => &host[..i],
+        _ => host,
+    };
+    host.trim_end_matches('.').to_lowercase()
+}
+
+/// TRUE when `host` carries a label reserved for documentation by IANA and
+/// therefore can never be a real merchant destination.
+///
+/// Encodes two published registries — no merchant, network, or query literals:
+///   * RFC 2606 §2 / RFC 6761 §6 — reserved NAMES: `example`, `test`,
+///     `invalid`, `localhost`, and their `.tld`/`.test`/`.example`/`.invalid`
+///     forms;
+///   * RFC 2606 §2 — the `example` documentation PREFIX: a label beginning with
+///     `example` followed by a separator (`example-merchant`, `example_shop`).
+///     This is what catches the common "invented merchant" shape, which is
+///     legal DNS but is a placeholder by convention.
+///
+/// Matching is LABEL-BOUNDARY, never substring, and the prefix rule applies ONLY
+/// to `example`:
+///   * `test` is a special-use NAME, but `testosterone-shop.com` is a real shop,
+///     so a label merely CONTAINING a reserved name must be accepted;
+///   * `invalid` likewise (RFC 2606 reserves the exact name, not the prefix), so
+///     `invalid-syntax.co.uk` must not be rejected.
+///
+/// Used to drop an `fbu` (bid-miss fallback) that would send a real user to a
+/// fabricated destination. The FIELD is dropped, never the network: wrapping,
+/// `bf` and `disclosed: true` all keep working.
+fn is_reserved_documentation_host(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_lowercase();
+    if h.is_empty() {
+        return false;
+    }
+    const RESERVED_NAMES: [&str; 4] = ["example", "test", "invalid", "localhost"];
+    for label in h.split('.') {
+        if RESERVED_NAMES.contains(&label) {
+            return true;
+        }
+        // `example` is additionally a documentation PREFIX (RFC 2606 §2):
+        // `example-merchant` / `example_shop` are placeholders by convention.
+        if let Some(rest) = label.strip_prefix("example") {
+            if rest
+                .chars()
+                .next()
+                .map(|c| !c.is_ascii_alphanumeric())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
 #[derive(Clone)]
 struct AffiliateCtx {
@@ -4953,6 +5024,7 @@ impl AffiliateCtx {
                     if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
                         for n in arr {
                             if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+<<<<<<< HEAD
                                 // Never accept a non-routable documentation domain as
                                 // a real merchant fallback. Dropping the FIELD (not the
                                 // whole network) keeps the network usable for wrapping
@@ -4963,6 +5035,25 @@ impl AffiliateCtx {
                                         tracing::warn!(
                                             network = %net.id,
                                             "affiliate: ignoring reserved placeholder fallback_url (RFC 2606/6761 documentation domain)"
+=======
+                                // HONESTY GUARD: `fbu` is the destination a user is
+                                // actually SENT to when a link's bid does not clear
+                                // `bf`. A destination reserved for documentation by
+                                // IANA (RFC 2606 §2 / RFC 6761 §6) is not a merchant,
+                                // so serving it would route real clicks to a
+                                // fabricated shop — exactly the misrepresentation the
+                                // commerce contract forbids. Drop the FIELD, not the
+                                // network: wrapping, `bf` and `disclosed: true` all
+                                // keep working. Encodes a published IANA registry —
+                                // no merchant/network literals live in this code.
+                                if let Some(fbu) = net.fallback_url.clone() {
+                                    let host = url_host(&fbu);
+                                    if is_reserved_documentation_host(&host) {
+                                        tracing::warn!(
+                                            "affiliate: dropping reserved-documentation fallback_url for network '{}' (host '{}' is IANA documentation space, not a merchant)",
+                                            net.id,
+                                            host
+>>>>>>> efeae13 (fix(commerce): never send a user to a documentation host on a bid miss)
                                         );
                                         net.fallback_url = None;
                                     }
