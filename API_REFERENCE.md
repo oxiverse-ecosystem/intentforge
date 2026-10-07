@@ -1731,10 +1731,14 @@ with a 22s wall cap — same enrichment + decoration pipeline, now consistent wi
 > `commerce_contract_tests.rs`).
 >
 > **Tuning the presentation cap (post-ROADMAP):** the number of enriched shopping
-> cards surfaced is capped at `mainpath_top_n`, loaded at startup from
-> `data/commerce/config.json` (`{"mainpath_top_n": 8}`). Change it WITHOUT
-> recompiling — just edit the file and `docker compose up -d gateway`. The cap
-> affects *presentation only*; it never influences ranking, selection, or ordering.
+> cards surfaced is capped at `COMMERCE_MAINPATH_TOP_N = 8` (a compile-time constant).
+> The enrichment window is `COMMERCE_ENRICH_WINDOW = 24` — the number of already-ranked
+> results that are enriched before the display cap is applied. This decoupling is the
+> main-path reachability fix: commercial queries often have bot-checked merchant pages
+> (Amazon/Walmart/Flipkart) in the top 8 with no structured markup, so enriching only 8
+> finds nothing and the strip is suppressed. A wider window (24) lets enrichment reach
+> past those to pages that DO carry product facts. Both constants are presentation-only;
+> they never influence ranking, selection, or ordering.
 
 ### POST /commerce/extract
 
