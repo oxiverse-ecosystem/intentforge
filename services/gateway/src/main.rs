@@ -15110,13 +15110,24 @@ async fn handle_search(
     // shape instead of applying a freshness/date-sensitive ranking profile.
     if intent.intent == "fresh" && derive_recency_window(&q.to_lowercase()).is_none() {
         let ql = q.to_lowercase();
-        intent.intent = if ql.starts_with("how ") || ql.starts_with("how to ") {
+        intent.intent = if ql.starts_with("how to ") || ql.starts_with("how do i ") || ql.starts_with("how can i ") {
             "how-to".to_string()
+        } else if ql.starts_with("how does ") || ql.starts_with("how is ") || ql.starts_with("how are ") {
+            "informational".to_string()
         } else if ql.starts_with("why ") || ql.starts_with("what causes") {
             "informational".to_string()
         } else {
             intent.intent.clone()
         };
+    }
+    // "how does X work" / "how does X happen" is an explanatory question, not a
+    // how-to guide. The intent engine may return "how-to" because it sees "how"
+    // at the start, but the query is asking for an explanation, not instructions.
+    if intent.intent == "how-to" {
+        let ql = q.to_lowercase();
+        if ql.starts_with("how does ") || ql.starts_with("how is ") || ql.starts_with("how are ") {
+            intent.intent = "informational".to_string();
+        }
     }
     
     // Merge constraints parsed directly by the gateway to prevent any loss of operators
@@ -15501,6 +15512,25 @@ async fn handle_search(
             "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
         ];
         let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
+        // A weather word alone is not enough — the query must be PRIMARILY about
+        // weather, not merely mention it as context. "cold weather" in a car repair
+        // query ("why does my car make a clicking noise when i try to start it in
+        // cold weather") is not a weather query. Require a weather-specific signal
+        // (forecast/temperature/rain/snow/etc.) OR the word "weather" as the first
+        // content word (i.e. the query is about weather itself, not a topic that
+        // happens to mention weather).
+        let weather_primary = q_has_word(&q_lower, "forecast")
+            || q_has_word(&q_lower, "temperature")
+            || q_has_word(&q_lower, "rain")
+            || q_has_word(&q_lower, "snow")
+            || q_has_word(&q_lower, "humidity")
+            || q_has_word(&q_lower, "precipitation")
+            || q_has_word(&q_lower, "thunderstorm")
+            || q_has_word(&q_lower, "sunny")
+            || q_has_word(&q_lower, "cloudy")
+            || q_has_word(&q_lower, "meteorology")
+            || q_lower.starts_with("weather ");
+        let has_weather_signal = weather_primary;
         // Do NOT clobber a decisive action/decision intent (comparison,
         // transactional, how-to, technical, navigational) to fresh. A weather word
         // like "rain" legitimately appears inside gear/commercial/how-to queries
@@ -15539,14 +15569,23 @@ async fn handle_search(
         }
 
         // Override 8: procedural / how-to queries → how-to
-        let howto_signals = [
-            "how to", "how do i", "how do you", "how can i", "how can you", "how to's",
+        // Only fire when the query STARTS with a how-to signal, not when "how can i"
+        // appears as a secondary clause in an informational query (e.g. "why do some
+        // people get altitude sickness and how can i prevent it" is primarily about
+        // causes, not a how-to guide).
+        let howto_starters = [
+            "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
+        ];
+        let has_howto_starter = howto_starters.iter().any(|s| q_lower.starts_with(s));
+        let howto_mid_signals = [
             "tutorial", "step by step", "step-by-step", "ways to", "guide to", "guide:",
             "find files", "find the", "modified", "fix ", "install", "configure",
             "set up", "setup", "uninstall", "upgrade", "build from", "compile",
             "debug", "troubleshoot", "resolve", "workaround",
         ];
-        let has_howto_signal = howto_signals.iter().any(|s| q_lower.contains(s));
+        let has_howto_signal = has_howto_starter
+            || (!q_lower.starts_with("why ") && !q_lower.starts_with("what ")
+                && howto_mid_signals.iter().any(|s| q_lower.contains(s)));
         if has_howto_signal
             && (intent.intent == "navigational" || intent.confidence < 0.40)
             && intent.intent != "how-to"
