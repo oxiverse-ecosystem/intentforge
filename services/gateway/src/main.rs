@@ -4451,13 +4451,19 @@ fn enrich_single_commerce(
             }
         }
     }
+    // After the snippet fallback, re-check whether commerce was actually
+    // attached. The snippet path sets r["commerce"] with source="snippet_extracted"
+    // but does NOT update `has_fact`, so provenance must be computed from the
+    // final state of r["commerce"], not from the stale `has_fact` flag.
+    let final_source = r.get("commerce").and_then(|c| c.get("source")).and_then(|s| s.as_str());
+    let final_data = r.get("commerce").and_then(|c| c.get("data"));
     let provenance = serde_json::json!({
         "url": url,
         "observed_at": offer.observed_at,
         // Only disclose a source when a fact was actually attached; a null fact
         // must never be attributed to an extraction source.
-        "source": if has_fact { offer.source.clone() } else { None },
-        "data": if has_fact { offer.data.clone() } else { None },
+        "source": final_source,
+        "data": final_data,
     });
     r["commerce_provenance"] = provenance;
 }
