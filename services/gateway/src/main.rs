@@ -4421,6 +4421,36 @@ fn enrich_single_commerce(
             r["commerce"] = v;
         }
     }
+    // Snippet-based price fallback: when the page fetch returned no structured
+    // product data, try to extract a price from the search result snippet
+    // (title + content). This improves enrichment recall on the parallel path
+    // (used by both /search main path and /shopping) without fabricating
+    // facts — the price is marked with source="snippet_extracted" so the
+    // frontend can label it as less certain than structured data. This mirrors
+    // the sequential enrich_with_commerce path exactly.
+    if !has_fact {
+        let snippet = format!(
+            "{} {}",
+            r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+            r.get("content").and_then(|v| v.as_str()).unwrap_or("")
+        );
+        if let Some(price_info) = extract_price_from_text(&snippet) {
+            let facts = OfferFacts {
+                price: Some(price_info.amount),
+                currency: Some(price_info.currency),
+                ..Default::default()
+            };
+            let snippet_offer = CommerceOffer {
+                url: Some(url.clone()),
+                observed_at: Some(now_unix_string()),
+                source: Some("snippet_extracted".to_string()),
+                data: Some(facts),
+            };
+            if let Ok(v) = serde_json::to_value(&snippet_offer) {
+                r["commerce"] = v;
+            }
+        }
+    }
     let provenance = serde_json::json!({
         "url": url,
         "observed_at": offer.observed_at,
@@ -4619,6 +4649,10 @@ async fn enrich_with_commerce_par<F, Fut>(
     }
 
     // 4) Attach provenance to any result we didn't fetch (idempotent path).
+    //    Also try snippet-based price extraction for unfetched results —
+    //    when the page fetch failed or timed out, the snippet (title + content)
+    //    may still carry a price. This mirrors the sequential enrich_with_commerce
+    //    path and ensures the parallel path has the same recall.
     for r in results.iter_mut() {
         if r.is_object() && r.get("commerce_provenance").is_none() {
             let url = r
@@ -4626,11 +4660,36 @@ async fn enrich_with_commerce_par<F, Fut>(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            // Snippet fallback for unfetched results: try price extraction
+            // from the search result snippet before giving up.
+            if r.get("commerce").is_none() {
+                let snippet = format!(
+                    "{} {}",
+                    r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                    r.get("content").and_then(|v| v.as_str()).unwrap_or("")
+                );
+                if let Some(price_info) = extract_price_from_text(&snippet) {
+                    let facts = OfferFacts {
+                        price: Some(price_info.amount),
+                        currency: Some(price_info.currency),
+                        ..Default::default()
+                    };
+                    let snippet_offer = CommerceOffer {
+                        url: Some(url.clone()),
+                        observed_at: Some(now_unix_string()),
+                        source: Some("snippet_extracted".to_string()),
+                        data: Some(facts),
+                    };
+                    if let Ok(v) = serde_json::to_value(&snippet_offer) {
+                        r["commerce"] = v;
+                    }
+                }
+            }
             let provenance = serde_json::json!({
                 "url": url,
                 "observed_at": now_unix_string(),
-                "source": null,
-                "data": null,
+                "source": r.get("commerce").and_then(|c| c.get("source")).and_then(|s| s.as_str()),
+                "data": r.get("commerce").and_then(|c| c.get("data")),
             });
             r["commerce_provenance"] = provenance;
         }
@@ -23140,5 +23199,180 @@ mod mainpath_shopping_strip_tests {
     fn enrich_window_is_wider_than_display_cap() {
         // Guards the constants from being re-conflated.
         assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
+    }
+
+    // ── Snippet fallback in parallel enrichment (this cycle's increment) ──
+
+    /// A result whose page fetch returned no structured data but whose snippet
+    /// carries a price must still get a commerce block via the snippet fallback.
+    /// This is the exact gap: the parallel path (enrich_with_commerce_par) used
+    /// to skip snippet extraction entirely, so pages without JSON-LD/OG/microdata
+    /// produced zero commerce blocks even when the snippet had a price.
+    #[tokio::test]
+    async fn parallel_enrich_snippet_fallback_attaches_price() {
+        // HTML with NO structured product data — only a title/body.
+        let html = r#"<!doctype html><html><head><title>Article</title></head>
+<body><p>Some review content</p></body></html>"#;
+        let mut results = vec![serde_json::json!({
+            "url": "https://example.com/article",
+            "title": "Sony WH-1000XM5 headphones",
+            "content": "These headphones are now $198 at Amazon",
+            "score": 0.9
+        })];
+        enrich_with_commerce_par(
+            &mut results,
+            move |url: String| async move {
+                assert_eq!(url, "https://example.com/article");
+                Some(html.to_string())
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let r = &results[0];
+        let commerce = r.get("commerce").expect("commerce block must be attached");
+        assert_eq!(
+            commerce["data"]["price"].as_f64(),
+            Some(198.0),
+            "snippet price must be extracted"
+        );
+        assert_eq!(
+            commerce["data"]["currency"].as_str(),
+            Some("USD"),
+            "snippet currency must be extracted"
+        );
+        assert_eq!(
+            commerce["source"].as_str(),
+            Some("snippet_extracted"),
+            "source must be snippet_extracted"
+        );
+        // Provenance must reflect the snippet source, not null.
+        let prov = r.get("commerce_provenance").expect("provenance");
+        assert_eq!(prov["source"].as_str(), Some("snippet_extracted"));
+        assert!(prov["data"].is_object(), "provenance data must be present");
+    }
+
+    /// When the page fetch FAILS (returns None), the snippet fallback must still
+    /// fire. This is the second half of the gap: unfetched results previously got
+    /// only null provenance, never a snippet price.
+    #[tokio::test]
+    async fn parallel_enrich_unfetched_result_gets_snippet_fallback() {
+        let mut results = vec![serde_json::json!({
+            "url": "https://example.com/product",
+            "title": "iPhone 15 Pro",
+            "content": "Buy now for $999",
+            "score": 0.8
+        })];
+        // Fetch always fails (returns None).
+        enrich_with_commerce_par(
+            &mut results,
+            |_url: String| async move { None },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let r = &results[0];
+        let commerce = r.get("commerce").expect("commerce block must be attached even when fetch fails");
+        assert_eq!(commerce["data"]["price"].as_f64(), Some(999.0));
+        assert_eq!(commerce["source"].as_str(), Some("snippet_extracted"));
+        let prov = r.get("commerce_provenance").expect("provenance");
+        assert_eq!(prov["source"].as_str(), Some("snippet_extracted"));
+    }
+
+    /// A result whose snippet has NO price must NOT get a commerce block —
+    /// the snippet fallback must not fabricate facts.
+    #[tokio::test]
+    async fn parallel_enrich_snippet_fallback_no_price_no_block() {
+        let html = r#"<!doctype html><html><head><title>Article</title></head>
+<body><p>No price mentioned here</p></body></html>"#;
+        let mut results = vec![serde_json::json!({
+            "url": "https://example.com/article",
+            "title": "Rust ownership guide",
+            "content": "Learn about borrowing and lifetimes",
+            "score": 0.7
+        })];
+        enrich_with_commerce_par(
+            &mut results,
+            move |url: String| async move {
+                assert_eq!(url, "https://example.com/article");
+                Some(html.to_string())
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let r = &results[0];
+        assert!(
+            r.get("commerce").is_none(),
+            "no commerce block when snippet has no price"
+        );
+        let prov = r.get("commerce_provenance").expect("provenance");
+        assert!(prov["source"].is_null(), "source must be null");
+        assert!(prov["data"].is_null(), "data must be null");
+    }
+
+    /// The snippet fallback must NOT overwrite a structured fact that was
+    /// already attached. If the page had JSON-LD with a price, the snippet
+    /// must not replace it.
+    #[tokio::test]
+    async fn parallel_enrich_snippet_does_not_overwrite_structured_fact() {
+        let html = r#"<!doctype html><html><head>
+<title>Product</title>
+<script type="application/ld+json">
+{"@context":"https://schema.org/","@type":"Product","name":"Widget",
+ "offers":{"@type":"Offer","price":"49.99","priceCurrency":"USD"}}
+</script></head><body><p>Now $9.99 for a limited time</p></body></html>"#;
+        let mut results = vec![serde_json::json!({
+            "url": "https://example.com/product",
+            "title": "Widget",
+            "content": "Now $9.99 for a limited time",
+            "score": 0.9
+        })];
+        enrich_with_commerce_par(
+            &mut results,
+            move |url: String| async move {
+                assert_eq!(url, "https://example.com/product");
+                Some(html.to_string())
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let r = &results[0];
+        let commerce = r.get("commerce").expect("commerce block");
+        // JSON-LD price (49.99) must win, not the snippet price (9.99).
+        assert_eq!(
+            commerce["data"]["price"].as_f64(),
+            Some(49.99),
+            "structured fact must not be overwritten by snippet"
+        );
+        assert_eq!(commerce["source"].as_str(), Some("json-ld"));
+    }
+
+    /// Order invariance: the snippet fallback must not change the order of
+    /// results. This is the no-manipulation guarantee.
+    #[tokio::test]
+    async fn parallel_enrich_snippet_fallback_preserves_order() {
+        let html = r#"<!doctype html><html><head><title>Article</title></head>
+<body><p>Content</p></body></html>"#;
+        let mut results: Vec<_> = (0..5)
+            .map(|i| serde_json::json!({
+                "url": format!("https://example.com/p{}", i),
+                "title": format!("Product {}", i),
+                "content": if i % 2 == 0 { format!("Price ${}", 100 + i) } else { "No price".to_string() },
+                "score": 1.0 - (i as f64 * 0.1)
+            }))
+            .collect();
+        let urls_before: Vec<_> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        enrich_with_commerce_par(
+            &mut results,
+            move |_url: String| async move { Some(html.to_string()) },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let urls_after: Vec<_> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        assert_eq!(urls_before, urls_after, "order must be preserved");
+        // Even-indexed results have prices in their snippets.
+        assert!(results[0].get("commerce").is_some(), "p0 has price");
+        assert!(results[1].get("commerce").is_none(), "p1 no price");
+        assert!(results[2].get("commerce").is_some(), "p2 has price");
+        assert!(results[3].get("commerce").is_none(), "p3 no price");
+        assert!(results[4].get("commerce").is_some(), "p4 has price");
     }
 }
