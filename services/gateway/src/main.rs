@@ -5435,6 +5435,36 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     None
 }
 
+/// P6 fail-open: decide whether the hard date window should be cleared.
+/// Returns true when the window should be removed (recency becomes scoring-only).
+///
+/// The hard date window (after_date/before_date) is only meaningful when at
+/// least one web result carries a parseable date. When NO result has a date,
+/// the window cannot discriminate between results — it would drop relevant
+/// results that happen to have a date outside the window while keeping only
+/// date-less ones. In that case, clear the window and use recency as a pure
+/// scoring boost (freshness half-life) instead.
+///
+/// Also clears when the window would empty or near-empty the result set
+/// (survivors == 0, or survivors < 3 with a survivor fraction < 25%).
+fn should_clear_date_window(
+    dated_result_count: usize,
+    pre_filter_count: usize,
+    survivors_after_window: usize,
+) -> bool {
+    if dated_result_count == 0 {
+        return true;
+    }
+    if pre_filter_count == 0 {
+        return false;
+    }
+    if survivors_after_window == 0 {
+        return true;
+    }
+    let survivor_fraction = survivors_after_window as f32 / pre_filter_count as f32;
+    survivors_after_window < 3 && survivor_fraction < 0.25
+}
+
 fn should_filter_by_constraints(
     title: &str, content: &str, url: &str, published_date: Option<&str>, constraints: &Constraints,
 ) -> bool {
@@ -16749,24 +16779,23 @@ async fn handle_search(
             }
             ok
         }).count();
-        // (A) no dates at all, or (B) all dated-but-out-of-range -> would empty.
-        // (C) RESIDUAL P6: the window keeps SOME results but crushes the set
-        //     pathologically (e.g. date-less upstream snippets for "latest X this
-        //     week" → 8/9 dropped, 1 survives = 11%). A near-empty result set is
-        //     the same user-facing failure as a zero one: relevant, date-less
-        //     results get discarded in favour of a single stale-but-dated item.
-        //     Fail-open when the surviving fraction is below a general 25% floor
-        //     AND the surviving count is too small to be useful (< 3). This is
-        //     keyed on survival ratio, not on any query/window, so it stays general.
-        let survivor_fraction = if pre_filter_count > 0 {
-            survivors_after_window as f32 / pre_filter_count as f32
-        } else {
-            1.0
-        };
-        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.25;
-        if survivors_after_window == 0 || fraction_too_low {
+        // P6 FIX: apply the hard date window ONLY when at least 1 web result has a
+        // parseable date. When NO result carries a date, the window is meaningless
+        // — it cannot discriminate between results, and applying it would drop
+        // relevant results that happen to have a date outside the window while
+        // keeping only date-less ones. In that case, clear the window and use
+        // recency as a pure scoring boost (freshness half-life) instead.
+        //
+        // Also fail-open when the window would empty or near-empty the result set
+        // (survivors == 0, or survivors < 3 with a survivor fraction < 25%).
+        if should_clear_date_window(dated_result_count, pre_filter_count, survivors_after_window) {
+            let survivor_fraction = if pre_filter_count > 0 {
+                survivors_after_window as f32 / pre_filter_count as f32
+            } else {
+                1.0
+            };
             tracing::info!(
-                "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
+                "DATE WINDOW FAIL-OPEN: {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
                 pre_filter_count, survivors_after_window, survivor_fraction, dated_result_count
             );
             intent.structured_constraints.after_date = None;
@@ -19544,6 +19573,47 @@ mod constraint_fix_tests {
             &c,
         );
         assert!(!fresh, "result dated 2025 should pass after:2024");
+    }
+
+    #[test]
+    fn p6_no_dated_results_clears_date_window() {
+        // P6 regression: when NO web result carries a parseable date, the hard
+        // date window must be cleared (recency becomes scoring-only). Before
+        // the fix, the window stayed set and dropped results that had a date
+        // outside the 7-day window, while keeping only date-less ones.
+        assert!(
+            should_clear_date_window(0, 10, 10),
+            "0 dated results out of 10 — window must be cleared"
+        );
+        assert!(
+            should_clear_date_window(0, 5, 5),
+            "0 dated results out of 5 — window must be cleared"
+        );
+        // When at least 1 result has a date, the window is meaningful and
+        // should NOT be cleared (unless it would empty the set).
+        assert!(
+            !should_clear_date_window(3, 10, 3),
+            "3 dated results, 3 survivors — window is meaningful"
+        );
+        assert!(
+            !should_clear_date_window(5, 20, 5),
+            "5 dated results, 5 survivors — window is meaningful"
+        );
+        // When the window would empty the set, clear it.
+        assert!(
+            should_clear_date_window(5, 10, 0),
+            "0 survivors — window must be cleared"
+        );
+        // Near-empty: survivors < 3 and fraction < 25%.
+        assert!(
+            should_clear_date_window(5, 20, 2),
+            "2 survivors out of 20 (10%) — window must be cleared"
+        );
+        // Edge: pre_filter_count == 0 — nothing to filter, don't clear.
+        assert!(
+            !should_clear_date_window(0, 0, 0),
+            "no results at all — nothing to clear"
+        );
     }
 
     #[test]
