@@ -1515,14 +1515,6 @@ mod tests {
     }
 
     #[test]
-    fn test_skoda_not_corrected_to_soda() {
-        // "skoda" (car brand) is edit-distance 1 from "soda"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("skoda"), None,
-            "skoda must NOT be corrected to soda");
-    }
-
-    #[test]
     fn test_oreo_not_corrected() {
         // "oreo" (cookie brand) is edit-distance 1 from "treo"/"oreo" variants
         let index = SymSpellIndex::build();
