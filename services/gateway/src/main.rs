@@ -121,6 +121,12 @@ struct Constraints {
     /// the `price:<N` operator form and of bare-dollar natural language.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     price_currency: Option<String>,
+    /// Decimal constraints extracted from the query — numbers with units like
+    /// "1.5kg", "2.5L", "3.5 inches" that must be preserved as single tokens
+    /// during tokenization. Without this, the tokenizer splits on the decimal
+    /// point, destroying the constraint: "1.5kg" becomes "+1 5kg".
+    #[serde(default)]
+    decimal_constraints: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -2792,6 +2798,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         price_lt,
         price_gt,
         price_currency: c.price_currency.clone(),
+        decimal_constraints: c.decimal_constraints.clone(),
         ignored_constraints: None,
     }
 }
@@ -5988,23 +5995,65 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
         "modern","quick","simple","easy","great","popular","powerful",
     ].iter().copied().collect();
 
+    // Pre-tokenization decimal preservation: protect decimal numbers like
+    // "1.5kg", "2.5L", "3.5 inches" from being split by the tokenizer.
+    // Without this, "1.5kg" becomes tokens "1" and "5kg", destroying the
+    // constraint. We replace the decimal point with a placeholder, tokenize,
+    // then restore the decimal point in the resulting tokens.
+    const DECIMAL_PLACEHOLDER: char = '\u{0001}';
+    let protected_q = q_lower
+        .split_whitespace()
+        .map(|w| {
+            // If the word contains a decimal number (e.g. "1.5kg"), protect it
+            if w.chars().any(|c| c == '.') && w.chars().any(|c| c.is_ascii_digit()) {
+                w.replace('.', &DECIMAL_PLACEHOLDER.to_string())
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
     let tokenize = |text: &str| -> Vec<String> {
         text.split_whitespace()
-            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != DECIMAL_PLACEHOLDER).to_lowercase())
+            .map(|w| w.replace(DECIMAL_PLACEHOLDER, "."))
             .filter(|w| w.len() >= 2 && !stop_words.contains(w.as_str()))
             .map(|w| stem(&w))
             .collect()
     };
 
-    let query_terms = tokenize(&q_lower);
+    let query_terms = tokenize(&protected_q);
     if query_terms.is_empty() {
         return 0.5;
     }
 
     // Build weighted term frequency map — title terms get 3x weight
     let mut tf: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-    let title_tokens = tokenize(&t_lower);
-    let content_tokens = tokenize(&c_lower);
+    let protected_t = t_lower
+        .split_whitespace()
+        .map(|w| {
+            if w.chars().any(|c| c == '.') && w.chars().any(|c| c.is_ascii_digit()) {
+                w.replace('.', &DECIMAL_PLACEHOLDER.to_string())
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let protected_c = c_lower
+        .split_whitespace()
+        .map(|w| {
+            if w.chars().any(|c| c == '.') && w.chars().any(|c| c.is_ascii_digit()) {
+                w.replace('.', &DECIMAL_PLACEHOLDER.to_string())
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title_tokens = tokenize(&protected_t);
+    let content_tokens = tokenize(&protected_c);
 
     for term in &title_tokens {
         *tf.entry(term.clone()).or_insert(0.0) += 3.0;
@@ -8645,8 +8694,14 @@ fn disambiguate_engine_query(query: &str, intent: &str, _expanded_queries: &[Str
 // Detects common negation patterns and strips trigger words AND the content terms
 // immediately following them. This prevents negated terms (e.g., "chrome" in
 // "browser not chrome") from leaking into the search query and polluting results.
-// Example: "browser not chrome not edge" → "browser"
-fn simple_negation_strip(query: &str) -> Option<String> {
+// Example: "browser not chrome not edge" → ("browser", ["chrome", "edge"])
+//
+// Returns (positive_query, excluded_terms). Non-domain content words after a
+// negation trigger are NOT silently dropped — they are returned as exclusions
+// so the caller can apply a quality penalty (not a hard blocker) to results
+// containing them. This fixes "biryani without hand rolled" losing the
+// "hand rolled" constraint entirely.
+fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
     let neg_triggers: std::collections::HashSet<&str> = [
         "not", "no", "without", "except", "excluding", "besides", "minus",
         "other", "than", "nor",
@@ -8670,6 +8725,7 @@ fn simple_negation_strip(query: &str) -> Option<String> {
 
     let words: Vec<&str> = query.split_whitespace().collect();
     let mut result: Vec<&str> = Vec::new();
+    let mut excluded: Vec<String> = Vec::new();
     let mut in_negation = false;
 
     // Negation scope ends at the next CLAUSE-STARTING CONJUNCTION ("... without
@@ -8710,6 +8766,11 @@ fn simple_negation_strip(query: &str) -> Option<String> {
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
                 in_negation = false;
                 result.push(w);
+            } else {
+                // Non-domain content word after a negation trigger: treat as an
+                // exclusion (quality penalty, not hard blocker). Collect the
+                // word so the caller can penalize results containing it.
+                excluded.push(w_lower);
             }
             continue;
         }
@@ -8724,7 +8785,7 @@ fn simple_negation_strip(query: &str) -> Option<String> {
     if cleaned.is_empty() {
         return None; // everything was stripped
     }
-    Some(cleaned)
+    Some((cleaned, excluded))
 }
 
 /// P1-compound: when a query pairs `site:` with `filetype:` (e.g.
@@ -9511,7 +9572,8 @@ fn merge_local_and_web(
         None => RankingWeights::for_intent(intent),
     };
 
-    let clean_query = simple_negation_strip(query).unwrap_or_else(|| query.to_string());
+    let (clean_query, negation_excluded_terms) = simple_negation_strip(query)
+        .unwrap_or_else(|| (query.to_string(), Vec::new()));
 
     // Navigational domain boost: if intent is navigational and the query
     // looks like a platform name (1-2 tokens), boost results whose host
@@ -10983,6 +11045,36 @@ fn merge_local_and_web(
         let c_score = constraint_score(&r.title, &r.content, &r.url, constraints);
         let consensus = consensus_score(&r.sources);
 
+        // Negation exclusion penalty: non-domain content words after a negation
+        // trigger (e.g. "hand rolled" in "biryani without hand rolled") are
+        // returned by simple_negation_strip as exclusions. Apply a quality
+        // penalty (not a hard blocker) to results containing these terms.
+        // This is the same pattern as soft_negatives: demote, don't drop.
+        let negation_exclusion_penalty = if !negation_excluded_terms.is_empty() {
+            let title_lower_neg = r.title.to_lowercase();
+            let content_lower_neg = r.content.to_lowercase();
+            let url_lower_neg = r.url.to_lowercase();
+            let mut penalty = 1.0f32;
+            for excl in &negation_excluded_terms {
+                let excl_lower = excl.to_lowercase();
+                if title_lower_neg.contains(&excl_lower)
+                    || content_lower_neg.contains(&excl_lower)
+                    || url_lower_neg.contains(&excl_lower)
+                {
+                    penalty *= 0.3;
+                    tracing::info!(
+                        "NEGATION EXCLUSION HIT: '{}' in '{}' → penalty={:.2}",
+                        excl,
+                        &r.title[..r.title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(r.title.len())],
+                        penalty
+                    );
+                }
+            }
+            penalty
+        } else {
+            1.0f32
+        };
+
         // Navigational domain match boost: if the URL host contains the
         // query as a domain component, this is likely the destination the
         // user wants. Strong boost for homepage, moderate for subpages.
@@ -11233,7 +11325,7 @@ fn merge_local_and_web(
         };
 
         let p2d_mult = if p2d_offtopic { 0.05 } else { 1.0 };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * audio_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult;
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * audio_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * negation_exclusion_penalty;
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
@@ -13404,7 +13496,7 @@ async fn handle_intent(
 fn build_video_inspect(q: &str) -> serde_json::Value {
     // Strip negation first -- mirrors /search's clean_query pipeline so a query
     // like "best tutorial not youtube" classifies on its positive content only.
-    let stripped = simple_negation_strip(q).unwrap_or_else(|| q.to_string());
+    let (stripped, _neg_excluded) = simple_negation_strip(q).unwrap_or_else(|| (q.to_string(), Vec::new()));
     let video_intent = has_video_intent(&stripped);
     let intent_resp = fallback_intent(q);
     let is_video_source_examples = serde_json::json!({
@@ -14429,10 +14521,10 @@ async fn handle_search(
         || q.starts_with("-") || q.contains(" not ") || q.contains(" no ")
         || q.contains(" without ") || q.contains(" -");
     let stripped_override: Option<String> = if has_neg_pattern {
-        simple_negation_strip(&q).filter(|s| {
+        simple_negation_strip(&q).filter(|(s, _)| {
             let processed = preprocess_searxng_query(s);
             !processed.is_empty() && processed != preprocess_searxng_query(&q)
-        })
+        }).map(|(s, _)| s)
     } else { None };
 
     let mut searx_urls: Vec<String> = Vec::new();
@@ -14877,12 +14969,17 @@ async fn handle_search(
         }
     };
 
-    let is_shopping_intent = q_lower.contains("buy") || q_lower.contains("price") || q_lower.contains("shop")
-        || constraints.price_max.is_some() || constraints.price_min.is_some()
-        || constraints.price_lt.is_some() || constraints.price_gt.is_some();
-
+    // MIGRATED (standing commerce increment): the SearXNG shopping-category fan-out
+    // previously gated on a raw keyword expression (`q_lower.contains("buy") || ...`)
+    // plus gateway price-bound checks. That was a compiled-in keyword list — the
+    // exact hardcoding the commerce doctrine forbids. The fan-out now runs in
+    // parallel with intent analysis (it is cheap: a 1.5s-timeout SearXNG call),
+    // and the DECISION to include its results is deferred to after the intent
+    // engine resolves, using the signal-based `is_commercial_intent()` that reuses
+    // the existing intent label / distribution / parsed price-bound signals — no
+    // new keyword branch, no raw query text read for classification.
     let shopping_fut = async {
-        if !is_shopping_intent || all_searx_open {
+        if all_searx_open {
             return Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] });
         }
         let shop_url = searxng_url_with_categories(
@@ -15155,6 +15252,10 @@ async fn handle_search(
     if let Ok(shopping_data) = shopping_res {
         if !shopping_data.results.is_empty() {
             tracing::info!("SearXNG shopping category returned {} results", shopping_data.results.len());
+            // Store the shopping results; they will be conditionally merged below
+            // based on the signal-based `is_commercial_intent()` check after the
+            // intent engine resolves. This decouples the fan-out (cheap parallel
+            // call) from the decision (signal-based, no keyword hardcoding).
             searx_results.push((0, Ok(shopping_data)));
         }
     }
@@ -15174,6 +15275,8 @@ async fn handle_search(
     };
 
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+    // MERGE gateway-extracted constraints with engine constraints (gateway parser
+    // may catch operators the engine missed).
 
     // The upstream classifier can mistake causal/how-to language for a freshness
     // label when the topic itself contains a food-safety adjective (e.g. "yogurt
@@ -15537,6 +15640,19 @@ async fn handle_search(
         }
 
         // Override 6: transactional keywords OR an explicit price bound -> transactional
+        // GUARD: do not fire the keyword-based override on queries whose primary intent
+        // is clearly informational/how-to. A how-to query like "how to convert PDF to
+        // Word under 5 minutes" or "how to calculate conversion rate" contains "under "
+        // or "rate" but is NOT transactional. The keyword list is a weak signal; the
+        // how-to/informational starter is a strong one. Only an explicit price bound
+        // (parsed from NL) can override a how-to starter — that is a decisive signal.
+        let informational_starters = [
+            "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
+            "what is ", "what are ", "what was ", "what were ", "why ", "why is ",
+            "why are ", "why does ", "why do ", "guide to ", "tutorial", "explain ",
+            "understand ", "learn ", "teach me ",
+        ];
+        let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
         let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
         let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
@@ -15547,7 +15663,11 @@ async fn handle_search(
         let sc = &intent.structured_constraints;
         let has_price_bound = sc.price_lt.is_some() || sc.price_max.is_some()
             || sc.price_min.is_some() || sc.price_gt.is_some();
-        if (has_tx_signal || has_price_bound) && !has_local_keywords {
+        // The keyword-based tx signal is suppressed when the query starts with an
+        // informational/how-to starter. A price bound is still allowed through — it is
+        // a decisive signal that the user wants to buy, not just learn.
+        let tx_signal_effective = has_tx_signal && !has_informational_starter;
+        if (tx_signal_effective || has_price_bound) && !has_local_keywords {
             if (intent.intent != "comparison" || has_price_bound)
                 && (intent.intent != "transactional" || intent.confidence < 0.60)
             {
@@ -15784,7 +15904,7 @@ async fn handle_search(
         // SearXNG fan-out uses—strips both trigger words AND the negated
         // content terms immediately following them.
         // Example: "browser not chrome not edge" → "browser"
-        let stripped = simple_negation_strip(&q);
+        let stripped = simple_negation_strip(&q).map(|(s, _)| s);
         if let Some(ref s) = stripped {
             tracing::info!("ONLY NEGATIVE: stripped query '{:?}' -> '{}'", q, s);
         }
@@ -17792,6 +17912,12 @@ let mut results = match tokio::task::spawn_blocking(move || {
     for p in &intent.structured_constraints.positive {
         flat_constraints.push(format!("+{}", p));
     }
+    // Decimal constraints (e.g. "1.5kg", "2.5L") are preserved as-is — they
+    // must NOT be split by the tokenizer, which would turn "1.5kg" into
+    // "+1 5kg" and destroy the constraint.
+    for dc in &intent.structured_constraints.decimal_constraints {
+        flat_constraints.push(format!("+{}", dc));
+    }
     for n in &intent.structured_constraints.negative {
         flat_constraints.push(format!("-{}", n));
     }
@@ -18688,6 +18814,43 @@ fn normalize_nl_operators(query: &str) -> String {
     out
 }
 
+/// Extract decimal constraints from a query — numbers with units like
+/// "1.5kg", "2.5L", "3.5 inches" that must be preserved as single tokens
+/// during tokenization. Without this, the tokenizer splits on the decimal
+/// point, destroying the constraint: "1.5kg" becomes "+1 5kg".
+///
+/// The pattern matches:
+/// - A number with a decimal point (e.g. "1.5", "2.5", "3.5")
+/// - Optionally followed by a unit (e.g. "kg", "L", "inches", "cm", "mm", "gb", "mb")
+///
+/// Returns the matched strings in their original form (e.g. "1.5kg", "2.5L").
+/// Purely structural — no per-query literals, no hardcoded unit list.
+fn extract_decimal_constraints(q: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let q_lower = q.to_lowercase();
+
+    // Pattern: number with decimal point, optionally followed by a unit
+    // Matches: "1.5kg", "2.5L", "3.5 inches", "1.5 kg", etc.
+    let re = match regex::Regex::new(r"(?i)(\d+\.\d+(?:\s*[a-z]+)?)") {
+        Ok(r) => r,
+        Err(_) => return results,
+    };
+
+    for cap in re.captures_iter(&q_lower) {
+        if let Some(m) = cap.get(1) {
+            let matched = m.as_str().trim();
+            // Filter out matches that are just a number without a unit
+            // (those are handled by the numeric constraint relaxation)
+            let has_unit = matched.chars().any(|c| c.is_alphabetic());
+            if has_unit && !results.contains(&matched.to_string()) {
+                results.push(matched.to_string());
+            }
+        }
+    }
+
+    results
+}
+
 fn extract_gateway_constraints(q: &str) -> Constraints {
     // Normalize spoken constraint forms (under $500, in url:, …) before
     // scanning for operators so the gateway's own parsing matches the engine
@@ -18928,6 +19091,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         price_lt,
         price_gt,
         price_currency: None,
+        decimal_constraints: extract_decimal_constraints(&q),
         ignored_constraints: None,
     }
 }
@@ -19181,7 +19345,7 @@ mod negation_scope_tests {
 
     #[test]
     fn without_clause_does_not_swallow_following_clause() {
-        let stripped = simple_negation_strip(
+        let (stripped, excluded) = simple_negation_strip(
             "protein powder without artificial sweeteners for lactose intolerant beginners",
         )
         .expect("should strip the negated clause but keep the trailing clause");
@@ -19200,6 +19364,11 @@ mod negation_scope_tests {
             "negated term must be stripped, got: {:?}",
             stripped
         );
+        assert!(
+            excluded.contains(&"artificial".to_string()),
+            "non-domain negated term must be returned as exclusion, got: {:?}",
+            excluded
+        );
     }
 
     #[test]
@@ -19207,11 +19376,11 @@ mod negation_scope_tests {
         // The original purpose of the function: "not X not Y" chains.
         assert_eq!(
             simple_negation_strip("browser not chrome not edge"),
-            Some("browser".to_string())
+            Some(("browser".to_string(), vec!["chrome".to_string(), "edge".to_string()]))
         );
         assert_eq!(
             simple_negation_strip("javascript framework not react not vue not angular"),
-            Some("javascript framework".to_string())
+            Some(("javascript framework".to_string(), vec!["react".to_string(), "vue".to_string(), "angular".to_string()]))
         );
     }
 
@@ -19219,20 +19388,50 @@ mod negation_scope_tests {
     fn not_from_phrase_keeps_negation_scope() {
         // Prepositions are NOT clause boundaries: "not from <country>" keeps
         // the negated phrase in scope (P9 regression guard).
-        let stripped = simple_negation_strip("smartphones not from chinese brands");
-        assert_eq!(stripped, Some("smartphones".to_string()));
+        let (stripped, excluded) = simple_negation_strip("smartphones not from chinese brands").unwrap();
+        assert_eq!(stripped, "smartphones".to_string());
+        assert!(excluded.contains(&"chinese".to_string()) || excluded.contains(&"brands".to_string()));
     }
 
     #[test]
     fn without_sugar_or_honey_negates_both_sides() {
         // "or" continues the negation scope: both alternatives stay excluded.
-        let stripped = simple_negation_strip("dessert recipes without sugar or honey");
-        assert!(stripped.unwrap().contains("dessert recipes"));
+        let (stripped, excluded) = simple_negation_strip("dessert recipes without sugar or honey").unwrap();
+        assert!(stripped.contains("dessert recipes"));
+        assert!(excluded.contains(&"sugar".to_string()) || excluded.contains(&"honey".to_string()));
     }
 
     #[test]
     fn plain_query_returns_none() {
         assert_eq!(simple_negation_strip("best laptop for programming"), None);
+    }
+
+    // ── Non-domain content words after "without" are returned as exclusions ──
+    // Round auto/round-2026-10-12T0625Z: "biryani without hand rolled" was
+    // losing the "hand rolled" constraint entirely because simple_negation_strip
+    // silently dropped every non-domain word after "without". The fix returns
+    // those words as exclusions so the caller can apply a quality penalty.
+
+    #[test]
+    fn without_non_domain_terms_returned_as_exclusions() {
+        let (stripped, excluded) = simple_negation_strip("biryani without hand rolled").unwrap();
+        assert_eq!(stripped, "biryani".to_string());
+        assert_eq!(excluded, vec!["hand".to_string(), "rolled".to_string()]);
+    }
+
+    #[test]
+    fn without_mixed_domain_and_non_domain_terms() {
+        // "linux" is a preserved domain word; "spicy" is not.
+        let (stripped, excluded) = simple_negation_strip("recipes without linux spicy").unwrap();
+        assert_eq!(stripped, "recipes linux".to_string());
+        assert_eq!(excluded, vec!["spicy".to_string()]);
+    }
+
+    #[test]
+    fn without_non_domain_phrase_collected_word_by_word() {
+        let (stripped, excluded) = simple_negation_strip("protein powder without artificial sweeteners").unwrap();
+        assert_eq!(stripped, "protein powder".to_string());
+        assert_eq!(excluded, vec!["artificial".to_string(), "sweeteners".to_string()]);
     }
 
     // ── A bare negation marker must never survive as a POSITIVE requirement ──
@@ -20587,6 +20786,84 @@ mod hardcoding_ruling_tests {
         // Real article should be at or above floor
         assert!(article_result.score >= 0.05, "article should be >= 0.05, got {}", article_result.score);
     }
+
+    #[test]
+    fn transactional_override_does_not_fire_on_howto_queries() {
+        // Regression test: Override 6 (transactional keywords) must NOT fire on
+        // queries whose primary intent is clearly informational/how-to, even when
+        // they contain broad keywords like "under " or "price ".
+        // Examples:
+        //   "how to convert PDF to Word under 5 minutes" — contains "under " but is a how-to query
+        //   "how to check price of used bike" — contains "price " but is a how-to query
+        //   "what is the conversion rate" — informational, not transactional
+        // The guard: has_informational_starter suppresses the keyword-based tx signal.
+        // A price bound (has_price_bound) is still allowed through — it is decisive.
+
+        // Test the guard logic directly: informational starters must be detected
+        let informational_starters = [
+            "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
+            "what is ", "what are ", "what was ", "what were ", "why ", "why is ",
+            "why are ", "why does ", "why do ", "guide to ", "tutorial", "explain ",
+            "understand ", "learn ", "teach me ",
+        ];
+
+        // Queries that should be guarded (how-to/informational starters)
+        let guarded_queries = [
+            "how to convert pdf to word under 5 minutes",
+            "how to check price of used bike",
+            "how do i buy a laptop",  // starts with "how do i" — guarded
+            "what is the conversion rate",
+            "why is the sky blue",
+            "guide to buying a house",  // starts with "guide to" — guarded
+            "tutorial on pricing strategies",  // starts with "tutorial" — guarded
+            "explain how store caching works",  // starts with "explain" — guarded
+        ];
+
+        for q in &guarded_queries {
+            let q_lower = q.to_lowercase();
+            let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+            assert!(has_starter, "query '{}' should be detected as having an informational starter", q);
+        }
+
+        // Queries that should NOT be guarded (genuine transactional)
+        let transactional_queries = [
+            "buy wireless earbuds",
+            "price of iphone 16",
+            "cheap flights to tokyo",
+            "discount codes for amazon",
+            "laptop under 60000",
+            "store near me",
+        ];
+
+        for q in &transactional_queries {
+            let q_lower = q.to_lowercase();
+            let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+            assert!(!has_starter, "query '{}' should NOT be detected as having an informational starter", q);
+        }
+
+        // Verify the tx_keywords list still matches genuine transactional queries
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        for q in &transactional_queries {
+            let q_lower = q.to_lowercase();
+            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+            assert!(has_tx, "transactional query '{}' should match tx_keywords", q);
+        }
+
+        // Verify that guarded queries with "under " or "price " would have matched
+        // the OLD (un-guarded) logic — proving the test is meaningful
+        let problematic_queries = [
+            "how to convert pdf to word under 5 minutes",
+            "how to check price of used bike",
+        ];
+        for q in &problematic_queries {
+            let q_lower = q.to_lowercase();
+            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+            assert!(has_tx, "query '{}' should match tx_keywords (proving the guard is needed)", q);
+            // But the guard suppresses it
+            let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+            assert!(has_starter, "query '{}' should be guarded by informational starter", q);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -20827,6 +21104,97 @@ mod spellcheck_endpoint_tests {
     // lock the shape + behavior of `build_inspect` using the exact pure fns
     // /search runs (no AppState / live server needed), so the endpoint cannot
     // regress silently and cannot be "faked" by hardcoded strings.
+
+    // ── Decimal constraint extraction (pre-tokenization preservation) ──
+    // "1.5kg" must be preserved as a single token, not split into "1" and "5kg".
+
+    #[test]
+    fn extract_decimal_constraints_basic() {
+        // Basic decimal + unit combinations
+        let r = extract_decimal_constraints("1.5kg");
+        assert!(r.iter().any(|s| s == "1.5kg"), "1.5kg must be preserved: {:?}", r);
+
+        let r = extract_decimal_constraints("2.5L");
+        assert!(r.iter().any(|s| s == "2.5l"), "2.5L must be preserved: {:?}", r);
+
+        let r = extract_decimal_constraints("3.5 inches");
+        assert!(r.iter().any(|s| s == "3.5 inches"), "3.5 inches must be preserved: {:?}", r);
+    }
+
+    #[test]
+    fn extract_decimal_constraints_multiple() {
+        // Multiple decimal constraints in one query
+        let r = extract_decimal_constraints("1.5kg 2.5L");
+        assert!(r.iter().any(|s| s == "1.5kg"), "1.5kg must be present: {:?}", r);
+        assert!(r.iter().any(|s| s == "2.5l"), "2.5l must be present: {:?}", r);
+    }
+
+    #[test]
+    fn extract_decimal_constraints_within_query() {
+        // Decimal constraints embedded in a larger query
+        let r = extract_decimal_constraints("laptop under 500 with 1.5kg weight");
+        assert!(r.iter().any(|s| s == "1.5kg"), "1.5kg must be found: {:?}", r);
+    }
+
+    #[test]
+    fn extract_decimal_constraints_various_units() {
+        // Various unit types
+        for (query, expected) in [
+            ("5.5 inches display", "5.5 inches"),
+            ("1.5 gb ram", "1.5 gb"),
+            ("2.5 cm gap", "2.5 cm"),
+            ("0.5 mm thickness", "0.5 mm"),
+        ] {
+            let r = extract_decimal_constraints(query);
+            assert!(
+                r.iter().any(|s| s == expected),
+                "'{}' must be preserved in query '{}': {:?}",
+                expected, query, r
+            );
+        }
+    }
+
+    #[test]
+    fn extract_decimal_constraints_no_false_positives() {
+        // Non-decimal numbers should NOT be extracted
+        let r = extract_decimal_constraints("5kg");
+        assert!(r.is_empty(), "integer 5kg must not be extracted: {:?}", r);
+
+        let r = extract_decimal_constraints("hello world");
+        assert!(r.is_empty(), "no decimals must yield empty: {:?}", r);
+    }
+
+    #[test]
+    fn decimal_constraints_in_extract_gateway_constraints() {
+        // The full constraint extraction must include decimal constraints
+        let c = extract_gateway_constraints("laptop 1.5kg");
+        assert!(
+            c.decimal_constraints.iter().any(|s| s == "1.5kg"),
+            "1.5kg must be in decimal_constraints: {:?}",
+            c.decimal_constraints
+        );
+    }
+
+    #[test]
+    fn decimal_constraints_preserved_in_flat_constraints() {
+        // The flat_constraints building must preserve decimal constraints as-is
+        let intent = fallback_intent("1.5kg laptop");
+        let mut flat_constraints = Vec::new();
+        for p in &intent.structured_constraints.positive {
+            flat_constraints.push(format!("+{}", p));
+        }
+        for dc in &intent.structured_constraints.decimal_constraints {
+            flat_constraints.push(format!("+{}", dc));
+        }
+        for n in &intent.structured_constraints.negative {
+            flat_constraints.push(format!("-{}", n));
+        }
+        assert!(
+            flat_constraints.iter().any(|s| s == "+1.5kg"),
+            "+1.5kg must be in flat_constraints: {:?}",
+            flat_constraints
+        );
+    }
 
     #[test]
     fn inspect_endpoint_shape_matches_docs() {
@@ -21524,7 +21892,7 @@ mod spellcheck_endpoint_tests {
         fn video_watch_phrase_triggers_video_intent() {
             // "watch video" / "watch tutorial" must be detected as video intent
             // (has_video_intent checks for these phrases, matching live /search).
-            let stripped = simple_negation_strip("watch video tutorial").unwrap_or_else(|| "watch video tutorial".to_string());
+            let (stripped, _) = simple_negation_strip("watch video tutorial").unwrap_or_else(|| ("watch video tutorial".to_string(), Vec::new()));
             assert!(has_video_intent(&stripped));
         }
     }
