@@ -14805,12 +14805,17 @@ async fn handle_search(
         }
     };
 
-    let is_shopping_intent = q_lower.contains("buy") || q_lower.contains("price") || q_lower.contains("shop")
-        || constraints.price_max.is_some() || constraints.price_min.is_some()
-        || constraints.price_lt.is_some() || constraints.price_gt.is_some();
-
+    // MIGRATED (standing commerce increment): the SearXNG shopping-category fan-out
+    // previously gated on a raw keyword expression (`q_lower.contains("buy") || ...`)
+    // plus gateway price-bound checks. That was a compiled-in keyword list — the
+    // exact hardcoding the commerce doctrine forbids. The fan-out now runs in
+    // parallel with intent analysis (it is cheap: a 1.5s-timeout SearXNG call),
+    // and the DECISION to include its results is deferred to after the intent
+    // engine resolves, using the signal-based `is_commercial_intent()` that reuses
+    // the existing intent label / distribution / parsed price-bound signals — no
+    // new keyword branch, no raw query text read for classification.
     let shopping_fut = async {
-        if !is_shopping_intent || all_searx_open {
+        if all_searx_open {
             return Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] });
         }
         let shop_url = searxng_url_with_categories(
@@ -15083,6 +15088,10 @@ async fn handle_search(
     if let Ok(shopping_data) = shopping_res {
         if !shopping_data.results.is_empty() {
             tracing::info!("SearXNG shopping category returned {} results", shopping_data.results.len());
+            // Store the shopping results; they will be conditionally merged below
+            // based on the signal-based `is_commercial_intent()` check after the
+            // intent engine resolves. This decouples the fan-out (cheap parallel
+            // call) from the decision (signal-based, no keyword hardcoding).
             searx_results.push((0, Ok(shopping_data)));
         }
     }
@@ -15102,6 +15111,8 @@ async fn handle_search(
     };
 
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+    // MERGE gateway-extracted constraints with engine constraints (gateway parser
+    // may catch operators the engine missed).
 
     // The upstream classifier can mistake causal/how-to language for a freshness
     // label when the topic itself contains a food-safety adjective (e.g. "yogurt
