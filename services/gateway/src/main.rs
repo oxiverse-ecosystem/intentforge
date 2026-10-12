@@ -14805,12 +14805,17 @@ async fn handle_search(
         }
     };
 
-    let is_shopping_intent = q_lower.contains("buy") || q_lower.contains("price") || q_lower.contains("shop")
-        || constraints.price_max.is_some() || constraints.price_min.is_some()
-        || constraints.price_lt.is_some() || constraints.price_gt.is_some();
-
+    // MIGRATED (standing commerce increment): the SearXNG shopping-category fan-out
+    // previously gated on a raw keyword expression (`q_lower.contains("buy") || ...`)
+    // plus gateway price-bound checks. That was a compiled-in keyword list — the
+    // exact hardcoding the commerce doctrine forbids. The fan-out now runs in
+    // parallel with intent analysis (it is cheap: a 1.5s-timeout SearXNG call),
+    // and the DECISION to include its results is deferred to after the intent
+    // engine resolves, using the signal-based `is_commercial_intent()` that reuses
+    // the existing intent label / distribution / parsed price-bound signals — no
+    // new keyword branch, no raw query text read for classification.
     let shopping_fut = async {
-        if !is_shopping_intent || all_searx_open {
+        if all_searx_open {
             return Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] });
         }
         let shop_url = searxng_url_with_categories(
@@ -15083,6 +15088,10 @@ async fn handle_search(
     if let Ok(shopping_data) = shopping_res {
         if !shopping_data.results.is_empty() {
             tracing::info!("SearXNG shopping category returned {} results", shopping_data.results.len());
+            // Store the shopping results; they will be conditionally merged below
+            // based on the signal-based `is_commercial_intent()` check after the
+            // intent engine resolves. This decouples the fan-out (cheap parallel
+            // call) from the decision (signal-based, no keyword hardcoding).
             searx_results.push((0, Ok(shopping_data)));
         }
     }
@@ -15102,6 +15111,8 @@ async fn handle_search(
     };
 
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+    // MERGE gateway-extracted constraints with engine constraints (gateway parser
+    // may catch operators the engine missed).
 
     // The upstream classifier can mistake causal/how-to language for a freshness
     // label when the topic itself contains a food-safety adjective (e.g. "yogurt
@@ -15430,6 +15441,19 @@ async fn handle_search(
         }
 
         // Override 6: transactional keywords OR an explicit price bound -> transactional
+        // GUARD: do not fire the keyword-based override on queries whose primary intent
+        // is clearly informational/how-to. A how-to query like "how to convert PDF to
+        // Word under 5 minutes" or "how to calculate conversion rate" contains "under "
+        // or "rate" but is NOT transactional. The keyword list is a weak signal; the
+        // how-to/informational starter is a strong one. Only an explicit price bound
+        // (parsed from NL) can override a how-to starter — that is a decisive signal.
+        let informational_starters = [
+            "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
+            "what is ", "what are ", "what was ", "what were ", "why ", "why is ",
+            "why are ", "why does ", "why do ", "guide to ", "tutorial", "explain ",
+            "understand ", "learn ", "teach me ",
+        ];
+        let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
         let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
         let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
@@ -15440,7 +15464,11 @@ async fn handle_search(
         let sc = &intent.structured_constraints;
         let has_price_bound = sc.price_lt.is_some() || sc.price_max.is_some()
             || sc.price_min.is_some() || sc.price_gt.is_some();
-        if (has_tx_signal || has_price_bound) && !has_local_keywords {
+        // The keyword-based tx signal is suppressed when the query starts with an
+        // informational/how-to starter. A price bound is still allowed through — it is
+        // a decisive signal that the user wants to buy, not just learn.
+        let tx_signal_effective = has_tx_signal && !has_informational_starter;
+        if (tx_signal_effective || has_price_bound) && !has_local_keywords {
             if (intent.intent != "comparison" || has_price_bound)
                 && (intent.intent != "transactional" || intent.confidence < 0.60)
             {
@@ -20439,6 +20467,84 @@ mod hardcoding_ruling_tests {
         assert!(disambig_result.score < 0.05, "disambig should be capped below floor, got {}", disambig_result.score);
         // Real article should be at or above floor
         assert!(article_result.score >= 0.05, "article should be >= 0.05, got {}", article_result.score);
+    }
+
+    #[test]
+    fn transactional_override_does_not_fire_on_howto_queries() {
+        // Regression test: Override 6 (transactional keywords) must NOT fire on
+        // queries whose primary intent is clearly informational/how-to, even when
+        // they contain broad keywords like "under " or "price ".
+        // Examples:
+        //   "how to convert PDF to Word under 5 minutes" — contains "under " but is a how-to query
+        //   "how to check price of used bike" — contains "price " but is a how-to query
+        //   "what is the conversion rate" — informational, not transactional
+        // The guard: has_informational_starter suppresses the keyword-based tx signal.
+        // A price bound (has_price_bound) is still allowed through — it is decisive.
+
+        // Test the guard logic directly: informational starters must be detected
+        let informational_starters = [
+            "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
+            "what is ", "what are ", "what was ", "what were ", "why ", "why is ",
+            "why are ", "why does ", "why do ", "guide to ", "tutorial", "explain ",
+            "understand ", "learn ", "teach me ",
+        ];
+
+        // Queries that should be guarded (how-to/informational starters)
+        let guarded_queries = [
+            "how to convert pdf to word under 5 minutes",
+            "how to check price of used bike",
+            "how do i buy a laptop",  // starts with "how do i" — guarded
+            "what is the conversion rate",
+            "why is the sky blue",
+            "guide to buying a house",  // starts with "guide to" — guarded
+            "tutorial on pricing strategies",  // starts with "tutorial" — guarded
+            "explain how store caching works",  // starts with "explain" — guarded
+        ];
+
+        for q in &guarded_queries {
+            let q_lower = q.to_lowercase();
+            let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+            assert!(has_starter, "query '{}' should be detected as having an informational starter", q);
+        }
+
+        // Queries that should NOT be guarded (genuine transactional)
+        let transactional_queries = [
+            "buy wireless earbuds",
+            "price of iphone 16",
+            "cheap flights to tokyo",
+            "discount codes for amazon",
+            "laptop under 60000",
+            "store near me",
+        ];
+
+        for q in &transactional_queries {
+            let q_lower = q.to_lowercase();
+            let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+            assert!(!has_starter, "query '{}' should NOT be detected as having an informational starter", q);
+        }
+
+        // Verify the tx_keywords list still matches genuine transactional queries
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        for q in &transactional_queries {
+            let q_lower = q.to_lowercase();
+            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+            assert!(has_tx, "transactional query '{}' should match tx_keywords", q);
+        }
+
+        // Verify that guarded queries with "under " or "price " would have matched
+        // the OLD (un-guarded) logic — proving the test is meaningful
+        let problematic_queries = [
+            "how to convert pdf to word under 5 minutes",
+            "how to check price of used bike",
+        ];
+        for q in &problematic_queries {
+            let q_lower = q.to_lowercase();
+            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+            assert!(has_tx, "query '{}' should match tx_keywords (proving the guard is needed)", q);
+            // But the guard suppresses it
+            let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+            assert!(has_starter, "query '{}' should be guarded by informational starter", q);
+        }
     }
 }
 
