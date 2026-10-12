@@ -6954,15 +6954,27 @@ fn has_local_intent(query: &str) -> bool {
         // LOCATION_GAZETTEER, the query has explicit local intent. General guard —
         // no per-query literals, reuses the same gazetteer reference data as geo
         // detection (line 1542) so the policy is consistent and future-proof.
+        // FIX: exclude country-level gazetteer entries — "in india" is a national
+        // scope, not a local search. A query like "organic farm in india" or
+        // "credit score in india" is a how-to/informational query, not local.
         || {
             let parts: Vec<&str> = lower.split(" in ").collect();
             if let Some(after_in) = parts.last() {
                 let after_in = *after_in;  // deref &&str -> &str
-                LOCATION_GAZETTEER.iter().any(|(name, _)| {
-                    let name_lower = name.to_lowercase();
-                    whole_word_contains(after_in, &name_lower)
-                        || after_in.starts_with(name_lower.as_str())
-                })
+                const COUNTRY_CODES: &[&str] = &[
+                    "US", "GB", "CA", "AU", "NZ", "DE", "FR", "ES", "IT", "PT", "NL",
+                    "IE", "SE", "NO", "DK", "FI", "PL", "AT", "CH", "BE", "RU", "UA",
+                    "TR", "GR", "JP", "CN", "KR", "IN", "SG", "HK", "BR", "MX", "AR",
+                    "AE", "SA", "EG", "IL", "TH", "VN", "ID", "MY", "PH", "ZA", "NG",
+                    "KE", "CZ", "HU", "RO", "HR", "SI",
+                ];
+                LOCATION_GAZETTEER.iter()
+                    .filter(|(_, cc)| !COUNTRY_CODES.contains(cc))
+                    .any(|(name, _)| {
+                        let name_lower = name.to_lowercase();
+                        whole_word_contains(after_in, &name_lower)
+                            || after_in.starts_with(name_lower.as_str())
+                    })
             } else {
                 false
             }
@@ -15289,27 +15301,62 @@ async fn handle_search(
             "comparison", "fresh", "transactional", "local",
         ];
         if !SUPPORTED.contains(&intent.intent.as_str()) {
-            let best = SUPPORTED.iter()
-                .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            match best {
-                Some((lbl, prob)) => {
+            // chitchat is semantically closest to informational (both are
+            // non-navigational, non-actionable queries). The old code picked
+            // the max-probability supported class, which for chitchat was
+            // often navigational — sending "what causes migraines" to the
+            // navigational ranking path (domain boost, academic-paper crush).
+            // Fix: for chitchat, prefer informational unless another supported
+            // class has a decisively higher probability (> 0.5).
+            if intent.intent == "chitchat" {
+                let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+                let best_other = SUPPORTED.iter()
+                    .filter(|l| **l != "informational")
+                    .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                let use_info = match best_other {
+                    Some((lbl, prob)) if prob > 0.5 && prob > info_prob * 2.0 => false,
+                    _ => true,
+                };
+                if use_info {
                     tracing::warn!(
-                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' — remapping to '{}' (top supported class)",
-                        intent.intent, q, lbl
-                    );
-                    intent.intent = (*lbl).to_string();
-                    // Use the distribution probability for the selected supported class
-                    // rather than the original unsupported-class confidence.
-                    intent.confidence = prob;
-                }
-                None => {
-                    tracing::warn!(
-                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' with no supported distribution entry — falling back to informational",
-                        intent.intent, q
+                        "INTENT CONTRACT: engine returned 'chitchat' for '{}' — remapping to 'informational' (chitchat is not navigational)",
+                        q
                     );
                     intent.intent = "informational".to_string();
+                    intent.confidence = info_prob.max(0.35);
+                } else if let Some((lbl, prob)) = best_other {
+                    tracing::warn!(
+                        "INTENT CONTRACT: engine returned 'chitchat' for '{}' — remapping to '{}' (decisive {:.3})",
+                        q, lbl, prob
+                    );
+                    intent.intent = (*lbl).to_string();
+                    intent.confidence = prob;
+                } else {
+                    intent.intent = "informational".to_string();
                     intent.confidence = 0.35;
+                }
+            } else {
+                let best = SUPPORTED.iter()
+                    .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                match best {
+                    Some((lbl, prob)) => {
+                        tracing::warn!(
+                            "INTENT CONTRACT: engine returned unsupported '{}' for '{}' — remapping to '{}' (top supported class)",
+                            intent.intent, q, lbl
+                        );
+                        intent.intent = (*lbl).to_string();
+                        intent.confidence = prob;
+                    }
+                    None => {
+                        tracing::warn!(
+                            "INTENT CONTRACT: engine returned unsupported '{}' for '{}' with no supported distribution entry — falling back to informational",
+                            intent.intent, q
+                        );
+                        intent.intent = "informational".to_string();
+                        intent.confidence = 0.35;
+                    }
                 }
             }
         }
