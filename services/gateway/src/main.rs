@@ -9500,7 +9500,8 @@ fn merge_local_and_web(
         None => RankingWeights::for_intent(intent),
     };
 
-    let clean_query = simple_negation_strip(query).unwrap_or_else(|| query.to_string());
+    let (clean_query, negation_excluded_terms) = simple_negation_strip(query)
+        .unwrap_or_else(|| (query.to_string(), Vec::new()));
 
     // Navigational domain boost: if intent is navigational and the query
     // looks like a platform name (1-2 tokens), boost results whose host
@@ -10972,6 +10973,36 @@ fn merge_local_and_web(
         let c_score = constraint_score(&r.title, &r.content, &r.url, constraints);
         let consensus = consensus_score(&r.sources);
 
+        // Negation exclusion penalty: non-domain content words after a negation
+        // trigger (e.g. "hand rolled" in "biryani without hand rolled") are
+        // returned by simple_negation_strip as exclusions. Apply a quality
+        // penalty (not a hard blocker) to results containing these terms.
+        // This is the same pattern as soft_negatives: demote, don't drop.
+        let negation_exclusion_penalty = if !negation_excluded_terms.is_empty() {
+            let title_lower_neg = r.title.to_lowercase();
+            let content_lower_neg = r.content.to_lowercase();
+            let url_lower_neg = r.url.to_lowercase();
+            let mut penalty = 1.0f32;
+            for excl in &negation_excluded_terms {
+                let excl_lower = excl.to_lowercase();
+                if title_lower_neg.contains(&excl_lower)
+                    || content_lower_neg.contains(&excl_lower)
+                    || url_lower_neg.contains(&excl_lower)
+                {
+                    penalty *= 0.3;
+                    tracing::info!(
+                        "NEGATION EXCLUSION HIT: '{}' in '{}' → penalty={:.2}",
+                        excl,
+                        &r.title[..r.title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(r.title.len())],
+                        penalty
+                    );
+                }
+            }
+            penalty
+        } else {
+            1.0f32
+        };
+
         // Navigational domain match boost: if the URL host contains the
         // query as a domain component, this is likely the destination the
         // user wants. Strong boost for homepage, moderate for subpages.
@@ -11222,7 +11253,7 @@ fn merge_local_and_web(
         };
 
         let p2d_mult = if p2d_offtopic { 0.05 } else { 1.0 };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * audio_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult;
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * audio_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * negation_exclusion_penalty;
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
@@ -13393,7 +13424,7 @@ async fn handle_intent(
 fn build_video_inspect(q: &str) -> serde_json::Value {
     // Strip negation first -- mirrors /search's clean_query pipeline so a query
     // like "best tutorial not youtube" classifies on its positive content only.
-    let stripped = simple_negation_strip(q).unwrap_or_else(|| q.to_string());
+    let (stripped, _neg_excluded) = simple_negation_strip(q).unwrap_or_else(|| (q.to_string(), Vec::new()));
     let video_intent = has_video_intent(&stripped);
     let intent_resp = fallback_intent(q);
     let is_video_source_examples = serde_json::json!({
@@ -14418,10 +14449,10 @@ async fn handle_search(
         || q.starts_with("-") || q.contains(" not ") || q.contains(" no ")
         || q.contains(" without ") || q.contains(" -");
     let stripped_override: Option<String> = if has_neg_pattern {
-        simple_negation_strip(&q).filter(|s| {
+        simple_negation_strip(&q).filter(|(s, _)| {
             let processed = preprocess_searxng_query(s);
             !processed.is_empty() && processed != preprocess_searxng_query(&q)
-        })
+        }).map(|(s, _)| s)
     } else { None };
 
     let mut searx_urls: Vec<String> = Vec::new();
@@ -15766,7 +15797,7 @@ async fn handle_search(
         // SearXNG fan-out uses—strips both trigger words AND the negated
         // content terms immediately following them.
         // Example: "browser not chrome not edge" → "browser"
-        let stripped = simple_negation_strip(&q);
+        let stripped = simple_negation_strip(&q).map(|(s, _)| s);
         if let Some(ref s) = stripped {
             tracing::info!("ONLY NEGATIVE: stripped query '{:?}' -> '{}'", q, s);
         }
@@ -19208,7 +19239,7 @@ mod negation_scope_tests {
 
     #[test]
     fn without_clause_does_not_swallow_following_clause() {
-        let stripped = simple_negation_strip(
+        let (stripped, excluded) = simple_negation_strip(
             "protein powder without artificial sweeteners for lactose intolerant beginners",
         )
         .expect("should strip the negated clause but keep the trailing clause");
@@ -19227,6 +19258,11 @@ mod negation_scope_tests {
             "negated term must be stripped, got: {:?}",
             stripped
         );
+        assert!(
+            excluded.contains(&"artificial".to_string()),
+            "non-domain negated term must be returned as exclusion, got: {:?}",
+            excluded
+        );
     }
 
     #[test]
@@ -19234,11 +19270,11 @@ mod negation_scope_tests {
         // The original purpose of the function: "not X not Y" chains.
         assert_eq!(
             simple_negation_strip("browser not chrome not edge"),
-            Some("browser".to_string())
+            Some(("browser".to_string(), vec!["chrome".to_string(), "edge".to_string()]))
         );
         assert_eq!(
             simple_negation_strip("javascript framework not react not vue not angular"),
-            Some("javascript framework".to_string())
+            Some(("javascript framework".to_string(), vec!["react".to_string(), "vue".to_string(), "angular".to_string()]))
         );
     }
 
@@ -19246,20 +19282,50 @@ mod negation_scope_tests {
     fn not_from_phrase_keeps_negation_scope() {
         // Prepositions are NOT clause boundaries: "not from <country>" keeps
         // the negated phrase in scope (P9 regression guard).
-        let stripped = simple_negation_strip("smartphones not from chinese brands");
-        assert_eq!(stripped, Some("smartphones".to_string()));
+        let (stripped, excluded) = simple_negation_strip("smartphones not from chinese brands").unwrap();
+        assert_eq!(stripped, "smartphones".to_string());
+        assert!(excluded.contains(&"chinese".to_string()) || excluded.contains(&"brands".to_string()));
     }
 
     #[test]
     fn without_sugar_or_honey_negates_both_sides() {
         // "or" continues the negation scope: both alternatives stay excluded.
-        let stripped = simple_negation_strip("dessert recipes without sugar or honey");
-        assert!(stripped.unwrap().contains("dessert recipes"));
+        let (stripped, excluded) = simple_negation_strip("dessert recipes without sugar or honey").unwrap();
+        assert!(stripped.contains("dessert recipes"));
+        assert!(excluded.contains(&"sugar".to_string()) || excluded.contains(&"honey".to_string()));
     }
 
     #[test]
     fn plain_query_returns_none() {
         assert_eq!(simple_negation_strip("best laptop for programming"), None);
+    }
+
+    // ── Non-domain content words after "without" are returned as exclusions ──
+    // Round auto/round-2026-10-12T0625Z: "biryani without hand rolled" was
+    // losing the "hand rolled" constraint entirely because simple_negation_strip
+    // silently dropped every non-domain word after "without". The fix returns
+    // those words as exclusions so the caller can apply a quality penalty.
+
+    #[test]
+    fn without_non_domain_terms_returned_as_exclusions() {
+        let (stripped, excluded) = simple_negation_strip("biryani without hand rolled").unwrap();
+        assert_eq!(stripped, "biryani".to_string());
+        assert_eq!(excluded, vec!["hand".to_string(), "rolled".to_string()]);
+    }
+
+    #[test]
+    fn without_mixed_domain_and_non_domain_terms() {
+        // "linux" is a preserved domain word; "spicy" is not.
+        let (stripped, excluded) = simple_negation_strip("recipes without linux spicy").unwrap();
+        assert_eq!(stripped, "recipes linux".to_string());
+        assert_eq!(excluded, vec!["spicy".to_string()]);
+    }
+
+    #[test]
+    fn without_non_domain_phrase_collected_word_by_word() {
+        let (stripped, excluded) = simple_negation_strip("protein powder without artificial sweeteners").unwrap();
+        assert_eq!(stripped, "protein powder".to_string());
+        assert_eq!(excluded, vec!["artificial".to_string(), "sweeteners".to_string()]);
     }
 
     // ── A bare negation marker must never survive as a POSITIVE requirement ──
@@ -21679,7 +21745,7 @@ mod spellcheck_endpoint_tests {
         fn video_watch_phrase_triggers_video_intent() {
             // "watch video" / "watch tutorial" must be detected as video intent
             // (has_video_intent checks for these phrases, matching live /search).
-            let stripped = simple_negation_strip("watch video tutorial").unwrap_or_else(|| "watch video tutorial".to_string());
+            let (stripped, _) = simple_negation_strip("watch video tutorial").unwrap_or_else(|| ("watch video tutorial".to_string(), Vec::new()));
             assert!(has_video_intent(&stripped));
         }
     }
