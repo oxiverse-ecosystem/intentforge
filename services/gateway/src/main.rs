@@ -121,6 +121,12 @@ struct Constraints {
     /// the `price:<N` operator form and of bare-dollar natural language.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     price_currency: Option<String>,
+    /// Decimal constraints extracted from the query — numbers with units like
+    /// "1.5kg", "2.5L", "3.5 inches" that must be preserved as single tokens
+    /// during tokenization. Without this, the tokenizer splits on the decimal
+    /// point, destroying the constraint: "1.5kg" becomes "+1 5kg".
+    #[serde(default)]
+    decimal_constraints: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -2792,6 +2798,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         price_lt,
         price_gt,
         price_currency: c.price_currency.clone(),
+        decimal_constraints: c.decimal_constraints.clone(),
         ignored_constraints: None,
     }
 }
@@ -5928,23 +5935,65 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
         "modern","quick","simple","easy","great","popular","powerful",
     ].iter().copied().collect();
 
+    // Pre-tokenization decimal preservation: protect decimal numbers like
+    // "1.5kg", "2.5L", "3.5 inches" from being split by the tokenizer.
+    // Without this, "1.5kg" becomes tokens "1" and "5kg", destroying the
+    // constraint. We replace the decimal point with a placeholder, tokenize,
+    // then restore the decimal point in the resulting tokens.
+    const DECIMAL_PLACEHOLDER: char = '\u{0001}';
+    let protected_q = q_lower
+        .split_whitespace()
+        .map(|w| {
+            // If the word contains a decimal number (e.g. "1.5kg"), protect it
+            if w.chars().any(|c| c == '.') && w.chars().any(|c| c.is_ascii_digit()) {
+                w.replace('.', &DECIMAL_PLACEHOLDER.to_string())
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
     let tokenize = |text: &str| -> Vec<String> {
         text.split_whitespace()
-            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != DECIMAL_PLACEHOLDER).to_lowercase())
+            .map(|w| w.replace(DECIMAL_PLACEHOLDER, "."))
             .filter(|w| w.len() >= 2 && !stop_words.contains(w.as_str()))
             .map(|w| stem(&w))
             .collect()
     };
 
-    let query_terms = tokenize(&q_lower);
+    let query_terms = tokenize(&protected_q);
     if query_terms.is_empty() {
         return 0.5;
     }
 
     // Build weighted term frequency map — title terms get 3x weight
     let mut tf: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-    let title_tokens = tokenize(&t_lower);
-    let content_tokens = tokenize(&c_lower);
+    let protected_t = t_lower
+        .split_whitespace()
+        .map(|w| {
+            if w.chars().any(|c| c == '.') && w.chars().any(|c| c.is_ascii_digit()) {
+                w.replace('.', &DECIMAL_PLACEHOLDER.to_string())
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let protected_c = c_lower
+        .split_whitespace()
+        .map(|w| {
+            if w.chars().any(|c| c == '.') && w.chars().any(|c| c.is_ascii_digit()) {
+                w.replace('.', &DECIMAL_PLACEHOLDER.to_string())
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title_tokens = tokenize(&protected_t);
+    let content_tokens = tokenize(&protected_c);
 
     for term in &title_tokens {
         *tf.entry(term.clone()).or_insert(0.0) += 3.0;
@@ -17714,6 +17763,12 @@ let mut results = match tokio::task::spawn_blocking(move || {
     for p in &intent.structured_constraints.positive {
         flat_constraints.push(format!("+{}", p));
     }
+    // Decimal constraints (e.g. "1.5kg", "2.5L") are preserved as-is — they
+    // must NOT be split by the tokenizer, which would turn "1.5kg" into
+    // "+1 5kg" and destroy the constraint.
+    for dc in &intent.structured_constraints.decimal_constraints {
+        flat_constraints.push(format!("+{}", dc));
+    }
     for n in &intent.structured_constraints.negative {
         flat_constraints.push(format!("-{}", n));
     }
@@ -18610,6 +18665,43 @@ fn normalize_nl_operators(query: &str) -> String {
     out
 }
 
+/// Extract decimal constraints from a query — numbers with units like
+/// "1.5kg", "2.5L", "3.5 inches" that must be preserved as single tokens
+/// during tokenization. Without this, the tokenizer splits on the decimal
+/// point, destroying the constraint: "1.5kg" becomes "+1 5kg".
+///
+/// The pattern matches:
+/// - A number with a decimal point (e.g. "1.5", "2.5", "3.5")
+/// - Optionally followed by a unit (e.g. "kg", "L", "inches", "cm", "mm", "gb", "mb")
+///
+/// Returns the matched strings in their original form (e.g. "1.5kg", "2.5L").
+/// Purely structural — no per-query literals, no hardcoded unit list.
+fn extract_decimal_constraints(q: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let q_lower = q.to_lowercase();
+
+    // Pattern: number with decimal point, optionally followed by a unit
+    // Matches: "1.5kg", "2.5L", "3.5 inches", "1.5 kg", etc.
+    let re = match regex::Regex::new(r"(?i)(\d+\.\d+(?:\s*[a-z]+)?)") {
+        Ok(r) => r,
+        Err(_) => return results,
+    };
+
+    for cap in re.captures_iter(&q_lower) {
+        if let Some(m) = cap.get(1) {
+            let matched = m.as_str().trim();
+            // Filter out matches that are just a number without a unit
+            // (those are handled by the numeric constraint relaxation)
+            let has_unit = matched.chars().any(|c| c.is_alphabetic());
+            if has_unit && !results.contains(&matched.to_string()) {
+                results.push(matched.to_string());
+            }
+        }
+    }
+
+    results
+}
+
 fn extract_gateway_constraints(q: &str) -> Constraints {
     // Normalize spoken constraint forms (under $500, in url:, …) before
     // scanning for operators so the gateway's own parsing matches the engine
@@ -18850,6 +18942,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         price_lt,
         price_gt,
         price_currency: None,
+        decimal_constraints: extract_decimal_constraints(&q),
         ignored_constraints: None,
     }
 }
@@ -20786,6 +20879,97 @@ mod spellcheck_endpoint_tests {
     // lock the shape + behavior of `build_inspect` using the exact pure fns
     // /search runs (no AppState / live server needed), so the endpoint cannot
     // regress silently and cannot be "faked" by hardcoded strings.
+
+    // ── Decimal constraint extraction (pre-tokenization preservation) ──
+    // "1.5kg" must be preserved as a single token, not split into "1" and "5kg".
+
+    #[test]
+    fn extract_decimal_constraints_basic() {
+        // Basic decimal + unit combinations
+        let r = extract_decimal_constraints("1.5kg");
+        assert!(r.iter().any(|s| s == "1.5kg"), "1.5kg must be preserved: {:?}", r);
+
+        let r = extract_decimal_constraints("2.5L");
+        assert!(r.iter().any(|s| s == "2.5l"), "2.5L must be preserved: {:?}", r);
+
+        let r = extract_decimal_constraints("3.5 inches");
+        assert!(r.iter().any(|s| s == "3.5 inches"), "3.5 inches must be preserved: {:?}", r);
+    }
+
+    #[test]
+    fn extract_decimal_constraints_multiple() {
+        // Multiple decimal constraints in one query
+        let r = extract_decimal_constraints("1.5kg 2.5L");
+        assert!(r.iter().any(|s| s == "1.5kg"), "1.5kg must be present: {:?}", r);
+        assert!(r.iter().any(|s| s == "2.5l"), "2.5l must be present: {:?}", r);
+    }
+
+    #[test]
+    fn extract_decimal_constraints_within_query() {
+        // Decimal constraints embedded in a larger query
+        let r = extract_decimal_constraints("laptop under 500 with 1.5kg weight");
+        assert!(r.iter().any(|s| s == "1.5kg"), "1.5kg must be found: {:?}", r);
+    }
+
+    #[test]
+    fn extract_decimal_constraints_various_units() {
+        // Various unit types
+        for (query, expected) in [
+            ("5.5 inches display", "5.5 inches"),
+            ("1.5 gb ram", "1.5 gb"),
+            ("2.5 cm gap", "2.5 cm"),
+            ("0.5 mm thickness", "0.5 mm"),
+        ] {
+            let r = extract_decimal_constraints(query);
+            assert!(
+                r.iter().any(|s| s == expected),
+                "'{}' must be preserved in query '{}': {:?}",
+                expected, query, r
+            );
+        }
+    }
+
+    #[test]
+    fn extract_decimal_constraints_no_false_positives() {
+        // Non-decimal numbers should NOT be extracted
+        let r = extract_decimal_constraints("5kg");
+        assert!(r.is_empty(), "integer 5kg must not be extracted: {:?}", r);
+
+        let r = extract_decimal_constraints("hello world");
+        assert!(r.is_empty(), "no decimals must yield empty: {:?}", r);
+    }
+
+    #[test]
+    fn decimal_constraints_in_extract_gateway_constraints() {
+        // The full constraint extraction must include decimal constraints
+        let c = extract_gateway_constraints("laptop 1.5kg");
+        assert!(
+            c.decimal_constraints.iter().any(|s| s == "1.5kg"),
+            "1.5kg must be in decimal_constraints: {:?}",
+            c.decimal_constraints
+        );
+    }
+
+    #[test]
+    fn decimal_constraints_preserved_in_flat_constraints() {
+        // The flat_constraints building must preserve decimal constraints as-is
+        let intent = fallback_intent("1.5kg laptop");
+        let mut flat_constraints = Vec::new();
+        for p in &intent.structured_constraints.positive {
+            flat_constraints.push(format!("+{}", p));
+        }
+        for dc in &intent.structured_constraints.decimal_constraints {
+            flat_constraints.push(format!("+{}", dc));
+        }
+        for n in &intent.structured_constraints.negative {
+            flat_constraints.push(format!("-{}", n));
+        }
+        assert!(
+            flat_constraints.iter().any(|s| s == "+1.5kg"),
+            "+1.5kg must be in flat_constraints: {:?}",
+            flat_constraints
+        );
+    }
 
     #[test]
     fn inspect_endpoint_shape_matches_docs() {
