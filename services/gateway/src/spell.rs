@@ -70,6 +70,21 @@ const PROTECTED_TERMS: &[&str] = &[
     // Food & cooking terms that collide with English words / tech terms
     "batter", "dosa", "idli", "vada", "poha", "upma", "biryani", "tandoori",
     "masala", "chutney", "achar", "ghee", "besan", "rava", "semolina",
+    // Non-media brands at edit-distance 1 from dictionary words
+    // (identified by systematic scan: brand vs 15k dictionary word at dist 1)
+    // Tech / software / platforms
+    "canva", "zoho", "webex", "quora", "roam", "vimeo", "tubi",
+    "twitch", "weebly", "pinterest", "gooten", "appletv", "hyperv",
+    "mediatek", "irobot", "icloud", "istock", "pexels",
+    // Automotive / hardware
+    "tesla", "skoda", "opel", "tata", "ktm", "jbl", "asics", "burrow",
+    "oster", "miele", "lowes", "lidl", "aldi", "kroger",
+    // Consumer goods / food / beverage
+    "levis", "oreo", "sprite", "fanta", "dole", "lays", "parle", "zara",
+    "lux", "joes", "kraft", "quaker", "garnier", "hulu",
+    // Other brands / services
+    "accor", "aew", "britannia", "clank", "etsy", "ikea", "klm", "moz",
+    "oyo", "pubg", "tmobile", "vrv",
 ];
 
 /// Returns true if `word` is a protected brand/entity that must never be
@@ -1476,5 +1491,425 @@ mod tests {
         // a known-misspelling entry, exempt from the absent-word block.
         let index = SymSpellIndex::build();
         assert_eq!(index.correct("ngnix"), Some("nginx".to_string()));
+    }
+
+    // ─── Non-media brand corruption tests (2026-10-12) ────────────────
+    // These brands are at edit-distance 1 from common dictionary words and
+    // must NEVER be spell-corrected. Identified by systematic scan of the
+    // 15k dictionary against common brand/product names.
+
+    #[test]
+    fn test_canva_not_corrected_to_canvas() {
+        // "canva" (design platform) is edit-distance 1 from "canvas"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("canva"), None,
+            "canva must NOT be corrected to canvas");
+    }
+
+    #[test]
+    fn test_tesla_not_corrected() {
+        // "tesla" (car brand) is edit-distance 1 from "testa"/"tesla" variants
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("tesla"), None,
+            "tesla must NOT be corrected");
+    }
+
+    #[test]
+    fn test_skoda_not_corrected_to_soda() {
+        // "skoda" (car brand) is edit-distance 1 from "soda"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("skoda"), None,
+            "skoda must NOT be corrected to soda");
+    }
+
+    #[test]
+    fn test_oreo_not_corrected() {
+        // "oreo" (cookie brand) is edit-distance 1 from "treo"/"oreo" variants
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("oreo"), None,
+            "oreo must NOT be corrected");
+    }
+
+    #[test]
+    fn test_sprite_not_corrected_to_spite() {
+        // "sprite" (soft drink) is edit-distance 1 from "spite"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("sprite"), None,
+            "sprite must NOT be corrected to spite");
+    }
+
+    #[test]
+    fn test_twitch_not_corrected_to_witch() {
+        // "twitch" (streaming platform) is edit-distance 1 from "witch"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("twitch"), None,
+            "twitch must NOT be corrected to witch");
+    }
+
+    #[test]
+    fn test_levis_not_corrected_to_elvis() {
+        // "levis" (jeans brand) is edit-distance 1 from "elvis"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("levis"), None,
+            "levis must NOT be corrected to elvis");
+    }
+
+    #[test]
+    fn test_hulu_not_corrected_to_hull() {
+        // "hulu" (streaming service) is edit-distance 1 from "hull"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("hulu"), None,
+            "hulu must NOT be corrected to hull");
+    }
+
+    #[test]
+    fn test_quora_not_corrected_to_quota() {
+        // "quora" (Q&A platform) is edit-distance 1 from "quota"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("quora"), None,
+            "quora must NOT be corrected to quota");
+    }
+
+    #[test]
+    fn test_pinterest_not_corrected_to_interest() {
+        // "pinterest" (social platform) is edit-distance 1 from "interest"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("pinterest"), None,
+            "pinterest must NOT be corrected to interest");
+    }
+
+    #[test]
+    fn test_ikea_not_corrected_to_idea() {
+        // "ikea" (furniture brand) is edit-distance 1 from "idea"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("ikea"), None,
+            "ikea must NOT be corrected to idea");
+    }
+
+    #[test]
+    fn test_roam_not_corrected_to_roma() {
+        // "roam" (note-taking app) is edit-distance 1 from "roma"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("roam"), None,
+            "roam must NOT be corrected to roma");
+    }
+
+    #[test]
+    fn test_vimeo_not_corrected_to_video() {
+        // "vimeo" (video platform) is edit-distance 1 from "video"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("vimeo"), None,
+            "vimeo must NOT be corrected to video");
+    }
+
+    #[test]
+    fn test_zara_not_corrected_to_para() {
+        // "zara" (clothing brand) is edit-distance 1 from "para"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("zara"), None,
+            "zara must NOT be corrected to para");
+    }
+
+    #[test]
+    fn test_lux_not_corrected() {
+        // "lux" (soap brand) is edit-distance 1 from "aux"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("lux"), None,
+            "lux must NOT be corrected");
+    }
+
+    #[test]
+    fn test_etsy_not_corrected_to_easy() {
+        // "etsy" (marketplace) is edit-distance 1 from "easy"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("etsy"), None,
+            "etsy must NOT be corrected to easy");
+    }
+
+    #[test]
+    fn test_garnier_not_corrected_to_garner() {
+        // "garnier" (cosmetics brand) is edit-distance 1 from "garner"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("garnier"), None,
+            "garnier must NOT be corrected to garner");
+    }
+
+    #[test]
+    fn test_opel_not_corrected_to_open() {
+        // "opel" (car brand) is edit-distance 1 from "open"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("opel"), None,
+            "opel must NOT be corrected to open");
+    }
+
+    #[test]
+    fn test_kraft_not_corrected_to_draft() {
+        // "kraft" (food brand) is edit-distance 1 from "draft"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("kraft"), None,
+            "kraft must NOT be corrected to draft");
+    }
+
+    #[test]
+    fn test_lays_not_corrected_to_says() {
+        // "lays" (chip brand) is edit-distance 1 from "says"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("lays"), None,
+            "lays must NOT be corrected to says");
+    }
+
+    #[test]
+    fn test_dole_not_corrected_to_doll() {
+        // "dole" (food brand) is edit-distance 1 from "doll"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("dole"), None,
+            "dole must NOT be corrected to doll");
+    }
+
+    #[test]
+    fn test_fanta_not_corrected_to_santa() {
+        // "fanta" (soft drink) is edit-distance 1 from "santa"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("fanta"), None,
+            "fanta must NOT be corrected to santa");
+    }
+
+    #[test]
+    fn test_tata_not_corrected_to_data() {
+        // "tata" (conglomerate) is edit-distance 1 from "data"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("tata"), None,
+            "tata must NOT be corrected to data");
+    }
+
+    #[test]
+    fn test_aldi_not_corrected_to_ali() {
+        // "aldi" (supermarket) is edit-distance 1 from "ali"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("aldi"), None,
+            "aldi must NOT be corrected to ali");
+    }
+
+    #[test]
+    fn test_lidl_not_corrected() {
+        // "lidl" (supermarket) is edit-distance 1 from "lid"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("lidl"), None,
+            "lidl must NOT be corrected");
+    }
+
+    #[test]
+    fn test_lowes_not_corrected_to_lower() {
+        // "lowes" (home improvement) is edit-distance 1 from "lower"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("lowes"), None,
+            "lowes must NOT be corrected to lower");
+    }
+
+    #[test]
+    fn test_kroger_not_corrected_to_roger() {
+        // "kroger" (supermarket) is edit-distance 1 from "roger"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("kroger"), None,
+            "kroger must NOT be corrected to roger");
+    }
+
+    #[test]
+    fn test_tubi_not_corrected_to_tube() {
+        // "tubi" (streaming service) is edit-distance 1 from "tube"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("tubi"), None,
+            "tubi must NOT be corrected to tube");
+    }
+
+    #[test]
+    fn test_weebly_not_corrected_to_weekly() {
+        // "weebly" (website builder) is edit-distance 1 from "weekly"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("weebly"), None,
+            "weebly must NOT be corrected to weekly");
+    }
+
+    #[test]
+    fn test_webex_not_corrected_to_weber() {
+        // "webex" (video conferencing) is edit-distance 1 from "weber"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("webex"), None,
+            "webex must NOT be corrected to weber");
+    }
+
+    #[test]
+    fn test_miele_not_corrected_to_mile() {
+        // "miele" (appliance brand) is edit-distance 1 from "mile"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("miele"), None,
+            "miele must NOT be corrected to mile");
+    }
+
+    #[test]
+    fn test_oster_not_corrected_to_foster() {
+        // "oster" (kitchen appliance) is edit-distance 1 from "foster"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("oster"), None,
+            "oster must NOT be corrected to foster");
+    }
+
+    #[test]
+    fn test_burrow_not_corrected_to_borrow() {
+        // "burrow" (furniture brand) is edit-distance 1 from "borrow"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("burrow"), None,
+            "burrow must NOT be corrected to borrow");
+    }
+
+    #[test]
+    fn test_hyperv_not_corrected_to_hyper() {
+        // "hyperv" (Microsoft hypervisor) is edit-distance 1 from "hyper"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("hyperv"), None,
+            "hyperv must NOT be corrected to hyper");
+    }
+
+    #[test]
+    fn test_appletv_not_corrected_to_applet() {
+        // "appletv" (Apple TV) is edit-distance 1 from "applet"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("appletv"), None,
+            "appletv must NOT be corrected to applet");
+    }
+
+    #[test]
+    fn test_icloud_not_corrected_to_cloud() {
+        // "icloud" (Apple iCloud) is edit-distance 1 from "cloud"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("icloud"), None,
+            "icloud must NOT be corrected to cloud");
+    }
+
+    #[test]
+    fn test_istock_not_corrected_to_stock() {
+        // "istock" (iStock) is edit-distance 1 from "stock"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("istock"), None,
+            "istock must NOT be corrected to stock");
+    }
+
+    #[test]
+    fn test_pexels_not_corrected_to_pixels() {
+        // "pexels" (stock photo site) is edit-distance 1 from "pixels"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("pexels"), None,
+            "pexels must NOT be corrected to pixels");
+    }
+
+    #[test]
+    fn test_mediatek_not_corrected_to_mediated() {
+        // "mediatek" (chipmaker) is edit-distance 1 from "mediated"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("mediatek"), None,
+            "mediatek must NOT be corrected to mediated");
+    }
+
+    #[test]
+    fn test_irobot_not_corrected_to_robot() {
+        // "irobot" (Robot Corp) is edit-distance 1 from "robot"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("irobot"), None,
+            "irobot must NOT be corrected to robot");
+    }
+
+    #[test]
+    fn test_gooten_not_corrected_to_gotten() {
+        // "gooten" (print-on-demand) is edit-distance 1 from "gotten"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("gooten"), None,
+            "gooten must NOT be corrected to gotten");
+    }
+
+    #[test]
+    fn test_accor_not_corrected_to_accord() {
+        // "accor" (hotel group) is edit-distance 1 from "accord"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("accor"), None,
+            "accor must NOT be corrected to accord");
+    }
+
+    #[test]
+    fn test_britannia_not_corrected_to_britannica() {
+        // "britannia" (Indian food brand) is edit-distance 1 from "britannica"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("britannia"), None,
+            "britannia must NOT be corrected to britannica");
+    }
+
+    #[test]
+    fn test_clank_not_corrected_to_clark() {
+        // "clank" (Ratchet & Clank) is edit-distance 1 from "clark"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("clank"), None,
+            "clank must NOT be corrected to clark");
+    }
+
+    #[test]
+    fn test_quaker_not_corrected_to_quake() {
+        // "quaker" (Quaker Oats) is edit-distance 1 from "quake"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("quaker"), None,
+            "quaker must NOT be corrected to quake");
+    }
+
+    #[test]
+    fn test_joes_not_corrected_to_jose() {
+        // "joes" (Trader Joe's) is edit-distance 1 from "jose"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("joes"), None,
+            "joes must NOT be corrected to jose");
+    }
+
+    #[test]
+    fn test_parle_not_corrected_to_pale() {
+        // "parle" (Indian biscuit brand) is edit-distance 1 from "pale"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("parle"), None,
+            "parle must NOT be corrected to pale");
+    }
+
+    #[test]
+    fn test_tmobile_not_corrected_to_mobile() {
+        // "tmobile" (T-Mobile) is edit-distance 1 from "mobile"
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("tmobile"), None,
+            "tmobile must NOT be corrected to mobile");
+    }
+
+    #[test]
+    fn test_genuine_typos_still_corrected_with_brands_present() {
+        // Sanity: adding brands to PROTECTED_TERMS must not break genuine typo correction
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("pythn"), Some("python".to_string()),
+            "pythn should still correct to python");
+        assert_eq!(index.correct("programing"), Some("programming".to_string()),
+            "programing should still correct to programming");
+        assert_eq!(index.correct("ngnix"), Some("nginx".to_string()),
+            "ngnix should still correct to nginx");
+        assert_eq!(index.correct("housr"), Some("house".to_string()),
+            "housr should still correct to house");
+    }
+
+    #[test]
+    fn test_brand_query_not_changed() {
+        // Full-query test: a query containing a protected brand must not be spell-changed
+        let index = SymSpellIndex::build();
+        let (corrected, changed) = correct_query(&index, "best canva alternatives for beginners");
+        assert!(!changed, "query with 'canva' must not be spell-changed");
+        assert_eq!(corrected, "best canva alternatives for beginners");
+
+        let (corrected, changed) = correct_query(&index, "skoda slavia vs honda city");
+        assert!(!changed, "query with 'skoda' must not be spell-changed");
+        assert_eq!(corrected, "skoda slavia vs honda city");
+
+        let (corrected, changed) = correct_query(&index, "twitch vs youtube for streaming");
+        assert!(!changed, "query with 'twitch' must not be spell-changed");
+        assert_eq!(corrected, "twitch vs youtube for streaming");
     }
 }
