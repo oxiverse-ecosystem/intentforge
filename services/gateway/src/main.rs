@@ -4330,7 +4330,15 @@ async fn enrich_with_commerce<F, Fut>(
                 // structured product data — never a guessed/fabricated fact.
                 if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
                     match serde_json::to_value(&offer) {
-                        Ok(v) => {
+                        Ok(mut v) => {
+                            // extract_commerce_offer labels HTML-pattern matches
+                            // as "extracted_from_text" (its internal step 5).
+                            // From enrich_with_commerce's perspective this IS
+                            // the html_pattern tier — upgrade the source so the
+                            // frontend labels it correctly.
+                            if v.get("source").and_then(|s| s.as_str()) == Some("extracted_from_text") {
+                                v["source"] = serde_json::json!("html_pattern");
+                            }
                             r["commerce"] = v;
                             attached = true;
                         }
@@ -4454,7 +4462,14 @@ fn enrich_single_commerce(
     let offer: CommerceOffer = extract_commerce_offer(html, &url);
     let has_fact = offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false);
     if has_fact {
-        if let Ok(v) = serde_json::to_value(&offer) {
+        if let Ok(mut v) = serde_json::to_value(&offer) {
+            // extract_commerce_offer labels HTML-pattern matches as
+            // "extracted_from_text" (its internal step 5). From the
+            // enrichment tier's perspective this IS the html_pattern tier —
+            // upgrade the source so the frontend labels it correctly.
+            if v.get("source").and_then(|s| s.as_str()) == Some("extracted_from_text") {
+                v["source"] = serde_json::json!("html_pattern");
+            }
             r["commerce"] = v;
         }
     }
