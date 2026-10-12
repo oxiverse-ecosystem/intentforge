@@ -5452,11 +5452,11 @@ fn should_clear_date_window(
     pre_filter_count: usize,
     survivors_after_window: usize,
 ) -> bool {
-    if dated_result_count == 0 {
-        return true;
-    }
     if pre_filter_count == 0 {
         return false;
+    }
+    if dated_result_count == 0 {
+        return true;
     }
     if survivors_after_window == 0 {
         return true;
