@@ -8622,8 +8622,14 @@ fn disambiguate_engine_query(query: &str, intent: &str, _expanded_queries: &[Str
 // Detects common negation patterns and strips trigger words AND the content terms
 // immediately following them. This prevents negated terms (e.g., "chrome" in
 // "browser not chrome") from leaking into the search query and polluting results.
-// Example: "browser not chrome not edge" → "browser"
-fn simple_negation_strip(query: &str) -> Option<String> {
+// Example: "browser not chrome not edge" → ("browser", ["chrome", "edge"])
+//
+// Returns (positive_query, excluded_terms). Non-domain content words after a
+// negation trigger are NOT silently dropped — they are returned as exclusions
+// so the caller can apply a quality penalty (not a hard blocker) to results
+// containing them. This fixes "biryani without hand rolled" losing the
+// "hand rolled" constraint entirely.
+fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
     let neg_triggers: std::collections::HashSet<&str> = [
         "not", "no", "without", "except", "excluding", "besides", "minus",
         "other", "than", "nor",
@@ -8647,6 +8653,7 @@ fn simple_negation_strip(query: &str) -> Option<String> {
 
     let words: Vec<&str> = query.split_whitespace().collect();
     let mut result: Vec<&str> = Vec::new();
+    let mut excluded: Vec<String> = Vec::new();
     let mut in_negation = false;
 
     // Negation scope ends at the next CLAUSE-STARTING CONJUNCTION ("... without
@@ -8687,6 +8694,11 @@ fn simple_negation_strip(query: &str) -> Option<String> {
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
                 in_negation = false;
                 result.push(w);
+            } else {
+                // Non-domain content word after a negation trigger: treat as an
+                // exclusion (quality penalty, not hard blocker). Collect the
+                // word so the caller can penalize results containing it.
+                excluded.push(w_lower);
             }
             continue;
         }
@@ -8701,7 +8713,7 @@ fn simple_negation_strip(query: &str) -> Option<String> {
     if cleaned.is_empty() {
         return None; // everything was stripped
     }
-    Some(cleaned)
+    Some((cleaned, excluded))
 }
 
 /// P1-compound: when a query pairs `site:` with `filetype:` (e.g.
