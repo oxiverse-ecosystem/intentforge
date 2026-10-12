@@ -4321,8 +4321,10 @@ async fn enrich_with_commerce<F, Fut>(
             continue; // already enriched by an earlier step
         }
         let mut attached = false;
+        let mut fetched_html: Option<String> = None;
         match fetch(url.clone()).await {
             Some(h) => {
+                fetched_html = Some(h.clone());
                 let offer: CommerceOffer = extract_commerce_offer(&h, &url);
                 // Only attach a `commerce` block when the page actually exposed
                 // structured product data — never a guessed/fabricated fact.
@@ -4337,6 +4339,34 @@ async fn enrich_with_commerce<F, Fut>(
                 }
             }
             None => {}
+        }
+        // HTML-pattern fallback: when the page was fetched but structured
+        // extraction found nothing, try known e-commerce HTML price patterns
+        // (class="a-price", data-price, etc.) on the ACTUAL page content.
+        // This is a provenance-carrying intermediate tier — it looks at the
+        // real page HTML (not just the snippet), but marks the source as
+        // "html_pattern" so the frontend can label it as less certain than
+        // structured data. Never fabricates: only fires on a real pattern match.
+        if !attached {
+            if let Some(ref html) = fetched_html {
+                if let Some((amount, currency)) = extract_price_from_html_patterns(html) {
+                    let facts = OfferFacts {
+                        price: Some(amount),
+                        currency: Some(currency),
+                        ..Default::default()
+                    };
+                    let offer = CommerceOffer {
+                        url: Some(url.clone()),
+                        observed_at: Some(now_unix_string()),
+                        source: Some("html_pattern".to_string()),
+                        data: Some(facts),
+                    };
+                    if let Ok(v) = serde_json::to_value(&offer) {
+                        r["commerce"] = v;
+                        attached = true;
+                    }
+                }
+            }
         }
         // Snippet-based price fallback: when the page fetch failed or returned
         // no structured data, try to extract a price from the search result
@@ -23659,5 +23689,121 @@ mod mainpath_shopping_strip_tests {
     fn enrich_window_is_wider_than_display_cap() {
         // Guards the constants from being re-conflated.
         assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
+    }
+
+    // ── HTML-pattern extraction tier (enrichment RECALL increment) ────────────
+    // When the page fetch succeeds but structured extraction (JSON-LD/OG/
+    // microdata) finds nothing, try known e-commerce HTML price patterns on
+    // the ACTUAL page content before falling back to the snippet. This is a
+    // provenance-carrying intermediate tier: source="html_pattern".
+
+    #[tokio::test]
+    async fn html_pattern_tier_extracts_price_when_structured_finds_nothing() {
+        // A page with NO structured markup but WITH a recognizable price container.
+        let html = r#"<!doctype html><html><head><title>Widget Store</title></head>
+<body><div class="product"><span class="a-price"><span class="a-offscreen">$1,199.00</span></span></div>
+</body></html>"#;
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://store.example.com/widget", "title": "Widget", "score": 9.0 }),
+        ];
+        let h = html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        let c = r.get("commerce").expect("commerce block attached via html_pattern");
+        assert_eq!(c["source"], serde_json::json!("html_pattern"));
+        assert_eq!(c["data"]["price"], serde_json::json!(1199.00));
+        assert!(c["data"]["currency"].as_str().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn html_pattern_tier_does_not_fire_when_structured_data_present() {
+        // When structured extraction succeeds, the html_pattern tier must NOT
+        // overwrite it (structured data is more reliable).
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{"@context":"https://schema.org/","@type":"Product","name":"Widget","offers":{"@type":"Offer","price":"49.99","priceCurrency":"USD"}}
+</script></head><body><span class="price">$99.99</span></body></html>"#;
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://store.example.com/widget", "title": "Widget", "score": 9.0 }),
+        ];
+        let h = html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        let c = r.get("commerce").expect("commerce block attached");
+        assert_eq!(c["source"], serde_json::json!("json-ld"), "structured wins over html_pattern");
+        assert_eq!(c["data"]["price"], serde_json::json!(49.99));
+    }
+
+    #[tokio::test]
+    async fn html_pattern_tier_falls_through_to_snippet_when_no_pattern_match() {
+        // A page with no structured data AND no recognizable price pattern.
+        // The html_pattern tier must NOT fire; the snippet fallback should.
+        let html = r#"<!doctype html><html><head><title>Just a page</title></head>
+<body><p>No price here, just text.</p></body></html>"#;
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://store.example.com/widget", "title": "Widget $49.99", "content": "Great widget", "score": 9.0 }),
+        ];
+        let h = html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        let c = r.get("commerce").expect("commerce block attached via snippet");
+        assert_eq!(c["source"], serde_json::json!("snippet_extracted"));
+        assert_eq!(c["data"]["price"], serde_json::json!(49.99));
+    }
+
+    #[tokio::test]
+    async fn html_pattern_tier_does_not_fire_when_fetch_fails() {
+        // When the page fetch returns None, the html_pattern tier must NOT
+        // fire (no HTML to parse). The snippet fallback should handle it.
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://store.example.com/widget", "title": "Widget $99.99", "content": "", "score": 9.0 }),
+        ];
+        let fetch = |_url: String| async move { None::<String> };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        let c = r.get("commerce").expect("commerce block attached via snippet");
+        assert_eq!(c["source"], serde_json::json!("snippet_extracted"));
+        assert_eq!(c["data"]["price"], serde_json::json!(99.99));
+    }
+
+    #[tokio::test]
+    async fn html_pattern_tier_never_reorders_results() {
+        // The html_pattern tier must never reorder ranked results.
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://a.example.com/x", "title": "A", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/y", "title": "B", "score": 8.0 }),
+            serde_json::json!({ "url": "https://c.example.com/z", "title": "C", "score": 7.0 }),
+        ];
+        let html = r#"<!doctype html><html><head><title>Store</title></head>
+<body><span class="price">$49.99</span></body></html>"#;
+        let h = html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let urls: Vec<_> = ranked.iter().map(|r| r["url"].as_str().unwrap()).collect();
+        assert_eq!(urls, vec![
+            "https://a.example.com/x",
+            "https://b.example.com/y",
+            "https://c.example.com/z",
+        ], "html_pattern tier must never reorder");
+        // All three should have html_pattern commerce blocks
+        for r in ranked.iter() {
+            let c = r.get("commerce").expect("commerce block attached");
+            assert_eq!(c["source"], serde_json::json!("html_pattern"));
+        }
     }
 }
