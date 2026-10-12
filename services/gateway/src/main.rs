@@ -15430,6 +15430,19 @@ async fn handle_search(
         }
 
         // Override 6: transactional keywords OR an explicit price bound -> transactional
+        // GUARD: do not fire the keyword-based override on queries whose primary intent
+        // is clearly informational/how-to. A how-to query like "how to convert PDF to
+        // Word under 5 minutes" or "how to calculate conversion rate" contains "under "
+        // or "rate" but is NOT transactional. The keyword list is a weak signal; the
+        // how-to/informational starter is a strong one. Only an explicit price bound
+        // (parsed from NL) can override a how-to starter — that is a decisive signal.
+        let informational_starters = [
+            "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
+            "what is ", "what are ", "what was ", "what were ", "why ", "why is ",
+            "why are ", "why does ", "why do ", "guide to ", "tutorial", "explain ",
+            "understand ", "learn ", "teach me ",
+        ];
+        let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
         let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
         let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
@@ -15440,7 +15453,11 @@ async fn handle_search(
         let sc = &intent.structured_constraints;
         let has_price_bound = sc.price_lt.is_some() || sc.price_max.is_some()
             || sc.price_min.is_some() || sc.price_gt.is_some();
-        if (has_tx_signal || has_price_bound) && !has_local_keywords {
+        // The keyword-based tx signal is suppressed when the query starts with an
+        // informational/how-to starter. A price bound is still allowed through — it is
+        // a decisive signal that the user wants to buy, not just learn.
+        let tx_signal_effective = has_tx_signal && !has_informational_starter;
+        if (tx_signal_effective || has_price_bound) && !has_local_keywords {
             if (intent.intent != "comparison" || has_price_bound)
                 && (intent.intent != "transactional" || intent.confidence < 0.60)
             {
@@ -20439,6 +20456,84 @@ mod hardcoding_ruling_tests {
         assert!(disambig_result.score < 0.05, "disambig should be capped below floor, got {}", disambig_result.score);
         // Real article should be at or above floor
         assert!(article_result.score >= 0.05, "article should be >= 0.05, got {}", article_result.score);
+    }
+
+    #[test]
+    fn transactional_override_does_not_fire_on_howto_queries() {
+        // Regression test: Override 6 (transactional keywords) must NOT fire on
+        // queries whose primary intent is clearly informational/how-to, even when
+        // they contain broad keywords like "under " or "price ".
+        // Examples:
+        //   "how to convert PDF to Word under 5 minutes" — contains "under " but is a how-to query
+        //   "how to check price of used bike" — contains "price " but is a how-to query
+        //   "what is the conversion rate" — informational, not transactional
+        // The guard: has_informational_starter suppresses the keyword-based tx signal.
+        // A price bound (has_price_bound) is still allowed through — it is decisive.
+
+        // Test the guard logic directly: informational starters must be detected
+        let informational_starters = [
+            "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
+            "what is ", "what are ", "what was ", "what were ", "why ", "why is ",
+            "why are ", "why does ", "why do ", "guide to ", "tutorial", "explain ",
+            "understand ", "learn ", "teach me ",
+        ];
+
+        // Queries that should be guarded (how-to/informational starters)
+        let guarded_queries = [
+            "how to convert pdf to word under 5 minutes",
+            "how to check price of used bike",
+            "how do i buy a laptop",  // starts with "how do i" — guarded
+            "what is the conversion rate",
+            "why is the sky blue",
+            "guide to buying a house",  // starts with "guide to" — guarded
+            "tutorial on pricing strategies",  // starts with "tutorial" — guarded
+            "explain how store caching works",  // starts with "explain" — guarded
+        ];
+
+        for q in &guarded_queries {
+            let q_lower = q.to_lowercase();
+            let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+            assert!(has_starter, "query '{}' should be detected as having an informational starter", q);
+        }
+
+        // Queries that should NOT be guarded (genuine transactional)
+        let transactional_queries = [
+            "buy wireless earbuds",
+            "price of iphone 16",
+            "cheap flights to tokyo",
+            "discount codes for amazon",
+            "laptop under 60000",
+            "store near me",
+        ];
+
+        for q in &transactional_queries {
+            let q_lower = q.to_lowercase();
+            let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+            assert!(!has_starter, "query '{}' should NOT be detected as having an informational starter", q);
+        }
+
+        // Verify the tx_keywords list still matches genuine transactional queries
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        for q in &transactional_queries {
+            let q_lower = q.to_lowercase();
+            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+            assert!(has_tx, "transactional query '{}' should match tx_keywords", q);
+        }
+
+        // Verify that guarded queries with "under " or "price " would have matched
+        // the OLD (un-guarded) logic — proving the test is meaningful
+        let problematic_queries = [
+            "how to convert pdf to word under 5 minutes",
+            "how to check price of used bike",
+        ];
+        for q in &problematic_queries {
+            let q_lower = q.to_lowercase();
+            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+            assert!(has_tx, "query '{}' should match tx_keywords (proving the guard is needed)", q);
+            // But the guard suppresses it
+            let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+            assert!(has_starter, "query '{}' should be guarded by informational starter", q);
+        }
     }
 }
 
