@@ -4973,8 +4973,7 @@ async fn handle_shopping(
             // ("best wireless earbuds under 50 dollars") must never receive
             // affiliate links even on /shopping. The gate is data-driven —
             // reuses the model-number regex, no hardcoded product lists.
-            let q_shopping = params.q.as_deref().unwrap_or("").to_lowercase();
-            if is_exact_model_query(&q_shopping) {
+            if is_exact_model {
                 decorate_affiliate(arr, &state.affiliate_ctx);
             }
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
