@@ -6999,7 +6999,21 @@ fn has_local_intent(query: &str) -> bool {
         // LOCATION_GAZETTEER, the query has explicit local intent. General guard —
         // no per-query literals, reuses the same gazetteer reference data as geo
         // detection (line 1542) so the policy is consistent and future-proof.
+        //
+        // SHORT-QUERY GUARD: a local intent query is typically short ("restaurants
+        // in bangalore", "hotels in paris"). A long conversational query (e.g. a
+        // career/advice question like "i have been working as a network
+        // administrator for five years ... job market in india") uses " in
+        // <country>" as CONTEXT, not as a local intent marker. Without this,
+        // career/advice queries get misclassified as "local" and return
+        // irrelevant results. General: query length threshold, no per-query
+        // literals. A 10-word threshold cleanly separates short local queries
+        // from long conversational ones.
         || {
+            let word_count = lower.split_whitespace().count();
+            if word_count > 10 {
+                return false;
+            }
             let parts: Vec<&str> = lower.split(" in ").collect();
             if let Some(after_in) = parts.last() {
                 let after_in = *after_in;  // deref &&str -> &str
@@ -11222,8 +11236,13 @@ fn merge_local_and_web(
                 (tchars.len() - non) as f32 / tchars.len() as f32
             };
             // Query is Latin-script dominant AND result is non-Latin-script dominant.
+            // 0.05 (not 0.25): when ALL results are non-Latin (e.g. Bing returning
+            // Japanese dictionary pages for an English query), a 0.25 multiplier
+            // is defeated by calibrate_scores' max-rescale — the Japanese results
+            // still float to 1.0. 0.05 matches the video/audio cap floor so
+            // cross-lingual junk stays below genuine on-topic results.
             if q_ascii_ratio >= 0.85 && res_ascii_ratio < 0.50 {
-                0.25 // dampen hard but keep present (fail-soft, not a hard drop)
+                0.05
             } else {
                 1.0
             }
