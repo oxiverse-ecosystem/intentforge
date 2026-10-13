@@ -264,7 +264,7 @@ fn is_model_number_price_query(q_lower: &str) -> bool {
 fn is_exact_model_query(q_lower: &str) -> bool {
     static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let model_re = MODEL_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+\d{1,2}").unwrap()
+        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+[a-z]?\d{1,3}").unwrap()
     });
     model_re.is_match(q_lower)
 }
