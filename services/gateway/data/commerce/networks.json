@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "note": "Runtime-loaded affiliate network metadata. Each entry describes a network's disclosure label, subid policy, and link-building behavior. Adding a new network requires ONLY editing this file — no recompile. The 'subid_policy' field controls what value is placed in the affiliate subid/cuid slot: 'merchant_host' (coarse, non-identifying — the destination host only), 'none' (no subid at all), or 'category' (a coarse product category, never user-identifying). The 'disclosure_label' is the human-readable text the frontend should show next to every affiliate-decorated result for this network.",
+  "networks": [
+    {
+      "id": "sovrn_commerce",
+      "name": "Sovrn Commerce",
+      "disclosure_label": "Sovrn Commerce",
+      "subid_policy": "merchant_host",
+      "subid_description": "Coarse, non-identifying: the destination merchant host only (e.g. 'amazon.com'). No user id, session id, IP, or query text."
+    },
+    {
+      "id": "skimlinks",
+      "name": "Skimlinks",
+      "disclosure_label": "Skimlinks",
+      "subid_policy": "none",
+      "subid_description": "No subid parameter is added. The network key alone identifies the program."
+    },
+    {
+      "id": "ebay_epn",
+      "name": "eBay Partner Network",
+      "disclosure_label": "eBay Partner Network",
+      "subid_policy": "merchant_host",
+      "subid_description": "Coarse, non-identifying: the destination eBay marketplace host (e.g. 'ebay.co.uk'). No user id, session id, IP, or query text."
+    },
+    {
+      "id": "amazon_associates",
+      "name": "Amazon Associates",
+      "disclosure_label": "Amazon Associates",
+      "subid_policy": "none",
+      "subid_description": "No subid parameter is added. The associate tag alone identifies the program."
+    },
+    {
+      "id": "rakuten_advertising",
+      "name": "Rakuten Advertising",
+      "disclosure_label": "Rakuten Advertising",
+      "subid_policy": "merchant_host",
+      "subid_description": "Coarse, non-identifying: the destination merchant host only. No user id, session id, IP, or query text."
+    }
+  ]
+}

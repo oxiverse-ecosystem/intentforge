@@ -20,6 +20,7 @@ mod clean;
 mod goals;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
+mod affiliate_engine_tests;
 // ROADMAP item 6: order invariance driven by the REAL shipped affiliate data
 // (every network, keys present vs absent) — the offline CI lock.
 mod real_data_order_tests;
@@ -121,6 +122,12 @@ struct Constraints {
     /// the `price:<N` operator form and of bare-dollar natural language.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     price_currency: Option<String>,
+    /// Decimal constraints extracted from the query — numbers with units like
+    /// "1.5kg", "2.5L", "3.5 inches" that must be preserved as single tokens
+    /// during tokenization. Without this, the tokenizer splits on the decimal
+    /// point, destroying the constraint: "1.5kg" becomes "+1 5kg".
+    #[serde(default)]
+    decimal_constraints: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -2792,6 +2799,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         price_lt,
         price_gt,
         price_currency: c.price_currency.clone(),
+        decimal_constraints: c.decimal_constraints.clone(),
         ignored_constraints: None,
     }
 }
@@ -4981,6 +4989,12 @@ async fn handle_shopping(
 // affiliate parameter (privacy rule) — the only coarse subid is the merchant
 // host, which is non-identifying.
 /// One network/program row loaded from the data file. Generic over kinds.
+///
+/// `host_suffix` enables per-merchant matching: when present, this program
+/// only applies to result URLs whose host equals or ends with the suffix
+/// (label-boundary match, case-insensitive). When null, the program is a
+/// catch-all (matches any URL) — preserving the original single-network
+/// behaviour for backward compatibility.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct AffiliateNetwork {
     id: String,
@@ -5007,6 +5021,10 @@ struct AffiliateNetwork {
     /// url-encoded as a query param. DATA-ONLY.
     #[serde(default)]
     fallback_url: Option<String>,
+    /// Optional merchant host suffix for per-merchant matching (e.g.
+    /// "amazon." matches amazon.com, amazon.co.uk, etc.). Null = catch-all.
+    #[serde(default)]
+    host_suffix: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -5014,6 +5032,22 @@ fn default_true() -> bool {
 }
 fn default_priority() -> i64 {
     0
+}
+
+/// Network metadata loaded from `data/commerce/networks.json`. Provides
+/// disclosure labels and subid policy documentation for each network.
+/// Purely informational — does not affect link rendering.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct AffiliateNetworkMeta {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    disclosure_label: String,
+    #[serde(default)]
+    subid_policy: String,
+    #[serde(default)]
+    subid_description: String,
 }
 
 /// HOST component of a URL, lowercased, without scheme/port/userinfo/path.
@@ -5087,10 +5121,22 @@ fn is_reserved_documentation_host(host: &str) -> bool {
     false
 }
 
-/// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
+/// Runtime-resolved config: data files + env-resolved keys. Built once at startup.
+///
+/// `networks` holds the legacy catch-all programs (from `affiliate.json`).
+/// `programs` holds per-merchant programs (from `affiliate_programs.json`) —
+/// each carries a `host_suffix` for domain matching. `network_meta` holds
+/// disclosure/subid metadata (from `networks.json`).
+///
+/// Decoration logic: for each result, the engine first tries to match a
+/// per-merchant program by `host_suffix`. If none matches, it falls back to
+/// the first usable catch-all network. This preserves backward compatibility
+/// with the single-network model while enabling per-merchant decoration.
 #[derive(Clone)]
 struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
+    programs: Vec<AffiliateNetwork>,
+    network_meta: Vec<AffiliateNetworkMeta>,
 }
 
 /// Host labels that are IANA-reserved and can never be a real merchant:
@@ -5151,21 +5197,32 @@ fn is_reserved_placeholder_url(url: &str) -> bool {
 }
 
 impl AffiliateCtx {
-    /// Load networks from the data file. An empty/missing file is NOT fatal: the
+    /// Load networks from the data files. An empty/missing file is NOT fatal: the
     /// engine simply has no networks and every result degrades to `affiliate:
     /// null`. This is intentional — affiliate decoration is best-effort and must
     /// never break search.
+    ///
+    /// Loads three data files:
+    ///   1. `affiliate.json`         — legacy catch-all networks (backward compat)
+    ///   2. `affiliate_programs.json` — per-merchant programs with host_suffix matching
+    ///   3. `networks.json`          — network metadata (disclosure labels, subid policy)
     fn load() -> Self {
         let mut networks: Vec<AffiliateNetwork> = Vec::new();
+        let mut programs: Vec<AffiliateNetwork> = Vec::new();
+        let mut network_meta: Vec<AffiliateNetworkMeta> = Vec::new();
+
         // Resolve the data path relative to the process cwd (container WORKDIR is
         // /app, app binary at /app/gateway; data baked at /app/data/commerce).
         let candidates = [
-            "data/commerce/affiliate.json",
-            "/app/data/commerce/affiliate.json",
-            "./data/commerce/affiliate.json",
+            "data/commerce",
+            "/app/data/commerce",
+            "./data/commerce",
         ];
-        for path in candidates {
-            if let Ok(text) = std::fs::read_to_string(path) {
+
+        // ── 1. Legacy catch-all networks (affiliate.json) ──
+        for base in &candidates {
+            let path = format!("{}/affiliate.json", base);
+            if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
                         for n in arr {
@@ -5194,9 +5251,71 @@ impl AffiliateCtx {
                 }
             }
         }
+
+        // ── 2. Per-merchant programs (affiliate_programs.json) ──
+        for base in &candidates {
+            let path = format!("{}/affiliate_programs.json", base);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("programs").and_then(|n| n.as_array()) {
+                        for n in arr {
+                            if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                                // Same fallback sanitization as legacy networks.
+                                if let Some(fbu) = net.fallback_url.clone() {
+                                    if is_reserved_placeholder_url(&fbu) {
+                                        tracing::warn!(
+                                            program = %net.id,
+                                            "affiliate: ignoring reserved placeholder fallback_url (RFC 2606/6761 documentation domain)"
+                                        );
+                                        net.fallback_url = None;
+                                    }
+                                }
+                                programs.push(net);
+                            }
+                        }
+                    }
+                }
+                if !programs.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // ── 3. Network metadata (networks.json) ──
+        for base in &candidates {
+            let path = format!("{}/networks.json", base);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
+                        for n in arr {
+                            if let Ok(meta) = serde_json::from_value::<AffiliateNetworkMeta>(n.clone()) {
+                                network_meta.push(meta);
+                            }
+                        }
+                    }
+                }
+                if !network_meta.is_empty() {
+                    break;
+                }
+            }
+        }
+
         networks.sort_by(|a, b| b.priority.cmp(&a.priority));
-        tracing::info!("affiliate: loaded {} network(s) from data file", networks.len());
-        Self { networks }
+        programs.sort_by(|a, b| b.priority.cmp(&a.priority));
+        tracing::info!(
+            "affiliate: loaded {} network(s), {} program(s), {} network meta(s) from data files",
+            networks.len(),
+            programs.len(),
+            network_meta.len()
+        );
+        Self { networks, programs, network_meta }
+    }
+
+    /// Construct an AffiliateCtx with only legacy catch-all networks (no
+    /// per-merchant programs, no network metadata). Used by tests that build
+    /// synthetic contexts.
+    fn from_networks(networks: Vec<AffiliateNetwork>) -> Self {
+        Self { networks, programs: vec![], network_meta: vec![] }
     }
 
     /// The first enabled network that has its required key present in the env.
@@ -5209,6 +5328,56 @@ impl AffiliateCtx {
                     .map(|k| std::env::var(k).is_ok())
                     .unwrap_or(false)
         })
+    }
+
+    /// Find the first enabled per-merchant program whose `host_suffix` matches
+    /// the given URL's host AND whose key is present in the env.
+    ///
+    /// `host_suffix` matching is label-boundary, case-insensitive: the result
+    /// URL's host must equal the suffix or end with `"." + suffix` (e.g.
+    /// suffix `"amazon."` matches `amazon.com`, `amazon.co.uk`, etc.).
+    ///
+    /// Returns None when no per-merchant program matches (caller should fall
+    /// back to `first_usable()` for the legacy catch-all path).
+    fn match_program(&self, url: &str) -> Option<&AffiliateNetwork> {
+        let host = url_host(url);
+        if host.is_empty() {
+            return None;
+        }
+        // Collect all matching programs, then pick the highest priority.
+        // This ensures deterministic behavior regardless of vector order.
+        let mut best: Option<&AffiliateNetwork> = None;
+        for p in &self.programs {
+            if !p.enabled {
+                continue;
+            }
+            let has_key = p.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false);
+            if !has_key {
+                continue;
+            }
+            let matches = match &p.host_suffix {
+                None => false,
+                Some(suffix) => {
+                    let suffix = suffix.trim_end_matches('.').to_lowercase();
+                    if suffix.is_empty() {
+                        false
+                    } else if host == suffix {
+                        true
+                    } else {
+                        host.split('.').any(|label| label == suffix)
+                    }
+                }
+            };
+            if !matches {
+                continue;
+            }
+            best = match best {
+                None => Some(p),
+                Some(current) if p.priority > current.priority => Some(p),
+                _ => best,
+            };
+        }
+        best
     }
 }
 
@@ -5329,11 +5498,15 @@ fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> 
 /// that already carries an `affiliate` block is left untouched (idempotent).
 /// When no usable network key is present, results keep `affiliate: null` and are
 /// still returned. This function NEVER reorders or re-scores.
+///
+/// Per-merchant matching: for each result, the engine first tries to find a
+/// per-merchant program (from `affiliate_programs.json`) whose `host_suffix`
+/// matches the result URL's host. If found, that program's template/params are
+/// used. If no per-merchant program matches, the engine falls back to the
+/// first usable catch-all network (from `affiliate.json`) — preserving the
+/// original single-network behaviour. This two-tier lookup is fully data-driven:
+/// adding a new merchant requires only editing `affiliate_programs.json`.
 fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
-    let net = match ctx.first_usable() {
-        Some(n) => n,
-        None => return, // graceful: no key => leave affiliate un-set
-    };
     for r in results.iter_mut() {
         if !r.is_object() {
             continue;
@@ -5345,7 +5518,19 @@ fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
             Some(u) if !u.is_empty() => u.to_string(),
             _ => continue,
         };
+
+        // Two-tier lookup: per-merchant program first, then catch-all fallback.
+        let net = ctx.match_program(&url).or_else(|| ctx.first_usable());
+        let net = match net {
+            Some(n) => n,
+            None => continue, // graceful: no key => leave affiliate un-set
+        };
+
         // Coarse, non-identifying subid: the destination merchant host only.
+        // PRIVACY: never add user id, session id, IP, or query text to subid.
+        // The subid is ONLY the merchant host (e.g. "amazon.com"), which is
+        // coarse and non-identifying — it tells the network which merchant the
+        // click is for, nothing about the user.
         let subid = reqwest::Url::parse(&url)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_string()))
@@ -6003,23 +6188,65 @@ fn semantic_relevance_score(query: &str, title: &str, content: &str) -> f32 {
         "modern","quick","simple","easy","great","popular","powerful",
     ].iter().copied().collect();
 
+    // Pre-tokenization decimal preservation: protect decimal numbers like
+    // "1.5kg", "2.5L", "3.5 inches" from being split by the tokenizer.
+    // Without this, "1.5kg" becomes tokens "1" and "5kg", destroying the
+    // constraint. We replace the decimal point with a placeholder, tokenize,
+    // then restore the decimal point in the resulting tokens.
+    const DECIMAL_PLACEHOLDER: char = '\u{0001}';
+    let protected_q = q_lower
+        .split_whitespace()
+        .map(|w| {
+            // If the word contains a decimal number (e.g. "1.5kg"), protect it
+            if w.chars().any(|c| c == '.') && w.chars().any(|c| c.is_ascii_digit()) {
+                w.replace('.', &DECIMAL_PLACEHOLDER.to_string())
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
     let tokenize = |text: &str| -> Vec<String> {
         text.split_whitespace()
-            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != DECIMAL_PLACEHOLDER).to_lowercase())
+            .map(|w| w.replace(DECIMAL_PLACEHOLDER, "."))
             .filter(|w| w.len() >= 2 && !stop_words.contains(w.as_str()))
             .map(|w| stem(&w))
             .collect()
     };
 
-    let query_terms = tokenize(&q_lower);
+    let query_terms = tokenize(&protected_q);
     if query_terms.is_empty() {
         return 0.5;
     }
 
     // Build weighted term frequency map — title terms get 3x weight
     let mut tf: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-    let title_tokens = tokenize(&t_lower);
-    let content_tokens = tokenize(&c_lower);
+    let protected_t = t_lower
+        .split_whitespace()
+        .map(|w| {
+            if w.chars().any(|c| c == '.') && w.chars().any(|c| c.is_ascii_digit()) {
+                w.replace('.', &DECIMAL_PLACEHOLDER.to_string())
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let protected_c = c_lower
+        .split_whitespace()
+        .map(|w| {
+            if w.chars().any(|c| c == '.') && w.chars().any(|c| c.is_ascii_digit()) {
+                w.replace('.', &DECIMAL_PLACEHOLDER.to_string())
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title_tokens = tokenize(&protected_t);
+    let content_tokens = tokenize(&protected_c);
 
     for term in &title_tokens {
         *tf.entry(term.clone()).or_insert(0.0) += 3.0;
@@ -8662,8 +8889,14 @@ fn disambiguate_engine_query(query: &str, intent: &str, _expanded_queries: &[Str
 // Detects common negation patterns and strips trigger words AND the content terms
 // immediately following them. This prevents negated terms (e.g., "chrome" in
 // "browser not chrome") from leaking into the search query and polluting results.
-// Example: "browser not chrome not edge" → "browser"
-fn simple_negation_strip(query: &str) -> Option<String> {
+// Example: "browser not chrome not edge" → ("browser", ["chrome", "edge"])
+//
+// Returns (positive_query, excluded_terms). Non-domain content words after a
+// negation trigger are NOT silently dropped — they are returned as exclusions
+// so the caller can apply a quality penalty (not a hard blocker) to results
+// containing them. This fixes "biryani without hand rolled" losing the
+// "hand rolled" constraint entirely.
+fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
     let neg_triggers: std::collections::HashSet<&str> = [
         "not", "no", "without", "except", "excluding", "besides", "minus",
         "other", "than", "nor",
@@ -8687,6 +8920,7 @@ fn simple_negation_strip(query: &str) -> Option<String> {
 
     let words: Vec<&str> = query.split_whitespace().collect();
     let mut result: Vec<&str> = Vec::new();
+    let mut excluded: Vec<String> = Vec::new();
     let mut in_negation = false;
 
     // Negation scope ends at the next CLAUSE-STARTING CONJUNCTION ("... without
@@ -8727,6 +8961,11 @@ fn simple_negation_strip(query: &str) -> Option<String> {
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
                 in_negation = false;
                 result.push(w);
+            } else {
+                // Non-domain content word after a negation trigger: treat as an
+                // exclusion (quality penalty, not hard blocker). Collect the
+                // word so the caller can penalize results containing it.
+                excluded.push(w_lower);
             }
             continue;
         }
@@ -8741,7 +8980,7 @@ fn simple_negation_strip(query: &str) -> Option<String> {
     if cleaned.is_empty() {
         return None; // everything was stripped
     }
-    Some(cleaned)
+    Some((cleaned, excluded))
 }
 
 /// P1-compound: when a query pairs `site:` with `filetype:` (e.g.
@@ -9528,7 +9767,8 @@ fn merge_local_and_web(
         None => RankingWeights::for_intent(intent),
     };
 
-    let clean_query = simple_negation_strip(query).unwrap_or_else(|| query.to_string());
+    let (clean_query, negation_excluded_terms) = simple_negation_strip(query)
+        .unwrap_or_else(|| (query.to_string(), Vec::new()));
 
     // Navigational domain boost: if intent is navigational and the query
     // looks like a platform name (1-2 tokens), boost results whose host
@@ -11000,6 +11240,36 @@ fn merge_local_and_web(
         let c_score = constraint_score(&r.title, &r.content, &r.url, constraints);
         let consensus = consensus_score(&r.sources);
 
+        // Negation exclusion penalty: non-domain content words after a negation
+        // trigger (e.g. "hand rolled" in "biryani without hand rolled") are
+        // returned by simple_negation_strip as exclusions. Apply a quality
+        // penalty (not a hard blocker) to results containing these terms.
+        // This is the same pattern as soft_negatives: demote, don't drop.
+        let negation_exclusion_penalty = if !negation_excluded_terms.is_empty() {
+            let title_lower_neg = r.title.to_lowercase();
+            let content_lower_neg = r.content.to_lowercase();
+            let url_lower_neg = r.url.to_lowercase();
+            let mut penalty = 1.0f32;
+            for excl in &negation_excluded_terms {
+                let excl_lower = excl.to_lowercase();
+                if title_lower_neg.contains(&excl_lower)
+                    || content_lower_neg.contains(&excl_lower)
+                    || url_lower_neg.contains(&excl_lower)
+                {
+                    penalty *= 0.3;
+                    tracing::info!(
+                        "NEGATION EXCLUSION HIT: '{}' in '{}' → penalty={:.2}",
+                        excl,
+                        &r.title[..r.title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(r.title.len())],
+                        penalty
+                    );
+                }
+            }
+            penalty
+        } else {
+            1.0f32
+        };
+
         // Navigational domain match boost: if the URL host contains the
         // query as a domain component, this is likely the destination the
         // user wants. Strong boost for homepage, moderate for subpages.
@@ -11255,7 +11525,7 @@ fn merge_local_and_web(
         };
 
         let p2d_mult = if p2d_offtopic { 0.05 } else { 1.0 };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * audio_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult;
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * audio_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * negation_exclusion_penalty;
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
@@ -11859,6 +12129,10 @@ fn merge_local_and_web(
         let dict_cap = 0.03f32;   // dictionary sites may appear but never rank top
         let weak_cap = 0.04f32;   // single-polysemous-token matches capped low
 
+        // Max pre-cap score for graded weak-match cap: preserves relative ordering
+        // among off-topic results instead of flattening them all to the same value.
+        let max_pre_cap_score = merged.iter().map(|r| r.score).fold(0.0f32, f32::max);
+
         // Best non-video score AFTER calibration but BEFORE this pass caps any video.
         // Used by the P8 video cap (b0): a video must never outrank the best genuine
         // text result for a non-video query, in any calibration regime (see comment
@@ -11962,12 +12236,20 @@ fn merge_local_and_web(
                 // contain at least 2 of the query's real topic terms to be on-topic.
                 if matched_strong < 2 {
                     if r.score > weak_cap {
+                        // GRADED WEAK-MATCH CAP: instead of a flat cap that makes all
+                        // off-topic results tie at the same score (causing insertion-order
+                        // ranking among junk), preserve relative ordering by scaling
+                        // proportionally to the pre-cap score. This keeps off-topic
+                        // results below the on-topic floor while still differentiating
+                        // among them — the "least irrelevant" junk ranks above the
+                        // "most irrelevant" junk rather than relying on stable-sort order.
+                        let graded_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
                         tracing::info!(
-                            "POST-CAL WEAK-MATCH CAP -> {:.2}: '{}' (matched {} of {} topics)",
-                            weak_cap, r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len()
+                            "POST-CAL WEAK-MATCH CAP -> {:.4}: '{}' (matched {} of {} topics, pre_cap={:.4})",
+                            graded_cap, r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len(), r.score
                         );
-                        r.post_cal_cap = Some(weak_cap);
-                        r.score = weak_cap;
+                        r.post_cal_cap = Some(graded_cap);
+                        r.score = graded_cap;
                     }
                 }
             }
@@ -12000,13 +12282,14 @@ fn merge_local_and_web(
                     1
                 };
                 if matched_anchors < required_anchors && r.score > weak_cap {
+                    let graded_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
                     tracing::info!(
-                        "POST-CAL RARE-ANCHOR CAP -> {:.2}: '{}' (matched {} of {} rare anchors {:?}, need {})",
-                        weak_cap, r.url.chars().take(60).collect::<String>(),
-                        matched_anchors, rare_anchor_terms.len(), rare_anchor_terms, required_anchors
+                        "POST-CAL RARE-ANCHOR CAP -> {:.4}: '{}' (matched {} of {} rare anchors {:?}, need {}, pre_cap={:.4})",
+                        graded_cap, r.url.chars().take(60).collect::<String>(),
+                        matched_anchors, rare_anchor_terms.len(), rare_anchor_terms, required_anchors, r.score
                     );
-                    r.post_cal_cap = Some(weak_cap);
-                    r.score = weak_cap;
+                    r.post_cal_cap = Some(graded_cap);
+                    r.score = graded_cap;
                 }
             }
 
@@ -12035,18 +12318,13 @@ fn merge_local_and_web(
                     rl.contains(e.as_str()) || cl.contains(e.as_str()) || ul.contains(e.as_str())
                 });
                 if !names_entity {
-                    // Absolute weak_cap (0.04, UNDER the calibrated article floor of
-                    // 0.05) — same convention as the video/weak-match caps. The old
-                    // relative best_non_video*0.6 cap FAILED when the whole result set
-                    // was weak (Planoly at 0.072 vs genuine comparison articles at
-                    // 0.051: the relative cap stayed ABOVE the genuine floor because
-                    // the best text result itself was weak). An absolute sub-floor
-                    // cap guarantees a principal-naming article always outranks junk.
-                    let d3_cap = weak_cap;
+                    // Graded cap (same as weak-match/rare-anchor): preserves relative
+                    // ordering among off-topic comparison results instead of flattening.
+                    let d3_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
                     if r.score > d3_cap {
                         tracing::info!(
-                            "POST-CAL D3 COMP-CAP -> {:.2}: '{}' names none of compared entities {:?} (best_text={:.2})",
-                            d3_cap, r.url.chars().take(60).collect::<String>(), comparison_anchor_terms, best_non_video
+                            "POST-CAL D3 COMP-CAP -> {:.4}: '{}' names none of compared entities {:?} (best_text={:.2}, pre_cap={:.4})",
+                            d3_cap, r.url.chars().take(60).collect::<String>(), comparison_anchor_terms, best_non_video, r.score
                         );
                         r.post_cal_cap = Some(d3_cap);
                         r.score = d3_cap;
@@ -13491,7 +13769,7 @@ async fn handle_intent(
 fn build_video_inspect(q: &str) -> serde_json::Value {
     // Strip negation first -- mirrors /search's clean_query pipeline so a query
     // like "best tutorial not youtube" classifies on its positive content only.
-    let stripped = simple_negation_strip(q).unwrap_or_else(|| q.to_string());
+    let (stripped, _neg_excluded) = simple_negation_strip(q).unwrap_or_else(|| (q.to_string(), Vec::new()));
     let video_intent = has_video_intent(&stripped);
     let intent_resp = fallback_intent(q);
     let is_video_source_examples = serde_json::json!({
@@ -14516,10 +14794,10 @@ async fn handle_search(
         || q.starts_with("-") || q.contains(" not ") || q.contains(" no ")
         || q.contains(" without ") || q.contains(" -");
     let stripped_override: Option<String> = if has_neg_pattern {
-        simple_negation_strip(&q).filter(|s| {
+        simple_negation_strip(&q).filter(|(s, _)| {
             let processed = preprocess_searxng_query(s);
             !processed.is_empty() && processed != preprocess_searxng_query(&q)
-        })
+        }).map(|(s, _)| s)
     } else { None };
 
     let mut searx_urls: Vec<String> = Vec::new();
@@ -15872,7 +16150,7 @@ async fn handle_search(
         // SearXNG fan-out uses—strips both trigger words AND the negated
         // content terms immediately following them.
         // Example: "browser not chrome not edge" → "browser"
-        let stripped = simple_negation_strip(&q);
+        let stripped = simple_negation_strip(&q).map(|(s, _)| s);
         if let Some(ref s) = stripped {
             tracing::info!("ONLY NEGATIVE: stripped query '{:?}' -> '{}'", q, s);
         }
@@ -17881,6 +18159,12 @@ let mut results = match tokio::task::spawn_blocking(move || {
     for p in &intent.structured_constraints.positive {
         flat_constraints.push(format!("+{}", p));
     }
+    // Decimal constraints (e.g. "1.5kg", "2.5L") are preserved as-is — they
+    // must NOT be split by the tokenizer, which would turn "1.5kg" into
+    // "+1 5kg" and destroy the constraint.
+    for dc in &intent.structured_constraints.decimal_constraints {
+        flat_constraints.push(format!("+{}", dc));
+    }
     for n in &intent.structured_constraints.negative {
         flat_constraints.push(format!("-{}", n));
     }
@@ -18777,6 +19061,43 @@ fn normalize_nl_operators(query: &str) -> String {
     out
 }
 
+/// Extract decimal constraints from a query — numbers with units like
+/// "1.5kg", "2.5L", "3.5 inches" that must be preserved as single tokens
+/// during tokenization. Without this, the tokenizer splits on the decimal
+/// point, destroying the constraint: "1.5kg" becomes "+1 5kg".
+///
+/// The pattern matches:
+/// - A number with a decimal point (e.g. "1.5", "2.5", "3.5")
+/// - Optionally followed by a unit (e.g. "kg", "L", "inches", "cm", "mm", "gb", "mb")
+///
+/// Returns the matched strings in their original form (e.g. "1.5kg", "2.5L").
+/// Purely structural — no per-query literals, no hardcoded unit list.
+fn extract_decimal_constraints(q: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let q_lower = q.to_lowercase();
+
+    // Pattern: number with decimal point, optionally followed by a unit
+    // Matches: "1.5kg", "2.5L", "3.5 inches", "1.5 kg", etc.
+    let re = match regex::Regex::new(r"(?i)(\d+\.\d+(?:\s*[a-z]+)?)") {
+        Ok(r) => r,
+        Err(_) => return results,
+    };
+
+    for cap in re.captures_iter(&q_lower) {
+        if let Some(m) = cap.get(1) {
+            let matched = m.as_str().trim();
+            // Filter out matches that are just a number without a unit
+            // (those are handled by the numeric constraint relaxation)
+            let has_unit = matched.chars().any(|c| c.is_alphabetic());
+            if has_unit && !results.contains(&matched.to_string()) {
+                results.push(matched.to_string());
+            }
+        }
+    }
+
+    results
+}
+
 fn extract_gateway_constraints(q: &str) -> Constraints {
     // Normalize spoken constraint forms (under $500, in url:, …) before
     // scanning for operators so the gateway's own parsing matches the engine
@@ -19017,6 +19338,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
         price_lt,
         price_gt,
         price_currency: None,
+        decimal_constraints: extract_decimal_constraints(&q),
         ignored_constraints: None,
     }
 }
@@ -19270,7 +19592,7 @@ mod negation_scope_tests {
 
     #[test]
     fn without_clause_does_not_swallow_following_clause() {
-        let stripped = simple_negation_strip(
+        let (stripped, excluded) = simple_negation_strip(
             "protein powder without artificial sweeteners for lactose intolerant beginners",
         )
         .expect("should strip the negated clause but keep the trailing clause");
@@ -19289,6 +19611,11 @@ mod negation_scope_tests {
             "negated term must be stripped, got: {:?}",
             stripped
         );
+        assert!(
+            excluded.contains(&"artificial".to_string()),
+            "non-domain negated term must be returned as exclusion, got: {:?}",
+            excluded
+        );
     }
 
     #[test]
@@ -19296,11 +19623,11 @@ mod negation_scope_tests {
         // The original purpose of the function: "not X not Y" chains.
         assert_eq!(
             simple_negation_strip("browser not chrome not edge"),
-            Some("browser".to_string())
+            Some(("browser".to_string(), vec!["chrome".to_string(), "edge".to_string()]))
         );
         assert_eq!(
             simple_negation_strip("javascript framework not react not vue not angular"),
-            Some("javascript framework".to_string())
+            Some(("javascript framework".to_string(), vec!["react".to_string(), "vue".to_string(), "angular".to_string()]))
         );
     }
 
@@ -19308,20 +19635,50 @@ mod negation_scope_tests {
     fn not_from_phrase_keeps_negation_scope() {
         // Prepositions are NOT clause boundaries: "not from <country>" keeps
         // the negated phrase in scope (P9 regression guard).
-        let stripped = simple_negation_strip("smartphones not from chinese brands");
-        assert_eq!(stripped, Some("smartphones".to_string()));
+        let (stripped, excluded) = simple_negation_strip("smartphones not from chinese brands").unwrap();
+        assert_eq!(stripped, "smartphones".to_string());
+        assert!(excluded.contains(&"chinese".to_string()) || excluded.contains(&"brands".to_string()));
     }
 
     #[test]
     fn without_sugar_or_honey_negates_both_sides() {
         // "or" continues the negation scope: both alternatives stay excluded.
-        let stripped = simple_negation_strip("dessert recipes without sugar or honey");
-        assert!(stripped.unwrap().contains("dessert recipes"));
+        let (stripped, excluded) = simple_negation_strip("dessert recipes without sugar or honey").unwrap();
+        assert!(stripped.contains("dessert recipes"));
+        assert!(excluded.contains(&"sugar".to_string()) || excluded.contains(&"honey".to_string()));
     }
 
     #[test]
     fn plain_query_returns_none() {
         assert_eq!(simple_negation_strip("best laptop for programming"), None);
+    }
+
+    // ── Non-domain content words after "without" are returned as exclusions ──
+    // Round auto/round-2026-10-12T0625Z: "biryani without hand rolled" was
+    // losing the "hand rolled" constraint entirely because simple_negation_strip
+    // silently dropped every non-domain word after "without". The fix returns
+    // those words as exclusions so the caller can apply a quality penalty.
+
+    #[test]
+    fn without_non_domain_terms_returned_as_exclusions() {
+        let (stripped, excluded) = simple_negation_strip("biryani without hand rolled").unwrap();
+        assert_eq!(stripped, "biryani".to_string());
+        assert_eq!(excluded, vec!["hand".to_string(), "rolled".to_string()]);
+    }
+
+    #[test]
+    fn without_mixed_domain_and_non_domain_terms() {
+        // "linux" is a preserved domain word; "spicy" is not.
+        let (stripped, excluded) = simple_negation_strip("recipes without linux spicy").unwrap();
+        assert_eq!(stripped, "recipes linux".to_string());
+        assert_eq!(excluded, vec!["spicy".to_string()]);
+    }
+
+    #[test]
+    fn without_non_domain_phrase_collected_word_by_word() {
+        let (stripped, excluded) = simple_negation_strip("protein powder without artificial sweeteners").unwrap();
+        assert_eq!(stripped, "protein powder".to_string());
+        assert_eq!(excluded, vec!["artificial".to_string(), "sweeteners".to_string()]);
     }
 
     // ── A bare negation marker must never survive as a POSITIVE requirement ──
@@ -20969,6 +21326,97 @@ mod spellcheck_endpoint_tests {
     // /search runs (no AppState / live server needed), so the endpoint cannot
     // regress silently and cannot be "faked" by hardcoded strings.
 
+    // ── Decimal constraint extraction (pre-tokenization preservation) ──
+    // "1.5kg" must be preserved as a single token, not split into "1" and "5kg".
+
+    #[test]
+    fn extract_decimal_constraints_basic() {
+        // Basic decimal + unit combinations
+        let r = extract_decimal_constraints("1.5kg");
+        assert!(r.iter().any(|s| s == "1.5kg"), "1.5kg must be preserved: {:?}", r);
+
+        let r = extract_decimal_constraints("2.5L");
+        assert!(r.iter().any(|s| s == "2.5l"), "2.5L must be preserved: {:?}", r);
+
+        let r = extract_decimal_constraints("3.5 inches");
+        assert!(r.iter().any(|s| s == "3.5 inches"), "3.5 inches must be preserved: {:?}", r);
+    }
+
+    #[test]
+    fn extract_decimal_constraints_multiple() {
+        // Multiple decimal constraints in one query
+        let r = extract_decimal_constraints("1.5kg 2.5L");
+        assert!(r.iter().any(|s| s == "1.5kg"), "1.5kg must be present: {:?}", r);
+        assert!(r.iter().any(|s| s == "2.5l"), "2.5l must be present: {:?}", r);
+    }
+
+    #[test]
+    fn extract_decimal_constraints_within_query() {
+        // Decimal constraints embedded in a larger query
+        let r = extract_decimal_constraints("laptop under 500 with 1.5kg weight");
+        assert!(r.iter().any(|s| s == "1.5kg"), "1.5kg must be found: {:?}", r);
+    }
+
+    #[test]
+    fn extract_decimal_constraints_various_units() {
+        // Various unit types
+        for (query, expected) in [
+            ("5.5 inches display", "5.5 inches"),
+            ("1.5 gb ram", "1.5 gb"),
+            ("2.5 cm gap", "2.5 cm"),
+            ("0.5 mm thickness", "0.5 mm"),
+        ] {
+            let r = extract_decimal_constraints(query);
+            assert!(
+                r.iter().any(|s| s == expected),
+                "'{}' must be preserved in query '{}': {:?}",
+                expected, query, r
+            );
+        }
+    }
+
+    #[test]
+    fn extract_decimal_constraints_no_false_positives() {
+        // Non-decimal numbers should NOT be extracted
+        let r = extract_decimal_constraints("5kg");
+        assert!(r.is_empty(), "integer 5kg must not be extracted: {:?}", r);
+
+        let r = extract_decimal_constraints("hello world");
+        assert!(r.is_empty(), "no decimals must yield empty: {:?}", r);
+    }
+
+    #[test]
+    fn decimal_constraints_in_extract_gateway_constraints() {
+        // The full constraint extraction must include decimal constraints
+        let c = extract_gateway_constraints("laptop 1.5kg");
+        assert!(
+            c.decimal_constraints.iter().any(|s| s == "1.5kg"),
+            "1.5kg must be in decimal_constraints: {:?}",
+            c.decimal_constraints
+        );
+    }
+
+    #[test]
+    fn decimal_constraints_preserved_in_flat_constraints() {
+        // The flat_constraints building must preserve decimal constraints as-is
+        let intent = fallback_intent("1.5kg laptop");
+        let mut flat_constraints = Vec::new();
+        for p in &intent.structured_constraints.positive {
+            flat_constraints.push(format!("+{}", p));
+        }
+        for dc in &intent.structured_constraints.decimal_constraints {
+            flat_constraints.push(format!("+{}", dc));
+        }
+        for n in &intent.structured_constraints.negative {
+            flat_constraints.push(format!("-{}", n));
+        }
+        assert!(
+            flat_constraints.iter().any(|s| s == "+1.5kg"),
+            "+1.5kg must be in flat_constraints: {:?}",
+            flat_constraints
+        );
+    }
+
     #[test]
     fn inspect_endpoint_shape_matches_docs() {
         // Locks the JSON shape documented in API_REFERENCE.md `GET /inspect`:
@@ -21665,7 +22113,7 @@ mod spellcheck_endpoint_tests {
         fn video_watch_phrase_triggers_video_intent() {
             // "watch video" / "watch tutorial" must be detected as video intent
             // (has_video_intent checks for these phrases, matching live /search).
-            let stripped = simple_negation_strip("watch video tutorial").unwrap_or_else(|| "watch video tutorial".to_string());
+            let (stripped, _) = simple_negation_strip("watch video tutorial").unwrap_or_else(|| ("watch video tutorial".to_string(), Vec::new()));
             assert!(has_video_intent(&stripped));
         }
     }
@@ -22221,6 +22669,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             param_env: HashMap::new(),
             bid_floor: None,
             fallback_url: None,
+            host_suffix: None,
         }
     }
 
@@ -22290,7 +22739,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn decoration_is_idempotent_no_double_wrap() {
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx::from_networks(vec![n]);
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -22307,7 +22756,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn missing_key_degrades_to_null_affiliate() {
         // No usable network (key env var unset) => results keep affiliate null.
         let n = net("wrap", "https://sovrn.co?key={key}&u={url}", HashMap::new(), Some("UNSET_KEY_ENV_VAR_XYZ"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx::from_networks(vec![n]);
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -22320,7 +22769,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // The central no-manipulation guarantee: decoration never reorders.
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx::from_networks(vec![n]);
         let mut results = vec![
             serde_json::json!({ "url": "https://a.example.com/x", "score": 9.7 }),
             serde_json::json!({ "url": "https://b.example.org/y", "score": 8.1 }),
@@ -23529,6 +23978,87 @@ mod mainpath_shopping_strip_tests {
         assert_eq!(facts.availability, None);
         // merchant still extracted from URL
         assert_eq!(facts.merchant, Some("www.bestbuy.com".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod local_intent_gazetteer_tests {
+    use super::*;
+
+    /// Regression test: queries like "restaurants in bangalore" or "hotels in paris"
+    /// must be detected as local intent via the LOCATION_GAZETTEER.
+    ///
+    /// Before the fix, `has_local_intent` only checked "near me" / "nearby" /
+    /// "in area" patterns, so gazetteer-city queries were not detected as local.
+    /// The fix splits on " in " and checks against LOCATION_GAZETTEER.
+    #[test]
+    fn gazetteer_city_after_in_detects_local_intent() {
+        // These must ALL be detected as local intent.
+        let local_queries = [
+            "restaurants in bangalore",
+            "hotels in paris",
+            "coffee shops in tokyo",
+            "things to do in new york",
+            "best cafes in london",
+            "street food in mumbai",
+            "pizza places in delhi",
+            "sightseeing in dubai",
+        ];
+        for q in &local_queries {
+            assert!(
+                has_local_intent(q),
+                "query '{}' should be detected as local intent via gazetteer",
+                q
+            );
+        }
+    }
+
+    #[test]
+    fn non_gazetteer_after_in_does_not_detect_local_intent() {
+        // These must NOT be detected as local intent — the place after " in "
+        // is not in the LOCATION_GAZETTEER and doesn't match other local patterns.
+        let non_local_queries = [
+            "restaurants in september",
+            "best in class",
+            "how to cook in a pressure cooker",
+        ];
+        for q in &non_local_queries {
+            assert!(
+                !has_local_intent(q),
+                "query '{}' should NOT be detected as local intent",
+                q
+            );
+        }
+    }
+
+    #[test]
+    fn long_conversational_query_with_in_country_not_local() {
+        // A long conversational query that happens to contain " in <country>"
+        // should NOT be classified as local intent (short-query guard).
+        let long_query = "i have been working as a network administrator for five years and now i want to understand the job market in india";
+        assert!(
+            !has_local_intent(long_query),
+            "long conversational query should not be local intent"
+        );
+    }
+
+    #[test]
+    fn traditional_local_patterns_still_work() {
+        // Ensure the original "near me" / "nearby" patterns still work
+        // after the gazetteer-city addition.
+        let traditional_locals = [
+            "restaurants near me",
+            "nearby coffee shops",
+            "hotels around me",
+            "gas stations close to me",
+        ];
+        for q in &traditional_locals {
+            assert!(
+                has_local_intent(q),
+                "traditional local query '{}' should still be detected",
+                q
+            );
+        }
     }
 }
 
