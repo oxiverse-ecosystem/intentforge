@@ -23567,10 +23567,9 @@ mod local_intent_gazetteer_tests {
     #[test]
     fn non_gazetteer_after_in_does_not_detect_local_intent() {
         // These must NOT be detected as local intent — the place after " in "
-        // is not in the LOCATION_GAZETTEER.
+        // is not in the LOCATION_GAZETTEER and doesn't match other local patterns.
         let non_local_queries = [
             "restaurants in september",
-            "hotels in my area",  // "area" suffix is a different pattern
             "best in class",
             "how to cook in a pressure cooker",
         ];
