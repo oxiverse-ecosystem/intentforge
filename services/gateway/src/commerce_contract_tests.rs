@@ -41,6 +41,7 @@ fn contract_net(
         param_env: HashMap::new(),
         bid_floor: None,
         fallback_url: None,
+        host_suffix: None,
     }
 }
 
@@ -104,7 +105,7 @@ fn contract_disclosure_present_on_every_decorated_result() {
         params,
         Some("CONTRACT_SOVRN_KEY"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx::from_networks(vec![n]);
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     // Decorate the ALREADY-RANKED results, exactly as handle_shopping does.
@@ -143,7 +144,7 @@ fn contract_no_query_user_or_ip_in_affiliate_urls() {
         params,
         Some("CONTRACT_SOVRN_KEY"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx::from_networks(vec![n]);
 
     let user_query = "best wireless earbuds under 50 dollars";
     let mut payload = representative_shopping_payload(user_query);
@@ -241,7 +242,7 @@ fn contract_decoration_is_idempotent_and_order_preserved() {
         HashMap::new(),
         Some("CONTRACT_SOVRN_KEY"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx::from_networks(vec![n]);
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     let before: Vec<String> = payload["results"]
@@ -290,7 +291,7 @@ fn contract_missing_key_degrades_without_leak_or_crash() {
         HashMap::new(),
         Some("CONTRACT_UNSET_KEY_ENV_VAR_ZZZ"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx::from_networks(vec![n]);
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     if let Some(arr) = payload.get_mut("results").and_then(|v| v.as_array_mut()) {
@@ -377,7 +378,7 @@ fn test_affiliate_decoration_does_not_change_ranking() {
         },
         Some("SOVRN_COMMERCE_KEY"),
     );
-    let enabled_ctx = AffiliateCtx { networks: vec![enabled_net] };
+    let enabled_ctx = AffiliateCtx::from_networks(vec![enabled_net]);
     let mut enabled_payload = ranked_input.clone();
     if let Some(arr) = enabled_payload
         .get_mut("results")
@@ -391,7 +392,7 @@ fn test_affiliate_decoration_does_not_change_ranking() {
     // ── DISABLED run ─────────────────────────────────────────────────────────
     // No networks at all => first_usable() returns None => affiliate omitted,
     // results returned untouched. This IS the "keys unset" behaviour.
-    let disabled_ctx = AffiliateCtx { networks: vec![] };
+    let disabled_ctx = AffiliateCtx::from_networks(vec![]);
     let mut disabled_payload = ranked_input.clone();
     if let Some(arr) = disabled_payload
         .get_mut("results")
@@ -453,7 +454,7 @@ fn test_affiliate_decoration_writes_affiliate_field_not_url() {
         },
         Some("SOVRN_COMMERCE_KEY"),
     );
-    let ctx = AffiliateCtx { networks: vec![net] };
+    let ctx = AffiliateCtx::from_networks(vec![net]);
 
     let raw = representative_shopping_payload("buy wireless earbuds under 200");
     let before_urls: Vec<String> = raw["results"]
@@ -524,6 +525,7 @@ fn contract_net_with_bf(
         param_env: HashMap::new(),
         bid_floor: bid_floor.map(|s| s.to_string()),
         fallback_url: fallback_url.map(|s| s.to_string()),
+        host_suffix: None,
     }
 }
 
@@ -540,7 +542,7 @@ fn item6_bid_floor_and_fallback_appended_and_reported() {
         Some("0.10"),
         Some("https://shop.acme-electronics.com/fallback"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx::from_networks(vec![n]);
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     if let Some(arr) = payload.get_mut("results").and_then(|v| v.as_array_mut()) {
@@ -601,7 +603,7 @@ fn item6_bf_fbu_never_change_ranking() {
         Some("0.25"),
         Some("https://shop.acme-electronics.com/fallback"),
     );
-    let enabled_ctx = AffiliateCtx { networks: vec![enabled_net] };
+    let enabled_ctx = AffiliateCtx::from_networks(vec![enabled_net]);
     let ranked_input = representative_shopping_payload("buy wireless earbuds under 200");
 
     let mut enabled_payload = ranked_input.clone();
@@ -622,7 +624,7 @@ fn item6_bf_fbu_never_change_ranking() {
         "bf must be present in decorated urls"
     );
 
-    let disabled_ctx = AffiliateCtx { networks: vec![] };
+    let disabled_ctx = AffiliateCtx::from_networks(vec![]);
     let mut disabled_payload = ranked_input.clone();
     if let Some(arr) = disabled_payload
         .get_mut("results")
@@ -795,7 +797,7 @@ fn placeholder_fallback_never_reaches_a_decorated_result() {
     {
         net.fallback_url = None;
     }
-    let ctx = AffiliateCtx { networks: vec![net] };
+    let ctx = AffiliateCtx::from_networks(vec![net]);
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     if let Some(arr) = payload.get_mut("results").and_then(|v| v.as_array_mut()) {
