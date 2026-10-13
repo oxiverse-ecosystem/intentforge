@@ -11417,8 +11417,13 @@ fn merge_local_and_web(
                 (tchars.len() - non) as f32 / tchars.len() as f32
             };
             // Query is Latin-script dominant AND result is non-Latin-script dominant.
+            // 0.05 (not 0.25): when ALL results are non-Latin (e.g. Bing returning
+            // Japanese dictionary pages for an English query), a 0.25 multiplier
+            // is defeated by calibrate_scores' max-rescale — the Japanese results
+            // still float to 1.0. 0.05 matches the video/audio cap floor so
+            // cross-lingual junk stays below genuine on-topic results.
             if q_ascii_ratio >= 0.85 && res_ascii_ratio < 0.50 {
-                0.25 // dampen hard but keep present (fail-soft, not a hard drop)
+                0.05
             } else {
                 1.0
             }
