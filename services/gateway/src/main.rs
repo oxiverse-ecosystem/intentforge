@@ -2905,6 +2905,84 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
     None
 }
 
+/// Extract product facts from a search result snippet (title + content).
+/// This is a FALLBACK for when the page fetch failed or returned no structured
+/// data. All extracted facts are marked with source="snippet_extracted" by the
+/// caller so the frontend can label them as less certain than structured data.
+///
+/// Extraction rules (all conservative — never fabricate):
+/// - Price/currency: via `extract_price_from_text` (existing, well-tested)
+/// - Product name: from the title, truncated at the first delimiter (|, -, —)
+/// - Merchant/brand: from the URL host (with merchant_observed: false)
+/// - Availability: from snippet text ("in stock", "out of stock", etc.)
+fn extract_snippet_facts(snippet: &str, url: &str) -> OfferFacts {
+    let mut facts = OfferFacts::default();
+
+    // Price + currency
+    if let Some(price_info) = extract_price_from_text(snippet) {
+        facts.price = Some(price_info.amount);
+        facts.currency = Some(price_info.currency);
+    }
+
+    // Product name: extract from title (first line, truncated at delimiter).
+    // Only if the title looks like a product name — not a question or how-to phrase.
+    let title = snippet.lines().next().unwrap_or("").trim();
+    if !title.is_empty() {
+        // Truncate at common delimiters: |, -, —, –
+        let name = title
+            .split(|c| c == '|' || c == '—' || c == '–')
+            .next()
+            .unwrap_or(title)
+            .trim();
+        // Only use as product name if it's not too long and doesn't look like a question/how-to
+        if !name.is_empty() && name.len() <= 200 && !is_question_or_howto(name) {
+            facts.name = Some(name.to_string());
+        }
+    }
+
+    // Merchant/brand: from URL host (NOT observed on page — merchant_observed stays false)
+    let host = url_host(url);
+    if !host.is_empty() && host != "localhost" {
+        facts.merchant = Some(host);
+        // merchant_observed stays false — this is derived from the URL, not the page
+    }
+
+    // Availability: look for common availability phrases in the snippet
+    let lower = snippet.to_lowercase();
+    if lower.contains("in stock") || lower.contains("available now") || lower.contains("ships today") {
+        facts.availability = Some("in_stock".to_string());
+    } else if lower.contains("out of stock") || lower.contains("unavailable") || lower.contains("sold out") {
+        facts.availability = Some("out_of_stock".to_string());
+    }
+
+    facts
+}
+
+/// Returns true if the text looks like a question or how-to phrase rather than a
+/// product name. Used to filter out non-product titles from snippet extraction.
+fn is_question_or_howto(text: &str) -> bool {
+    let lower = text.to_lowercase().trim().to_string();
+    // Question phrases
+    if lower.ends_with('?') {
+        return true;
+    }
+    // Common question starters
+    let question_starters = [
+        "what ", "how ", "why ", "when ", "where ", "which ", "who ", "is ", "are ",
+        "can ", "should ", "does ", "do ",
+    ];
+    for starter in &question_starters {
+        if lower.starts_with(starter) {
+            return true;
+        }
+    }
+    // How-to phrases
+    if lower.contains("how to") || lower.contains("how do") || lower.contains("how can") {
+        return true;
+    }
+    false
+}
+
 /// Secondary commerce price extraction: parse common HTML price patterns from
 /// pages that don't expose JSON-LD/OpenGraph/Product microdata. This is a
 /// STRUCTURED FALLBACK for known e-commerce HTML patterns — not free-text
@@ -4339,23 +4417,20 @@ async fn enrich_with_commerce<F, Fut>(
             }
             None => {}
         }
-        // Snippet-based price fallback: when the page fetch failed or returned
-        // no structured data, try to extract a price from the search result
+        // Snippet-based fallback: when the page fetch failed or returned
+        // no structured data, try to extract product facts from the search result
         // snippet (title + content). This improves enrichment recall without
-        // fabricating facts — the price is marked with source="snippet_extracted"
-        // so the frontend can label it as less certain than structured data.
+        // fabricating facts — all snippet-derived facts are marked with
+        // source="snippet_extracted" so the frontend can label them as less
+        // certain than structured data.
         if !attached {
             let snippet = format!(
                 "{} {}",
                 r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
                 r.get("content").and_then(|v| v.as_str()).unwrap_or("")
             );
-            if let Some(price_info) = extract_price_from_text(&snippet) {
-                let facts = OfferFacts {
-                    price: Some(price_info.amount),
-                    currency: Some(price_info.currency),
-                    ..Default::default()
-                };
+            let facts = extract_snippet_facts(&snippet, &url);
+            if data_has_fact(&facts) {
                 let offer = CommerceOffer {
                     url: Some(url.clone()),
                     observed_at: Some(now_unix_string()),
@@ -8884,7 +8959,10 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                in_negation = false;
+                // Preserved domain word: keep it in the result, but do NOT end
+                // the negation scope. Subsequent non-preserved words are still
+                // negated (e.g. "recipes without linux spicy" → "recipes linux",
+                // excluded: ["spicy"]). The scope only ends at a clause boundary.
                 result.push(w);
             } else {
                 // Non-domain content word after a negation trigger: treat as an
@@ -11578,6 +11656,71 @@ fn merge_local_and_web(
                 restored.len()
             );
             merged = restored;
+        }
+    }
+
+    // ── Cross-lingual hard drop (D2 extension) ──
+    // The in-loop cross-lingual guard (0.05 multiplier) is defeated by
+    // calibrate_scores when ALL results are non-Latin (e.g. Bing returning
+    // Japanese dictionary pages for an English query). A multiplier alone
+    // cannot fix this — the max-rescale stretches the dampened results back
+    // to 1.0. A hard drop removes them outright. General: keyed on script
+    // ratio, no language tables, no per-domain lists.
+    {
+        let q_chars: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
+        let q_ascii_ratio = if q_chars.is_empty() {
+            1.0
+        } else {
+            let non = q_chars.iter().filter(|c| !c.is_ascii()).count();
+            (q_chars.len() - non) as f32 / q_chars.len() as f32
+        };
+        if q_ascii_ratio >= 0.85 {
+            let before = merged.len();
+            let retained_pre_xlingual: Vec<MergedResult> = merged.iter().cloned().collect();
+            merged.retain(|r| {
+                let res_text = format!("{} {}", r.title, r.content);
+                let r_chars: Vec<char> = res_text.chars().filter(|c| !c.is_whitespace()).collect();
+                let r_ascii_ratio = if r_chars.is_empty() {
+                    1.0
+                } else {
+                    let non = r_chars.iter().filter(|c| !c.is_ascii()).count();
+                    (r_chars.len() - non) as f32 / r_chars.len() as f32
+                };
+                r_ascii_ratio >= 0.50
+            });
+            let removed = before - merged.len();
+            if removed > 0 {
+                tracing::info!(
+                    "CROSS_LINGUAL_DROP: removed {}/{} result(s) for Latin-script query (res_ascii_ratio < 0.50)",
+                    removed, before
+                );
+            }
+            // Fail-open: if dropping would empty the set, restore non-adult results
+            if merged.is_empty() && before > 0 {
+                tracing::warn!(
+                    "CROSS_LINGUAL_DROP FAIL-OPEN: all {} results were non-Latin — keeping set (sparse upstream draw)",
+                    before
+                );
+                merged = retained_pre_xlingual
+                    .into_iter()
+                    .filter(|r| {
+                        let ul = r.url.to_lowercase();
+                        let tl = r.title.to_lowercase();
+                        let host = reqwest::Url::parse(&r.url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                            .unwrap_or_default();
+                        let tld_adult = host.ends_with(".xxx");
+                        let host_adult = adult_hosts.iter().any(|h| host.contains(h));
+                        let path_adult = adult_paths.iter().any(|p| ul.contains(p));
+                        let title_adult = tl.contains("porn") || tl.contains("xxx ")
+                            || tl.contains("nude") || tl.contains("naked")
+                            || tl.contains("sex video") || tl.contains("adult film");
+                        let is_adult = tld_adult || host_adult || path_adult || title_adult;
+                        !is_adult
+                    })
+                    .collect();
+            }
         }
     }
 
@@ -15751,8 +15894,16 @@ async fn handle_search(
             "understand ", "learn ", "teach me ",
         ];
         let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+        // Word-boundary matching: each keyword must appear as a complete word,
+        // not as a substring of another word (e.g. "price" must not match
+        // "priceless"). The trailing-space convention ("price ") missed queries
+        // ending with the keyword ("sony wh-1000xm5 price"). \b word boundaries
+        // fix both ends without per-query literals.
+        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
+        let has_tx_signal = tx_keywords.iter().any(|k| {
+            let pattern = format!(r"\b{}\b", regex::escape(k));
+            regex::Regex::new(&pattern).map(|re| re.is_match(&q_lower)).unwrap_or(false)
+        });
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -20900,25 +21051,40 @@ mod hardcoding_ruling_tests {
         }
 
         // Verify the tx_keywords list still matches genuine transactional queries
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
-        for q in &transactional_queries {
+        // using word-boundary matching (same logic as production).
+        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
+        let has_tx_wordboundary = |q: &str| -> bool {
             let q_lower = q.to_lowercase();
-            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
-            assert!(has_tx, "transactional query '{}' should match tx_keywords", q);
+            tx_keywords.iter().any(|k| {
+                let pattern = format!(r"\b{}\b", regex::escape(k));
+                regex::Regex::new(&pattern).map(|re| re.is_match(&q_lower)).unwrap_or(false)
+            })
+        };
+        for q in &transactional_queries {
+            assert!(has_tx_wordboundary(q), "transactional query '{}' should match tx_keywords", q);
         }
 
-        // Verify that guarded queries with "under " or "price " would have matched
+        // Verify that queries ending with a keyword (no trailing space) match.
+        // This was the root cause: "price " (trailing space) missed "sony wh-1000xm5 price".
+        let end_keyword_queries = [
+            "sony wh-1000xm5 price",
+            "iphone 16 pro max buy",
+            "best laptop under",
+        ];
+        for q in &end_keyword_queries {
+            assert!(has_tx_wordboundary(q), "end-of-query keyword '{}' should match tx_keywords", q);
+        }
+
+        // Verify that guarded queries with "under" or "price" would have matched
         // the OLD (un-guarded) logic — proving the test is meaningful
         let problematic_queries = [
             "how to convert pdf to word under 5 minutes",
             "how to check price of used bike",
         ];
         for q in &problematic_queries {
-            let q_lower = q.to_lowercase();
-            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
-            assert!(has_tx, "query '{}' should match tx_keywords (proving the guard is needed)", q);
+            assert!(has_tx_wordboundary(q), "query '{}' should match tx_keywords (proving the guard is needed)", q);
             // But the guard suppresses it
-            let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+            let has_starter = informational_starters.iter().any(|s| q.to_lowercase().starts_with(s));
             assert!(has_starter, "query '{}' should be guarded by informational starter", q);
         }
     }
@@ -23714,6 +23880,107 @@ mod mainpath_shopping_strip_tests {
     fn enrich_window_is_wider_than_display_cap() {
         // Guards the constants from being re-conflated.
         assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
+    }
+
+    // ─── extract_snippet_facts tests ────────────────────────────────────
+
+    #[test]
+    fn snippet_facts_extracts_price_and_currency() {
+        let snippet = "Sony WH-1000XM5 headphones $349.99";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.price, Some(349.99));
+        assert_eq!(facts.currency, Some("USD".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_extracts_product_name_from_title() {
+        let snippet = "Sony WH-1000XM5 Wireless Headphones | Best Buy\n$349.99";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(
+            facts.name,
+            Some("Sony WH-1000XM5 Wireless Headphones".to_string())
+        );
+    }
+
+    #[test]
+    fn snippet_facts_extracts_merchant_from_url_host() {
+        let snippet = "Sony WH-1000XM5 headphones $349.99";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.merchant, Some("www.bestbuy.com".to_string()));
+        // merchant_observed must be false — derived from URL, not page
+        assert!(!facts.merchant_observed);
+    }
+
+    #[test]
+    fn snippet_facts_extracts_availability_in_stock() {
+        let snippet = "Sony WH-1000XM5 headphones $349.99 — In Stock";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.availability, Some("in_stock".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_extracts_availability_out_of_stock() {
+        let snippet = "Sony WH-1000XM5 headphones $349.99 — Out of Stock";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.availability, Some("out_of_stock".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_returns_empty_for_no_match() {
+        let snippet = "How to cook pasta";
+        let url = "https://recipes.example.com/pasta";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.price, None);
+        assert_eq!(facts.currency, None);
+        assert_eq!(facts.name, None);
+        assert_eq!(facts.availability, None);
+        // merchant is always extracted from URL host (even if no other facts)
+        assert_eq!(facts.merchant, Some("recipes.example.com".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_passes_data_has_gate() {
+        // A snippet with a price must pass data_has_fact
+        let snippet = "Sony WH-1000XM5 headphones $349.99";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert!(data_has_fact(&facts));
+    }
+
+    #[test]
+    fn snippet_facts_fails_data_has_gate_for_no_facts() {
+        // A snippet with no price, no availability, no name must fail data_has_fact
+        // (merchant alone doesn't count — merchant_observed is false)
+        let snippet = "How to cook pasta";
+        let url = "https://recipes.example.com/pasta";
+        let facts = extract_snippet_facts(snippet, url);
+        assert!(!data_has_fact(&facts));
+    }
+
+    #[test]
+    fn snippet_facts_extracts_inr_price() {
+        let snippet = "Sony WH-1000XM5 headphones ₹29,999";
+        let url = "https://www.amazon.in/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.price, Some(29999.0));
+        assert_eq!(facts.currency, Some("INR".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_handles_empty_snippet() {
+        let snippet = "";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.price, None);
+        assert_eq!(facts.name, None);
+        assert_eq!(facts.availability, None);
+        // merchant still extracted from URL
+        assert_eq!(facts.merchant, Some("www.bestbuy.com".to_string()));
     }
 }
 
