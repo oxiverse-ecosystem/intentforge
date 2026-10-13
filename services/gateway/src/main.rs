@@ -5269,38 +5269,33 @@ impl AffiliateCtx {
         if host.is_empty() {
             return None;
         }
-        self.programs.iter().find(|p| {
-            if !p.enabled {
-                return false;
-            }
-            // Key must be present for the program to be usable.
-            let has_key = p.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false);
-            if !has_key {
-                return false;
-            }
-            match &p.host_suffix {
-                None => false, // catch-all programs are not per-merchant matches
-                Some(suffix) => {
-                    let suffix = suffix.trim_end_matches('.').to_lowercase();
-                    if suffix.is_empty() {
-                        return false;
-                    }
-                    // Label-boundary match: the host's domain ends with the suffix
-                    // at a dot boundary. E.g. suffix "amazon" matches
-                    // "amazon.com", "www.amazon.com", "amazon.co.uk" — but NOT
-                    // "notamazon.com" or "amazonian-shop.com".
-                    // We check: host == suffix, or host ends with "." + suffix
-                    // followed by "." or end-of-string.
-                    if host == suffix {
-                        return true;
-                    }
-                    // Check each label position: does any label in the host equal
-                    // the suffix? This handles www.amazon.com (label "amazon"
-                    // matches), amazon.com (label "amazon" matches), etc.
-                    host.split('.').any(|label| label == suffix)
+        // Collect all matching programs, then pick the highest priority.
+        // This ensures deterministic behavior regardless of vector order.
+        self.programs
+            .iter()
+            .filter(|p| {
+                if !p.enabled {
+                    return false;
                 }
-            }
-        })
+                let has_key = p.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false);
+                if !has_key {
+                    return false;
+                }
+                match &p.host_suffix {
+                    None => false,
+                    Some(suffix) => {
+                        let suffix = suffix.trim_end_matches('.').to_lowercase();
+                        if suffix.is_empty() {
+                            return false;
+                        }
+                        if host == suffix {
+                            return true;
+                        }
+                        host.split('.').any(|label| label == suffix)
+                    }
+                }
+            })
+            .max_by_key(|p| p.priority)
     }
 }
 
