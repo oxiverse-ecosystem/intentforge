@@ -15668,8 +15668,8 @@ async fn handle_search(
             "understand ", "learn ", "teach me ",
         ];
         let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
+        let has_tx_signal = tx_keywords.iter().any(|k| q_has_word(&q_lower, k));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -21012,11 +21012,27 @@ mod hardcoding_ruling_tests {
         }
 
         // Verify the tx_keywords list still matches genuine transactional queries
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        // Uses q_has_word (whole-word match) — the same approach as the production code.
+        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
         for q in &transactional_queries {
             let q_lower = q.to_lowercase();
-            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+            let has_tx = tx_keywords.iter().any(|k| q_has_word(&q_lower, k));
             assert!(has_tx, "transactional query '{}' should match tx_keywords", q);
+        }
+
+        // Regression: query ENDING with "price" (no trailing space) must still match.
+        // The old trailing-space approach ("price ") missed queries like
+        // "sony wh-1000xm5 price" where "price" is the last word.
+        let ending_queries = [
+            "sony wh-1000xm5 price",
+            "iphone 16 pro max price",
+            "macbook pro m3 price",
+            "pixel 9 price",
+        ];
+        for q in &ending_queries {
+            let q_lower = q.to_lowercase();
+            let has_tx = tx_keywords.iter().any(|k| q_has_word(&q_lower, k));
+            assert!(has_tx, "query ending with 'price' '{}' should match tx_keywords", q);
         }
 
         // Verify that guarded queries with "under " or "price " would have matched
@@ -21027,7 +21043,7 @@ mod hardcoding_ruling_tests {
         ];
         for q in &problematic_queries {
             let q_lower = q.to_lowercase();
-            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+            let has_tx = tx_keywords.iter().any(|k| q_has_word(&q_lower, k));
             assert!(has_tx, "query '{}' should match tx_keywords (proving the guard is needed)", q);
             // But the guard suppresses it
             let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
