@@ -18310,7 +18310,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             // EXISTING ranked order (strict subsequence — never promotes a
             // lower-ranked result). Returns None when no candidate has facts,
             // so the strip is omitted rather than shown empty.
-            let strip = select_shopping_strip(&shop_arr, COMMERCE_MAINPATH_TOP_N);
+            let strip = select_shopping_strip(&shop_arr, state.commerce_config.mainpath_top_n);
             match strip {
                 None => None,
                 Some(mut strip) => {
@@ -22288,7 +22288,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let mut dist = std::collections::HashMap::new();
         dist.insert("transactional".to_string(), 0.9);
         dist.insert("informational".to_string(), 0.1);
-        assert!(is_commercial_intent("transactional", &dist, false));
+        let signals = CommerceSignals::default();
+        assert!(is_commercial_intent("transactional", &dist, false, &signals, "test"));
     }
 
     #[test]
@@ -22301,7 +22302,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("comparison".to_string(), 0.51);
         dist.insert("transactional".to_string(), 0.62);
         // argmax label is "comparison" but transactional prob >= 0.50 => commercial.
-        assert!(is_commercial_intent("comparison", &dist, false));
+        let signals = CommerceSignals::default();
+        assert!(is_commercial_intent("comparison", &dist, false, &signals, "test"));
     }
 
     #[test]
@@ -22310,7 +22312,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // intent — no need for the transactional label. The bound is parsed by the
         // EXISTING gateway/engine constraint parser, never a keyword.
         let dist = std::collections::HashMap::new();
-        assert!(is_commercial_intent("informational", &dist, true));
+        let signals = CommerceSignals::default();
+        assert!(is_commercial_intent("informational", &dist, true, &signals, "test"));
     }
 
     #[test]
@@ -22322,7 +22325,80 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let mut dist = std::collections::HashMap::new();
         dist.insert("informational".to_string(), 0.95);
         dist.insert("transactional".to_string(), 0.02);
-        assert!(!is_commercial_intent("informational", &dist, false));
+        let signals = CommerceSignals::default();
+        assert!(!is_commercial_intent("informational", &dist, false, &signals, "rust ownership"));
+    }
+
+    // ── Commerce config + signals data-file wiring tests ─────────────────────
+
+    #[test]
+    fn commerce_config_loads_mainpath_top_n_from_data_file() {
+        // The shipped config.json sets mainpath_top_n = 8. Loading it must
+        // produce that value (not the default, not a hardcoded constant).
+        let cfg = CommerceConfig::load();
+        assert!(
+            cfg.mainpath_top_n > 0 && cfg.mainpath_top_n <= 100,
+            "mainpath_top_n must be a sane positive value, got {}",
+            cfg.mainpath_top_n
+        );
+        // The shipped data file sets 8; if this fails the data file changed
+        // and the test should be updated alongside it.
+        assert_eq!(cfg.mainpath_top_n, 8, "shipped config.json mainpath_top_n");
+    }
+
+    #[test]
+    fn commerce_signals_loads_transactional_keywords_from_data_file() {
+        let sig = CommerceSignals::load();
+        assert!(
+            !sig.transactional_keywords.is_empty(),
+            "signals.json must yield at least one transactional keyword"
+        );
+        // The shipped data file includes "buy" and "price".
+        assert!(
+            sig.transactional_keywords.contains(&"buy".to_string()),
+            "shipped signals.json must contain 'buy'"
+        );
+        assert!(
+            sig.transactional_keywords.contains(&"price".to_string()),
+            "shipped signals.json must contain 'price'"
+        );
+    }
+
+    #[test]
+    fn transactional_keyword_whole_word_matching() {
+        let sig = CommerceSignals::default();
+        // Positive: whole-word matches
+        assert!(sig.has_transactional_keyword("buy wireless earbuds"));
+        assert!(sig.has_transactional_keyword("price of iphone"));
+        assert!(sig.has_transactional_keyword("how much does a laptop cost"));
+        assert!(sig.has_transactional_keyword("shop for shoes"));
+        // Negative: substring but NOT whole-word
+        assert!(!sig.has_transactional_keyword("rust ownership"));
+        assert!(!sig.has_transactional_keyword("buying")); // "buy" is a prefix but not whole-word
+        assert!(!sig.has_transactional_keyword("priceless")); // "price" is a prefix but not whole-word
+        assert!(!sig.has_transactional_keyword("shopping")); // "shop" is a prefix but not whole-word
+        // Edge: empty query
+        assert!(!sig.has_transactional_keyword(""));
+    }
+
+    #[test]
+    fn commercial_intent_boosted_by_transactional_keyword() {
+        // A query with a transactional keyword but NO intent engine signal
+        // (informational label, no price bound, weak distribution) should
+        // STILL be commercial thanks to the data-driven keyword boost.
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("informational".to_string(), 0.7);
+        dist.insert("transactional".to_string(), 0.1);
+        let sig = CommerceSignals::default();
+        assert!(
+            is_commercial_intent("informational", &dist, false, &sig, "buy wireless earbuds"),
+            "transactional keyword 'buy' should boost commercial intent"
+        );
+        // Same but with a non-transactional query — should NOT be commercial
+        assert!(
+            !is_commercial_intent("informational", &dist, false, &sig, "rust ownership"),
+            "non-transactional query must not be boosted"
+        );
     }
 
     #[test]
