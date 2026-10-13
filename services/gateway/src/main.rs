@@ -4748,6 +4748,8 @@ fn is_commercial_intent(
     label: &str,
     distribution: &std::collections::HashMap<String, f32>,
     has_price_bound: bool,
+    signals: &CommerceSignals,
+    query: &str,
 ) -> bool {
     if has_price_bound {
         return true;
@@ -4758,11 +4760,23 @@ fn is_commercial_intent(
     // Strong transactional distribution is itself commercial intent even if the
     // argmax label is something else (e.g. "comparison"). Threshold is a signal
     // probability, not a per-query literal.
-    distribution
+    if distribution
         .get("transactional")
         .copied()
         .unwrap_or(0.0)
         >= 0.50
+    {
+        return true;
+    }
+    // WEAK signal boost: the runtime-loaded transactional keywords from
+    // signals.json provide additional recall when the intent engine is
+    // borderline. This is a SUPPLEMENT to the label/distribution check —
+    // never a standalone replacement. The keywords are data-driven (loaded
+    // from data/commerce/signals.json), not hardcoded in the classifier.
+    if signals.has_transactional_keyword(query) {
+        return true;
+    }
+    false
 }
 
 /// Pure helper: from an already-enriched array of result JSON values, keep only
@@ -12071,6 +12085,126 @@ impl ResultVolumeTracker {
 
 }
 
+/// Runtime-loaded commerce config from `data/commerce/config.json`.
+/// All values can be changed WITHOUT recompile — edit the file and restart.
+/// Missing file or fields fall back to sensible defaults.
+#[derive(Clone, Debug)]
+struct CommerceConfig {
+    /// How many top-ranked results to display in the main-path shopping strip.
+    /// Replaces the former hardcoded `COMMERCE_MAINPATH_TOP_N` constant.
+    mainpath_top_n: usize,
+}
+
+impl Default for CommerceConfig {
+    fn default() -> Self {
+        Self { mainpath_top_n: 8 }
+    }
+}
+
+impl CommerceConfig {
+    /// Load from `data/commerce/config.json`. Missing file or fields → defaults.
+    fn load() -> Self {
+        let mut cfg = Self::default();
+        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
+            let path = std::path::Path::new(dir).join("config.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(n) = v.get("mainpath_top_n").and_then(|x| x.as_u64()) {
+                        if n > 0 && n <= 100 {
+                            cfg.mainpath_top_n = n as usize;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        cfg
+    }
+}
+
+/// Runtime-loaded commerce intent signals from `data/commerce/signals.json`.
+/// The `transactional_keywords` list is a WEAK signal boost to the existing
+/// intent classifier — it never replaces the label/distribution check, it only
+/// adds recall when the intent engine is borderline. All values can be changed
+/// WITHOUT recompile.
+#[derive(Clone, Debug)]
+struct CommerceSignals {
+    /// Keywords that weakly indicate transactional intent. Checked as whole-word
+    /// matches against the query. This is a SUPPLEMENT to the intent engine's
+    /// label/distribution — never a standalone classifier.
+    transactional_keywords: Vec<String>,
+}
+
+impl Default for CommerceSignals {
+    fn default() -> Self {
+        Self {
+            transactional_keywords: vec![
+                "buy", "price", "pricing", "cheap", "cheapest", "purchase",
+                "shop", "discount", "coupon", "deal", "deals", "offer",
+                "sale", "order", "pay", "budget", "cost", "worth", "value",
+                "refurbished", "under", "store",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        }
+    }
+}
+
+impl CommerceSignals {
+    /// Load from `data/commerce/signals.json`. Missing file or fields → defaults.
+    fn load() -> Self {
+        let mut sig = Self::default();
+        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
+            let path = std::path::Path::new(dir).join("signals.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(kw) = v.get("transactional_keywords").and_then(|x| x.as_array()) {
+                        let loaded: Vec<String> = kw
+                            .iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_lowercase()))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !loaded.is_empty() {
+                            sig.transactional_keywords = loaded;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        sig
+    }
+
+    /// True when the query contains any transactional keyword as a WHOLE WORD.
+    /// This is a weak signal — it supplements the intent engine's label /
+    /// distribution, never replaces it. Returns false for empty queries.
+    fn has_transactional_keyword(&self, query: &str) -> bool {
+        if self.transactional_keywords.is_empty() || query.is_empty() {
+            return false;
+        }
+        let q_lower = query.to_lowercase();
+        self.transactional_keywords.iter().any(|kw| {
+            // Whole-word match: the keyword must be bounded by non-alphanumeric
+            // characters (or string start/end) on both sides.
+            let mut start = 0;
+            while let Some(pos) = q_lower[start..].find(kw) {
+                let abs_pos = start + pos;
+                let before_ok = abs_pos == 0
+                    || !q_lower.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+                let after_pos = abs_pos + kw.len();
+                let after_ok = after_pos >= q_lower.len()
+                    || !q_lower.as_bytes()[after_pos].is_ascii_alphanumeric();
+                if before_ok && after_ok {
+                    return true;
+                }
+                start = abs_pos + 1;
+            }
+            false
+        })
+    }
+}
+
 struct AppState {
     circuit: CircuitBreaker,
     cache: SearchCache,
@@ -12104,6 +12238,15 @@ struct AppState {
     /// knowledge is data, never code. Used only as a strict post-rank decoration
     /// pass — never affects ranking/order.
     affiliate_ctx: AffiliateCtx,
+    /// Runtime-loaded commerce config (mainpath_top_n etc). Loaded once at
+    /// startup from `data/commerce/config.json`. Changing it requires NO
+    /// recompile — edit the file and restart.
+    commerce_config: CommerceConfig,
+    /// Runtime-loaded commerce intent signals (transactional_keywords etc).
+    /// Loaded once at startup from `data/commerce/signals.json`. Used as a
+    /// WEAK signal boost to the existing intent classifier — never a
+    /// standalone replacement.
+    commerce_signals: CommerceSignals,
 }
 
 async fn handle_images(
@@ -12737,6 +12880,9 @@ async fn main() {
         search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         // Affiliate template engine config (ROADMAP item 3) — loaded from data.
         affiliate_ctx: AffiliateCtx::load(),
+        // Commerce config + signals — loaded from data, no recompile needed.
+        commerce_config: CommerceConfig::load(),
+        commerce_signals: CommerceSignals::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -18116,6 +18262,8 @@ let mut results = match tokio::task::spawn_blocking(move || {
         &intent.intent,
         &intent.distribution,
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
+        &state.commerce_signals,
+        &q,
     ) {
         // The enrichment budget is derived from the time this request has ALREADY
         // spent, not a flat 22s (see `commerce_wall_for_elapsed`). Without this the
