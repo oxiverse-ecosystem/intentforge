@@ -5271,31 +5271,38 @@ impl AffiliateCtx {
         }
         // Collect all matching programs, then pick the highest priority.
         // This ensures deterministic behavior regardless of vector order.
-        self.programs
-            .iter()
-            .filter(|p| {
-                if !p.enabled {
-                    return false;
-                }
-                let has_key = p.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false);
-                if !has_key {
-                    return false;
-                }
-                match &p.host_suffix {
-                    None => false,
-                    Some(suffix) => {
-                        let suffix = suffix.trim_end_matches('.').to_lowercase();
-                        if suffix.is_empty() {
-                            return false;
-                        }
-                        if host == suffix {
-                            return true;
-                        }
+        let mut best: Option<&AffiliateNetwork> = None;
+        for p in &self.programs {
+            if !p.enabled {
+                continue;
+            }
+            let has_key = p.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false);
+            if !has_key {
+                continue;
+            }
+            let matches = match &p.host_suffix {
+                None => false,
+                Some(suffix) => {
+                    let suffix = suffix.trim_end_matches('.').to_lowercase();
+                    if suffix.is_empty() {
+                        false
+                    } else if host == suffix {
+                        true
+                    } else {
                         host.split('.').any(|label| label == suffix)
                     }
                 }
-            })
-            .max_by_key(|p| p.priority)
+            };
+            if !matches {
+                continue;
+            }
+            best = match best {
+                None => Some(p),
+                Some(current) if p.priority > current.priority => Some(p),
+                _ => best,
+            };
+        }
+        best
     }
 }
 
