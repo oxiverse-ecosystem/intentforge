@@ -959,6 +959,61 @@ fn extract_date_from_text(text: &str) -> Option<(i32, i32, i32)> {
     None
 }
 
+/// Extract a full date (year + month + day) from text, ignoring bare years.
+/// Used for date-bound filtering: a bare year like "2024" in content is not
+/// a reliable publication date, so we only trust full dates (e.g. "March 3, 2021").
+fn extract_full_date_from_text(text: &str) -> Option<(i32, i32, i32)> {
+    let t = text.to_lowercase();
+    let month_alt = r"(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)";
+
+    // "Month DD, YYYY" → groups: 1=month 2=day 3=year
+    static RE1: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re1 = RE1.get_or_init(|| {
+        regex::Regex::new(&format!(r"(?i)\b{}\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})", month_alt)).unwrap()
+    });
+    if let Some(c) = re1.captures(&t) {
+        if let (Some(m), Ok(d), Ok(y)) = (
+            month_num(c.get(1).unwrap().as_str()),
+            c.get(2).unwrap().as_str().parse::<i32>(),
+            c.get(3).unwrap().as_str().parse::<i32>(),
+        ) {
+            return Some((y, m, d));
+        }
+    }
+
+    // "DD Month YYYY" → groups: 1=day 2=month 3=year
+    static RE2: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re2 = RE2.get_or_init(|| {
+        regex::Regex::new(&format!(r"(?i)\b(\d{{1,2}})(?:st|nd|rd|th)?\s+{}\.?,?\s+(\d{{4}})", month_alt)).unwrap()
+    });
+    if let Some(c) = re2.captures(&t) {
+        if let (Ok(d), Some(m), Ok(y)) = (
+            c.get(1).unwrap().as_str().parse::<i32>(),
+            month_num(c.get(2).unwrap().as_str()),
+            c.get(3).unwrap().as_str().parse::<i32>(),
+        ) {
+            return Some((y, m, d));
+        }
+    }
+
+    // "Month YYYY" → groups: 1=month 2=year
+    static RE3: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re3 = RE3.get_or_init(|| {
+        regex::Regex::new(&format!(r"(?i)\b{}\.?,?\s+(\d{{4}})", month_alt)).unwrap()
+    });
+    if let Some(c) = re3.captures(&t) {
+        if let (Some(m), Ok(y)) = (
+            month_num(c.get(1).unwrap().as_str()),
+            c.get(2).unwrap().as_str().parse::<i32>(),
+        ) {
+            return Some((y, m, 1));
+        }
+    }
+
+    // Numeric YYYY-MM-DD / YYYY/MM/DD
+    parse_numeric_date(text)
+}
+
 /// True when `word` appears as a whole word in `q_lower` (alphanumeric-boundary
 /// delimited). Avoids the substring false-positive where `contains("fresh")` also
 /// matches "fresher", "freshman", or "refresh" and wrongly injects a recency window.
@@ -5637,7 +5692,8 @@ fn should_filter_by_constraints(
     // assumed in-range rather than out-of-range.
     if let Some(ref ad) = constraints.after_date {
         if let Some(limit) = parse_date_to_comparable(ad) {
-            if let Some(p_date) = resolve_item_date(published_date, url, title, content) {
+            if let Some(p_date) = published_date.and_then(parse_date_to_comparable)
+                .or_else(|| extract_full_date_from_text(&format!("{} {}", title, content))) {
                 if !date_gte(p_date, limit) {
                     return true;
                 }
@@ -5646,7 +5702,8 @@ fn should_filter_by_constraints(
     }
     if let Some(ref bd) = constraints.before_date {
         if let Some(limit) = parse_date_to_comparable(bd) {
-            if let Some(p_date) = resolve_item_date(published_date, url, title, content) {
+            if let Some(p_date) = published_date.and_then(parse_date_to_comparable)
+                .or_else(|| extract_full_date_from_text(&format!("{} {}", title, content))) {
                 if !date_lte(p_date, limit) {
                     return true;
                 }
@@ -8779,7 +8836,6 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                in_negation = false;
                 result.push(w);
             } else {
                 // Non-domain content word after a negation trigger: treat as an
