@@ -11970,6 +11970,10 @@ fn merge_local_and_web(
         let dict_cap = 0.03f32;   // dictionary sites may appear but never rank top
         let weak_cap = 0.04f32;   // single-polysemous-token matches capped low
 
+        // Max pre-cap score for graded weak-match cap: preserves relative ordering
+        // among off-topic results instead of flattening them all to the same value.
+        let max_pre_cap_score = merged.iter().map(|r| r.score).fold(0.0f32, f32::max);
+
         // Best non-video score AFTER calibration but BEFORE this pass caps any video.
         // Used by the P8 video cap (b0): a video must never outrank the best genuine
         // text result for a non-video query, in any calibration regime (see comment
@@ -12073,12 +12077,20 @@ fn merge_local_and_web(
                 // contain at least 2 of the query's real topic terms to be on-topic.
                 if matched_strong < 2 {
                     if r.score > weak_cap {
+                        // GRADED WEAK-MATCH CAP: instead of a flat cap that makes all
+                        // off-topic results tie at the same score (causing insertion-order
+                        // ranking among junk), preserve relative ordering by scaling
+                        // proportionally to the pre-cap score. This keeps off-topic
+                        // results below the on-topic floor while still differentiating
+                        // among them — the "least irrelevant" junk ranks above the
+                        // "most irrelevant" junk rather than relying on stable-sort order.
+                        let graded_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
                         tracing::info!(
-                            "POST-CAL WEAK-MATCH CAP -> {:.2}: '{}' (matched {} of {} topics)",
-                            weak_cap, r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len()
+                            "POST-CAL WEAK-MATCH CAP -> {:.4}: '{}' (matched {} of {} topics, pre_cap={:.4})",
+                            graded_cap, r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len(), r.score
                         );
-                        r.post_cal_cap = Some(weak_cap);
-                        r.score = weak_cap;
+                        r.post_cal_cap = Some(graded_cap);
+                        r.score = graded_cap;
                     }
                 }
             }
@@ -12111,13 +12123,14 @@ fn merge_local_and_web(
                     1
                 };
                 if matched_anchors < required_anchors && r.score > weak_cap {
+                    let graded_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
                     tracing::info!(
-                        "POST-CAL RARE-ANCHOR CAP -> {:.2}: '{}' (matched {} of {} rare anchors {:?}, need {})",
-                        weak_cap, r.url.chars().take(60).collect::<String>(),
-                        matched_anchors, rare_anchor_terms.len(), rare_anchor_terms, required_anchors
+                        "POST-CAL RARE-ANCHOR CAP -> {:.4}: '{}' (matched {} of {} rare anchors {:?}, need {}, pre_cap={:.4})",
+                        graded_cap, r.url.chars().take(60).collect::<String>(),
+                        matched_anchors, rare_anchor_terms.len(), rare_anchor_terms, required_anchors, r.score
                     );
-                    r.post_cal_cap = Some(weak_cap);
-                    r.score = weak_cap;
+                    r.post_cal_cap = Some(graded_cap);
+                    r.score = graded_cap;
                 }
             }
 
@@ -12146,18 +12159,13 @@ fn merge_local_and_web(
                     rl.contains(e.as_str()) || cl.contains(e.as_str()) || ul.contains(e.as_str())
                 });
                 if !names_entity {
-                    // Absolute weak_cap (0.04, UNDER the calibrated article floor of
-                    // 0.05) — same convention as the video/weak-match caps. The old
-                    // relative best_non_video*0.6 cap FAILED when the whole result set
-                    // was weak (Planoly at 0.072 vs genuine comparison articles at
-                    // 0.051: the relative cap stayed ABOVE the genuine floor because
-                    // the best text result itself was weak). An absolute sub-floor
-                    // cap guarantees a principal-naming article always outranks junk.
-                    let d3_cap = weak_cap;
+                    // Graded cap (same as weak-match/rare-anchor): preserves relative
+                    // ordering among off-topic comparison results instead of flattening.
+                    let d3_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
                     if r.score > d3_cap {
                         tracing::info!(
-                            "POST-CAL D3 COMP-CAP -> {:.2}: '{}' names none of compared entities {:?} (best_text={:.2})",
-                            d3_cap, r.url.chars().take(60).collect::<String>(), comparison_anchor_terms, best_non_video
+                            "POST-CAL D3 COMP-CAP -> {:.4}: '{}' names none of compared entities {:?} (best_text={:.2}, pre_cap={:.4})",
+                            d3_cap, r.url.chars().take(60).collect::<String>(), comparison_anchor_terms, best_non_video, r.score
                         );
                         r.post_cal_cap = Some(d3_cap);
                         r.score = d3_cap;
