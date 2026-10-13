@@ -422,6 +422,32 @@ make dev-logs
 docker logs -f if-dev-gateway
 ```
 
+### Troubleshooting: Stale Docker Port Bindings
+
+**Symptom:** `curl http://localhost:4000/health` returns rc=52 (empty reply from server) while `docker ps` shows all containers as `(healthy)`. This happens after a gluetun recreate, Docker Desktop restart, or Windows reboot.
+
+**Root cause:** Docker Desktop's port-proxy loses its binding when the container that owns the port mapping is recreated. All IntentForge services share gluetun's network namespace, so a stale gluetun port binding breaks every published port (4000, 6000, 8080, etc.) at once.
+
+**Quick fix (automatic):**
+```bash
+make dev-port-recover
+# or
+bash scripts/docker-port-healthcheck.sh
+```
+
+This detects the stale binding, recreates gluetun + all dependents, and verifies recovery. Index data survives (host bind mount). The crawler needs ~15s to restore its queue.
+
+**Manual fix:**
+```bash
+cd services
+docker compose -f docker-compose.dev.yml up -d --force-recreate gluetun gateway indexer crawler intent-engine searxng tor2 searxng2
+```
+
+**Check only (no recovery):**
+```bash
+make dev-port-check
+```
+
 ---
 
 ## Deployment
