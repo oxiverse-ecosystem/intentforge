@@ -19583,6 +19583,77 @@ async fn handle_search_fast(
 }
 
 #[cfg(test)]
+mod exact_model_gate_tests {
+    use super::*;
+
+    // ── is_exact_model_query: eligibility gate for affiliate decoration ──
+    // Monetization is exact-model-only. Broad category queries must never
+    // receive affiliate links. The gate is data-driven (regex), not a
+    // hardcoded product list.
+
+    #[test]
+    fn test_exact_model_queries_pass_the_gate() {
+        // Exact-model queries: brand + model number
+        assert!(is_exact_model_query("iphone 16 pro max price"));
+        assert!(is_exact_model_query("iphone 16"));
+        assert!(is_exact_model_query("galaxy s24 ultra"));
+        assert!(is_exact_model_query("pixel 9 pro"));
+        assert!(is_exact_model_query("macbook pro 14"));
+        assert!(is_exact_model_query("ipad air 5"));
+        assert!(is_exact_model_query("oneplus 12"));
+        assert!(is_exact_model_query("redmi note 13"));
+        assert!(is_exact_model_query("rog phone 8"));
+        assert!(is_exact_model_query("surface pro 9"));
+        assert!(is_exact_model_query("nokia g42"));
+        assert!(is_exact_model_query("moto g84"));
+        assert!(is_exact_model_query("nothing phone 2"));
+        assert!(is_exact_model_query("xiaomi 14"));
+        assert!(is_exact_model_query("poco x6"));
+        assert!(is_exact_model_query("realme gt 6"));
+        assert!(is_exact_model_query("zenfone 10"));
+        assert!(is_exact_model_query("imac 24"));
+        assert!(is_exact_model_query("apple watch 9"));
+    }
+
+    #[test]
+    fn test_broad_category_queries_fail_the_gate() {
+        // Broad product/category queries: no exact model number
+        assert!(!is_exact_model_query("best wireless earbuds under 50 dollars"));
+        assert!(!is_exact_model_query("best laptop for programming"));
+        assert!(!is_exact_model_query("cheap headphones"));
+        assert!(!is_exact_model_query("iphone vs android"));  // no model number
+        assert!(!is_exact_model_query("best phone 2026"));   // no brand+model
+        assert!(!is_exact_model_query("how to choose a laptop"));
+        assert!(!is_exact_model_query("wireless earbuds"));
+        assert!(!is_exact_model_query("laptop under 1000 rupees"));
+    }
+
+    #[test]
+    fn test_model_without_price_still_passes() {
+        // The gate is exact-model-only, not model+price. A query that names
+        // a specific model is exact-model regardless of whether it mentions price.
+        assert!(is_exact_model_query("iphone 16 pro max"));
+        assert!(is_exact_model_query("galaxy s24"));
+        assert!(is_exact_model_query("pixel 9"));
+    }
+
+    #[test]
+    fn test_price_without_model_fails() {
+        // Price signal alone is not enough — must have a specific model.
+        assert!(!is_exact_model_query("best phone under 500 dollars"));
+        assert!(!is_exact_model_query("cheap laptop"));
+        assert!(!is_exact_model_query("price of wireless earbuds"));
+    }
+
+    #[test]
+    fn test_case_insensitive() {
+        assert!(is_exact_model_query("iPhone 16 Pro Max"));
+        assert!(is_exact_model_query("GALAXY S24"));
+        assert!(is_exact_model_query("Pixel 9 Pro"));
+    }
+}
+
+#[cfg(test)]
 mod negation_scope_tests {
     use super::*;
 
