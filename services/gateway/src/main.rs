@@ -5637,7 +5637,7 @@ fn should_filter_by_constraints(
     // assumed in-range rather than out-of-range.
     if let Some(ref ad) = constraints.after_date {
         if let Some(limit) = parse_date_to_comparable(ad) {
-            if let Some(p_date) = resolve_item_date(published_date, url, title, content) {
+            if let Some(p_date) = published_date.and_then(parse_date_to_comparable) {
                 if !date_gte(p_date, limit) {
                     return true;
                 }
@@ -5646,7 +5646,7 @@ fn should_filter_by_constraints(
     }
     if let Some(ref bd) = constraints.before_date {
         if let Some(limit) = parse_date_to_comparable(bd) {
-            if let Some(p_date) = resolve_item_date(published_date, url, title, content) {
+            if let Some(p_date) = published_date.and_then(parse_date_to_comparable) {
                 if !date_lte(p_date, limit) {
                     return true;
                 }
@@ -8779,7 +8779,6 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                in_negation = false;
                 result.push(w);
             } else {
                 // Non-domain content word after a negation trigger: treat as an
