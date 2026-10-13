@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# docker-port-healthcheck.sh -- Detect and recover stale Docker port bindings
+# docker-port-healthcheck.sh - Detect and recover stale Docker port bindings
 #
 # Problem: After a gluetun recreate or Docker Desktop restart, host->container
 # port forwarding can die while containers remain healthy.  The symptom is
-# `curl http://localhost:4000/health` returning rc=52 (empty reply from server)
-# even though `docker ps` shows every container as (healthy).
+# curl http://localhost:4000/health returning rc=52 (empty reply from server)
+# even though docker ps shows every container as (healthy).
 #
 # Root cause: Docker Desktop port-proxy (com.docker.backend.exe on Windows)
 # loses its binding when the container that owns the port mapping is recreated.
@@ -32,22 +32,10 @@ COMPOSE_FILE="docker-compose.dev.yml"
 
 # Services that share the gluetun network namespace and must be recreated
 # when gluetun is recreated (their port bindings live on gluetun).
-GLUETUN_DEPENDENTS=(
-  gluetun
-  gateway
-  indexer
-  crawler
-  intent-engine
-  searxng
-  tor
-  vpn-rotator
-)
+GLUETUN_DEPENDENTS="gluetun gateway indexer crawler intent-engine searxng tor vpn-rotator"
 
 # Services on the tor2 network namespace (independent path)
-TOR2_DEPENDENCIES=(
-  tor2
-  searxng2
-)
+TOR2_DEPENDENCIES="tor2 searxng2"
 
 LOG_PREFIX="[port-healthcheck]"
 VERBOSE="${VERBOSE:-0}"
@@ -56,7 +44,7 @@ log() {
   echo "${LOG_PREFIX} $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*"
 }
 
-if [[ "${VERBOSE}" == "1" ]]; then
+if [ "${VERBOSE}" = "1" ]; then
   vlog() { log "$@"; }
 else
   vlog() { :; }
@@ -67,7 +55,7 @@ check_host_port() {
   local port="${1:-4000}"
   local http_code
   http_code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "http://localhost:${port}/health" 2>/dev/null)
-  if [[ "$http_code" == "200" ]]; then
+  if [ "$http_code" = "200" ]; then
     vlog "Host port $port: OK (HTTP $http_code)"
     return 0
   else
@@ -81,7 +69,7 @@ check_container_health() {
   local container="${1:-if-dev-gateway}"
   local http_code
   http_code=$(docker exec "$container" curl -s -m 5 -o /dev/null -w "%{http_code}" "http://localhost:4000/health" 2>/dev/null)
-  if [[ "$http_code" == "200" ]]; then
+  if [ "$http_code" = "200" ]; then
     vlog "Container $container internal: OK (HTTP $http_code)"
     return 0
   else
@@ -93,15 +81,15 @@ check_container_health() {
 # --- Check Docker container status ----------------------------------------
 check_containers_running() {
   local missing=0
-  for svc in "${GLUETUN_DEPENDENTS[@]}" "${TOR2_DEPENDENCIES[@]}"; do
+  for svc in $GLUETUN_DEPENDENTS $TOR2_DEPENDENCIES; do
     local name="if-dev-${svc}"
-    if ! docker inspect "$name" &>/dev/null; then
+    if ! docker inspect "$name" >/dev/null 2>&1; then
       log "Container $name: NOT FOUND"
       missing=$((missing + 1))
     else
       local state
       state=$(docker inspect "$name" --format '{{.State.Status}}' 2>/dev/null)
-      if [[ "$state" != "running" ]]; then
+      if [ "$state" != "running" ]; then
         log "Container $name: $state (not running)"
         missing=$((missing + 1))
       else
@@ -115,7 +103,7 @@ check_containers_running() {
 # --- Recreate gluetun + dependents ----------------------------------------
 recover_ports() {
   log "Starting port recovery: recreating gluetun + dependents"
-  log "This will recreate: ${GLUETUN_DEPENDENTS[*]}"
+  log "This will recreate: $GLUETUN_DEPENDENTS"
   log "Index data survives (host bind mount). Crawler queue restores in ~15s."
 
   cd "$COMPOSE_DIR" || return 2
@@ -131,10 +119,10 @@ recover_ports() {
   log "Waiting for gluetun to become healthy..."
   local attempts=0
   local max_attempts=30
-  while [[ $attempts -lt $max_attempts ]]; do
+  while [ $attempts -lt $max_attempts ]; do
     local health
     health=$(docker inspect if-dev-gluetun --format '{{.State.Health.Status}}' 2>/dev/null)
-    if [[ "$health" == "healthy" ]]; then
+    if [ "$health" = "healthy" ]; then
       log "gluetun is healthy"
       break
     fi
@@ -142,15 +130,15 @@ recover_ports() {
     sleep 2
   done
 
-  if [[ $attempts -ge $max_attempts ]]; then
+  if [ $attempts -ge $max_attempts ]; then
     log "WARNING: gluetun did not become healthy in time, continuing anyway"
   fi
 
   # Recreate all dependents
   log "Recreating dependents..."
   local recreate_list=""
-  for svc in "${GLUETUN_DEPENDENTS[@]}"; do
-    if [[ "$svc" != "gluetun" ]]; then
+  for svc in $GLUETUN_DEPENDENTS; do
+    if [ "$svc" != "gluetun" ]; then
       recreate_list="$recreate_list $svc"
     fi
   done
@@ -172,7 +160,7 @@ recover_ports() {
 
 # --- Main -----------------------------------------------------------------
 main() {
-  local mode="${1:-auto"}  # auto | check | recover
+  local mode="${1:-auto}"
 
   log "=== Docker Port Healthcheck ==="
   log "Mode: $mode"
@@ -180,7 +168,7 @@ main() {
   # Quick check: are containers running at all?
   if ! check_containers_running; then
     log "WARNING: Some containers are not running"
-    if [[ "$mode" == "check" ]]; then
+    if [ "$mode" = "check" ]; then
       log "Containers not running. Run: cd $COMPOSE_DIR && docker compose -f $COMPOSE_FILE up -d"
       return 2
     fi
@@ -194,7 +182,7 @@ main() {
 
   log "Host port 4000 is NOT reachable"
 
-  if [[ "$mode" == "check" ]]; then
+  if [ "$mode" = "check" ]; then
     log "Host port 4000 is unreachable. Run: bash scripts/docker-port-healthcheck.sh --recover"
     return 2
   fi
@@ -207,7 +195,7 @@ main() {
     log "Check: docker logs if-dev-gateway"
   fi
 
-  if [[ "$mode" == "check" ]]; then
+  if [ "$mode" = "check" ]; then
     return 2
   fi
 
@@ -221,7 +209,7 @@ main() {
   sleep 3
   if check_host_port 4000; then
     log "SUCCESS: Port 4000 is now reachable"
-    return 1  # 1 = was broken, now recovered
+    return 1
   else
     log "ERROR: Port 4000 still unreachable after recovery"
     log "Manual steps:"
