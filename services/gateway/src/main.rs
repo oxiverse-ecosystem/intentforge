@@ -11386,6 +11386,71 @@ fn merge_local_and_web(
         }
     }
 
+    // ── Cross-lingual hard drop (D2 extension) ──
+    // The in-loop cross-lingual guard (0.05 multiplier) is defeated by
+    // calibrate_scores when ALL results are non-Latin (e.g. Bing returning
+    // Japanese dictionary pages for an English query). A multiplier alone
+    // cannot fix this — the max-rescale stretches the dampened results back
+    // to 1.0. A hard drop removes them outright. General: keyed on script
+    // ratio, no language tables, no per-domain lists.
+    {
+        let q_chars: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
+        let q_ascii_ratio = if q_chars.is_empty() {
+            1.0
+        } else {
+            let non = q_chars.iter().filter(|c| !c.is_ascii()).count();
+            (q_chars.len() - non) as f32 / q_chars.len() as f32
+        };
+        if q_ascii_ratio >= 0.85 {
+            let before = merged.len();
+            let retained_pre_xlingual: Vec<MergedResult> = merged.iter().cloned().collect();
+            merged.retain(|r| {
+                let res_text = format!("{} {}", r.title, r.content);
+                let r_chars: Vec<char> = res_text.chars().filter(|c| !c.is_whitespace()).collect();
+                let r_ascii_ratio = if r_chars.is_empty() {
+                    1.0
+                } else {
+                    let non = r_chars.iter().filter(|c| !c.is_ascii()).count();
+                    (r_chars.len() - non) as f32 / r_chars.len() as f32
+                };
+                r_ascii_ratio >= 0.50
+            });
+            let removed = before - merged.len();
+            if removed > 0 {
+                tracing::info!(
+                    "CROSS_LINGUAL_DROP: removed {}/{} result(s) for Latin-script query (res_ascii_ratio < 0.50)",
+                    removed, before
+                );
+            }
+            // Fail-open: if dropping would empty the set, restore non-adult results
+            if merged.is_empty() && before > 0 {
+                tracing::warn!(
+                    "CROSS_LINGUAL_DROP FAIL-OPEN: all {} results were non-Latin — keeping set (sparse upstream draw)",
+                    before
+                );
+                merged = retained_pre_xlingual
+                    .into_iter()
+                    .filter(|r| {
+                        let ul = r.url.to_lowercase();
+                        let tl = r.title.to_lowercase();
+                        let host = reqwest::Url::parse(&r.url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                            .unwrap_or_default();
+                        let tld_adult = host.ends_with(".xxx");
+                        let host_adult = adult_hosts.iter().any(|h| host.contains(h));
+                        let path_adult = adult_paths.iter().any(|p| ul.contains(p));
+                        let title_adult = tl.contains("porn") || tl.contains("xxx ")
+                            || tl.contains("nude") || tl.contains("naked")
+                            || tl.contains("sex video") || tl.contains("adult film");
+                        let is_adult = tld_adult || host_adult || path_adult || title_adult;
+                        !is_adult
+                    })
+                    .collect();
+            }
+        }
+    }
+
     // ── Adult-content hard-drop for non-adult queries (this round, D4) ──
     // Privacy-first search must not surface pornographic/NSFW results for ordinary
     // queries. The web fan-out (SearXNG-via-VPN) returned XNXX adult forums for an
