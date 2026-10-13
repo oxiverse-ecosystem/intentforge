@@ -2897,6 +2897,84 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
     None
 }
 
+/// Extract product facts from a search result snippet (title + content).
+/// This is a FALLBACK for when the page fetch failed or returned no structured
+/// data. All extracted facts are marked with source="snippet_extracted" by the
+/// caller so the frontend can label them as less certain than structured data.
+///
+/// Extraction rules (all conservative — never fabricate):
+/// - Price/currency: via `extract_price_from_text` (existing, well-tested)
+/// - Product name: from the title, truncated at the first delimiter (|, -, —)
+/// - Merchant/brand: from the URL host (with merchant_observed: false)
+/// - Availability: from snippet text ("in stock", "out of stock", etc.)
+fn extract_snippet_facts(snippet: &str, url: &str) -> OfferFacts {
+    let mut facts = OfferFacts::default();
+
+    // Price + currency
+    if let Some(price_info) = extract_price_from_text(snippet) {
+        facts.price = Some(price_info.amount);
+        facts.currency = Some(price_info.currency);
+    }
+
+    // Product name: extract from title (first line, truncated at delimiter).
+    // Only if the title looks like a product name — not a question or how-to phrase.
+    let title = snippet.lines().next().unwrap_or("").trim();
+    if !title.is_empty() {
+        // Truncate at common delimiters: |, -, —, –
+        let name = title
+            .split(|c| c == '|' || c == '—' || c == '–')
+            .next()
+            .unwrap_or(title)
+            .trim();
+        // Only use as product name if it's not too long and doesn't look like a question/how-to
+        if !name.is_empty() && name.len() <= 200 && !is_question_or_howto(name) {
+            facts.name = Some(name.to_string());
+        }
+    }
+
+    // Merchant/brand: from URL host (NOT observed on page — merchant_observed stays false)
+    let host = url_host(url);
+    if !host.is_empty() && host != "localhost" {
+        facts.merchant = Some(host);
+        // merchant_observed stays false — this is derived from the URL, not the page
+    }
+
+    // Availability: look for common availability phrases in the snippet
+    let lower = snippet.to_lowercase();
+    if lower.contains("in stock") || lower.contains("available now") || lower.contains("ships today") {
+        facts.availability = Some("in_stock".to_string());
+    } else if lower.contains("out of stock") || lower.contains("unavailable") || lower.contains("sold out") {
+        facts.availability = Some("out_of_stock".to_string());
+    }
+
+    facts
+}
+
+/// Returns true if the text looks like a question or how-to phrase rather than a
+/// product name. Used to filter out non-product titles from snippet extraction.
+fn is_question_or_howto(text: &str) -> bool {
+    let lower = text.to_lowercase().trim().to_string();
+    // Question phrases
+    if lower.ends_with('?') {
+        return true;
+    }
+    // Common question starters
+    let question_starters = [
+        "what ", "how ", "why ", "when ", "where ", "which ", "who ", "is ", "are ",
+        "can ", "should ", "does ", "do ",
+    ];
+    for starter in &question_starters {
+        if lower.starts_with(starter) {
+            return true;
+        }
+    }
+    // How-to phrases
+    if lower.contains("how to") || lower.contains("how do") || lower.contains("how can") {
+        return true;
+    }
+    false
+}
+
 /// Secondary commerce price extraction: parse common HTML price patterns from
 /// pages that don't expose JSON-LD/OpenGraph/Product microdata. This is a
 /// STRUCTURED FALLBACK for known e-commerce HTML patterns — not free-text
@@ -4331,23 +4409,20 @@ async fn enrich_with_commerce<F, Fut>(
             }
             None => {}
         }
-        // Snippet-based price fallback: when the page fetch failed or returned
-        // no structured data, try to extract a price from the search result
+        // Snippet-based fallback: when the page fetch failed or returned
+        // no structured data, try to extract product facts from the search result
         // snippet (title + content). This improves enrichment recall without
-        // fabricating facts — the price is marked with source="snippet_extracted"
-        // so the frontend can label it as less certain than structured data.
+        // fabricating facts — all snippet-derived facts are marked with
+        // source="snippet_extracted" so the frontend can label them as less
+        // certain than structured data.
         if !attached {
             let snippet = format!(
                 "{} {}",
                 r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
                 r.get("content").and_then(|v| v.as_str()).unwrap_or("")
             );
-            if let Some(price_info) = extract_price_from_text(&snippet) {
-                let facts = OfferFacts {
-                    price: Some(price_info.amount),
-                    currency: Some(price_info.currency),
-                    ..Default::default()
-                };
+            let facts = extract_snippet_facts(&snippet, &url);
+            if data_has_fact(&facts) {
                 let offer = CommerceOffer {
                     url: Some(url.clone()),
                     observed_at: Some(now_unix_string()),
@@ -23246,5 +23321,106 @@ mod mainpath_shopping_strip_tests {
     fn enrich_window_is_wider_than_display_cap() {
         // Guards the constants from being re-conflated.
         assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
+    }
+
+    // ─── extract_snippet_facts tests ────────────────────────────────────
+
+    #[test]
+    fn snippet_facts_extracts_price_and_currency() {
+        let snippet = "Sony WH-1000XM5 headphones $349.99";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.price, Some(349.99));
+        assert_eq!(facts.currency, Some("USD".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_extracts_product_name_from_title() {
+        let snippet = "Sony WH-1000XM5 Wireless Headphones | Best Buy\n$349.99";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(
+            facts.name,
+            Some("Sony WH-1000XM5 Wireless Headphones".to_string())
+        );
+    }
+
+    #[test]
+    fn snippet_facts_extracts_merchant_from_url_host() {
+        let snippet = "Sony WH-1000XM5 headphones $349.99";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.merchant, Some("www.bestbuy.com".to_string()));
+        // merchant_observed must be false — derived from URL, not page
+        assert!(!facts.merchant_observed);
+    }
+
+    #[test]
+    fn snippet_facts_extracts_availability_in_stock() {
+        let snippet = "Sony WH-1000XM5 headphones $349.99 — In Stock";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.availability, Some("in_stock".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_extracts_availability_out_of_stock() {
+        let snippet = "Sony WH-1000XM5 headphones $349.99 — Out of Stock";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.availability, Some("out_of_stock".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_returns_empty_for_no_match() {
+        let snippet = "How to cook pasta";
+        let url = "https://recipes.example.com/pasta";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.price, None);
+        assert_eq!(facts.currency, None);
+        assert_eq!(facts.name, None);
+        assert_eq!(facts.availability, None);
+        // merchant is always extracted from URL host (even if no other facts)
+        assert_eq!(facts.merchant, Some("recipes.example.com".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_passes_data_has_gate() {
+        // A snippet with a price must pass data_has_fact
+        let snippet = "Sony WH-1000XM5 headphones $349.99";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert!(data_has_fact(&facts));
+    }
+
+    #[test]
+    fn snippet_facts_fails_data_has_gate_for_no_facts() {
+        // A snippet with no price, no availability, no name must fail data_has_fact
+        // (merchant alone doesn't count — merchant_observed is false)
+        let snippet = "How to cook pasta";
+        let url = "https://recipes.example.com/pasta";
+        let facts = extract_snippet_facts(snippet, url);
+        assert!(!data_has_fact(&facts));
+    }
+
+    #[test]
+    fn snippet_facts_extracts_inr_price() {
+        let snippet = "Sony WH-1000XM5 headphones ₹29,999";
+        let url = "https://www.amazon.in/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.price, Some(29999.0));
+        assert_eq!(facts.currency, Some("INR".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_handles_empty_snippet() {
+        let snippet = "";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.price, None);
+        assert_eq!(facts.name, None);
+        assert_eq!(facts.availability, None);
+        // merchant still extracted from URL
+        assert_eq!(facts.merchant, Some("www.bestbuy.com".to_string()));
     }
 }

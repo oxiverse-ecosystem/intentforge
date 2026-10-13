@@ -1740,6 +1740,28 @@ with a 22s wall cap — same enrichment + decoration pipeline, now consistent wi
 > past those to pages that DO carry product facts. Both constants are presentation-only;
 > they never influence ranking, selection, or ordering.
 
+### Snippet-based fallback enrichment (post-ROADMAP)
+
+When the page fetch fails or returns no structured product data, the gateway
+falls back to extracting product facts from the search result snippet (title +
+content). This improves enrichment recall without fabricating facts — all
+snippet-derived facts are marked with `source: "snippet_extracted"` so the
+frontend can label them as less certain than structured data.
+
+The snippet fallback extracts:
+- **Price + currency** — via `extract_price_from_text` (same well-tested function
+  used for HTML price extraction)
+- **Product name** — from the title, truncated at the first delimiter
+  (`|`, `—`, `–`), filtered to exclude question/how-to phrases
+- **Merchant/brand** — from the URL host (with `merchant_observed: false` —
+  derived from the URL, not observed on the page)
+- **Availability** — from snippet text (`"in stock"`, `"out of stock"`, etc.)
+
+All facts are marked with `source: "snippet_extracted"` and proper provenance.
+The `data_has_fact` gate applies: a snippet with no price, no availability, and
+no product name does NOT produce a `commerce` block (merchant alone doesn't
+count — `merchant_observed` is false for URL-derived merchants).
+
 ### POST /commerce/extract
 
 A **verification primitive** — runs the honest commerce extractor on supplied HTML
