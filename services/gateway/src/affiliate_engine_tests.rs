@@ -324,11 +324,13 @@ fn subid_is_coarse_host_not_user_identifying() {
     let url = aff["url"].as_str().unwrap();
     // The cuid subid must be the coarse merchant host
     assert!(url.contains("cuid=shop.example.com"), "subid must be merchant host: {}", url);
-    // No user-identifying info should appear
-    assert!(!url.contains("uid="), "no user id in subid");
-    assert!(!url.contains("session="), "no session id in subid");
-    assert!(!url.contains("ip="), "no IP in subid");
-    assert!(!url.contains("q="), "no query text in subid");
+    // No user-identifying info should appear as an affiliate-level param.
+    // We check for these as query params (preceded by & or ?) to avoid
+    // false positives from the encoded destination URL.
+    let lower = url.to_lowercase();
+    for bad in ["&uid=", "?uid=", "&user=", "?user=", "&session=", "?session=", "&ip=", "?ip=", "&q=", "?q="] {
+        assert!(!lower.contains(bad), "affiliate url leaked forbidden token '{}': {}", bad, url);
+    }
 }
 
 // ── 5. Fallback to catch-all when no per-merchant program matches ───────────

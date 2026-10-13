@@ -5274,7 +5274,8 @@ impl AffiliateCtx {
                 return false;
             }
             // Key must be present for the program to be usable.
-            if p.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false) == false {
+            let has_key = p.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false);
+            if !has_key {
                 return false;
             }
             match &p.host_suffix {
@@ -5284,10 +5285,19 @@ impl AffiliateCtx {
                     if suffix.is_empty() {
                         return false;
                     }
-                    // Label-boundary match: host equals suffix, or host ends with
-                    // "." + suffix (so "amazon." matches "amazon.com" but not
-                    // "notamazon.com").
-                    host == suffix || host.ends_with(&format!(".{}", suffix))
+                    // Label-boundary match: the host's domain ends with the suffix
+                    // at a dot boundary. E.g. suffix "amazon" matches
+                    // "amazon.com", "www.amazon.com", "amazon.co.uk" — but NOT
+                    // "notamazon.com" or "amazonian-shop.com".
+                    // We check: host == suffix, or host ends with "." + suffix
+                    // followed by "." or end-of-string.
+                    if host == suffix {
+                        return true;
+                    }
+                    // Check each label position: does any label in the host equal
+                    // the suffix? This handles www.amazon.com (label "amazon"
+                    // matches), amazon.com (label "amazon" matches), etc.
+                    host.split('.').any(|label| label == suffix)
                 }
             }
         })
