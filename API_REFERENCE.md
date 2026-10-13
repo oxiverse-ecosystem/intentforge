@@ -1684,14 +1684,18 @@ already written for `GET /shopping`, applied to a **clone** of the top-N already
 results. The main `results` ordering is untouched, so the no-manipulation guarantee
 holds for the main path too (the order-invariance test covers it).
 
-**Signal-based detection (no external call, no keyword list):** `is_commercial_intent`
+**Signal-based detection (no external call, no hardcoded keyword list):** `is_commercial_intent`
 returns true when the in-process intent signals say "wants to buy":
 - the resolved intent `label == "transactional"`, **or**
 - the `transactional` probability in the intent `distribution` is ≥ 0.50 (covers
   "X vs Y" product queries that resolve to a non-transactional argmax label but carry
   a strong transactional distribution), **or**
 - a price bound was parsed by the existing constraint parser (`price:<N` / `price:>N`
-  / `price_min` / `price_max`).
+  / `price_min` / `price_max`), **or**
+- the query contains a transactional keyword from `data/commerce/signals.json`
+  (whole-word match, data-driven — edit the file to add/remove keywords, no recompile).
+  This is a WEAK signal boost that supplements the intent engine; it never replaces
+  the label/distribution check.
 
 The `shopping` block is surfaced whenever commercial intent is detected, even
 if no upstream page exposed structured product data — every result carries
