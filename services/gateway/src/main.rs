@@ -18,6 +18,7 @@ mod geoloc;
 mod dictionary;
 mod clean;
 mod goals;
+mod query_expansion;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
 mod affiliate_engine_tests;
@@ -16528,6 +16529,114 @@ async fn handle_search(
                             tracing::warn!("THIN-RESULT FALLBACK: relaxed query timed out after 8s");
                             partial_results = true;
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // ─── Cold-start zero-result fallback: query expansion ──────────────
+    // When ALL upstreams time out under concurrent load, the candidate pool
+    // is empty after the SearXNG retry + parallel expanded-query retry +
+    // numeric-relaxation fallback. For non-numeric queries (or when the
+    // numeric relaxation also found nothing), fire a final bounded set of
+    // query-expansion variants against the VPN-only SearXNG instance.
+    // This is the "partial-result serving path when the candidate pool is
+    // empty" — it recovers from transient upstream collapse by retrying
+    // with simplified query forms (entities only, modifiers stripped).
+    if web_results.is_empty() && !searx_base_urls.is_empty() {
+        let expansion_variants = query_expansion::expand_capped(&q, 3);
+        if !expansion_variants.is_empty() {
+            tracing::info!(
+                "COLD-START FALLBACK: web_results empty, firing {} query-expansion variants",
+                expansion_variants.len()
+            );
+            let fallback_timeout = Duration::from_secs(6);
+            for variant in &expansion_variants {
+                let variant_clean = preprocess_searxng_query(variant);
+                if variant_clean.is_empty() || variant_clean == q.to_lowercase() {
+                    continue;
+                }
+                // VPN-only fallback (fast path, no Tor)
+                let fb_key = searx_base_keys[0].clone();
+                if circuit_ref.is_open(&fb_key) {
+                    continue;
+                }
+                let fb_url = searxng_url(
+                    searx_base_urls[0],
+                    &variant_clean,
+                    geo_location.as_ref(),
+                    lang,
+                );
+                let fb_client = client.clone();
+                let fb_circuit = circuit_ref.clone();
+                let fb_result = tokio::time::timeout(fallback_timeout, async move {
+                    match fb_client.get(&fb_url).send().await {
+                        Ok(resp) => {
+                            match tokio::time::timeout(Duration::from_secs(3), resp.text()).await {
+                                Ok(Ok(text)) => {
+                                    let sanitized = sanitize_json_text(&text);
+                                    match serde_json::from_str::<SearxResponse>(&sanitized) {
+                                        Ok(data) => Some(data),
+                                        Err(_) => None,
+                                    }
+                                }
+                                _ => None,
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                }).await;
+
+                match fb_result {
+                    Ok(Some(data)) if !data.results.is_empty() => {
+                        tracing::info!(
+                            "COLD-START FALLBACK: variant '{}' returned {} results",
+                            variant,
+                            data.results.len()
+                        );
+                        partial_results = true;
+                        fb_circuit.record_success(&fb_key);
+                        fb_circuit.record_results(&fb_key, data.results.len() as u64);
+                        for (pos, result) in data.results.into_iter().enumerate() {
+                            let engine_weight = fb_circuit.weight(&result.engine);
+                            let normalized = {
+                                let lower = result.url.to_lowercase();
+                                let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                                let no_trailing = no_fragment.trim_end_matches('/');
+                                let no_www = no_trailing.replacen("://www.", "://", 1);
+                                let no_mobile = no_www
+                                    .replacen("://m.", "://", 1)
+                                    .replacen("://mobile.", "://", 1);
+                                strip_tracking_params(&no_mobile)
+                            };
+                            if !url_rrf_contributions.contains_key(&normalized) {
+                                let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
+                                *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
+                                let mut instance_tagged = result;
+                                let instance_tag =
+                                    format!("instance_{}", fb_key.trim_start_matches("searxng"));
+                                if !instance_tagged.sources.contains(&instance_tag) {
+                                    instance_tagged.sources.push(instance_tag);
+                                }
+                                web_results.push(instance_tagged);
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            "COLD-START FALLBACK: variant '{}' returned 0 results",
+                            variant
+                        );
+                        partial_results = true;
+                        fb_circuit.record_success(&fb_key);
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "COLD-START FALLBACK: variant '{}' timed out after 6s",
+                            variant
+                        );
+                        partial_results = true;
                     }
                 }
             }
