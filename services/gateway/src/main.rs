@@ -4907,6 +4907,9 @@ async fn handle_shopping(
     // enrichment pass derives its budget from the time actually left in the
     // shared 30s request budget instead of assuming a fresh full one.
     let shopping_started = std::time::Instant::now();
+    // Extract the query for the exact-model gate BEFORE params is moved into
+    // handle_search. The gate decides whether affiliate decoration runs at all.
+    let is_exact_model = params.q.as_deref().map(|q| is_exact_model_query(&q.to_lowercase())).unwrap_or(false);
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
     let (status, body) = handle_search(
         state.clone(),
