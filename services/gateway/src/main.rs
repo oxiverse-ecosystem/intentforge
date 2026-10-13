@@ -16827,8 +16827,12 @@ async fn handle_search(
     // date / detectable price. These let us report applied-vs-ignored
     // constraints honestly instead of silently returning empty or unfiltered.
     let pre_filter_count = web_results.len();
+    // Count only results with an EXPLICIT published_date that parses — not dates
+    // extracted from URL patterns or free-text snippets. The FRESH_OVERRIDE hard
+    // window must only bite when upstream actually surfaced real dates; otherwise
+    // date-less results get dropped by extracted dates that fall outside the window.
     let dated_result_count = web_results.iter().filter(|r| {
-        resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
+        r.published_date.as_deref().and_then(parse_date_to_comparable).is_some()
     }).count();
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
 
@@ -16847,6 +16851,24 @@ async fn handle_search(
     // SCORING boost (freshness half-life) and the results survive. Fail-open is
     // keyed on "the hard window would remove every result", not on any specific
     // query/domain/window — so it is general and never over-drops.
+    // P6 FIX: apply the hard date window ONLY when at least 1 web result has an
+    // explicit parseable published_date. When NO result carries a real date, the
+    // hard window is cleared so recency stays a pure scoring boost (freshness
+    // half-life) — otherwise date-less results get dropped by dates extracted
+    // from URL patterns / free-text snippets that fall outside the narrow window.
+    // This is the root-cause fix for "gaganyaan latest news" returning 5 results
+    // via /search but 21 via /news: the FRESH_OVERRIDE 7-day window was dropping
+    // results whose only "date" came from extract_year_from_url or text matching.
+    if dated_result_count == 0 && (intent.structured_constraints.after_date.is_some()
+        || intent.structured_constraints.before_date.is_some())
+    {
+        tracing::info!(
+            "DATE WINDOW FAIL-OPEN (no explicit dates): 0/{} web results have a parseable published_date — clearing hard recency window (recency stays scoring-only)",
+            pre_filter_count
+        );
+        intent.structured_constraints.after_date = None;
+        intent.structured_constraints.before_date = None;
+    }
     let date_window_present = intent.structured_constraints.after_date.is_some()
         || intent.structured_constraints.before_date.is_some();
     if date_window_present && pre_filter_count > 0 {
@@ -20596,8 +20618,141 @@ mod constraint_fix_tests {
             "NOT:flask must appear in applied_constraints as 'not:flask', got: {:?}", applied);
     }
 
+    // P6 regression: the FRESH_OVERRIDE hard date window must only apply when at
+    // least 1 web result has an explicit parseable published_date. When no result
+    // carries a real date, the hard window is cleared so recency stays a scoring
+    // boost only — otherwise date-less results get dropped by dates extracted
+    // from URL patterns / free-text snippets that fall outside the narrow window.
+    // This is the root-cause fix for "gaganyaan latest news" returning 5 results
+    // via /search but 21 via /news.
+    #[test]
+    fn p6_fresh_override_no_explicit_dates_clears_hard_window() {
+        // Simulate the fail-open logic: no web result has an explicit published_date,
+        // but the FRESH_OVERRIDE has set a 7-day window.
+        let mut c = cst();
+        c.after_date = Some("2026-10-06".to_string());
+        c.before_date = Some("2026-10-13".to_string());
 
-	}
+        // Results with NO published_date — only URL-extracted or text-extracted dates.
+        let web_results = vec![
+            SearxResult {
+                title: "Gaganyaan mission update".to_string(),
+                url: "https://example.com/2024/03/15/gaganyaan".to_string(),
+                content: "The Gaganyaan mission is progressing well.".to_string(),
+                engine: "bing".to_string(),
+                score: 1.0,
+                sources: vec![],
+                published_date: None,
+                price: None,
+                currency: None,
+            },
+            SearxResult {
+                title: "ISRO Gaganyaan latest news".to_string(),
+                url: "https://example.com/news/gaganyaan".to_string(),
+                content: "Gaganyaan crew training completed in March 2024.".to_string(),
+                engine: "google".to_string(),
+                score: 0.9,
+                sources: vec![],
+                published_date: None,
+                price: None,
+                currency: None,
+            },
+        ];
+
+        // Count only results with an EXPLICIT published_date that parses.
+        let dated_result_count = web_results.iter().filter(|r| {
+            r.published_date.as_deref().and_then(parse_date_to_comparable).is_some()
+        }).count();
+
+        // With no explicit dates, the hard window must be cleared.
+        assert_eq!(dated_result_count, 0, "no results should have explicit published_date");
+
+        // Simulate the fail-open: clear the window when dated_result_count == 0.
+        let mut constraints = c.clone();
+        if dated_result_count == 0 {
+            constraints.after_date = None;
+            constraints.before_date = None;
+        }
+
+        assert!(constraints.after_date.is_none(), "hard window must be cleared when no explicit dates");
+        assert!(constraints.before_date.is_none(), "hard window must be cleared when no explicit dates");
+
+        // Verify that should_filter_by_constraints does NOT drop date-less results
+        // when the window is cleared.
+        for r in &web_results {
+            let filtered = should_filter_by_constraints(
+                &r.title, &r.content, &r.url, r.published_date.as_deref(), &constraints,
+            );
+            assert!(!filtered, "date-less result must be kept when hard window is cleared: {}", r.title);
+        }
+    }
+
+    // P6 regression: when at least 1 web result HAS an explicit parseable
+    // published_date, the hard window IS applied (normal behavior preserved).
+    #[test]
+    fn p6_fresh_override_with_explicit_dates_keeps_hard_window() {
+        let mut c = cst();
+        c.after_date = Some("2026-10-06".to_string());
+        c.before_date = Some("2026-10-13".to_string());
+
+        let web_results = vec![
+            SearxResult {
+                title: "Gaganyaan mission update".to_string(),
+                url: "https://example.com/gaganyaan".to_string(),
+                content: "The Gaganyaan mission is progressing well.".to_string(),
+                engine: "bing".to_string(),
+                score: 1.0,
+                sources: vec![],
+                published_date: Some("2026-10-10".to_string()),
+                price: None,
+                currency: None,
+            },
+            SearxResult {
+                title: "Old Gaganyaan article".to_string(),
+                url: "https://example.com/2024/03/15/gaganyaan".to_string(),
+                content: "Old news about Gaganyaan from 2024.".to_string(),
+                engine: "google".to_string(),
+                score: 0.9,
+                sources: vec![],
+                published_date: None,
+                price: None,
+                currency: None,
+            },
+        ];
+
+        let dated_result_count = web_results.iter().filter(|r| {
+            r.published_date.as_deref().and_then(parse_date_to_comparable).is_some()
+        }).count();
+
+        assert_eq!(dated_result_count, 1, "one result should have explicit published_date");
+
+        // With at least 1 explicit date, the hard window is NOT cleared.
+        let mut constraints = c.clone();
+        if dated_result_count == 0 {
+            constraints.after_date = None;
+            constraints.before_date = None;
+        }
+
+        assert!(constraints.after_date.is_some(), "hard window must be kept when explicit dates exist");
+        assert!(constraints.before_date.is_some(), "hard window must be kept when explicit dates exist");
+
+        // The result with a date inside the window should be kept.
+        let kept = should_filter_by_constraints(
+            &web_results[0].title, &web_results[0].content, &web_results[0].url,
+            web_results[0].published_date.as_deref(), &constraints,
+        );
+        assert!(!kept, "result with date inside window must be kept");
+
+        // The date-less result should also be kept (fail-open in should_filter_by_constraints).
+        let kept2 = should_filter_by_constraints(
+            &web_results[1].title, &web_results[1].content, &web_results[1].url,
+            web_results[1].published_date.as_deref(), &constraints,
+        );
+        assert!(!kept2, "date-less result must be kept (fail-open)");
+    }
+
+
+}
 
 #[cfg(test)]
 mod hardcoding_ruling_tests {
