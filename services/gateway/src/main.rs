@@ -251,6 +251,24 @@ fn is_model_number_price_query(q_lower: &str) -> bool {
     has_model && has_price
 }
 
+/// True when the query names a specific product model (e.g. "iphone 16 pro
+/// max", "galaxy s24 ultra", "pixel 9 pro"). This is the eligibility gate for
+/// affiliate decoration: monetization is exact-model-only, so broad category
+/// queries ("best wireless earbuds under 50 dollars") must never receive
+/// affiliate links even when they use the /shopping endpoint.
+///
+/// Reuses the same model-number regex as `is_model_number_price_query` but
+/// drops the price requirement — a query that names a specific model is
+/// exact-model regardless of whether it mentions price. Data-driven: the
+/// brand+model pattern lives in the regex, not in a keyword→reply table.
+fn is_exact_model_query(q_lower: &str) -> bool {
+    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let model_re = MODEL_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+\d{1,2}").unwrap()
+    });
+    model_re.is_match(q_lower)
+}
+
 fn has_price_signal(title_lower: &str, content_lower: &str) -> bool {
     static RS_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let rs_re = RS_REGEX.get_or_init(|| regex::Regex::new(r"(?i)\b(rs\.?|rupee|rupees|inr)\b|₹").unwrap());
@@ -4951,7 +4969,14 @@ async fn handle_shopping(
             )
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
-            decorate_affiliate(arr, &state.affiliate_ctx);
+            // GATE: monetization is exact-model-only. Broad category queries
+            // ("best wireless earbuds under 50 dollars") must never receive
+            // affiliate links even on /shopping. The gate is data-driven —
+            // reuses the model-number regex, no hardcoded product lists.
+            let q_shopping = params.q.as_deref().unwrap_or("").to_lowercase();
+            if is_exact_model_query(&q_shopping) {
+                decorate_affiliate(arr, &state.affiliate_ctx);
+            }
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
             // already-attached `commerce` blocks. Never reorders/reselects results.
             if let Some(arr_ref) = value.get("results").and_then(|v| v.as_array()) {
@@ -18567,7 +18592,12 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 Some(mut strip) => {
                     // STRICT post-ranking affiliate decoration on the DISPLAY strip only
                     // (never reorders — decoration is a pure post-ranking pass).
-                    decorate_affiliate(&mut strip, &state.affiliate_ctx);
+                    // GATE: monetization is exact-model-only — broad category queries
+                    // must never receive affiliate links even on the /search shopping
+                    // block. `q_lower` is in scope from the handle_search entry.
+                    if is_exact_model_query(&q_lower) {
+                        decorate_affiliate(&mut strip, &state.affiliate_ctx);
+                    }
                     // Read-only multi-merchant offer comparison from the attached facts.
                     let mut block = serde_json::json!({ "results": strip });
                     if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
