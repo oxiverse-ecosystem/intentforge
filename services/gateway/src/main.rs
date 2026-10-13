@@ -8779,7 +8779,11 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                in_negation = false;
+                // A preserved domain word inside a negation scope is real
+                // topical content the user wants (e.g. "recipes without linux
+                // spicy" — "linux" is a topic, "spicy" is not). Keep the word
+                // but do NOT end the negation scope: subsequent non-preserved
+                // words are still exclusions. Only a clause boundary ends it.
                 result.push(w);
             } else {
                 // Non-domain content word after a negation trigger: treat as an
@@ -20693,8 +20697,11 @@ mod constraint_fix_tests {
         assert_eq!(dated_result_count, 1, "one result should have explicit published_date");
 
         // With at least 1 explicit date, the hard window is NOT cleared.
+        // Replicate the production guard order from should_clear_date_window:
+        // pre_filter_count==0 is checked first (nothing to filter → don't clear),
+        // then dated_result_count==0 (no dates → clear).
         let mut constraints = c.clone();
-        if dated_result_count == 0 {
+        if dated_result_count == 0 && web_results.len() > 0 {
             constraints.after_date = None;
             constraints.before_date = None;
         }
