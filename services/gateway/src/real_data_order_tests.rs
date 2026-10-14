@@ -40,6 +40,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::affiliate::*;
 use serde_json::Value;
 
 /// The ranked input every test here decorates: several results with DIFFERENT
@@ -160,9 +161,7 @@ fn real_data_order_is_invariant_for_every_network_key_on_and_off() {
 
     for net in &networks {
         // KEYS PRESENT: only this network, its remapped key set to a dummy value.
-        let keyed_ctx = AffiliateCtx {
-            networks: remap_keys(std::slice::from_ref(net), "PRESENT", true),
-        };
+        let keyed_ctx = AffiliateCtx::from_networks(remap_keys(std::slice::from_ref(net), "PRESENT", true));
         let mut with_key = ranked_fixture();
         decorate_affiliate(&mut with_key, &keyed_ctx);
         let with_key_ranked = ranked_urls(&with_key);
@@ -176,9 +175,7 @@ fn real_data_order_is_invariant_for_every_network_key_on_and_off() {
         );
 
         // KEYS ABSENT: same network, key_env remapped to a name nothing ever sets.
-        let unkeyed_ctx = AffiliateCtx {
-            networks: remap_keys(std::slice::from_ref(net), "ABSENT", false),
-        };
+        let unkeyed_ctx = AffiliateCtx::from_networks(remap_keys(std::slice::from_ref(net), "ABSENT", false));
         let mut no_key = ranked_fixture();
         decorate_affiliate(&mut no_key, &unkeyed_ctx);
         let no_key_ranked = ranked_urls(&no_key);
@@ -207,9 +204,7 @@ fn real_data_order_is_invariant_for_every_network_key_on_and_off() {
 fn real_data_whole_config_order_invariant_keys_present_vs_absent() {
     let networks = real_ctx();
 
-    let unkeyed_ctx = AffiliateCtx {
-        networks: remap_keys(&networks, "WHOLE_ABSENT", false),
-    };
+    let unkeyed_ctx = AffiliateCtx::from_networks(remap_keys(&networks, "WHOLE_ABSENT", false));
     let mut absent = ranked_fixture();
     decorate_affiliate(&mut absent, &unkeyed_ctx);
     let absent_ranked = ranked_urls(&absent);
@@ -218,9 +213,7 @@ fn real_data_whole_config_order_invariant_keys_present_vs_absent() {
         "keys unresolvable => nothing may be decorated"
     );
 
-    let keyed_ctx = AffiliateCtx {
-        networks: remap_keys(&networks, "WHOLE_PRESENT", true),
-    };
+    let keyed_ctx = AffiliateCtx::from_networks(remap_keys(&networks, "WHOLE_PRESENT", true));
     let mut present = ranked_fixture();
     decorate_affiliate(&mut present, &keyed_ctx);
     let present_ranked = ranked_urls(&present);
@@ -243,9 +236,7 @@ fn real_data_whole_config_order_invariant_keys_present_vs_absent() {
 #[test]
 fn real_data_decoration_touches_no_field_except_affiliate() {
     let networks = real_ctx();
-    let keyed_ctx = AffiliateCtx {
-        networks: remap_keys(&networks, "FIELDS", true),
-    };
+    let keyed_ctx = AffiliateCtx::from_networks(remap_keys(&networks, "FIELDS", true));
 
     let mut decorated = ranked_fixture();
     decorate_affiliate(&mut decorated, &keyed_ctx);
@@ -327,9 +318,7 @@ async fn main_path_enrichment_is_non_vacuous_with_fetchable_pages() {
 
     // Now decorate with keys present and verify the strip would be non-empty.
     let networks = real_ctx();
-    let keyed_ctx = AffiliateCtx {
-        networks: remap_keys(&networks, "STRIP_PRESENT", true),
-    };
+    let keyed_ctx = AffiliateCtx::from_networks(remap_keys(&networks, "STRIP_PRESENT", true));
     decorate_affiliate(&mut arr, &keyed_ctx);
 
     // The concrete_offers filter (main path gate) must find at least one row.
