@@ -12785,7 +12785,8 @@ impl ExactModelConfig {
         if self.brands.is_empty() || q_lower.is_empty() {
             return false;
         }
-        let tokens: Vec<&str> = q_lower.split_whitespace().collect();
+        let q = q_lower.to_lowercase();
+        let tokens: Vec<&str> = q.split_whitespace().collect();
         for (i, token) in tokens.iter().enumerate() {
             let token_clean = token.trim_matches(|c: char| !c.is_alphanumeric());
             if !self.brands.iter().any(|b| b == token_clean) {
@@ -20272,6 +20273,7 @@ mod exact_model_gate_tests {
 
     #[test]
     fn test_case_insensitive() {
+        // has_exact_model lowercases internally, so mixed-case input works.
         let cfg = ExactModelConfig::default();
         assert!(is_exact_model_query("iPhone 16 Pro Max", &cfg));
         assert!(is_exact_model_query("GALAXY S24", &cfg));
