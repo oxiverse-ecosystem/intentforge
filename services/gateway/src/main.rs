@@ -16280,6 +16280,7 @@ async fn handle_search(
         if has_research_signal
             && (intent.intent == "navigational" || intent.confidence < 0.40)
             && intent.intent != "informational"
+            && intent.intent != "fresh"
         {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): research query '{}' was '{}' (conf={:.3}) → informational",
