@@ -238,12 +238,8 @@ fn normalize_currency_str(s: &str) -> String {
     }
 }
 
-fn is_model_number_price_query(q_lower: &str) -> bool {
-    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let model_re = MODEL_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+\d{1,2}").unwrap()
-    });
-    let has_model = model_re.is_match(q_lower);
+fn is_model_number_price_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
+    let has_model = cfg.has_exact_model(q_lower);
     let has_price = q_lower.contains("price") || q_lower.contains("cost")
         || q_lower.contains("rupee") || q_lower.contains("rupees")
         || q_lower.contains("inr") || q_lower.contains('₹')
@@ -263,12 +259,8 @@ fn is_model_number_price_query(q_lower: &str) -> bool {
 /// drops the price requirement — a query that names a specific model is
 /// exact-model regardless of whether it mentions price. Data-driven: the
 /// brand+model pattern lives in the regex, not in a keyword→reply table.
-fn is_exact_model_query(q_lower: &str) -> bool {
-    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let model_re = MODEL_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+(?:[a-z]+\s+)*[a-z]?\d{1,3}").unwrap()
-    });
-    model_re.is_match(q_lower)
+fn is_exact_model_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
+    cfg.has_exact_model(q_lower)
 }
 
 fn has_price_signal(title_lower: &str, content_lower: &str) -> bool {
@@ -4929,7 +4921,7 @@ async fn handle_shopping(
     let shopping_started = std::time::Instant::now();
     // Extract the query for the exact-model gate BEFORE params is moved into
     // handle_search. The gate decides whether affiliate decoration runs at all.
-    let is_exact_model = params.q.as_deref().map(|q| is_exact_model_query(&q.to_lowercase())).unwrap_or(false);
+    let is_exact_model = params.q.as_deref().map(|q| is_exact_model_query(&q.to_lowercase(), &state.exact_model_config)).unwrap_or(false);
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
     let (status, body) = handle_search(
         state.clone(),
@@ -12728,6 +12720,89 @@ impl CommerceSignals {
     }
 }
 
+/// Runtime-loaded exact-model brand patterns from
+/// `data/commerce/exact_model_brands.json`. The brand list is the data
+/// source for the affiliate eligibility gate (`is_exact_model_query`) and
+/// the transactional intent override (`is_model_number_price_query`).
+/// Previously these used hardcoded regexes with compiled-in brand lists —
+/// a HARD RULES violation. Now the brand list is runtime data.
+#[derive(Clone, Debug)]
+struct ExactModelConfig {
+    /// Brand names that signal an exact-product query when followed by a
+    /// model number (e.g. "iphone 16", "galaxy s24"). Loaded from
+    /// `exact_model_brands.json`. Changing this list requires NO recompile.
+    brands: Vec<String>,
+}
+
+impl Default for ExactModelConfig {
+    fn default() -> Self {
+        Self {
+            brands: vec![
+                "iphone", "ipad", "galaxy", "oneplus", "pixel", "redmi",
+                "nothing", "xiaomi", "poco", "realme", "rog", "zenfone",
+                "nokia", "moto", "motorola", "surface", "macbook", "imac", "watch",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        }
+    }
+}
+
+impl ExactModelConfig {
+    /// Load from `data/commerce/exact_model_brands.json`. Missing file or
+    /// fields → defaults. The brand list is data, never code.
+    fn load() -> Self {
+        let mut cfg = Self::default();
+        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
+            let path = std::path::Path::new(dir).join("exact_model_brands.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(arr) = v.get("brands").and_then(|x| x.as_array()) {
+                        let loaded: Vec<String> = arr
+                            .iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_lowercase()))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !loaded.is_empty() {
+                            cfg.brands = loaded;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        cfg
+    }
+
+    /// True when the query contains a known brand name followed by a model
+    /// number (e.g. "iphone 16", "galaxy s24 ultra", "pixel 9 pro").
+    /// This replaces the former hardcoded regex with a runtime-loaded
+    /// brand list. The matching logic is: find a brand word, then check
+    /// if a digit appears within the next few tokens.
+    fn has_exact_model(&self, q_lower: &str) -> bool {
+        if self.brands.is_empty() || q_lower.is_empty() {
+            return false;
+        }
+        let tokens: Vec<&str> = q_lower.split_whitespace().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            let token_clean = token.trim_matches(|c: char| !c.is_alphanumeric());
+            if !self.brands.iter().any(|b| b == token_clean) {
+                continue;
+            }
+            // Brand found — check if a digit appears in the next 4 tokens
+            // (covers "iphone 16", "galaxy s24 ultra", "pixel 9 pro")
+            let window_end = (i + 5).min(tokens.len());
+            for t in &tokens[i + 1..window_end] {
+                if t.chars().any(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 struct AppState {
     circuit: CircuitBreaker,
     cache: SearchCache,
@@ -12770,6 +12845,12 @@ struct AppState {
     /// WEAK signal boost to the existing intent classifier — never a
     /// standalone replacement.
     commerce_signals: CommerceSignals,
+    /// Runtime-loaded exact-model brand patterns. Loaded once at startup from
+    /// `data/commerce/exact_model_brands.json`. Used by the affiliate
+    /// eligibility gate (`is_exact_model_query`) and the transactional intent
+    /// override (`is_model_number_price_query`). Changing the brand list
+    /// requires NO recompile — edit the file and restart.
+    exact_model_config: ExactModelConfig,
 }
 
 async fn handle_images(
@@ -13406,6 +13487,7 @@ async fn main() {
         // Commerce config + signals — loaded from data, no recompile needed.
         commerce_config: CommerceConfig::load(),
         commerce_signals: CommerceSignals::load(),
+        exact_model_config: ExactModelConfig::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -16393,7 +16475,7 @@ async fn handle_search(
         // "oneplus 12 price") — the word "price" alone is weak signal. When a known
         // brand+model pattern co-occurs with a price/cost term, the intent is
         // decisively transactional (P10/P11 style compensation for the linear probe).
-        if is_model_number_price_query(&q_lower) {
+        if is_model_number_price_query(&q_lower, &state.exact_model_config) {
             if intent.intent != "transactional" || intent.confidence < 0.60 {
                 tracing::info!(
                     "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
