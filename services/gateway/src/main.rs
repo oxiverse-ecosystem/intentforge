@@ -24,6 +24,8 @@ mod affiliate_engine_tests;
 // ROADMAP item 6: order invariance driven by the REAL shipped affiliate data
 // (every network, keys present vs absent) — the offline CI lock.
 mod real_data_order_tests;
+// Integration tests: end-to-end affiliate decoration against real data files.
+mod affiliate_integration_tests;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
