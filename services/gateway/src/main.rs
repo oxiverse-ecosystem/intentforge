@@ -5617,7 +5617,11 @@ fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
 /// Patterns (case-insensitive, currency-agnostic — no merchant/region hardcoding):
 ///   A) "<upper-marker> <number> [currency]"  e.g. "under 150 dollars", "below 1000 rs"
 ///   B) "<currency-symbol><number> <upper-marker>" e.g. "₹20000 or less", "$600 max"
-///   C) "<number> <currency> <upper-marker>" e.g. "1000 rupees max"
+///   C) "<number> <currency> <upper-marker>"  e.g. "1000 rupees max"
+///
+/// Indian number units (lakh, crore) are converted to their numeric equivalents:
+///   1 lakh = 100,000; 1 crore = 10,000,000. Without this, "under 30 lakh" was
+///   parsed as price:<30 instead of price:<3000000.
 fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     let lower = q.to_lowercase();
     let upper_markers = [
@@ -5626,6 +5630,12 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     let lower_markers = ["over", "more than", "above", "minimum", "at least", "from"];
     let amount_pat = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
     let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.", "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw"];
+    // Indian number units: "30 lakh" = 3,000,000; "5 crore" = 50,000,000.
+    // The multiplier is applied to the parsed number before returning.
+    let indian_units: &[(&str, f32)] = &[
+        ("lakh", 100_000.0), ("lakhs", 100_000.0),
+        ("crore", 10_000_000.0), ("crores", 10_000_000.0),
+    ];
     // Distance units: a number followed by one of these is a RANGE/DISTANCE
     // bound (e.g. "within 300 kilometers", "up to 50 miles"), NOT a price.
     // Without this guard, "within 300 kilometers" was mis-read as price:<300
@@ -5646,6 +5656,16 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
         let next_token_lower = next_token.to_lowercase();
         distance_units.iter().any(|u| next_token_lower == *u)
     };
+    /// Check if the token immediately after the number is an Indian unit
+    /// (lakh/lakhs/crore/crores). Returns the multiplier if found.
+    let get_indian_multiplier = |rest_after_num: &str| -> Option<f32> {
+        let next_token = rest_after_num.trim_start()
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        indian_units.iter().find(|(u, _)| next_token == *u).map(|(_, m)| *m)
+    };
 
     // Pattern A: upper-marker then number (+ optional currency word)
     for marker in upper_markers {
@@ -5657,10 +5677,16 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
                         // Distance-bound guard: "within 300 kilometers" is a
                         // range, not a price — skip this marker (let a later
-                        // price marker, if any) match instead).
-                        if is_distance_bound(rest) {
+                        // price marker, if any, match instead).
+                        // NOTE: check the text AFTER the number, not `rest`
+                        // (which still contains the number itself).
+                        if is_distance_bound(after_num) {
                             continue;
                         }
+                        // Indian unit conversion: "30 lakh" → 3,000,000
+                        let after_num = &rest[m.end()..];
+                        let multiplier = get_indian_multiplier(after_num).unwrap_or(1.0);
+                        let v = v * multiplier;
                         // Currency-proximity guard: Pattern A is "<marker> <number>",
                         // but a discourse marker like "about" can be followed by an
                         // unrelated number that is NOT a price (e.g. "gpt 5",
@@ -5669,7 +5695,6 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         // not anywhere in the rest of the query. Without a nearby
                         // currency word, this is not a price bound — skip and try
                         // the next marker. General guard; no per-query literals.
-                        let after_num = &rest[m.end()..];
                         let near_currency = currency_words.iter().any(|c| {
                             after_num.len() >= c.len() && after_num[..c.len()].starts_with(c)
                                 || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
@@ -7284,6 +7309,13 @@ fn has_local_intent(query: &str) -> bool {
         // irrelevant results. General: query length threshold, no per-query
         // literals. A 10-word threshold cleanly separates short local queries
         // from long conversational ones.
+        //
+        // AREA-MODIFIER FIX: "south mumbai", "north delhi", "east bangalore" —
+        // the gazetteer check must match the city name ANYWHERE in the after-in
+        // segment, not just at the start. "best restaurants in south mumbai" has
+        // after_in = "south mumbai open late..." which does NOT start with
+        // "mumbai" but CONTAINS it. Without this, area-modified city queries
+        // lose local intent. General: whole-word containment, no per-query literals.
         || {
             let word_count = lower.split_whitespace().count();
             if word_count > 10 {
@@ -7300,6 +7332,23 @@ fn has_local_intent(query: &str) -> bool {
             } else {
                 false
             }
+        }
+        // "best X in <area>" / "X near <area>" — a local business/service query
+        // that names a locality or area (not necessarily a gazetteer city). The
+        // query pattern "best <service> in <area>" or "<service> near <area>" is
+        // a strong local intent signal even when <area> is a neighbourhood, not
+        // a city. General: pattern-based, no per-query literals.
+        || {
+            let word_count = lower.split_whitespace().count();
+            if word_count > 15 {
+                return false;
+            }
+            // "best <service> in <area>" or "<service> near <area>"
+            let has_local_service_pattern = (lower.starts_with("best ") && lower.contains(" in "))
+                || lower.contains(" near ")
+                || lower.contains(" nearby ")
+                || lower.contains(" local ");
+            has_local_service_pattern && word_count <= 15
         }
 }
 
@@ -15489,17 +15538,19 @@ async fn handle_search(
         // budget and surfaces upstream_unavailable even though tor2 would
         // have answered once warm. We only wait when tor2 is actually in the
         // fan-out (it is, for every request) and it's currently marked cold.
-        // Cap at 12s so a genuinely stuck tor2 can't hang the request.
+        // Cap at 6s (reduced from 12s) so a genuinely stuck tor2 can't hang the
+        // request. The 24s circuit-breaker timeout defect (round 2026-10-14)
+        // showed that 12s warm-up + 10s × 2 attempts exceeded the 30s budget.
         if searx_urls.iter().any(|u| u.contains("tor2")) && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
             let mut waited = 0u64;
-            while waited < 12000 && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
+            while waited < 6000 && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 waited += 500;
             }
             if TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
                 tracing::debug!("tor2 warmed during pre-query wait ({}ms)", waited);
             } else {
-                tracing::warn!("tor2 still cold after 12s pre-query wait; querying anyway");
+                tracing::warn!("tor2 still cold after 6s pre-query wait; querying anyway");
             }
         }
 
@@ -15532,7 +15583,13 @@ async fn handle_search(
             } else {
                 // Non-site queries also fan out to tor2; allow its cold-circuit
                 // time so it can serve as a true redundant path.
-                10000
+                // Reduced from 10s to 6s: the 24s circuit-breaker timeout defect
+                // (round 2026-10-14) showed that 10s × 2 attempts + tor2 warm-up
+                // wait exceeded the 30s REQUEST_TIMEOUT_SECS, causing 40% of queries
+                // to hit the circuit breaker. 6s per attempt gives a worst case of
+                // 6+6=12s + overhead, well under the 30s budget. The retry still
+                // recovers transient failures — it just doesn't wait as long.
+                6000
             }
         };
         let min_early_return: usize = 15;
@@ -16077,6 +16134,10 @@ async fn handle_search(
         // or "rate" but is NOT transactional. The keyword list is a weak signal; the
         // how-to/informational starter is a strong one. Only an explicit price bound
         // (parsed from NL) can override a how-to starter — that is a decisive signal.
+        //
+        // EXCEPTION: "how much does X cost" / "how many" queries are price questions,
+        // not informational. The word "cost" or a price/cost term in the query body
+        // is a decisive transactional signal even when the query starts with "how much".
         let informational_starters = [
             "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
             "what is ", "what are ", "what was ", "what were ", "why ", "why is ",
@@ -16084,6 +16145,14 @@ async fn handle_search(
             "understand ", "learn ", "teach me ",
         ];
         let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+        // "how much does X cost" / "how much is X" / "how many" with a price/cost term
+        // is a transactional price question, NOT informational. The presence of
+        // "cost", "price", "rupee", "inr", "₹", "dollar", etc. in the query body is a
+        // decisive signal that overrides the informational starter guard.
+        let has_price_term_in_body = ["cost", "price", "pricing", "rupee", "rupees", "inr", "₹", "dollar", "dollars", "budget", "cheap", "expensive", "affordable", "worth"]
+            .iter().any(|t| q_lower.contains(t));
+        let is_how_much_price_query = (q_lower.starts_with("how much") || q_lower.starts_with("how many"))
+            && has_price_term_in_body;
         // Word-boundary matching: each keyword must appear as a complete word,
         // not as a substring of another word (e.g. "price" must not match
         // "priceless"). The trailing-space convention ("price ") missed queries
@@ -16105,7 +16174,8 @@ async fn handle_search(
         // The keyword-based tx signal is suppressed when the query starts with an
         // informational/how-to starter. A price bound is still allowed through — it is
         // a decisive signal that the user wants to buy, not just learn.
-        let tx_signal_effective = has_tx_signal && !has_informational_starter;
+        // EXCEPTION: "how much does X cost" is a price question, not informational.
+        let tx_signal_effective = (has_tx_signal && !has_informational_starter) || is_how_much_price_query;
         if (tx_signal_effective || has_price_bound) && !has_local_keywords {
             if (intent.intent != "comparison" || has_price_bound)
                 && (intent.intent != "transactional" || intent.confidence < 0.60)
@@ -16129,6 +16199,39 @@ async fn handle_search(
                 intent.confidence = intent.confidence.max(0.80);
                 let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
                 intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
+            }
+        }
+
+        // Override 6b: Career-advice / transition queries → informational
+        // Long conversational queries like "i am a 28 year old chartered accountant
+        // ... i want to transition into data analytics ... should i learn python or r"
+        // are career advice, NOT technical. The intent engine misclassifies them as
+        // "technical" because they mention tech terms (python, data, programming).
+        // The decisive signal: the query describes a career situation (job title +
+        // "transition" / "switch" / "move into" / "career" / "should i learn").
+        // General: pattern-based on career vocabulary, no per-query literals.
+        let career_signals = [
+            "transition", "transitioning", "switch", "switching", "move into",
+            "moving into", "career", "job change", "new field", "new career",
+            "should i learn", "should i study", "how do i become",
+            "how to become", "what should i learn", "advice", "guidance",
+        ];
+        let has_career_signal = career_signals.iter().any(|s| q_lower.contains(s));
+        let has_job_context = ["i am a ", "i'm a ", "i work as ", "i have been working",
+            "years of experience", "working as", "my job", "my career",
+        ].iter().any(|s| q_lower.contains(s));
+        if has_career_signal && has_job_context && intent.intent == "technical" {
+            tracing::info!(
+                "INTENT OVERRIDE (CAREER): career-advice query '{}' was 'technical' -> informational",
+                q
+            );
+            intent.intent = "informational".to_string();
+            intent.confidence = intent.confidence.max(0.75);
+            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+            intent.distribution.insert("informational".to_string(), (info_prob + 0.50).min(0.88));
+            // Dampen the spurious technical probability
+            if let Some(t) = intent.distribution.get_mut("technical") {
+                *t = (*t * 0.4).min(0.30);
             }
         }
 
