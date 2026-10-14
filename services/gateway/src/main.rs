@@ -5604,13 +5604,20 @@ fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
 
         let aff_url = render_affiliate_url(net, &url, &subid);
 
-        // Disclosure label: prefer the metadata's `disclosure_label` (from
-        // networks.json), falling back to the program/network's own `network`
-        // field. This is DATA-DRIVEN — the label comes from the data file.
-        let disclosure_label = meta
-            .map(|m| m.disclosure_label.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&net.network);
+        // Disclosure label: prefer the program/network's own `network` field
+        // (from affiliate_programs.json / affiliate.json), falling back to the
+        // metadata's `disclosure_label` (from networks.json). This is DATA-DRIVEN
+        // — the label comes from the runtime-loaded data files, never from code.
+        // The program's own `network` field is now the primary source (all
+        // entries in affiliate_programs.json carry it), with networks.json as
+        // a fallback for legacy catch-all networks that lack the field.
+        let disclosure_label = if !net.network.is_empty() {
+            net.network.as_str()
+        } else {
+            meta.map(|m| m.disclosure_label.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&net.network)
+        };
 
         // Reporting fields (ROADMAP item 6): surface the configured bid floor /
         // fallback so operators can report on monetization. These are DATA-driven

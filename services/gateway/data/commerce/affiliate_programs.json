@@ -5,6 +5,7 @@
     {
       "id": "sovrn_commerce",
       "name": "Sovrn Commerce",
+      "network": "Sovrn Commerce",
       "host_suffix": null,
       "kind": "wrap",
       "enabled": true,
@@ -22,6 +23,7 @@
     {
       "id": "skimlinks",
       "name": "Skimlinks",
+      "network": "Skimlinks",
       "host_suffix": null,
       "kind": "wrap",
       "enabled": true,
@@ -34,6 +36,7 @@
     {
       "id": "ebay_epn",
       "name": "eBay Partner Network",
+      "network": "eBay Partner Network",
       "host_suffix": "ebay.",
       "kind": "append_params",
       "enabled": true,
@@ -55,6 +58,7 @@
     {
       "id": "amazon_associates",
       "name": "Amazon Associates",
+      "network": "Amazon Associates",
       "host_suffix": "amazon.",
       "kind": "append_params",
       "enabled": true,
@@ -69,6 +73,7 @@
     {
       "id": "rakuten_advertising",
       "name": "Rakuten Advertising",
+      "network": "Rakuten Advertising",
       "host_suffix": null,
       "kind": "wrap",
       "enabled": true,
