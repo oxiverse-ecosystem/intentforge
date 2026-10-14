@@ -5053,6 +5053,7 @@ struct AffiliateNetwork {
     #[serde(default = "default_priority")]
     priority: i64,
     #[serde(default)]
+    #[serde(default)]
     network: String,
     template: String,
     #[serde(default)]
