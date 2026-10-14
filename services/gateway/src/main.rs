@@ -18728,7 +18728,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         // carry product facts. `serde_json::to_value` on `MergedResult` is lossless.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
             .iter()
-            .take(enrich_window)
+            .take(state.commerce_config.enrich_window)
             .filter_map(|r| serde_json::to_value(r).ok())
             .collect();
         if shop_arr.is_empty() {
