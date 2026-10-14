@@ -13504,6 +13504,7 @@ async fn main() {
         // ranking, no monetization, no user-tracking surface. The /shopping
         // endpoint and affiliate decoration land in later increments.
         .route("/commerce/extract", post(handle_commerce_extract))
+        .route("/commerce/status", get(handle_commerce_status))
         .route("/shopping", get(handle_shopping))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
@@ -14156,6 +14157,115 @@ async fn handle_video(
         );
     }
     let result = build_video_inspect(&q);
+    (axum::http::StatusCode::OK, Json(result))
+}
+
+/// Pure builder for `/commerce/status`. Reports the current commerce/affiliate
+/// configuration state without exposing secrets. For each network/program, it
+/// reports whether the required env var is SET (boolean only — never the value).
+/// Also reports whether a given query would be detected as commercial intent.
+///
+/// This is a DIAGNOSTIC endpoint — it helps operators debug commerce issues
+/// without reading logs or inspecting data files manually. It is additive and
+/// zero-side-effect: it never touches ranking, never fetches pages, never
+/// decorates results.
+fn build_commerce_status(
+    ctx: &AffiliateCtx,
+    cfg: &CommerceConfig,
+    signals: &CommerceSignals,
+    query: &str,
+) -> serde_json::Value {
+    // Report each network/program with its key status (boolean only).
+    let mut networks_json = Vec::new();
+    for net in &ctx.networks {
+        let has_key = net
+            .key_env
+            .as_ref()
+            .map(|k| std::env::var(k).is_ok())
+            .unwrap_or(false);
+        networks_json.push(serde_json::json!({
+            "id": net.id,
+            "kind": net.kind,
+            "enabled": net.enabled,
+            "priority": net.priority,
+            "network": net.network,
+            "host_suffix": net.host_suffix,
+            "key_env": net.key_env,
+            "key_configured": has_key,
+        }));
+    }
+    let mut programs_json = Vec::new();
+    for prog in &ctx.programs {
+        let has_key = prog
+            .key_env
+            .as_ref()
+            .map(|k| std::env::var(k).is_ok())
+            .unwrap_or(false);
+        programs_json.push(serde_json::json!({
+            "id": prog.id,
+            "kind": prog.kind,
+            "enabled": prog.enabled,
+            "priority": prog.priority,
+            "network": prog.network,
+            "host_suffix": prog.host_suffix,
+            "key_env": prog.key_env,
+            "key_configured": has_key,
+        }));
+    }
+
+    // Report whether the query would be detected as commercial intent.
+    // Uses the SAME is_commercial_intent fn that /search uses.
+    let q_trimmed = query.trim();
+    let is_commercial = if q_trimmed.is_empty() {
+        false
+    } else {
+        // Use the fallback intent (no network call) for a deterministic check.
+        let intent_resp = fallback_intent(q_trimmed);
+        let has_price_bound = extract_price_bound(q_trimmed).is_some();
+        is_commercial_intent(
+            &intent_resp.intent,
+            &intent_resp.distribution,
+            has_price_bound,
+            signals,
+            q_trimmed,
+        )
+    };
+
+    serde_json::json!({
+        "config": {
+            "mainpath_top_n": cfg.mainpath_top_n,
+            "enrich_window": cfg.enrich_window,
+        },
+        "signals": {
+            "transactional_keywords_count": signals.transactional_keywords.len(),
+        },
+        "networks": networks_json,
+        "programs": programs_json,
+        "query": query,
+        "is_commercial_intent": is_commercial,
+    })
+}
+
+/// `GET /commerce/status?q=...` — commerce/affiliate diagnostic endpoint.
+///
+/// Reports the current commerce configuration state: which networks/programs
+/// are loaded, whether their required env vars are set, and whether a given
+/// query would be detected as commercial intent. This helps operators debug
+/// commerce issues without reading logs or inspecting data files manually.
+///
+/// ADDITIVE + ZERO-SIDE-EFFECT: never touches ranking, never fetches pages,
+/// never decorates results. Empty `q` returns the status with `is_commercial_intent: false`.
+async fn handle_commerce_status(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let q = params.q.clone().unwrap_or_default();
+    let result = build_commerce_status(
+        &state.affiliate_ctx,
+        &state.commerce_config,
+        &state.commerce_signals,
+        &q,
+    );
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -23195,6 +23305,98 @@ structured product data, so nothing must be extracted from the body.</p></body><
             !is_commercial_intent("informational", &dist, false, &sig, "rust ownership"),
             "non-transactional query must not be boosted"
         );
+    }
+
+    #[test]
+    fn commerce_status_reports_networks_and_config() {
+        let ctx = AffiliateCtx::load();
+        let cfg = CommerceConfig::load();
+        let sig = CommerceSignals::load();
+        let status = build_commerce_status(&ctx, &cfg, &sig, "laptop price");
+
+        // Config values must be present and match the loaded config.
+        let config = status.get("config").expect("config block");
+        assert_eq!(
+            config.get("mainpath_top_n").and_then(|v| v.as_u64()),
+            Some(cfg.mainpath_top_n as u64)
+        );
+        assert_eq!(
+            config.get("enrich_window").and_then(|v| v.as_u64()),
+            Some(cfg.enrich_window as u64)
+        );
+
+        // Networks and programs must be arrays (possibly empty if no data files).
+        assert!(status.get("networks").unwrap().is_array());
+        assert!(status.get("programs").unwrap().is_array());
+
+        // The query must be commercial (it contains "price").
+        assert_eq!(
+            status.get("is_commercial_intent").and_then(|v| v.as_bool()),
+            Some(true),
+            "laptop price should be commercial"
+        );
+    }
+
+    #[test]
+    fn commerce_status_non_commercial_query() {
+        let ctx = AffiliateCtx::load();
+        let cfg = CommerceConfig::load();
+        let sig = CommerceSignals::load();
+        let status = build_commerce_status(&ctx, &cfg, &sig, "rust ownership");
+
+        assert_eq!(
+            status.get("is_commercial_intent").and_then(|v| v.as_bool()),
+            Some(false),
+            "rust ownership should NOT be commercial"
+        );
+    }
+
+    #[test]
+    fn commerce_status_empty_query_is_not_commercial() {
+        let ctx = AffiliateCtx::load();
+        let cfg = CommerceConfig::load();
+        let sig = CommerceSignals::load();
+        let status = build_commerce_status(&ctx, &cfg, &sig, "");
+
+        assert_eq!(
+            status.get("is_commercial_intent").and_then(|v| v.as_bool()),
+            Some(false),
+            "empty query must not be commercial"
+        );
+    }
+
+    #[test]
+    fn commerce_status_reports_key_configured_boolean_only() {
+        // The endpoint must report whether an env var is SET, never its value.
+        // This test verifies the shape: every network/program has a boolean
+        // `key_configured` field.
+        let ctx = AffiliateCtx::load();
+        let cfg = CommerceConfig::load();
+        let sig = CommerceSignals::load();
+        let status = build_commerce_status(&ctx, &cfg, &sig, "test");
+
+        for net in status.get("networks").unwrap().as_array().unwrap() {
+            assert!(
+                net.get("key_configured").is_some(),
+                "network {} must have key_configured",
+                net.get("id").unwrap()
+            );
+            assert!(
+                net.get("key_configured").unwrap().is_boolean(),
+                "key_configured must be boolean"
+            );
+        }
+        for prog in status.get("programs").unwrap().as_array().unwrap() {
+            assert!(
+                prog.get("key_configured").is_some(),
+                "program {} must have key_configured",
+                prog.get("id").unwrap()
+            );
+            assert!(
+                prog.get("key_configured").unwrap().is_boolean(),
+                "key_configured must be boolean"
+            );
+        }
     }
 
     #[test]
