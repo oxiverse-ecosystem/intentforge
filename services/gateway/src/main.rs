@@ -2914,7 +2914,7 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
 ///
 /// Only fires when structured extraction (JSON-LD, OG, microdata) found nothing,
 /// and only extracts the FIRST visible price — no aggregation or guessing.
-/// The resulting OfferFacts is marked source="extracted_from_text" by the caller.
+/// The resulting OfferFacts is marked source="html_pattern" by the caller.
 ///
 /// Returns Some((price, currency)) on the first match, None otherwise.
 fn extract_price_from_html_patterns(html: &str) -> Option<(f64, String)> {
@@ -3645,24 +3645,7 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         }
     }
 
-    // 5) Secondary commerce extraction: parse common HTML price patterns from the
-    //    page when structured extraction (JSON-LD, OG, microdata, MF2) found nothing.
-    //    Many product pages (Amazon, eBay, Walmart, etc.) embed prices in custom
-    //    HTML (e.g., <span class="a-price">) that don't conform to any standard
-    //    schema. This fallback ONLY fires when primary extraction returned no price,
-    //    and ONLY sets price + currency — never merchant, rating, or other facts
-    //    that would require more context. Marked with source="extracted_from_text"
-    //    so the frontend can label it distinctly from structured data. This is NOT
-    //    regex guessing on body text — it targets known e-commerce HTML patterns.
-    if facts.price.is_none() && facts.price_low.is_none() {
-        if let Some((price, currency)) = extract_price_from_html_patterns(html) {
-            facts.price = Some(price);
-            facts.currency = Some(currency);
-            source = Some("extracted_from_text".to_string());
-        }
-    }
-
-    // 6) Merchant fallback: derive a coarse host label only when no page-provided
+    // 5) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     //
     //    Whether a merchant was OBSERVED is recorded BEFORE the fallback runs, so
@@ -5513,6 +5496,40 @@ fn should_clear_date_window(
 fn should_filter_by_constraints(
     title: &str, content: &str, url: &str, published_date: Option<&str>, constraints: &Constraints,
 ) -> bool {
+    // 0. Hard-drop results that match ZERO positive constraints.
+    // When a query carries positive constraints (e.g. "note taking app"),
+    // a result that matches none of them is off-topic and must be dropped,
+    // not just softly penalised. Without this, "note taking app" returns
+    // privacy apps (LibreWolf, Tuta calendar) because they get a 0.60x
+    // penalty but still appear in results.
+    if !constraints.positive.is_empty() {
+        let text_lower = format!("{} {} {}", title.to_lowercase(), content.to_lowercase(), url.to_lowercase());
+        let any_positive_matched = constraints.positive.iter().any(|pos| {
+            let pos_lower = pos.to_lowercase();
+            let pos_normalized: String = pos_lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
+            let pos_words: Vec<&str> = pos_lower.split_whitespace().collect();
+            if pos_words.len() == 1 {
+                text_lower.split_whitespace().any(|w| {
+                    w == pos_lower
+                    || w.trim_matches(|c: char| !c.is_alphanumeric()) == pos_lower
+                    || w.chars().filter(|c| c.is_alphanumeric()).collect::<String>() == pos_normalized
+                })
+                || (pos_normalized.len() >= 3 && text_lower.contains(&pos_normalized))
+            } else {
+                text_lower.contains(&pos_lower)
+                || pos_words.iter().all(|w| {
+                    let w_clean = w.chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+                    text_lower.split_whitespace().any(|tw| {
+                        tw == *w || tw.trim_matches(|c: char| !c.is_alphanumeric()) == *w
+                    }) || (w_clean.len() >= 3 && text_lower.contains(&w_clean))
+                })
+            }
+        });
+        if !any_positive_matched {
+            return true;
+        }
+    }
+
     // 1. Hard filter on file_types
     if !constraints.file_types.is_empty() {
         if let Ok(parsed_url) = reqwest::Url::parse(url) {
@@ -5626,29 +5643,34 @@ fn should_filter_by_constraints(
     }
 
     // 3. Hard filter on date bounds
-    // Policy: a date bound filters ONLY results that carry a parseable
-    // published date. Results without a resolvable date are KEPT, never
-    // dropped — dropping them silently removes the majority of general web
-    // results (most pages expose no machine-readable date), which previously
-    // zeroed out queries like "python after:2024" even though plenty of
-    // relevant content existed. We report the coverage gap via
-    // `ignored_constraints` (dated_result_count==0) instead of silently
-    // filtering everything. This is the fail-open choice: a dateless result is
-    // assumed in-range rather than out-of-range.
+    // Policy: a date bound filters ONLY results that carry an explicit
+    // published_date. Results with published_date == None are KEPT (fail-open) —
+    // dropping them silently removes the majority of general web results (most
+    // pages expose no machine-readable date), which previously zeroed out queries
+    // like "python after:2024" even though plenty of relevant content existed.
+    // We report the coverage gap via `ignored_constraints` (dated_result_count==0)
+    // instead of silently filtering everything.
+    // NOTE: we do NOT call resolve_item_date here because it extracts dates from
+    // URLs (e.g. /2024/03/15/) and content text, which would cause date-less
+    // results to be dropped — defeating the fail-open policy.
     if let Some(ref ad) = constraints.after_date {
         if let Some(limit) = parse_date_to_comparable(ad) {
-            if let Some(p_date) = resolve_item_date(published_date, url, title, content) {
-                if !date_gte(p_date, limit) {
-                    return true;
+            if let Some(pd) = published_date {
+                if let Some(p_date) = parse_date_to_comparable(pd) {
+                    if !date_gte(p_date, limit) {
+                        return true;
+                    }
                 }
             }
         }
     }
     if let Some(ref bd) = constraints.before_date {
         if let Some(limit) = parse_date_to_comparable(bd) {
-            if let Some(p_date) = resolve_item_date(published_date, url, title, content) {
-                if !date_lte(p_date, limit) {
-                    return true;
+            if let Some(pd) = published_date {
+                if let Some(p_date) = parse_date_to_comparable(pd) {
+                    if !date_lte(p_date, limit) {
+                        return true;
+                    }
                 }
             }
         }
@@ -8779,7 +8801,11 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                in_negation = false;
+                // A preserved domain word inside negation scope is kept as a
+                // positive term, but it does NOT end the negation scope —
+                // subsequent non-preserved words are still exclusions.
+                // (e.g. "recipes without linux spicy" -> "linux" stays,
+                //  "spicy" is excluded)
                 result.push(w);
             } else {
                 // Non-domain content word after a negation trigger: treat as an
@@ -16220,8 +16246,8 @@ async fn handle_search(
     // Count-based retry (no relevance needed yet — fires before Invidious/news/image)
     if (needs_more_results || has_contrastive_negatives) && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
         let mut retry_futs = Vec::new();
-        let retry_timeout = Duration::from_secs(4); // shorter than initial 5s
-        let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 6 } else { 3 };
+        let retry_timeout = Duration::from_secs(2); // shorter than initial 5s; 2s is enough for a retry
+        let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 4 } else { 2 };
         for (eq_idx, eq) in expanded_queries.iter().enumerate().skip(1) {
             if eq_idx > max_variations { break; }
             let clean_eq = preprocess_searxng_query(eq);
@@ -19640,7 +19666,7 @@ mod constraint_fix_tests {
             "Old article",
             "This was published on March 3, 2021 and is stale.",
             "https://example.com/a",
-            None,
+            Some("2021-03-03"),
             &c,
         );
         assert!(old, "result dated 2021 should be filtered by after:2024");
@@ -19649,7 +19675,7 @@ mod constraint_fix_tests {
             "New article",
             "This was published on March 3, 2025 and is current.",
             "https://example.com/b",
-            None,
+            Some("2025-03-03"),
             &c,
         );
         assert!(!fresh, "result dated 2025 should pass after:2024");
@@ -21801,14 +21827,17 @@ mod spellcheck_endpoint_tests {
         assert_eq!(d.price_high, None);
     }
 
-    // ── ROADMAP item 1 (increment): secondary HTML price fallback ─────────
-    // When structured extraction (JSON-LD/OG/microdata) finds no price, the
-    // secondary HTML price pattern fallback recovers prices from common
-    // e-commerce HTML patterns. These tests prove it fires only as a fallback,
-    // extracts the first visible price, and labels the source correctly.
+    // ── HTML-pattern extraction (now in enrich_with_commerce, not here) ────
+    // extract_commerce_offer ONLY does structured extraction (JSON-LD, OG,
+    // microdata, MF2). HTML pattern extraction is handled by the dedicated
+    // html_pattern tier in enrich_with_commerce. These tests verify that
+    // extract_commerce_offer does NOT fire on HTML patterns alone.
 
     #[test]
-    fn html_pattern_fallback_extracts_from_data_price_attribute() {
+    fn html_pattern_not_extracted_by_extract_commerce_offer() {
+        // A page with NO structured markup but WITH a recognizable price container.
+        // extract_commerce_offer must NOT extract it — that is the job of the
+        // html_pattern tier in enrich_with_commerce.
         let html = r#"<!doctype html><html><body>
 <h1>Wireless Headphones</h1>
 <div class="product-price" data-price="299.99" data-currency="USD">
@@ -21817,25 +21846,26 @@ mod spellcheck_endpoint_tests {
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/hp");
         let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(299.99), "price extracted from data-price");
-        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+        assert_eq!(d.price, None, "price must NOT be extracted from HTML patterns");
+        assert_eq!(d.currency, None, "currency must NOT be extracted from HTML patterns");
+        assert_eq!(o.source.as_deref(), None);
     }
 
     #[test]
-    fn html_pattern_fallback_extracts_currency_in_class_span() {
+    fn html_pattern_currency_not_extracted_by_extract_commerce_offer() {
         let html = r#"<!doctype html><html><body>
 <h1>Sony WH-1000XM5</h1>
 <span class="price">₹29,999</span>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/sony");
         let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(29999.0));
-        assert_eq!(d.currency.as_deref(), Some("INR"));
-        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+        assert_eq!(d.price, None, "price must NOT be extracted from HTML patterns");
+        assert_eq!(d.currency, None, "currency must NOT be extracted from HTML patterns");
     }
 
     #[test]
-    fn html_pattern_fallback_does_not_fire_when_jsonld_present() {
+    fn html_pattern_not_extracted_when_jsonld_present() {
+        // When structured extraction succeeds, HTML patterns are irrelevant.
         let html = r#"<!doctype html><html><head>
 <script type="application/ld+json">
 { "@context": "https://schema.org/", "@type": "Product",
@@ -21845,13 +21875,12 @@ mod spellcheck_endpoint_tests {
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/w");
         let d = o.data.as_ref().unwrap();
-        // JSON-LD wins, HTML pattern does NOT overwrite
         assert_eq!(d.price, Some(49.99));
         assert_eq!(o.source.as_deref(), Some("json-ld"));
     }
 
     #[test]
-    fn html_pattern_fallback_does_not_fire_when_microdata_present() {
+    fn html_pattern_not_extracted_when_microdata_present() {
         let html = format!(r#"<!doctype html><html><body>
 <div itemscope itemtype="https://schema.org/Product">
   <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
@@ -21868,7 +21897,7 @@ mod spellcheck_endpoint_tests {
     }
 
     #[test]
-    fn html_pattern_fallback_returns_none_for_non_product_pages() {
+    fn html_pattern_returns_none_for_non_product_pages() {
         let html = r#"<!doctype html><html><body>
 <h1>How to bake bread</h1>
 <p>This recipe uses 3 cups of flour and costs about $2 per loaf.</p>
@@ -21876,16 +21905,12 @@ mod spellcheck_endpoint_tests {
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://blog.example.com/bread");
         let d = o.data.as_ref().unwrap();
-        // The recipe mentions "$2" but not in a product context — the HTML
-        // pattern scan only looks in the first 8KB and the $2 is far from any
-        // price container. It should NOT fire.
         assert_eq!(d.price, None);
         assert_eq!(o.source.as_deref(), None);
     }
 
     #[test]
-    fn html_pattern_fallback_ignores_unreasonable_prices() {
-        // Price of 0 or >10M should be rejected
+    fn html_pattern_ignores_unreasonable_prices() {
         let html = r#"<!doctype html><html><body>
 <span class="price">$99999999</span>
 </body></html>"#;
@@ -21895,31 +21920,28 @@ mod spellcheck_endpoint_tests {
     }
 
     #[test]
-    fn html_pattern_fallback_preserves_structured_currency() {
+    fn html_pattern_does_not_extract_currency_without_structured() {
         let html = r#"<!doctype html><html><body>
 <span class="sale-price">€89.99</span>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/eu");
         let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(89.99));
-        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(d.price, None);
+        assert_eq!(d.currency, None);
     }
 
     #[test]
-    fn html_pattern_fallback_itemprop_meta_price() {
+    fn html_pattern_itemprop_meta_not_extracted() {
         let html = r#"<!doctype html><html><head>
 <meta itemprop="price" content="549.00">
 </head><body><h1>Product</h1></body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/m");
         let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(549.00));
-        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+        assert_eq!(d.price, None);
     }
 
     #[test]
-    fn html_pattern_fallback_does_not_extract_rating_or_other_facts() {
-        // The fallback should ONLY extract price and currency — never other
-        // facts like rating, availability, or name from free text.
+    fn html_pattern_does_not_extract_rating_or_other_facts() {
         let html = r#"<!doctype html><html><body>
 <h1>Amazing Product</h1>
 <span class="price">$49.99</span>
@@ -21928,7 +21950,7 @@ mod spellcheck_endpoint_tests {
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/ap");
         let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.price, None);
         assert_eq!(d.rating, None, "rating must NOT be extracted from text");
         assert_eq!(d.availability, None, "availability must NOT be extracted from text");
     }
@@ -23208,7 +23230,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
                 { "url": "https://store.example.com/p/1",
                   "commerce": { "price": 199.0, "currency": "USD" },
                   "commerce_provenance": { "url": "https://store.example.com/p/1",
-                      "observed_at": "2026-01-01T00:00:00Z", "source": "extracted_from_text",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "html_pattern",
                       "data": { "price": 199.0 } } },
                 // URL 2 is in the shopping block too — must NOT overwrite its
                 // existing commerce (no clobbering).
@@ -23260,7 +23282,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
         // Provenance copied for enriched results (honesty invariant).
         assert_eq!(
-            results[0]["commerce_provenance"]["source"], "extracted_from_text"
+            results[0]["commerce_provenance"]["source"], "html_pattern"
         );
         assert_eq!(
             results[2]["commerce_provenance"]["source"], "json-ld"
