@@ -4988,6 +4988,7 @@ struct AffiliateNetwork {
     /// url-encoded as a query param. DATA-ONLY.
     #[serde(default)]
     fallback_url: Option<String>,
+            host_suffix: None,
 }
 
 fn default_true() -> bool {
@@ -5071,7 +5072,9 @@ fn is_reserved_documentation_host(host: &str) -> bool {
 /// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
 #[derive(Clone)]
 struct AffiliateCtx {
-    networks: Vec<AffiliateNetwork>,
+    networks: Vec<AffiliateNetwork>,,
+        programs: vec![],
+        network_meta: vec![]
 }
 
 /// Host labels that are IANA-reserved and can never be a real merchant:
@@ -22626,6 +22629,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             param_env: HashMap::new(),
             bid_floor: None,
             fallback_url: None,
+            host_suffix: None,
         }
     }
 
@@ -22695,7 +22699,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn decoration_is_idempotent_no_double_wrap() {
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], programs: vec![], network_meta: vec![] };
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -22712,7 +22716,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn missing_key_degrades_to_null_affiliate() {
         // No usable network (key env var unset) => results keep affiliate null.
         let n = net("wrap", "https://sovrn.co?key={key}&u={url}", HashMap::new(), Some("UNSET_KEY_ENV_VAR_XYZ"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], programs: vec![], network_meta: vec![] };
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -22725,7 +22729,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // The central no-manipulation guarantee: decoration never reorders.
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], programs: vec![], network_meta: vec![] };
         let mut results = vec![
             serde_json::json!({ "url": "https://a.example.com/x", "score": 9.7 }),
             serde_json::json!({ "url": "https://b.example.org/y", "score": 8.1 }),

@@ -130,7 +130,7 @@ pub fn url_host(value: &str) -> String {
 /// Used to drop an `fbu` (bid-miss fallback) that would send a real user to a
 /// fabricated destination. The FIELD is dropped, never the network: wrapping,
 /// `bf` and `disclosed: true` all keep working.
-fn is_reserved_documentation_host(host: &str) -> bool {
+pub fn is_reserved_documentation_host(host: &str) -> bool {
     let h = host.trim().trim_end_matches('.').to_lowercase();
     if h.is_empty() {
         return false;
@@ -191,7 +191,7 @@ const RESERVED_HOST_LABEL_PREFIXES: &[&str] = &["example"];
 ///
 /// Returns `true` for unparseable/host-less input: a fallback we cannot even
 /// resolve is treated as unusable rather than shipped.
-fn is_reserved_placeholder_url(url: &str) -> bool {
+pub fn is_reserved_placeholder_url(url: &str) -> bool {
     let host = match reqwest::Url::parse(url) {
         Ok(u) => match u.host_str() {
             Some(h) => h.trim_end_matches('.').to_ascii_lowercase(),
