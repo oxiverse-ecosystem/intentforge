@@ -21787,7 +21787,9 @@ mod spellcheck_endpoint_tests {
 </div>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/hp");
-        assert!(o.data.is_none(), "extract_commerce_offer must NOT extract HTML patterns");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None, "price must NOT be extracted from HTML patterns");
+        assert_eq!(d.currency, None, "currency must NOT be extracted from HTML patterns");
         assert_eq!(o.source.as_deref(), None);
     }
 
@@ -21798,7 +21800,9 @@ mod spellcheck_endpoint_tests {
 <span class="price">₹29,999</span>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/sony");
-        assert!(o.data.is_none(), "extract_commerce_offer must NOT extract HTML patterns");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None, "price must NOT be extracted from HTML patterns");
+        assert_eq!(d.currency, None, "currency must NOT be extracted from HTML patterns");
     }
 
     #[test]
@@ -21842,7 +21846,8 @@ mod spellcheck_endpoint_tests {
 <p>Preheat oven to 375°F.</p>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://blog.example.com/bread");
-        assert!(o.data.is_none());
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None);
         assert_eq!(o.source.as_deref(), None);
     }
 
@@ -21852,7 +21857,8 @@ mod spellcheck_endpoint_tests {
 <span class="price">$99999999</span>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/bad");
-        assert!(o.data.is_none());
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None, "price >10M should be rejected");
     }
 
     #[test]
@@ -21861,7 +21867,9 @@ mod spellcheck_endpoint_tests {
 <span class="sale-price">€89.99</span>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/eu");
-        assert!(o.data.is_none());
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None);
+        assert_eq!(d.currency, None);
     }
 
     #[test]
@@ -21870,7 +21878,8 @@ mod spellcheck_endpoint_tests {
 <meta itemprop="price" content="549.00">
 </head><body><h1>Product</h1></body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/m");
-        assert!(o.data.is_none());
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None);
     }
 
     #[test]
@@ -21882,7 +21891,10 @@ mod spellcheck_endpoint_tests {
 <p>In stock, ready to ship.</p>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/ap");
-        assert!(o.data.is_none());
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.price, None);
+        assert_eq!(d.rating, None, "rating must NOT be extracted from text");
+        assert_eq!(d.availability, None, "availability must NOT be extracted from text");
     }
 
         #[test]
