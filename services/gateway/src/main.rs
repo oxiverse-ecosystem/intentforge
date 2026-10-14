@@ -2914,7 +2914,7 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
 ///
 /// Only fires when structured extraction (JSON-LD, OG, microdata) found nothing,
 /// and only extracts the FIRST visible price — no aggregation or guessing.
-/// The resulting OfferFacts is marked source="extracted_from_text" by the caller.
+/// The resulting OfferFacts is marked source="html_pattern" by the caller.
 ///
 /// Returns Some((price, currency)) on the first match, None otherwise.
 fn extract_price_from_html_patterns(html: &str) -> Option<(f64, String)> {
@@ -4313,15 +4313,7 @@ async fn enrich_with_commerce<F, Fut>(
                 // structured product data — never a guessed/fabricated fact.
                 if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
                     match serde_json::to_value(&offer) {
-                        Ok(mut v) => {
-                            // extract_commerce_offer labels HTML-pattern matches
-                            // as "extracted_from_text" (its internal step 5).
-                            // From enrich_with_commerce's perspective this IS
-                            // the html_pattern tier — upgrade the source so the
-                            // frontend labels it correctly.
-                            if v.get("source").and_then(|s| s.as_str()) == Some("extracted_from_text") {
-                                v["source"] = serde_json::json!("html_pattern");
-                            }
+                        Ok(v) => {
                             r["commerce"] = v;
                             attached = true;
                         }
@@ -4445,14 +4437,7 @@ fn enrich_single_commerce(
     let offer: CommerceOffer = extract_commerce_offer(html, &url);
     let has_fact = offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false);
     if has_fact {
-        if let Ok(mut v) = serde_json::to_value(&offer) {
-            // extract_commerce_offer labels HTML-pattern matches as
-            // "extracted_from_text" (its internal step 5). From the
-            // enrichment tier's perspective this IS the html_pattern tier —
-            // upgrade the source so the frontend labels it correctly.
-            if v.get("source").and_then(|s| s.as_str()) == Some("extracted_from_text") {
-                v["source"] = serde_json::json!("html_pattern");
-            }
+        if let Ok(v) = serde_json::to_value(&offer) {
             r["commerce"] = v;
         }
     }
@@ -21784,14 +21769,17 @@ mod spellcheck_endpoint_tests {
         assert_eq!(d.price_high, None);
     }
 
-    // ── ROADMAP item 1 (increment): secondary HTML price fallback ─────────
-    // When structured extraction (JSON-LD/OG/microdata) finds no price, the
-    // secondary HTML price pattern fallback recovers prices from common
-    // e-commerce HTML patterns. These tests prove it fires only as a fallback,
-    // extracts the first visible price, and labels the source correctly.
+    // ── HTML-pattern extraction (now in enrich_with_commerce, not here) ────
+    // extract_commerce_offer ONLY does structured extraction (JSON-LD, OG,
+    // microdata, MF2). HTML pattern extraction is handled by the dedicated
+    // html_pattern tier in enrich_with_commerce. These tests verify that
+    // extract_commerce_offer does NOT fire on HTML patterns alone.
 
     #[test]
-    fn html_pattern_fallback_extracts_from_data_price_attribute() {
+    fn html_pattern_not_extracted_by_extract_commerce_offer() {
+        // A page with NO structured markup but WITH a recognizable price container.
+        // extract_commerce_offer must NOT extract it — that is the job of the
+        // html_pattern tier in enrich_with_commerce.
         let html = r#"<!doctype html><html><body>
 <h1>Wireless Headphones</h1>
 <div class="product-price" data-price="299.99" data-currency="USD">
@@ -21799,26 +21787,23 @@ mod spellcheck_endpoint_tests {
 </div>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/hp");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(299.99), "price extracted from data-price");
-        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+        assert!(o.data.is_none(), "extract_commerce_offer must NOT extract HTML patterns");
+        assert_eq!(o.source.as_deref(), None);
     }
 
     #[test]
-    fn html_pattern_fallback_extracts_currency_in_class_span() {
+    fn html_pattern_currency_not_extracted_by_extract_commerce_offer() {
         let html = r#"<!doctype html><html><body>
 <h1>Sony WH-1000XM5</h1>
 <span class="price">₹29,999</span>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/sony");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(29999.0));
-        assert_eq!(d.currency.as_deref(), Some("INR"));
-        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+        assert!(o.data.is_none(), "extract_commerce_offer must NOT extract HTML patterns");
     }
 
     #[test]
-    fn html_pattern_fallback_does_not_fire_when_jsonld_present() {
+    fn html_pattern_not_extracted_when_jsonld_present() {
+        // When structured extraction succeeds, HTML patterns are irrelevant.
         let html = r#"<!doctype html><html><head>
 <script type="application/ld+json">
 { "@context": "https://schema.org/", "@type": "Product",
@@ -21828,13 +21813,12 @@ mod spellcheck_endpoint_tests {
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/w");
         let d = o.data.as_ref().unwrap();
-        // JSON-LD wins, HTML pattern does NOT overwrite
         assert_eq!(d.price, Some(49.99));
         assert_eq!(o.source.as_deref(), Some("json-ld"));
     }
 
     #[test]
-    fn html_pattern_fallback_does_not_fire_when_microdata_present() {
+    fn html_pattern_not_extracted_when_microdata_present() {
         let html = format!(r#"<!doctype html><html><body>
 <div itemscope itemtype="https://schema.org/Product">
   <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
@@ -21851,58 +21835,46 @@ mod spellcheck_endpoint_tests {
     }
 
     #[test]
-    fn html_pattern_fallback_returns_none_for_non_product_pages() {
+    fn html_pattern_returns_none_for_non_product_pages() {
         let html = r#"<!doctype html><html><body>
 <h1>How to bake bread</h1>
 <p>This recipe uses 3 cups of flour and costs about $2 per loaf.</p>
 <p>Preheat oven to 375°F.</p>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://blog.example.com/bread");
-        let d = o.data.as_ref().unwrap();
-        // The recipe mentions "$2" but not in a product context — the HTML
-        // pattern scan only looks in the first 8KB and the $2 is far from any
-        // price container. It should NOT fire.
-        assert_eq!(d.price, None);
+        assert!(o.data.is_none());
         assert_eq!(o.source.as_deref(), None);
     }
 
     #[test]
-    fn html_pattern_fallback_ignores_unreasonable_prices() {
-        // Price of 0 or >10M should be rejected
+    fn html_pattern_ignores_unreasonable_prices() {
         let html = r#"<!doctype html><html><body>
 <span class="price">$99999999</span>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/bad");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, None, "price >10M should be rejected");
+        assert!(o.data.is_none());
     }
 
     #[test]
-    fn html_pattern_fallback_preserves_structured_currency() {
+    fn html_pattern_does_not_extract_currency_without_structured() {
         let html = r#"<!doctype html><html><body>
 <span class="sale-price">€89.99</span>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/eu");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(89.99));
-        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert!(o.data.is_none());
     }
 
     #[test]
-    fn html_pattern_fallback_itemprop_meta_price() {
+    fn html_pattern_itemprop_meta_not_extracted() {
         let html = r#"<!doctype html><html><head>
 <meta itemprop="price" content="549.00">
 </head><body><h1>Product</h1></body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/m");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(549.00));
-        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+        assert!(o.data.is_none());
     }
 
     #[test]
-    fn html_pattern_fallback_does_not_extract_rating_or_other_facts() {
-        // The fallback should ONLY extract price and currency — never other
-        // facts like rating, availability, or name from free text.
+    fn html_pattern_does_not_extract_rating_or_other_facts() {
         let html = r#"<!doctype html><html><body>
 <h1>Amazing Product</h1>
 <span class="price">$49.99</span>
@@ -21910,10 +21882,7 @@ mod spellcheck_endpoint_tests {
 <p>In stock, ready to ship.</p>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/ap");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(49.99));
-        assert_eq!(d.rating, None, "rating must NOT be extracted from text");
-        assert_eq!(d.availability, None, "availability must NOT be extracted from text");
+        assert!(o.data.is_none());
     }
 
         #[test]
@@ -23191,7 +23160,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
                 { "url": "https://store.example.com/p/1",
                   "commerce": { "price": 199.0, "currency": "USD" },
                   "commerce_provenance": { "url": "https://store.example.com/p/1",
-                      "observed_at": "2026-01-01T00:00:00Z", "source": "extracted_from_text",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "html_pattern",
                       "data": { "price": 199.0 } } },
                 // URL 2 is in the shopping block too — must NOT overwrite its
                 // existing commerce (no clobbering).
@@ -23243,7 +23212,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
         // Provenance copied for enriched results (honesty invariant).
         assert_eq!(
-            results[0]["commerce_provenance"]["source"], "extracted_from_text"
+            results[0]["commerce_provenance"]["source"], "html_pattern"
         );
         assert_eq!(
             results[2]["commerce_provenance"]["source"], "json-ld"
