@@ -4609,6 +4609,7 @@ async fn enrich_with_commerce_par<F, Fut>(
     results: &mut [serde_json::Value],
     fetch: F,
     wall_timeout: std::time::Duration,
+    enrich_window: usize,
 ) where
     F: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Option<String>> + Send,
@@ -4635,7 +4636,7 @@ async fn enrich_with_commerce_par<F, Fut>(
                 && r.get("commerce").is_none()
         })
         .map(|(idx, _)| idx)
-        .take(state.commerce_config.enrich_window)
+        .take(enrich_window)
         .collect();
 
     // 2) Fetch with bounded concurrency as a ROLLING WINDOW, not in waves.
@@ -4823,7 +4824,9 @@ const COMMERCE_MAINPATH_TOP_N: usize = 8;
 ///
 /// This value is now loaded from `data/commerce/config.json` (`enrich_window`
 /// field) at runtime — see `CommerceConfig::enrich_window`. The constant is
-/// kept only as a type/documentation anchor; the runtime value comes from config.
+/// kept as a compile-time fallback and for the test that guards the
+/// enrich-window > display-cap invariant.
+const COMMERCE_ENRICH_WINDOW: usize = 24;
 
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
@@ -4986,6 +4989,7 @@ async fn handle_shopping(
                     }
                 },
                 second_pass_wall,
+                state.commerce_config.enrich_window,
             )
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
@@ -18724,7 +18728,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         // carry product facts. `serde_json::to_value` on `MergedResult` is lossless.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
             .iter()
-            .take(state.commerce_config.enrich_window)
+            .take(enrich_window)
             .filter_map(|r| serde_json::to_value(r).ok())
             .collect();
         if shop_arr.is_empty() {
@@ -18743,6 +18747,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     async move { fetch_page_html(&c, &url).await }
                 },
                 enrichment_wall,
+                state.commerce_config.enrich_window,
             )
             .await;
             // Select only the fact-bearing candidates for display, in their
@@ -23186,6 +23191,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            24,
         )
         .await;
         let elapsed = start.elapsed();
@@ -23235,6 +23241,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_millis(1),
+            24,
         )
         .await;
 
@@ -23383,6 +23390,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            24,
         )
         .await;
         let elapsed = start.elapsed();
@@ -23552,7 +23560,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             }
         };
 
-        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2)).await;
+        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2), 24).await;
 
         let with_commerce = ranked
             .iter()
