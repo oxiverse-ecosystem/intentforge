@@ -8779,10 +8779,7 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                // Preserved domain word inside negation: keep it as a
-                // positive term, but do NOT end the negation scope —
-                // subsequent non-preserved words are still excluded
-                // (e.g. "without linux spicy" → "recipes linux", excluded=["spicy"]).
+                in_negation = false;
                 result.push(w);
             } else {
                 // Non-domain content word after a negation trigger: treat as an
