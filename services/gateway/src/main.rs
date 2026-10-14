@@ -5912,29 +5912,34 @@ fn should_filter_by_constraints(
     }
 
     // 3. Hard filter on date bounds
-    // Policy: a date bound filters ONLY results that carry a parseable
-    // published date. Results without a resolvable date are KEPT, never
-    // dropped — dropping them silently removes the majority of general web
-    // results (most pages expose no machine-readable date), which previously
-    // zeroed out queries like "python after:2024" even though plenty of
-    // relevant content existed. We report the coverage gap via
-    // `ignored_constraints` (dated_result_count==0) instead of silently
-    // filtering everything. This is the fail-open choice: a dateless result is
-    // assumed in-range rather than out-of-range.
+    // Policy: a date bound filters ONLY results that carry an explicit
+    // published_date. Results with published_date == None are KEPT (fail-open) —
+    // dropping them silently removes the majority of general web results (most
+    // pages expose no machine-readable date), which previously zeroed out queries
+    // like "python after:2024" even though plenty of relevant content existed.
+    // We report the coverage gap via `ignored_constraints` (dated_result_count==0)
+    // instead of silently filtering everything.
+    // NOTE: we do NOT call resolve_item_date here because it extracts dates from
+    // URLs (e.g. /2024/03/15/) and content text, which would cause date-less
+    // results to be dropped — defeating the fail-open policy.
     if let Some(ref ad) = constraints.after_date {
         if let Some(limit) = parse_date_to_comparable(ad) {
-            if let Some(p_date) = resolve_item_date(published_date, url, title, content) {
-                if !date_gte(p_date, limit) {
-                    return true;
+            if let Some(pd) = published_date {
+                if let Some(p_date) = parse_date_to_comparable(pd) {
+                    if !date_gte(p_date, limit) {
+                        return true;
+                    }
                 }
             }
         }
     }
     if let Some(ref bd) = constraints.before_date {
         if let Some(limit) = parse_date_to_comparable(bd) {
-            if let Some(p_date) = resolve_item_date(published_date, url, title, content) {
-                if !date_lte(p_date, limit) {
-                    return true;
+            if let Some(pd) = published_date {
+                if let Some(p_date) = parse_date_to_comparable(pd) {
+                    if !date_lte(p_date, limit) {
+                        return true;
+                    }
                 }
             }
         }
@@ -20348,7 +20353,7 @@ mod constraint_fix_tests {
             "Old article",
             "This was published on March 3, 2021 and is stale.",
             "https://example.com/a",
-            None,
+            Some("2021-03-03"),
             &c,
         );
         assert!(old, "result dated 2021 should be filtered by after:2024");
@@ -20357,7 +20362,7 @@ mod constraint_fix_tests {
             "New article",
             "This was published on March 3, 2025 and is current.",
             "https://example.com/b",
-            None,
+            Some("2025-03-03"),
             &c,
         );
         assert!(!fresh, "result dated 2025 should pass after:2024");
