@@ -24643,7 +24643,7 @@ mod affiliate_mainpath_tests {
     fn decorate_affiliate_missing_credentials_leaves_null() {
         // No env var set → no usable network → affiliate stays unset (null).
         let n = AffiliateNetwork {
-            key_env: Some("TOTALLY_UNSET_ENV_VAR_XYZ".to_string(),
+            key_env: Some("TOTALLY_UNSET_ENV_VAR_XYZ".to_string()),
             ..test_network()
         };
         let ctx = AffiliateCtx::from_networks(vec![n]);
