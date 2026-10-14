@@ -14221,7 +14221,11 @@ fn build_commerce_status(
     } else {
         // Use the fallback intent (no network call) for a deterministic check.
         let intent_resp = fallback_intent(q_trimmed);
-        let has_price_bound = extract_price_bound(q_trimmed).is_some();
+        let sc = &intent_resp.structured_constraints;
+        let has_price_bound = sc.price_lt.is_some()
+            || sc.price_max.is_some()
+            || sc.price_min.is_some()
+            || sc.price_gt.is_some();
         is_commercial_intent(
             &intent_resp.intent,
             &intent_resp.distribution,
