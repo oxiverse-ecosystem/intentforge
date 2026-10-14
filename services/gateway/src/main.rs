@@ -5072,9 +5072,9 @@ fn is_reserved_documentation_host(host: &str) -> bool {
 /// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
 #[derive(Clone)]
 struct AffiliateCtx {
-    networks: Vec<AffiliateNetwork>,,
-        programs: vec![],
-        network_meta: vec![]
+    networks: Vec<AffiliateNetwork>,
+    programs: Vec<AffiliateNetwork>,
+    network_meta: Vec<AffiliateNetworkMeta>,
 }
 
 /// Host labels that are IANA-reserved and can never be a real merchant:
