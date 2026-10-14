@@ -4511,19 +4511,46 @@ fn enrich_single_commerce(
         .unwrap_or("")
         .to_string();
     let offer: CommerceOffer = extract_commerce_offer(html, &url);
-    let has_fact = offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false);
+    let mut has_fact = offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false);
     if has_fact {
         if let Ok(v) = serde_json::to_value(&offer) {
             r["commerce"] = v;
         }
     }
+    // Snippet-based fallback: when the page fetch failed or returned no
+    // structured data, try to extract product facts from the search result
+    // snippet (title + content). This improves enrichment recall without
+    // fabricating facts — all snippet-derived facts are marked with
+    // source="snippet_extracted" so the frontend can label them as less
+    // certain than structured data. Applies to BOTH the sequential and
+    // parallel enrichment paths (this function is the shared attach point).
+    if !has_fact {
+        let snippet = format!(
+            "{} {}",
+            r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+            r.get("content").and_then(|v| v.as_str()).unwrap_or("")
+        );
+        let facts = extract_snippet_facts(&snippet, &url);
+        if data_has_fact(&facts) {
+            let snippet_offer = CommerceOffer {
+                url: Some(url.clone()),
+                observed_at: Some(now_unix_string()),
+                source: Some("snippet_extracted".to_string()),
+                data: Some(facts),
+            };
+            if let Ok(v) = serde_json::to_value(&snippet_offer) {
+                r["commerce"] = v;
+                has_fact = true;
+            }
+        }
+    }
     let provenance = serde_json::json!({
         "url": url,
-        "observed_at": offer.observed_at,
+        "observed_at": r.get("commerce").and_then(|c| c.get("observed_at")).and_then(|v| v.as_str()),
         // Only disclose a source when a fact was actually attached; a null fact
         // must never be attributed to an extraction source.
-        "source": if has_fact { offer.source.clone() } else { None },
-        "data": if has_fact { offer.data.clone() } else { None },
+        "source": if has_fact { r.get("commerce").and_then(|c| c.get("source")).and_then(|s| s.as_str()) } else { None },
+        "data": if has_fact { r.get("commerce").and_then(|c| c.get("data")) } else { None },
     });
     r["commerce_provenance"] = provenance;
 }
