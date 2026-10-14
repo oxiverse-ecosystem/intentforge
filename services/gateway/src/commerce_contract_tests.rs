@@ -19,6 +19,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::affiliate::*;
 use serde_json::{json, Value};
 
 /// Build a network/program row for tests (mirrors the data-driven shape; all

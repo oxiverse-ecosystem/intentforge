@@ -40,6 +40,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::affiliate::*;
 use serde_json::Value;
 
 /// The ranked input every test here decorates: several results with DIFFERENT

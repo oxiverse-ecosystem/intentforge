@@ -13,6 +13,7 @@ use tower_http::timeout::TimeoutLayer;
 use axum::http::HeaderMap;
 use std::net::IpAddr;
 
+mod affiliate;
 mod spell;
 mod geoloc;
 mod dictionary;
@@ -20,9 +21,12 @@ mod clean;
 mod goals;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
+mod affiliate_engine_tests;
 // ROADMAP item 6: order invariance driven by the REAL shipped affiliate data
 // (every network, keys present vs absent) — the offline CI lock.
 mod real_data_order_tests;
+// Integration tests: end-to-end affiliate decoration against real data files.
+mod affiliate_integration_tests;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -12236,7 +12240,7 @@ struct AppState {
     /// startup from `data/commerce/affiliate.json`; all network/template/key-env
     /// knowledge is data, never code. Used only as a strict post-rank decoration
     /// pass — never affects ranking/order.
-    affiliate_ctx: AffiliateCtx,
+    affiliate_ctx: affiliate::AffiliateCtx,
 }
 
 async fn handle_images(
@@ -12869,7 +12873,7 @@ async fn main() {
         // limit even under a burst, while still allowing real parallelism.
         search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         // Affiliate template engine config (ROADMAP item 3) — loaded from data.
-        affiliate_ctx: AffiliateCtx::load(),
+        affiliate_ctx: affiliate::AffiliateCtx::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -22161,6 +22165,7 @@ mod spellcheck_endpoint_tests {
 
 mod commerce_extraction_tests {
     use super::*;
+    use affiliate::*;
 
     // Realistic schema.org Product + Offer JSON-LD fixture (single offer).
     const HTML_SINGLE_OFFER: &str = r#"<!doctype html><html><head>
