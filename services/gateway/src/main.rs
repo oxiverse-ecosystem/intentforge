@@ -20678,8 +20678,8 @@ mod constraint_fix_tests {
             },
             SearxResult {
                 title: "Old Gaganyaan article".to_string(),
-                url: "https://example.com/2024/03/15/gaganyaan".to_string(),
-                content: "Old news about Gaganyaan from 2024.".to_string(),
+                url: "https://example.com/gaganyaan-old".to_string(),
+                content: "Old news about Gaganyaan.".to_string(),
                 engine: "google".to_string(),
                 score: 0.9,
                 sources: vec![],
