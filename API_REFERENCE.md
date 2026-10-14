@@ -1684,14 +1684,18 @@ already written for `GET /shopping`, applied to a **clone** of the top-N already
 results. The main `results` ordering is untouched, so the no-manipulation guarantee
 holds for the main path too (the order-invariance test covers it).
 
-**Signal-based detection (no external call, no keyword list):** `is_commercial_intent`
+**Signal-based detection (no external call, no hardcoded keyword list):** `is_commercial_intent`
 returns true when the in-process intent signals say "wants to buy":
 - the resolved intent `label == "transactional"`, **or**
 - the `transactional` probability in the intent `distribution` is ≥ 0.50 (covers
   "X vs Y" product queries that resolve to a non-transactional argmax label but carry
   a strong transactional distribution), **or**
 - a price bound was parsed by the existing constraint parser (`price:<N` / `price:>N`
-  / `price_min` / `price_max`).
+  / `price_min` / `price_max`), **or**
+- the query contains a transactional keyword from `data/commerce/signals.json`
+  (whole-word match, data-driven — edit the file to add/remove keywords, no recompile).
+  This is a WEAK signal boost that supplements the intent engine; it never replaces
+  the label/distribution check.
 
 The `shopping` block is surfaced whenever commercial intent is detected, even
 if no upstream page exposed structured product data — every result carries
@@ -1740,6 +1744,28 @@ with a 22s wall cap — same enrichment + decoration pipeline, now consistent wi
 > finds nothing and the strip is suppressed. A wider window (24) lets enrichment reach
 > past those to pages that DO carry product facts. Both values are presentation-only;
 > they never influence ranking, selection, or ordering.
+
+### Snippet-based fallback enrichment (post-ROADMAP)
+
+When the page fetch fails or returns no structured product data, the gateway
+falls back to extracting product facts from the search result snippet (title +
+content). This improves enrichment recall without fabricating facts — all
+snippet-derived facts are marked with `source: "snippet_extracted"` so the
+frontend can label them as less certain than structured data.
+
+The snippet fallback extracts:
+- **Price + currency** — via `extract_price_from_text` (same well-tested function
+  used for HTML price extraction)
+- **Product name** — from the title, truncated at the first delimiter
+  (`|`, `—`, `–`), filtered to exclude question/how-to phrases
+- **Merchant/brand** — from the URL host (with `merchant_observed: false` —
+  derived from the URL, not observed on the page)
+- **Availability** — from snippet text (`"in stock"`, `"out of stock"`, etc.)
+
+All facts are marked with `source: "snippet_extracted"` and proper provenance.
+The `data_has_fact` gate applies: a snippet with no price, no availability, and
+no product name does NOT produce a `commerce` block (merchant alone doesn't
+count — `merchant_observed` is false for URL-derived merchants).
 
 ### POST /commerce/extract
 

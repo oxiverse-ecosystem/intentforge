@@ -1,4 +1,4 @@
-FROM rust:1.88-slim-bookworm as builder
+FROM rust:1.89-slim-bookworm as builder
 
 WORKDIR /usr/src/crawler
 COPY Cargo.toml ./

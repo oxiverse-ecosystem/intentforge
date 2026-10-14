@@ -20,6 +20,7 @@ mod clean;
 mod goals;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
+mod affiliate_engine_tests;
 // ROADMAP item 6: order invariance driven by the REAL shipped affiliate data
 // (every network, keys present vs absent) — the offline CI lock.
 mod real_data_order_tests;
@@ -248,6 +249,24 @@ fn is_model_number_price_query(q_lower: &str) -> bool {
         || q_lower.contains("budget") || q_lower.contains("cheap")
         || q_lower.contains("pricing");
     has_model && has_price
+}
+
+/// True when the query names a specific product model (e.g. "iphone 16 pro
+/// max", "galaxy s24 ultra", "pixel 9 pro"). This is the eligibility gate for
+/// affiliate decoration: monetization is exact-model-only, so broad category
+/// queries ("best wireless earbuds under 50 dollars") must never receive
+/// affiliate links even when they use the /shopping endpoint.
+///
+/// Reuses the same model-number regex as `is_model_number_price_query` but
+/// drops the price requirement — a query that names a specific model is
+/// exact-model regardless of whether it mentions price. Data-driven: the
+/// brand+model pattern lives in the regex, not in a keyword→reply table.
+fn is_exact_model_query(q_lower: &str) -> bool {
+    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let model_re = MODEL_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+(?:[a-z]+\s+)*[a-z]?\d{1,3}").unwrap()
+    });
+    model_re.is_match(q_lower)
 }
 
 fn has_price_signal(title_lower: &str, content_lower: &str) -> bool {
@@ -2904,6 +2923,84 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
     None
 }
 
+/// Extract product facts from a search result snippet (title + content).
+/// This is a FALLBACK for when the page fetch failed or returned no structured
+/// data. All extracted facts are marked with source="snippet_extracted" by the
+/// caller so the frontend can label them as less certain than structured data.
+///
+/// Extraction rules (all conservative — never fabricate):
+/// - Price/currency: via `extract_price_from_text` (existing, well-tested)
+/// - Product name: from the title, truncated at the first delimiter (|, -, —)
+/// - Merchant/brand: from the URL host (with merchant_observed: false)
+/// - Availability: from snippet text ("in stock", "out of stock", etc.)
+fn extract_snippet_facts(snippet: &str, url: &str) -> OfferFacts {
+    let mut facts = OfferFacts::default();
+
+    // Price + currency
+    if let Some(price_info) = extract_price_from_text(snippet) {
+        facts.price = Some(price_info.amount);
+        facts.currency = Some(price_info.currency);
+    }
+
+    // Product name: extract from title (first line, truncated at delimiter).
+    // Only if the title looks like a product name — not a question or how-to phrase.
+    let title = snippet.lines().next().unwrap_or("").trim();
+    if !title.is_empty() {
+        // Truncate at common delimiters: |, -, —, –
+        let name = title
+            .split(|c| c == '|' || c == '—' || c == '–')
+            .next()
+            .unwrap_or(title)
+            .trim();
+        // Only use as product name if it's not too long and doesn't look like a question/how-to
+        if !name.is_empty() && name.len() <= 200 && !is_question_or_howto(name) {
+            facts.name = Some(name.to_string());
+        }
+    }
+
+    // Merchant/brand: from URL host (NOT observed on page — merchant_observed stays false)
+    let host = url_host(url);
+    if !host.is_empty() && host != "localhost" {
+        facts.merchant = Some(host);
+        // merchant_observed stays false — this is derived from the URL, not the page
+    }
+
+    // Availability: look for common availability phrases in the snippet
+    let lower = snippet.to_lowercase();
+    if lower.contains("in stock") || lower.contains("available now") || lower.contains("ships today") {
+        facts.availability = Some("in_stock".to_string());
+    } else if lower.contains("out of stock") || lower.contains("unavailable") || lower.contains("sold out") {
+        facts.availability = Some("out_of_stock".to_string());
+    }
+
+    facts
+}
+
+/// Returns true if the text looks like a question or how-to phrase rather than a
+/// product name. Used to filter out non-product titles from snippet extraction.
+fn is_question_or_howto(text: &str) -> bool {
+    let lower = text.to_lowercase().trim().to_string();
+    // Question phrases
+    if lower.ends_with('?') {
+        return true;
+    }
+    // Common question starters
+    let question_starters = [
+        "what ", "how ", "why ", "when ", "where ", "which ", "who ", "is ", "are ",
+        "can ", "should ", "does ", "do ",
+    ];
+    for starter in &question_starters {
+        if lower.starts_with(starter) {
+            return true;
+        }
+    }
+    // How-to phrases
+    if lower.contains("how to") || lower.contains("how do") || lower.contains("how can") {
+        return true;
+    }
+    false
+}
+
 /// Secondary commerce price extraction: parse common HTML price patterns from
 /// pages that don't expose JSON-LD/OpenGraph/Product microdata. This is a
 /// STRUCTURED FALLBACK for known e-commerce HTML patterns — not free-text
@@ -4338,23 +4435,20 @@ async fn enrich_with_commerce<F, Fut>(
             }
             None => {}
         }
-        // Snippet-based price fallback: when the page fetch failed or returned
-        // no structured data, try to extract a price from the search result
+        // Snippet-based fallback: when the page fetch failed or returned
+        // no structured data, try to extract product facts from the search result
         // snippet (title + content). This improves enrichment recall without
-        // fabricating facts — the price is marked with source="snippet_extracted"
-        // so the frontend can label it as less certain than structured data.
+        // fabricating facts — all snippet-derived facts are marked with
+        // source="snippet_extracted" so the frontend can label them as less
+        // certain than structured data.
         if !attached {
             let snippet = format!(
                 "{} {}",
                 r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
                 r.get("content").and_then(|v| v.as_str()).unwrap_or("")
             );
-            if let Some(price_info) = extract_price_from_text(&snippet) {
-                let facts = OfferFacts {
-                    price: Some(price_info.amount),
-                    currency: Some(price_info.currency),
-                    ..Default::default()
-                };
+            let facts = extract_snippet_facts(&snippet, &url);
+            if data_has_fact(&facts) {
                 let offer = CommerceOffer {
                     url: Some(url.clone()),
                     observed_at: Some(now_unix_string()),
@@ -4541,7 +4635,7 @@ async fn enrich_with_commerce_par<F, Fut>(
                 && r.get("commerce").is_none()
         })
         .map(|(idx, _)| idx)
-        .take(COMMERCE_ENRICH_WINDOW)
+        .take(state.commerce_config.enrich_window)
         .collect();
 
     // 2) Fetch with bounded concurrency as a ROLLING WINDOW, not in waves.
@@ -4716,7 +4810,7 @@ fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
 const COMMERCE_MAINPATH_TOP_N: usize = 8;
 
 /// How many already-ranked results are ENRICHED on the main `/search` path before
-/// the display cap (`COMMERCE_MAINPATH_TOP_N`) is applied. Decoupling the two is
+/// the display cap (`mainpath_top_n`) is applied. Decoupling the two is
 /// the main-path reachability fix: commercial queries often have bot-checked
 /// merchant pages (Amazon/Walmart/Flipkart) in the top 8 with no structured
 /// markup, so enriching only 8 finds nothing and the strip is suppressed. A wider
@@ -4726,7 +4820,10 @@ const COMMERCE_MAINPATH_TOP_N: usize = 8;
 /// This is NOT a ranking change: enrichment is a strict post-ranking decoration
 /// pass over a CLONE of the ranked results. The real `results` array is never
 /// mutated, reordered, or reselected.
-const COMMERCE_ENRICH_WINDOW: usize = 24;
+///
+/// This value is now loaded from `data/commerce/config.json` (`enrich_window`
+/// field) at runtime — see `CommerceConfig::enrich_window`. The constant is
+/// kept only as a type/documentation anchor; the runtime value comes from config.
 
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
@@ -4827,6 +4924,9 @@ async fn handle_shopping(
     // enrichment pass derives its budget from the time actually left in the
     // shared 30s request budget instead of assuming a fresh full one.
     let shopping_started = std::time::Instant::now();
+    // Extract the query for the exact-model gate BEFORE params is moved into
+    // handle_search. The gate decides whether affiliate decoration runs at all.
+    let is_exact_model = params.q.as_deref().map(|q| is_exact_model_query(&q.to_lowercase())).unwrap_or(false);
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
     let (status, body) = handle_search(
         state.clone(),
@@ -4889,7 +4989,13 @@ async fn handle_shopping(
             )
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
-            decorate_affiliate(arr, &state.affiliate_ctx);
+            // GATE: monetization is exact-model-only. Broad category queries
+            // ("best wireless earbuds under 50 dollars") must never receive
+            // affiliate links even on /shopping. The gate is data-driven —
+            // reuses the model-number regex, no hardcoded product lists.
+            if is_exact_model {
+                decorate_affiliate(arr, &state.affiliate_ctx);
+            }
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
             // already-attached `commerce` blocks. Never reorders/reselects results.
             if let Some(arr_ref) = value.get("results").and_then(|v| v.as_array()) {
@@ -4927,6 +5033,12 @@ async fn handle_shopping(
 // affiliate parameter (privacy rule) — the only coarse subid is the merchant
 // host, which is non-identifying.
 /// One network/program row loaded from the data file. Generic over kinds.
+///
+/// `host_suffix` enables per-merchant matching: when present, this program
+/// only applies to result URLs whose host equals or ends with the suffix
+/// (label-boundary match, case-insensitive). When null, the program is a
+/// catch-all (matches any URL) — preserving the original single-network
+/// behaviour for backward compatibility.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct AffiliateNetwork {
     id: String,
@@ -4953,6 +5065,10 @@ struct AffiliateNetwork {
     /// url-encoded as a query param. DATA-ONLY.
     #[serde(default)]
     fallback_url: Option<String>,
+    /// Optional merchant host suffix for per-merchant matching (e.g.
+    /// "amazon." matches amazon.com, amazon.co.uk, etc.). Null = catch-all.
+    #[serde(default)]
+    host_suffix: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -4960,6 +5076,22 @@ fn default_true() -> bool {
 }
 fn default_priority() -> i64 {
     0
+}
+
+/// Network metadata loaded from `data/commerce/networks.json`. Provides
+/// disclosure labels and subid policy documentation for each network.
+/// Purely informational — does not affect link rendering.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct AffiliateNetworkMeta {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    disclosure_label: String,
+    #[serde(default)]
+    subid_policy: String,
+    #[serde(default)]
+    subid_description: String,
 }
 
 /// HOST component of a URL, lowercased, without scheme/port/userinfo/path.
@@ -5033,10 +5165,22 @@ fn is_reserved_documentation_host(host: &str) -> bool {
     false
 }
 
-/// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
+/// Runtime-resolved config: data files + env-resolved keys. Built once at startup.
+///
+/// `networks` holds the legacy catch-all programs (from `affiliate.json`).
+/// `programs` holds per-merchant programs (from `affiliate_programs.json`) —
+/// each carries a `host_suffix` for domain matching. `network_meta` holds
+/// disclosure/subid metadata (from `networks.json`).
+///
+/// Decoration logic: for each result, the engine first tries to match a
+/// per-merchant program by `host_suffix`. If none matches, it falls back to
+/// the first usable catch-all network. This preserves backward compatibility
+/// with the single-network model while enabling per-merchant decoration.
 #[derive(Clone)]
 struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
+    programs: Vec<AffiliateNetwork>,
+    network_meta: Vec<AffiliateNetworkMeta>,
 }
 
 /// Host labels that are IANA-reserved and can never be a real merchant:
@@ -5097,21 +5241,32 @@ fn is_reserved_placeholder_url(url: &str) -> bool {
 }
 
 impl AffiliateCtx {
-    /// Load networks from the data file. An empty/missing file is NOT fatal: the
+    /// Load networks from the data files. An empty/missing file is NOT fatal: the
     /// engine simply has no networks and every result degrades to `affiliate:
     /// null`. This is intentional — affiliate decoration is best-effort and must
     /// never break search.
+    ///
+    /// Loads three data files:
+    ///   1. `affiliate.json`         — legacy catch-all networks (backward compat)
+    ///   2. `affiliate_programs.json` — per-merchant programs with host_suffix matching
+    ///   3. `networks.json`          — network metadata (disclosure labels, subid policy)
     fn load() -> Self {
         let mut networks: Vec<AffiliateNetwork> = Vec::new();
+        let mut programs: Vec<AffiliateNetwork> = Vec::new();
+        let mut network_meta: Vec<AffiliateNetworkMeta> = Vec::new();
+
         // Resolve the data path relative to the process cwd (container WORKDIR is
         // /app, app binary at /app/gateway; data baked at /app/data/commerce).
         let candidates = [
-            "data/commerce/affiliate.json",
-            "/app/data/commerce/affiliate.json",
-            "./data/commerce/affiliate.json",
+            "data/commerce",
+            "/app/data/commerce",
+            "./data/commerce",
         ];
-        for path in candidates {
-            if let Ok(text) = std::fs::read_to_string(path) {
+
+        // ── 1. Legacy catch-all networks (affiliate.json) ──
+        for base in &candidates {
+            let path = format!("{}/affiliate.json", base);
+            if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
                         for n in arr {
@@ -5140,9 +5295,71 @@ impl AffiliateCtx {
                 }
             }
         }
+
+        // ── 2. Per-merchant programs (affiliate_programs.json) ──
+        for base in &candidates {
+            let path = format!("{}/affiliate_programs.json", base);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("programs").and_then(|n| n.as_array()) {
+                        for n in arr {
+                            if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                                // Same fallback sanitization as legacy networks.
+                                if let Some(fbu) = net.fallback_url.clone() {
+                                    if is_reserved_placeholder_url(&fbu) {
+                                        tracing::warn!(
+                                            program = %net.id,
+                                            "affiliate: ignoring reserved placeholder fallback_url (RFC 2606/6761 documentation domain)"
+                                        );
+                                        net.fallback_url = None;
+                                    }
+                                }
+                                programs.push(net);
+                            }
+                        }
+                    }
+                }
+                if !programs.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // ── 3. Network metadata (networks.json) ──
+        for base in &candidates {
+            let path = format!("{}/networks.json", base);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
+                        for n in arr {
+                            if let Ok(meta) = serde_json::from_value::<AffiliateNetworkMeta>(n.clone()) {
+                                network_meta.push(meta);
+                            }
+                        }
+                    }
+                }
+                if !network_meta.is_empty() {
+                    break;
+                }
+            }
+        }
+
         networks.sort_by(|a, b| b.priority.cmp(&a.priority));
-        tracing::info!("affiliate: loaded {} network(s) from data file", networks.len());
-        Self { networks }
+        programs.sort_by(|a, b| b.priority.cmp(&a.priority));
+        tracing::info!(
+            "affiliate: loaded {} network(s), {} program(s), {} network meta(s) from data files",
+            networks.len(),
+            programs.len(),
+            network_meta.len()
+        );
+        Self { networks, programs, network_meta }
+    }
+
+    /// Construct an AffiliateCtx with only legacy catch-all networks (no
+    /// per-merchant programs, no network metadata). Used by tests that build
+    /// synthetic contexts.
+    fn from_networks(networks: Vec<AffiliateNetwork>) -> Self {
+        Self { networks, programs: vec![], network_meta: vec![] }
     }
 
     /// The first enabled network that has its required key present in the env.
@@ -5155,6 +5372,56 @@ impl AffiliateCtx {
                     .map(|k| std::env::var(k).is_ok())
                     .unwrap_or(false)
         })
+    }
+
+    /// Find the first enabled per-merchant program whose `host_suffix` matches
+    /// the given URL's host AND whose key is present in the env.
+    ///
+    /// `host_suffix` matching is label-boundary, case-insensitive: the result
+    /// URL's host must equal the suffix or end with `"." + suffix` (e.g.
+    /// suffix `"amazon."` matches `amazon.com`, `amazon.co.uk`, etc.).
+    ///
+    /// Returns None when no per-merchant program matches (caller should fall
+    /// back to `first_usable()` for the legacy catch-all path).
+    fn match_program(&self, url: &str) -> Option<&AffiliateNetwork> {
+        let host = url_host(url);
+        if host.is_empty() {
+            return None;
+        }
+        // Collect all matching programs, then pick the highest priority.
+        // This ensures deterministic behavior regardless of vector order.
+        let mut best: Option<&AffiliateNetwork> = None;
+        for p in &self.programs {
+            if !p.enabled {
+                continue;
+            }
+            let has_key = p.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false);
+            if !has_key {
+                continue;
+            }
+            let matches = match &p.host_suffix {
+                None => false,
+                Some(suffix) => {
+                    let suffix = suffix.trim_end_matches('.').to_lowercase();
+                    if suffix.is_empty() {
+                        false
+                    } else if host == suffix {
+                        true
+                    } else {
+                        host.split('.').any(|label| label == suffix)
+                    }
+                }
+            };
+            if !matches {
+                continue;
+            }
+            best = match best {
+                None => Some(p),
+                Some(current) if p.priority > current.priority => Some(p),
+                _ => best,
+            };
+        }
+        best
     }
 }
 
@@ -5275,11 +5542,15 @@ fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> 
 /// that already carries an `affiliate` block is left untouched (idempotent).
 /// When no usable network key is present, results keep `affiliate: null` and are
 /// still returned. This function NEVER reorders or re-scores.
+///
+/// Per-merchant matching: for each result, the engine first tries to find a
+/// per-merchant program (from `affiliate_programs.json`) whose `host_suffix`
+/// matches the result URL's host. If found, that program's template/params are
+/// used. If no per-merchant program matches, the engine falls back to the
+/// first usable catch-all network (from `affiliate.json`) — preserving the
+/// original single-network behaviour. This two-tier lookup is fully data-driven:
+/// adding a new merchant requires only editing `affiliate_programs.json`.
 fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
-    let net = match ctx.first_usable() {
-        Some(n) => n,
-        None => return, // graceful: no key => leave affiliate un-set
-    };
     for r in results.iter_mut() {
         if !r.is_object() {
             continue;
@@ -5291,7 +5562,19 @@ fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
             Some(u) if !u.is_empty() => u.to_string(),
             _ => continue,
         };
+
+        // Two-tier lookup: per-merchant program first, then catch-all fallback.
+        let net = ctx.match_program(&url).or_else(|| ctx.first_usable());
+        let net = match net {
+            Some(n) => n,
+            None => continue, // graceful: no key => leave affiliate un-set
+        };
+
         // Coarse, non-identifying subid: the destination merchant host only.
+        // PRIVACY: never add user id, session id, IP, or query text to subid.
+        // The subid is ONLY the merchant host (e.g. "amazon.com"), which is
+        // coarse and non-identifying — it tells the network which merchant the
+        // click is for, nothing about the user.
         let subid = reqwest::Url::parse(&url)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_string()))
@@ -6987,7 +7270,21 @@ fn has_local_intent(query: &str) -> bool {
         // LOCATION_GAZETTEER, the query has explicit local intent. General guard —
         // no per-query literals, reuses the same gazetteer reference data as geo
         // detection (line 1542) so the policy is consistent and future-proof.
+        //
+        // SHORT-QUERY GUARD: a local intent query is typically short ("restaurants
+        // in bangalore", "hotels in paris"). A long conversational query (e.g. a
+        // career/advice question like "i have been working as a network
+        // administrator for five years ... job market in india") uses " in
+        // <country>" as CONTEXT, not as a local intent marker. Without this,
+        // career/advice queries get misclassified as "local" and return
+        // irrelevant results. General: query length threshold, no per-query
+        // literals. A 10-word threshold cleanly separates short local queries
+        // from long conversational ones.
         || {
+            let word_count = lower.split_whitespace().count();
+            if word_count > 10 {
+                return false;
+            }
             let parts: Vec<&str> = lower.split(" in ").collect();
             if let Some(after_in) = parts.last() {
                 let after_in = *after_in;  // deref &&str -> &str
@@ -8636,8 +8933,14 @@ fn disambiguate_engine_query(query: &str, intent: &str, _expanded_queries: &[Str
 // Detects common negation patterns and strips trigger words AND the content terms
 // immediately following them. This prevents negated terms (e.g., "chrome" in
 // "browser not chrome") from leaking into the search query and polluting results.
-// Example: "browser not chrome not edge" → "browser"
-fn simple_negation_strip(query: &str) -> Option<String> {
+// Example: "browser not chrome not edge" → ("browser", ["chrome", "edge"])
+//
+// Returns (positive_query, excluded_terms). Non-domain content words after a
+// negation trigger are NOT silently dropped — they are returned as exclusions
+// so the caller can apply a quality penalty (not a hard blocker) to results
+// containing them. This fixes "biryani without hand rolled" losing the
+// "hand rolled" constraint entirely.
+fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
     let neg_triggers: std::collections::HashSet<&str> = [
         "not", "no", "without", "except", "excluding", "besides", "minus",
         "other", "than", "nor",
@@ -8661,6 +8964,7 @@ fn simple_negation_strip(query: &str) -> Option<String> {
 
     let words: Vec<&str> = query.split_whitespace().collect();
     let mut result: Vec<&str> = Vec::new();
+    let mut excluded: Vec<String> = Vec::new();
     let mut in_negation = false;
 
     // Negation scope ends at the next CLAUSE-STARTING CONJUNCTION ("... without
@@ -8699,8 +9003,16 @@ fn simple_negation_strip(query: &str) -> Option<String> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                in_negation = false;
+                // Preserved domain word: keep it in the result, but do NOT end
+                // the negation scope. Subsequent non-preserved words are still
+                // negated (e.g. "recipes without linux spicy" → "recipes linux",
+                // excluded: ["spicy"]). The scope only ends at a clause boundary.
                 result.push(w);
+            } else {
+                // Non-domain content word after a negation trigger: treat as an
+                // exclusion (quality penalty, not hard blocker). Collect the
+                // word so the caller can penalize results containing it.
+                excluded.push(w_lower);
             }
             continue;
         }
@@ -8715,7 +9027,7 @@ fn simple_negation_strip(query: &str) -> Option<String> {
     if cleaned.is_empty() {
         return None; // everything was stripped
     }
-    Some(cleaned)
+    Some((cleaned, excluded))
 }
 
 /// P1-compound: when a query pairs `site:` with `filetype:` (e.g.
@@ -9502,7 +9814,8 @@ fn merge_local_and_web(
         None => RankingWeights::for_intent(intent),
     };
 
-    let clean_query = simple_negation_strip(query).unwrap_or_else(|| query.to_string());
+    let (clean_query, negation_excluded_terms) = simple_negation_strip(query)
+        .unwrap_or_else(|| (query.to_string(), Vec::new()));
 
     // Navigational domain boost: if intent is navigational and the query
     // looks like a platform name (1-2 tokens), boost results whose host
@@ -10974,6 +11287,36 @@ fn merge_local_and_web(
         let c_score = constraint_score(&r.title, &r.content, &r.url, constraints);
         let consensus = consensus_score(&r.sources);
 
+        // Negation exclusion penalty: non-domain content words after a negation
+        // trigger (e.g. "hand rolled" in "biryani without hand rolled") are
+        // returned by simple_negation_strip as exclusions. Apply a quality
+        // penalty (not a hard blocker) to results containing these terms.
+        // This is the same pattern as soft_negatives: demote, don't drop.
+        let negation_exclusion_penalty = if !negation_excluded_terms.is_empty() {
+            let title_lower_neg = r.title.to_lowercase();
+            let content_lower_neg = r.content.to_lowercase();
+            let url_lower_neg = r.url.to_lowercase();
+            let mut penalty = 1.0f32;
+            for excl in &negation_excluded_terms {
+                let excl_lower = excl.to_lowercase();
+                if title_lower_neg.contains(&excl_lower)
+                    || content_lower_neg.contains(&excl_lower)
+                    || url_lower_neg.contains(&excl_lower)
+                {
+                    penalty *= 0.3;
+                    tracing::info!(
+                        "NEGATION EXCLUSION HIT: '{}' in '{}' → penalty={:.2}",
+                        excl,
+                        &r.title[..r.title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(r.title.len())],
+                        penalty
+                    );
+                }
+            }
+            penalty
+        } else {
+            1.0f32
+        };
+
         // Navigational domain match boost: if the URL host contains the
         // query as a domain component, this is likely the destination the
         // user wants. Strong boost for homepage, moderate for subpages.
@@ -11210,8 +11553,13 @@ fn merge_local_and_web(
                 (tchars.len() - non) as f32 / tchars.len() as f32
             };
             // Query is Latin-script dominant AND result is non-Latin-script dominant.
+            // 0.05 (not 0.25): when ALL results are non-Latin (e.g. Bing returning
+            // Japanese dictionary pages for an English query), a 0.25 multiplier
+            // is defeated by calibrate_scores' max-rescale — the Japanese results
+            // still float to 1.0. 0.05 matches the video/audio cap floor so
+            // cross-lingual junk stays below genuine on-topic results.
             if q_ascii_ratio >= 0.85 && res_ascii_ratio < 0.50 {
-                0.25 // dampen hard but keep present (fail-soft, not a hard drop)
+                0.05
             } else {
                 1.0
             }
@@ -11224,7 +11572,7 @@ fn merge_local_and_web(
         };
 
         let p2d_mult = if p2d_offtopic { 0.05 } else { 1.0 };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * audio_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult;
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * audio_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * negation_exclusion_penalty;
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
@@ -11352,6 +11700,71 @@ fn merge_local_and_web(
                 restored.len()
             );
             merged = restored;
+        }
+    }
+
+    // ── Cross-lingual hard drop (D2 extension) ──
+    // The in-loop cross-lingual guard (0.05 multiplier) is defeated by
+    // calibrate_scores when ALL results are non-Latin (e.g. Bing returning
+    // Japanese dictionary pages for an English query). A multiplier alone
+    // cannot fix this — the max-rescale stretches the dampened results back
+    // to 1.0. A hard drop removes them outright. General: keyed on script
+    // ratio, no language tables, no per-domain lists.
+    {
+        let q_chars: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
+        let q_ascii_ratio = if q_chars.is_empty() {
+            1.0
+        } else {
+            let non = q_chars.iter().filter(|c| !c.is_ascii()).count();
+            (q_chars.len() - non) as f32 / q_chars.len() as f32
+        };
+        if q_ascii_ratio >= 0.85 {
+            let before = merged.len();
+            let retained_pre_xlingual: Vec<MergedResult> = merged.iter().cloned().collect();
+            merged.retain(|r| {
+                let res_text = format!("{} {}", r.title, r.content);
+                let r_chars: Vec<char> = res_text.chars().filter(|c| !c.is_whitespace()).collect();
+                let r_ascii_ratio = if r_chars.is_empty() {
+                    1.0
+                } else {
+                    let non = r_chars.iter().filter(|c| !c.is_ascii()).count();
+                    (r_chars.len() - non) as f32 / r_chars.len() as f32
+                };
+                r_ascii_ratio >= 0.50
+            });
+            let removed = before - merged.len();
+            if removed > 0 {
+                tracing::info!(
+                    "CROSS_LINGUAL_DROP: removed {}/{} result(s) for Latin-script query (res_ascii_ratio < 0.50)",
+                    removed, before
+                );
+            }
+            // Fail-open: if dropping would empty the set, restore non-adult results
+            if merged.is_empty() && before > 0 {
+                tracing::warn!(
+                    "CROSS_LINGUAL_DROP FAIL-OPEN: all {} results were non-Latin — keeping set (sparse upstream draw)",
+                    before
+                );
+                merged = retained_pre_xlingual
+                    .into_iter()
+                    .filter(|r| {
+                        let ul = r.url.to_lowercase();
+                        let tl = r.title.to_lowercase();
+                        let host = reqwest::Url::parse(&r.url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                            .unwrap_or_default();
+                        let tld_adult = host.ends_with(".xxx");
+                        let host_adult = adult_hosts.iter().any(|h| host.contains(h));
+                        let path_adult = adult_paths.iter().any(|p| ul.contains(p));
+                        let title_adult = tl.contains("porn") || tl.contains("xxx ")
+                            || tl.contains("nude") || tl.contains("naked")
+                            || tl.contains("sex video") || tl.contains("adult film");
+                        let is_adult = tld_adult || host_adult || path_adult || title_adult;
+                        !is_adult
+                    })
+                    .collect();
+            }
         }
     }
 
@@ -11763,6 +12176,10 @@ fn merge_local_and_web(
         let dict_cap = 0.03f32;   // dictionary sites may appear but never rank top
         let weak_cap = 0.04f32;   // single-polysemous-token matches capped low
 
+        // Max pre-cap score for graded weak-match cap: preserves relative ordering
+        // among off-topic results instead of flattening them all to the same value.
+        let max_pre_cap_score = merged.iter().map(|r| r.score).fold(0.0f32, f32::max);
+
         // Best non-video score AFTER calibration but BEFORE this pass caps any video.
         // Used by the P8 video cap (b0): a video must never outrank the best genuine
         // text result for a non-video query, in any calibration regime (see comment
@@ -11866,12 +12283,20 @@ fn merge_local_and_web(
                 // contain at least 2 of the query's real topic terms to be on-topic.
                 if matched_strong < 2 {
                     if r.score > weak_cap {
+                        // GRADED WEAK-MATCH CAP: instead of a flat cap that makes all
+                        // off-topic results tie at the same score (causing insertion-order
+                        // ranking among junk), preserve relative ordering by scaling
+                        // proportionally to the pre-cap score. This keeps off-topic
+                        // results below the on-topic floor while still differentiating
+                        // among them — the "least irrelevant" junk ranks above the
+                        // "most irrelevant" junk rather than relying on stable-sort order.
+                        let graded_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
                         tracing::info!(
-                            "POST-CAL WEAK-MATCH CAP -> {:.2}: '{}' (matched {} of {} topics)",
-                            weak_cap, r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len()
+                            "POST-CAL WEAK-MATCH CAP -> {:.4}: '{}' (matched {} of {} topics, pre_cap={:.4})",
+                            graded_cap, r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len(), r.score
                         );
-                        r.post_cal_cap = Some(weak_cap);
-                        r.score = weak_cap;
+                        r.post_cal_cap = Some(graded_cap);
+                        r.score = graded_cap;
                     }
                 }
             }
@@ -11904,13 +12329,14 @@ fn merge_local_and_web(
                     1
                 };
                 if matched_anchors < required_anchors && r.score > weak_cap {
+                    let graded_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
                     tracing::info!(
-                        "POST-CAL RARE-ANCHOR CAP -> {:.2}: '{}' (matched {} of {} rare anchors {:?}, need {})",
-                        weak_cap, r.url.chars().take(60).collect::<String>(),
-                        matched_anchors, rare_anchor_terms.len(), rare_anchor_terms, required_anchors
+                        "POST-CAL RARE-ANCHOR CAP -> {:.4}: '{}' (matched {} of {} rare anchors {:?}, need {}, pre_cap={:.4})",
+                        graded_cap, r.url.chars().take(60).collect::<String>(),
+                        matched_anchors, rare_anchor_terms.len(), rare_anchor_terms, required_anchors, r.score
                     );
-                    r.post_cal_cap = Some(weak_cap);
-                    r.score = weak_cap;
+                    r.post_cal_cap = Some(graded_cap);
+                    r.score = graded_cap;
                 }
             }
 
@@ -11939,18 +12365,13 @@ fn merge_local_and_web(
                     rl.contains(e.as_str()) || cl.contains(e.as_str()) || ul.contains(e.as_str())
                 });
                 if !names_entity {
-                    // Absolute weak_cap (0.04, UNDER the calibrated article floor of
-                    // 0.05) — same convention as the video/weak-match caps. The old
-                    // relative best_non_video*0.6 cap FAILED when the whole result set
-                    // was weak (Planoly at 0.072 vs genuine comparison articles at
-                    // 0.051: the relative cap stayed ABOVE the genuine floor because
-                    // the best text result itself was weak). An absolute sub-floor
-                    // cap guarantees a principal-naming article always outranks junk.
-                    let d3_cap = weak_cap;
+                    // Graded cap (same as weak-match/rare-anchor): preserves relative
+                    // ordering among off-topic comparison results instead of flattening.
+                    let d3_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
                     if r.score > d3_cap {
                         tracing::info!(
-                            "POST-CAL D3 COMP-CAP -> {:.2}: '{}' names none of compared entities {:?} (best_text={:.2})",
-                            d3_cap, r.url.chars().take(60).collect::<String>(), comparison_anchor_terms, best_non_video
+                            "POST-CAL D3 COMP-CAP -> {:.4}: '{}' names none of compared entities {:?} (best_text={:.2}, pre_cap={:.4})",
+                            d3_cap, r.url.chars().take(60).collect::<String>(), comparison_anchor_terms, best_non_video, r.score
                         );
                         r.post_cal_cap = Some(d3_cap);
                         r.score = d3_cap;
@@ -12093,11 +12514,16 @@ struct CommerceConfig {
     /// How many top-ranked results to display in the main-path shopping strip.
     /// Replaces the former hardcoded `COMMERCE_MAINPATH_TOP_N` constant.
     mainpath_top_n: usize,
+    /// How many already-ranked results are ENRICHED on the main `/search` path
+    /// before the display cap (`mainpath_top_n`) is applied. A wider window
+    /// lets enrichment reach past bot-checked merchant pages that lack structured
+    /// markup. Replaces the former hardcoded `COMMERCE_ENRICH_WINDOW` constant.
+    enrich_window: usize,
 }
 
 impl Default for CommerceConfig {
     fn default() -> Self {
-        Self { mainpath_top_n: 8 }
+        Self { mainpath_top_n: 8, enrich_window: 24 }
     }
 }
 
@@ -12112,6 +12538,11 @@ impl CommerceConfig {
                     if let Some(n) = v.get("mainpath_top_n").and_then(|x| x.as_u64()) {
                         if n > 0 && n <= 100 {
                             cfg.mainpath_top_n = n as usize;
+                        }
+                    }
+                    if let Some(n) = v.get("enrich_window").and_then(|x| x.as_u64()) {
+                        if n > 0 && n <= 100 {
+                            cfg.enrich_window = n as usize;
                         }
                     }
                 }
@@ -13527,7 +13958,7 @@ async fn handle_intent(
 fn build_video_inspect(q: &str) -> serde_json::Value {
     // Strip negation first -- mirrors /search's clean_query pipeline so a query
     // like "best tutorial not youtube" classifies on its positive content only.
-    let stripped = simple_negation_strip(q).unwrap_or_else(|| q.to_string());
+    let (stripped, _neg_excluded) = simple_negation_strip(q).unwrap_or_else(|| (q.to_string(), Vec::new()));
     let video_intent = has_video_intent(&stripped);
     let intent_resp = fallback_intent(q);
     let is_video_source_examples = serde_json::json!({
@@ -14552,10 +14983,10 @@ async fn handle_search(
         || q.starts_with("-") || q.contains(" not ") || q.contains(" no ")
         || q.contains(" without ") || q.contains(" -");
     let stripped_override: Option<String> = if has_neg_pattern {
-        simple_negation_strip(&q).filter(|s| {
+        simple_negation_strip(&q).filter(|(s, _)| {
             let processed = preprocess_searxng_query(s);
             !processed.is_empty() && processed != preprocess_searxng_query(&q)
-        })
+        }).map(|(s, _)| s)
     } else { None };
 
     let mut searx_urls: Vec<String> = Vec::new();
@@ -15649,8 +16080,16 @@ async fn handle_search(
             "understand ", "learn ", "teach me ",
         ];
         let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+        // Word-boundary matching: each keyword must appear as a complete word,
+        // not as a substring of another word (e.g. "price" must not match
+        // "priceless"). The trailing-space convention ("price ") missed queries
+        // ending with the keyword ("sony wh-1000xm5 price"). \b word boundaries
+        // fix both ends without per-query literals.
+        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
+        let has_tx_signal = tx_keywords.iter().any(|k| {
+            let pattern = format!(r"\b{}\b", regex::escape(k));
+            regex::Regex::new(&pattern).map(|re| re.is_match(&q_lower)).unwrap_or(false)
+        });
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -15900,7 +16339,7 @@ async fn handle_search(
         // SearXNG fan-out uses—strips both trigger words AND the negated
         // content terms immediately following them.
         // Example: "browser not chrome not edge" → "browser"
-        let stripped = simple_negation_strip(&q);
+        let stripped = simple_negation_strip(&q).map(|(s, _)| s);
         if let Some(ref s) = stripped {
             tracing::info!("ONLY NEGATIVE: stripped query '{:?}' -> '{}'", q, s);
         }
@@ -18285,7 +18724,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         // carry product facts. `serde_json::to_value` on `MergedResult` is lossless.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
             .iter()
-            .take(COMMERCE_ENRICH_WINDOW)
+            .take(state.commerce_config.enrich_window)
             .filter_map(|r| serde_json::to_value(r).ok())
             .collect();
         if shop_arr.is_empty() {
@@ -18316,7 +18755,12 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 Some(mut strip) => {
                     // STRICT post-ranking affiliate decoration on the DISPLAY strip only
                     // (never reorders — decoration is a pure post-ranking pass).
-                    decorate_affiliate(&mut strip, &state.affiliate_ctx);
+                    // GATE: monetization is exact-model-only — broad category queries
+                    // must never receive affiliate links even on the /search shopping
+                    // block. `q_lower` is in scope from the handle_search entry.
+                    if is_exact_model_query(&q_lower) {
+                        decorate_affiliate(&mut strip, &state.affiliate_ctx);
+                    }
                     // Read-only multi-merchant offer comparison from the attached facts.
                     let mut block = serde_json::json!({ "results": strip });
                     if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
@@ -19332,6 +19776,77 @@ async fn handle_search_fast(
 }
 
 #[cfg(test)]
+mod exact_model_gate_tests {
+    use super::*;
+
+    // ── is_exact_model_query: eligibility gate for affiliate decoration ──
+    // Monetization is exact-model-only. Broad category queries must never
+    // receive affiliate links. The gate is data-driven (regex), not a
+    // hardcoded product list.
+
+    #[test]
+    fn test_exact_model_queries_pass_the_gate() {
+        // Exact-model queries: brand + model number
+        assert!(is_exact_model_query("iphone 16 pro max price"));
+        assert!(is_exact_model_query("iphone 16"));
+        assert!(is_exact_model_query("galaxy s24 ultra"));
+        assert!(is_exact_model_query("pixel 9 pro"));
+        assert!(is_exact_model_query("macbook pro 14"));
+        assert!(is_exact_model_query("ipad air 5"));
+        assert!(is_exact_model_query("oneplus 12"));
+        assert!(is_exact_model_query("redmi note 13"));
+        assert!(is_exact_model_query("rog phone 8"));
+        assert!(is_exact_model_query("surface pro 9"));
+        assert!(is_exact_model_query("nokia g42"));
+        assert!(is_exact_model_query("moto g84"));
+        assert!(is_exact_model_query("nothing phone 2"));
+        assert!(is_exact_model_query("xiaomi 14"));
+        assert!(is_exact_model_query("poco x6"));
+        assert!(is_exact_model_query("realme gt 6"));
+        assert!(is_exact_model_query("zenfone 10"));
+        assert!(is_exact_model_query("imac 24"));
+        assert!(is_exact_model_query("apple watch 9"));
+    }
+
+    #[test]
+    fn test_broad_category_queries_fail_the_gate() {
+        // Broad product/category queries: no exact model number
+        assert!(!is_exact_model_query("best wireless earbuds under 50 dollars"));
+        assert!(!is_exact_model_query("best laptop for programming"));
+        assert!(!is_exact_model_query("cheap headphones"));
+        assert!(!is_exact_model_query("iphone vs android"));  // no model number
+        assert!(!is_exact_model_query("best phone 2026"));   // no brand+model
+        assert!(!is_exact_model_query("how to choose a laptop"));
+        assert!(!is_exact_model_query("wireless earbuds"));
+        assert!(!is_exact_model_query("laptop under 1000 rupees"));
+    }
+
+    #[test]
+    fn test_model_without_price_still_passes() {
+        // The gate is exact-model-only, not model+price. A query that names
+        // a specific model is exact-model regardless of whether it mentions price.
+        assert!(is_exact_model_query("iphone 16 pro max"));
+        assert!(is_exact_model_query("galaxy s24"));
+        assert!(is_exact_model_query("pixel 9"));
+    }
+
+    #[test]
+    fn test_price_without_model_fails() {
+        // Price signal alone is not enough — must have a specific model.
+        assert!(!is_exact_model_query("best phone under 500 dollars"));
+        assert!(!is_exact_model_query("cheap laptop"));
+        assert!(!is_exact_model_query("price of wireless earbuds"));
+    }
+
+    #[test]
+    fn test_case_insensitive() {
+        assert!(is_exact_model_query("iPhone 16 Pro Max"));
+        assert!(is_exact_model_query("GALAXY S24"));
+        assert!(is_exact_model_query("Pixel 9 Pro"));
+    }
+}
+
+#[cfg(test)]
 mod negation_scope_tests {
     use super::*;
 
@@ -19344,7 +19859,7 @@ mod negation_scope_tests {
 
     #[test]
     fn without_clause_does_not_swallow_following_clause() {
-        let stripped = simple_negation_strip(
+        let (stripped, excluded) = simple_negation_strip(
             "protein powder without artificial sweeteners for lactose intolerant beginners",
         )
         .expect("should strip the negated clause but keep the trailing clause");
@@ -19363,6 +19878,11 @@ mod negation_scope_tests {
             "negated term must be stripped, got: {:?}",
             stripped
         );
+        assert!(
+            excluded.contains(&"artificial".to_string()),
+            "non-domain negated term must be returned as exclusion, got: {:?}",
+            excluded
+        );
     }
 
     #[test]
@@ -19370,11 +19890,11 @@ mod negation_scope_tests {
         // The original purpose of the function: "not X not Y" chains.
         assert_eq!(
             simple_negation_strip("browser not chrome not edge"),
-            Some("browser".to_string())
+            Some(("browser".to_string(), vec!["chrome".to_string(), "edge".to_string()]))
         );
         assert_eq!(
             simple_negation_strip("javascript framework not react not vue not angular"),
-            Some("javascript framework".to_string())
+            Some(("javascript framework".to_string(), vec!["react".to_string(), "vue".to_string(), "angular".to_string()]))
         );
     }
 
@@ -19382,20 +19902,50 @@ mod negation_scope_tests {
     fn not_from_phrase_keeps_negation_scope() {
         // Prepositions are NOT clause boundaries: "not from <country>" keeps
         // the negated phrase in scope (P9 regression guard).
-        let stripped = simple_negation_strip("smartphones not from chinese brands");
-        assert_eq!(stripped, Some("smartphones".to_string()));
+        let (stripped, excluded) = simple_negation_strip("smartphones not from chinese brands").unwrap();
+        assert_eq!(stripped, "smartphones".to_string());
+        assert!(excluded.contains(&"chinese".to_string()) || excluded.contains(&"brands".to_string()));
     }
 
     #[test]
     fn without_sugar_or_honey_negates_both_sides() {
         // "or" continues the negation scope: both alternatives stay excluded.
-        let stripped = simple_negation_strip("dessert recipes without sugar or honey");
-        assert!(stripped.unwrap().contains("dessert recipes"));
+        let (stripped, excluded) = simple_negation_strip("dessert recipes without sugar or honey").unwrap();
+        assert!(stripped.contains("dessert recipes"));
+        assert!(excluded.contains(&"sugar".to_string()) || excluded.contains(&"honey".to_string()));
     }
 
     #[test]
     fn plain_query_returns_none() {
         assert_eq!(simple_negation_strip("best laptop for programming"), None);
+    }
+
+    // ── Non-domain content words after "without" are returned as exclusions ──
+    // Round auto/round-2026-10-12T0625Z: "biryani without hand rolled" was
+    // losing the "hand rolled" constraint entirely because simple_negation_strip
+    // silently dropped every non-domain word after "without". The fix returns
+    // those words as exclusions so the caller can apply a quality penalty.
+
+    #[test]
+    fn without_non_domain_terms_returned_as_exclusions() {
+        let (stripped, excluded) = simple_negation_strip("biryani without hand rolled").unwrap();
+        assert_eq!(stripped, "biryani".to_string());
+        assert_eq!(excluded, vec!["hand".to_string(), "rolled".to_string()]);
+    }
+
+    #[test]
+    fn without_mixed_domain_and_non_domain_terms() {
+        // "linux" is a preserved domain word; "spicy" is not.
+        let (stripped, excluded) = simple_negation_strip("recipes without linux spicy").unwrap();
+        assert_eq!(stripped, "recipes linux".to_string());
+        assert_eq!(excluded, vec!["spicy".to_string()]);
+    }
+
+    #[test]
+    fn without_non_domain_phrase_collected_word_by_word() {
+        let (stripped, excluded) = simple_negation_strip("protein powder without artificial sweeteners").unwrap();
+        assert_eq!(stripped, "protein powder".to_string());
+        assert_eq!(excluded, vec!["artificial".to_string(), "sweeteners".to_string()]);
     }
 
     // ── A bare negation marker must never survive as a POSITIVE requirement ──
@@ -20765,25 +21315,40 @@ mod hardcoding_ruling_tests {
         }
 
         // Verify the tx_keywords list still matches genuine transactional queries
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
-        for q in &transactional_queries {
+        // using word-boundary matching (same logic as production).
+        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
+        let has_tx_wordboundary = |q: &str| -> bool {
             let q_lower = q.to_lowercase();
-            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
-            assert!(has_tx, "transactional query '{}' should match tx_keywords", q);
+            tx_keywords.iter().any(|k| {
+                let pattern = format!(r"\b{}\b", regex::escape(k));
+                regex::Regex::new(&pattern).map(|re| re.is_match(&q_lower)).unwrap_or(false)
+            })
+        };
+        for q in &transactional_queries {
+            assert!(has_tx_wordboundary(q), "transactional query '{}' should match tx_keywords", q);
         }
 
-        // Verify that guarded queries with "under " or "price " would have matched
+        // Verify that queries ending with a keyword (no trailing space) match.
+        // This was the root cause: "price " (trailing space) missed "sony wh-1000xm5 price".
+        let end_keyword_queries = [
+            "sony wh-1000xm5 price",
+            "iphone 16 pro max buy",
+            "best laptop under",
+        ];
+        for q in &end_keyword_queries {
+            assert!(has_tx_wordboundary(q), "end-of-query keyword '{}' should match tx_keywords", q);
+        }
+
+        // Verify that guarded queries with "under" or "price" would have matched
         // the OLD (un-guarded) logic — proving the test is meaningful
         let problematic_queries = [
             "how to convert pdf to word under 5 minutes",
             "how to check price of used bike",
         ];
         for q in &problematic_queries {
-            let q_lower = q.to_lowercase();
-            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
-            assert!(has_tx, "query '{}' should match tx_keywords (proving the guard is needed)", q);
+            assert!(has_tx_wordboundary(q), "query '{}' should match tx_keywords (proving the guard is needed)", q);
             // But the guard suppresses it
-            let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+            let has_starter = informational_starters.iter().any(|s| q.to_lowercase().starts_with(s));
             assert!(has_starter, "query '{}' should be guarded by informational starter", q);
         }
     }
@@ -21815,7 +22380,7 @@ mod spellcheck_endpoint_tests {
         fn video_watch_phrase_triggers_video_intent() {
             // "watch video" / "watch tutorial" must be detected as video intent
             // (has_video_intent checks for these phrases, matching live /search).
-            let stripped = simple_negation_strip("watch video tutorial").unwrap_or_else(|| "watch video tutorial".to_string());
+            let (stripped, _) = simple_negation_strip("watch video tutorial").unwrap_or_else(|| ("watch video tutorial".to_string(), Vec::new()));
             assert!(has_video_intent(&stripped));
         }
     }
@@ -22447,6 +23012,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             param_env: HashMap::new(),
             bid_floor: None,
             fallback_url: None,
+            host_suffix: None,
         }
     }
 
@@ -22516,7 +23082,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn decoration_is_idempotent_no_double_wrap() {
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx::from_networks(vec![n]);
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -22533,7 +23099,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn missing_key_degrades_to_null_affiliate() {
         // No usable network (key env var unset) => results keep affiliate null.
         let n = net("wrap", "https://sovrn.co?key={key}&u={url}", HashMap::new(), Some("UNSET_KEY_ENV_VAR_XYZ"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx::from_networks(vec![n]);
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -22546,7 +23112,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // The central no-manipulation guarantee: decoration never reorders.
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx::from_networks(vec![n]);
         let mut results = vec![
             serde_json::json!({ "url": "https://a.example.com/x", "score": 9.7 }),
             serde_json::json!({ "url": "https://b.example.org/y", "score": 8.1 }),
@@ -23654,5 +24220,187 @@ mod mainpath_shopping_strip_tests {
     fn enrich_window_is_wider_than_display_cap() {
         // Guards the constants from being re-conflated.
         assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
+    }
+
+    // ─── extract_snippet_facts tests ────────────────────────────────────
+
+    #[test]
+    fn snippet_facts_extracts_price_and_currency() {
+        let snippet = "Sony WH-1000XM5 headphones $349.99";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.price, Some(349.99));
+        assert_eq!(facts.currency, Some("USD".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_extracts_product_name_from_title() {
+        let snippet = "Sony WH-1000XM5 Wireless Headphones | Best Buy\n$349.99";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(
+            facts.name,
+            Some("Sony WH-1000XM5 Wireless Headphones".to_string())
+        );
+    }
+
+    #[test]
+    fn snippet_facts_extracts_merchant_from_url_host() {
+        let snippet = "Sony WH-1000XM5 headphones $349.99";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.merchant, Some("www.bestbuy.com".to_string()));
+        // merchant_observed must be false — derived from URL, not page
+        assert!(!facts.merchant_observed);
+    }
+
+    #[test]
+    fn snippet_facts_extracts_availability_in_stock() {
+        let snippet = "Sony WH-1000XM5 headphones $349.99 — In Stock";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.availability, Some("in_stock".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_extracts_availability_out_of_stock() {
+        let snippet = "Sony WH-1000XM5 headphones $349.99 — Out of Stock";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.availability, Some("out_of_stock".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_returns_empty_for_no_match() {
+        let snippet = "How to cook pasta";
+        let url = "https://recipes.example.com/pasta";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.price, None);
+        assert_eq!(facts.currency, None);
+        assert_eq!(facts.name, None);
+        assert_eq!(facts.availability, None);
+        // merchant is always extracted from URL host (even if no other facts)
+        assert_eq!(facts.merchant, Some("recipes.example.com".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_passes_data_has_gate() {
+        // A snippet with a price must pass data_has_fact
+        let snippet = "Sony WH-1000XM5 headphones $349.99";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert!(data_has_fact(&facts));
+    }
+
+    #[test]
+    fn snippet_facts_fails_data_has_gate_for_no_facts() {
+        // A snippet with no price, no availability, no name must fail data_has_fact
+        // (merchant alone doesn't count — merchant_observed is false)
+        let snippet = "How to cook pasta";
+        let url = "https://recipes.example.com/pasta";
+        let facts = extract_snippet_facts(snippet, url);
+        assert!(!data_has_fact(&facts));
+    }
+
+    #[test]
+    fn snippet_facts_extracts_inr_price() {
+        let snippet = "Sony WH-1000XM5 headphones ₹29,999";
+        let url = "https://www.amazon.in/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.price, Some(29999.0));
+        assert_eq!(facts.currency, Some("INR".to_string()));
+    }
+
+    #[test]
+    fn snippet_facts_handles_empty_snippet() {
+        let snippet = "";
+        let url = "https://www.bestbuy.com/sony-wh1000xm5";
+        let facts = extract_snippet_facts(snippet, url);
+        assert_eq!(facts.price, None);
+        assert_eq!(facts.name, None);
+        assert_eq!(facts.availability, None);
+        // merchant still extracted from URL
+        assert_eq!(facts.merchant, Some("www.bestbuy.com".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod local_intent_gazetteer_tests {
+    use super::*;
+
+    /// Regression test: queries like "restaurants in bangalore" or "hotels in paris"
+    /// must be detected as local intent via the LOCATION_GAZETTEER.
+    ///
+    /// Before the fix, `has_local_intent` only checked "near me" / "nearby" /
+    /// "in area" patterns, so gazetteer-city queries were not detected as local.
+    /// The fix splits on " in " and checks against LOCATION_GAZETTEER.
+    #[test]
+    fn gazetteer_city_after_in_detects_local_intent() {
+        // These must ALL be detected as local intent.
+        let local_queries = [
+            "restaurants in bangalore",
+            "hotels in paris",
+            "coffee shops in tokyo",
+            "things to do in new york",
+            "best cafes in london",
+            "street food in mumbai",
+            "pizza places in delhi",
+            "sightseeing in dubai",
+        ];
+        for q in &local_queries {
+            assert!(
+                has_local_intent(q),
+                "query '{}' should be detected as local intent via gazetteer",
+                q
+            );
+        }
+    }
+
+    #[test]
+    fn non_gazetteer_after_in_does_not_detect_local_intent() {
+        // These must NOT be detected as local intent — the place after " in "
+        // is not in the LOCATION_GAZETTEER and doesn't match other local patterns.
+        let non_local_queries = [
+            "restaurants in september",
+            "best in class",
+            "how to cook in a pressure cooker",
+        ];
+        for q in &non_local_queries {
+            assert!(
+                !has_local_intent(q),
+                "query '{}' should NOT be detected as local intent",
+                q
+            );
+        }
+    }
+
+    #[test]
+    fn long_conversational_query_with_in_country_not_local() {
+        // A long conversational query that happens to contain " in <country>"
+        // should NOT be classified as local intent (short-query guard).
+        let long_query = "i have been working as a network administrator for five years and now i want to understand the job market in india";
+        assert!(
+            !has_local_intent(long_query),
+            "long conversational query should not be local intent"
+        );
+    }
+
+    #[test]
+    fn traditional_local_patterns_still_work() {
+        // Ensure the original "near me" / "nearby" patterns still work
+        // after the gazetteer-city addition.
+        let traditional_locals = [
+            "restaurants near me",
+            "nearby coffee shops",
+            "hotels around me",
+            "gas stations close to me",
+        ];
+        for q in &traditional_locals {
+            assert!(
+                has_local_intent(q),
+                "traditional local query '{}' should still be detected",
+                q
+            );
+        }
     }
 }
