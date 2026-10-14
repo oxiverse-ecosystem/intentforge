@@ -255,10 +255,11 @@ fn is_model_number_price_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
 /// queries ("best wireless earbuds under 50 dollars") must never receive
 /// affiliate links even when they use the /shopping endpoint.
 ///
-/// Reuses the same model-number regex as `is_model_number_price_query` but
+/// Reuses the same model-number detection as `is_model_number_price_query` but
 /// drops the price requirement — a query that names a specific model is
 /// exact-model regardless of whether it mentions price. Data-driven: the
-/// brand+model pattern lives in the regex, not in a keyword→reply table.
+/// brand list lives in `ExactModelConfig` (loaded from
+/// `data/commerce/exact_model_brands.json`), not in a keyword→reply table.
 fn is_exact_model_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
     cfg.has_exact_model(q_lower)
 }
@@ -19167,7 +19168,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     // GATE: monetization is exact-model-only — broad category queries
                     // must never receive affiliate links even on the /search shopping
                     // block. `q_lower` is in scope from the handle_search entry.
-                    if is_exact_model_query(&q_lower) {
+                    if is_exact_model_query(&q_lower, &state.exact_model_config) {
                         decorate_affiliate(&mut strip, &state.affiliate_ctx);
                     }
                     // Read-only multi-merchant offer comparison from the attached facts.
@@ -20208,68 +20209,142 @@ mod exact_model_gate_tests {
 
     // ── is_exact_model_query: eligibility gate for affiliate decoration ──
     // Monetization is exact-model-only. Broad category queries must never
-    // receive affiliate links. The gate is data-driven (regex), not a
-    // hardcoded product list.
+    // receive affiliate links. The gate is data-driven (runtime-loaded brand
+    // list from exact_model_brands.json), not a hardcoded product list.
 
     #[test]
     fn test_exact_model_queries_pass_the_gate() {
         // Exact-model queries: brand + model number
-        assert!(is_exact_model_query("iphone 16 pro max price"));
-        assert!(is_exact_model_query("iphone 16"));
-        assert!(is_exact_model_query("galaxy s24 ultra"));
-        assert!(is_exact_model_query("pixel 9 pro"));
-        assert!(is_exact_model_query("macbook pro 14"));
-        assert!(is_exact_model_query("ipad air 5"));
-        assert!(is_exact_model_query("oneplus 12"));
-        assert!(is_exact_model_query("redmi note 13"));
-        assert!(is_exact_model_query("rog phone 8"));
-        assert!(is_exact_model_query("surface pro 9"));
-        assert!(is_exact_model_query("nokia g42"));
-        assert!(is_exact_model_query("moto g84"));
-        assert!(is_exact_model_query("nothing phone 2"));
-        assert!(is_exact_model_query("xiaomi 14"));
-        assert!(is_exact_model_query("poco x6"));
-        assert!(is_exact_model_query("realme gt 6"));
-        assert!(is_exact_model_query("zenfone 10"));
-        assert!(is_exact_model_query("imac 24"));
-        assert!(is_exact_model_query("apple watch 9"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_exact_model_query("iphone 16 pro max price", &cfg));
+        assert!(is_exact_model_query("iphone 16", &cfg));
+        assert!(is_exact_model_query("galaxy s24 ultra", &cfg));
+        assert!(is_exact_model_query("pixel 9 pro", &cfg));
+        assert!(is_exact_model_query("macbook pro 14", &cfg));
+        assert!(is_exact_model_query("ipad air 5", &cfg));
+        assert!(is_exact_model_query("oneplus 12", &cfg));
+        assert!(is_exact_model_query("redmi note 13", &cfg));
+        assert!(is_exact_model_query("rog phone 8", &cfg));
+        assert!(is_exact_model_query("surface pro 9", &cfg));
+        assert!(is_exact_model_query("nokia g42", &cfg));
+        assert!(is_exact_model_query("moto g84", &cfg));
+        assert!(is_exact_model_query("nothing phone 2", &cfg));
+        assert!(is_exact_model_query("xiaomi 14", &cfg));
+        assert!(is_exact_model_query("poco x6", &cfg));
+        assert!(is_exact_model_query("realme gt 6", &cfg));
+        assert!(is_exact_model_query("zenfone 10", &cfg));
+        assert!(is_exact_model_query("imac 24", &cfg));
+        assert!(is_exact_model_query("apple watch 9", &cfg));
     }
 
     #[test]
     fn test_broad_category_queries_fail_the_gate() {
         // Broad product/category queries: no exact model number
-        assert!(!is_exact_model_query("best wireless earbuds under 50 dollars"));
-        assert!(!is_exact_model_query("best laptop for programming"));
-        assert!(!is_exact_model_query("cheap headphones"));
-        assert!(!is_exact_model_query("iphone vs android"));  // no model number
-        assert!(!is_exact_model_query("best phone 2026"));   // no brand+model
-        assert!(!is_exact_model_query("how to choose a laptop"));
-        assert!(!is_exact_model_query("wireless earbuds"));
-        assert!(!is_exact_model_query("laptop under 1000 rupees"));
+        let cfg = ExactModelConfig::default();
+        assert!(!is_exact_model_query("best wireless earbuds under 50 dollars", &cfg));
+        assert!(!is_exact_model_query("best laptop for programming", &cfg));
+        assert!(!is_exact_model_query("cheap headphones", &cfg));
+        assert!(!is_exact_model_query("iphone vs android", &cfg));  // no model number
+        assert!(!is_exact_model_query("best phone 2026", &cfg));   // no brand+model
+        assert!(!is_exact_model_query("how to choose a laptop", &cfg));
+        assert!(!is_exact_model_query("wireless earbuds", &cfg));
+        assert!(!is_exact_model_query("laptop under 1000 rupees", &cfg));
     }
 
     #[test]
     fn test_model_without_price_still_passes() {
         // The gate is exact-model-only, not model+price. A query that names
         // a specific model is exact-model regardless of whether it mentions price.
-        assert!(is_exact_model_query("iphone 16 pro max"));
-        assert!(is_exact_model_query("galaxy s24"));
-        assert!(is_exact_model_query("pixel 9"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_exact_model_query("iphone 16 pro max", &cfg));
+        assert!(is_exact_model_query("galaxy s24", &cfg));
+        assert!(is_exact_model_query("pixel 9", &cfg));
     }
 
     #[test]
     fn test_price_without_model_fails() {
         // Price signal alone is not enough — must have a specific model.
-        assert!(!is_exact_model_query("best phone under 500 dollars"));
-        assert!(!is_exact_model_query("cheap laptop"));
-        assert!(!is_exact_model_query("price of wireless earbuds"));
+        let cfg = ExactModelConfig::default();
+        assert!(!is_exact_model_query("best phone under 500 dollars", &cfg));
+        assert!(!is_exact_model_query("cheap laptop", &cfg));
+        assert!(!is_exact_model_query("price of wireless earbuds", &cfg));
     }
 
     #[test]
     fn test_case_insensitive() {
-        assert!(is_exact_model_query("iPhone 16 Pro Max"));
-        assert!(is_exact_model_query("GALAXY S24"));
-        assert!(is_exact_model_query("Pixel 9 Pro"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_exact_model_query("iPhone 16 Pro Max", &cfg));
+        assert!(is_exact_model_query("GALAXY S24", &cfg));
+        assert!(is_exact_model_query("Pixel 9 Pro", &cfg));
+    }
+
+    #[test]
+    fn test_exact_model_config_loads_from_data_file() {
+        // The config loads from data/commerce/exact_model_brands.json.
+        // We can't easily test the file-loading path in a unit test (it
+        // reads from disk), but we can verify the default has the expected
+        // brands and that a custom config respects the loaded list.
+        let cfg = ExactModelConfig::default();
+        assert!(cfg.brands.contains(&"iphone".to_string()));
+        assert!(cfg.brands.contains(&"galaxy".to_string()));
+        assert!(cfg.brands.contains(&"pixel".to_string()));
+        assert!(!cfg.brands.contains(&"nonexistent_brand".to_string()));
+    }
+
+    #[test]
+    fn test_custom_brand_list_is_respected() {
+        // A custom brand list (as if loaded from the data file) is respected.
+        let mut cfg = ExactModelConfig::default();
+        cfg.brands = vec!["acme".to_string(), "widget".to_string()];
+        assert!(is_exact_model_query("acme 123", &cfg));
+        assert!(is_exact_model_query("widget pro 5", &cfg));
+        // iphone is no longer in the list
+        assert!(!is_exact_model_query("iphone 16", &cfg));
+    }
+
+    #[test]
+    fn test_empty_brand_list_returns_false() {
+        let mut cfg = ExactModelConfig::default();
+        cfg.brands = vec![];
+        assert!(!is_exact_model_query("iphone 16", &cfg));
+    }
+
+    #[test]
+    fn test_brand_without_number_returns_false() {
+        let cfg = ExactModelConfig::default();
+        // Brand present but no model number follows
+        assert!(!is_exact_model_query("iphone", &cfg));
+        assert!(!is_exact_model_query("galaxy", &cfg));
+        assert!(!is_exact_model_query("iphone vs android", &cfg));
+    }
+
+    #[test]
+    fn test_model_number_price_query_uses_config() {
+        let cfg = ExactModelConfig::default();
+        // Model + price = true
+        assert!(is_model_number_price_query("iphone 16 price", &cfg));
+        assert!(is_model_number_price_query("galaxy s24 cost", &cfg));
+        // Price but no model = false
+        assert!(!is_model_number_price_query("best phone under 500", &cfg));
+        // Model but no price = false
+        assert!(!is_model_number_price_query("iphone 16", &cfg));
+    }
+
+    #[test]
+    fn test_brand_with_trailing_punctuation() {
+        // Brand followed by punctuation (e.g. "iphone:") should still match
+        let cfg = ExactModelConfig::default();
+        assert!(is_exact_model_query("iphone: 16 pro", &cfg));
+        assert!(is_exact_model_query("galaxy, s24", &cfg));
+    }
+
+    #[test]
+    fn test_brand_window_covers_multi_word_models() {
+        // "galaxy s24 ultra" — brand at index 0, model number at index 1
+        let cfg = ExactModelConfig::default();
+        assert!(is_exact_model_query("galaxy s24 ultra", &cfg));
+        // "apple watch 9" — "watch" is in the brand list
+        assert!(is_exact_model_query("apple watch 9", &cfg));
     }
 }
 
