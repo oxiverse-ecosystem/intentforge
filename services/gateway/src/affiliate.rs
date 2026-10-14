@@ -35,6 +35,12 @@ use std::collections::HashMap;
 // affiliate parameter (privacy rule) — the only coarse subid is the merchant
 // host, which is non-identifying.
 /// One network/program row loaded from the data file. Generic over kinds.
+///
+/// `host_suffix` enables per-merchant matching: when present, this program
+/// only applies to result URLs whose host equals or ends with the suffix
+/// (label-boundary match, case-insensitive). When null, the program is a
+/// catch-all (matches any URL) — preserving the original single-network
+/// behaviour for backward compatibility.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct AffiliateNetwork {
     id: String,
@@ -44,6 +50,7 @@ struct AffiliateNetwork {
     enabled: bool,
     #[serde(default = "default_priority")]
     priority: i64,
+    #[serde(default)]
     network: String,
     template: String,
     #[serde(default)]
@@ -61,6 +68,10 @@ struct AffiliateNetwork {
     /// url-encoded as a query param. DATA-ONLY.
     #[serde(default)]
     fallback_url: Option<String>,
+    /// Optional merchant host suffix for per-merchant matching (e.g.
+    /// "amazon." matches amazon.com, amazon.co.uk, etc.). Null = catch-all.
+    #[serde(default)]
+    host_suffix: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -68,6 +79,22 @@ fn default_true() -> bool {
 }
 fn default_priority() -> i64 {
     0
+}
+
+/// Network metadata loaded from `data/commerce/networks.json`. Provides
+/// disclosure labels and subid policy documentation for each network.
+/// Purely informational — does not affect link rendering.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct AffiliateNetworkMeta {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    disclosure_label: String,
+    #[serde(default)]
+    subid_policy: String,
+    #[serde(default)]
+    subid_description: String,
 }
 
 /// HOST component of a URL, lowercased, without scheme/port/userinfo/path.
@@ -141,10 +168,22 @@ fn is_reserved_documentation_host(host: &str) -> bool {
     false
 }
 
-/// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
+/// Runtime-resolved config: data files + env-resolved keys. Built once at startup.
+///
+/// `networks` holds the legacy catch-all programs (from `affiliate.json`).
+/// `programs` holds per-merchant programs (from `affiliate_programs.json`) —
+/// each carries a `host_suffix` for domain matching. `network_meta` holds
+/// disclosure/subid metadata (from `networks.json`).
+///
+/// Decoration logic: for each result, the engine first tries to match a
+/// per-merchant program by `host_suffix`. If none matches, it falls back to
+/// the first usable catch-all network. This preserves backward compatibility
+/// with the single-network model while enabling per-merchant decoration.
 #[derive(Clone)]
 struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
+    programs: Vec<AffiliateNetwork>,
+    network_meta: Vec<AffiliateNetworkMeta>,
 }
 
 /// Host labels that are IANA-reserved and can never be a real merchant:
@@ -205,21 +244,32 @@ fn is_reserved_placeholder_url(url: &str) -> bool {
 }
 
 impl AffiliateCtx {
-    /// Load networks from the data file. An empty/missing file is NOT fatal: the
+    /// Load networks from the data files. An empty/missing file is NOT fatal: the
     /// engine simply has no networks and every result degrades to `affiliate:
     /// null`. This is intentional — affiliate decoration is best-effort and must
     /// never break search.
+    ///
+    /// Loads three data files:
+    ///   1. `affiliate.json`         — legacy catch-all networks (backward compat)
+    ///   2. `affiliate_programs.json` — per-merchant programs with host_suffix matching
+    ///   3. `networks.json`          — network metadata (disclosure labels, subid policy)
     fn load() -> Self {
         let mut networks: Vec<AffiliateNetwork> = Vec::new();
+        let mut programs: Vec<AffiliateNetwork> = Vec::new();
+        let mut network_meta: Vec<AffiliateNetworkMeta> = Vec::new();
+
         // Resolve the data path relative to the process cwd (container WORKDIR is
         // /app, app binary at /app/gateway; data baked at /app/data/commerce).
         let candidates = [
-            "data/commerce/affiliate.json",
-            "/app/data/commerce/affiliate.json",
-            "./data/commerce/affiliate.json",
+            "data/commerce",
+            "/app/data/commerce",
+            "./data/commerce",
         ];
-        for path in candidates {
-            if let Ok(text) = std::fs::read_to_string(path) {
+
+        // ── 1. Legacy catch-all networks (affiliate.json) ──
+        for base in &candidates {
+            let path = format!("{}/affiliate.json", base);
+            if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
                         for n in arr {
@@ -248,9 +298,71 @@ impl AffiliateCtx {
                 }
             }
         }
+
+        // ── 2. Per-merchant programs (affiliate_programs.json) ──
+        for base in &candidates {
+            let path = format!("{}/affiliate_programs.json", base);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("programs").and_then(|n| n.as_array()) {
+                        for n in arr {
+                            if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                                // Same fallback sanitization as legacy networks.
+                                if let Some(fbu) = net.fallback_url.clone() {
+                                    if is_reserved_placeholder_url(&fbu) {
+                                        tracing::warn!(
+                                            program = %net.id,
+                                            "affiliate: ignoring reserved placeholder fallback_url (RFC 2606/6761 documentation domain)"
+                                        );
+                                        net.fallback_url = None;
+                                    }
+                                }
+                                programs.push(net);
+                            }
+                        }
+                    }
+                }
+                if !programs.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // ── 3. Network metadata (networks.json) ──
+        for base in &candidates {
+            let path = format!("{}/networks.json", base);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
+                        for n in arr {
+                            if let Ok(meta) = serde_json::from_value::<AffiliateNetworkMeta>(n.clone()) {
+                                network_meta.push(meta);
+                            }
+                        }
+                    }
+                }
+                if !network_meta.is_empty() {
+                    break;
+                }
+            }
+        }
+
         networks.sort_by(|a, b| b.priority.cmp(&a.priority));
-        tracing::info!("affiliate: loaded {} network(s) from data file", networks.len());
-        Self { networks }
+        programs.sort_by(|a, b| b.priority.cmp(&a.priority));
+        tracing::info!(
+            "affiliate: loaded {} network(s), {} program(s), {} network meta(s) from data files",
+            networks.len(),
+            programs.len(),
+            network_meta.len()
+        );
+        Self { networks, programs, network_meta }
+    }
+
+    /// Construct an AffiliateCtx with only legacy catch-all networks (no
+    /// per-merchant programs, no network metadata). Used by tests that build
+    /// synthetic contexts.
+    fn from_networks(networks: Vec<AffiliateNetwork>) -> Self {
+        Self { networks, programs: vec![], network_meta: vec![] }
     }
 
     /// The first enabled network that has its required key present in the env.
@@ -263,6 +375,56 @@ impl AffiliateCtx {
                     .map(|k| std::env::var(k).is_ok())
                     .unwrap_or(false)
         })
+    }
+
+    /// Find the first enabled per-merchant program whose `host_suffix` matches
+    /// the given URL's host AND whose key is present in the env.
+    ///
+    /// `host_suffix` matching is label-boundary, case-insensitive: the result
+    /// URL's host must equal the suffix or end with `"." + suffix` (e.g.
+    /// suffix `"amazon."` matches `amazon.com`, `amazon.co.uk`, etc.).
+    ///
+    /// Returns None when no per-merchant program matches (caller should fall
+    /// back to `first_usable()` for the legacy catch-all path).
+    fn match_program(&self, url: &str) -> Option<&AffiliateNetwork> {
+        let host = url_host(url);
+        if host.is_empty() {
+            return None;
+        }
+        // Collect all matching programs, then pick the highest priority.
+        // This ensures deterministic behavior regardless of vector order.
+        let mut best: Option<&AffiliateNetwork> = None;
+        for p in &self.programs {
+            if !p.enabled {
+                continue;
+            }
+            let has_key = p.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false);
+            if !has_key {
+                continue;
+            }
+            let matches = match &p.host_suffix {
+                None => false,
+                Some(suffix) => {
+                    let suffix = suffix.trim_end_matches('.').to_lowercase();
+                    if suffix.is_empty() {
+                        false
+                    } else if host == suffix {
+                        true
+                    } else {
+                        host.split('.').any(|label| label == suffix)
+                    }
+                }
+            };
+            if !matches {
+                continue;
+            }
+            best = match best {
+                None => Some(p),
+                Some(current) if p.priority > current.priority => Some(p),
+                _ => best,
+            };
+        }
+        best
     }
 }
 
@@ -383,11 +545,15 @@ fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> 
 /// that already carries an `affiliate` block is left untouched (idempotent).
 /// When no usable network key is present, results keep `affiliate: null` and are
 /// still returned. This function NEVER reorders or re-scores.
+///
+/// Per-merchant matching: for each result, the engine first tries to find a
+/// per-merchant program (from `affiliate_programs.json`) whose `host_suffix`
+/// matches the result URL's host. If found, that program's template/params are
+/// used. If no per-merchant program matches, the engine falls back to the
+/// first usable catch-all network (from `affiliate.json`) — preserving the
+/// original single-network behaviour. This two-tier lookup is fully data-driven:
+/// adding a new merchant requires only editing `affiliate_programs.json`.
 fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
-    let net = match ctx.first_usable() {
-        Some(n) => n,
-        None => return, // graceful: no key => leave affiliate un-set
-    };
     for r in results.iter_mut() {
         if !r.is_object() {
             continue;
@@ -399,7 +565,19 @@ fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
             Some(u) if !u.is_empty() => u.to_string(),
             _ => continue,
         };
+
+        // Two-tier lookup: per-merchant program first, then catch-all fallback.
+        let net = ctx.match_program(&url).or_else(|| ctx.first_usable());
+        let net = match net {
+            Some(n) => n,
+            None => continue, // graceful: no key => leave affiliate un-set
+        };
+
         // Coarse, non-identifying subid: the destination merchant host only.
+        // PRIVACY: never add user id, session id, IP, or query text to subid.
+        // The subid is ONLY the merchant host (e.g. "amazon.com"), which is
+        // coarse and non-identifying — it tells the network which merchant the
+        // click is for, nothing about the user.
         let subid = reqwest::Url::parse(&url)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_string()))
