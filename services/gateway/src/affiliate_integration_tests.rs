@@ -26,6 +26,12 @@ use serde_json::{json, Value};
 
 /// Load the real runtime config and assert it is usable (non-vacuity guard).
 fn real_ctx() -> AffiliateCtx {
+    // Ensure CWD is the gateway directory so AffiliateCtx::load() finds data/commerce.
+    let gateway_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .expect("CARGO_MANIFEST_DIR must exist");
+    std::env::set_current_dir(&gateway_dir)
+        .expect("must be able to set CWD to gateway dir");
     let ctx = AffiliateCtx::load();
     assert!(
         !ctx.programs.is_empty(),
