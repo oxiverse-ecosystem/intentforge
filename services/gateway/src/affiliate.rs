@@ -42,42 +42,42 @@ use std::collections::HashMap;
 /// catch-all (matches any URL) — preserving the original single-network
 /// behaviour for backward compatibility.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct AffiliateNetwork {
-    id: String,
+pub struct AffiliateNetwork {
+    pub id: String,
     #[serde(default)]
-    kind: String, // "wrap" | "append_params"
+    pub kind: String, // "wrap" | "append_params"
     #[serde(default = "default_true")]
-    enabled: bool,
+    pub enabled: bool,
     #[serde(default = "default_priority")]
-    priority: i64,
+    pub priority: i64,
     #[serde(default)]
-    network: String,
-    template: String,
+    pub network: String,
+    pub template: String,
     #[serde(default)]
-    params: std::collections::HashMap<String, String>,
+    pub params: std::collections::HashMap<String, String>,
     #[serde(default)]
-    key_env: Option<String>,
+    pub key_env: Option<String>,
     #[serde(default)]
-    param_env: HashMap<String, String>,
+    pub param_env: HashMap<String, String>,
     /// Bid floor (Sovrn `bf`) appended as a query param on the decorated URL.
     /// DATA-ONLY — never influences ranking (decoration is a strict post-ranking
     /// pass). Surfaced in the `affiliate` block for reporting.
     #[serde(default)]
-    bid_floor: Option<String>,
+    pub bid_floor: Option<String>,
     /// Fallback URL (Sovrn `fbu`) used if the bid floor isn't met. Appended
     /// url-encoded as a query param. DATA-ONLY.
     #[serde(default)]
-    fallback_url: Option<String>,
+    pub fallback_url: Option<String>,
     /// Optional merchant host suffix for per-merchant matching (e.g.
     /// "amazon." matches amazon.com, amazon.co.uk, etc.). Null = catch-all.
     #[serde(default)]
-    host_suffix: Option<String>,
+    pub host_suffix: Option<String>,
 }
 
-fn default_true() -> bool {
+pub fn default_true() -> bool {
     true
 }
-fn default_priority() -> i64 {
+pub fn default_priority() -> i64 {
     0
 }
 
@@ -85,21 +85,21 @@ fn default_priority() -> i64 {
 /// disclosure labels and subid policy documentation for each network.
 /// Purely informational — does not affect link rendering.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct AffiliateNetworkMeta {
-    id: String,
+pub struct AffiliateNetworkMeta {
+    pub id: String,
     #[serde(default)]
-    name: String,
+    pub name: String,
     #[serde(default)]
-    disclosure_label: String,
+    pub disclosure_label: String,
     #[serde(default)]
-    subid_policy: String,
+    pub subid_policy: String,
     #[serde(default)]
-    subid_description: String,
+    pub subid_description: String,
 }
 
 /// HOST component of a URL, lowercased, without scheme/port/userinfo/path.
 /// Pure; falls back to the raw string when the value has no `://` scheme.
-fn url_host(value: &str) -> String {
+pub fn url_host(value: &str) -> String {
     let after_scheme = match value.find("://") {
         Some(i) => &value[i + 3..],
         None => value,
@@ -142,7 +142,7 @@ fn url_host(value: &str) -> String {
 /// Used to drop an `fbu` (bid-miss fallback) that would send a real user to a
 /// fabricated destination. The FIELD is dropped, never the network: wrapping,
 /// `bf` and `disclosed: true` all keep working.
-fn is_reserved_documentation_host(host: &str) -> bool {
+pub fn is_reserved_documentation_host(host: &str) -> bool {
     let h = host.trim().trim_end_matches('.').to_lowercase();
     if h.is_empty() {
         return false;
@@ -180,10 +180,10 @@ fn is_reserved_documentation_host(host: &str) -> bool {
 /// the first usable catch-all network. This preserves backward compatibility
 /// with the single-network model while enabling per-merchant decoration.
 #[derive(Clone)]
-struct AffiliateCtx {
-    networks: Vec<AffiliateNetwork>,
-    programs: Vec<AffiliateNetwork>,
-    network_meta: Vec<AffiliateNetworkMeta>,
+pub struct AffiliateCtx {
+    pub networks: Vec<AffiliateNetwork>,
+    pub programs: Vec<AffiliateNetwork>,
+    pub network_meta: Vec<AffiliateNetworkMeta>,
 }
 
 /// Host labels that are IANA-reserved and can never be a real merchant:
@@ -193,7 +193,7 @@ struct AffiliateCtx {
 /// Exact matching only — deliberately. `invalid` is a special-use NAME, not a
 /// documentation PREFIX, so prefix-matching it would wrongly reject real hosts
 /// like `invalid-syntax.co.uk`.
-const RESERVED_HOST_LABELS: &[&str] = &["example", "test", "invalid", "localhost"];
+pub const RESERVED_HOST_LABELS: &[&str] = &["example", "test", "invalid", "localhost"];
 
 /// Host-label PREFIXES reserved by the documentation-label convention. A label
 /// beginning with one of these followed by a separator (`example-merchant`,
@@ -204,7 +204,7 @@ const RESERVED_HOST_LABELS: &[&str] = &["example", "test", "invalid", "localhost
 /// OWN registrable domain, NOT a subdomain of `example.com`, so a pure
 /// suffix/exact check on the reserved set misses the exact value that shipped in
 /// production config.
-const RESERVED_HOST_LABEL_PREFIXES: &[&str] = &["example"];
+pub const RESERVED_HOST_LABEL_PREFIXES: &[&str] = &["example"];
 
 /// True when any label of `url`'s host marks it as a documentation/example
 /// placeholder, i.e. it cannot be a real merchant destination.
@@ -221,7 +221,7 @@ const RESERVED_HOST_LABEL_PREFIXES: &[&str] = &["example"];
 ///
 /// Returns `true` for unparseable/host-less input: a fallback we cannot even
 /// resolve is treated as unusable rather than shipped.
-fn is_reserved_placeholder_url(url: &str) -> bool {
+pub fn is_reserved_placeholder_url(url: &str) -> bool {
     let host = match reqwest::Url::parse(url) {
         Ok(u) => match u.host_str() {
             Some(h) => h.trim_end_matches('.').to_ascii_lowercase(),
@@ -253,7 +253,7 @@ impl AffiliateCtx {
     ///   1. `affiliate.json`         — legacy catch-all networks (backward compat)
     ///   2. `affiliate_programs.json` — per-merchant programs with host_suffix matching
     ///   3. `networks.json`          — network metadata (disclosure labels, subid policy)
-    fn load() -> Self {
+    pub fn load() -> Self {
         let mut networks: Vec<AffiliateNetwork> = Vec::new();
         let mut programs: Vec<AffiliateNetwork> = Vec::new();
         let mut network_meta: Vec<AffiliateNetworkMeta> = Vec::new();
@@ -361,13 +361,13 @@ impl AffiliateCtx {
     /// Construct an AffiliateCtx with only legacy catch-all networks (no
     /// per-merchant programs, no network metadata). Used by tests that build
     /// synthetic contexts.
-    fn from_networks(networks: Vec<AffiliateNetwork>) -> Self {
+    pub fn from_networks(networks: Vec<AffiliateNetwork>) -> Self {
         Self { networks, programs: vec![], network_meta: vec![] }
     }
 
     /// The first enabled network that has its required key present in the env.
     /// Returns None when no network can be applied (=> `affiliate: null`).
-    fn first_usable(&self) -> Option<&AffiliateNetwork> {
+    pub fn first_usable(&self) -> Option<&AffiliateNetwork> {
         self.networks.iter().find(|n| {
             n.enabled
                 && n.key_env
@@ -386,7 +386,7 @@ impl AffiliateCtx {
     ///
     /// Returns None when no per-merchant program matches (caller should fall
     /// back to `first_usable()` for the legacy catch-all path).
-    fn match_program(&self, url: &str) -> Option<&AffiliateNetwork> {
+    pub fn match_program(&self, url: &str) -> Option<&AffiliateNetwork> {
         let host = url_host(url);
         if host.is_empty() {
             return None;
@@ -444,7 +444,7 @@ impl AffiliateCtx {
 ///   {url}            the (encoded for wrap / raw for append_params) destination
 ///   {subid}          the coarse merchant host
 ///   {param:<name>}   env var named by `param_env[name]` (generic — any name)
-fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> String {
+pub fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> String {
     let key = net
         .key_env
         .as_ref()
@@ -553,7 +553,7 @@ fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> 
 /// first usable catch-all network (from `affiliate.json`) — preserving the
 /// original single-network behaviour. This two-tier lookup is fully data-driven:
 /// adding a new merchant requires only editing `affiliate_programs.json`.
-fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
+pub fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
     for r in results.iter_mut() {
         if !r.is_object() {
             continue;

@@ -23,7 +23,8 @@ mod commerce_contract_tests;
 // ROADMAP item 6: order invariance driven by the REAL shipped affiliate data
 // (every network, keys present vs absent) — the offline CI lock.
 mod real_data_order_tests;
-mod affiliate;
+pub mod affiliate;
+use affiliate::*;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
