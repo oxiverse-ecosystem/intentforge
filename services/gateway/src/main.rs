@@ -5710,6 +5710,8 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
+                        // Indian unit conversion: "30 lakh" → 3,000,000
+                        let after_num = &rest[m.end()..];
                         // Distance-bound guard: "within 300 kilometers" is a
                         // range, not a price — skip this marker (let a later
                         // price marker, if any, match instead).
@@ -5718,8 +5720,6 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         if is_distance_bound(after_num) {
                             continue;
                         }
-                        // Indian unit conversion: "30 lakh" → 3,000,000
-                        let after_num = &rest[m.end()..];
                         let multiplier = get_indian_multiplier(after_num).unwrap_or(1.0);
                         let v = v * multiplier;
                         // Currency-proximity guard: Pattern A is "<marker> <number>",
