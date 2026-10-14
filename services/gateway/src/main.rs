@@ -18033,10 +18033,74 @@ async fn handle_search(
         let neg_lc: std::collections::HashSet<String> =
             gated_neg_dedup.iter().map(|n| n.to_lowercase()).collect();
         intent.structured_constraints.positive.retain(|p| !neg_lc.contains(&p.to_lowercase()));
-    }
+        }
 
-    let has_only_negative = intent.structured_constraints.positive.is_empty()
-        && !gated_neg_dedup.is_empty();
+        // Long conversational queries (>15 words) produce many low-value positive
+        // constraints ("28 year", "am", "lakhs") that pollute the search engine query
+        // and cause irrelevant results. Filter out constraints that are pure noise:
+        // single common English words, pure numbers, or very short fragments.
+        // Keep domain-specific terms, multi-word phrases, and action items.
+        let q_word_count = q_orig.split_whitespace().count();
+        if q_word_count > 15 && intent.structured_constraints.positive.len() > 3 {
+            let common_words: std::collections::HashSet<&str> = [
+                "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+                "do", "does", "did", "have", "has", "had", "will", "would", "could",
+                "should", "may", "might", "can", "shall", "must", "need", "want",
+                "am", "im", "i", "me", "my", "we", "our", "you", "your", "he", "she",
+                "it", "its", "they", "them", "their", "this", "that", "these", "those",
+                "and", "or", "but", "so", "if", "then", "than", "when", "where", "why",
+                "how", "what", "which", "who", "whom", "whose", "not", "no", "yes",
+                "all", "some", "any", "each", "every", "few", "more", "most", "other",
+                "such", "only", "own", "same", "too", "very", "just", "also", "now",
+                "here", "there", "up", "down", "out", "off", "over", "under", "again",
+                "once", "twice", "thrice", "year", "years", "month", "months", "week",
+                "weeks", "day", "days", "hour", "hours", "minute", "minutes", "second",
+                "seconds", "time", "times", "way", "ways", "kind", "kinds", "sort",
+                "sorts", "type", "types", "part", "parts", "piece", "pieces", "bit",
+                "bits", "lot", "lots", "plenty", "many", "much", "several", "various",
+                "certain", "sure", "true", "false", "right", "wrong", "good", "bad",
+                "better", "best", "worse", "worst", "big", "small", "large", "little",
+                "long", "short", "tall", "high", "low", "wide", "narrow", "thick",
+                "thin", "deep", "shallow", "heavy", "light", "fast", "slow", "quick",
+                "easy", "hard", "difficult", "simple", "complex", "new", "old", "young",
+                "early", "late", "first", "last", "next", "previous", "following",
+                "above", "below", "between", "among", "through", "across", "around",
+                "behind", "before", "after", "during", "while", "since", "until",
+                "till", "as", "at", "by", "for", "from", "in", "into", "of", "on",
+                "onto", "out", "outside", "over", "to", "toward", "under", "upon",
+                "with", "within", "without", "per", "via", "etc", "ie", "eg", "vs",
+                "lakh", "lakhs", "crore", "crores", "thousand", "thousands", "million",
+                "millions", "billion", "billions", "hundred", "hundreds", "dozen",
+                "dozens", "zero", "one", "two", "three", "four", "five", "six",
+                "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen",
+                "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+                "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty",
+                "ninety", "rupee", "rupees", "dollar", "dollars", "euro", "euros",
+                "pound", "pounds", "yen", "yuan", "franc", "francs", "peso", "pesos",
+            ].iter().copied().collect();
+            intent.structured_constraints.positive.retain(|p| {
+                let pl = p.to_lowercase();
+                // Keep multi-word phrases (they're specific)
+                if pl.split_whitespace().count() > 1 {
+                    return true;
+                }
+                // Drop pure numbers and common words
+                if pl.chars().all(|c| c.is_numeric() || c == ' ') {
+                    return false;
+                }
+                if common_words.contains(pl.as_str()) {
+                    return false;
+                }
+                // Drop single very short words (< 3 chars)
+                if pl.len() < 3 {
+                    return false;
+                }
+                true
+            });
+        }
+
+        let has_only_negative = intent.structured_constraints.positive.is_empty()
+            && !gated_neg_dedup.is_empty();
 
     let neg_terms: Vec<String> = gated_neg_dedup.iter()
         .map(|n| n.to_lowercase())
@@ -18844,13 +18908,14 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // so the order-invariance guarantee holds: affiliate decoration runs strictly
     // AFTER the order is fixed and cannot move a result. No external call, no
     // keyword list — the commercial signal comes purely from in-process intent.
-    let shopping_block: Option<serde_json::Value> = if is_commercial_intent(
+    let is_commercial = is_commercial_intent(
         &intent.intent,
         &intent.distribution,
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
         &state.commerce_signals,
         &q,
-    ) {
+    );
+    let shopping_block: Option<serde_json::Value> = if is_commercial {
         // The enrichment budget is derived from the time this request has ALREADY
         // spent, not a flat 22s (see `commerce_wall_for_elapsed`). Without this the
         // decoration pass could overrun the 30s TimeoutLayer on a slow upstream
@@ -18986,7 +19051,25 @@ let mut results = match tokio::task::spawn_blocking(move || {
         guard.complete();
     }
 
-    (axum::http::StatusCode::OK, Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({}))))
+    // ── ROADMAP item: affiliate decoration on MAIN /search results ──
+    // STRICT post-ranking pass: the results array is already fully ranked,
+    // scored, and paginated. We serialize to JSON, decorate each result's
+    // `affiliate` field in place, and return. The decoration NEVER reorders,
+    // reselects, or re-scores — it only attaches an affiliate block (or leaves
+    // it null when credentials are missing). The gate is the signal-driven
+    // `is_commercial_intent` classifier (transactional label / strong
+    // transactional distribution / price bound), NOT a keyword check.
+    let response_json = serde_json::to_value(&response).unwrap_or(serde_json::json!({}));
+    let final_json = if is_commercial {
+        let mut v = response_json;
+        if let Some(arr) = v.get_mut("results").and_then(|r| r.as_array_mut()) {
+            decorate_affiliate(arr, &state.affiliate_ctx);
+        }
+        v
+    } else {
+        response_json
+    };
+    (axum::http::StatusCode::OK, Json(final_json))
 }
 
 fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
@@ -24472,6 +24555,114 @@ mod mainpath_shopping_strip_tests {
         assert_eq!(facts.availability, None);
         // merchant still extracted from URL
         assert_eq!(facts.merchant, Some("www.bestbuy.com".to_string()));
+    }
+}
+
+/// Tests for the affiliate decoration post-pass on MAIN /search results.
+///
+/// The decoration runs as a strict post-ranking pass: it serializes the
+/// already-ranked response to JSON, decorates each result's `affiliate` field
+/// in place, and returns. The gate is `is_commercial_intent` — the signal-driven
+/// classifier (transactional label / strong transactional distribution / price
+/// bound). Non-commerce queries are unaffected.
+#[cfg(test)]
+mod affiliate_mainpath_tests {
+    use super::*;
+
+    fn test_network() -> AffiliateNetwork {
+        AffiliateNetwork {
+            id: "test_net".to_string(),
+            kind: "wrap".to_string(),
+            enabled: true,
+            priority: 0,
+            network: "TestNetwork".to_string(),
+            template: "https://tracker.example.com/?k={key}&u={url}".to_string(),
+            params: std::collections::HashMap::new(),
+            key_env: Some("TEST_AFF_KEY".to_string()),
+            param_env: std::collections::HashMap::new(),
+            bid_floor: None,
+            fallback_url: None,
+            host_suffix: None,
+        }
+    }
+
+    #[test]
+    fn commerce_intent_gate_true_for_transactional_label() {
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("transactional".to_string(), 0.85);
+        let sig = CommerceSignals::load();
+        assert!(is_commercial_intent("transactional", &dist, false, &sig, "buy iphone 16"));
+    }
+
+    #[test]
+    fn commerce_intent_gate_true_for_price_bound() {
+        let dist = std::collections::HashMap::new();
+        let sig = CommerceSignals::load();
+        assert!(is_commercial_intent("informational", &dist, true, &sig, "laptop under 500"));
+    }
+
+    #[test]
+    fn commerce_intent_gate_true_for_strong_distribution() {
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("comparison".to_string(), 0.6);
+        dist.insert("transactional".to_string(), 0.55);
+        let sig = CommerceSignals::load();
+        assert!(is_commercial_intent("comparison", &dist, false, &sig, "iphone vs pixel"));
+    }
+
+    #[test]
+    fn commerce_intent_gate_false_for_informational() {
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("informational".to_string(), 0.9);
+        dist.insert("transactional".to_string(), 0.1);
+        let sig = CommerceSignals::load();
+        assert!(!is_commercial_intent("informational", &dist, false, &sig, "rust ownership"));
+    }
+
+    #[test]
+    fn decorate_affiliate_on_main_results_preserves_order() {
+        // Simulate the post-pass: ranked results → JSON → decorate → verify order.
+        std::env::set_var("TEST_AFF_KEY", "test_key_value");
+        let ctx = AffiliateCtx::from_networks(vec![test_network()]);
+        let mut results = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1", "title": "A", "score": 9.7 }),
+            serde_json::json!({ "url": "https://shop.example.net/p/2", "title": "B", "score": 8.2 }),
+            serde_json::json!({ "url": "https://m.example.org/p/3", "title": "C", "score": 7.1 }),
+        ];
+        let before: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        decorate_affiliate(&mut results, &ctx);
+        let after: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        assert_eq!(before, after, "decoration must never reorder");
+        for r in &results {
+            assert!(r["affiliate"].is_object(), "each result must have affiliate block");
+            assert_eq!(r["affiliate"]["disclosed"], serde_json::json!(true));
+        }
+    }
+
+    #[test]
+    fn decorate_affiliate_missing_credentials_leaves_null() {
+        // No env var set → no usable network → affiliate stays unset (null).
+        let n = AffiliateNetwork {
+            key_env: Some("TOTALLY_UNSET_ENV_VAR_XYZ".to_string(),
+            ..test_network()
+        };
+        let ctx = AffiliateCtx::from_networks(vec![n]);
+        let mut results = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1", "title": "A", "score": 9.7 }),
+        ];
+        decorate_affiliate(&mut results, &ctx);
+        assert!(results[0].get("affiliate").is_none(), "missing key => affiliate omitted");
+    }
+
+    #[test]
+    fn non_commerce_query_results_undecorated() {
+        // When is_commercial_intent is false, the post-pass is skipped entirely.
+        // This test verifies the gate logic; the integration is a branch on the bool.
+        let mut dist = std::collections::HashMap::new();
+        dist.insert("informational".to_string(), 0.95);
+        let sig = CommerceSignals::load();
+        let is_commercial = is_commercial_intent("informational", &dist, false, &sig, "how does rust work");
+        assert!(!is_commercial, "informational query must not trigger affiliate decoration");
     }
 }
 
