@@ -7379,7 +7379,11 @@ fn has_local_intent(query: &str) -> bool {
                 return false;
             }
             // "best <service> in <area>" or "<service> near <area>"
-            let has_local_service_pattern = (lower.starts_with("best ") && lower.contains(" in "))
+            // Require at least one word between "best" and "in" to avoid
+            // matching non-local phrases like "best in class" where "in"
+            // immediately follows "best" with no service word between them.
+            let has_local_service_pattern = (lower.starts_with("best ")
+                && lower[5..].contains(" in "))
                 || lower.contains(" near ")
                 || lower.contains(" nearby ")
                 || lower.contains(" local ");
