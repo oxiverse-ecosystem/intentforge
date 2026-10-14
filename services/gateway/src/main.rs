@@ -5052,6 +5052,7 @@ struct AffiliateNetwork {
     enabled: bool,
     #[serde(default = "default_priority")]
     priority: i64,
+    #[serde(default)]
     network: String,
     template: String,
     #[serde(default)]
@@ -5359,6 +5360,13 @@ impl AffiliateCtx {
         Self { networks, programs, network_meta }
     }
 
+    /// Look up network metadata by network id. Returns `None` when no
+    /// metadata entry matches — callers fall back to the program/network's
+    /// own fields.
+    fn meta_for(&self, id: &str) -> Option<&AffiliateNetworkMeta> {
+        self.network_meta.iter().find(|m| m.id == id)
+    }
+
     /// Construct an AffiliateCtx with only legacy catch-all networks (no
     /// per-merchant programs, no network metadata). Used by tests that build
     /// synthetic contexts.
@@ -5574,16 +5582,43 @@ fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
             None => continue, // graceful: no key => leave affiliate un-set
         };
 
-        // Coarse, non-identifying subid: the destination merchant host only.
+        // Look up the network's metadata (from networks.json) to determine
+        // the subid policy and disclosure label. This is DATA-DRIVEN — the
+        // policy comes from the runtime-loaded data file, never from code.
+        let meta = ctx.meta_for(&net.id);
+
+        // Determine the subid value based on the network's `subid_policy`:
+        //   "merchant_host" → the destination merchant host (coarse, non-identifying)
+        //   "none"           → no subid at all (empty string)
+        //   "category"       → a coarse product category (falls back to merchant_host
+        //                      until a category signal is available — never user-identifying)
         // PRIVACY: never add user id, session id, IP, or query text to subid.
-        // The subid is ONLY the merchant host (e.g. "amazon.com"), which is
-        // coarse and non-identifying — it tells the network which merchant the
-        // click is for, nothing about the user.
-        let subid = reqwest::Url::parse(&url)
+        let merchant_host = reqwest::Url::parse(&url)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_string()))
             .unwrap_or_default();
+        let subid_policy = meta.map(|m| m.subid_policy.as_str()).unwrap_or("merchant_host");
+        let subid = match subid_policy {
+            "none" => String::new(),
+            "category" => {
+                // Category policy: we don't have a category extraction signal yet.
+                // Fall back to merchant_host (coarse, non-identifying) rather than
+                // fabricating a category. This is documented in networks.json.
+                merchant_host.clone()
+            }
+            _ => merchant_host.clone(),
+        };
+
         let aff_url = render_affiliate_url(net, &url, &subid);
+
+        // Disclosure label: prefer the metadata's `disclosure_label` (from
+        // networks.json), falling back to the program/network's own `network`
+        // field. This is DATA-DRIVEN — the label comes from the data file.
+        let disclosure_label = meta
+            .map(|m| m.disclosure_label.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&net.network);
+
         // Reporting fields (ROADMAP item 6): surface the configured bid floor /
         // fallback so operators can report on monetization. These are DATA-driven
         // (from the network config) and are NEVER used for ranking. `disclosed`
@@ -5591,7 +5626,7 @@ fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
         let mut block = serde_json::Map::new();
         block.insert(
             "network".to_string(),
-            serde_json::Value::String(net.network.clone()),
+            serde_json::Value::String(disclosure_label.to_string()),
         );
         block.insert("url".to_string(), serde_json::Value::String(aff_url));
         block.insert("disclosed".to_string(), serde_json::Value::Bool(true));
@@ -5675,6 +5710,8 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
+                        // Indian unit conversion: "30 lakh" → 3,000,000
+                        let after_num = &rest[m.end()..];
                         // Distance-bound guard: "within 300 kilometers" is a
                         // range, not a price — skip this marker (let a later
                         // price marker, if any, match instead).
@@ -5683,8 +5720,6 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         if is_distance_bound(after_num) {
                             continue;
                         }
-                        // Indian unit conversion: "30 lakh" → 3,000,000
-                        let after_num = &rest[m.end()..];
                         let multiplier = get_indian_multiplier(after_num).unwrap_or(1.0);
                         let v = v * multiplier;
                         // Currency-proximity guard: Pattern A is "<marker> <number>",
@@ -7344,7 +7379,11 @@ fn has_local_intent(query: &str) -> bool {
                 return false;
             }
             // "best <service> in <area>" or "<service> near <area>"
-            let has_local_service_pattern = (lower.starts_with("best ") && lower.contains(" in "))
+            // Require at least one word between "best" and "in" to avoid
+            // matching non-local phrases like "best in class" where "in"
+            // immediately follows "best" with no service word between them.
+            let has_local_service_pattern = (lower.starts_with("best ")
+                && lower[5..].contains(" in "))
                 || lower.contains(" near ")
                 || lower.contains(" nearby ")
                 || lower.contains(" local ");
@@ -16382,6 +16421,7 @@ async fn handle_search(
         if has_research_signal
             && (intent.intent == "navigational" || intent.confidence < 0.40)
             && intent.intent != "informational"
+            && intent.intent != "fresh"
         {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): research query '{}' was '{}' (conf={:.3}) → informational",
