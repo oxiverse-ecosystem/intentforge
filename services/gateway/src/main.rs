@@ -3645,24 +3645,7 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         }
     }
 
-    // 5) Secondary commerce extraction: parse common HTML price patterns from the
-    //    page when structured extraction (JSON-LD, OG, microdata, MF2) found nothing.
-    //    Many product pages (Amazon, eBay, Walmart, etc.) embed prices in custom
-    //    HTML (e.g., <span class="a-price">) that don't conform to any standard
-    //    schema. This fallback ONLY fires when primary extraction returned no price,
-    //    and ONLY sets price + currency — never merchant, rating, or other facts
-    //    that would require more context. Marked with source="extracted_from_text"
-    //    so the frontend can label it distinctly from structured data. This is NOT
-    //    regex guessing on body text — it targets known e-commerce HTML patterns.
-    if facts.price.is_none() && facts.price_low.is_none() {
-        if let Some((price, currency)) = extract_price_from_html_patterns(html) {
-            facts.price = Some(price);
-            facts.currency = Some(currency);
-            source = Some("extracted_from_text".to_string());
-        }
-    }
-
-    // 6) Merchant fallback: derive a coarse host label only when no page-provided
+    // 5) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     //
     //    Whether a merchant was OBSERVED is recorded BEFORE the fallback runs, so
