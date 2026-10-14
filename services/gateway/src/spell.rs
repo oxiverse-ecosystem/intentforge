@@ -102,6 +102,8 @@ const PROTECTED_TERMS: &[&str] = &[
     "uplay", "xbox", "playstation", "nintendo", "sega", "atari",
     "commodore", "lastpass", "bitwarden", "dashlane", "brave", "proton",
     "threema", "potplayer", "kmplayer",
+    // Indian degree abbreviations (edit-distance 1 from English words — "btech"→"tech", "mtech"→"tech")
+    "btech", "mtech", "bca", "mca", "be", "me", "mba", "phd", "bsc", "msc", "ba", "ma", "bcom", "mcom",
 ];
 
 /// Returns true if `word` is a protected brand/entity that must never be
