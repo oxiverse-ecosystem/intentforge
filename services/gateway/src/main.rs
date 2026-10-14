@@ -18033,10 +18033,74 @@ async fn handle_search(
         let neg_lc: std::collections::HashSet<String> =
             gated_neg_dedup.iter().map(|n| n.to_lowercase()).collect();
         intent.structured_constraints.positive.retain(|p| !neg_lc.contains(&p.to_lowercase()));
-    }
+        }
 
-    let has_only_negative = intent.structured_constraints.positive.is_empty()
-        && !gated_neg_dedup.is_empty();
+        // Long conversational queries (>15 words) produce many low-value positive
+        // constraints ("28 year", "am", "lakhs") that pollute the search engine query
+        // and cause irrelevant results. Filter out constraints that are pure noise:
+        // single common English words, pure numbers, or very short fragments.
+        // Keep domain-specific terms, multi-word phrases, and action items.
+        let q_word_count = q_orig.split_whitespace().count();
+        if q_word_count > 15 && intent.structured_constraints.positive.len() > 3 {
+            let common_words: std::collections::HashSet<&str> = [
+                "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+                "do", "does", "did", "have", "has", "had", "will", "would", "could",
+                "should", "may", "might", "can", "shall", "must", "need", "want",
+                "am", "im", "i", "me", "my", "we", "our", "you", "your", "he", "she",
+                "it", "its", "they", "them", "their", "this", "that", "these", "those",
+                "and", "or", "but", "so", "if", "then", "than", "when", "where", "why",
+                "how", "what", "which", "who", "whom", "whose", "not", "no", "yes",
+                "all", "some", "any", "each", "every", "few", "more", "most", "other",
+                "such", "only", "own", "same", "too", "very", "just", "also", "now",
+                "here", "there", "up", "down", "out", "off", "over", "under", "again",
+                "once", "twice", "thrice", "year", "years", "month", "months", "week",
+                "weeks", "day", "days", "hour", "hours", "minute", "minutes", "second",
+                "seconds", "time", "times", "way", "ways", "kind", "kinds", "sort",
+                "sorts", "type", "types", "part", "parts", "piece", "pieces", "bit",
+                "bits", "lot", "lots", "plenty", "many", "much", "several", "various",
+                "certain", "sure", "true", "false", "right", "wrong", "good", "bad",
+                "better", "best", "worse", "worst", "big", "small", "large", "little",
+                "long", "short", "tall", "high", "low", "wide", "narrow", "thick",
+                "thin", "deep", "shallow", "heavy", "light", "fast", "slow", "quick",
+                "easy", "hard", "difficult", "simple", "complex", "new", "old", "young",
+                "early", "late", "first", "last", "next", "previous", "following",
+                "above", "below", "between", "among", "through", "across", "around",
+                "behind", "before", "after", "during", "while", "since", "until",
+                "till", "as", "at", "by", "for", "from", "in", "into", "of", "on",
+                "onto", "out", "outside", "over", "to", "toward", "under", "upon",
+                "with", "within", "without", "per", "via", "etc", "ie", "eg", "vs",
+                "lakh", "lakhs", "crore", "crores", "thousand", "thousands", "million",
+                "millions", "billion", "billions", "hundred", "hundreds", "dozen",
+                "dozens", "zero", "one", "two", "three", "four", "five", "six",
+                "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen",
+                "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+                "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty",
+                "ninety", "rupee", "rupees", "dollar", "dollars", "euro", "euros",
+                "pound", "pounds", "yen", "yuan", "franc", "francs", "peso", "pesos",
+            ].iter().copied().collect();
+            intent.structured_constraints.positive.retain(|p| {
+                let pl = p.to_lowercase();
+                // Keep multi-word phrases (they're specific)
+                if pl.split_whitespace().count() > 1 {
+                    return true;
+                }
+                // Drop pure numbers and common words
+                if pl.chars().all(|c| c.is_numeric() || c == ' ') {
+                    return false;
+                }
+                if common_words.contains(pl.as_str()) {
+                    return false;
+                }
+                // Drop single very short words (< 3 chars)
+                if pl.len() < 3 {
+                    return false;
+                }
+                true
+            });
+        }
+
+        let has_only_negative = intent.structured_constraints.positive.is_empty()
+            && !gated_neg_dedup.is_empty();
 
     let neg_terms: Vec<String> = gated_neg_dedup.iter()
         .map(|n| n.to_lowercase())
