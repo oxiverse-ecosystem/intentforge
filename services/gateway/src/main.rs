@@ -4635,7 +4635,7 @@ async fn enrich_with_commerce_par<F, Fut>(
                 && r.get("commerce").is_none()
         })
         .map(|(idx, _)| idx)
-        .take(COMMERCE_ENRICH_WINDOW)
+        .take(state.commerce_config.enrich_window)
         .collect();
 
     // 2) Fetch with bounded concurrency as a ROLLING WINDOW, not in waves.
@@ -4810,7 +4810,7 @@ fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
 const COMMERCE_MAINPATH_TOP_N: usize = 8;
 
 /// How many already-ranked results are ENRICHED on the main `/search` path before
-/// the display cap (`COMMERCE_MAINPATH_TOP_N`) is applied. Decoupling the two is
+/// the display cap (`mainpath_top_n`) is applied. Decoupling the two is
 /// the main-path reachability fix: commercial queries often have bot-checked
 /// merchant pages (Amazon/Walmart/Flipkart) in the top 8 with no structured
 /// markup, so enriching only 8 finds nothing and the strip is suppressed. A wider
@@ -4820,7 +4820,10 @@ const COMMERCE_MAINPATH_TOP_N: usize = 8;
 /// This is NOT a ranking change: enrichment is a strict post-ranking decoration
 /// pass over a CLONE of the ranked results. The real `results` array is never
 /// mutated, reordered, or reselected.
-const COMMERCE_ENRICH_WINDOW: usize = 24;
+///
+/// This value is now loaded from `data/commerce/config.json` (`enrich_window`
+/// field) at runtime — see `CommerceConfig::enrich_window`. The constant is
+/// kept only as a type/documentation anchor; the runtime value comes from config.
 
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
@@ -12511,11 +12514,16 @@ struct CommerceConfig {
     /// How many top-ranked results to display in the main-path shopping strip.
     /// Replaces the former hardcoded `COMMERCE_MAINPATH_TOP_N` constant.
     mainpath_top_n: usize,
+    /// How many already-ranked results are ENRICHED on the main `/search` path
+    /// before the display cap (`mainpath_top_n`) is applied. A wider window
+    /// lets enrichment reach past bot-checked merchant pages that lack structured
+    /// markup. Replaces the former hardcoded `COMMERCE_ENRICH_WINDOW` constant.
+    enrich_window: usize,
 }
 
 impl Default for CommerceConfig {
     fn default() -> Self {
-        Self { mainpath_top_n: 8 }
+        Self { mainpath_top_n: 8, enrich_window: 24 }
     }
 }
 
@@ -12530,6 +12538,11 @@ impl CommerceConfig {
                     if let Some(n) = v.get("mainpath_top_n").and_then(|x| x.as_u64()) {
                         if n > 0 && n <= 100 {
                             cfg.mainpath_top_n = n as usize;
+                        }
+                    }
+                    if let Some(n) = v.get("enrich_window").and_then(|x| x.as_u64()) {
+                        if n > 0 && n <= 100 {
+                            cfg.enrich_window = n as usize;
                         }
                     }
                 }
@@ -18711,7 +18724,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         // carry product facts. `serde_json::to_value` on `MergedResult` is lossless.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
             .iter()
-            .take(COMMERCE_ENRICH_WINDOW)
+            .take(state.commerce_config.enrich_window)
             .filter_map(|r| serde_json::to_value(r).ok())
             .collect();
         if shop_arr.is_empty() {
