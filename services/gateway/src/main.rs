@@ -19257,7 +19257,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // `is_commercial_intent` classifier (transactional label / strong
     // transactional distribution / price bound), NOT a keyword check.
     let response_json = serde_json::to_value(&response).unwrap_or(serde_json::json!({}));
-    let final_json = if is_commercial {
+    let final_json = if is_commercial && is_exact_model_query(&q_lower, &state.exact_model_config) {
         let mut v = response_json;
         if let Some(arr) = v.get_mut("results").and_then(|r| r.as_array_mut()) {
             decorate_affiliate(arr, &state.affiliate_ctx);
