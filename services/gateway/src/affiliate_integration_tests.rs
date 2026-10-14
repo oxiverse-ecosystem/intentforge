@@ -124,10 +124,12 @@ fn integ_merchant_in_data_file_gets_affiliate_url_when_env_set() {
     let aff = results[0]
         .get("affiliate")
         .expect("merchant in data file must get an affiliate block when env var is set");
+    // The `network` field in the affiliate block is the display name from the
+    // data file. For programs it may be empty (the `id` is the identifier).
     assert_eq!(
         aff["network"].as_str().unwrap(),
-        program.id,
-        "affiliate network should match the program id"
+        program.network,
+        "affiliate network should match the program's network field"
     );
     assert_eq!(aff["disclosed"], true, "disclosed must be true");
     let aff_url = aff["url"].as_str().unwrap();
