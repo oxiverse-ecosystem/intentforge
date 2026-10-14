@@ -18,8 +18,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #![cfg(test)]
 
-use super::*;
+use crate::affiliate::*;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 /// Build a network/program row for tests (mirrors the data-driven shape; all
 /// knowledge comes from arguments, none is hardcoded in this test).
@@ -41,6 +42,7 @@ fn contract_net(
         param_env: HashMap::new(),
         bid_floor: None,
         fallback_url: None,
+        host_suffix: None,
     }
 }
 
@@ -104,7 +106,7 @@ fn contract_disclosure_present_on_every_decorated_result() {
         params,
         Some("CONTRACT_SOVRN_KEY"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx { networks: vec![n], programs: vec![], network_meta: vec![] };
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     // Decorate the ALREADY-RANKED results, exactly as handle_shopping does.
@@ -143,7 +145,7 @@ fn contract_no_query_user_or_ip_in_affiliate_urls() {
         params,
         Some("CONTRACT_SOVRN_KEY"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx { networks: vec![n], programs: vec![], network_meta: vec![] };
 
     let user_query = "best wireless earbuds under 50 dollars";
     let mut payload = representative_shopping_payload(user_query);
@@ -241,7 +243,7 @@ fn contract_decoration_is_idempotent_and_order_preserved() {
         HashMap::new(),
         Some("CONTRACT_SOVRN_KEY"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx { networks: vec![n], programs: vec![], network_meta: vec![] };
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     let before: Vec<String> = payload["results"]
@@ -290,7 +292,7 @@ fn contract_missing_key_degrades_without_leak_or_crash() {
         HashMap::new(),
         Some("CONTRACT_UNSET_KEY_ENV_VAR_ZZZ"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx { networks: vec![n], programs: vec![], network_meta: vec![] };
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     if let Some(arr) = payload.get_mut("results").and_then(|v| v.as_array_mut()) {
@@ -524,6 +526,7 @@ fn contract_net_with_bf(
         param_env: HashMap::new(),
         bid_floor: bid_floor.map(|s| s.to_string()),
         fallback_url: fallback_url.map(|s| s.to_string()),
+        host_suffix: None,
     }
 }
 
@@ -540,7 +543,7 @@ fn item6_bid_floor_and_fallback_appended_and_reported() {
         Some("0.10"),
         Some("https://shop.acme-electronics.com/fallback"),
     );
-    let ctx = AffiliateCtx { networks: vec![n] };
+    let ctx = AffiliateCtx { networks: vec![n], programs: vec![], network_meta: vec![] };
 
     let mut payload = representative_shopping_payload("best wireless earbuds under 50 dollars");
     if let Some(arr) = payload.get_mut("results").and_then(|v| v.as_array_mut()) {

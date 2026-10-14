@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use parking_lot::Mutex;
@@ -13,6 +13,7 @@ use tower_http::timeout::TimeoutLayer;
 use axum::http::HeaderMap;
 use std::net::IpAddr;
 
+mod affiliate;
 mod spell;
 mod geoloc;
 mod dictionary;
@@ -23,7 +24,6 @@ mod commerce_contract_tests;
 // ROADMAP item 6: order invariance driven by the REAL shipped affiliate data
 // (every network, keys present vs absent) — the offline CI lock.
 mod real_data_order_tests;
-mod affiliate;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -4943,6 +4943,416 @@ async fn handle_shopping(
     (status, Json(value))
 }
 
+// ─── Affiliate template engine (ROADMAP item 3) ──────────────────────
+// Server-side, data-driven affiliate decoration. NO hardcoded merchant/network
+// knowledge lives in code — everything (network list, template, params, key env
+// var name, rotation ids) comes from `data/commerce/affiliate.json`, so a new
+// merchant/network is added by editing DATA ONLY. The engine is a generic
+// template renderer supporting two kinds:
+//   * `wrap`        — network prefix + url-encoded destination (Sovrn/Skimlinks)
+//   * `append_params` — add query params to the merchant URL (EPN/Amazon/most)
+// Decoration is a STRICT post-ranking pass: `decorate_affiliate` iterates the
+// ALREADY-RANKED results and mutates only each result's `affiliate` field.
+// It never reorders, reselects, or re-scores. Missing key => `affiliate: null`,
+// result still returned (graceful degradation, never a crash / never breaks
+// search). No user id / session id / IP / query text is ever placed in an
+// affiliate parameter (privacy rule) — the only coarse subid is the merchant
+// host, which is non-identifying.
+/// One network/program row loaded from the data file. Generic over kinds.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct AffiliateNetwork {
+    id: String,
+    #[serde(default)]
+    kind: String, // "wrap" | "append_params"
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_priority")]
+    priority: i64,
+    network: String,
+    template: String,
+    #[serde(default)]
+    params: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    key_env: Option<String>,
+    #[serde(default)]
+    param_env: HashMap<String, String>,
+    /// Bid floor (Sovrn `bf`) appended as a query param on the decorated URL.
+    /// DATA-ONLY — never influences ranking (decoration is a strict post-ranking
+    /// pass). Surfaced in the `affiliate` block for reporting.
+    #[serde(default)]
+    bid_floor: Option<String>,
+    /// Fallback URL (Sovrn `fbu`) used if the bid floor isn't met. Appended
+    /// url-encoded as a query param. DATA-ONLY.
+    #[serde(default)]
+    fallback_url: Option<String>,
+            host_suffix: None,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_priority() -> i64 {
+    0
+}
+
+/// HOST component of a URL, lowercased, without scheme/port/userinfo/path.
+/// Pure; falls back to the raw string when the value has no `://` scheme.
+fn url_host(value: &str) -> String {
+    let after_scheme = match value.find("://") {
+        Some(i) => &value[i + 3..],
+        None => value,
+    };
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    // Strip userinfo (`user:pass@host`) then any `:port`.
+    let host = match authority.rfind('@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    let host = match host.rfind(':') {
+        Some(i) if host[i + 1..].chars().all(|c| c.is_ascii_digit()) => &host[..i],
+        _ => host,
+    };
+    host.trim_end_matches('.').to_lowercase()
+}
+
+/// TRUE when `host` carries a label reserved for documentation by IANA and
+/// therefore can never be a real merchant destination.
+///
+/// Encodes two published registries — no merchant, network, or query literals:
+///   * RFC 2606 §2 / RFC 6761 §6 — reserved NAMES: `example`, `test`,
+///     `invalid`, `localhost`, and their `.tld`/`.test`/`.example`/`.invalid`
+///     forms;
+///   * RFC 2606 §2 — the `example` documentation PREFIX: a label beginning with
+///     `example` followed by a separator (`example-merchant`, `example_shop`).
+///     This is what catches the common "invented merchant" shape, which is
+///     legal DNS but is a placeholder by convention.
+///
+/// Matching is LABEL-BOUNDARY, never substring, and the prefix rule applies ONLY
+/// to `example`:
+///   * `test` is a special-use NAME, but `testosterone-shop.com` is a real shop,
+///     so a label merely CONTAINING a reserved name must be accepted;
+///   * `invalid` likewise (RFC 2606 reserves the exact name, not the prefix), so
+///     `invalid-syntax.co.uk` must not be rejected.
+///
+/// Used to drop an `fbu` (bid-miss fallback) that would send a real user to a
+/// fabricated destination. The FIELD is dropped, never the network: wrapping,
+/// `bf` and `disclosed: true` all keep working.
+fn is_reserved_documentation_host(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_lowercase();
+    if h.is_empty() {
+        return false;
+    }
+    const RESERVED_NAMES: [&str; 4] = ["example", "test", "invalid", "localhost"];
+    for label in h.split('.') {
+        if RESERVED_NAMES.contains(&label) {
+            return true;
+        }
+        // `example` is additionally a documentation PREFIX (RFC 2606 §2):
+        // `example-merchant` / `example_shop` are placeholders by convention.
+        if let Some(rest) = label.strip_prefix("example") {
+            if rest
+                .chars()
+                .next()
+                .map(|c| !c.is_ascii_alphanumeric())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
+#[derive(Clone)]
+struct AffiliateCtx {
+    networks: Vec<AffiliateNetwork>,
+    programs: Vec<AffiliateNetwork>,
+    network_meta: Vec<AffiliateNetworkMeta>,
+}
+
+/// Host labels that are IANA-reserved and can never be a real merchant:
+/// matched EXACTLY as a host label. RFC 2606 §2 reserves `example`; RFC 6761
+/// reserves the `test` / `invalid` / `localhost` special-use names.
+///
+/// Exact matching only — deliberately. `invalid` is a special-use NAME, not a
+/// documentation PREFIX, so prefix-matching it would wrongly reject real hosts
+/// like `invalid-syntax.co.uk`.
+const RESERVED_HOST_LABELS: &[&str] = &["example", "test", "invalid", "localhost"];
+
+/// Host-label PREFIXES reserved by the documentation-label convention. A label
+/// beginning with one of these followed by a separator (`example-merchant`,
+/// `example-shop`) is a documentation placeholder, not a merchant.
+///
+/// This is a separate list from `RESERVED_HOST_LABELS` precisely because
+/// prefix-matching is only correct for `example`: `example-merchant.com` is its
+/// OWN registrable domain, NOT a subdomain of `example.com`, so a pure
+/// suffix/exact check on the reserved set misses the exact value that shipped in
+/// production config.
+const RESERVED_HOST_LABEL_PREFIXES: &[&str] = &["example"];
+
+/// True when any label of `url`'s host marks it as a documentation/example
+/// placeholder, i.e. it cannot be a real merchant destination.
+///
+/// Rejected shapes:
+///   * a label exactly equal to a reserved name (`example.com`, `foo.test`), and
+///   * a label beginning with a reserved documentation prefix + separator
+///     (`example-merchant.com`, `example-shop.co.uk`).
+///
+/// Matching is always on a LABEL boundary: a real host that merely CONTAINS a
+/// reserved word as a substring (`notexample.com`, `testosterone-shop.com`,
+/// `invalid-syntax.co.uk`) is NOT rejected, so the guard cannot silently disable
+/// a legitimate merchant fallback.
+///
+/// Returns `true` for unparseable/host-less input: a fallback we cannot even
+/// resolve is treated as unusable rather than shipped.
+fn is_reserved_placeholder_url(url: &str) -> bool {
+    let host = match reqwest::Url::parse(url) {
+        Ok(u) => match u.host_str() {
+            Some(h) => h.trim_end_matches('.').to_ascii_lowercase(),
+            None => return true,
+        },
+        Err(_) => return true,
+    };
+    let separated_prefix = |label: &str, prefix: &str| {
+        label
+            .strip_prefix(prefix)
+            .map(|rest| rest.starts_with('-') || rest.starts_with('_'))
+            .unwrap_or(false)
+    };
+    host.split('.').any(|label| {
+        RESERVED_HOST_LABELS.iter().any(|r| label == *r)
+            || RESERVED_HOST_LABEL_PREFIXES
+                .iter()
+                .any(|p| separated_prefix(label, p))
+    })
+}
+
+impl AffiliateCtx {
+    /// Load networks from the data file. An empty/missing file is NOT fatal: the
+    /// engine simply has no networks and every result degrades to `affiliate:
+    /// null`. This is intentional — affiliate decoration is best-effort and must
+    /// never break search.
+    fn load() -> Self {
+        let mut networks: Vec<AffiliateNetwork> = Vec::new();
+        // Resolve the data path relative to the process cwd (container WORKDIR is
+        // /app, app binary at /app/gateway; data baked at /app/data/commerce).
+        let candidates = [
+            "data/commerce/affiliate.json",
+            "/app/data/commerce/affiliate.json",
+            "./data/commerce/affiliate.json",
+        ];
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
+                        for n in arr {
+                            if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                                // Never accept a non-routable documentation domain as
+                                // a real merchant fallback. Dropping the FIELD (not the
+                                // whole network) keeps the network usable for wrapping
+                                // while guaranteeing no click is ever routed to a
+                                // fabricated destination.
+                                if let Some(fbu) = net.fallback_url.clone() {
+                                    if is_reserved_placeholder_url(&fbu) {
+                                        tracing::warn!(
+                                            network = %net.id,
+                                            "affiliate: ignoring reserved placeholder fallback_url (RFC 2606/6761 documentation domain)"
+                                        );
+                                        net.fallback_url = None;
+                                    }
+                                }
+                                networks.push(net);
+                            }
+                        }
+                    }
+                }
+                if !networks.is_empty() {
+                    break;
+                }
+            }
+        }
+        networks.sort_by(|a, b| b.priority.cmp(&a.priority));
+        tracing::info!("affiliate: loaded {} network(s) from data file", networks.len());
+        Self { networks }
+    }
+
+    /// The first enabled network that has its required key present in the env.
+    /// Returns None when no network can be applied (=> `affiliate: null`).
+    fn first_usable(&self) -> Option<&AffiliateNetwork> {
+        self.networks.iter().find(|n| {
+            n.enabled
+                && n.key_env
+                    .as_ref()
+                    .map(|k| std::env::var(k).is_ok())
+                    .unwrap_or(false)
+        })
+    }
+}
+
+/// Build the affiliate URL for a (network, destination) without touching any
+/// result. Pure + unit-testable. `subid` is the coarse, non-identifying value
+/// (merchant host) — see privacy rule above.
+///
+/// Both template kinds share ONE generic renderer:
+///   * `wrap`          — the template is a NETWORK PREFIX; the destination URL
+///                       must be percent-encoded (it is a query-param value), and
+///                       the network's `params` are appended as extra query pairs
+///                       (e.g. Sovrn `cuid={subid}`).
+///   * `append_params` — the template IS the raw destination URL; `params` are
+///                       appended (encoded) directly to it (e.g. eBay EPN / Amazon).
+/// Resolved value sources (all data, never code):
+///   {key}            env var named by `key_env`
+///   {url}            the (encoded for wrap / raw for append_params) destination
+///   {subid}          the coarse merchant host
+///   {param:<name>}   env var named by `param_env[name]` (generic — any name)
+fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> String {
+    let key = net
+        .key_env
+        .as_ref()
+        .and_then(|k| std::env::var(k).ok())
+        .unwrap_or_default();
+
+    // Resolve {param:<name>} placeholders from the network's param_env.
+    let mut resolved_params: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (pname, env_key) in &net.param_env {
+        if let Ok(v) = std::env::var(env_key) {
+            resolved_params.insert(pname.clone(), v);
+        }
+    }
+
+    // For `wrap` the destination must be url-encoded (it is a query-param value
+    // inside the network's prefix); for `append_params` the template IS the raw
+    // destination URL, so the `{url}` token must stay un-encoded.
+    let url_token = if net.kind == "wrap" {
+        urlencoding::encode(dest_url).into_owned()
+    } else {
+        dest_url.to_string()
+    };
+    let fill = |s: &str| -> String {
+        // Generic {param:<name>} resolution — any name, not just campaign_id.
+        let mut out = s.to_string();
+        // First interpolate scalar tokens.
+        out = out.replace("{key}", &key);
+        out = out.replace("{url}", &url_token);
+        out = out.replace("{subid}", subid);
+        // Then replace every {param:<name>} we have resolved from env.
+        for (pname, pval) in &resolved_params {
+            out = out.replace(&format!("{{param:{}}}", pname), pval);
+        }
+        // Any un-resolved {param:*} (missing env) collapses to empty — never a
+        // fabricated value, never a leftover literal placeholder.
+        let leftover = regex::Regex::new(r"\{param:[^}]*\}")
+            .ok()
+            .and_then(|re| re.find(&out).map(|_| true))
+            .unwrap_or(false);
+        if leftover {
+            // Strip the bare {param:...} token entirely.
+            if let Ok(re) = regex::Regex::new(r"\{param:[^}]*\}") {
+                out = re.replace_all(&out, "").to_string();
+            }
+        }
+        out
+    };
+
+    // The base template, with scalar + {param:*} tokens filled.
+    let base = fill(&net.template);
+
+    // Merge the network's own `params` plus the generic bid-floor / fallback
+    // fields (ROADMAP item 6) into one query-pair list. ALL THREE are
+    // DATA-DRIVEN — none is hardcoded here. `bf`/`fbu` are pure reporting/fallback
+    // signals that NEVER affect ranking: decoration runs strictly AFTER the ranked
+    // order is fixed (see `decorate_affiliate` + the order-invariance test), so
+    // nothing appended here can move a result's position.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (k, v) in &net.params {
+        let val = fill(v);
+        if val.is_empty() {
+            continue;
+        }
+        pairs.push((k.clone(), val));
+    }
+    if let Some(bf) = &net.bid_floor {
+        let val = fill(bf);
+        if !val.is_empty() {
+            pairs.push(("bf".to_string(), val));
+        }
+    }
+    if let Some(fbu) = &net.fallback_url {
+        // fbu is itself a URL. We must NOT pre-encode it here: the final
+        // query-pair encoding step below encodes every value exactly once, so
+        // passing the raw URL avoids a double-encoding bug (raw => encoded once).
+        let val = fbu.clone();
+        if !val.is_empty() {
+            pairs.push(("fbu".to_string(), val));
+        }
+    }
+    if !pairs.is_empty() {
+        let encoded: Vec<String> = pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect();
+        if base.contains('?') {
+            return format!("{}&{}", base, encoded.join("&"));
+        } else {
+            return format!("{}?{}", base, encoded.join("&"));
+        }
+    }
+    base
+}
+
+/// STRICT POST-RANKING decoration pass. Takes the ALREADY-RANKED `results` and
+/// adds an `affiliate` block to each, preserving order byte-for-byte. A result
+/// that already carries an `affiliate` block is left untouched (idempotent).
+/// When no usable network key is present, results keep `affiliate: null` and are
+/// still returned. This function NEVER reorders or re-scores.
+fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
+    let net = match ctx.first_usable() {
+        Some(n) => n,
+        None => return, // graceful: no key => leave affiliate un-set
+    };
+    for r in results.iter_mut() {
+        if !r.is_object() {
+            continue;
+        }
+        if r.get("affiliate").is_some() {
+            continue; // idempotent: never double-wrap
+        }
+        let url = match r.get("url").and_then(|v| v.as_str()) {
+            Some(u) if !u.is_empty() => u.to_string(),
+            _ => continue,
+        };
+        // Coarse, non-identifying subid: the destination merchant host only.
+        let subid = reqwest::Url::parse(&url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_default();
+        let aff_url = render_affiliate_url(net, &url, &subid);
+        // Reporting fields (ROADMAP item 6): surface the configured bid floor /
+        // fallback so operators can report on monetization. These are DATA-driven
+        // (from the network config) and are NEVER used for ranking. `disclosed`
+        // stays true so the frontend can label the result.
+        let mut block = serde_json::Map::new();
+        block.insert(
+            "network".to_string(),
+            serde_json::Value::String(net.network.clone()),
+        );
+        block.insert("url".to_string(), serde_json::Value::String(aff_url));
+        block.insert("disclosed".to_string(), serde_json::Value::Bool(true));
+        if let Some(bf) = &net.bid_floor {
+            block.insert("bid_floor".to_string(), serde_json::Value::String(bf.clone()));
+        }
+        if let Some(fbu) = &net.fallback_url {
+            block.insert("fallback".to_string(), serde_json::Value::String(fbu.clone()));
+        }
+        r["affiliate"] = serde_json::Value::Object(block);
+    }
+}
+
 // ─── end commerce extraction ──────────────────────────────────────────
 
 /// Extract a natural-language price bound from a raw query (no operator syntax).
@@ -4955,11 +5365,7 @@ async fn handle_shopping(
 /// Patterns (case-insensitive, currency-agnostic — no merchant/region hardcoding):
 ///   A) "<upper-marker> <number> [currency]"  e.g. "under 150 dollars", "below 1000 rs"
 ///   B) "<currency-symbol><number> <upper-marker>" e.g. "₹20000 or less", "$600 max"
-///   C) "<number> <currency> <upper-marker>"  e.g. "1000 rupees max"
-///
-/// Indian number units (lakh, crore) are converted to their numeric equivalents:
-///   1 lakh = 100,000; 1 crore = 10,000,000. Without this, "under 30 lakh" was
-///   parsed as price:<30 instead of price:<3000000.
+///   C) "<number> <currency> <upper-marker>" e.g. "1000 rupees max"
 fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     let lower = q.to_lowercase();
     let upper_markers = [
@@ -4968,12 +5374,6 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     let lower_markers = ["over", "more than", "above", "minimum", "at least", "from"];
     let amount_pat = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
     let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.", "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw"];
-    // Indian number units: "30 lakh" = 3,000,000; "5 crore" = 50,000,000.
-    // The multiplier is applied to the parsed number before returning.
-    let indian_units: &[(&str, f32)] = &[
-        ("lakh", 100_000.0), ("lakhs", 100_000.0),
-        ("crore", 10_000_000.0), ("crores", 10_000_000.0),
-    ];
     // Distance units: a number followed by one of these is a RANGE/DISTANCE
     // bound (e.g. "within 300 kilometers", "up to 50 miles"), NOT a price.
     // Without this guard, "within 300 kilometers" was mis-read as price:<300
@@ -4994,16 +5394,6 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
         let next_token_lower = next_token.to_lowercase();
         distance_units.iter().any(|u| next_token_lower == *u)
     };
-    /// Check if the token immediately after the number is an Indian unit
-    /// (lakh/lakhs/crore/crores). Returns the multiplier if found.
-    let get_indian_multiplier = |rest_after_num: &str| -> Option<f32> {
-        let next_token = rest_after_num.trim_start()
-            .split(|c: char| !c.is_alphanumeric())
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
-        indian_units.iter().find(|(u, _)| next_token == *u).map(|(_, m)| *m)
-    };
 
     // Pattern A: upper-marker then number (+ optional currency word)
     for marker in upper_markers {
@@ -5015,16 +5405,10 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
                         // Distance-bound guard: "within 300 kilometers" is a
                         // range, not a price — skip this marker (let a later
-                        // price marker, if any, match instead).
-                        // NOTE: check the text AFTER the number, not `rest`
-                        // (which still contains the number itself).
-                        let after_num = &rest[m.end()..];
-                        if is_distance_bound(after_num) {
+                        // price marker, if any) match instead).
+                        if is_distance_bound(rest) {
                             continue;
                         }
-                        // Indian unit conversion: "30 lakh" → 3,000,000
-                        let multiplier = get_indian_multiplier(after_num).unwrap_or(1.0);
-                        let v = v * multiplier;
                         // Currency-proximity guard: Pattern A is "<marker> <number>",
                         // but a discourse marker like "about" can be followed by an
                         // unrelated number that is NOT a price (e.g. "gpt 5",
@@ -5033,6 +5417,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         // not anywhere in the rest of the query. Without a nearby
                         // currency word, this is not a price bound — skip and try
                         // the next marker. General guard; no per-query literals.
+                        let after_num = &rest[m.end()..];
                         let near_currency = currency_words.iter().any(|c| {
                             after_num.len() >= c.len() && after_num[..c.len()].starts_with(c)
                                 || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
@@ -6670,18 +7055,7 @@ fn has_local_intent(query: &str) -> bool {
         // FIX: exclude country-level gazetteer entries — "in india" is a national
         // scope, not a local search. A query like "organic farm in india" or
         // "credit score in india" is a how-to/informational query, not local.
-        //
-        // AREA-MODIFIER FIX: "south mumbai", "north delhi", "east bangalore" —
-        // the gazetteer check must match the city name ANYWHERE in the after-in
-        // segment, not just at the start. "best restaurants in south mumbai" has
-        // after_in = "south mumbai open late..." which does NOT start with
-        // "mumbai" but CONTAINS it. Without this, area-modified city queries
-        // lose local intent. General: whole-word containment, no per-query literals.
         || {
-            let word_count = lower.split_whitespace().count();
-            if word_count > 10 {
-                return false;
-            }
             let parts: Vec<&str> = lower.split(" in ").collect();
             if let Some(after_in) = parts.last() {
                 let after_in = *after_in;  // deref &&str -> &str
@@ -6702,22 +7076,6 @@ fn has_local_intent(query: &str) -> bool {
             } else {
                 false
             }
-        }
-        // "best X in <area>" / "X near <area>" — a local business/service query
-        // that names a locality or area (not necessarily a gazetteer city). The
-        // query pattern "best <service> in <area>" or "<service> near <area>" is
-        // a strong local intent signal even when <area> is a neighbourhood, not
-        // a city. General: pattern-based, no per-query literals.
-        || {
-            let word_count = lower.split_whitespace().count();
-            if word_count > 15 {
-                return false;
-            }
-            let has_local_service_pattern = (lower.starts_with("best ") && lower.contains(" in "))
-                || lower.contains(" near ")
-                || lower.contains(" nearby ")
-                || lower.contains(" local ");
-            has_local_service_pattern && word_count <= 15
         }
 }
 
@@ -8425,7 +8783,10 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                in_negation = false;
+                // Preserved domain word: keep it in the result, but do NOT end
+                // the negation scope. Subsequent non-preserved words are still
+                // negated (e.g. "recipes without linux spicy" → "recipes linux",
+                // excluded: ["spicy"]). The scope only ends at a clause boundary.
                 result.push(w);
             } else {
                 // Non-domain content word after a negation trigger: treat as an
@@ -10906,11 +11267,7 @@ fn merge_local_and_web(
         // article for text queries (e.g. "how to make biryani at home"). Videos have
         // their own /videos endpoint; in /search they are secondary, so dampen them
         // unless the query is explicitly video-seeking. Floor keeps them present, not dominant.
-        let is_video_source = r.sources.iter().any(|s| s == "invidious" || s == "video")
-            || is_url_video_host(&r.url)
-            || r.url.to_lowercase().contains("/videos/")
-            || r.url.to_lowercase().contains("/video/")
-            || r.url.to_lowercase().contains("/watch");
+        let is_video_source = r.sources.iter().any(|s| s == "invidious" || s == "video");
         let video_mult = if is_video_source {
             if has_video_intent(query) {
                 1.0 // explicit video intent → keep
@@ -11883,7 +12240,7 @@ struct AppState {
     /// startup from `data/commerce/affiliate.json`; all network/template/key-env
     /// knowledge is data, never code. Used only as a strict post-rank decoration
     /// pass — never affects ranking/order.
-    affiliate_ctx: AffiliateCtx,
+    affiliate_ctx: affiliate::AffiliateCtx,
 }
 
 async fn handle_images(
@@ -12516,7 +12873,7 @@ async fn main() {
         // limit even under a burst, while still allowing real parallelism.
         search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         // Affiliate template engine config (ROADMAP item 3) — loaded from data.
-        affiliate_ctx: AffiliateCtx::load(),
+        affiliate_ctx: affiliate::AffiliateCtx::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -14688,19 +15045,17 @@ async fn handle_search(
         // budget and surfaces upstream_unavailable even though tor2 would
         // have answered once warm. We only wait when tor2 is actually in the
         // fan-out (it is, for every request) and it's currently marked cold.
-        // Cap at 6s (reduced from 12s) so a genuinely stuck tor2 can't hang the
-        // request. The 24s circuit-breaker timeout defect (round 2026-10-14)
-        // showed that 12s warm-up + 10s × 2 attempts exceeded the 30s budget.
+        // Cap at 12s so a genuinely stuck tor2 can't hang the request.
         if searx_urls.iter().any(|u| u.contains("tor2")) && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
             let mut waited = 0u64;
-            while waited < 6000 && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
+            while waited < 12000 && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 waited += 500;
             }
             if TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
                 tracing::debug!("tor2 warmed during pre-query wait ({}ms)", waited);
             } else {
-                tracing::warn!("tor2 still cold after 6s pre-query wait; querying anyway");
+                tracing::warn!("tor2 still cold after 12s pre-query wait; querying anyway");
             }
         }
 
@@ -14733,13 +15088,7 @@ async fn handle_search(
             } else {
                 // Non-site queries also fan out to tor2; allow its cold-circuit
                 // time so it can serve as a true redundant path.
-                // Reduced from 10s to 6s: the 24s circuit-breaker timeout defect
-                // (round 2026-10-14) showed that 10s × 2 attempts + tor2 warm-up
-                // wait exceeded the 30s REQUEST_TIMEOUT_SECS, causing 40% of queries
-                // to hit the circuit breaker. 6s per attempt gives a worst case of
-                // 6+6=12s + overhead, well under the 30s budget. The retry still
-                // recovers transient failures — it just doesn't wait as long.
-                6000
+                10000
             }
         };
         let min_early_return: usize = 15;
@@ -15319,10 +15668,6 @@ async fn handle_search(
         // or "rate" but is NOT transactional. The keyword list is a weak signal; the
         // how-to/informational starter is a strong one. Only an explicit price bound
         // (parsed from NL) can override a how-to starter — that is a decisive signal.
-        //
-        // EXCEPTION: "how much does X cost" / "how many" queries are price questions,
-        // not informational. The word "cost" or a price/cost term in the query body
-        // is a decisive transactional signal even when the query starts with "how much".
         let informational_starters = [
             "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
             "what is ", "what are ", "what was ", "what were ", "why ", "why is ",
@@ -15330,16 +15675,8 @@ async fn handle_search(
             "understand ", "learn ", "teach me ",
         ];
         let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
-        // "how much does X cost" / "how much is X" / "how many" with a price/cost term
-        // is a transactional price question, NOT informational. The presence of
-        // "cost", "price", "rupee", "inr", "₹", "dollar", etc. in the query body is a
-        // decisive signal that overrides the informational starter guard.
-        let has_price_term_in_body = ["cost", "price", "pricing", "rupee", "rupees", "inr", "₹", "dollar", "dollars", "budget", "cheap", "expensive", "affordable", "worth"]
-            .iter().any(|t| q_lower.contains(t));
-        let is_how_much_price_query = (q_lower.starts_with("how much") || q_lower.starts_with("how many"))
-            && has_price_term_in_body;
-        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_has_word(&q_lower, k));
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -15351,8 +15688,7 @@ async fn handle_search(
         // The keyword-based tx signal is suppressed when the query starts with an
         // informational/how-to starter. A price bound is still allowed through — it is
         // a decisive signal that the user wants to buy, not just learn.
-        // EXCEPTION: "how much does X cost" is a price question, not informational.
-        let tx_signal_effective = (has_tx_signal && !has_informational_starter) || is_how_much_price_query;
+        let tx_signal_effective = has_tx_signal && !has_informational_starter;
         if (tx_signal_effective || has_price_bound) && !has_local_keywords {
             if (intent.intent != "comparison" || has_price_bound)
                 && (intent.intent != "transactional" || intent.confidence < 0.60)
@@ -15376,39 +15712,6 @@ async fn handle_search(
                 intent.confidence = intent.confidence.max(0.80);
                 let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
                 intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
-            }
-        }
-
-        // Override 6b: Career-advice / transition queries → informational
-        // Long conversational queries like "i am a 28 year old chartered accountant
-        // ... i want to transition into data analytics ... should i learn python or r"
-        // are career advice, NOT technical. The intent engine misclassifies them as
-        // "technical" because they mention tech terms (python, data, programming).
-        // The decisive signal: the query describes a career situation (job title +
-        // "transition" / "switch" / "move into" / "career" / "should i learn").
-        // General: pattern-based on career vocabulary, no per-query literals.
-        let career_signals = [
-            "transition", "transitioning", "switch", "switching", "move into",
-            "moving into", "career", "job change", "new field", "new career",
-            "should i learn", "should i study", "how do i become",
-            "how to become", "what should i learn", "advice", "guidance",
-        ];
-        let has_career_signal = career_signals.iter().any(|s| q_lower.contains(s));
-        let has_job_context = ["i am a ", "i'm a ", "i work as ", "i have been working",
-            "years of experience", "working as", "my job", "my career",
-        ].iter().any(|s| q_lower.contains(s));
-        if has_career_signal && has_job_context && intent.intent == "technical" {
-            tracing::info!(
-                "INTENT OVERRIDE (CAREER): career-advice query '{}' was 'technical' -> informational",
-                q
-            );
-            intent.intent = "informational".to_string();
-            intent.confidence = intent.confidence.max(0.75);
-            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-            intent.distribution.insert("informational".to_string(), (info_prob + 0.50).min(0.88));
-            // Dampen the spurious technical probability
-            if let Some(t) = intent.distribution.get_mut("technical") {
-                *t = (*t * 0.4).min(0.30);
             }
         }
 
@@ -15707,28 +16010,6 @@ async fn handle_search(
                 tracing::info!(target:"expansion.debug", "numeric-relaxed expanded query: {:?}", relaxed_clean);
                 let insert_pos = 1.min(expanded_queries.len());
                 expanded_queries.insert(insert_pos, relaxed_clean);
-            }
-        }
-    }
-
-    // Long-query simplification: queries with > 20 words often return poor results
-    // because SearXNG struggles with long NL. Extract the key product/topic terms
-    // and create a shorter query. General: word-count threshold, no per-query literals.
-    let word_count = q.split_whitespace().count();
-    if word_count > 20 {
-        let stop_words: HashSet<&str> = ["the", "a", "an", "in", "on", "for", "of", "to", "with", "from", "is", "are", "was", "were", "who", "what", "when", "where", "why", "how", "do", "does", "did", "will", "would", "could", "should", "can", "may", "might", "me", "my", "your", "he", "she", "they", "it", "this", "that", "these", "those", "has", "have", "had", "been", "being", "also", "about", "into", "than", "then", "there", "here", "not", "no", "without", "except", "other", "and", "or", "but", "if", "so", "as", "at", "by", "up", "down", "out", "off", "over", "under", "again", "further", "once", "all", "any", "both", "each", "few", "more", "most", "some", "such", "only", "own", "same", "too", "very", "just", "now", "which", "while", "because", "until", "between", "through", "during", "before", "after", "above", "below"].iter().copied().collect();
-        let key_terms: Vec<&str> = q.split_whitespace()
-            .filter(|w| {
-                let wl = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
-                wl.len() >= 3 && !stop_words.contains(wl.as_str())
-            })
-            .collect();
-        if key_terms.len() >= 2 && key_terms.len() <= 10 {
-            let simplified = key_terms.join(" ");
-            let simplified_clean = preprocess_searxng_query(&simplified);
-            if !simplified_clean.is_empty() && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == simplified_clean) {
-                tracing::info!(target:"expansion.debug", "long-query simplified: {} words -> '{}'", word_count, simplified_clean);
-                expanded_queries.insert(0, simplified_clean);
             }
         }
     }
@@ -20738,27 +21019,11 @@ mod hardcoding_ruling_tests {
         }
 
         // Verify the tx_keywords list still matches genuine transactional queries
-        // Uses q_has_word (whole-word match) — the same approach as the production code.
-        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
         for q in &transactional_queries {
             let q_lower = q.to_lowercase();
-            let has_tx = tx_keywords.iter().any(|k| q_has_word(&q_lower, k));
+            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
             assert!(has_tx, "transactional query '{}' should match tx_keywords", q);
-        }
-
-        // Regression: query ENDING with "price" (no trailing space) must still match.
-        // The old trailing-space approach ("price ") missed queries like
-        // "sony wh-1000xm5 price" where "price" is the last word.
-        let ending_queries = [
-            "sony wh-1000xm5 price",
-            "iphone 16 pro max price",
-            "macbook pro m3 price",
-            "pixel 9 price",
-        ];
-        for q in &ending_queries {
-            let q_lower = q.to_lowercase();
-            let has_tx = tx_keywords.iter().any(|k| q_has_word(&q_lower, k));
-            assert!(has_tx, "query ending with 'price' '{}' should match tx_keywords", q);
         }
 
         // Verify that guarded queries with "under " or "price " would have matched
@@ -20769,7 +21034,7 @@ mod hardcoding_ruling_tests {
         ];
         for q in &problematic_queries {
             let q_lower = q.to_lowercase();
-            let has_tx = tx_keywords.iter().any(|k| q_has_word(&q_lower, k));
+            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
             assert!(has_tx, "query '{}' should match tx_keywords (proving the guard is needed)", q);
             // But the guard suppresses it
             let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
@@ -21900,6 +22165,7 @@ mod spellcheck_endpoint_tests {
 
 mod commerce_extraction_tests {
     use super::*;
+    use affiliate::*;
 
     // Realistic schema.org Product + Offer JSON-LD fixture (single offer).
     const HTML_SINGLE_OFFER: &str = r#"<!doctype html><html><head>
@@ -22360,6 +22626,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             param_env: HashMap::new(),
             bid_floor: None,
             fallback_url: None,
+            host_suffix: None,
         }
     }
 
@@ -22429,7 +22696,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn decoration_is_idempotent_no_double_wrap() {
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], programs: vec![], network_meta: vec![] };
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -22446,7 +22713,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn missing_key_degrades_to_null_affiliate() {
         // No usable network (key env var unset) => results keep affiliate null.
         let n = net("wrap", "https://sovrn.co?key={key}&u={url}", HashMap::new(), Some("UNSET_KEY_ENV_VAR_XYZ"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], programs: vec![], network_meta: vec![] };
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -22459,7 +22726,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // The central no-manipulation guarantee: decoration never reorders.
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], programs: vec![], network_meta: vec![] };
         let mut results = vec![
             serde_json::json!({ "url": "https://a.example.com/x", "score": 9.7 }),
             serde_json::json!({ "url": "https://b.example.org/y", "score": 8.1 }),
