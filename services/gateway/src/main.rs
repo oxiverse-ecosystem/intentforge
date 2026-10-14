@@ -5438,6 +5438,40 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
 fn should_filter_by_constraints(
     title: &str, content: &str, url: &str, published_date: Option<&str>, constraints: &Constraints,
 ) -> bool {
+    // 0. Hard-drop results that match ZERO positive constraints.
+    // When a query carries positive constraints (e.g. "note taking app"),
+    // a result that matches none of them is off-topic and must be dropped,
+    // not just softly penalised. Without this, "note taking app" returns
+    // privacy apps (LibreWolf, Tuta calendar) because they get a 0.60x
+    // penalty but still appear in results.
+    if !constraints.positive.is_empty() {
+        let text_lower = format!("{} {} {}", title.to_lowercase(), content.to_lowercase(), url.to_lowercase());
+        let any_positive_matched = constraints.positive.iter().any(|pos| {
+            let pos_lower = pos.to_lowercase();
+            let pos_normalized: String = pos_lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
+            let pos_words: Vec<&str> = pos_lower.split_whitespace().collect();
+            if pos_words.len() == 1 {
+                text_lower.split_whitespace().any(|w| {
+                    w == pos_lower
+                    || w.trim_matches(|c: char| !c.is_alphanumeric()) == pos_lower
+                    || w.chars().filter(|c| c.is_alphanumeric()).collect::<String>() == pos_normalized
+                })
+                || (pos_normalized.len() >= 3 && text_lower.contains(&pos_normalized))
+            } else {
+                text_lower.contains(&pos_lower)
+                || pos_words.iter().all(|w| {
+                    let w_clean = w.chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+                    text_lower.split_whitespace().any(|tw| {
+                        tw == *w || tw.trim_matches(|c: char| !c.is_alphanumeric()) == *w
+                    }) || (w_clean.len() >= 3 && text_lower.contains(&w_clean))
+                })
+            }
+        });
+        if !any_positive_matched {
+            return true;
+        }
+    }
+
     // 1. Hard filter on file_types
     if !constraints.file_types.is_empty() {
         if let Ok(parsed_url) = reqwest::Url::parse(url) {
@@ -16098,8 +16132,8 @@ async fn handle_search(
     // Count-based retry (no relevance needed yet — fires before Invidious/news/image)
     if (needs_more_results || has_contrastive_negatives) && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
         let mut retry_futs = Vec::new();
-        let retry_timeout = Duration::from_secs(4); // shorter than initial 5s
-        let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 6 } else { 3 };
+        let retry_timeout = Duration::from_secs(2); // shorter than initial 5s; 2s is enough for a retry
+        let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 4 } else { 2 };
         for (eq_idx, eq) in expanded_queries.iter().enumerate().skip(1) {
             if eq_idx > max_variations { break; }
             let clean_eq = preprocess_searxng_query(eq);
