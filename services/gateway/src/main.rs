@@ -5799,6 +5799,13 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
 fn should_filter_by_constraints(
     title: &str, content: &str, url: &str, published_date: Option<&str>, constraints: &Constraints,
 ) -> bool {
+    // Positive constraints are SOFT preferences (boost), not hard requirements (filter).
+    // A result that doesn't contain every positive term is still relevant — it just
+    // ranks lower. Hard-dropping on positive constraints causes result-count collapse
+    // for long conversational queries where the intent engine extracts generic words
+    // (e.g. "background" from "i have no programming background") as positive constraints.
+    // Only negative constraints, file_types, sites, date bounds, and phrases are hard filters.
+
     // 1. Hard filter on file_types
     if !constraints.file_types.is_empty() {
         if let Ok(parsed_url) = reqwest::Url::parse(url) {
