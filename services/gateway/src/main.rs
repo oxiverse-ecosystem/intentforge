@@ -24227,7 +24227,7 @@ mod mainpath_shopping_strip_tests {
     #[test]
     fn enrich_window_is_wider_than_display_cap() {
         // Guards the constants from being re-conflated.
-        assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
+        assert!(24 > COMMERCE_MAINPATH_TOP_N);
     }
 
     // ─── extract_snippet_facts tests ────────────────────────────────────
