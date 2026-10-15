@@ -64,8 +64,8 @@
       "network": "Rakuten Advertising",
       "template": "https://click.linksynergy.com/deeplink?id={key}&mid={param:merchant_id}&murl={url}",
       "params": {},
-      "key_env": "RAKTUEN_LINKSYNERGY_ID",
-      "param_env": { "merchant_id": "RAKTUEN_MERCHANT_ID" }
+      "key_env": "RAKUTEN_LINKSYNERGY_ID",
+      "param_env": { "merchant_id": "RAKUTEN_MERCHANT_ID" }
     }
   ]
 }

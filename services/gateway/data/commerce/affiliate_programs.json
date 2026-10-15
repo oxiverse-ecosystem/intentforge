@@ -5,6 +5,7 @@
     {
       "id": "sovrn_commerce",
       "name": "Sovrn Commerce",
+      "network": "Sovrn Commerce",
       "host_suffix": null,
       "kind": "wrap",
       "enabled": true,
@@ -22,6 +23,7 @@
     {
       "id": "skimlinks",
       "name": "Skimlinks",
+      "network": "Skimlinks",
       "host_suffix": null,
       "kind": "wrap",
       "enabled": true,
@@ -34,6 +36,7 @@
     {
       "id": "ebay_epn",
       "name": "eBay Partner Network",
+      "network": "eBay Partner Network",
       "host_suffix": "ebay.",
       "kind": "append_params",
       "enabled": true,
@@ -55,6 +58,7 @@
     {
       "id": "amazon_associates",
       "name": "Amazon Associates",
+      "network": "Amazon Associates",
       "host_suffix": "amazon.",
       "kind": "append_params",
       "enabled": true,
@@ -69,15 +73,16 @@
     {
       "id": "rakuten_advertising",
       "name": "Rakuten Advertising",
+      "network": "Rakuten Advertising",
       "host_suffix": null,
       "kind": "wrap",
       "enabled": true,
       "priority": 60,
       "template": "https://click.linksynergy.com/deeplink?id={key}&mid={param:merchant_id}&murl={url}",
       "params": {},
-      "key_env": "RAKTUEN_LINKSYNERGY_ID",
+      "key_env": "RAKUTEN_LINKSYNERGY_ID",
       "param_env": {
-        "merchant_id": "RAKTUEN_MERCHANT_ID"
+        "merchant_id": "RAKUTEN_MERCHANT_ID"
       }
     }
   ]
