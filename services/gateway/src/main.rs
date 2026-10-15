@@ -24962,6 +24962,100 @@ mod mainpath_shopping_strip_tests {
         // merchant still extracted from URL
         assert_eq!(facts.merchant, Some("www.bestbuy.com".to_string()));
     }
+
+    // ─── enrich_single_commerce snippet fallback tests ──────────────────
+    //
+    // These tests prove that the parallel enrichment path (which calls
+    // `enrich_single_commerce`) now has the same snippet-based fallback as
+    // the sequential path: when a page fetch returns no structured data,
+    // the function falls back to extracting facts from the search result
+    // snippet (title + content). This is the increment that closes the
+    // recall gap on the main /search path and /shopping endpoint.
+
+    #[test]
+    fn enrich_single_commerce_snippet_fallback_when_no_structured_data() {
+        // A result with a price in the snippet but no structured data
+        let mut result = serde_json::json!({
+            "url": "https://www.bestbuy.com/sony-wh1000xm5",
+            "title": "Sony WH-1000XM5 Wireless Headphones",
+            "content": "Price: $349.99 - In Stock - Free shipping"
+        });
+        // Empty HTML = no structured data found
+        enrich_single_commerce(&mut result, "<html><body>no structured data</body></html>");
+
+        let commerce = result.get("commerce").expect("commerce block should be attached");
+        assert_eq!(commerce.get("source").unwrap(), "snippet_extracted");
+        let data = commerce.get("data").unwrap();
+        assert_eq!(data.get("price").unwrap(), 349.99);
+        assert_eq!(data.get("currency").unwrap(), "USD");
+        assert_eq!(data.get("availability").unwrap(), "in_stock");
+        assert_eq!(data.get("merchant").unwrap(), "www.bestbuy.com");
+        assert_eq!(data.get("name").unwrap(), "Sony WH-1000XM5 Wireless Headphones");
+    }
+
+    #[test]
+    fn enrich_single_commerce_snippet_fallback_not_used_when_structured_data_present() {
+        // A result where the page HAS structured data — snippet fallback must NOT fire
+        let mut result = serde_json::json!({
+            "url": "https://www.bestbuy.com/sony-wh1000xm5",
+            "title": "Sony WH-1000XM5 Wireless Headphones",
+            "content": "Price: $349.99 - In Stock"
+        });
+        // HTML with JSON-LD structured data
+        let html = r#"<script type="application/ld+json">
+        {"@type":"Product","name":"Sony WH-1000XM5","offers":{"@type":"Offer","price":"299.99","priceCurrency":"USD","availability":"https://schema.org/InStock"}
+        </script>"#;
+        enrich_single_commerce(&mut result, html);
+
+        let commerce = result.get("commerce").expect("commerce block should be attached");
+        // Source should be the structured data source, NOT snippet_extracted
+        assert_ne!(commerce.get("source").unwrap(), "snippet_extracted");
+        let data = commerce.get("data").unwrap();
+        assert_eq!(data.get("price").unwrap(), 299.99);
+        assert_eq!(data.get("name").unwrap(), "Sony WH-1000XM5");
+    }
+
+    #[test]
+    fn enrich_single_commerce_snippet_fallback_no_facts_no_commerce() {
+        // A result with no structured data AND no extractable snippet facts
+        let mut result = serde_json::json!({
+            "url": "https://www.bestbuy.com/sony-wh1000xm5",
+            "title": "How to choose headphones",
+            "content": "This guide explains what to look for"
+        });
+        enrich_single_commerce(&mut result, "<html><body>no data</body></html>");
+
+        // No commerce block should be attached (no facts to show)
+        assert!(result.get("commerce").is_none());
+        // But provenance should still be present (honest: we checked, found nothing)
+        assert!(result.get("commerce_provenance").is_some());
+        let prov = result.get("commerce_provenance").unwrap();
+        assert_eq!(prov.get("source").unwrap(), serde_json::Value::Null);
+        assert_eq!(prov.get("data").unwrap(), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn enrich_single_commerce_snippet_fallback_provenance_uses_observed_at() {
+        // Verify that the provenance observed_at comes from the commerce block
+        // (not a fresh timestamp) when snippet fallback fires
+        let mut result = serde_json::json!({
+            "url": "https://www.bestbuy.com/sony-wh1000xm5",
+            "title": "Sony WH-1000XM5",
+            "content": "Price: $349.99"
+        });
+        enrich_single_commerce(&mut result, "<html><body>no data</body></html>");
+
+        let commerce = result.get("commerce").unwrap();
+        let prov = result.get("commerce_provenance").unwrap();
+        // Both should carry the same observed_at timestamp
+        assert_eq!(
+            commerce.get("observed_at").unwrap(),
+            prov.get("observed_at").unwrap()
+        );
+        // Source should be snippet_extracted in both
+        assert_eq!(commerce.get("source").unwrap(), "snippet_extracted");
+        assert_eq!(prov.get("source").unwrap(), "snippet_extracted");
+    }
 }
 
 /// Tests for the affiliate decoration post-pass on MAIN /search results.
