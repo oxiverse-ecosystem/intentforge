@@ -20,12 +20,9 @@ mod clean;
 mod goals;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
-mod affiliate_engine_tests;
 // ROADMAP item 6: order invariance driven by the REAL shipped affiliate data
 // (every network, keys present vs absent) — the offline CI lock.
 mod real_data_order_tests;
-// Integration tests: end-to-end affiliate decoration against real data files.
-mod affiliate_integration_tests;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -238,8 +235,12 @@ fn normalize_currency_str(s: &str) -> String {
     }
 }
 
-fn is_model_number_price_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
-    let has_model = cfg.has_exact_model(q_lower);
+fn is_model_number_price_query(q_lower: &str) -> bool {
+    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let model_re = MODEL_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+\d{1,2}").unwrap()
+    });
+    let has_model = model_re.is_match(q_lower);
     let has_price = q_lower.contains("price") || q_lower.contains("cost")
         || q_lower.contains("rupee") || q_lower.contains("rupees")
         || q_lower.contains("inr") || q_lower.contains('₹')
@@ -247,21 +248,6 @@ fn is_model_number_price_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
         || q_lower.contains("budget") || q_lower.contains("cheap")
         || q_lower.contains("pricing");
     has_model && has_price
-}
-
-/// True when the query names a specific product model (e.g. "iphone 16 pro
-/// max", "galaxy s24 ultra", "pixel 9 pro"). This is the eligibility gate for
-/// affiliate decoration: monetization is exact-model-only, so broad category
-/// queries ("best wireless earbuds under 50 dollars") must never receive
-/// affiliate links even when they use the /shopping endpoint.
-///
-/// Reuses the same model-number detection as `is_model_number_price_query` but
-/// drops the price requirement — a query that names a specific model is
-/// exact-model regardless of whether it mentions price. Data-driven: the
-/// brand list lives in `ExactModelConfig` (loaded from
-/// `data/commerce/exact_model_brands.json`), not in a keyword→reply table.
-fn is_exact_model_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
-    cfg.has_exact_model(q_lower)
 }
 
 fn has_price_signal(title_lower: &str, content_lower: &str) -> bool {
@@ -2596,6 +2582,17 @@ const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
 ];
 
 fn sanitize_constraints(c: &Constraints) -> Constraints {
+    sanitize_constraints_with_query(c, None)
+}
+
+/// Full sanitization with query-aware negative-conclusion gating.
+///
+/// When `q_orig` is provided, negative constraints are additionally checked
+/// against `is_real_exclusion` — this filters out false negatives the intent
+/// engine may emit (e.g. "no cost emi" → "cost emi" is NOT a real exclusion
+/// because "no cost EMI" is a financial term meaning equal monthly installments
+/// without extra cost, not a negation of "cost").
+fn sanitize_constraints_with_query(c: &Constraints, q_orig: Option<&str>) -> Constraints {
     let mut negative: Vec<String> = Vec::new();
     let mut positive: Vec<String> = Vec::new();
     let mut file_types = c.file_types.clone();
@@ -2621,6 +2618,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
     // grammar-noise function words (e.g. "is genuinely fun" → exclusion `genuinely`;
     // "and also have parking" → exclusion `also`). These invert the user's intent and
     // penalize relevant pages. General, data-driven gates (no per-query literals).
+    let query_contrastive = q_orig.map(|q| query_is_contrastive(q)).unwrap_or(false);
     for n in &c.negative {
         let mut clean_n = n.trim().to_lowercase();
         if clean_n.starts_with('-') {
@@ -2632,6 +2630,16 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         if clean_n.split_whitespace().count() <= 2 && !clean_n.is_empty() {
             if is_subjective_quality_term(&clean_n) || is_exclusion_grammar_noise(&clean_n) {
                 continue;
+            }
+            // Query-aware gate: when the original query is available, also check
+            // is_real_exclusion. This filters false negatives like "cost emi" from
+            // "no cost emi" (a financial term, not a negation). The intent engine
+            // sees "no" and extracts "cost emi" as a negative, but it is not a
+            // real exclusion — the user wants EMI plans, not to exclude "cost".
+            if let Some(q) = q_orig {
+                if !is_real_exclusion(&clean_n, q, query_contrastive) {
+                    continue;
+                }
             }
             if !negative.contains(&clean_n) {
                 negative.push(clean_n);
@@ -2916,84 +2924,6 @@ fn extract_price_from_text(text: &str) -> Option<PriceInfo> {
     }
 
     None
-}
-
-/// Extract product facts from a search result snippet (title + content).
-/// This is a FALLBACK for when the page fetch failed or returned no structured
-/// data. All extracted facts are marked with source="snippet_extracted" by the
-/// caller so the frontend can label them as less certain than structured data.
-///
-/// Extraction rules (all conservative — never fabricate):
-/// - Price/currency: via `extract_price_from_text` (existing, well-tested)
-/// - Product name: from the title, truncated at the first delimiter (|, -, —)
-/// - Merchant/brand: from the URL host (with merchant_observed: false)
-/// - Availability: from snippet text ("in stock", "out of stock", etc.)
-fn extract_snippet_facts(snippet: &str, url: &str) -> OfferFacts {
-    let mut facts = OfferFacts::default();
-
-    // Price + currency
-    if let Some(price_info) = extract_price_from_text(snippet) {
-        facts.price = Some(price_info.amount);
-        facts.currency = Some(price_info.currency);
-    }
-
-    // Product name: extract from title (first line, truncated at delimiter).
-    // Only if the title looks like a product name — not a question or how-to phrase.
-    let title = snippet.lines().next().unwrap_or("").trim();
-    if !title.is_empty() {
-        // Truncate at common delimiters: |, -, —, –
-        let name = title
-            .split(|c| c == '|' || c == '—' || c == '–')
-            .next()
-            .unwrap_or(title)
-            .trim();
-        // Only use as product name if it's not too long and doesn't look like a question/how-to
-        if !name.is_empty() && name.len() <= 200 && !is_question_or_howto(name) {
-            facts.name = Some(name.to_string());
-        }
-    }
-
-    // Merchant/brand: from URL host (NOT observed on page — merchant_observed stays false)
-    let host = url_host(url);
-    if !host.is_empty() && host != "localhost" {
-        facts.merchant = Some(host);
-        // merchant_observed stays false — this is derived from the URL, not the page
-    }
-
-    // Availability: look for common availability phrases in the snippet
-    let lower = snippet.to_lowercase();
-    if lower.contains("in stock") || lower.contains("available now") || lower.contains("ships today") {
-        facts.availability = Some("in_stock".to_string());
-    } else if lower.contains("out of stock") || lower.contains("unavailable") || lower.contains("sold out") {
-        facts.availability = Some("out_of_stock".to_string());
-    }
-
-    facts
-}
-
-/// Returns true if the text looks like a question or how-to phrase rather than a
-/// product name. Used to filter out non-product titles from snippet extraction.
-fn is_question_or_howto(text: &str) -> bool {
-    let lower = text.to_lowercase().trim().to_string();
-    // Question phrases
-    if lower.ends_with('?') {
-        return true;
-    }
-    // Common question starters
-    let question_starters = [
-        "what ", "how ", "why ", "when ", "where ", "which ", "who ", "is ", "are ",
-        "can ", "should ", "does ", "do ",
-    ];
-    for starter in &question_starters {
-        if lower.starts_with(starter) {
-            return true;
-        }
-    }
-    // How-to phrases
-    if lower.contains("how to") || lower.contains("how do") || lower.contains("how can") {
-        return true;
-    }
-    false
 }
 
 /// Secondary commerce price extraction: parse common HTML price patterns from
@@ -4430,20 +4360,23 @@ async fn enrich_with_commerce<F, Fut>(
             }
             None => {}
         }
-        // Snippet-based fallback: when the page fetch failed or returned
-        // no structured data, try to extract product facts from the search result
+        // Snippet-based price fallback: when the page fetch failed or returned
+        // no structured data, try to extract a price from the search result
         // snippet (title + content). This improves enrichment recall without
-        // fabricating facts — all snippet-derived facts are marked with
-        // source="snippet_extracted" so the frontend can label them as less
-        // certain than structured data.
+        // fabricating facts — the price is marked with source="snippet_extracted"
+        // so the frontend can label it as less certain than structured data.
         if !attached {
             let snippet = format!(
                 "{} {}",
                 r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
                 r.get("content").and_then(|v| v.as_str()).unwrap_or("")
             );
-            let facts = extract_snippet_facts(&snippet, &url);
-            if data_has_fact(&facts) {
+            if let Some(price_info) = extract_price_from_text(&snippet) {
+                let facts = OfferFacts {
+                    price: Some(price_info.amount),
+                    currency: Some(price_info.currency),
+                    ..Default::default()
+                };
                 let offer = CommerceOffer {
                     url: Some(url.clone()),
                     observed_at: Some(now_unix_string()),
@@ -4604,7 +4537,6 @@ async fn enrich_with_commerce_par<F, Fut>(
     results: &mut [serde_json::Value],
     fetch: F,
     wall_timeout: std::time::Duration,
-    enrich_window: usize,
 ) where
     F: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Option<String>> + Send,
@@ -4631,7 +4563,7 @@ async fn enrich_with_commerce_par<F, Fut>(
                 && r.get("commerce").is_none()
         })
         .map(|(idx, _)| idx)
-        .take(enrich_window)
+        .take(COMMERCE_ENRICH_WINDOW)
         .collect();
 
     // 2) Fetch with bounded concurrency as a ROLLING WINDOW, not in waves.
@@ -4806,7 +4738,7 @@ fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
 const COMMERCE_MAINPATH_TOP_N: usize = 8;
 
 /// How many already-ranked results are ENRICHED on the main `/search` path before
-/// the display cap (`mainpath_top_n`) is applied. Decoupling the two is
+/// the display cap (`COMMERCE_MAINPATH_TOP_N`) is applied. Decoupling the two is
 /// the main-path reachability fix: commercial queries often have bot-checked
 /// merchant pages (Amazon/Walmart/Flipkart) in the top 8 with no structured
 /// markup, so enriching only 8 finds nothing and the strip is suppressed. A wider
@@ -4816,10 +4748,7 @@ const COMMERCE_MAINPATH_TOP_N: usize = 8;
 /// This is NOT a ranking change: enrichment is a strict post-ranking decoration
 /// pass over a CLONE of the ranked results. The real `results` array is never
 /// mutated, reordered, or reselected.
-///
-/// This value is now loaded from `data/commerce/config.json` (`enrich_window`
-/// field) at runtime — see `CommerceConfig::enrich_window`. The constant is
-/// kept only as a type/documentation anchor; the runtime value comes from config.
+const COMMERCE_ENRICH_WINDOW: usize = 24;
 
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
@@ -4841,8 +4770,6 @@ fn is_commercial_intent(
     label: &str,
     distribution: &std::collections::HashMap<String, f32>,
     has_price_bound: bool,
-    signals: &CommerceSignals,
-    query: &str,
 ) -> bool {
     if has_price_bound {
         return true;
@@ -4853,23 +4780,11 @@ fn is_commercial_intent(
     // Strong transactional distribution is itself commercial intent even if the
     // argmax label is something else (e.g. "comparison"). Threshold is a signal
     // probability, not a per-query literal.
-    if distribution
+    distribution
         .get("transactional")
         .copied()
         .unwrap_or(0.0)
         >= 0.50
-    {
-        return true;
-    }
-    // WEAK signal boost: the runtime-loaded transactional keywords from
-    // signals.json provide additional recall when the intent engine is
-    // borderline. This is a SUPPLEMENT to the label/distribution check —
-    // never a standalone replacement. The keywords are data-driven (loaded
-    // from data/commerce/signals.json), not hardcoded in the classifier.
-    if signals.has_transactional_keyword(query) {
-        return true;
-    }
-    false
 }
 
 /// Pure helper: from an already-enriched array of result JSON values, keep only
@@ -4920,9 +4835,6 @@ async fn handle_shopping(
     // enrichment pass derives its budget from the time actually left in the
     // shared 30s request budget instead of assuming a fresh full one.
     let shopping_started = std::time::Instant::now();
-    // Extract the query for the exact-model gate BEFORE params is moved into
-    // handle_search. The gate decides whether affiliate decoration runs at all.
-    let is_exact_model = params.q.as_deref().map(|q| is_exact_model_query(&q.to_lowercase(), &state.exact_model_config)).unwrap_or(false);
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
     let (status, body) = handle_search(
         state.clone(),
@@ -4982,17 +4894,10 @@ async fn handle_shopping(
                     }
                 },
                 second_pass_wall,
-                state.commerce_config.enrich_window,
             )
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
-            // GATE: monetization is exact-model-only. Broad category queries
-            // ("best wireless earbuds under 50 dollars") must never receive
-            // affiliate links even on /shopping. The gate is data-driven —
-            // reuses the model-number regex, no hardcoded product lists.
-            if is_exact_model {
-                decorate_affiliate(arr, &state.affiliate_ctx);
-            }
+            decorate_affiliate(arr, &state.affiliate_ctx);
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
             // already-attached `commerce` blocks. Never reorders/reselects results.
             if let Some(arr_ref) = value.get("results").and_then(|v| v.as_array()) {
@@ -5030,12 +4935,6 @@ async fn handle_shopping(
 // affiliate parameter (privacy rule) — the only coarse subid is the merchant
 // host, which is non-identifying.
 /// One network/program row loaded from the data file. Generic over kinds.
-///
-/// `host_suffix` enables per-merchant matching: when present, this program
-/// only applies to result URLs whose host equals or ends with the suffix
-/// (label-boundary match, case-insensitive). When null, the program is a
-/// catch-all (matches any URL) — preserving the original single-network
-/// behaviour for backward compatibility.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct AffiliateNetwork {
     id: String,
@@ -5045,7 +4944,6 @@ struct AffiliateNetwork {
     enabled: bool,
     #[serde(default = "default_priority")]
     priority: i64,
-    #[serde(default)]
     network: String,
     template: String,
     #[serde(default)]
@@ -5063,10 +4961,6 @@ struct AffiliateNetwork {
     /// url-encoded as a query param. DATA-ONLY.
     #[serde(default)]
     fallback_url: Option<String>,
-    /// Optional merchant host suffix for per-merchant matching (e.g.
-    /// "amazon." matches amazon.com, amazon.co.uk, etc.). Null = catch-all.
-    #[serde(default)]
-    host_suffix: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -5074,22 +4968,6 @@ fn default_true() -> bool {
 }
 fn default_priority() -> i64 {
     0
-}
-
-/// Network metadata loaded from `data/commerce/networks.json`. Provides
-/// disclosure labels and subid policy documentation for each network.
-/// Purely informational — does not affect link rendering.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct AffiliateNetworkMeta {
-    id: String,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    disclosure_label: String,
-    #[serde(default)]
-    subid_policy: String,
-    #[serde(default)]
-    subid_description: String,
 }
 
 /// HOST component of a URL, lowercased, without scheme/port/userinfo/path.
@@ -5163,22 +5041,10 @@ fn is_reserved_documentation_host(host: &str) -> bool {
     false
 }
 
-/// Runtime-resolved config: data files + env-resolved keys. Built once at startup.
-///
-/// `networks` holds the legacy catch-all programs (from `affiliate.json`).
-/// `programs` holds per-merchant programs (from `affiliate_programs.json`) —
-/// each carries a `host_suffix` for domain matching. `network_meta` holds
-/// disclosure/subid metadata (from `networks.json`).
-///
-/// Decoration logic: for each result, the engine first tries to match a
-/// per-merchant program by `host_suffix`. If none matches, it falls back to
-/// the first usable catch-all network. This preserves backward compatibility
-/// with the single-network model while enabling per-merchant decoration.
+/// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
 #[derive(Clone)]
 struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
-    programs: Vec<AffiliateNetwork>,
-    network_meta: Vec<AffiliateNetworkMeta>,
 }
 
 /// Host labels that are IANA-reserved and can never be a real merchant:
@@ -5239,32 +5105,21 @@ fn is_reserved_placeholder_url(url: &str) -> bool {
 }
 
 impl AffiliateCtx {
-    /// Load networks from the data files. An empty/missing file is NOT fatal: the
+    /// Load networks from the data file. An empty/missing file is NOT fatal: the
     /// engine simply has no networks and every result degrades to `affiliate:
     /// null`. This is intentional — affiliate decoration is best-effort and must
     /// never break search.
-    ///
-    /// Loads three data files:
-    ///   1. `affiliate.json`         — legacy catch-all networks (backward compat)
-    ///   2. `affiliate_programs.json` — per-merchant programs with host_suffix matching
-    ///   3. `networks.json`          — network metadata (disclosure labels, subid policy)
     fn load() -> Self {
         let mut networks: Vec<AffiliateNetwork> = Vec::new();
-        let mut programs: Vec<AffiliateNetwork> = Vec::new();
-        let mut network_meta: Vec<AffiliateNetworkMeta> = Vec::new();
-
         // Resolve the data path relative to the process cwd (container WORKDIR is
         // /app, app binary at /app/gateway; data baked at /app/data/commerce).
         let candidates = [
-            "data/commerce",
-            "/app/data/commerce",
-            "./data/commerce",
+            "data/commerce/affiliate.json",
+            "/app/data/commerce/affiliate.json",
+            "./data/commerce/affiliate.json",
         ];
-
-        // ── 1. Legacy catch-all networks (affiliate.json) ──
-        for base in &candidates {
-            let path = format!("{}/affiliate.json", base);
-            if let Ok(text) = std::fs::read_to_string(&path) {
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
                         for n in arr {
@@ -5293,78 +5148,9 @@ impl AffiliateCtx {
                 }
             }
         }
-
-        // ── 2. Per-merchant programs (affiliate_programs.json) ──
-        for base in &candidates {
-            let path = format!("{}/affiliate_programs.json", base);
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(arr) = v.get("programs").and_then(|n| n.as_array()) {
-                        for n in arr {
-                            if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
-                                // Same fallback sanitization as legacy networks.
-                                if let Some(fbu) = net.fallback_url.clone() {
-                                    if is_reserved_placeholder_url(&fbu) {
-                                        tracing::warn!(
-                                            program = %net.id,
-                                            "affiliate: ignoring reserved placeholder fallback_url (RFC 2606/6761 documentation domain)"
-                                        );
-                                        net.fallback_url = None;
-                                    }
-                                }
-                                programs.push(net);
-                            }
-                        }
-                    }
-                }
-                if !programs.is_empty() {
-                    break;
-                }
-            }
-        }
-
-        // ── 3. Network metadata (networks.json) ──
-        for base in &candidates {
-            let path = format!("{}/networks.json", base);
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
-                        for n in arr {
-                            if let Ok(meta) = serde_json::from_value::<AffiliateNetworkMeta>(n.clone()) {
-                                network_meta.push(meta);
-                            }
-                        }
-                    }
-                }
-                if !network_meta.is_empty() {
-                    break;
-                }
-            }
-        }
-
         networks.sort_by(|a, b| b.priority.cmp(&a.priority));
-        programs.sort_by(|a, b| b.priority.cmp(&a.priority));
-        tracing::info!(
-            "affiliate: loaded {} network(s), {} program(s), {} network meta(s) from data files",
-            networks.len(),
-            programs.len(),
-            network_meta.len()
-        );
-        Self { networks, programs, network_meta }
-    }
-
-    /// Look up network metadata by network id. Returns `None` when no
-    /// metadata entry matches — callers fall back to the program/network's
-    /// own fields.
-    fn meta_for(&self, id: &str) -> Option<&AffiliateNetworkMeta> {
-        self.network_meta.iter().find(|m| m.id == id)
-    }
-
-    /// Construct an AffiliateCtx with only legacy catch-all networks (no
-    /// per-merchant programs, no network metadata). Used by tests that build
-    /// synthetic contexts.
-    fn from_networks(networks: Vec<AffiliateNetwork>) -> Self {
-        Self { networks, programs: vec![], network_meta: vec![] }
+        tracing::info!("affiliate: loaded {} network(s) from data file", networks.len());
+        Self { networks }
     }
 
     /// The first enabled network that has its required key present in the env.
@@ -5377,56 +5163,6 @@ impl AffiliateCtx {
                     .map(|k| std::env::var(k).is_ok())
                     .unwrap_or(false)
         })
-    }
-
-    /// Find the first enabled per-merchant program whose `host_suffix` matches
-    /// the given URL's host AND whose key is present in the env.
-    ///
-    /// `host_suffix` matching is label-boundary, case-insensitive: the result
-    /// URL's host must equal the suffix or end with `"." + suffix` (e.g.
-    /// suffix `"amazon."` matches `amazon.com`, `amazon.co.uk`, etc.).
-    ///
-    /// Returns None when no per-merchant program matches (caller should fall
-    /// back to `first_usable()` for the legacy catch-all path).
-    fn match_program(&self, url: &str) -> Option<&AffiliateNetwork> {
-        let host = url_host(url);
-        if host.is_empty() {
-            return None;
-        }
-        // Collect all matching programs, then pick the highest priority.
-        // This ensures deterministic behavior regardless of vector order.
-        let mut best: Option<&AffiliateNetwork> = None;
-        for p in &self.programs {
-            if !p.enabled {
-                continue;
-            }
-            let has_key = p.key_env.as_ref().map(|k| std::env::var(k).is_ok()).unwrap_or(false);
-            if !has_key {
-                continue;
-            }
-            let matches = match &p.host_suffix {
-                None => false,
-                Some(suffix) => {
-                    let suffix = suffix.trim_end_matches('.').to_lowercase();
-                    if suffix.is_empty() {
-                        false
-                    } else if host == suffix {
-                        true
-                    } else {
-                        host.split('.').any(|label| label == suffix)
-                    }
-                }
-            };
-            if !matches {
-                continue;
-            }
-            best = match best {
-                None => Some(p),
-                Some(current) if p.priority > current.priority => Some(p),
-                _ => best,
-            };
-        }
-        best
     }
 }
 
@@ -5547,15 +5283,11 @@ fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> 
 /// that already carries an `affiliate` block is left untouched (idempotent).
 /// When no usable network key is present, results keep `affiliate: null` and are
 /// still returned. This function NEVER reorders or re-scores.
-///
-/// Per-merchant matching: for each result, the engine first tries to find a
-/// per-merchant program (from `affiliate_programs.json`) whose `host_suffix`
-/// matches the result URL's host. If found, that program's template/params are
-/// used. If no per-merchant program matches, the engine falls back to the
-/// first usable catch-all network (from `affiliate.json`) — preserving the
-/// original single-network behaviour. This two-tier lookup is fully data-driven:
-/// adding a new merchant requires only editing `affiliate_programs.json`.
 fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
+    let net = match ctx.first_usable() {
+        Some(n) => n,
+        None => return, // graceful: no key => leave affiliate un-set
+    };
     for r in results.iter_mut() {
         if !r.is_object() {
             continue;
@@ -5567,58 +5299,12 @@ fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
             Some(u) if !u.is_empty() => u.to_string(),
             _ => continue,
         };
-
-        // Two-tier lookup: per-merchant program first, then catch-all fallback.
-        let net = ctx.match_program(&url).or_else(|| ctx.first_usable());
-        let net = match net {
-            Some(n) => n,
-            None => continue, // graceful: no key => leave affiliate un-set
-        };
-
-        // Look up the network's metadata (from networks.json) to determine
-        // the subid policy and disclosure label. This is DATA-DRIVEN — the
-        // policy comes from the runtime-loaded data file, never from code.
-        let meta = ctx.meta_for(&net.id);
-
-        // Determine the subid value based on the network's `subid_policy`:
-        //   "merchant_host" → the destination merchant host (coarse, non-identifying)
-        //   "none"           → no subid at all (empty string)
-        //   "category"       → a coarse product category (falls back to merchant_host
-        //                      until a category signal is available — never user-identifying)
-        // PRIVACY: never add user id, session id, IP, or query text to subid.
-        let merchant_host = reqwest::Url::parse(&url)
+        // Coarse, non-identifying subid: the destination merchant host only.
+        let subid = reqwest::Url::parse(&url)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_string()))
             .unwrap_or_default();
-        let subid_policy = meta.map(|m| m.subid_policy.as_str()).unwrap_or("merchant_host");
-        let subid = match subid_policy {
-            "none" => String::new(),
-            "category" => {
-                // Category policy: we don't have a category extraction signal yet.
-                // Fall back to merchant_host (coarse, non-identifying) rather than
-                // fabricating a category. This is documented in networks.json.
-                merchant_host.clone()
-            }
-            _ => merchant_host.clone(),
-        };
-
         let aff_url = render_affiliate_url(net, &url, &subid);
-
-        // Disclosure label: prefer the program/network's own `network` field
-        // (from affiliate_programs.json / affiliate.json), falling back to the
-        // metadata's `disclosure_label` (from networks.json). This is DATA-DRIVEN
-        // — the label comes from the runtime-loaded data files, never from code.
-        // The program's own `network` field is now the primary source (all
-        // entries in affiliate_programs.json carry it), with networks.json as
-        // a fallback for legacy catch-all networks that lack the field.
-        let disclosure_label = if !net.network.is_empty() {
-            net.network.as_str()
-        } else {
-            meta.map(|m| m.disclosure_label.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(&net.network)
-        };
-
         // Reporting fields (ROADMAP item 6): surface the configured bid floor /
         // fallback so operators can report on monetization. These are DATA-driven
         // (from the network config) and are NEVER used for ranking. `disclosed`
@@ -5626,7 +5312,7 @@ fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
         let mut block = serde_json::Map::new();
         block.insert(
             "network".to_string(),
-            serde_json::Value::String(disclosure_label.to_string()),
+            serde_json::Value::String(net.network.clone()),
         );
         block.insert("url".to_string(), serde_json::Value::String(aff_url));
         block.insert("disclosed".to_string(), serde_json::Value::Bool(true));
@@ -5652,11 +5338,7 @@ fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
 /// Patterns (case-insensitive, currency-agnostic — no merchant/region hardcoding):
 ///   A) "<upper-marker> <number> [currency]"  e.g. "under 150 dollars", "below 1000 rs"
 ///   B) "<currency-symbol><number> <upper-marker>" e.g. "₹20000 or less", "$600 max"
-///   C) "<number> <currency> <upper-marker>"  e.g. "1000 rupees max"
-///
-/// Indian number units (lakh, crore) are converted to their numeric equivalents:
-///   1 lakh = 100,000; 1 crore = 10,000,000. Without this, "under 30 lakh" was
-///   parsed as price:<30 instead of price:<3000000.
+///   C) "<number> <currency> <upper-marker>" e.g. "1000 rupees max"
 fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     let lower = q.to_lowercase();
     let upper_markers = [
@@ -5665,12 +5347,6 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     let lower_markers = ["over", "more than", "above", "minimum", "at least", "from"];
     let amount_pat = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
     let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.", "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw"];
-    // Indian number units: "30 lakh" = 3,000,000; "5 crore" = 50,000,000.
-    // The multiplier is applied to the parsed number before returning.
-    let indian_units: &[(&str, f32)] = &[
-        ("lakh", 100_000.0), ("lakhs", 100_000.0),
-        ("crore", 10_000_000.0), ("crores", 10_000_000.0),
-    ];
     // Distance units: a number followed by one of these is a RANGE/DISTANCE
     // bound (e.g. "within 300 kilometers", "up to 50 miles"), NOT a price.
     // Without this guard, "within 300 kilometers" was mis-read as price:<300
@@ -5691,16 +5367,6 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
         let next_token_lower = next_token.to_lowercase();
         distance_units.iter().any(|u| next_token_lower == *u)
     };
-    /// Check if the token immediately after the number is an Indian unit
-    /// (lakh/lakhs/crore/crores). Returns the multiplier if found.
-    let get_indian_multiplier = |rest_after_num: &str| -> Option<f32> {
-        let next_token = rest_after_num.trim_start()
-            .split(|c: char| !c.is_alphanumeric())
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
-        indian_units.iter().find(|(u, _)| next_token == *u).map(|(_, m)| *m)
-    };
 
     // Pattern A: upper-marker then number (+ optional currency word)
     for marker in upper_markers {
@@ -5710,18 +5376,12 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
-                        // Indian unit conversion: "30 lakh" → 3,000,000
-                        let after_num = &rest[m.end()..];
                         // Distance-bound guard: "within 300 kilometers" is a
                         // range, not a price — skip this marker (let a later
-                        // price marker, if any, match instead).
-                        // NOTE: check the text AFTER the number, not `rest`
-                        // (which still contains the number itself).
-                        if is_distance_bound(after_num) {
+                        // price marker, if any) match instead).
+                        if is_distance_bound(rest) {
                             continue;
                         }
-                        let multiplier = get_indian_multiplier(after_num).unwrap_or(1.0);
-                        let v = v * multiplier;
                         // Currency-proximity guard: Pattern A is "<marker> <number>",
                         // but a discourse marker like "about" can be followed by an
                         // unrelated number that is NOT a price (e.g. "gpt 5",
@@ -5730,6 +5390,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         // not anywhere in the rest of the query. Without a nearby
                         // currency word, this is not a price bound — skip and try
                         // the next marker. General guard; no per-query literals.
+                        let after_num = &rest[m.end()..];
                         let near_currency = currency_words.iter().any(|c| {
                             after_num.len() >= c.len() && after_num[..c.len()].starts_with(c)
                                 || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
@@ -5799,13 +5460,6 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
 fn should_filter_by_constraints(
     title: &str, content: &str, url: &str, published_date: Option<&str>, constraints: &Constraints,
 ) -> bool {
-    // Positive constraints are SOFT preferences (boost), not hard requirements (filter).
-    // A result that doesn't contain every positive term is still relevant — it just
-    // ranks lower. Hard-dropping on positive constraints causes result-count collapse
-    // for long conversational queries where the intent engine extracts generic words
-    // (e.g. "background" from "i have no programming background") as positive constraints.
-    // Only negative constraints, file_types, sites, date bounds, and phrases are hard filters.
-
     // 1. Hard filter on file_types
     if !constraints.file_types.is_empty() {
         if let Ok(parsed_url) = reqwest::Url::parse(url) {
@@ -7341,28 +6995,7 @@ fn has_local_intent(query: &str) -> bool {
         // LOCATION_GAZETTEER, the query has explicit local intent. General guard —
         // no per-query literals, reuses the same gazetteer reference data as geo
         // detection (line 1542) so the policy is consistent and future-proof.
-        //
-        // SHORT-QUERY GUARD: a local intent query is typically short ("restaurants
-        // in bangalore", "hotels in paris"). A long conversational query (e.g. a
-        // career/advice question like "i have been working as a network
-        // administrator for five years ... job market in india") uses " in
-        // <country>" as CONTEXT, not as a local intent marker. Without this,
-        // career/advice queries get misclassified as "local" and return
-        // irrelevant results. General: query length threshold, no per-query
-        // literals. A 10-word threshold cleanly separates short local queries
-        // from long conversational ones.
-        //
-        // AREA-MODIFIER FIX: "south mumbai", "north delhi", "east bangalore" —
-        // the gazetteer check must match the city name ANYWHERE in the after-in
-        // segment, not just at the start. "best restaurants in south mumbai" has
-        // after_in = "south mumbai open late..." which does NOT start with
-        // "mumbai" but CONTAINS it. Without this, area-modified city queries
-        // lose local intent. General: whole-word containment, no per-query literals.
         || {
-            let word_count = lower.split_whitespace().count();
-            if word_count > 10 {
-                return false;
-            }
             let parts: Vec<&str> = lower.split(" in ").collect();
             if let Some(after_in) = parts.last() {
                 let after_in = *after_in;  // deref &&str -> &str
@@ -7374,27 +7007,6 @@ fn has_local_intent(query: &str) -> bool {
             } else {
                 false
             }
-        }
-        // "best X in <area>" / "X near <area>" — a local business/service query
-        // that names a locality or area (not necessarily a gazetteer city). The
-        // query pattern "best <service> in <area>" or "<service> near <area>" is
-        // a strong local intent signal even when <area> is a neighbourhood, not
-        // a city. General: pattern-based, no per-query literals.
-        || {
-            let word_count = lower.split_whitespace().count();
-            if word_count > 15 {
-                return false;
-            }
-            // "best <service> in <area>" or "<service> near <area>"
-            // Require at least one word between "best" and "in" to avoid
-            // matching non-local phrases like "best in class" where "in"
-            // immediately follows "best" with no service word between them.
-            let has_local_service_pattern = (lower.starts_with("best ")
-                && lower[5..].contains(" in "))
-                || lower.contains(" near ")
-                || lower.contains(" nearby ")
-                || lower.contains(" local ");
-            has_local_service_pattern && word_count <= 15
         }
 }
 
@@ -9102,10 +8714,10 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                // Preserved domain word: keep it in the result, but do NOT end
-                // the negation scope. Subsequent non-preserved words are still
-                // negated (e.g. "recipes without linux spicy" → "recipes linux",
-                // excluded: ["spicy"]). The scope only ends at a clause boundary.
+                // A preserved domain word inside a negation scope is still a
+                // positive term (e.g. "recipes without linux spicy" → "linux"
+                // stays positive). Do NOT end the negation scope — subsequent
+                // non-domain words (e.g. "spicy") must still be excluded.
                 result.push(w);
             } else {
                 // Non-domain content word after a negation trigger: treat as an
@@ -9745,13 +9357,15 @@ fn is_weak_anchor_word(w: &str) -> bool {
         // message queue" surfaced Weblio entries for "choose". Same class as the
         // other weak anchors above. General question-framing vocabulary; no
         // query- or domain-specific entries.
-        "difference", "differences", "compare", "compares", "compared",
+        "difference", "differences", "differ", "differs", "differed",
+        "compare", "compares", "compared",
         "comparison", "comparisons", "versus", "vs", "distinction",
         "distinctions", "choose", "choosing", "chosen", "choice", "choices",
         "select", "selecting", "selected", "selection", "pick", "picking",
         "meaning", "meanings", "definition", "definitions", "define",
         "defined", "explained", "explain", "explains", "alternative",
         "alternatives", "overview", "introduction", "summary", "summaries",
+        "cause", "causes", "caused", "causing",
     ];
     WEAK.contains(&w)
 }
@@ -11652,13 +11266,8 @@ fn merge_local_and_web(
                 (tchars.len() - non) as f32 / tchars.len() as f32
             };
             // Query is Latin-script dominant AND result is non-Latin-script dominant.
-            // 0.05 (not 0.25): when ALL results are non-Latin (e.g. Bing returning
-            // Japanese dictionary pages for an English query), a 0.25 multiplier
-            // is defeated by calibrate_scores' max-rescale — the Japanese results
-            // still float to 1.0. 0.05 matches the video/audio cap floor so
-            // cross-lingual junk stays below genuine on-topic results.
             if q_ascii_ratio >= 0.85 && res_ascii_ratio < 0.50 {
-                0.05
+                0.25 // dampen hard but keep present (fail-soft, not a hard drop)
             } else {
                 1.0
             }
@@ -11799,71 +11408,6 @@ fn merge_local_and_web(
                 restored.len()
             );
             merged = restored;
-        }
-    }
-
-    // ── Cross-lingual hard drop (D2 extension) ──
-    // The in-loop cross-lingual guard (0.05 multiplier) is defeated by
-    // calibrate_scores when ALL results are non-Latin (e.g. Bing returning
-    // Japanese dictionary pages for an English query). A multiplier alone
-    // cannot fix this — the max-rescale stretches the dampened results back
-    // to 1.0. A hard drop removes them outright. General: keyed on script
-    // ratio, no language tables, no per-domain lists.
-    {
-        let q_chars: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
-        let q_ascii_ratio = if q_chars.is_empty() {
-            1.0
-        } else {
-            let non = q_chars.iter().filter(|c| !c.is_ascii()).count();
-            (q_chars.len() - non) as f32 / q_chars.len() as f32
-        };
-        if q_ascii_ratio >= 0.85 {
-            let before = merged.len();
-            let retained_pre_xlingual: Vec<MergedResult> = merged.iter().cloned().collect();
-            merged.retain(|r| {
-                let res_text = format!("{} {}", r.title, r.content);
-                let r_chars: Vec<char> = res_text.chars().filter(|c| !c.is_whitespace()).collect();
-                let r_ascii_ratio = if r_chars.is_empty() {
-                    1.0
-                } else {
-                    let non = r_chars.iter().filter(|c| !c.is_ascii()).count();
-                    (r_chars.len() - non) as f32 / r_chars.len() as f32
-                };
-                r_ascii_ratio >= 0.50
-            });
-            let removed = before - merged.len();
-            if removed > 0 {
-                tracing::info!(
-                    "CROSS_LINGUAL_DROP: removed {}/{} result(s) for Latin-script query (res_ascii_ratio < 0.50)",
-                    removed, before
-                );
-            }
-            // Fail-open: if dropping would empty the set, restore non-adult results
-            if merged.is_empty() && before > 0 {
-                tracing::warn!(
-                    "CROSS_LINGUAL_DROP FAIL-OPEN: all {} results were non-Latin — keeping set (sparse upstream draw)",
-                    before
-                );
-                merged = retained_pre_xlingual
-                    .into_iter()
-                    .filter(|r| {
-                        let ul = r.url.to_lowercase();
-                        let tl = r.title.to_lowercase();
-                        let host = reqwest::Url::parse(&r.url)
-                            .ok()
-                            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
-                            .unwrap_or_default();
-                        let tld_adult = host.ends_with(".xxx");
-                        let host_adult = adult_hosts.iter().any(|h| host.contains(h));
-                        let path_adult = adult_paths.iter().any(|p| ul.contains(p));
-                        let title_adult = tl.contains("porn") || tl.contains("xxx ")
-                            || tl.contains("nude") || tl.contains("naked")
-                            || tl.contains("sex video") || tl.contains("adult film");
-                        let is_adult = tld_adult || host_adult || path_adult || title_adult;
-                        !is_adult
-                    })
-                    .collect();
-            }
         }
     }
 
@@ -12275,10 +11819,6 @@ fn merge_local_and_web(
         let dict_cap = 0.03f32;   // dictionary sites may appear but never rank top
         let weak_cap = 0.04f32;   // single-polysemous-token matches capped low
 
-        // Max pre-cap score for graded weak-match cap: preserves relative ordering
-        // among off-topic results instead of flattening them all to the same value.
-        let max_pre_cap_score = merged.iter().map(|r| r.score).fold(0.0f32, f32::max);
-
         // Best non-video score AFTER calibration but BEFORE this pass caps any video.
         // Used by the P8 video cap (b0): a video must never outrank the best genuine
         // text result for a non-video query, in any calibration regime (see comment
@@ -12382,20 +11922,12 @@ fn merge_local_and_web(
                 // contain at least 2 of the query's real topic terms to be on-topic.
                 if matched_strong < 2 {
                     if r.score > weak_cap {
-                        // GRADED WEAK-MATCH CAP: instead of a flat cap that makes all
-                        // off-topic results tie at the same score (causing insertion-order
-                        // ranking among junk), preserve relative ordering by scaling
-                        // proportionally to the pre-cap score. This keeps off-topic
-                        // results below the on-topic floor while still differentiating
-                        // among them — the "least irrelevant" junk ranks above the
-                        // "most irrelevant" junk rather than relying on stable-sort order.
-                        let graded_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
                         tracing::info!(
-                            "POST-CAL WEAK-MATCH CAP -> {:.4}: '{}' (matched {} of {} topics, pre_cap={:.4})",
-                            graded_cap, r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len(), r.score
+                            "POST-CAL WEAK-MATCH CAP -> {:.2}: '{}' (matched {} of {} topics)",
+                            weak_cap, r.url.chars().take(60).collect::<String>(), matched_strong, strong_topics.len()
                         );
-                        r.post_cal_cap = Some(graded_cap);
-                        r.score = graded_cap;
+                        r.post_cal_cap = Some(weak_cap);
+                        r.score = weak_cap;
                     }
                 }
             }
@@ -12428,14 +11960,13 @@ fn merge_local_and_web(
                     1
                 };
                 if matched_anchors < required_anchors && r.score > weak_cap {
-                    let graded_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
                     tracing::info!(
-                        "POST-CAL RARE-ANCHOR CAP -> {:.4}: '{}' (matched {} of {} rare anchors {:?}, need {}, pre_cap={:.4})",
-                        graded_cap, r.url.chars().take(60).collect::<String>(),
-                        matched_anchors, rare_anchor_terms.len(), rare_anchor_terms, required_anchors, r.score
+                        "POST-CAL RARE-ANCHOR CAP -> {:.2}: '{}' (matched {} of {} rare anchors {:?}, need {})",
+                        weak_cap, r.url.chars().take(60).collect::<String>(),
+                        matched_anchors, rare_anchor_terms.len(), rare_anchor_terms, required_anchors
                     );
-                    r.post_cal_cap = Some(graded_cap);
-                    r.score = graded_cap;
+                    r.post_cal_cap = Some(weak_cap);
+                    r.score = weak_cap;
                 }
             }
 
@@ -12464,13 +11995,18 @@ fn merge_local_and_web(
                     rl.contains(e.as_str()) || cl.contains(e.as_str()) || ul.contains(e.as_str())
                 });
                 if !names_entity {
-                    // Graded cap (same as weak-match/rare-anchor): preserves relative
-                    // ordering among off-topic comparison results instead of flattening.
-                    let d3_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
+                    // Absolute weak_cap (0.04, UNDER the calibrated article floor of
+                    // 0.05) — same convention as the video/weak-match caps. The old
+                    // relative best_non_video*0.6 cap FAILED when the whole result set
+                    // was weak (Planoly at 0.072 vs genuine comparison articles at
+                    // 0.051: the relative cap stayed ABOVE the genuine floor because
+                    // the best text result itself was weak). An absolute sub-floor
+                    // cap guarantees a principal-naming article always outranks junk.
+                    let d3_cap = weak_cap;
                     if r.score > d3_cap {
                         tracing::info!(
-                            "POST-CAL D3 COMP-CAP -> {:.4}: '{}' names none of compared entities {:?} (best_text={:.2}, pre_cap={:.4})",
-                            d3_cap, r.url.chars().take(60).collect::<String>(), comparison_anchor_terms, best_non_video, r.score
+                            "POST-CAL D3 COMP-CAP -> {:.2}: '{}' names none of compared entities {:?} (best_text={:.2})",
+                            d3_cap, r.url.chars().take(60).collect::<String>(), comparison_anchor_terms, best_non_video
                         );
                         r.post_cal_cap = Some(d3_cap);
                         r.score = d3_cap;
@@ -12605,220 +12141,6 @@ impl ResultVolumeTracker {
 
 }
 
-/// Runtime-loaded commerce config from `data/commerce/config.json`.
-/// All values can be changed WITHOUT recompile — edit the file and restart.
-/// Missing file or fields fall back to sensible defaults.
-#[derive(Clone, Debug)]
-struct CommerceConfig {
-    /// How many top-ranked results to display in the main-path shopping strip.
-    /// Replaces the former hardcoded `COMMERCE_MAINPATH_TOP_N` constant.
-    mainpath_top_n: usize,
-    /// How many already-ranked results are ENRICHED on the main `/search` path
-    /// before the display cap (`mainpath_top_n`) is applied. A wider window
-    /// lets enrichment reach past bot-checked merchant pages that lack structured
-    /// markup. Replaces the former hardcoded `COMMERCE_ENRICH_WINDOW` constant.
-    enrich_window: usize,
-}
-
-impl Default for CommerceConfig {
-    fn default() -> Self {
-        Self { mainpath_top_n: 8, enrich_window: 24 }
-    }
-}
-
-impl CommerceConfig {
-    /// Load from `data/commerce/config.json`. Missing file or fields → defaults.
-    fn load() -> Self {
-        let mut cfg = Self::default();
-        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
-            let path = std::path::Path::new(dir).join("config.json");
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    if let Some(n) = v.get("mainpath_top_n").and_then(|x| x.as_u64()) {
-                        if n > 0 && n <= 100 {
-                            cfg.mainpath_top_n = n as usize;
-                        }
-                    }
-                    if let Some(n) = v.get("enrich_window").and_then(|x| x.as_u64()) {
-                        if n > 0 && n <= 100 {
-                            cfg.enrich_window = n as usize;
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        cfg
-    }
-}
-
-/// Runtime-loaded commerce intent signals from `data/commerce/signals.json`.
-/// The `transactional_keywords` list is a WEAK signal boost to the existing
-/// intent classifier — it never replaces the label/distribution check, it only
-/// adds recall when the intent engine is borderline. All values can be changed
-/// WITHOUT recompile.
-#[derive(Clone, Debug)]
-struct CommerceSignals {
-    /// Keywords that weakly indicate transactional intent. Checked as whole-word
-    /// matches against the query. This is a SUPPLEMENT to the intent engine's
-    /// label/distribution — never a standalone classifier.
-    transactional_keywords: Vec<String>,
-}
-
-impl Default for CommerceSignals {
-    fn default() -> Self {
-        Self {
-            transactional_keywords: vec![
-                "buy", "price", "pricing", "cheap", "cheapest", "purchase",
-                "shop", "discount", "coupon", "deal", "deals", "offer",
-                "sale", "order", "pay", "budget", "cost", "worth", "value",
-                "refurbished", "under", "store",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-        }
-    }
-}
-
-impl CommerceSignals {
-    /// Load from `data/commerce/signals.json`. Missing file or fields → defaults.
-    fn load() -> Self {
-        let mut sig = Self::default();
-        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
-            let path = std::path::Path::new(dir).join("signals.json");
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    if let Some(kw) = v.get("transactional_keywords").and_then(|x| x.as_array()) {
-                        let loaded: Vec<String> = kw
-                            .iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_lowercase()))
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        if !loaded.is_empty() {
-                            sig.transactional_keywords = loaded;
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        sig
-    }
-
-    /// True when the query contains any transactional keyword as a WHOLE WORD.
-    /// This is a weak signal — it supplements the intent engine's label /
-    /// distribution, never replaces it. Returns false for empty queries.
-    fn has_transactional_keyword(&self, query: &str) -> bool {
-        if self.transactional_keywords.is_empty() || query.is_empty() {
-            return false;
-        }
-        let q_lower = query.to_lowercase();
-        self.transactional_keywords.iter().any(|kw| {
-            // Whole-word match: the keyword must be bounded by non-alphanumeric
-            // characters (or string start/end) on both sides.
-            let mut start = 0;
-            while let Some(pos) = q_lower[start..].find(kw) {
-                let abs_pos = start + pos;
-                let before_ok = abs_pos == 0
-                    || !q_lower.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
-                let after_pos = abs_pos + kw.len();
-                let after_ok = after_pos >= q_lower.len()
-                    || !q_lower.as_bytes()[after_pos].is_ascii_alphanumeric();
-                if before_ok && after_ok {
-                    return true;
-                }
-                start = abs_pos + 1;
-            }
-            false
-        })
-    }
-}
-
-/// Runtime-loaded exact-model brand patterns from
-/// `data/commerce/exact_model_brands.json`. The brand list is the data
-/// source for the affiliate eligibility gate (`is_exact_model_query`) and
-/// the transactional intent override (`is_model_number_price_query`).
-/// Previously these used hardcoded regexes with compiled-in brand lists —
-/// a HARD RULES violation. Now the brand list is runtime data.
-#[derive(Clone, Debug)]
-struct ExactModelConfig {
-    /// Brand names that signal an exact-product query when followed by a
-    /// model number (e.g. "iphone 16", "galaxy s24"). Loaded from
-    /// `exact_model_brands.json`. Changing this list requires NO recompile.
-    brands: Vec<String>,
-}
-
-impl Default for ExactModelConfig {
-    fn default() -> Self {
-        Self {
-            brands: vec![
-                "iphone", "ipad", "galaxy", "oneplus", "pixel", "redmi",
-                "nothing", "xiaomi", "poco", "realme", "rog", "zenfone",
-                "nokia", "moto", "motorola", "surface", "macbook", "imac", "watch",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-        }
-    }
-}
-
-impl ExactModelConfig {
-    /// Load from `data/commerce/exact_model_brands.json`. Missing file or
-    /// fields → defaults. The brand list is data, never code.
-    fn load() -> Self {
-        let mut cfg = Self::default();
-        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
-            let path = std::path::Path::new(dir).join("exact_model_brands.json");
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    if let Some(arr) = v.get("brands").and_then(|x| x.as_array()) {
-                        let loaded: Vec<String> = arr
-                            .iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_lowercase()))
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        if !loaded.is_empty() {
-                            cfg.brands = loaded;
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        cfg
-    }
-
-    /// True when the query contains a known brand name followed by a model
-    /// number (e.g. "iphone 16", "galaxy s24 ultra", "pixel 9 pro").
-    /// This replaces the former hardcoded regex with a runtime-loaded
-    /// brand list. The matching logic is: find a brand word, then check
-    /// if a digit appears within the next few tokens.
-    fn has_exact_model(&self, q_lower: &str) -> bool {
-        if self.brands.is_empty() || q_lower.is_empty() {
-            return false;
-        }
-        let q = q_lower.to_lowercase();
-        let tokens: Vec<&str> = q.split_whitespace().collect();
-        for (i, token) in tokens.iter().enumerate() {
-            let token_clean = token.trim_matches(|c: char| !c.is_alphanumeric());
-            if !self.brands.iter().any(|b| b == token_clean) {
-                continue;
-            }
-            // Brand found — check if a digit appears in the next 4 tokens
-            // (covers "iphone 16", "galaxy s24 ultra", "pixel 9 pro")
-            let window_end = (i + 5).min(tokens.len());
-            for t in &tokens[i + 1..window_end] {
-                if t.chars().any(|c| c.is_ascii_digit()) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-}
-
 struct AppState {
     circuit: CircuitBreaker,
     cache: SearchCache,
@@ -12852,21 +12174,6 @@ struct AppState {
     /// knowledge is data, never code. Used only as a strict post-rank decoration
     /// pass — never affects ranking/order.
     affiliate_ctx: AffiliateCtx,
-    /// Runtime-loaded commerce config (mainpath_top_n etc). Loaded once at
-    /// startup from `data/commerce/config.json`. Changing it requires NO
-    /// recompile — edit the file and restart.
-    commerce_config: CommerceConfig,
-    /// Runtime-loaded commerce intent signals (transactional_keywords etc).
-    /// Loaded once at startup from `data/commerce/signals.json`. Used as a
-    /// WEAK signal boost to the existing intent classifier — never a
-    /// standalone replacement.
-    commerce_signals: CommerceSignals,
-    /// Runtime-loaded exact-model brand patterns. Loaded once at startup from
-    /// `data/commerce/exact_model_brands.json`. Used by the affiliate
-    /// eligibility gate (`is_exact_model_query`) and the transactional intent
-    /// override (`is_model_number_price_query`). Changing the brand list
-    /// requires NO recompile — edit the file and restart.
-    exact_model_config: ExactModelConfig,
 }
 
 async fn handle_images(
@@ -13369,6 +12676,11 @@ fn recall_gap_stopwords() -> std::collections::HashSet<&'static str> {
         "simple", "quick", "fast", "new", "recent", "latest", "safe", "natural",
         "home", "house", "make", "making", "get", "getting", "use", "using",
         "find", "finding", "help", "need", "want", "like", "near", "nearby",
+        // auxiliary verbs (do/does/did) — not content-bearing
+        "does", "do", "did",
+        // common adjectives that carry no topical signal
+        "main", "proper", "major", "key", "important", "basic", "general",
+        "specific", "certain", "particular", "various", "several", "many",
         // negations (handled as constraints, not recall gaps)
         "not", "no", "without", "except", "besides", "minus", "other", "than",
         "nor",
@@ -13441,9 +12753,18 @@ fn compute_recall_gap_terms(
         })
         .collect::<std::collections::HashSet<String>>();
 
+    // A term is "covered" if it appears as a substring in any haystack,
+    // OR if a morphological variant (word starting with the term's first
+    // 4 chars) appears — handles differs/differ/difference, causes/cause/caused.
     let missing: Vec<String> = topics
         .into_iter()
-        .filter(|t| !covered.iter().any(|hay| hay.contains(t.as_str())))
+        .filter(|t| {
+            let prefix: String = t.chars().take(4).collect();
+            !covered.iter().any(|hay| {
+                hay.contains(t.as_str())
+                    || hay.split_whitespace().any(|w| w.starts_with(&prefix))
+            })
+        })
         .collect();
 
     if missing.is_empty() {
@@ -13500,10 +12821,6 @@ async fn main() {
         search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         // Affiliate template engine config (ROADMAP item 3) — loaded from data.
         affiliate_ctx: AffiliateCtx::load(),
-        // Commerce config + signals — loaded from data, no recompile needed.
-        commerce_config: CommerceConfig::load(),
-        commerce_signals: CommerceSignals::load(),
-        exact_model_config: ExactModelConfig::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -13602,7 +12919,6 @@ async fn main() {
         // ranking, no monetization, no user-tracking surface. The /shopping
         // endpoint and affiliate decoration land in later increments.
         .route("/commerce/extract", post(handle_commerce_extract))
-        .route("/commerce/status", get(handle_commerce_status))
         .route("/shopping", get(handle_shopping))
         // Goal Feature endpoints
         .route("/goals", post(goals::handle_create_goal))
@@ -14255,119 +13571,6 @@ async fn handle_video(
         );
     }
     let result = build_video_inspect(&q);
-    (axum::http::StatusCode::OK, Json(result))
-}
-
-/// Pure builder for `/commerce/status`. Reports the current commerce/affiliate
-/// configuration state without exposing secrets. For each network/program, it
-/// reports whether the required env var is SET (boolean only — never the value).
-/// Also reports whether a given query would be detected as commercial intent.
-///
-/// This is a DIAGNOSTIC endpoint — it helps operators debug commerce issues
-/// without reading logs or inspecting data files manually. It is additive and
-/// zero-side-effect: it never touches ranking, never fetches pages, never
-/// decorates results.
-fn build_commerce_status(
-    ctx: &AffiliateCtx,
-    cfg: &CommerceConfig,
-    signals: &CommerceSignals,
-    query: &str,
-) -> serde_json::Value {
-    // Report each network/program with its key status (boolean only).
-    let mut networks_json = Vec::new();
-    for net in &ctx.networks {
-        let has_key = net
-            .key_env
-            .as_ref()
-            .map(|k| std::env::var(k).is_ok())
-            .unwrap_or(false);
-        networks_json.push(serde_json::json!({
-            "id": net.id,
-            "kind": net.kind,
-            "enabled": net.enabled,
-            "priority": net.priority,
-            "network": net.network,
-            "host_suffix": net.host_suffix,
-            "key_env": net.key_env,
-            "key_configured": has_key,
-        }));
-    }
-    let mut programs_json = Vec::new();
-    for prog in &ctx.programs {
-        let has_key = prog
-            .key_env
-            .as_ref()
-            .map(|k| std::env::var(k).is_ok())
-            .unwrap_or(false);
-        programs_json.push(serde_json::json!({
-            "id": prog.id,
-            "kind": prog.kind,
-            "enabled": prog.enabled,
-            "priority": prog.priority,
-            "network": prog.network,
-            "host_suffix": prog.host_suffix,
-            "key_env": prog.key_env,
-            "key_configured": has_key,
-        }));
-    }
-
-    // Report whether the query would be detected as commercial intent.
-    // Uses the SAME is_commercial_intent fn that /search uses.
-    let q_trimmed = query.trim();
-    let is_commercial = if q_trimmed.is_empty() {
-        false
-    } else {
-        // Use the fallback intent (no network call) for a deterministic check.
-        let intent_resp = fallback_intent(q_trimmed);
-        let sc = &intent_resp.structured_constraints;
-        let has_price_bound = sc.price_lt.is_some()
-            || sc.price_max.is_some()
-            || sc.price_min.is_some()
-            || sc.price_gt.is_some();
-        is_commercial_intent(
-            &intent_resp.intent,
-            &intent_resp.distribution,
-            has_price_bound,
-            signals,
-            q_trimmed,
-        )
-    };
-
-    serde_json::json!({
-        "config": {
-            "mainpath_top_n": cfg.mainpath_top_n,
-            "enrich_window": cfg.enrich_window,
-        },
-        "signals": {
-            "transactional_keywords_count": signals.transactional_keywords.len(),
-        },
-        "networks": networks_json,
-        "programs": programs_json,
-        "query": query,
-        "is_commercial_intent": is_commercial,
-    })
-}
-
-/// `GET /commerce/status?q=...` — commerce/affiliate diagnostic endpoint.
-///
-/// Reports the current commerce configuration state: which networks/programs
-/// are loaded, whether their required env vars are set, and whether a given
-/// query would be detected as commercial intent. This helps operators debug
-/// commerce issues without reading logs or inspecting data files manually.
-///
-/// ADDITIVE + ZERO-SIDE-EFFECT: never touches ranking, never fetches pages,
-/// never decorates results. Empty `q` returns the status with `is_commercial_intent: false`.
-async fn handle_commerce_status(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
-) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    let q = params.q.clone().unwrap_or_default();
-    let result = build_commerce_status(
-        &state.affiliate_ctx,
-        &state.commerce_config,
-        &state.commerce_signals,
-        &q,
-    );
     (axum::http::StatusCode::OK, Json(result))
 }
 
@@ -15789,19 +14992,17 @@ async fn handle_search(
         // budget and surfaces upstream_unavailable even though tor2 would
         // have answered once warm. We only wait when tor2 is actually in the
         // fan-out (it is, for every request) and it's currently marked cold.
-        // Cap at 6s (reduced from 12s) so a genuinely stuck tor2 can't hang the
-        // request. The 24s circuit-breaker timeout defect (round 2026-10-14)
-        // showed that 12s warm-up + 10s × 2 attempts exceeded the 30s budget.
+        // Cap at 12s so a genuinely stuck tor2 can't hang the request.
         if searx_urls.iter().any(|u| u.contains("tor2")) && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
             let mut waited = 0u64;
-            while waited < 6000 && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
+            while waited < 12000 && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 waited += 500;
             }
             if TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
                 tracing::debug!("tor2 warmed during pre-query wait ({}ms)", waited);
             } else {
-                tracing::warn!("tor2 still cold after 6s pre-query wait; querying anyway");
+                tracing::warn!("tor2 still cold after 12s pre-query wait; querying anyway");
             }
         }
 
@@ -15834,13 +15035,7 @@ async fn handle_search(
             } else {
                 // Non-site queries also fan out to tor2; allow its cold-circuit
                 // time so it can serve as a true redundant path.
-                // Reduced from 10s to 6s: the 24s circuit-breaker timeout defect
-                // (round 2026-10-14) showed that 10s × 2 attempts + tor2 warm-up
-                // wait exceeded the 30s REQUEST_TIMEOUT_SECS, causing 40% of queries
-                // to hit the circuit breaker. 6s per attempt gives a worst case of
-                // 6+6=12s + overhead, well under the 30s budget. The retry still
-                // recovers transient failures — it just doesn't wait as long.
-                6000
+                10000
             }
         };
         let min_early_return: usize = 15;
@@ -16048,7 +15243,7 @@ async fn handle_search(
         }
     };
 
-    intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+    intent.structured_constraints = sanitize_constraints_with_query(&intent.structured_constraints, Some(&q));
     // MERGE gateway-extracted constraints with engine constraints (gateway parser
     // may catch operators the engine missed).
 
@@ -16154,7 +15349,7 @@ async fn handle_search(
             );
         }
     }
-    intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+    intent.structured_constraints = sanitize_constraints_with_query(&intent.structured_constraints, Some(&q));
 
     // P3 fix: inject detected location as a Target entity so structured_constraints.entities
     // reflects the explicit user location intent. Must happen AFTER intent is defined.
@@ -16385,10 +15580,6 @@ async fn handle_search(
         // or "rate" but is NOT transactional. The keyword list is a weak signal; the
         // how-to/informational starter is a strong one. Only an explicit price bound
         // (parsed from NL) can override a how-to starter — that is a decisive signal.
-        //
-        // EXCEPTION: "how much does X cost" / "how many" queries are price questions,
-        // not informational. The word "cost" or a price/cost term in the query body
-        // is a decisive transactional signal even when the query starts with "how much".
         let informational_starters = [
             "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
             "what is ", "what are ", "what was ", "what were ", "why ", "why is ",
@@ -16396,24 +15587,8 @@ async fn handle_search(
             "understand ", "learn ", "teach me ",
         ];
         let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
-        // "how much does X cost" / "how much is X" / "how many" with a price/cost term
-        // is a transactional price question, NOT informational. The presence of
-        // "cost", "price", "rupee", "inr", "₹", "dollar", etc. in the query body is a
-        // decisive signal that overrides the informational starter guard.
-        let has_price_term_in_body = ["cost", "price", "pricing", "rupee", "rupees", "inr", "₹", "dollar", "dollars", "budget", "cheap", "expensive", "affordable", "worth"]
-            .iter().any(|t| q_lower.contains(t));
-        let is_how_much_price_query = (q_lower.starts_with("how much") || q_lower.starts_with("how many"))
-            && has_price_term_in_body;
-        // Word-boundary matching: each keyword must appear as a complete word,
-        // not as a substring of another word (e.g. "price" must not match
-        // "priceless"). The trailing-space convention ("price ") missed queries
-        // ending with the keyword ("sony wh-1000xm5 price"). \b word boundaries
-        // fix both ends without per-query literals.
-        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
-        let has_tx_signal = tx_keywords.iter().any(|k| {
-            let pattern = format!(r"\b{}\b", regex::escape(k));
-            regex::Regex::new(&pattern).map(|re| re.is_match(&q_lower)).unwrap_or(false)
-        });
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -16425,8 +15600,7 @@ async fn handle_search(
         // The keyword-based tx signal is suppressed when the query starts with an
         // informational/how-to starter. A price bound is still allowed through — it is
         // a decisive signal that the user wants to buy, not just learn.
-        // EXCEPTION: "how much does X cost" is a price question, not informational.
-        let tx_signal_effective = (has_tx_signal && !has_informational_starter) || is_how_much_price_query;
+        let tx_signal_effective = has_tx_signal && !has_informational_starter;
         if (tx_signal_effective || has_price_bound) && !has_local_keywords {
             if (intent.intent != "comparison" || has_price_bound)
                 && (intent.intent != "transactional" || intent.confidence < 0.60)
@@ -16453,45 +15627,12 @@ async fn handle_search(
             }
         }
 
-        // Override 6b: Career-advice / transition queries → informational
-        // Long conversational queries like "i am a 28 year old chartered accountant
-        // ... i want to transition into data analytics ... should i learn python or r"
-        // are career advice, NOT technical. The intent engine misclassifies them as
-        // "technical" because they mention tech terms (python, data, programming).
-        // The decisive signal: the query describes a career situation (job title +
-        // "transition" / "switch" / "move into" / "career" / "should i learn").
-        // General: pattern-based on career vocabulary, no per-query literals.
-        let career_signals = [
-            "transition", "transitioning", "switch", "switching", "move into",
-            "moving into", "career", "job change", "new field", "new career",
-            "should i learn", "should i study", "how do i become",
-            "how to become", "what should i learn", "advice", "guidance",
-        ];
-        let has_career_signal = career_signals.iter().any(|s| q_lower.contains(s));
-        let has_job_context = ["i am a ", "i'm a ", "i work as ", "i have been working",
-            "years of experience", "working as", "my job", "my career",
-        ].iter().any(|s| q_lower.contains(s));
-        if has_career_signal && has_job_context && intent.intent == "technical" {
-            tracing::info!(
-                "INTENT OVERRIDE (CAREER): career-advice query '{}' was 'technical' -> informational",
-                q
-            );
-            intent.intent = "informational".to_string();
-            intent.confidence = intent.confidence.max(0.75);
-            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-            intent.distribution.insert("informational".to_string(), (info_prob + 0.50).min(0.88));
-            // Dampen the spurious technical probability
-            if let Some(t) = intent.distribution.get_mut("technical") {
-                *t = (*t * 0.4).min(0.30);
-            }
-        }
-
         // Override 7: Model-number + price/cost terms → transactional
         // The classifier misses model-number patterns ("iphone 16 pro max price",
         // "oneplus 12 price") — the word "price" alone is weak signal. When a known
         // brand+model pattern co-occurs with a price/cost term, the intent is
         // decisively transactional (P10/P11 style compensation for the linear probe).
-        if is_model_number_price_query(&q_lower, &state.exact_model_config) {
+        if is_model_number_price_query(&q_lower) {
             if intent.intent != "transactional" || intent.confidence < 0.60 {
                 tracing::info!(
                     "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
@@ -16633,7 +15774,6 @@ async fn handle_search(
         if has_research_signal
             && (intent.intent == "navigational" || intent.confidence < 0.40)
             && intent.intent != "informational"
-            && intent.intent != "fresh"
         {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): research query '{}' was '{}' (conf={:.3}) → informational",
@@ -18245,74 +17385,10 @@ async fn handle_search(
         let neg_lc: std::collections::HashSet<String> =
             gated_neg_dedup.iter().map(|n| n.to_lowercase()).collect();
         intent.structured_constraints.positive.retain(|p| !neg_lc.contains(&p.to_lowercase()));
-        }
+    }
 
-        // Long conversational queries (>15 words) produce many low-value positive
-        // constraints ("28 year", "am", "lakhs") that pollute the search engine query
-        // and cause irrelevant results. Filter out constraints that are pure noise:
-        // single common English words, pure numbers, or very short fragments.
-        // Keep domain-specific terms, multi-word phrases, and action items.
-        let q_word_count = q_orig.split_whitespace().count();
-        if q_word_count > 15 && intent.structured_constraints.positive.len() > 3 {
-            let common_words: std::collections::HashSet<&str> = [
-                "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-                "do", "does", "did", "have", "has", "had", "will", "would", "could",
-                "should", "may", "might", "can", "shall", "must", "need", "want",
-                "am", "im", "i", "me", "my", "we", "our", "you", "your", "he", "she",
-                "it", "its", "they", "them", "their", "this", "that", "these", "those",
-                "and", "or", "but", "so", "if", "then", "than", "when", "where", "why",
-                "how", "what", "which", "who", "whom", "whose", "not", "no", "yes",
-                "all", "some", "any", "each", "every", "few", "more", "most", "other",
-                "such", "only", "own", "same", "too", "very", "just", "also", "now",
-                "here", "there", "up", "down", "out", "off", "over", "under", "again",
-                "once", "twice", "thrice", "year", "years", "month", "months", "week",
-                "weeks", "day", "days", "hour", "hours", "minute", "minutes", "second",
-                "seconds", "time", "times", "way", "ways", "kind", "kinds", "sort",
-                "sorts", "type", "types", "part", "parts", "piece", "pieces", "bit",
-                "bits", "lot", "lots", "plenty", "many", "much", "several", "various",
-                "certain", "sure", "true", "false", "right", "wrong", "good", "bad",
-                "better", "best", "worse", "worst", "big", "small", "large", "little",
-                "long", "short", "tall", "high", "low", "wide", "narrow", "thick",
-                "thin", "deep", "shallow", "heavy", "light", "fast", "slow", "quick",
-                "easy", "hard", "difficult", "simple", "complex", "new", "old", "young",
-                "early", "late", "first", "last", "next", "previous", "following",
-                "above", "below", "between", "among", "through", "across", "around",
-                "behind", "before", "after", "during", "while", "since", "until",
-                "till", "as", "at", "by", "for", "from", "in", "into", "of", "on",
-                "onto", "out", "outside", "over", "to", "toward", "under", "upon",
-                "with", "within", "without", "per", "via", "etc", "ie", "eg", "vs",
-                "lakh", "lakhs", "crore", "crores", "thousand", "thousands", "million",
-                "millions", "billion", "billions", "hundred", "hundreds", "dozen",
-                "dozens", "zero", "one", "two", "three", "four", "five", "six",
-                "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen",
-                "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
-                "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty",
-                "ninety", "rupee", "rupees", "dollar", "dollars", "euro", "euros",
-                "pound", "pounds", "yen", "yuan", "franc", "francs", "peso", "pesos",
-            ].iter().copied().collect();
-            intent.structured_constraints.positive.retain(|p| {
-                let pl = p.to_lowercase();
-                // Keep multi-word phrases (they're specific)
-                if pl.split_whitespace().count() > 1 {
-                    return true;
-                }
-                // Drop pure numbers and common words
-                if pl.chars().all(|c| c.is_numeric() || c == ' ') {
-                    return false;
-                }
-                if common_words.contains(pl.as_str()) {
-                    return false;
-                }
-                // Drop single very short words (< 3 chars)
-                if pl.len() < 3 {
-                    return false;
-                }
-                true
-            });
-        }
-
-        let has_only_negative = intent.structured_constraints.positive.is_empty()
-            && !gated_neg_dedup.is_empty();
+    let has_only_negative = intent.structured_constraints.positive.is_empty()
+        && !gated_neg_dedup.is_empty();
 
     let neg_terms: Vec<String> = gated_neg_dedup.iter()
         .map(|n| n.to_lowercase())
@@ -19120,14 +18196,11 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // so the order-invariance guarantee holds: affiliate decoration runs strictly
     // AFTER the order is fixed and cannot move a result. No external call, no
     // keyword list — the commercial signal comes purely from in-process intent.
-    let is_commercial = is_commercial_intent(
+    let shopping_block: Option<serde_json::Value> = if is_commercial_intent(
         &intent.intent,
         &intent.distribution,
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
-        &state.commerce_signals,
-        &q,
-    );
-    let shopping_block: Option<serde_json::Value> = if is_commercial {
+    ) {
         // The enrichment budget is derived from the time this request has ALREADY
         // spent, not a flat 22s (see `commerce_wall_for_elapsed`). Without this the
         // decoration pass could overrun the 30s TimeoutLayer on a slow upstream
@@ -19148,7 +18221,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         // carry product facts. `serde_json::to_value` on `MergedResult` is lossless.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
             .iter()
-            .take(state.commerce_config.enrich_window)
+            .take(COMMERCE_ENRICH_WINDOW)
             .filter_map(|r| serde_json::to_value(r).ok())
             .collect();
         if shop_arr.is_empty() {
@@ -19167,25 +18240,19 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     async move { fetch_page_html(&c, &url).await }
                 },
                 enrichment_wall,
-                state.commerce_config.enrich_window,
             )
             .await;
             // Select only the fact-bearing candidates for display, in their
             // EXISTING ranked order (strict subsequence — never promotes a
             // lower-ranked result). Returns None when no candidate has facts,
             // so the strip is omitted rather than shown empty.
-            let strip = select_shopping_strip(&shop_arr, state.commerce_config.mainpath_top_n);
+            let strip = select_shopping_strip(&shop_arr, COMMERCE_MAINPATH_TOP_N);
             match strip {
                 None => None,
                 Some(mut strip) => {
                     // STRICT post-ranking affiliate decoration on the DISPLAY strip only
                     // (never reorders — decoration is a pure post-ranking pass).
-                    // GATE: monetization is exact-model-only — broad category queries
-                    // must never receive affiliate links even on the /search shopping
-                    // block. `q_lower` is in scope from the handle_search entry.
-                    if is_exact_model_query(&q_lower, &state.exact_model_config) {
-                        decorate_affiliate(&mut strip, &state.affiliate_ctx);
-                    }
+                    decorate_affiliate(&mut strip, &state.affiliate_ctx);
                     // Read-only multi-merchant offer comparison from the attached facts.
                     let mut block = serde_json::json!({ "results": strip });
                     if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
@@ -19263,25 +18330,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         guard.complete();
     }
 
-    // ── ROADMAP item: affiliate decoration on MAIN /search results ──
-    // STRICT post-ranking pass: the results array is already fully ranked,
-    // scored, and paginated. We serialize to JSON, decorate each result's
-    // `affiliate` field in place, and return. The decoration NEVER reorders,
-    // reselects, or re-scores — it only attaches an affiliate block (or leaves
-    // it null when credentials are missing). The gate is the signal-driven
-    // `is_commercial_intent` classifier (transactional label / strong
-    // transactional distribution / price bound), NOT a keyword check.
-    let response_json = serde_json::to_value(&response).unwrap_or(serde_json::json!({}));
-    let final_json = if is_commercial && is_exact_model_query(&q_lower, &state.exact_model_config) {
-        let mut v = response_json;
-        if let Some(arr) = v.get_mut("results").and_then(|r| r.as_array_mut()) {
-            decorate_affiliate(arr, &state.affiliate_ctx);
-        }
-        v
-    } else {
-        response_json
-    };
-    (axum::http::StatusCode::OK, Json(final_json))
+    (axum::http::StatusCode::OK, Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({}))))
 }
 
 fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
@@ -19460,6 +18509,14 @@ const NL_NEG_STOPWORDS: &[&str] = &[
     "is", "are", "was", "were", "be", "been", "being", "has", "have", "had",
     "do", "does", "did", "will", "would", "should", "can", "could",
     "your", "you", "our", "we", "they", "it", "its", "their", "from", "but",
+    // Trailer verbs that follow a negation marker but are not the exclusion
+    // target (e.g. "without calling a plumber" → exclude "plumber", not
+    // "calling"). Mirrors the trailer_verbs list in
+    // extract_query_negative_terms_with_dropped so both negation extractors
+    // skip the same function words.
+    "calling", "called", "call", "using", "use", "used", "taking", "taken",
+    "take", "having", "making", "make", "made", "getting", "get", "got",
+    "buying", "buy", "bought", "eating", "eat", "ate", "drinking", "drink",
 ];
 
 fn normalize_nl_operators(query: &str) -> String {
@@ -20216,152 +19273,6 @@ async fn handle_search_fast(
     }
 
     (axum::http::StatusCode::OK, Json(response))
-}
-
-#[cfg(test)]
-mod exact_model_gate_tests {
-    use super::*;
-
-    // ── is_exact_model_query: eligibility gate for affiliate decoration ──
-    // Monetization is exact-model-only. Broad category queries must never
-    // receive affiliate links. The gate is data-driven (runtime-loaded brand
-    // list from exact_model_brands.json), not a hardcoded product list.
-
-    #[test]
-    fn test_exact_model_queries_pass_the_gate() {
-        // Exact-model queries: brand + model number
-        let cfg = ExactModelConfig::default();
-        assert!(is_exact_model_query("iphone 16 pro max price", &cfg));
-        assert!(is_exact_model_query("iphone 16", &cfg));
-        assert!(is_exact_model_query("galaxy s24 ultra", &cfg));
-        assert!(is_exact_model_query("pixel 9 pro", &cfg));
-        assert!(is_exact_model_query("macbook pro 14", &cfg));
-        assert!(is_exact_model_query("ipad air 5", &cfg));
-        assert!(is_exact_model_query("oneplus 12", &cfg));
-        assert!(is_exact_model_query("redmi note 13", &cfg));
-        assert!(is_exact_model_query("rog phone 8", &cfg));
-        assert!(is_exact_model_query("surface pro 9", &cfg));
-        assert!(is_exact_model_query("nokia g42", &cfg));
-        assert!(is_exact_model_query("moto g84", &cfg));
-        assert!(is_exact_model_query("nothing phone 2", &cfg));
-        assert!(is_exact_model_query("xiaomi 14", &cfg));
-        assert!(is_exact_model_query("poco x6", &cfg));
-        assert!(is_exact_model_query("realme gt 6", &cfg));
-        assert!(is_exact_model_query("zenfone 10", &cfg));
-        assert!(is_exact_model_query("imac 24", &cfg));
-        assert!(is_exact_model_query("apple watch 9", &cfg));
-    }
-
-    #[test]
-    fn test_broad_category_queries_fail_the_gate() {
-        // Broad product/category queries: no exact model number
-        let cfg = ExactModelConfig::default();
-        assert!(!is_exact_model_query("best wireless earbuds under 50 dollars", &cfg));
-        assert!(!is_exact_model_query("best laptop for programming", &cfg));
-        assert!(!is_exact_model_query("cheap headphones", &cfg));
-        assert!(!is_exact_model_query("iphone vs android", &cfg));  // no model number
-        assert!(!is_exact_model_query("best phone 2026", &cfg));   // no brand+model
-        assert!(!is_exact_model_query("how to choose a laptop", &cfg));
-        assert!(!is_exact_model_query("wireless earbuds", &cfg));
-        assert!(!is_exact_model_query("laptop under 1000 rupees", &cfg));
-    }
-
-    #[test]
-    fn test_model_without_price_still_passes() {
-        // The gate is exact-model-only, not model+price. A query that names
-        // a specific model is exact-model regardless of whether it mentions price.
-        let cfg = ExactModelConfig::default();
-        assert!(is_exact_model_query("iphone 16 pro max", &cfg));
-        assert!(is_exact_model_query("galaxy s24", &cfg));
-        assert!(is_exact_model_query("pixel 9", &cfg));
-    }
-
-    #[test]
-    fn test_price_without_model_fails() {
-        // Price signal alone is not enough — must have a specific model.
-        let cfg = ExactModelConfig::default();
-        assert!(!is_exact_model_query("best phone under 500 dollars", &cfg));
-        assert!(!is_exact_model_query("cheap laptop", &cfg));
-        assert!(!is_exact_model_query("price of wireless earbuds", &cfg));
-    }
-
-    #[test]
-    fn test_case_insensitive() {
-        // has_exact_model lowercases internally, so mixed-case input works.
-        let cfg = ExactModelConfig::default();
-        assert!(is_exact_model_query("iPhone 16 Pro Max", &cfg));
-        assert!(is_exact_model_query("GALAXY S24", &cfg));
-        assert!(is_exact_model_query("Pixel 9 Pro", &cfg));
-    }
-
-    #[test]
-    fn test_exact_model_config_loads_from_data_file() {
-        // The config loads from data/commerce/exact_model_brands.json.
-        // We can't easily test the file-loading path in a unit test (it
-        // reads from disk), but we can verify the default has the expected
-        // brands and that a custom config respects the loaded list.
-        let cfg = ExactModelConfig::default();
-        assert!(cfg.brands.contains(&"iphone".to_string()));
-        assert!(cfg.brands.contains(&"galaxy".to_string()));
-        assert!(cfg.brands.contains(&"pixel".to_string()));
-        assert!(!cfg.brands.contains(&"nonexistent_brand".to_string()));
-    }
-
-    #[test]
-    fn test_custom_brand_list_is_respected() {
-        // A custom brand list (as if loaded from the data file) is respected.
-        let mut cfg = ExactModelConfig::default();
-        cfg.brands = vec!["acme".to_string(), "widget".to_string()];
-        assert!(is_exact_model_query("acme 123", &cfg));
-        assert!(is_exact_model_query("widget pro 5", &cfg));
-        // iphone is no longer in the list
-        assert!(!is_exact_model_query("iphone 16", &cfg));
-    }
-
-    #[test]
-    fn test_empty_brand_list_returns_false() {
-        let mut cfg = ExactModelConfig::default();
-        cfg.brands = vec![];
-        assert!(!is_exact_model_query("iphone 16", &cfg));
-    }
-
-    #[test]
-    fn test_brand_without_number_returns_false() {
-        let cfg = ExactModelConfig::default();
-        // Brand present but no model number follows
-        assert!(!is_exact_model_query("iphone", &cfg));
-        assert!(!is_exact_model_query("galaxy", &cfg));
-        assert!(!is_exact_model_query("iphone vs android", &cfg));
-    }
-
-    #[test]
-    fn test_model_number_price_query_uses_config() {
-        let cfg = ExactModelConfig::default();
-        // Model + price = true
-        assert!(is_model_number_price_query("iphone 16 price", &cfg));
-        assert!(is_model_number_price_query("galaxy s24 cost", &cfg));
-        // Price but no model = false
-        assert!(!is_model_number_price_query("best phone under 500", &cfg));
-        // Model but no price = false
-        assert!(!is_model_number_price_query("iphone 16", &cfg));
-    }
-
-    #[test]
-    fn test_brand_with_trailing_punctuation() {
-        // Brand followed by punctuation (e.g. "iphone:") should still match
-        let cfg = ExactModelConfig::default();
-        assert!(is_exact_model_query("iphone: 16 pro", &cfg));
-        assert!(is_exact_model_query("galaxy, s24", &cfg));
-    }
-
-    #[test]
-    fn test_brand_window_covers_multi_word_models() {
-        // "galaxy s24 ultra" — brand at index 0, model number at index 1
-        let cfg = ExactModelConfig::default();
-        assert!(is_exact_model_query("galaxy s24 ultra", &cfg));
-        // "apple watch 9" — "watch" is in the brand list
-        assert!(is_exact_model_query("apple watch 9", &cfg));
-    }
 }
 
 #[cfg(test)]
@@ -21833,40 +20744,25 @@ mod hardcoding_ruling_tests {
         }
 
         // Verify the tx_keywords list still matches genuine transactional queries
-        // using word-boundary matching (same logic as production).
-        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
-        let has_tx_wordboundary = |q: &str| -> bool {
-            let q_lower = q.to_lowercase();
-            tx_keywords.iter().any(|k| {
-                let pattern = format!(r"\b{}\b", regex::escape(k));
-                regex::Regex::new(&pattern).map(|re| re.is_match(&q_lower)).unwrap_or(false)
-            })
-        };
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
         for q in &transactional_queries {
-            assert!(has_tx_wordboundary(q), "transactional query '{}' should match tx_keywords", q);
+            let q_lower = q.to_lowercase();
+            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+            assert!(has_tx, "transactional query '{}' should match tx_keywords", q);
         }
 
-        // Verify that queries ending with a keyword (no trailing space) match.
-        // This was the root cause: "price " (trailing space) missed "sony wh-1000xm5 price".
-        let end_keyword_queries = [
-            "sony wh-1000xm5 price",
-            "iphone 16 pro max buy",
-            "best laptop under",
-        ];
-        for q in &end_keyword_queries {
-            assert!(has_tx_wordboundary(q), "end-of-query keyword '{}' should match tx_keywords", q);
-        }
-
-        // Verify that guarded queries with "under" or "price" would have matched
+        // Verify that guarded queries with "under " or "price " would have matched
         // the OLD (un-guarded) logic — proving the test is meaningful
         let problematic_queries = [
             "how to convert pdf to word under 5 minutes",
             "how to check price of used bike",
         ];
         for q in &problematic_queries {
-            assert!(has_tx_wordboundary(q), "query '{}' should match tx_keywords (proving the guard is needed)", q);
+            let q_lower = q.to_lowercase();
+            let has_tx = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+            assert!(has_tx, "query '{}' should match tx_keywords (proving the guard is needed)", q);
             // But the guard suppresses it
-            let has_starter = informational_starters.iter().any(|s| q.to_lowercase().starts_with(s));
+            let has_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
             assert!(has_starter, "query '{}' should be guarded by informational starter", q);
         }
     }
@@ -23371,8 +22267,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let mut dist = std::collections::HashMap::new();
         dist.insert("transactional".to_string(), 0.9);
         dist.insert("informational".to_string(), 0.1);
-        let signals = CommerceSignals::default();
-        assert!(is_commercial_intent("transactional", &dist, false, &signals, "test"));
+        assert!(is_commercial_intent("transactional", &dist, false));
     }
 
     #[test]
@@ -23385,8 +22280,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("comparison".to_string(), 0.51);
         dist.insert("transactional".to_string(), 0.62);
         // argmax label is "comparison" but transactional prob >= 0.50 => commercial.
-        let signals = CommerceSignals::default();
-        assert!(is_commercial_intent("comparison", &dist, false, &signals, "test"));
+        assert!(is_commercial_intent("comparison", &dist, false));
     }
 
     #[test]
@@ -23395,8 +22289,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // intent — no need for the transactional label. The bound is parsed by the
         // EXISTING gateway/engine constraint parser, never a keyword.
         let dist = std::collections::HashMap::new();
-        let signals = CommerceSignals::default();
-        assert!(is_commercial_intent("informational", &dist, true, &signals, "test"));
+        assert!(is_commercial_intent("informational", &dist, true));
     }
 
     #[test]
@@ -23408,172 +22301,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let mut dist = std::collections::HashMap::new();
         dist.insert("informational".to_string(), 0.95);
         dist.insert("transactional".to_string(), 0.02);
-        let signals = CommerceSignals::default();
-        assert!(!is_commercial_intent("informational", &dist, false, &signals, "rust ownership"));
-    }
-
-    // ── Commerce config + signals data-file wiring tests ─────────────────────
-
-    #[test]
-    fn commerce_config_loads_mainpath_top_n_from_data_file() {
-        // The shipped config.json sets mainpath_top_n = 8. Loading it must
-        // produce that value (not the default, not a hardcoded constant).
-        let cfg = CommerceConfig::load();
-        assert!(
-            cfg.mainpath_top_n > 0 && cfg.mainpath_top_n <= 100,
-            "mainpath_top_n must be a sane positive value, got {}",
-            cfg.mainpath_top_n
-        );
-        // The shipped data file sets 8; if this fails the data file changed
-        // and the test should be updated alongside it.
-        assert_eq!(cfg.mainpath_top_n, 8, "shipped config.json mainpath_top_n");
-    }
-
-    #[test]
-    fn commerce_signals_loads_transactional_keywords_from_data_file() {
-        let sig = CommerceSignals::load();
-        assert!(
-            !sig.transactional_keywords.is_empty(),
-            "signals.json must yield at least one transactional keyword"
-        );
-        // The shipped data file includes "buy" and "price".
-        assert!(
-            sig.transactional_keywords.contains(&"buy".to_string()),
-            "shipped signals.json must contain 'buy'"
-        );
-        assert!(
-            sig.transactional_keywords.contains(&"price".to_string()),
-            "shipped signals.json must contain 'price'"
-        );
-    }
-
-    #[test]
-    fn transactional_keyword_whole_word_matching() {
-        let sig = CommerceSignals::default();
-        // Positive: whole-word matches
-        assert!(sig.has_transactional_keyword("buy wireless earbuds"));
-        assert!(sig.has_transactional_keyword("price of iphone"));
-        assert!(sig.has_transactional_keyword("how much does a laptop cost"));
-        assert!(sig.has_transactional_keyword("shop for shoes"));
-        // Negative: substring but NOT whole-word
-        assert!(!sig.has_transactional_keyword("rust ownership"));
-        assert!(!sig.has_transactional_keyword("buying")); // "buy" is a prefix but not whole-word
-        assert!(!sig.has_transactional_keyword("priceless")); // "price" is a prefix but not whole-word
-        assert!(!sig.has_transactional_keyword("shopping")); // "shop" is a prefix but not whole-word
-        // Edge: empty query
-        assert!(!sig.has_transactional_keyword(""));
-    }
-
-    #[test]
-    fn commercial_intent_boosted_by_transactional_keyword() {
-        // A query with a transactional keyword but NO intent engine signal
-        // (informational label, no price bound, weak distribution) should
-        // STILL be commercial thanks to the data-driven keyword boost.
-        let mut dist = std::collections::HashMap::new();
-        dist.insert("informational".to_string(), 0.7);
-        dist.insert("transactional".to_string(), 0.1);
-        let sig = CommerceSignals::default();
-        assert!(
-            is_commercial_intent("informational", &dist, false, &sig, "buy wireless earbuds"),
-            "transactional keyword 'buy' should boost commercial intent"
-        );
-        // Same but with a non-transactional query — should NOT be commercial
-        assert!(
-            !is_commercial_intent("informational", &dist, false, &sig, "rust ownership"),
-            "non-transactional query must not be boosted"
-        );
-    }
-
-    #[test]
-    fn commerce_status_reports_networks_and_config() {
-        let ctx = AffiliateCtx::load();
-        let cfg = CommerceConfig::load();
-        let sig = CommerceSignals::load();
-        let status = build_commerce_status(&ctx, &cfg, &sig, "laptop price");
-
-        // Config values must be present and match the loaded config.
-        let config = status.get("config").expect("config block");
-        assert_eq!(
-            config.get("mainpath_top_n").and_then(|v| v.as_u64()),
-            Some(cfg.mainpath_top_n as u64)
-        );
-        assert_eq!(
-            config.get("enrich_window").and_then(|v| v.as_u64()),
-            Some(cfg.enrich_window as u64)
-        );
-
-        // Networks and programs must be arrays (possibly empty if no data files).
-        assert!(status.get("networks").unwrap().is_array());
-        assert!(status.get("programs").unwrap().is_array());
-
-        // The query must be commercial (it contains "price").
-        assert_eq!(
-            status.get("is_commercial_intent").and_then(|v| v.as_bool()),
-            Some(true),
-            "laptop price should be commercial"
-        );
-    }
-
-    #[test]
-    fn commerce_status_non_commercial_query() {
-        let ctx = AffiliateCtx::load();
-        let cfg = CommerceConfig::load();
-        let sig = CommerceSignals::load();
-        let status = build_commerce_status(&ctx, &cfg, &sig, "rust ownership");
-
-        assert_eq!(
-            status.get("is_commercial_intent").and_then(|v| v.as_bool()),
-            Some(false),
-            "rust ownership should NOT be commercial"
-        );
-    }
-
-    #[test]
-    fn commerce_status_empty_query_is_not_commercial() {
-        let ctx = AffiliateCtx::load();
-        let cfg = CommerceConfig::load();
-        let sig = CommerceSignals::load();
-        let status = build_commerce_status(&ctx, &cfg, &sig, "");
-
-        assert_eq!(
-            status.get("is_commercial_intent").and_then(|v| v.as_bool()),
-            Some(false),
-            "empty query must not be commercial"
-        );
-    }
-
-    #[test]
-    fn commerce_status_reports_key_configured_boolean_only() {
-        // The endpoint must report whether an env var is SET, never its value.
-        // This test verifies the shape: every network/program has a boolean
-        // `key_configured` field.
-        let ctx = AffiliateCtx::load();
-        let cfg = CommerceConfig::load();
-        let sig = CommerceSignals::load();
-        let status = build_commerce_status(&ctx, &cfg, &sig, "test");
-
-        for net in status.get("networks").unwrap().as_array().unwrap() {
-            assert!(
-                net.get("key_configured").is_some(),
-                "network {} must have key_configured",
-                net.get("id").unwrap()
-            );
-            assert!(
-                net.get("key_configured").unwrap().is_boolean(),
-                "key_configured must be boolean"
-            );
-        }
-        for prog in status.get("programs").unwrap().as_array().unwrap() {
-            assert!(
-                prog.get("key_configured").is_some(),
-                "program {} must have key_configured",
-                prog.get("id").unwrap()
-            );
-            assert!(
-                prog.get("key_configured").unwrap().is_boolean(),
-                "key_configured must be boolean"
-            );
-        }
+        assert!(!is_commercial_intent("informational", &dist, false));
     }
 
     #[test]
@@ -23622,7 +22350,6 @@ structured product data, so nothing must be extracted from the body.</p></body><
             param_env: HashMap::new(),
             bid_floor: None,
             fallback_url: None,
-            host_suffix: None,
         }
     }
 
@@ -23692,7 +22419,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn decoration_is_idempotent_no_double_wrap() {
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx::from_networks(vec![n]);
+        let ctx = AffiliateCtx { networks: vec![n] };
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -23709,7 +22436,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn missing_key_degrades_to_null_affiliate() {
         // No usable network (key env var unset) => results keep affiliate null.
         let n = net("wrap", "https://sovrn.co?key={key}&u={url}", HashMap::new(), Some("UNSET_KEY_ENV_VAR_XYZ"));
-        let ctx = AffiliateCtx::from_networks(vec![n]);
+        let ctx = AffiliateCtx { networks: vec![n] };
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -23722,7 +22449,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // The central no-manipulation guarantee: decoration never reorders.
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx::from_networks(vec![n]);
+        let ctx = AffiliateCtx { networks: vec![n] };
         let mut results = vec![
             serde_json::json!({ "url": "https://a.example.com/x", "score": 9.7 }),
             serde_json::json!({ "url": "https://b.example.org/y", "score": 8.1 }),
@@ -23796,7 +22523,6 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
-            24,
         )
         .await;
         let elapsed = start.elapsed();
@@ -23846,7 +22572,6 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_millis(1),
-            24,
         )
         .await;
 
@@ -23995,7 +22720,6 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
-            24,
         )
         .await;
         let elapsed = start.elapsed();
@@ -24165,7 +22889,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             }
         };
 
-        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2), 24).await;
+        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2)).await;
 
         let with_commerce = ranked
             .iter()
@@ -24832,296 +23556,6 @@ mod mainpath_shopping_strip_tests {
     #[test]
     fn enrich_window_is_wider_than_display_cap() {
         // Guards the constants from being re-conflated.
-        assert!(24 > COMMERCE_MAINPATH_TOP_N);
-    }
-
-    // ─── extract_snippet_facts tests ────────────────────────────────────
-
-    #[test]
-    fn snippet_facts_extracts_price_and_currency() {
-        let snippet = "Sony WH-1000XM5 headphones $349.99";
-        let url = "https://www.bestbuy.com/sony-wh1000xm5";
-        let facts = extract_snippet_facts(snippet, url);
-        assert_eq!(facts.price, Some(349.99));
-        assert_eq!(facts.currency, Some("USD".to_string()));
-    }
-
-    #[test]
-    fn snippet_facts_extracts_product_name_from_title() {
-        let snippet = "Sony WH-1000XM5 Wireless Headphones | Best Buy\n$349.99";
-        let url = "https://www.bestbuy.com/sony-wh1000xm5";
-        let facts = extract_snippet_facts(snippet, url);
-        assert_eq!(
-            facts.name,
-            Some("Sony WH-1000XM5 Wireless Headphones".to_string())
-        );
-    }
-
-    #[test]
-    fn snippet_facts_extracts_merchant_from_url_host() {
-        let snippet = "Sony WH-1000XM5 headphones $349.99";
-        let url = "https://www.bestbuy.com/sony-wh1000xm5";
-        let facts = extract_snippet_facts(snippet, url);
-        assert_eq!(facts.merchant, Some("www.bestbuy.com".to_string()));
-        // merchant_observed must be false — derived from URL, not page
-        assert!(!facts.merchant_observed);
-    }
-
-    #[test]
-    fn snippet_facts_extracts_availability_in_stock() {
-        let snippet = "Sony WH-1000XM5 headphones $349.99 — In Stock";
-        let url = "https://www.bestbuy.com/sony-wh1000xm5";
-        let facts = extract_snippet_facts(snippet, url);
-        assert_eq!(facts.availability, Some("in_stock".to_string()));
-    }
-
-    #[test]
-    fn snippet_facts_extracts_availability_out_of_stock() {
-        let snippet = "Sony WH-1000XM5 headphones $349.99 — Out of Stock";
-        let url = "https://www.bestbuy.com/sony-wh1000xm5";
-        let facts = extract_snippet_facts(snippet, url);
-        assert_eq!(facts.availability, Some("out_of_stock".to_string()));
-    }
-
-    #[test]
-    fn snippet_facts_returns_empty_for_no_match() {
-        let snippet = "How to cook pasta";
-        let url = "https://recipes.example.com/pasta";
-        let facts = extract_snippet_facts(snippet, url);
-        assert_eq!(facts.price, None);
-        assert_eq!(facts.currency, None);
-        assert_eq!(facts.name, None);
-        assert_eq!(facts.availability, None);
-        // merchant is always extracted from URL host (even if no other facts)
-        assert_eq!(facts.merchant, Some("recipes.example.com".to_string()));
-    }
-
-    #[test]
-    fn snippet_facts_passes_data_has_gate() {
-        // A snippet with a price must pass data_has_fact
-        let snippet = "Sony WH-1000XM5 headphones $349.99";
-        let url = "https://www.bestbuy.com/sony-wh1000xm5";
-        let facts = extract_snippet_facts(snippet, url);
-        assert!(data_has_fact(&facts));
-    }
-
-    #[test]
-    fn snippet_facts_fails_data_has_gate_for_no_facts() {
-        // A snippet with no price, no availability, no name must fail data_has_fact
-        // (merchant alone doesn't count — merchant_observed is false)
-        let snippet = "How to cook pasta";
-        let url = "https://recipes.example.com/pasta";
-        let facts = extract_snippet_facts(snippet, url);
-        assert!(!data_has_fact(&facts));
-    }
-
-    #[test]
-    fn snippet_facts_extracts_inr_price() {
-        let snippet = "Sony WH-1000XM5 headphones ₹29,999";
-        let url = "https://www.amazon.in/sony-wh1000xm5";
-        let facts = extract_snippet_facts(snippet, url);
-        assert_eq!(facts.price, Some(29999.0));
-        assert_eq!(facts.currency, Some("INR".to_string()));
-    }
-
-    #[test]
-    fn snippet_facts_handles_empty_snippet() {
-        let snippet = "";
-        let url = "https://www.bestbuy.com/sony-wh1000xm5";
-        let facts = extract_snippet_facts(snippet, url);
-        assert_eq!(facts.price, None);
-        assert_eq!(facts.name, None);
-        assert_eq!(facts.availability, None);
-        // merchant still extracted from URL
-        assert_eq!(facts.merchant, Some("www.bestbuy.com".to_string()));
-    }
-}
-
-/// Tests for the affiliate decoration post-pass on MAIN /search results.
-///
-/// The decoration runs as a strict post-ranking pass: it serializes the
-/// already-ranked response to JSON, decorates each result's `affiliate` field
-/// in place, and returns. The gate is `is_commercial_intent` — the signal-driven
-/// classifier (transactional label / strong transactional distribution / price
-/// bound). Non-commerce queries are unaffected.
-#[cfg(test)]
-mod affiliate_mainpath_tests {
-    use super::*;
-
-    fn test_network() -> AffiliateNetwork {
-        AffiliateNetwork {
-            id: "test_net".to_string(),
-            kind: "wrap".to_string(),
-            enabled: true,
-            priority: 0,
-            network: "TestNetwork".to_string(),
-            template: "https://tracker.example.com/?k={key}&u={url}".to_string(),
-            params: std::collections::HashMap::new(),
-            key_env: Some("TEST_AFF_KEY".to_string()),
-            param_env: std::collections::HashMap::new(),
-            bid_floor: None,
-            fallback_url: None,
-            host_suffix: None,
-        }
-    }
-
-    #[test]
-    fn commerce_intent_gate_true_for_transactional_label() {
-        let mut dist = std::collections::HashMap::new();
-        dist.insert("transactional".to_string(), 0.85);
-        let sig = CommerceSignals::load();
-        assert!(is_commercial_intent("transactional", &dist, false, &sig, "buy iphone 16"));
-    }
-
-    #[test]
-    fn commerce_intent_gate_true_for_price_bound() {
-        let dist = std::collections::HashMap::new();
-        let sig = CommerceSignals::load();
-        assert!(is_commercial_intent("informational", &dist, true, &sig, "laptop under 500"));
-    }
-
-    #[test]
-    fn commerce_intent_gate_true_for_strong_distribution() {
-        let mut dist = std::collections::HashMap::new();
-        dist.insert("comparison".to_string(), 0.6);
-        dist.insert("transactional".to_string(), 0.55);
-        let sig = CommerceSignals::load();
-        assert!(is_commercial_intent("comparison", &dist, false, &sig, "iphone vs pixel"));
-    }
-
-    #[test]
-    fn commerce_intent_gate_false_for_informational() {
-        let mut dist = std::collections::HashMap::new();
-        dist.insert("informational".to_string(), 0.9);
-        dist.insert("transactional".to_string(), 0.1);
-        let sig = CommerceSignals::load();
-        assert!(!is_commercial_intent("informational", &dist, false, &sig, "rust ownership"));
-    }
-
-    #[test]
-    fn decorate_affiliate_on_main_results_preserves_order() {
-        // Simulate the post-pass: ranked results → JSON → decorate → verify order.
-        std::env::set_var("TEST_AFF_KEY", "test_key_value");
-        let ctx = AffiliateCtx::from_networks(vec![test_network()]);
-        let mut results = vec![
-            serde_json::json!({ "url": "https://store.example.com/p/1", "title": "A", "score": 9.7 }),
-            serde_json::json!({ "url": "https://shop.example.net/p/2", "title": "B", "score": 8.2 }),
-            serde_json::json!({ "url": "https://m.example.org/p/3", "title": "C", "score": 7.1 }),
-        ];
-        let before: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
-        decorate_affiliate(&mut results, &ctx);
-        let after: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
-        assert_eq!(before, after, "decoration must never reorder");
-        for r in &results {
-            assert!(r["affiliate"].is_object(), "each result must have affiliate block");
-            assert_eq!(r["affiliate"]["disclosed"], serde_json::json!(true));
-        }
-    }
-
-    #[test]
-    fn decorate_affiliate_missing_credentials_leaves_null() {
-        // No env var set → no usable network → affiliate stays unset (null).
-        let n = AffiliateNetwork {
-            key_env: Some("TOTALLY_UNSET_ENV_VAR_XYZ".to_string()),
-            ..test_network()
-        };
-        let ctx = AffiliateCtx::from_networks(vec![n]);
-        let mut results = vec![
-            serde_json::json!({ "url": "https://store.example.com/p/1", "title": "A", "score": 9.7 }),
-        ];
-        decorate_affiliate(&mut results, &ctx);
-        assert!(results[0].get("affiliate").is_none(), "missing key => affiliate omitted");
-    }
-
-    #[test]
-    fn non_commerce_query_results_undecorated() {
-        // When is_commercial_intent is false, the post-pass is skipped entirely.
-        // This test verifies the gate logic; the integration is a branch on the bool.
-        let mut dist = std::collections::HashMap::new();
-        dist.insert("informational".to_string(), 0.95);
-        let sig = CommerceSignals::load();
-        let is_commercial = is_commercial_intent("informational", &dist, false, &sig, "how does rust work");
-        assert!(!is_commercial, "informational query must not trigger affiliate decoration");
-    }
-}
-
-#[cfg(test)]
-mod local_intent_gazetteer_tests {
-    use super::*;
-
-    /// Regression test: queries like "restaurants in bangalore" or "hotels in paris"
-    /// must be detected as local intent via the LOCATION_GAZETTEER.
-    ///
-    /// Before the fix, `has_local_intent` only checked "near me" / "nearby" /
-    /// "in area" patterns, so gazetteer-city queries were not detected as local.
-    /// The fix splits on " in " and checks against LOCATION_GAZETTEER.
-    #[test]
-    fn gazetteer_city_after_in_detects_local_intent() {
-        // These must ALL be detected as local intent.
-        let local_queries = [
-            "restaurants in bangalore",
-            "hotels in paris",
-            "coffee shops in tokyo",
-            "things to do in new york",
-            "best cafes in london",
-            "street food in mumbai",
-            "pizza places in delhi",
-            "sightseeing in dubai",
-        ];
-        for q in &local_queries {
-            assert!(
-                has_local_intent(q),
-                "query '{}' should be detected as local intent via gazetteer",
-                q
-            );
-        }
-    }
-
-    #[test]
-    fn non_gazetteer_after_in_does_not_detect_local_intent() {
-        // These must NOT be detected as local intent — the place after " in "
-        // is not in the LOCATION_GAZETTEER and doesn't match other local patterns.
-        let non_local_queries = [
-            "restaurants in september",
-            "best in class",
-            "how to cook in a pressure cooker",
-        ];
-        for q in &non_local_queries {
-            assert!(
-                !has_local_intent(q),
-                "query '{}' should NOT be detected as local intent",
-                q
-            );
-        }
-    }
-
-    #[test]
-    fn long_conversational_query_with_in_country_not_local() {
-        // A long conversational query that happens to contain " in <country>"
-        // should NOT be classified as local intent (short-query guard).
-        let long_query = "i have been working as a network administrator for five years and now i want to understand the job market in india";
-        assert!(
-            !has_local_intent(long_query),
-            "long conversational query should not be local intent"
-        );
-    }
-
-    #[test]
-    fn traditional_local_patterns_still_work() {
-        // Ensure the original "near me" / "nearby" patterns still work
-        // after the gazetteer-city addition.
-        let traditional_locals = [
-            "restaurants near me",
-            "nearby coffee shops",
-            "hotels around me",
-            "gas stations close to me",
-        ];
-        for q in &traditional_locals {
-            assert!(
-                has_local_intent(q),
-                "traditional local query '{}' should still be detected",
-                q
-            );
-        }
+        assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
     }
 }
