@@ -3687,6 +3687,18 @@ fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
 }
 
 fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
+    extract_commerce_offer_with_patterns(html, url, &PricePatternConfig::default())
+}
+
+/// Extract commerce offer using a caller-supplied pattern config. This is the
+/// production entry point — it lets the caller pass a runtime-loaded
+/// `PricePatternConfig` so new HTML price patterns can be added by editing
+/// `data/commerce/price_patterns.json` WITHOUT recompiling.
+fn extract_commerce_offer_with_patterns(
+    html: &str,
+    url: &str,
+    patterns: &PricePatternConfig,
+) -> CommerceOffer {
     let mut facts = OfferFacts::default();
     let mut source: Option<String> = None;
 
@@ -3746,8 +3758,9 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     //    that would require more context. Marked with source="extracted_from_text"
     //    so the frontend can label it distinctly from structured data. This is NOT
     //    regex guessing on body text — it targets known e-commerce HTML patterns.
+    //    The pattern list is DATA (loaded from price_patterns.json), never hardcoded.
     if facts.price.is_none() && facts.price_low.is_none() {
-        if let Some((price, currency)) = extract_price_from_html_patterns(html) {
+        if let Some((price, currency)) = patterns.extract_price(html) {
             facts.price = Some(price);
             facts.currency = Some(currency);
             source = Some("extracted_from_text".to_string());
@@ -4501,6 +4514,7 @@ fn data_has_fact(d: &OfferFacts) -> bool {
 fn enrich_single_commerce(
     r: &mut serde_json::Value,
     html: &str,
+    patterns: &PricePatternConfig,
 ) {
     if !r.is_object() {
         return;
@@ -4510,7 +4524,7 @@ fn enrich_single_commerce(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let offer: CommerceOffer = extract_commerce_offer(html, &url);
+    let offer: CommerceOffer = extract_commerce_offer_with_patterns(html, &url, patterns);
     let mut has_fact = offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false);
     if has_fact {
         if let Ok(v) = serde_json::to_value(&offer) {
@@ -4632,6 +4646,7 @@ async fn enrich_with_commerce_par<F, Fut>(
     fetch: F,
     wall_timeout: std::time::Duration,
     enrich_window: usize,
+    patterns: &PricePatternConfig,
 ) where
     F: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Option<String>> + Send,
@@ -4736,9 +4751,11 @@ async fn enrich_with_commerce_par<F, Fut>(
     drop(tx);
 
     // 3) Attach results back onto the original array (preserving order).
+    //    Pass the runtime-loaded price pattern config so the extraction
+    //    fallback uses data-driven patterns, not hardcoded ones.
     for (idx, html) in fetched {
         if let Some(r) = results.get_mut(idx) {
-            enrich_single_commerce(r, &html);
+            enrich_single_commerce(r, &html, patterns);
         }
     }
 
@@ -5010,6 +5027,7 @@ async fn handle_shopping(
                 },
                 second_pass_wall,
                 state.commerce_config.enrich_window,
+                &state.price_pattern_config,
             )
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
@@ -19429,6 +19447,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 },
                 enrichment_wall,
                 state.commerce_config.enrich_window,
+                &state.price_pattern_config,
             )
             .await;
             // Select only the fact-bearing candidates for display, in their
@@ -24058,6 +24077,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
             24,
+            &PricePatternConfig::default(),
         )
         .await;
         let elapsed = start.elapsed();
@@ -24108,6 +24128,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             fetch,
             std::time::Duration::from_millis(1),
             24,
+            &PricePatternConfig::default(),
         )
         .await;
 
@@ -24257,6 +24278,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
             24,
+            &PricePatternConfig::default(),
         )
         .await;
         let elapsed = start.elapsed();
@@ -24426,7 +24448,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             }
         };
 
-        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2), 24).await;
+        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2), 24, &PricePatternConfig::default()).await;
 
         let with_commerce = ranked
             .iter()
@@ -25215,7 +25237,7 @@ mod mainpath_shopping_strip_tests {
             "content": "Price: $349.99 - In Stock - Free shipping"
         });
         // Empty HTML = no structured data found
-        enrich_single_commerce(&mut result, "<html><body>no structured data</body></html>");
+        enrich_single_commerce(&mut result, "<html><body>no structured data</body></html>", &PricePatternConfig::default());
 
         let commerce = result.get("commerce").expect("commerce block should be attached");
         assert_eq!(commerce.get("source").unwrap(), "snippet_extracted");
@@ -25239,7 +25261,7 @@ mod mainpath_shopping_strip_tests {
         let html = r#"<script type="application/ld+json">
         {"@type":"Product","name":"Sony WH-1000XM5","offers":{"@type":"Offer","price":"299.99","priceCurrency":"USD","availability":"https://schema.org/InStock"}
         </script>"#;
-        enrich_single_commerce(&mut result, html);
+        enrich_single_commerce(&mut result, html, &PricePatternConfig::default());
 
         let commerce = result.get("commerce").expect("commerce block should be attached");
         // Source should be the structured data source, NOT snippet_extracted
@@ -25257,7 +25279,7 @@ mod mainpath_shopping_strip_tests {
             "title": "How to choose headphones",
             "content": "This guide explains what to look for"
         });
-        enrich_single_commerce(&mut result, "<html><body>no data</body></html>");
+        enrich_single_commerce(&mut result, "<html><body>no data</body></html>", &PricePatternConfig::default());
 
         // No commerce block should be attached (no facts to show)
         assert!(result.get("commerce").is_none());
@@ -25277,7 +25299,7 @@ mod mainpath_shopping_strip_tests {
             "title": "Sony WH-1000XM5",
             "content": "Price: $349.99"
         });
-        enrich_single_commerce(&mut result, "<html><body>no data</body></html>");
+        enrich_single_commerce(&mut result, "<html><body>no data</body></html>", &PricePatternConfig::default());
 
         let commerce = result.get("commerce").unwrap();
         let prov = result.get("commerce_provenance").unwrap();
