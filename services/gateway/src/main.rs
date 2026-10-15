@@ -9354,13 +9354,15 @@ fn is_weak_anchor_word(w: &str) -> bool {
         // message queue" surfaced Weblio entries for "choose". Same class as the
         // other weak anchors above. General question-framing vocabulary; no
         // query- or domain-specific entries.
-        "difference", "differences", "compare", "compares", "compared",
+        "difference", "differences", "differ", "differs", "differed",
+        "compare", "compares", "compared",
         "comparison", "comparisons", "versus", "vs", "distinction",
         "distinctions", "choose", "choosing", "chosen", "choice", "choices",
         "select", "selecting", "selected", "selection", "pick", "picking",
         "meaning", "meanings", "definition", "definitions", "define",
         "defined", "explained", "explain", "explains", "alternative",
         "alternatives", "overview", "introduction", "summary", "summaries",
+        "cause", "causes", "caused", "causing",
     ];
     WEAK.contains(&w)
 }
@@ -12671,6 +12673,11 @@ fn recall_gap_stopwords() -> std::collections::HashSet<&'static str> {
         "simple", "quick", "fast", "new", "recent", "latest", "safe", "natural",
         "home", "house", "make", "making", "get", "getting", "use", "using",
         "find", "finding", "help", "need", "want", "like", "near", "nearby",
+        // auxiliary verbs (do/does/did) — not content-bearing
+        "does", "do", "did",
+        // common adjectives that carry no topical signal
+        "main", "proper", "major", "key", "important", "basic", "general",
+        "specific", "certain", "particular", "various", "several", "many",
         // negations (handled as constraints, not recall gaps)
         "not", "no", "without", "except", "besides", "minus", "other", "than",
         "nor",
@@ -12743,9 +12750,18 @@ fn compute_recall_gap_terms(
         })
         .collect::<std::collections::HashSet<String>>();
 
+    // A term is "covered" if it appears as a substring in any haystack,
+    // OR if a morphological variant (word starting with the term's first
+    // 4 chars) appears — handles differs/differ/difference, causes/cause/caused.
     let missing: Vec<String> = topics
         .into_iter()
-        .filter(|t| !covered.iter().any(|hay| hay.contains(t.as_str())))
+        .filter(|t| {
+            let prefix: String = t.chars().take(4).collect();
+            !covered.iter().any(|hay| {
+                hay.contains(t.as_str())
+                    || hay.split_whitespace().any(|w| w.starts_with(&prefix))
+            })
+        })
         .collect();
 
     if missing.is_empty() {
