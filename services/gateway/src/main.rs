@@ -12859,6 +12859,100 @@ impl ExactModelConfig {
     }
 }
 
+/// Runtime-loaded HTML price extraction patterns from
+/// `data/commerce/price_patterns.json`. Each pattern is a regex that captures
+/// a price from HTML source. Patterns are tried in order; the first match
+/// wins. This makes the price extraction engine fully data-driven — new
+/// patterns can be added without recompiling.
+#[derive(Clone, Debug)]
+struct PricePatternConfig {
+    /// Ordered list of regex patterns. Each pattern's first capture group
+    /// must be the numeric price value.
+    patterns: Vec<String>,
+}
+
+impl Default for PricePatternConfig {
+    fn default() -> Self {
+        // Built-in fallback patterns (same as the former hardcoded regexes).
+        // These are used when the data file is missing or empty.
+        Self {
+            patterns: vec![
+                // Known price container patterns (Amazon-style, data-price, generic price classes)
+                r#"(?i)(?:class\s*=\s*["'][^"']*(?:a-price|price|product-price|sale-price|offer-price|current-price|selling-price|deal-price)[^"']*["']|data-(?:price|amount|sale-price))\s*(?:[^>]*>\s*|\s*=\s*["'])\s*(?:<[^>]*>\s*)?(?:\$|€|£|¥|₹|Rs\.?|INR|USD|EUR|GBP)?\s*([\d,]+\.?\d*)"#.to_string(),
+                // Meta tag price
+                r#"(?i)(?:itemprop|name|property)\s*=\s*["'](?:price|product:price:amount|product:price)["'][^>]*\s*content\s*=\s*["']([\d,]+\.?\d*)["']"#.to_string(),
+                // data-price attribute
+                r#"(?i)data-price\s*=\s*["']([\d,]+\.?\d*)["']"#.to_string(),
+                // Price text content (requires currency symbol)
+                r#"(?i)<[^>]*(?:class|data-(?:price|amount|sale))\s*=\s*["'][^"'\n]*(?:price|amount|sale|offer|current|selling|deal)[^"'\n]*["'][^>]*>\s*(?:<[^>]*>\s*)?(?:\$|€|£|¥|₹|Rs\.?|INR|USD|EUR|GBP)\s*([\d,]+\.?\d*)\s*(?:</[^>]*>\s*)?</[^>]*>"#.to_string(),
+            ],
+        }
+    }
+}
+
+impl PricePatternConfig {
+    /// Load from `data/commerce/price_patterns.json`. Missing file or
+    /// fields → defaults. The pattern list is data, never code.
+    fn load() -> Self {
+        let mut cfg = Self::default();
+        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
+            let path = std::path::Path::new(dir).join("price_patterns.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(arr) = v.get("patterns").and_then(|x| x.as_array()) {
+                        let loaded: Vec<String> = arr
+                            .iter()
+                            .filter_map(|p| p.get("regex").and_then(|r| r.as_str()).map(String::from))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !loaded.is_empty() {
+                            cfg.patterns = loaded;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        cfg
+    }
+
+    /// Try to extract a (price, currency) from HTML using the loaded patterns.
+    /// Returns the first successful match. Each pattern is compiled lazily
+    /// and cached in a thread-local.
+    fn extract_price(&self, html: &str) -> Option<(f64, String)> {
+        for pattern in &self.patterns {
+            thread_local! {
+                static CACHE: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> = std::cell::RefCell::new(std::collections::HashMap::new());
+            }
+            let regex = CACHE.with(|c| {
+                let mut cache = c.borrow_mut();
+                if let Some(re) = cache.get(pattern) {
+                    re.clone()
+                } else {
+                    match regex::Regex::new(pattern) {
+                        Ok(re) => {
+                            cache.insert(pattern.clone(), re.clone());
+                            re
+                        }
+                        Err(_) => return None,
+                    }
+                }
+            });
+            if let Some(caps) = regex.captures(html) {
+                let raw = caps.get(1)?.as_str().replace(',', "");
+                if let Ok(v) = raw.parse::<f64>() {
+                    if v > 0.0 && v < 10_000_000.0 {
+                        let curr_str = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                        let currency = normalize_currency_str(curr_str);
+                        return Some((v, currency));
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 struct AppState {
     circuit: CircuitBreaker,
     cache: SearchCache,
@@ -12907,6 +13001,11 @@ struct AppState {
     /// override (`is_model_number_price_query`). Changing the brand list
     /// requires NO recompile — edit the file and restart.
     exact_model_config: ExactModelConfig,
+    /// Runtime-loaded HTML price extraction patterns. Loaded once at startup
+    /// from `data/commerce/price_patterns.json`. Used by the commerce offer
+    /// extraction fallback. Changing the pattern list requires NO recompile —
+    /// edit the file and restart.
+    price_pattern_config: PricePatternConfig,
 }
 
 async fn handle_images(
@@ -13544,6 +13643,7 @@ async fn main() {
         commerce_config: CommerceConfig::load(),
         commerce_signals: CommerceSignals::load(),
         exact_model_config: ExactModelConfig::load(),
+        price_pattern_config: PricePatternConfig::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.

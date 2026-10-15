@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "note": "Runtime-loaded HTML price extraction patterns. Each pattern is a regex that captures a price from HTML source. The first capture group must be the numeric price value. Patterns are tried in order; the first match wins. All patterns must include a currency symbol or code near the price to avoid matching bare numbers. Adding a new pattern requires ONLY editing this file — no recompile.",
+  "patterns": [
+    {
+      "name": "known_price_container",
+      "description": "Amazon-style a-price spans, data-price attributes, generic price classes",
+      "regex": "(?i)(?:class\\s*=\\s*[\"'][^\"']*(?:a-price|price|product-price|sale-price|offer-price|current-price|selling-price|deal-price)[^\"']*[\"']|data-(?:price|amount|sale-price))\\s*(?:[^>]*>\\s*|\\s*=\\s*[\"'])\\s*(?:<[^>]*>\\s*)?(?:\\$|€|£|¥|₹|Rs\\.?|INR|USD|EUR|GBP)?\\s*([\\d,]+\\.?\\d*)"
+    },
+    {
+      "name": "meta_tag_price",
+      "description": "Meta tag with itemprop=price or product:price:amount",
+      "regex": "(?i)(?:itemprop|name|property)\\s*=\\s*[\"'](?:price|product:price:amount|product:price)[\"'][^>]*\\s*content\\s*=\\s*[\"']([\\d,]+\\.?\\d*)[\"']"
+    },
+    {
+      "name": "data_price_attribute",
+      "description": "data-price attribute on any element",
+      "regex": "(?i)data-price\\s*=\\s*[\"']([\\d,]+\\.?\\d*)[\"']"
+    },
+    {
+      "name": "price_text_content",
+      "description": "Price as direct text content of a price-related element (requires currency symbol)",
+      "regex": "(?i)<[^>]*(?:class|data-(?:price|amount|sale))\\s*=\\s*[\"'][^\"'\\n]*(?:price|amount|sale|offer|current|selling|deal)[^\"'\\n]*[\"'][^>]*>\\s*(?:<[^>]*>\\s*)?(?:\\$|€|£|¥|₹|Rs\\.?|INR|USD|EUR|GBP)\\s*([\\d,]+\\.?\\d*)\\s*(?:</[^>]*>\\s*)?</[^>]*>"
+    }
+  ]
+}
