@@ -2611,7 +2611,20 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
     let mut positive: Vec<String> = Vec::new();
     let mut file_types = c.file_types.clone();
     let mut sites = c.sites.clone();
-    let phrases = c.phrases.clone();
+    // Filter phrases through NON_TOPICAL_QUERY_WORDS — gateway-extracted phrases
+    // (quoted strings, operator payloads) can carry stopwords ("dont", "want",
+    // "2 hours") that drown topical signal. Drop stopword tokens from each
+    // phrase; if nothing content-bearing remains, drop the phrase entirely.
+    let phrases: Vec<String> = c.phrases.iter().filter_map(|ph| {
+        let filtered: Vec<&str> = ph.split_whitespace()
+            .filter(|w| !NON_TOPICAL_QUERY_WORDS.contains(&w.to_lowercase().as_str()))
+            .collect();
+        if filtered.is_empty() {
+            None
+        } else {
+            Some(filtered.join(" "))
+        }
+    }).collect();
     let mut after_date = c.after_date.clone();
     let mut before_date = c.before_date.clone();
     let mut intitle = c.intitle.clone();
@@ -8717,7 +8730,10 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                in_negation = false;
+                // A preserved domain word inside a negation scope is kept as a
+                // positive term, but it does NOT end the negation scope —
+                // subsequent non-preserved words are still exclusions.
+                // (e.g. "recipes without linux spicy" -> "recipes linux", ["spicy"])
                 result.push(w);
             } else {
                 // Non-domain content word after a negation trigger: treat as an
