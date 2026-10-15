@@ -2582,6 +2582,17 @@ const NON_TOPICAL_QUERY_WORDS: &[&str] = &[
 ];
 
 fn sanitize_constraints(c: &Constraints) -> Constraints {
+    sanitize_constraints_with_query(c, None)
+}
+
+/// Full sanitization with query-aware negative-conclusion gating.
+///
+/// When `q_orig` is provided, negative constraints are additionally checked
+/// against `is_real_exclusion` — this filters out false negatives the intent
+/// engine may emit (e.g. "no cost emi" → "cost emi" is NOT a real exclusion
+/// because "no cost EMI" is a financial term meaning equal monthly installments
+/// without extra cost, not a negation of "cost").
+fn sanitize_constraints_with_query(c: &Constraints, q_orig: Option<&str>) -> Constraints {
     let mut negative: Vec<String> = Vec::new();
     let mut positive: Vec<String> = Vec::new();
     let mut file_types = c.file_types.clone();
@@ -2607,6 +2618,7 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
     // grammar-noise function words (e.g. "is genuinely fun" → exclusion `genuinely`;
     // "and also have parking" → exclusion `also`). These invert the user's intent and
     // penalize relevant pages. General, data-driven gates (no per-query literals).
+    let query_contrastive = q_orig.map(|q| query_is_contrastive(q)).unwrap_or(false);
     for n in &c.negative {
         let mut clean_n = n.trim().to_lowercase();
         if clean_n.starts_with('-') {
@@ -2618,6 +2630,16 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         if clean_n.split_whitespace().count() <= 2 && !clean_n.is_empty() {
             if is_subjective_quality_term(&clean_n) || is_exclusion_grammar_noise(&clean_n) {
                 continue;
+            }
+            // Query-aware gate: when the original query is available, also check
+            // is_real_exclusion. This filters false negatives like "cost emi" from
+            // "no cost emi" (a financial term, not a negation). The intent engine
+            // sees "no" and extracts "cost emi" as a negative, but it is not a
+            // real exclusion — the user wants EMI plans, not to exclude "cost".
+            if let Some(q) = q_orig {
+                if !is_real_exclusion(&clean_n, q, query_contrastive) {
+                    continue;
+                }
             }
             if !negative.contains(&clean_n) {
                 negative.push(clean_n);
@@ -15202,7 +15224,7 @@ async fn handle_search(
         }
     };
 
-    intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+    intent.structured_constraints = sanitize_constraints_with_query(&intent.structured_constraints, Some(&q));
     // MERGE gateway-extracted constraints with engine constraints (gateway parser
     // may catch operators the engine missed).
 
@@ -15308,7 +15330,7 @@ async fn handle_search(
             );
         }
     }
-    intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+    intent.structured_constraints = sanitize_constraints_with_query(&intent.structured_constraints, Some(&q));
 
     // P3 fix: inject detected location as a Target entity so structured_constraints.entities
     // reflects the explicit user location intent. Must happen AFTER intent is defined.
@@ -18468,6 +18490,14 @@ const NL_NEG_STOPWORDS: &[&str] = &[
     "is", "are", "was", "were", "be", "been", "being", "has", "have", "had",
     "do", "does", "did", "will", "would", "should", "can", "could",
     "your", "you", "our", "we", "they", "it", "its", "their", "from", "but",
+    // Trailer verbs that follow a negation marker but are not the exclusion
+    // target (e.g. "without calling a plumber" → exclude "plumber", not
+    // "calling"). Mirrors the trailer_verbs list in
+    // extract_query_negative_terms_with_dropped so both negation extractors
+    // skip the same function words.
+    "calling", "called", "call", "using", "use", "used", "taking", "taken",
+    "take", "having", "making", "make", "made", "getting", "get", "got",
+    "buying", "buy", "bought", "eating", "eat", "ate", "drinking", "drink",
 ];
 
 fn normalize_nl_operators(query: &str) -> String {
