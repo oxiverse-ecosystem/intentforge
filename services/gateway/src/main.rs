@@ -4438,7 +4438,7 @@ async fn enrich_with_commerce<F, Fut>(
         // certain than structured data.
         if !attached {
             let snippet = format!(
-                "{} {}",
+                "{}\n{}",
                 r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
                 r.get("content").and_then(|v| v.as_str()).unwrap_or("")
             );
@@ -4526,7 +4526,7 @@ fn enrich_single_commerce(
     // parallel enrichment paths (this function is the shared attach point).
     if !has_fact {
         let snippet = format!(
-            "{} {}",
+            "{}\n{}",
             r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
             r.get("content").and_then(|v| v.as_str()).unwrap_or("")
         );
