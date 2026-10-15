@@ -9277,6 +9277,19 @@ fn has_numeric_constraint(query: &str) -> bool {
     q_lower.split_whitespace().any(|w| w.chars().any(|c| c.is_ascii_digit()))
 }
 
+/// Decide whether the cold-start bounded retry should fire.
+///
+/// The retry fires only when the candidate pool is completely empty (all
+/// upstreams timed out or returned nothing) AND at least one SearXNG instance
+/// is available to re-probe. This prevents the retry from firing on genuine
+/// zero-hit queries where the upstreams responded successfully with no matches.
+///
+/// Extracted from `handle_search` for testability — the actual retry I/O
+/// (fan-out, backoff, result merging) stays inline in the handler.
+fn should_cold_start_retry(web_results_empty: bool, searx_instances_available: bool) -> bool {
+    web_results_empty && searx_instances_available
+}
+
 
 // ─── JSON Key Deduplication ────────────────────────────────────────
 // Removes duplicate keys from JSON objects. Keeps the LAST value for each key.
@@ -17254,6 +17267,123 @@ async fn handle_search(
                     }
                 }
             }
+        }
+    }
+
+    // ─── Cold-start bounded retry ──────────────────────────────────────
+    // When all upstreams time out under concurrent load, the candidate pool
+    // is empty and the gateway returns 0 results with no retry. This adds a
+    // single bounded retry: wait 500ms, then re-fire the raw query on ALL
+    // instances with a tight 3s per-instance timeout. If the retry also fails,
+    // we fall through to serve whatever partial results exist (Invidious,
+    // news, image) with partial_results=true.
+    if web_results.is_empty() && !searx_base_urls.is_empty() {
+        let cold_start_retry_timeout = Duration::from_secs(3);
+        tracing::warn!(
+            "COLD-START RETRY: web_results empty after all upstream attempts, \
+             re-firing raw query on {} instance(s) with {} timeout",
+            searx_base_urls.len(),
+            cold_start_retry_timeout.as_secs()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut cold_retry_futs = Vec::new();
+        for (inst_idx, base_url) in searx_base_urls.iter().enumerate() {
+            let retry_key = searx_base_keys[inst_idx].clone();
+            if circuit_ref.is_open(&retry_key) { continue; }
+            let retry_url = searxng_url(base_url, &q, geo_location.as_ref(), lang);
+            let retry_client = client.clone();
+            let retry_circuit = circuit_ref.clone();
+            cold_retry_futs.push(Box::pin(async move {
+                let task = tokio::spawn(async move {
+                    match tokio::time::timeout(
+                        cold_start_retry_timeout,
+                        retry_client.get(&retry_url).send(),
+                    ).await {
+                        Ok(Ok(resp)) => {
+                            let raw = match tokio::time::timeout(
+                                Duration::from_secs(2),
+                                resp.text(),
+                            ).await {
+                                Ok(Ok(t)) => t,
+                                _ => return (inst_idx, retry_key, None),
+                            };
+                            let sanitized = sanitize_json_text(&raw);
+                            match serde_json::from_str::<SearxResponse>(&sanitized) {
+                                Ok(data) => (inst_idx, retry_key, Some(data)),
+                                Err(_) => (inst_idx, retry_key, None),
+                            }
+                        }
+                        _ => (inst_idx, retry_key, None),
+                    }
+                });
+                match task.await {
+                    Ok((inst_idx, key, result)) => (inst_idx, key, result),
+                    Err(_) => (inst_idx, retry_key, None),
+                }
+            }));
+        }
+
+        let mut cold_retry_count = 0usize;
+        let mut pending = cold_retry_futs;
+        while !pending.is_empty() {
+            let ((inst_idx, retry_key, result), _idx, remaining) =
+                futures::future::select_all(pending).await;
+            pending = remaining;
+            match result {
+                Ok(data) if !data.results.is_empty() => {
+                    tracing::info!(
+                        "COLD-START RETRY: instance {} returned {} results",
+                        inst_idx, data.results.len()
+                    );
+                    partial_results = true;
+                    circuit_ref.record_success(&retry_key);
+                    for (pos, result) in data.results.into_iter().enumerate() {
+                        let engine_weight = circuit_ref.weight(&result.engine);
+                        let normalized = {
+                            let lower = result.url.to_lowercase();
+                            let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                            let no_trailing = no_fragment.trim_end_matches('/');
+                            let no_www = no_trailing.replacen("://www.", "://", 1);
+                            let no_mobile = no_www
+                                .replacen("://m.", "://", 1)
+                                .replacen("://mobile.", "://", 1);
+                            strip_tracking_params(&no_mobile)
+                        };
+                        if !url_rrf_contributions.contains_key(&normalized) {
+                            let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
+                            *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
+                            let mut instance_tagged = result;
+                            let instance_tag =
+                                format!("instance_{}", retry_key.trim_start_matches("searxng"));
+                            if !instance_tagged.sources.contains(&instance_tag) {
+                                instance_tagged.sources.push(instance_tag);
+                            }
+                            web_results.push(instance_tagged);
+                            cold_retry_count += 1;
+                        }
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!("COLD-START RETRY: instance {} returned 0 results", inst_idx);
+                    circuit_ref.record_success(&retry_key);
+                }
+                Err(_) => {
+                    tracing::warn!("COLD-START RETRY: instance {} failed", inst_idx);
+                    circuit_ref.record_failure(&retry_key);
+                }
+            }
+        }
+        if cold_retry_count > 0 {
+            tracing::info!(
+                "COLD-START RETRY: recovered {} results from retry",
+                cold_retry_count
+            );
+        } else {
+            tracing::warn!(
+                "COLD-START RETRY: all instances still empty — serving partial results"
+            );
+            partial_results = true;
         }
     }
 
