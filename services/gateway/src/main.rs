@@ -19241,7 +19241,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             && (sc.price_lt.is_some() || sc.price_gt.is_some() || sc.price_min.is_some() || sc.price_max.is_some())
         { Some(priced_result_count) } else { None },
         recall_gap_terms,
-        shopping: shopping_block,
+        shopping: shopping_block.clone(),
     };
 
     // Cache for 5 minutes — but never cache empty results
