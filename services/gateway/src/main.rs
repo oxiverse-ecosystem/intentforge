@@ -25030,8 +25030,8 @@ mod mainpath_shopping_strip_tests {
         // But provenance should still be present (honest: we checked, found nothing)
         assert!(result.get("commerce_provenance").is_some());
         let prov = result.get("commerce_provenance").unwrap();
-        assert_eq!(prov.get("source").unwrap(), serde_json::Value::Null);
-        assert_eq!(prov.get("data").unwrap(), serde_json::Value::Null);
+        assert_eq!(prov.get("source").unwrap(), &serde_json::Value::Null);
+        assert_eq!(prov.get("data").unwrap(), &serde_json::Value::Null);
     }
 
     #[test]
