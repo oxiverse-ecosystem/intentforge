@@ -16401,6 +16401,9 @@ async fn handle_search(
             if s.contains("...") {
                 let parts: Vec<&str> = s.split("...").collect();
                 parts.len() == 2 && q_lower.contains(parts[0].trim()) && q_lower.contains(parts[1].trim())
+            } else if *s == "vs" {
+                // Word-boundary match: "vs" must not match inside "vscode", "visual", etc.
+                regex::Regex::new(r"\bvs\b").map(|re| re.is_match(&q_lower)).unwrap_or(false)
             } else {
                 q_lower.contains(s)
             }
