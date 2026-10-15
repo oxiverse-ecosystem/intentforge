@@ -19271,11 +19271,28 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // it null when credentials are missing). The gate is the signal-driven
     // `is_commercial_intent` classifier (transactional label / strong
     // transactional distribution / price bound), NOT a keyword check.
+    //
+    // Commerce facts (price, availability, merchant, etc.) are replayed onto
+    // the main results array from the shopping block — a strict post-ranking
+    // fact replay that never touches order, selection, or scoring. This lets
+    // the frontend show product facts inline in the main results list without
+    // requiring the user to look at the separate shopping strip.
     let response_json = serde_json::to_value(&response).unwrap_or(serde_json::json!({}));
-    let final_json = if is_commercial && is_exact_model_query(&q_lower, &state.exact_model_config) {
+    let final_json = if is_commercial {
         let mut v = response_json;
+        // Replay commerce facts from the shopping block onto matching URLs
+        // in the main results array. This is a pure fact replay — it copies
+        // already-extracted `commerce` + `commerce_provenance` from the
+        // shopping block onto the same URLs in `results`. No reordering, no
+        // re-fetching, no re-scoring. The order-invariance test proves this.
         if let Some(arr) = v.get_mut("results").and_then(|r| r.as_array_mut()) {
-            decorate_affiliate(arr, &state.affiliate_ctx);
+            copy_commerce_facts_from_shopping_block(arr, shopping_block.as_ref());
+        }
+        // Affiliate decoration on main results (exact-model gate only).
+        if is_exact_model_query(&q_lower, &state.exact_model_config) {
+            if let Some(arr) = v.get_mut("results").and_then(|r| r.as_array_mut()) {
+                decorate_affiliate(arr, &state.affiliate_ctx);
+            }
         }
         v
     } else {
@@ -24285,6 +24302,69 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let before = serde_json::to_value(&results).unwrap();
         copy_commerce_facts_from_shopping_block(&mut results, None);
         assert_eq!(before, serde_json::to_value(&results).unwrap(), "no-op when shopping is None");
+    }
+
+    /// Main-path commerce fact replay: when `handle_search` attaches commerce
+    /// facts to the main `results` array (via `copy_commerce_facts_from_shopping_block`),
+    /// the ranked URL order MUST be byte-identical before and after. This is the
+    /// no-manipulation guarantee for the main `/search` path — the same invariant
+    /// the order-invariance test enforces for the `/shopping` endpoint.
+    #[test]
+    fn main_path_commerce_replay_preserves_ranked_order() {
+        // Simulate a ranked results array (already scored and ordered).
+        let mut results: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0, "title": "Product A" }),
+            serde_json::json!({ "url": "https://store.example.com/p/2", "score": 8.5, "title": "Product B" }),
+            serde_json::json!({ "url": "https://store.example.com/p/3", "score": 8.0, "title": "Product C" }),
+            serde_json::json!({ "url": "https://store.example.com/p/4", "score": 7.5, "title": "Product D" }),
+        ];
+
+        // Shopping block with commerce facts for URLs 1 and 3.
+        let shopping = serde_json::json!({
+            "results": [
+                { "url": "https://store.example.com/p/1",
+                  "commerce": { "price": 199.0, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/1",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
+                      "data": { "price": 199.0 } } },
+                { "url": "https://store.example.com/p/3",
+                  "commerce": { "price": 49.99, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/3",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "og",
+                      "data": { "price": 49.99 } } },
+            ]
+        });
+
+        let before_urls: Vec<String> = results
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        let before_scores: Vec<f64> = results
+            .iter()
+            .map(|r| r["score"].as_f64().unwrap())
+            .collect();
+
+        copy_commerce_facts_from_shopping_block(&mut results, Some(&shopping));
+
+        // THE CONTRACT: ranked URL order and scores are byte-identical.
+        let after_urls: Vec<String> = results
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        let after_scores: Vec<f64> = results
+            .iter()
+            .map(|r| r["score"].as_f64().unwrap())
+            .collect();
+        assert_eq!(before_urls, after_urls, "URL order must be byte-identical");
+        assert_eq!(before_scores, after_scores, "scores must be unchanged");
+
+        // Commerce facts attached to matching URLs.
+        assert_eq!(results[0]["commerce"]["price"], 199.0);
+        assert_eq!(results[2]["commerce"]["price"], 49.99);
+
+        // Non-matching URLs stay null.
+        assert!(results[1].get("commerce").is_none());
+        assert!(results[3].get("commerce").is_none());
     }
 
     // ── Microformats2 h-product extraction ───────────────────────────────
