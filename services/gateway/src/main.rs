@@ -25117,11 +25117,11 @@ mod mainpath_shopping_strip_tests {
         let commerce = result.get("commerce").expect("commerce block should be attached");
         assert_eq!(commerce.get("source").unwrap(), "snippet_extracted");
         let data = commerce.get("data").unwrap();
-        assert_eq!(data.get("price").unwrap(), 349.99);
-        assert_eq!(data.get("currency").unwrap(), "USD");
-        assert_eq!(data.get("availability").unwrap(), "in_stock");
-        assert_eq!(data.get("merchant").unwrap(), "www.bestbuy.com");
-        assert_eq!(data.get("name").unwrap(), "Sony WH-1000XM5 Wireless Headphones");
+        assert_eq!(data.get("price").unwrap(), &serde_json::json!(349.99));
+        assert_eq!(data.get("currency").unwrap(), &serde_json::json!("USD"));
+        assert_eq!(data.get("availability").unwrap(), &serde_json::json!("in_stock"));
+        assert_eq!(data.get("merchant").unwrap(), &serde_json::json!("www.bestbuy.com"));
+        assert_eq!(data.get("name").unwrap(), &serde_json::json!("Sony WH-1000XM5 Wireless Headphones"));
     }
 
     #[test]
@@ -25140,10 +25140,10 @@ mod mainpath_shopping_strip_tests {
 
         let commerce = result.get("commerce").expect("commerce block should be attached");
         // Source should be the structured data source, NOT snippet_extracted
-        assert_ne!(commerce.get("source").unwrap(), "snippet_extracted");
+        assert_ne!(commerce.get("source").unwrap(), &serde_json::json!("snippet_extracted"));
         let data = commerce.get("data").unwrap();
-        assert_eq!(data.get("price").unwrap(), 299.99);
-        assert_eq!(data.get("name").unwrap(), "Sony WH-1000XM5");
+        assert_eq!(data.get("price").unwrap(), &serde_json::json!(299.99));
+        assert_eq!(data.get("name").unwrap(), &serde_json::json!("Sony WH-1000XM5"));
     }
 
     #[test]
