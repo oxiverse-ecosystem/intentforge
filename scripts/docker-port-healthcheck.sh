@@ -32,7 +32,11 @@ COMPOSE_FILE="docker-compose.dev.yml"
 
 # Services that share the gluetun network namespace and must be recreated
 # when gluetun is recreated (their port bindings live on gluetun).
-GLUETUN_DEPENDENTS="gluetun gateway indexer crawler intent-engine searxng tor vpn-rotator"
+# NOTE: vpn-rotator is excluded from this list because it has no published
+# ports and no container_name in the compose file (it uses the default
+# naming scheme). It will be recreated automatically when gluetun is
+# recreated because it depends_on gluetun.
+GLUETUN_DEPENDENTS="gluetun gateway indexer crawler intent-engine searxng tor"
 
 # Services on the tor2 network namespace (independent path)
 TOR2_DEPENDENCIES="tor2 searxng2"
