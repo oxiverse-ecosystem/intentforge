@@ -235,12 +235,8 @@ fn normalize_currency_str(s: &str) -> String {
     }
 }
 
-fn is_model_number_price_query(q_lower: &str) -> bool {
-    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let model_re = MODEL_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+\d{1,2}").unwrap()
-    });
-    let has_model = model_re.is_match(q_lower);
+fn is_model_number_price_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
+    let has_model = cfg.has_exact_model(q_lower);
     let has_price = q_lower.contains("price") || q_lower.contains("cost")
         || q_lower.contains("rupee") || q_lower.contains("rupees")
         || q_lower.contains("inr") || q_lower.contains('₹')
@@ -15834,7 +15830,7 @@ async fn handle_search(
         // "oneplus 12 price") — the word "price" alone is weak signal. When a known
         // brand+model pattern co-occurs with a price/cost term, the intent is
         // decisively transactional (P10/P11 style compensation for the linear probe).
-        if is_model_number_price_query(&q_lower) {
+        if is_model_number_price_query(&q_lower, &state.exact_model_config) {
             if intent.intent != "transactional" || intent.confidence < 0.60 {
                 tracing::info!(
                     "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
