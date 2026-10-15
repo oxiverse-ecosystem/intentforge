@@ -106,6 +106,8 @@ const PROTECTED_TERMS: &[&str] = &[
     "btech", "mtech", "bca", "mca", "be", "me", "mba", "phd", "bsc", "msc", "ba", "ma", "bcom", "mcom",
     // Car brands at edit-distance 1 from common English/dictionary words (brand-corruption class)
     "skoda", "seat", "saab",
+    // Tech brands at edit-distance 1 from common English words (brand-corruption class)
+    "iphone", "ipad", "ipod", "imac",
 ];
 
 /// Returns true if `word` is a protected brand/entity that must never be
