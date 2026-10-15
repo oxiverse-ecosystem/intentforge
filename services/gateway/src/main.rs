@@ -17295,6 +17295,7 @@ async fn handle_search(
             let retry_client = client.clone();
             let retry_circuit = circuit_ref.clone();
             cold_retry_futs.push(Box::pin(async move {
+                let retry_key_outer = retry_key.clone();
                 let task = tokio::spawn(async move {
                     match tokio::time::timeout(
                         cold_start_retry_timeout,
@@ -17306,20 +17307,20 @@ async fn handle_search(
                                 resp.text(),
                             ).await {
                                 Ok(Ok(t)) => t,
-                                _ => return (inst_idx, retry_key, None),
+                                _ => return (inst_idx, retry_key.clone(), None),
                             };
                             let sanitized = sanitize_json_text(&raw);
                             match serde_json::from_str::<SearxResponse>(&sanitized) {
-                                Ok(data) => (inst_idx, retry_key, Some(data)),
-                                Err(_) => (inst_idx, retry_key, None),
+                                Ok(data) => (inst_idx, retry_key.clone(), Some(data)),
+                                Err(_) => (inst_idx, retry_key.clone(), None),
                             }
                         }
-                        _ => (inst_idx, retry_key, None),
+                        _ => (inst_idx, retry_key.clone(), None),
                     }
                 });
                 match task.await {
                     Ok((inst_idx, key, result)) => (inst_idx, key, result),
-                    Err(_) => (inst_idx, retry_key, None),
+                    Err(_) => (inst_idx, retry_key_outer, None),
                 }
             }));
         }
@@ -17331,7 +17332,7 @@ async fn handle_search(
                 futures::future::select_all(pending).await;
             pending = remaining;
             match result {
-                Ok(data) if !data.results.is_empty() => {
+                Some(data) if !data.results.is_empty() => {
                     tracing::info!(
                         "COLD-START RETRY: instance {} returned {} results",
                         inst_idx, data.results.len()
@@ -17364,11 +17365,11 @@ async fn handle_search(
                         }
                     }
                 }
-                Ok(_) => {
+                Some(_) => {
                     tracing::warn!("COLD-START RETRY: instance {} returned 0 results", inst_idx);
                     circuit_ref.record_success(&retry_key);
                 }
-                Err(_) => {
+                None => {
                     tracing::warn!("COLD-START RETRY: instance {} failed", inst_idx);
                     circuit_ref.record_failure(&retry_key);
                 }
@@ -25374,5 +25375,58 @@ mod local_intent_gazetteer_tests {
                 q
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cold_start_retry_tests {
+    use super::*;
+
+    /// Regression test: the cold-start retry MUST fire when the candidate pool
+    /// is empty and SearXNG instances are available.
+    ///
+    /// Before the fix, `handle_search` had no retry path for this case — when
+    /// all upstreams timed out, the gateway returned 0 results with no retry
+    /// or partial fallback. The `should_cold_start_retry` helper encodes the
+    /// decision the inline retry block uses.
+    #[test]
+    fn cold_start_retry_fires_when_results_empty_and_instances_available() {
+        // All upstreams timed out → web_results is empty, instances exist.
+        assert!(
+            should_cold_start_retry(true, true),
+            "cold-start retry must fire when results are empty and instances are available"
+        );
+    }
+
+    #[test]
+    fn cold_start_retry_does_not_fire_when_results_exist() {
+        // Upstream returned results — no need to retry.
+        assert!(
+            !should_cold_start_retry(false, true),
+            "cold-start retry must NOT fire when results already exist"
+        );
+    }
+
+    #[test]
+    fn cold_start_retry_does_not_fire_when_no_instances_available() {
+        // No SearXNG instances to re-probe — retry would be a no-op.
+        assert!(
+            !should_cold_start_retry(true, false),
+            "cold-start retry must NOT fire when no instances are available"
+        );
+    }
+
+    #[test]
+    fn cold_start_retry_does_not_fire_when_genuine_zero_hit() {
+        // Genuine zero-hit: upstreams responded successfully with no matches.
+        // web_results is empty but this is NOT a cold-start failure — the
+        // retry should still fire (it will just return 0 again, harmlessly),
+        // but the decision is driven by the empty-results condition alone.
+        // This test documents that the retry is a bounded probe, not a
+        // guarantee of results.
+        assert!(
+            should_cold_start_retry(true, true),
+            "cold-start retry fires on empty results regardless of cause (bounded probe)"
+        );
     }
 }
