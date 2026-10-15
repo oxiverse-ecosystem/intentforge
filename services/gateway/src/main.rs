@@ -1575,6 +1575,34 @@ fn text_matches_negative(text_lower: &str, term_lower: &str) -> bool {
     })
 }
 
+/// Returns true if a multi-word negative constraint matches a text via
+/// partial-word fallback: when the exact phrase is absent, match if ANY
+/// content word (non-stopword, len >= 3) of the negative appears in the text.
+/// This handles cases like "alternatives to adobe photoshop" not matching
+/// "Adobe Creative Cloud" pages — the content word "adobe" still signals
+/// the excluded entity.
+fn multi_word_negative_matches_text(neg_lower: &str, text_lower: &str) -> bool {
+    // First try exact phrase match (existing behavior)
+    if text_lower.contains(neg_lower) {
+        return true;
+    }
+    // Fallback: match any content word of the negative
+    let neg_words: Vec<&str> = neg_lower.split_whitespace().collect();
+    let text_words: Vec<&str> = text_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    neg_words.iter().any(|nw| {
+        let nw_clean: String = nw.chars().filter(|c| c.is_alphanumeric()).collect();
+        if nw_clean.len() < 3 || STOPWORDS.contains(&nw_clean.as_str()) {
+            return false;
+        }
+        text_words.iter().any(|tw| {
+            negative_term_matches_token(&nw_clean, tw)
+        })
+    })
+}
+
 /// Gazetteer mapping well-known place names to ISO-3166 country codes.
 /// This is *reference data* (like a dictionary), NOT per-query hardcoded logic:
 /// it lets a query that explicitly names a location override the IP-derived
@@ -2135,14 +2163,15 @@ fn constraint_score(
                 }
             })
         } else {
-            title_lower.contains(&neg_lower) || title_normalized.contains(&neg_normalized)
-            || url.to_lowercase().contains(&neg_lower)
+            multi_word_negative_matches_text(&neg_lower, &title_lower)
+            || multi_word_negative_matches_text(&neg_lower, &title_normalized)
+            || multi_word_negative_matches_text(&neg_lower, &url.to_lowercase())
         };
 
         let content_matched = if neg_words.len() == 1 {
             text_matches_negative(&content.to_lowercase(), &neg_lower)
         } else {
-            content.to_lowercase().contains(&neg_lower)
+            multi_word_negative_matches_text(&neg_lower, &content.to_lowercase())
         };
 
         if title_or_url_matched {
@@ -16985,8 +17014,7 @@ async fn handle_search(
                         if words.len() == 1 {
                             text_matches_negative(&text_lower, &neg_lower)
                         } else {
-                            let joined = words.join(" ");
-                            text_lower.contains(&joined)
+                            multi_word_negative_matches_text(&neg_lower, &text_lower)
                         }
                     });
                     // No hard drop — soft penalty applied later in scoring.
@@ -17591,8 +17619,8 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     // "not java" from dropping every "javascript" result.
                     !text_matches_negative(&text_lower, &neg_lower)
                 } else {
-                    let joined = words.join(" ");
-                    !(text_lower.contains(&joined) || text_normalized.contains(&joined))
+                    !(multi_word_negative_matches_text(&neg_lower, &text_lower)
+                      || multi_word_negative_matches_text(&neg_lower, &text_normalized))
                 }
             });
 
