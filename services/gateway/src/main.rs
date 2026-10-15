@@ -421,6 +421,156 @@ fn is_exact_model_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
     cfg.has_exact_model(q_lower)
 }
 
+/// Runtime-loaded commerce intent signals from `data/commerce/signals.json`.
+/// The `transactional_keywords` list is a WEAK signal boost to the existing
+/// intent classifier — it never replaces the label/distribution check, it only
+/// adds recall when the intent engine is borderline. All values can be changed
+/// WITHOUT recompile.
+#[derive(Clone, Debug)]
+struct CommerceSignals {
+    /// Keywords that weakly indicate transactional intent. Checked as whole-word
+    /// matches against the query. This is a SUPPLEMENT to the intent engine's
+    /// label/distribution — never a standalone classifier.
+    transactional_keywords: Vec<String>,
+}
+
+impl Default for CommerceSignals {
+    fn default() -> Self {
+        Self {
+            transactional_keywords: vec![
+                "buy", "price", "pricing", "cheap", "cheapest", "purchase",
+                "shop", "discount", "coupon", "deal", "deals", "offer",
+                "sale", "order", "pay", "budget", "cost", "worth", "value",
+                "refurbished", "under", "store",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        }
+    }
+}
+
+impl CommerceSignals {
+    /// Load from `data/commerce/signals.json`. Missing file or fields → defaults.
+    fn load() -> Self {
+        let mut sig = Self::default();
+        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
+            let path = std::path::Path::new(dir).join("signals.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(kw) = v.get("transactional_keywords").and_then(|x| x.as_array()) {
+                        let loaded: Vec<String> = kw
+                            .iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_lowercase()))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !loaded.is_empty() {
+                            sig.transactional_keywords = loaded;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        sig
+    }
+
+    /// True when the query contains any transactional keyword as a WHOLE WORD.
+    /// This is a weak signal — it supplements the intent engine's label /
+    /// distribution, never replaces it. Returns false for empty queries.
+    fn has_transactional_keyword(&self, query: &str) -> bool {
+        if self.transactional_keywords.is_empty() || query.is_empty() {
+            return false;
+        }
+        let q_lower = query.to_lowercase();
+        self.transactional_keywords.iter().any(|kw| {
+            let mut start = 0;
+            while let Some(pos) = q_lower[start..].find(kw) {
+                let abs_pos = start + pos;
+                let before_ok = abs_pos == 0
+                    || !q_lower.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+                let after_pos = abs_pos + kw.len();
+                let after_ok = after_pos >= q_lower.len()
+                    || !q_lower.as_bytes()[after_pos].is_ascii_alphanumeric();
+                if before_ok && after_ok {
+                    return true;
+                }
+                start = abs_pos + 1;
+            }
+            false
+        })
+    }
+}
+
+/// Runtime-loaded exact-model brand patterns from
+/// `data/commerce/exact_model_brands.json`. The brand list is the data
+/// source for the affiliate eligibility gate (`is_exact_model_query`) and
+/// the transactional intent override (`is_model_number_price_query`).
+#[derive(Clone, Debug)]
+struct ExactModelConfig {
+    brands: Vec<String>,
+}
+
+impl Default for ExactModelConfig {
+    fn default() -> Self {
+        Self {
+            brands: vec![
+                "iphone", "ipad", "galaxy", "oneplus", "pixel", "redmi",
+                "nothing", "xiaomi", "poco", "realme", "rog", "zenfone",
+                "nokia", "moto", "motorola", "surface", "macbook", "imac", "watch",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        }
+    }
+}
+
+impl ExactModelConfig {
+    fn load() -> Self {
+        let mut cfg = Self::default();
+        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
+            let path = std::path::Path::new(dir).join("exact_model_brands.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(arr) = v.get("brands").and_then(|x| x.as_array()) {
+                        let loaded: Vec<String> = arr
+                            .iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_lowercase()))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !loaded.is_empty() {
+                            cfg.brands = loaded;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        cfg
+    }
+
+    fn has_exact_model(&self, q_lower: &str) -> bool {
+        if self.brands.is_empty() || q_lower.is_empty() {
+            return false;
+        }
+        let q = q_lower.to_lowercase();
+        let tokens: Vec<&str> = q.split_whitespace().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            let token_clean = token.trim_matches(|c: char| !c.is_alphanumeric());
+            if !self.brands.iter().any(|b| b == token_clean) {
+                continue;
+            }
+            for j in (i + 1)..std::cmp::min(i + 5, tokens.len()) {
+                if tokens[j].chars().any(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 fn has_price_signal(title_lower: &str, content_lower: &str) -> bool {
     static RS_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let rs_re = RS_REGEX.get_or_init(|| regex::Regex::new(r"(?i)\b(rs\.?|rupee|rupees|inr)\b|₹").unwrap());
