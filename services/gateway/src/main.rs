@@ -15795,8 +15795,12 @@ async fn handle_search(
             "understand ", "learn ", "teach me ",
         ];
         let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+        // Use the runtime-loaded CommerceSignals whole-word matcher instead of a
+        // hardcoded substring list. The old `contains("price ")` check missed
+        // "price" at the END of a query (no trailing space), so "sony wh-1000xm5
+        // price" and "iphone 16 pro max price" were not detected as transactional.
+        // The keyword list lives in data/commerce/signals.json — no recompile.
+        let has_tx_signal = state.commerce_signals.has_transactional_keyword(&q_lower);
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -15828,24 +15832,6 @@ async fn handle_search(
                         q, intent.intent, intent.confidence
                     );
                 }
-                intent.intent = "transactional".to_string();
-                intent.confidence = intent.confidence.max(0.80);
-                let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
-                intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
-            }
-        }
-
-        // Override 7: Model-number + price/cost terms → transactional
-        // The classifier misses model-number patterns ("iphone 16 pro max price",
-        // "oneplus 12 price") — the word "price" alone is weak signal. When a known
-        // brand+model pattern co-occurs with a price/cost term, the intent is
-        // decisively transactional (P10/P11 style compensation for the linear probe).
-        if is_model_number_price_query(&q_lower, &state.exact_model_config) {
-            if intent.intent != "transactional" || intent.confidence < 0.60 {
-                tracing::info!(
-                    "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
-                    q, intent.intent, intent.confidence
-                );
                 intent.intent = "transactional".to_string();
                 intent.confidence = intent.confidence.max(0.80);
                 let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
@@ -15994,6 +15980,26 @@ async fn handle_search(
             intent.distribution.insert("informational".to_string(), (info_prob + current_top_prob * 0.5).min(0.85));
             let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
             intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
+        }
+    }
+
+    // Override 7: Model-number + price/cost terms → transactional
+    // The classifier misses model-number patterns ("iphone 16 pro max price",
+    // "oneplus 12 price") — the word "price" alone is weak signal. When a known
+    // brand+model pattern co-occurs with a price/cost term, the intent is
+    // decisively transactional (P10/P11 style compensation for the linear probe).
+    // MOVED OUTSIDE the confidence gate (2026-10-16): a decisive pattern match
+    // must not be suppressed by a high-confidence misclassification.
+    if is_model_number_price_query(&q_lower, &state.exact_model_config) {
+        if intent.intent != "transactional" || intent.confidence < 0.60 {
+            tracing::info!(
+                "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "transactional".to_string();
+            intent.confidence = intent.confidence.max(0.80);
+            let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
+            intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
         }
     }
 
