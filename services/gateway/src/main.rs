@@ -12945,24 +12945,26 @@ impl PricePatternConfig {
             let regex = CACHE.with(|c| {
                 let mut cache = c.borrow_mut();
                 if let Some(re) = cache.get(pattern) {
-                    re.clone()
+                    Some(re.clone())
                 } else {
                     match regex::Regex::new(pattern) {
                         Ok(re) => {
                             cache.insert(pattern.clone(), re.clone());
-                            re
+                            Some(re)
                         }
-                        Err(_) => return None,
+                        Err(_) => None,
                     }
                 }
             });
-            if let Some(caps) = regex.captures(html) {
-                let raw = caps.get(1)?.as_str().replace(',', "");
-                if let Ok(v) = raw.parse::<f64>() {
-                    if v > 0.0 && v < 10_000_000.0 {
-                        let curr_str = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-                        let currency = normalize_currency_str(curr_str);
-                        return Some((v, currency));
+            if let Some(ref regex) = regex {
+                if let Some(caps) = regex.captures(html) {
+                    let raw = caps.get(1)?.as_str().replace(',', "");
+                    if let Ok(v) = raw.parse::<f64>() {
+                        if v > 0.0 && v < 10_000_000.0 {
+                            let curr_str = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                            let currency = normalize_currency_str(curr_str);
+                            return Some((v, currency));
+                        }
                     }
                 }
             }
@@ -24155,7 +24157,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let mut r = serde_json::json!({
             "url": "https://shop.example.com/p/widget",
         });
-        enrich_single_commerce(&mut r, HTML_SINGLE_OFFER);
+        enrich_single_commerce(&mut r, HTML_SINGLE_OFFER, &PricePatternConfig::default());
 
         assert!(
             r.get("commerce").is_some(),
@@ -24191,7 +24193,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let mut r = serde_json::json!({
             "url": "https://blog.example.com/post",
         });
-        enrich_single_commerce(&mut r, HTML_NO_H_PRODUCT);
+        enrich_single_commerce(&mut r, HTML_NO_H_PRODUCT, &PricePatternConfig::default());
 
         assert!(r.get("commerce").is_none(), "no fabricated commerce block");
         let p = &r["commerce_provenance"];
