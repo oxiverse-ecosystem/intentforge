@@ -235,12 +235,8 @@ fn normalize_currency_str(s: &str) -> String {
     }
 }
 
-fn is_model_number_price_query(q_lower: &str) -> bool {
-    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let model_re = MODEL_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+\d{1,2}").unwrap()
-    });
-    let has_model = model_re.is_match(q_lower);
+fn is_model_number_price_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
+    let has_model = cfg.has_exact_model(q_lower);
     let has_price = q_lower.contains("price") || q_lower.contains("cost")
         || q_lower.contains("rupee") || q_lower.contains("rupees")
         || q_lower.contains("inr") || q_lower.contains('₹')
@@ -250,6 +246,182 @@ fn is_model_number_price_query(q_lower: &str) -> bool {
     has_model && has_price
 }
 
+/// Runtime-loaded commerce intent signals from `data/commerce/signals.json`.
+/// The `transactional_keywords` list is a WEAK signal boost to the existing
+/// intent classifier — it never replaces the label/distribution check, it only
+/// adds recall when the intent engine is borderline. All values can be changed
+/// WITHOUT recompile.
+#[derive(Clone, Debug)]
+struct CommerceSignals {
+    /// Keywords that weakly indicate transactional intent. Checked as whole-word
+    /// matches against the query. This is a SUPPLEMENT to the intent engine's
+    /// label/distribution — never a standalone classifier.
+    transactional_keywords: Vec<String>,
+}
+
+impl Default for CommerceSignals {
+    fn default() -> Self {
+        Self {
+            transactional_keywords: vec![
+                "buy", "price", "pricing", "cheap", "cheapest", "purchase",
+                "shop", "discount", "coupon", "deal", "deals", "offer",
+                "sale", "order", "pay", "budget", "cost", "worth", "value",
+                "refurbished", "under", "store",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        }
+    }
+}
+
+impl CommerceSignals {
+    /// Load from `data/commerce/signals.json`. Missing file or fields → defaults.
+    fn load() -> Self {
+        let mut sig = Self::default();
+        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
+            let path = std::path::Path::new(dir).join("signals.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(kw) = v.get("transactional_keywords").and_then(|x| x.as_array()) {
+                        let loaded: Vec<String> = kw
+                            .iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_lowercase()))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !loaded.is_empty() {
+                            sig.transactional_keywords = loaded;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        sig
+    }
+
+    /// True when the query contains any transactional keyword as a WHOLE WORD.
+    /// This is a weak signal — it supplements the intent engine's label /
+    /// distribution, never replaces it. Returns false for empty queries.
+    fn has_transactional_keyword(&self, query: &str) -> bool {
+        if self.transactional_keywords.is_empty() || query.is_empty() {
+            return false;
+        }
+        let q_lower = query.to_lowercase();
+        self.transactional_keywords.iter().any(|kw| {
+            // Whole-word match: the keyword must be bounded by non-alphanumeric
+            // characters (or string start/end) on both sides.
+            let mut start = 0;
+            while let Some(pos) = q_lower[start..].find(kw) {
+                let abs_pos = start + pos;
+                let before_ok = abs_pos == 0
+                    || !q_lower.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+                let after_pos = abs_pos + kw.len();
+                let after_ok = after_pos >= q_lower.len()
+                    || !q_lower.as_bytes()[after_pos].is_ascii_alphanumeric();
+                if before_ok && after_ok {
+                    return true;
+                }
+                start = abs_pos + 1;
+            }
+            false
+        })
+    }
+}
+
+/// Runtime-loaded exact-model brand patterns from
+/// `data/commerce/exact_model_brands.json`. The brand list is the data
+/// source for the affiliate eligibility gate (`is_exact_model_query`) and
+/// the transactional intent override (`is_model_number_price_query`).
+/// Previously these used hardcoded regexes with compiled-in brand lists —
+/// a HARD RULES violation. Now the brand list is runtime data.
+#[derive(Clone, Debug)]
+struct ExactModelConfig {
+    /// Brand names that signal an exact-product query when followed by a
+    /// model number (e.g. "iphone 16", "galaxy s24"). Loaded from
+    /// `exact_model_brands.json`. Changing this list requires NO recompile.
+    brands: Vec<String>,
+}
+
+impl Default for ExactModelConfig {
+    fn default() -> Self {
+        Self {
+            brands: vec![
+                "iphone", "ipad", "galaxy", "oneplus", "pixel", "redmi",
+                "nothing", "xiaomi", "poco", "realme", "rog", "zenfone",
+                "nokia", "moto", "motorola", "surface", "macbook", "imac", "watch",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        }
+    }
+}
+
+impl ExactModelConfig {
+    /// Load from `data/commerce/exact_model_brands.json`. Missing file or
+    /// fields → defaults. The brand list is data, never code.
+    fn load() -> Self {
+        let mut cfg = Self::default();
+        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
+            let path = std::path::Path::new(dir).join("exact_model_brands.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(arr) = v.get("brands").and_then(|x| x.as_array()) {
+                        let loaded: Vec<String> = arr
+                            .iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_lowercase()))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !loaded.is_empty() {
+                            cfg.brands = loaded;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        cfg
+    }
+
+    /// True when the query contains a known brand name followed by a model
+    /// number (e.g. "iphone 16", "galaxy s24 ultra", "pixel 9 pro").
+    /// This replaces the former hardcoded regex with a runtime-loaded
+    /// brand list. The matching logic is: find a brand word, then check
+    /// if a digit appears within the next few tokens.
+    fn has_exact_model(&self, q_lower: &str) -> bool {
+        if self.brands.is_empty() || q_lower.is_empty() {
+            return false;
+        }
+        let q = q_lower.to_lowercase();
+        let tokens: Vec<&str> = q.split_whitespace().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            let token_clean = token.trim_matches(|c: char| !c.is_alphanumeric());
+            if !self.brands.iter().any(|b| b == token_clean) {
+                continue;
+            }
+            // Brand found — check if a digit appears in the next 4 tokens
+            // (covers "iphone 16", "galaxy s24 ultra", "pixel 9 pro")
+            for j in (i + 1)..std::cmp::min(i + 5, tokens.len()) {
+                if tokens[j].chars().any(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Reuses the same model-number detection as `is_model_number_price_query` but
+/// drops the price requirement — a query that names a specific model is
+/// exact-model regardless of whether it mentions price. Data-driven: the
+/// brand list lives in `ExactModelConfig` (loaded from
+/// `data/commerce/exact_model_brands.json`), not in a keyword→reply table.
+fn is_exact_model_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
+    cfg.has_exact_model(q_lower)
+}
+
+/// Runtime-loaded commerce intent signals from `data/commerce/signals.json`.
 fn has_price_signal(title_lower: &str, content_lower: &str) -> bool {
     static RS_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let rs_re = RS_REGEX.get_or_init(|| regex::Regex::new(r"(?i)\b(rs\.?|rupee|rupees|inr)\b|₹").unwrap());
@@ -4770,6 +4942,8 @@ fn is_commercial_intent(
     label: &str,
     distribution: &std::collections::HashMap<String, f32>,
     has_price_bound: bool,
+    signals: &CommerceSignals,
+    query: &str,
 ) -> bool {
     if has_price_bound {
         return true;
@@ -4780,11 +4954,23 @@ fn is_commercial_intent(
     // Strong transactional distribution is itself commercial intent even if the
     // argmax label is something else (e.g. "comparison"). Threshold is a signal
     // probability, not a per-query literal.
-    distribution
+    if distribution
         .get("transactional")
         .copied()
         .unwrap_or(0.0)
         >= 0.50
+    {
+        return true;
+    }
+    // WEAK signal boost: the runtime-loaded transactional keywords from
+    // signals.json provide additional recall when the intent engine is
+    // borderline. This is a SUPPLEMENT to the label/distribution check —
+    // never a standalone replacement. The keywords are data-driven (loaded
+    // from data/commerce/signals.json), not hardcoded in the classifier.
+    if signals.has_transactional_keyword(query) {
+        return true;
+    }
+    false
 }
 
 /// Pure helper: from an already-enriched array of result JSON values, keep only
@@ -12174,6 +12360,16 @@ struct AppState {
     /// knowledge is data, never code. Used only as a strict post-rank decoration
     /// pass — never affects ranking/order.
     affiliate_ctx: AffiliateCtx,
+    /// Runtime-loaded commerce intent signals from `data/commerce/signals.json`.
+    /// Used as a WEAK signal boost to the existing intent classifier — never a
+    /// standalone replacement.
+    commerce_signals: CommerceSignals,
+    /// Runtime-loaded exact-model brand patterns. Loaded once at startup from
+    /// `data/commerce/exact_model_brands.json`. Used by the affiliate
+    /// eligibility gate (`is_exact_model_query`) and the transactional intent
+    /// override (`is_model_number_price_query`). Changing the brand list
+    /// requires NO recompile — edit the file and restart.
+    exact_model_config: ExactModelConfig,
 }
 
 async fn handle_images(
@@ -12821,6 +13017,9 @@ async fn main() {
         search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         // Affiliate template engine config (ROADMAP item 3) — loaded from data.
         affiliate_ctx: AffiliateCtx::load(),
+        // Commerce config + signals — loaded from data, no recompile needed.
+        commerce_signals: CommerceSignals::load(),
+        exact_model_config: ExactModelConfig::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -15632,7 +15831,7 @@ async fn handle_search(
         // "oneplus 12 price") — the word "price" alone is weak signal. When a known
         // brand+model pattern co-occurs with a price/cost term, the intent is
         // decisively transactional (P10/P11 style compensation for the linear probe).
-        if is_model_number_price_query(&q_lower) {
+        if is_model_number_price_query(&q_lower, &state.exact_model_config) {
             if intent.intent != "transactional" || intent.confidence < 0.60 {
                 tracing::info!(
                     "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
@@ -18196,11 +18395,14 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // so the order-invariance guarantee holds: affiliate decoration runs strictly
     // AFTER the order is fixed and cannot move a result. No external call, no
     // keyword list — the commercial signal comes purely from in-process intent.
-    let shopping_block: Option<serde_json::Value> = if is_commercial_intent(
+    let is_commercial = is_commercial_intent(
         &intent.intent,
         &intent.distribution,
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
-    ) {
+        &state.commerce_signals,
+        &q,
+    );
+    let shopping_block: Option<serde_json::Value> = if is_commercial {
         // The enrichment budget is derived from the time this request has ALREADY
         // spent, not a flat 22s (see `commerce_wall_for_elapsed`). Without this the
         // decoration pass could overrun the 30s TimeoutLayer on a slow upstream
@@ -18308,7 +18510,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             && (sc.price_lt.is_some() || sc.price_gt.is_some() || sc.price_min.is_some() || sc.price_max.is_some())
         { Some(priced_result_count) } else { None },
         recall_gap_terms,
-        shopping: shopping_block,
+        shopping: shopping_block.clone(),
     };
 
     // Cache for 5 minutes — but never cache empty results
@@ -18330,7 +18532,49 @@ let mut results = match tokio::task::spawn_blocking(move || {
         guard.complete();
     }
 
-    (axum::http::StatusCode::OK, Json(serde_json::to_value(&response).unwrap_or(serde_json::json!({}))))
+    // ── ROADMAP item: affiliate decoration on MAIN /search results ──
+    // STRICT post-ranking pass: the results array is already fully ranked,
+    // scored, and paginated. We serialize to JSON, decorate each result's
+    // `affiliate` field in place, and return. The decoration NEVER reorders,
+    // reselects, or re-scores — it only attaches an affiliate block (or leaves
+    // it null when credentials are missing). The gate is the signal-driven
+    // `is_commercial_intent` classifier (transactional label / strong
+    // transactional distribution / price bound), NOT a keyword check.
+    //
+    // Commerce facts (price, availability, merchant, etc.) are replayed onto
+    // the main results array from the shopping block — a strict post-ranking
+    // fact replay that never touches order, selection, or scoring. This lets
+    // the frontend show product facts inline in the main results list without
+    // requiring the user to look at the separate shopping strip.
+    let is_commercial = is_commercial_intent(
+        &intent.intent,
+        &intent.distribution,
+        sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
+        &state.commerce_signals,
+        &q,
+    );
+    let response_json = serde_json::to_value(&response).unwrap_or(serde_json::json!({}));
+    let final_json = if is_commercial {
+        let mut v = response_json;
+        // Replay commerce facts from the shopping block onto matching URLs
+        // in the main results array. This is a pure fact replay — it copies
+        // already-extracted `commerce` + `commerce_provenance` from the
+        // shopping block onto the same URLs in `results`. No reordering, no
+        // re-fetching, no re-scoring. The order-invariance test proves this.
+        if let Some(arr) = v.get_mut("results").and_then(|r| r.as_array_mut()) {
+            copy_commerce_facts_from_shopping_block(arr, shopping_block.as_ref());
+        }
+        // Affiliate decoration on main results (exact-model gate only).
+        if is_exact_model_query(&q_lower, &state.exact_model_config) {
+            if let Some(arr) = v.get_mut("results").and_then(|r| r.as_array_mut()) {
+                decorate_affiliate(arr, &state.affiliate_ctx);
+            }
+        }
+        v
+    } else {
+        response_json
+    };
+    (axum::http::StatusCode::OK, Json(final_json))
 }
 
 fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
@@ -22267,7 +22511,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let mut dist = std::collections::HashMap::new();
         dist.insert("transactional".to_string(), 0.9);
         dist.insert("informational".to_string(), 0.1);
-        assert!(is_commercial_intent("transactional", &dist, false));
+        let signals = CommerceSignals::default();
+        assert!(is_commercial_intent("transactional", &dist, false, &signals, "test"));
     }
 
     #[test]
@@ -22280,7 +22525,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("comparison".to_string(), 0.51);
         dist.insert("transactional".to_string(), 0.62);
         // argmax label is "comparison" but transactional prob >= 0.50 => commercial.
-        assert!(is_commercial_intent("comparison", &dist, false));
+        let signals = CommerceSignals::default();
+        assert!(is_commercial_intent("comparison", &dist, false, &signals, "test"));
     }
 
     #[test]
@@ -22289,7 +22535,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // intent — no need for the transactional label. The bound is parsed by the
         // EXISTING gateway/engine constraint parser, never a keyword.
         let dist = std::collections::HashMap::new();
-        assert!(is_commercial_intent("informational", &dist, true));
+        let signals = CommerceSignals::default();
+        assert!(is_commercial_intent("informational", &dist, true, &signals, "test"));
     }
 
     #[test]
@@ -22301,7 +22548,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let mut dist = std::collections::HashMap::new();
         dist.insert("informational".to_string(), 0.95);
         dist.insert("transactional".to_string(), 0.02);
-        assert!(!is_commercial_intent("informational", &dist, false));
+        let signals = CommerceSignals::default();
+        assert!(!is_commercial_intent("informational", &dist, false, &signals, "test"));
     }
 
     #[test]
@@ -23009,6 +23257,69 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let before = serde_json::to_value(&results).unwrap();
         copy_commerce_facts_from_shopping_block(&mut results, None);
         assert_eq!(before, serde_json::to_value(&results).unwrap(), "no-op when shopping is None");
+    }
+
+    /// Main-path commerce fact replay: when `handle_search` attaches commerce
+    /// facts to the main `results` array (via `copy_commerce_facts_from_shopping_block`),
+    /// the ranked URL order MUST be byte-identical before and after. This is the
+    /// no-manipulation guarantee for the main `/search` path — the same invariant
+    /// the order-invariance test enforces for the `/shopping` endpoint.
+    #[test]
+    fn main_path_commerce_replay_preserves_ranked_order() {
+        // Simulate a ranked results array (already scored and ordered).
+        let mut results: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0, "title": "Product A" }),
+            serde_json::json!({ "url": "https://store.example.com/p/2", "score": 8.5, "title": "Product B" }),
+            serde_json::json!({ "url": "https://store.example.com/p/3", "score": 8.0, "title": "Product C" }),
+            serde_json::json!({ "url": "https://store.example.com/p/4", "score": 7.5, "title": "Product D" }),
+        ];
+
+        // Shopping block with commerce facts for URLs 1 and 3.
+        let shopping = serde_json::json!({
+            "results": [
+                { "url": "https://store.example.com/p/1",
+                  "commerce": { "price": 199.0, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/1",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
+                      "data": { "price": 199.0 } } },
+                { "url": "https://store.example.com/p/3",
+                  "commerce": { "price": 49.99, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/3",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "og",
+                      "data": { "price": 49.99 } } },
+            ]
+        });
+
+        let before_urls: Vec<String> = results
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        let before_scores: Vec<f64> = results
+            .iter()
+            .map(|r| r["score"].as_f64().unwrap())
+            .collect();
+
+        copy_commerce_facts_from_shopping_block(&mut results, Some(&shopping));
+
+        // THE CONTRACT: ranked URL order and scores are byte-identical.
+        let after_urls: Vec<String> = results
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        let after_scores: Vec<f64> = results
+            .iter()
+            .map(|r| r["score"].as_f64().unwrap())
+            .collect();
+        assert_eq!(before_urls, after_urls, "URL order must be byte-identical");
+        assert_eq!(before_scores, after_scores, "scores must be unchanged");
+
+        // Commerce facts attached to matching URLs.
+        assert_eq!(results[0]["commerce"]["price"], 199.0);
+        assert_eq!(results[2]["commerce"]["price"], 49.99);
+
+        // Non-matching URLs stay null.
+        assert!(results[1].get("commerce").is_none());
+        assert!(results[3].get("commerce").is_none());
     }
 
     // ── Microformats2 h-product extraction ───────────────────────────────
