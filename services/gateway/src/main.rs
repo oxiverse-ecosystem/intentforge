@@ -15840,6 +15840,8 @@ async fn handle_search(
         // "oneplus 12 price") — the word "price" alone is weak signal. When a known
         // brand+model pattern co-occurs with a price/cost term, the intent is
         // decisively transactional (P10/P11 style compensation for the linear probe).
+        // MOVED OUTSIDE the confidence gate (2026-10-16): a decisive pattern match
+        // must not be suppressed by a high-confidence misclassification.
         if is_model_number_price_query(&q_lower, &state.exact_model_config) {
             if intent.intent != "transactional" || intent.confidence < 0.60 {
                 tracing::info!(
