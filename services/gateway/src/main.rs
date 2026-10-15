@@ -15795,8 +15795,12 @@ async fn handle_search(
             "understand ", "learn ", "teach me ",
         ];
         let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
-        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
+        // Use the runtime-loaded CommerceSignals whole-word matcher instead of a
+        // hardcoded substring list. The old `contains("price ")` check missed
+        // "price" at the END of a query (no trailing space), so "sony wh-1000xm5
+        // price" and "iphone 16 pro max price" were not detected as transactional.
+        // The keyword list lives in data/commerce/signals.json — no recompile.
+        let has_tx_signal = state.commerce_signals.has_transactional_keyword(&q_lower);
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
