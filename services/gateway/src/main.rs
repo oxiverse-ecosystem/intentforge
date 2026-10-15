@@ -4945,6 +4945,8 @@ fn is_commercial_intent(
     label: &str,
     distribution: &std::collections::HashMap<String, f32>,
     has_price_bound: bool,
+    signals: &CommerceSignals,
+    query: &str,
 ) -> bool {
     if has_price_bound {
         return true;
@@ -4955,11 +4957,23 @@ fn is_commercial_intent(
     // Strong transactional distribution is itself commercial intent even if the
     // argmax label is something else (e.g. "comparison"). Threshold is a signal
     // probability, not a per-query literal.
-    distribution
+    if distribution
         .get("transactional")
         .copied()
         .unwrap_or(0.0)
         >= 0.50
+    {
+        return true;
+    }
+    // WEAK signal boost: the runtime-loaded transactional keywords from
+    // signals.json provide additional recall when the intent engine is
+    // borderline. This is a SUPPLEMENT to the label/distribution check —
+    // never a standalone replacement. The keywords are data-driven (loaded
+    // from data/commerce/signals.json), not hardcoded in the classifier.
+    if signals.has_transactional_keyword(query) {
+        return true;
+    }
+    false
 }
 
 /// Pure helper: from an already-enriched array of result JSON values, keep only
@@ -12349,6 +12363,16 @@ struct AppState {
     /// knowledge is data, never code. Used only as a strict post-rank decoration
     /// pass — never affects ranking/order.
     affiliate_ctx: AffiliateCtx,
+    /// Runtime-loaded commerce intent signals from `data/commerce/signals.json`.
+    /// Used as a WEAK signal boost to the existing intent classifier — never a
+    /// standalone replacement.
+    commerce_signals: CommerceSignals,
+    /// Runtime-loaded exact-model brand patterns. Loaded once at startup from
+    /// `data/commerce/exact_model_brands.json`. Used by the affiliate
+    /// eligibility gate (`is_exact_model_query`) and the transactional intent
+    /// override (`is_model_number_price_query`). Changing the brand list
+    /// requires NO recompile — edit the file and restart.
+    exact_model_config: ExactModelConfig,
 }
 
 async fn handle_images(
@@ -12996,6 +13020,9 @@ async fn main() {
         search_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         // Affiliate template engine config (ROADMAP item 3) — loaded from data.
         affiliate_ctx: AffiliateCtx::load(),
+        // Commerce config + signals — loaded from data, no recompile needed.
+        commerce_signals: CommerceSignals::load(),
+        exact_model_config: ExactModelConfig::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -18371,11 +18398,14 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // so the order-invariance guarantee holds: affiliate decoration runs strictly
     // AFTER the order is fixed and cannot move a result. No external call, no
     // keyword list — the commercial signal comes purely from in-process intent.
-    let shopping_block: Option<serde_json::Value> = if is_commercial_intent(
+    let is_commercial = is_commercial_intent(
         &intent.intent,
         &intent.distribution,
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
-    ) {
+        &state.commerce_signals,
+        &q,
+    );
+    let shopping_block: Option<serde_json::Value> = if is_commercial {
         // The enrichment budget is derived from the time this request has ALREADY
         // spent, not a flat 22s (see `commerce_wall_for_elapsed`). Without this the
         // decoration pass could overrun the 30s TimeoutLayer on a slow upstream
@@ -18519,6 +18549,13 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // fact replay that never touches order, selection, or scoring. This lets
     // the frontend show product facts inline in the main results list without
     // requiring the user to look at the separate shopping strip.
+    let is_commercial = is_commercial_intent(
+        &intent.intent,
+        &intent.distribution,
+        sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
+        &state.commerce_signals,
+        &q,
+    );
     let response_json = serde_json::to_value(&response).unwrap_or(serde_json::json!({}));
     let final_json = if is_commercial {
         let mut v = response_json;
@@ -22477,7 +22514,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let mut dist = std::collections::HashMap::new();
         dist.insert("transactional".to_string(), 0.9);
         dist.insert("informational".to_string(), 0.1);
-        assert!(is_commercial_intent("transactional", &dist, false));
+        let signals = CommerceSignals::default();
+        assert!(is_commercial_intent("transactional", &dist, false, &signals, "test"));
     }
 
     #[test]
@@ -22490,7 +22528,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("comparison".to_string(), 0.51);
         dist.insert("transactional".to_string(), 0.62);
         // argmax label is "comparison" but transactional prob >= 0.50 => commercial.
-        assert!(is_commercial_intent("comparison", &dist, false));
+        let signals = CommerceSignals::default();
+        assert!(is_commercial_intent("comparison", &dist, false, &signals, "test"));
     }
 
     #[test]
@@ -22499,7 +22538,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // intent — no need for the transactional label. The bound is parsed by the
         // EXISTING gateway/engine constraint parser, never a keyword.
         let dist = std::collections::HashMap::new();
-        assert!(is_commercial_intent("informational", &dist, true));
+        let signals = CommerceSignals::default();
+        assert!(is_commercial_intent("informational", &dist, true, &signals, "test"));
     }
 
     #[test]
@@ -22511,7 +22551,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         let mut dist = std::collections::HashMap::new();
         dist.insert("informational".to_string(), 0.95);
         dist.insert("transactional".to_string(), 0.02);
-        assert!(!is_commercial_intent("informational", &dist, false));
+        let signals = CommerceSignals::default();
+        assert!(!is_commercial_intent("informational", &dist, false, &signals, "test"));
     }
 
     #[test]
