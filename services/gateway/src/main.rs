@@ -4987,6 +4987,7 @@ async fn handle_shopping(
                     }
                 },
                 second_pass_wall,
+                state.commerce_config.enrich_window,
             )
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
@@ -18744,6 +18745,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     async move { fetch_page_html(&c, &url).await }
                 },
                 enrichment_wall,
+                state.commerce_config.enrich_window,
             )
             .await;
             // Select only the fact-bearing candidates for display, in their
@@ -23187,6 +23189,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            CommerceConfig::default().enrich_window,
         )
         .await;
         let elapsed = start.elapsed();
@@ -23236,6 +23239,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_millis(1),
+            CommerceConfig::default().enrich_window,
         )
         .await;
 
@@ -23384,6 +23388,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            CommerceConfig::default().enrich_window,
         )
         .await;
         let elapsed = start.elapsed();
@@ -23391,7 +23396,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         for r in ranked.iter() {
             assert!(
                 r.get("commerce").is_some(),
-                "a SLOW-but-successful fetch must still attach commerce facts"
+                "a SLOW-but-successful fetch must still attach commerce facts",
             );
             // Honesty invariant: the fact carries provenance tied to THIS url.
             assert_eq!(
@@ -23553,7 +23558,13 @@ structured product data, so nothing must be extracted from the body.</p></body><
             }
         };
 
-        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2)).await;
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(2),
+            CommerceConfig::default().enrich_window,
+        )
+        .await;
 
         let with_commerce = ranked
             .iter()
@@ -24219,8 +24230,9 @@ mod mainpath_shopping_strip_tests {
 
     #[test]
     fn enrich_window_is_wider_than_display_cap() {
-        // Guards the constants from being re-conflated.
-        assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
+        // Guards the runtime config defaults from being re-conflated.
+        let cfg = CommerceConfig::default();
+        assert!(cfg.enrich_window > cfg.mainpath_top_n);
     }
 
     // ─── extract_snippet_facts tests ────────────────────────────────────
@@ -24403,5 +24415,84 @@ mod local_intent_gazetteer_tests {
                 q
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod price_discourse_marker_tests {
+    use super::*;
+
+    /// Regression test: "about" + bare number (no currency word nearby) must NOT
+    /// produce a price bound. Before the currency-proximity guard, Pattern A
+    /// matched "about" + any number, so "about openai gpt 5 release date" produced
+    /// price:<5, collapsing results to nothing.
+    #[test]
+    fn about_plus_bare_number_is_not_a_price_bound() {
+        // The exact failing query from the bug report.
+        assert!(
+            extract_nl_price_bound("about openai gpt 5 release date").is_none(),
+            "\"about\" + bare number (no currency word nearby) must not produce a price bound"
+        );
+
+        // Variants: discourse markers + bare numbers that are NOT prices.
+        let false_positives = [
+            "about 5 things to know",
+            "around 10 reasons why",
+            "about 3 chapters in this book",
+            "under 5000 dollars",  // this one SHOULD match (currency present)
+        ];
+        // The first three must NOT match.
+        for q in &false_positives[..3] {
+            assert!(
+                extract_nl_price_bound(q).is_none(),
+                "\"{}\" must not produce a price bound (no currency word near number)",
+                q
+            );
+        }
+        // The last one MUST match (it has a currency word).
+        assert!(
+            extract_nl_price_bound(false_positives[3]).is_some(),
+            "\"{}\" must produce a price bound (currency word present)",
+            false_positives[3]
+        );
+    }
+
+    /// Ensure the guard does not break legitimate price bounds with "about".
+    #[test]
+    fn about_with_currency_word_still_matches() {
+        let result = extract_nl_price_bound("about 100 dollars");
+        assert!(result.is_some(), "\"about 100 dollars\" should produce a price bound");
+        let (bound, currency) = result.unwrap();
+        assert_eq!(bound, 100.0);
+        assert_eq!(currency, "USD");
+    }
+
+    /// Ensure "around" + currency still works (another discourse marker).
+    #[test]
+    fn around_with_currency_word_still_matches() {
+        let result = extract_nl_price_bound("around 500 rupees");
+        assert!(result.is_some(), "\"around 500 rupees\" should produce a price bound");
+        let (bound, currency) = result.unwrap();
+        assert_eq!(bound, 500.0);
+        assert_eq!(currency, "INR");
+    }
+
+    /// Ensure "within" + bare number (no currency) does NOT match.
+    #[test]
+    fn within_plus_bare_number_is_not_a_price_bound() {
+        assert!(
+            extract_nl_price_bound("within 5 minutes").is_none(),
+            "\"within\" + bare number (no currency word nearby) must not produce a price bound"
+        );
+    }
+
+    /// Ensure "within" + currency still works.
+    #[test]
+    fn within_with_currency_word_still_matches() {
+        let result = extract_nl_price_bound("within 2000 rupees");
+        assert!(result.is_some(), "\"within 2000 rupees\" should produce a price bound");
+        let (bound, currency) = result.unwrap();
+        assert_eq!(bound, 2000.0);
+        assert_eq!(currency, "INR");
     }
 }
