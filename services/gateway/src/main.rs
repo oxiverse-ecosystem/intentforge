@@ -1561,8 +1561,6 @@ fn negative_term_matches_token(term_clean: &str, token_clean: &str) -> bool {
 fn text_matches_negative(text_lower: &str, term_lower: &str) -> bool {
     let term_words: Vec<&str> = term_lower.split_whitespace().collect();
     if term_words.len() > 1 {
-        // Multi-word constraint: require the full phrase (word-boundary safe
-        // enough for phrases; single-word collisions are the real hazard).
         return text_lower.contains(term_lower);
     }
     let term_clean: String = term_lower.chars().filter(|c| c.is_alphanumeric()).collect();
@@ -1582,11 +1580,9 @@ fn text_matches_negative(text_lower: &str, term_lower: &str) -> bool {
 /// "Adobe Creative Cloud" pages — the content word "adobe" still signals
 /// the excluded entity.
 fn multi_word_negative_matches_text(neg_lower: &str, text_lower: &str) -> bool {
-    // First try exact phrase match (existing behavior)
     if text_lower.contains(neg_lower) {
         return true;
     }
-    // Fallback: match any content word of the negative
     let neg_words: Vec<&str> = neg_lower.split_whitespace().collect();
     let text_words: Vec<&str> = text_lower
         .split(|c: char| !c.is_alphanumeric())
@@ -19468,6 +19464,81 @@ mod negation_scope_tests {
             negs.iter().any(|n| n == "microwave"),
             "genuine second target after the connector must be extracted, got {:?}",
             negs
+        );
+    }
+}
+
+#[cfg(test)]
+mod multi_word_negative_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn multi_word_negative_partial_word_fallback_matches() {
+        assert!(
+            multi_word_negative_matches_text("adobe photoshop", "adobe creative cloud subscription"),
+            "multi-word negative should match via content word fallback"
+        );
+    }
+
+    #[test]
+    fn multi_word_negative_exact_phrase_still_matches() {
+        assert!(
+            multi_word_negative_matches_text("adobe photoshop", "best adobe photoshop alternatives"),
+            "exact phrase match must still work"
+        );
+    }
+
+    #[test]
+    fn multi_word_negative_stopwords_do_not_match() {
+        assert!(
+            !multi_word_negative_matches_text("alternatives to adobe", "creative cloud subscription"),
+            "stopword-only content words must not trigger a match"
+        );
+    }
+
+    #[test]
+    fn multi_word_negative_short_words_do_not_match() {
+        assert!(
+            !multi_word_negative_matches_text("go lang", "golang programming"),
+            "words shorter than 3 chars must not trigger a match"
+        );
+    }
+
+    #[test]
+    fn constraint_score_penalizes_partial_word_match() {
+        let constraints = Constraints {
+            negative: vec!["adobe photoshop".to_string()],
+            ..Default::default()
+        };
+        let score = constraint_score(
+            "Adobe Creative Cloud Subscription",
+            "Creative cloud plans and pricing",
+            "https://example.com/adobe-creative-cloud",
+            &constraints,
+        );
+        assert!(
+            score < 1.0,
+            "constraint_score should penalize partial-word match, got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn constraint_score_no_false_positive() {
+        let constraints = Constraints {
+            negative: vec!["adobe photoshop".to_string()],
+            ..Default::default()
+        };
+        let score = constraint_score(
+            "Best Free Image Editors",
+            "A guide to free image editing software",
+            "https://example.com/free-image-editors",
+            &constraints,
+        );
+        assert!(
+            score == 1.0,
+            "constraint_score should not penalize unrelated results, got {}",
+            score
         );
     }
 }
