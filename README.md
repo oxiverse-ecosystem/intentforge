@@ -448,6 +448,18 @@ docker compose -f docker-compose.dev.yml up -d --force-recreate gluetun gateway 
 make dev-port-check
 ```
 
+**Simulate a stale port binding and verify recovery:**
+```bash
+bash scripts/docker-port-healthcheck.sh --simulate
+```
+
+This stops gluetun (breaking the port binding), starts it back up without `--force-recreate` (leaving the binding stale), then runs the full detection + recovery cycle. Useful for verifying the healthcheck works after Docker Desktop updates or configuration changes.
+
+**Verbose output:**
+```bash
+VERBOSE=1 bash scripts/docker-port-healthcheck.sh
+```
+
 ---
 
 ## Deployment

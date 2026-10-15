@@ -57,13 +57,16 @@ dev-ps:                               ## List dev containers
 dev-shell SVC=gateway:                ## Shell into a dev service (make dev-shell SVC=gateway)
 	docker exec -it if-dev-$(SVC) sh
 
-.PHONY: dev-port-check dev-port-recover
+.PHONY: dev-port-check dev-port-recover dev-port-simulate
 
 dev-port-check:                       ## Check Docker port forwarding health (no recovery)
 	bash scripts/docker-port-healthcheck.sh --check
 
 dev-port-recover:                     ## Check and auto-recover stale Docker port bindings
 	bash scripts/docker-port-healthcheck.sh --recover
+
+dev-port-simulate:                   ## Simulate a stale port binding and verify recovery
+	bash scripts/docker-port-healthcheck.sh --simulate
 
 # ─────────────────────────────────────────────────────────────────
 # NUCLEAR OPTION — wipe ALL intentforge containers/images/volumes

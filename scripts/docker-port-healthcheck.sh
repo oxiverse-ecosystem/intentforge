@@ -22,6 +22,8 @@
 #   bash scripts/docker-port-healthcheck.sh              # check + auto-recover
 #   bash scripts/docker-port-healthcheck.sh --check     # check only, no recovery
 #   bash scripts/docker-port-healthcheck.sh --recover   # force recovery
+#   bash scripts/docker-port-healthcheck.sh --simulate  # simulate stale port + recover
+#   VERBOSE=1 bash scripts/docker-port-healthcheck.sh   # verbose output
 #
 # Exit codes: 0 = healthy, 1 = recovered, 2 = unhealthy (recovery failed)
 set -uo pipefail
@@ -104,6 +106,23 @@ check_containers_running() {
   return $missing
 }
 
+# --- Check all published ports --------------------------------------------
+check_all_ports() {
+  local ports=(4000 6000 8080 3000 5000 8081)
+  local failed=0
+  for port in "${ports[@]}"; do
+    local http_code
+    http_code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "http://localhost:${port}/health" 2>/dev/null)
+    if [ "$http_code" != "200" ]; then
+      vlog "Port $port: FAIL (HTTP $http_code)"
+      failed=$((failed + 1))
+    else
+      vlog "Port $port: OK (HTTP $http_code)"
+    fi
+  done
+  return $failed
+}
+
 # --- Recreate gluetun + dependents ----------------------------------------
 recover_ports() {
   log "Starting port recovery: recreating gluetun + dependents"
@@ -162,12 +181,74 @@ recover_ports() {
   return 0
 }
 
+# --- Simulate a stale port binding (for testing) ---------------------------
+# This kills the gluetun container's port binding by stopping gluetun,
+# then starting it back up WITHOUT --force-recreate.  This leaves the
+# container's network namespace intact but the host port binding stale,
+# which is exactly the failure mode we want to detect and recover from.
+simulate_stale_port() {
+  log "=== SIMULATING STALE PORT BINDING ==="
+  log "Stopping gluetun (this will break host->container port forwarding)..."
+
+  # Stop gluetun — this breaks the port binding
+  docker stop if-dev-gluetun 2>&1
+  sleep 2
+
+  # Verify the port is now broken
+  if check_host_port 4000; then
+    log "WARNING: Port 4000 still reachable after stopping gluetun (may be cached)"
+  else
+    log "CONFIRMED: Port 4000 is now unreachable (stale port binding simulated)"
+  fi
+
+  # Start gluetun back up (without --force-recreate, so the binding stays stale)
+  log "Starting gluetun back up (without --force-recreate)..."
+  cd "$COMPOSE_DIR" || return 2
+  docker compose -f "$COMPOSE_FILE" up -d gluetun 2>&1
+  sleep 3
+
+  # Check if port is still broken
+  if check_host_port 4000; then
+    log "Port 4000 recovered on its own (Docker re-established the binding)"
+    log "Simulation inconclusive — the stale binding did not persist"
+    return 0
+  else
+    log "CONFIRMED: Port 4000 is still unreachable after gluetun restart"
+    log "This is the stale port binding failure mode."
+    log "Now running recovery..."
+    return 1
+  fi
+}
+
 # --- Main -----------------------------------------------------------------
 main() {
   local mode="${1:-auto}"
 
   log "=== Docker Port Healthcheck ==="
   log "Mode: $mode"
+
+  # Simulate mode: create a stale port binding, then detect + recover
+  if [ "$mode" = "--simulate" ]; then
+    simulate_stale_port
+    local sim_result=$?
+    if [ $sim_result -eq 0 ]; then
+      log "Simulation complete (port recovered on its own)"
+      return 0
+    fi
+    # Port is stale — now recover
+    if ! recover_ports; then
+      log "ERROR: Recovery failed"
+      return 2
+    fi
+    sleep 3
+    if check_host_port 4000; then
+      log "SUCCESS: Port 4000 recovered after stale-port simulation"
+      return 1
+    else
+      log "ERROR: Port 4000 still unreachable after recovery"
+      return 2
+    fi
+  fi
 
   # Quick check: are containers running at all?
   if ! check_containers_running; then
