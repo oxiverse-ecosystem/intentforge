@@ -4970,6 +4970,7 @@ fn is_commercial_intent(
     has_price_bound: bool,
     signals: &CommerceSignals,
     query: &str,
+    exact_model_cfg: &ExactModelConfig,
 ) -> bool {
     if has_price_bound {
         return true;
@@ -4986,6 +4987,14 @@ fn is_commercial_intent(
         .unwrap_or(0.0)
         >= 0.50
     {
+        return true;
+    }
+    // Exact-model signal: a query that names a specific product model (brand +
+    // model number from the runtime-loaded exact_model_brands.json) is inherently
+    // commercial — the user is researching or buying a specific product. This is
+    // data-driven (the brand list lives in a data file, not a keyword list in
+    // code) and supplements the intent engine's label/distribution check.
+    if exact_model_cfg.has_exact_model(query) {
         return true;
     }
     // WEAK signal boost: the runtime-loaded transactional keywords from
@@ -5049,7 +5058,7 @@ async fn handle_shopping(
     let shopping_started = std::time::Instant::now();
     // Extract the query for the exact-model gate BEFORE params is moved into
     // handle_search. The gate decides whether affiliate decoration runs at all.
-    let is_exact_model = params.q.as_deref().map(|q| is_exact_model_query(&q.to_lowercase())).unwrap_or(false);
+    let is_exact_model = params.q.as_deref().map(|q| is_exact_model_query(&q.to_lowercase(), &state.exact_model_config)).unwrap_or(false);
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
     let (status, body) = handle_search(
         state.clone(),
@@ -13532,6 +13541,7 @@ async fn main() {
         // Commerce config + signals — loaded from data, no recompile needed.
         commerce_config: CommerceConfig::load(),
         commerce_signals: CommerceSignals::load(),
+        exact_model_config: ExactModelConfig::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -19041,6 +19051,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
         &state.commerce_signals,
         &q,
+        &state.exact_model_config,
     );
     let shopping_block: Option<serde_json::Value> = if is_commercial {
         // The enrichment budget is derived from the time this request has ALREADY
@@ -19098,7 +19109,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     // GATE: monetization is exact-model-only — broad category queries
                     // must never receive affiliate links even on the /search shopping
                     // block. `q_lower` is in scope from the handle_search entry.
-                    if is_exact_model_query(&q_lower) {
+                    if is_exact_model_query(&q_lower, &state.exact_model_config) {
                         decorate_affiliate(&mut strip, &state.affiliate_ctx);
                     }
                     // Read-only multi-merchant offer comparison from the attached facts.
@@ -23212,7 +23223,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("transactional".to_string(), 0.9);
         dist.insert("informational".to_string(), 0.1);
         let signals = CommerceSignals::default();
-        assert!(is_commercial_intent("transactional", &dist, false, &signals, "test"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_commercial_intent("transactional", &dist, false, &signals, "test", &cfg));
     }
 
     #[test]
@@ -23226,7 +23238,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("transactional".to_string(), 0.62);
         // argmax label is "comparison" but transactional prob >= 0.50 => commercial.
         let signals = CommerceSignals::default();
-        assert!(is_commercial_intent("comparison", &dist, false, &signals, "test"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_commercial_intent("comparison", &dist, false, &signals, "test", &cfg));
     }
 
     #[test]
@@ -23236,7 +23249,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // EXISTING gateway/engine constraint parser, never a keyword.
         let dist = std::collections::HashMap::new();
         let signals = CommerceSignals::default();
-        assert!(is_commercial_intent("informational", &dist, true, &signals, "test"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_commercial_intent("informational", &dist, true, &signals, "test", &cfg));
     }
 
     #[test]
@@ -23249,7 +23263,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("informational".to_string(), 0.95);
         dist.insert("transactional".to_string(), 0.02);
         let signals = CommerceSignals::default();
-        assert!(!is_commercial_intent("informational", &dist, false, &signals, "rust ownership"));
+        let cfg = ExactModelConfig::default();
+        assert!(!is_commercial_intent("informational", &dist, false, &signals, "rust ownership", &cfg));
     }
 
     // ── Commerce config + signals data-file wiring tests ─────────────────────
@@ -23313,13 +23328,14 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("informational".to_string(), 0.7);
         dist.insert("transactional".to_string(), 0.1);
         let sig = CommerceSignals::default();
+        let cfg = ExactModelConfig::default();
         assert!(
-            is_commercial_intent("informational", &dist, false, &sig, "buy wireless earbuds"),
+            is_commercial_intent("informational", &dist, false, &sig, "buy wireless earbuds", &cfg),
             "transactional keyword 'buy' should boost commercial intent"
         );
         // Same but with a non-transactional query — should NOT be commercial
         assert!(
-            !is_commercial_intent("informational", &dist, false, &sig, "rust ownership"),
+            !is_commercial_intent("informational", &dist, false, &sig, "rust ownership", &cfg),
             "non-transactional query must not be boosted"
         );
     }
@@ -24719,14 +24735,16 @@ mod affiliate_mainpath_tests {
         let mut dist = std::collections::HashMap::new();
         dist.insert("transactional".to_string(), 0.85);
         let sig = CommerceSignals::load();
-        assert!(is_commercial_intent("transactional", &dist, false, &sig, "buy iphone 16"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_commercial_intent("transactional", &dist, false, &sig, "buy iphone 16", &cfg));
     }
 
     #[test]
     fn commerce_intent_gate_true_for_price_bound() {
         let dist = std::collections::HashMap::new();
         let sig = CommerceSignals::load();
-        assert!(is_commercial_intent("informational", &dist, true, &sig, "laptop under 500"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_commercial_intent("informational", &dist, true, &sig, "laptop under 500", &cfg));
     }
 
     #[test]
@@ -24735,7 +24753,8 @@ mod affiliate_mainpath_tests {
         dist.insert("comparison".to_string(), 0.6);
         dist.insert("transactional".to_string(), 0.55);
         let sig = CommerceSignals::load();
-        assert!(is_commercial_intent("comparison", &dist, false, &sig, "iphone vs pixel"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_commercial_intent("comparison", &dist, false, &sig, "iphone vs pixel", &cfg));
     }
 
     #[test]
@@ -24744,7 +24763,8 @@ mod affiliate_mainpath_tests {
         dist.insert("informational".to_string(), 0.9);
         dist.insert("transactional".to_string(), 0.1);
         let sig = CommerceSignals::load();
-        assert!(!is_commercial_intent("informational", &dist, false, &sig, "rust ownership"));
+        let cfg = ExactModelConfig::default();
+        assert!(!is_commercial_intent("informational", &dist, false, &sig, "rust ownership", &cfg));
     }
 
     #[test]
