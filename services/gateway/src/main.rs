@@ -2334,6 +2334,10 @@ fn constraint_score(
                     neg, &title[..title.char_indices().nth(50).map(|(i,_)| i).unwrap_or(title.len())],
                     boost);
                 score *= boost;
+                // Do NOT flag as violation: the term is in negating context,
+                // meaning the page is FULFILLING the exclusion (e.g. "without pills"),
+                // not violating it. The alt-page penalty below must not cancel
+                // this boost.
             } else if !is_alt_page {
                 let penalty = (0.02 + (neg_count - 1.0) * 0.06).clamp(0.02, 0.20);
                 tracing::info!("CONSTRAINT HIT (TITLE/URL): '{}' in '{}' → penalty={:.4} (non-alt)",
