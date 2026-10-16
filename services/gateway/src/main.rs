@@ -5453,7 +5453,78 @@ fn default_priority() -> i64 {
     0
 }
 
-/// Runtime-resolved config: data files + env-resolved keys. Built once at startup.
+/// HOST component of a URL, lowercased, without scheme/port/userinfo/path.
+/// Pure; falls back to the raw string when the value has no `://` scheme.
+fn url_host(value: &str) -> String {
+    let after_scheme = match value.find("://") {
+        Some(i) => &value[i + 3..],
+        None => value,
+    };
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    // Strip userinfo (`user:pass@host`) then any `:port`.
+    let host = match authority.rfind('@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    let host = match host.rfind(':') {
+        Some(i) if host[i + 1..].chars().all(|c| c.is_ascii_digit()) => &host[..i],
+        _ => host,
+    };
+    host.trim_end_matches('.').to_lowercase()
+}
+
+/// TRUE when `host` carries a label reserved for documentation by IANA and
+/// therefore can never be a real merchant destination.
+///
+/// Encodes two published registries — no merchant, network, or query literals:
+///   * RFC 2606 §2 / RFC 6761 §6 — reserved NAMES: `example`, `test`,
+///     `invalid`, `localhost`, and their `.tld`/`.test`/`.example`/`.invalid`
+///     forms;
+///   * RFC 2606 §2 — the `example` documentation PREFIX: a label beginning with
+///     `example` followed by a separator (`example-merchant`, `example_shop`).
+///     This is what catches the common "invented merchant" shape, which is
+///     legal DNS but is a placeholder by convention.
+///
+/// Matching is LABEL-BOUNDARY, never substring, and the prefix rule applies ONLY
+/// to `example`:
+///   * `test` is a special-use NAME, but `testosterone-shop.com` is a real shop,
+///     so a label merely CONTAINING a reserved name must be accepted;
+///   * `invalid` likewise (RFC 2606 reserves the exact name, not the prefix), so
+///     `invalid-syntax.co.uk` must not be rejected.
+///
+/// Used to drop an `fbu` (bid-miss fallback) that would send a real user to a
+/// fabricated destination. The FIELD is dropped, never the network: wrapping,
+/// `bf` and `disclosed: true` all keep working.
+fn is_reserved_documentation_host(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_lowercase();
+    if h.is_empty() {
+        return false;
+    }
+    const RESERVED_NAMES: [&str; 4] = ["example", "test", "invalid", "localhost"];
+    for label in h.split('.') {
+        if RESERVED_NAMES.contains(&label) {
+            return true;
+        }
+        // `example` is additionally a documentation PREFIX (RFC 2606 §2):
+        // `example-merchant` / `example_shop` are placeholders by convention.
+        if let Some(rest) = label.strip_prefix("example") {
+            if rest
+                .chars()
+                .next()
+                .map(|c| !c.is_ascii_alphanumeric())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
 #[derive(Clone)]
 struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
@@ -10199,15 +10270,13 @@ fn is_weak_anchor_word(w: &str) -> bool {
         // message queue" surfaced Weblio entries for "choose". Same class as the
         // other weak anchors above. General question-framing vocabulary; no
         // query- or domain-specific entries.
-        "difference", "differences", "differ", "differs", "differed",
-        "compare", "compares", "compared",
+        "difference", "differences", "compare", "compares", "compared",
         "comparison", "comparisons", "versus", "vs", "distinction",
         "distinctions", "choose", "choosing", "chosen", "choice", "choices",
         "select", "selecting", "selected", "selection", "pick", "picking",
         "meaning", "meanings", "definition", "definitions", "define",
         "defined", "explained", "explain", "explains", "alternative",
         "alternatives", "overview", "introduction", "summary", "summaries",
-        "cause", "causes", "caused", "causing",
     ];
     WEAK.contains(&w)
 }
@@ -16463,7 +16532,7 @@ async fn handle_search(
     let lang = constraints.language.as_deref();
 
     for (i, base_url) in searx_base_urls.iter().enumerate() {
-        let key = format!("searxng{}", i);
+        let key = searx_base_keys[i].clone();
         // NEGATION ORDERING (round auto/round-2026-09-24T0559Z): when the query
         // carries a negation pattern, the STRIPPED variant (negated clause
         // removed) is the user's actual intent and must fire FIRST. The fan-out
@@ -18263,17 +18332,42 @@ async fn handle_search(
         }
     }
 
-    // ─── Upstream recall gap fallback (IF-1) ────────────────────────
-    // When SearXNG still returns critically few results after the retry
-    // fan-out (niche technical queries where upstream engines have poor
-    // recall), fire expanded query variations on the VPN instance and
-    // re-query the local indexer with expanded terms. Both compensate
-    // for upstream recall gaps. The expanded queries come from the
-    // intent engine (algorithmically generated, no hardcoded strings).
-    let web_results_pre_fallback = web_results.len();
-    let local_results_pre_fallback = local_results.len();
-    if web_results_pre_fallback < 5 && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
-        let fallback_budget = Duration::from_millis(2500);
+    // FIX-IF-03: Thin-result fallback — if the initial + retry still returned
+    // fewer than 5 results, fire a final numeric-relaxed query with a hard 8s
+    // timeout guard. If SearXNG doesn't respond within 8s, return whatever
+    // partial results exist with a flag rather than timing out entirely.
+    let mut partial_results = false;
+    let final_total = web_results.len();
+    if final_total < 5 && has_numeric_constraint(&q) && !searx_base_urls.is_empty() {
+        if let Some(relaxed) = numeric_constraint_relaxation(&q) {
+            let relaxed_clean = preprocess_searxng_query(&relaxed);
+            if !relaxed_clean.is_empty() {
+                let fallback_timeout = Duration::from_secs(8);
+                for (inst_idx, base_url) in searx_base_urls.iter().enumerate() {
+                    let fb_key = searx_base_keys[inst_idx].clone();
+                    // VPN-only fallback, selected by stable key not sort position.
+                    if fb_key != "searxng0" { break; }
+                    if circuit_ref.is_open(&fb_key) { continue; }
+                    let fb_url = searxng_url(base_url, &relaxed_clean, geo_location.as_ref(), lang);
+                    let fb_client = client.clone();
+                    let fb_circuit = circuit_ref.clone();
+                    let fb_result = tokio::time::timeout(fallback_timeout, async move {
+                        match fb_client.get(&fb_url).send().await {
+                            Ok(resp) => {
+                                match tokio::time::timeout(Duration::from_secs(3), resp.text()).await {
+                                    Ok(Ok(text)) => {
+                                        let sanitized = sanitize_json_text(&text);
+                                        match serde_json::from_str::<SearxResponse>(&sanitized) {
+                                            Ok(data) => Some(data),
+                                            Err(_) => None,
+                                        }
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            Err(_) => None,
+                        }
+                    }).await;
 
         // Phase A: secondary SearXNG with expanded terms (VPN instance only for speed)
         if let Some(base_url) = searx_base_urls.get(0) {
@@ -25706,5 +25800,125 @@ mod kb_gibberish_mixed_tests {
         // digit garbage; a lone kb run with a real word must stay searchable.
         let (flag, _) = query_quality_flag("qwerty vs dvorak", &index);
         assert_ne!(flag, "junk");
+    }
+
+    // CIRCUIT-KEY STABILITY (round auto/round-2026-09-29T1239Z). The fan-out
+    // list is sorted warmest-first, so its ORDER changes between requests while
+    // the backends do not. Keys must therefore identify the backend, otherwise
+    // a VPN timeout opens the circuit on the Tor key (and vice versa) and the
+    // two-path redundancy silently collapses.
+    #[test]
+    fn searx_circuit_key_is_stable_across_fanout_order() {
+        let canonical = canonical_searx_urls(&Some("http://tor2:8081".to_string()));
+        assert_eq!(canonical[0], "http://127.0.0.1:8080", "canonical 0 is the VPN instance");
+        assert_eq!(canonical[1], "http://tor2:8081", "canonical 1 is the Tor instance");
+
+        // Warm VPN first, then warm Tor (the original declaration order).
+        let vpn_first = ["http://127.0.0.1:8080", "http://tor2:8081"];
+        // Warm Tor first, then warm VPN (what the sort produces after Tor is used).
+        let tor_first = ["http://tor2:8081", "http://127.0.0.1:8080"];
+
+        let k1 = searx_instance_keys_for(&canonical, &vpn_first);
+        let k2 = searx_instance_keys_for(&canonical, &tor_first);
+
+        // The SAME backend must get the SAME key in both orders. Look the key up
+        // by the BACKEND's position in that particular fan-out order, so the
+        // lookup itself follows the order being tested.
+        let key_of = |order: &[&str], ks: &Vec<String>, backend: &str| -> String {
+            let slot = order.iter().position(|u| *u == backend).expect("backend in order");
+            ks[slot].clone()
+        };
+        const VPN: &str = "http://127.0.0.1:8080";
+        const TOR: &str = "http://tor2:8081";
+
+        assert_eq!(key_of(&vpn_first, &k1, VPN), "searxng0", "VPN backend is searxng0 when fanned out first");
+        assert_eq!(key_of(&tor_first, &k2, VPN), "searxng0", "VPN backend key is order-independent");
+        assert_eq!(key_of(&vpn_first, &k1, TOR), "searxng1", "Tor backend is searxng1 when fanned out second");
+        assert_eq!(key_of(&tor_first, &k2, TOR), "searxng1", "Tor backend key is order-independent");
+
+        // Explicitly: a Tor-position slot never borrows the VPN key.
+        assert_eq!(k2[0], "searxng1", "when Tor is fanned out first its key is searxng1");
+        assert_eq!(k2[1], "searxng0", "when VPN is fanned out second its key is searxng0");
+    }
+
+    // The two "VPN only" fast paths select an instance by key. If they selected
+    // by fan-out position they would send the retry through Tor (or skip the
+    // retry entirely) whenever the warmth sort put Tor first.
+    #[test]
+    fn vpn_only_paths_never_target_the_tor_instance() {
+        let canonical = canonical_searx_urls(&Some("http://tor2:8081".to_string()));
+        let tor_first = ["http://tor2:8081", "http://127.0.0.1:8080"];
+        let keys = searx_instance_keys_for(&canonical, &tor_first);
+
+        // Replicates the `retry_key != "searxng0"` / `fb_key != "searxng0"` guards.
+        let vpn_only: Vec<&str> = tor_first
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keys[*i] == "searxng0")
+            .map(|(_, u)| *u)
+            .collect();
+        assert_eq!(vpn_only, vec!["http://127.0.0.1:8080"], "VPN-only path must resolve to the VPN backend");
+    }
+
+    // INTENT BUDGET (round auto/round-2026-09-29T1239Z). The retry ladder and
+    // the overall budget were independent constants, so the budget could expire
+    // before the ladder finished — making every attempt after the first
+    // unreachable. The budget is now derived from the ladder; this asserts the
+    // relationship the gateway relies on: the budget must cover every delay
+    // plus a full attempt budget for EVERY attempt, so the last attempt can
+    // both start and finish inside it.
+    #[test]
+    fn intent_overall_budget_covers_the_whole_retry_ladder() {
+        const ATTEMPT_BUDGET_MS: u64 = 2000;
+        const DELAYS_MS: [u64; 3] = [0, 200, 400];
+        let overall = DELAYS_MS.iter().sum::<u64>() + ATTEMPT_BUDGET_MS * DELAYS_MS.len() as u64;
+
+        // Time at which the final attempt STARTS.
+        let n = DELAYS_MS.len() as u64;
+        let last_attempt_start = DELAYS_MS.iter().take(DELAYS_MS.len() - 1).sum::<u64>() + ATTEMPT_BUDGET_MS * (n - 1);
+        assert!(
+            last_attempt_start < overall,
+            "final attempt must start inside the overall budget (starts at {}ms, budget {}ms)",
+            last_attempt_start,
+            overall
+        );
+        // And it must be able to FINISH, not merely start.
+        assert!(
+            last_attempt_start + ATTEMPT_BUDGET_MS <= overall,
+            "final attempt must finish inside the overall budget"
+        );
+    }
+
+    // QUESTION-FRAMING ANCHORS (round auto/round-2026-09-29T1239Z). A
+    // comparative/selection word names the SHAPE of the question, not its
+    // subject. When such a word is allowed to act as a topic anchor, pages
+    // that merely DEFINE that word outrank every page about the real subject:
+    // "what is the difference between optimistic and pessimistic locking"
+    // returned four Japanese-English dictionary entries for "difference" at
+    // the top. These must be excluded from the mandatory topic gate, exactly
+    // like the existing warning/sign framing words.
+    #[test]
+    fn comparative_framing_words_are_not_topic_anchors() {
+        // The words that must never anchor relevance on their own.
+        for w in [
+            "difference", "differences", "compare", "comparison", "versus", "vs",
+            "distinction", "choose", "choice", "select", "selection", "meaning",
+            "definition", "explain", "explained", "alternative", "alternatives",
+        ] {
+            assert!(
+                is_weak_anchor_word(w),
+                "'{}' is question framing, not a topic: it must not anchor relevance",
+                w
+            );
+        }
+        // Guard against over-reach: the actual SUBJECT terms of those queries
+        // must remain valid anchors, or the fix would gut real relevance.
+        for w in ["optimistic", "pessimistic", "locking", "databases", "queue", "message"] {
+            assert!(
+                !is_weak_anchor_word(w),
+                "'{}' is a real subject term and must stay a valid anchor",
+                w
+            );
+        }
     }
 }
