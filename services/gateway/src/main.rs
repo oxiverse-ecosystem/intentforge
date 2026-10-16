@@ -7362,6 +7362,42 @@ fn whole_word_contains(haystack: &str, needle: &str) -> bool {
         .any(|w| w.trim_matches(|c: char| !c.is_alphanumeric()) == n)
 }
 
+/// A location the gateway resolved for a query but did NOT take from the query
+/// itself — an IP geolocation, or the local-intent fallback.
+///
+/// Such a location is INFERRED, not requested. It is legitimate for upstream
+/// hints (`source_country` / `language` on the SearXNG URL) and for the geo
+/// boost, but it must never become a hard requirement on the result set: a
+/// user in India searching "nearby restaurants" must not be handed a page
+/// requirement of "New York" simply because the gateway had no IP fix and fell
+/// back to a default. The query's own words are the only thing a result can be
+/// REQUIRED to contain.
+///
+/// Pure and structural: it tests the resolved `GeoLocation` against the query's
+/// own tokens, so it needs no per-query literals and no place allow-list. A
+/// location that the query actually names is always "explicit".
+fn is_inferred_location(query: &str, loc: &geoloc::GeoLocation) -> bool {
+    let q_lower = query.to_lowercase();
+    let q_tokens: Vec<&str> = q_lower
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let q_has = |s: &str| {
+        let s = s.trim().to_lowercase();
+        !s.is_empty()
+            && (q_tokens.iter().any(|t| *t == s)
+                || q_lower.contains(&s))
+    };
+    let city_named = loc.city.as_deref().map(|c| q_has(c)).unwrap_or(false);
+    let country_named = loc
+        .country_name
+        .as_deref()
+        .map(|c| q_has(c))
+        .unwrap_or(false);
+    !(city_named || country_named)
+}
+
 /// Cross-location mismatch penalty (local/geo round defect, 2026-08-19).
 ///
 /// When the user NAMES a place in the query (explicit geo), a result that talks
@@ -13885,14 +13921,14 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         return GeolocateResponse {
             query: q.to_string(),
             resolved: Some(geoloc::GeoLocation {
-                country_code: Some("US".to_string()),
-                country_name: Some("United States".to_string()),
-                region: Some("New York".to_string()),
-                city: Some("New York".to_string()),
-                postal_code: Some("10001".to_string()),
-                latitude: Some(40.7128),
-                longitude: Some(-74.0060),
-                time_zone: Some("America/New_York".to_string()),
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                region: None,
+                city: None,
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
             }),
             source: "local_intent_fallback".to_string(),
             explicit_location: false,
@@ -15070,17 +15106,24 @@ async fn handle_search(
 
     // M3 fix: fallback location for loopback/private IP or missing geo DB when query has local intent ("near me")
     if geo_location.is_none() && has_local_intent(&q) {
+        // COUNTRY-LEVEL fallback only (no city). A city-level default is a
+        // fabricated requirement: it gets injected into `positive` and the
+        // cross-location gate, so "nearby restaurants" demanded a page mention
+        // "New York" — the wrong region for a user in India. Country-level is
+        // the correct granularity for a location we could not resolve: it
+        // scopes the upstream query (`source_country`) without inventing a
+        // place the user never named.
         geo_location = Some(geoloc::GeoLocation {
-            country_code: Some("US".to_string()),
-            country_name: Some("United States".to_string()),
-            region: Some("New York".to_string()),
-            city: Some("New York".to_string()),
-            postal_code: Some("10001".to_string()),
-            latitude: Some(40.7128),
-            longitude: Some(-74.0060),
-            time_zone: Some("America/New_York".to_string()),
+            country_code: Some("IN".to_string()),
+            country_name: Some("India".to_string()),
+            region: None,
+            city: None,
+            postal_code: None,
+            latitude: None,
+            longitude: None,
+            time_zone: None,
         });
-        tracing::info!("GEO: local intent detected, applied default geolocation fallback (New York, US)");
+        tracing::info!("GEO: local intent detected, applied country-level geolocation fallback (IN) — no city invented");
     }
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
