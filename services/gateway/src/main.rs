@@ -4889,6 +4889,70 @@ const MAX_PARALLEL_FETCH: usize = 4;
 /// top-N results must complete well before it fires. 22s leaves ~8s headroom.
 const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 22;
 
+/// Snippet-based price fallback (ROADMAP item 8).
+///
+/// When upstream page enrichment yields no structured commerce facts (common for
+/// bot-check pages like Amazon, Walmart, etc.), the search snippet (`content` field)
+/// is still a real upstream signal about that URL. This fallback extracts a price
+/// from the snippet using the same currency-aware patterns as `extract_price_from_text`,
+/// but ONLY when a currency symbol/word is present (never bare numbers).
+///
+/// Attached as `source="snippet_extracted"` so the frontend can label it distinctly
+/// from structured page data. This runs AFTER structured enrichment and provenance
+/// attachment, so it never overwrites stronger signals.
+///
+/// NO ranking manipulation: this is a read-only post-pass over already-ranked
+/// results that only *attaches* facts. Pure + offline-testable.
+fn enrich_snippet_fallback(results: &mut [serde_json::Value]) {
+    for r in results.iter_mut() {
+        if !r.is_object() {
+            continue;
+        }
+        // Only fire when structured enrichment found nothing
+        if r.get("commerce").is_some() {
+            continue;
+        }
+        let snippet = r
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if snippet.is_empty() {
+            continue;
+        }
+        // Try to extract a price from the snippet
+        if let Some(price_info) = extract_price_from_text(snippet) {
+            // Only accept reasonable product prices (reject $0, $9999999, etc.)
+            if price_info.amount <= 0.0 || price_info.amount >= 10_000_000.0 {
+                continue;
+            }
+            let facts = OfferFacts {
+                price: Some(price_info.amount),
+                currency: Some(price_info.currency),
+                ..Default::default()
+            };
+            let provenance_url = r
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let observed_at = r
+                .get("commerce_provenance")
+                .and_then(|cp| cp.get("observed_at"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let offer = CommerceOffer {
+                url: Some(provenance_url),
+                observed_at,
+                source: Some("snippet_extracted".to_string()),
+                data: Some(facts),
+            };
+            if let Ok(v) = serde_json::to_value(&offer) {
+                r["commerce"] = v;
+            }
+        }
+    }
+}
+
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
 /// page exposed structured product data, attached by `enrich_with_commerce`).
 /// Powers the main-path `shopping` gate: the strip is only surfaced when at
@@ -4997,6 +5061,11 @@ async fn handle_shopping(
                 Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
             )
             .await;
+            // ROADMAP item 8: snippet-based price fallback — when page enrichment
+            // yields nothing (bot-check pages), extract an honest price from the
+            // search snippet (a real upstream signal about the URL). Marked distinctly
+            // as source="snippet_extracted" so the frontend can label it separately.
+            enrich_snippet_fallback(arr);
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
             decorate_affiliate(arr, &state.affiliate_ctx);
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
@@ -7475,6 +7544,50 @@ const COUNTRY_DEMONYMS: &[&str] = &[
     "australian", "australia",
 ];
 
+/// FIX-IF-01 (2026-09-24): seed list of household appliances / cooking tools.
+/// When a query negates one of these ("cook salmon without oven or microwave",
+/// "biryani without a pressure cooker", "fried rice without a wok",
+/// "brownies without an oven"), the appliance IS the genuine topical exclusion —
+/// a concrete tool the user wants removed from the method space, not a manner
+/// qualifier. This mirrors the COUNTRY_DEMONYMS precedent: a general data seed
+/// (like PROTECTED_TERMS) that closes the whole "prepare X without <appliance>"
+/// query class broadly — NOT a per-query literal list. Multi-word appliances are
+/// listed in full AND covered by their head noun token ("pressure cooker" via
+/// "cooker"), so compound and single-token lookups both work. Deliberately
+/// EXCLUDES ambiguous heads ("processor" alone would collide with CPUs;
+/// "maker" with "decision maker") — those only match as full compounds.
+const HOUSEHOLD_APPLIANCES: &[&str] = &[
+    // Ovens & cookers
+    "oven", "microwave", "toaster oven", "dutch oven", "pressure cooker",
+    "slow cooker", "rice cooker", "cooker", "crockpot", "crock pot", "instant pot",
+    "air fryer", "fryer", "steamer",
+    // Stovetop
+    "stove", "stovetop", "cooktop", "range", "wok", "grill", "tandoor",
+    "tawa", "kadai", "karahi",
+    // Small kitchen appliances
+    "blender", "immersion blender", "hand blender", "food processor",
+    "mixer", "stand mixer", "grinder", "juicer", "toaster", "kettle",
+    "coffee maker", "espresso machine", "microwave oven",
+    // Household utilities
+    "dishwasher", "washing machine", "dryer", "vacuum", "iron",
+    "refrigerator", "fridge", "freezer", "air conditioner", "heater",
+];
+
+/// FIX-IF-01: true when the negated compound names a household appliance /
+/// cooking tool (whole compound or any token matches the seed). Used to exempt
+/// a negated appliance from the manner-qualifier gate — "without oven" is a
+/// real exclusion even though "oven" sits in a "without X" manner frame.
+fn is_household_appliance(compound: &str) -> bool {
+    let lc = compound.trim().to_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
+    if HOUSEHOLD_APPLIANCES.contains(&lc.as_str()) {
+        return true;
+    }
+    lc.split_whitespace().any(|t| HOUSEHOLD_APPLIANCES.contains(&t))
+}
+
 /// D3: precise manner-frame detection at the PHRASE level (not the bare-token
 /// level that `is_manner_phrase` uses). A declined candidate is a manner
 /// qualifier when it appears inside a "without/with-no <optional article> <term>"
@@ -7729,6 +7842,41 @@ fn is_real_exclusion(
     if compound == "pay" || compound == "paying" || lc == "pay" || lc == "paying" {
         return pay_exclusion_is_money(&q_orig);
     }
+    if negated_compound_is_recognized_entity(compound, q_orig) {
+        return true;
+    }
+    // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
+    // (e.g. "javascript not java not typescript" → java, typescript).
+    if query_is_contrastive {
+        return true;
+    }
+    // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
+    // acceptance here that unconditionally treated ANY object of `without`/`not`/`except`
+    // as a real exclusion. That over-reached: generic attribute/manner objects
+    // ("without soap", "recipes not spicy") were wrongly extracted as hard-filter
+    // exclusions, breaking the manner/attribute tests and degrading result sets. It
+    // had no unit test of its own and cannot distinguish "spicy" from "systemd" without
+    // a hardcoded allow-list (which the no-hardcoding doctrine forbids). The pre-c4317bc
+    // behavior — decline generic nouns unless they are protected terms, capitalized
+    // proper nouns, or in contrastive framing — is the correct contract (covered by the
+    // existing manner/attribute tests), so this path is intentionally NOT taken.
+    false
+}
+
+/// FIX-IF-01 (2026-09-24): the entity-recognition core of `is_real_exclusion`,
+/// extracted so the explicit-directive manner-frame exception in handle_search
+/// can consult the SAME recognition signals. A negated compound is a recognized
+/// entity when any token (or the whole compound) is a protected brand/tech
+/// term, a country-of-origin demonym, a household appliance/cooking tool
+/// (seed lists — general data, no per-query literals), or a capitalized proper
+/// noun the user named in the original query. Recognition is framing-independent:
+/// "without django" is a real exclusion because django is a recognized entity,
+/// even though it sits in a "without X" manner frame.
+fn negated_compound_is_recognized_entity(compound: &str, q_orig: &str) -> bool {
+    let lc = compound.trim().to_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
     let tokens: Vec<&str> = lc.split_whitespace().collect();
     // Entity: any token (or the whole compound) is a protected brand/tech term.
     if tokens.iter().any(|t| spell::is_protected_term(t)) {
@@ -7746,6 +7894,15 @@ fn is_real_exclusion(
     {
         return true;
     }
+    // FIX-IF-01 (2026-09-24): a negated household appliance / cooking tool is a
+    // genuine topical exclusion even without contrastive framing — "cook salmon
+    // without oven or microwave" must exclude both tools from the generic-noun
+    // decline. Same seed-list pattern as COUNTRY_DEMONYMS above: general data
+    // seed, no per-query literals, covers the whole "prepare X without
+    // <appliance>" class.
+    if is_household_appliance(&lc) || tokens.iter().any(|t| HOUSEHOLD_APPLIANCES.contains(t)) {
+        return true;
+    }
     // Entity: a term in the compound is capitalized in the original query
     // (proper noun the user named, e.g. "without Samsung bloat" → Samsung).
     let orig_tokens: Vec<&str> = q_orig.split_whitespace().collect();
@@ -7760,31 +7917,6 @@ fn is_real_exclusion(
             }
         }
     }
-    // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
-    // (e.g. "javascript not java not typescript" → java, typescript).
-    if query_is_contrastive {
-        return true;
-    }
-    // BARE-NOT SELECTION ("wireless headphones not bose"): a single `not`
-    // directly governing a content word is the same explicit user directive as
-    // "except X" / "other than X" — the user named an alternative they do not
-    // want. Without this the class was demoted to a soft negative and the
-    // excluded brand kept ranking. Structurally separated from the attribute /
-    // predicate negations that must stay declined ("recipes not spicy",
-    // "movies not rated r", "does not latch") by `is_bare_not_selection`.
-    if is_bare_not_selection(q_orig, &lc) {
-        return true;
-    }
-    // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
-    // acceptance here that unconditionally treated ANY object of `without`/`not`/`except`
-    // as a real exclusion. That over-reached: generic attribute/manner objects
-    // ("without soap", "recipes not spicy") were wrongly extracted as hard-filter
-    // exclusions, breaking the manner/attribute tests and degrading result sets. It
-    // had no unit test of its own and cannot distinguish "spicy" from "systemd" without
-    // a hardcoded allow-list (which the no-hardcoding doctrine forbids). The pre-c4317bc
-    // behavior — decline generic nouns unless they are protected terms, capitalized
-    // proper nouns, or in contrastive framing — is the correct contract (covered by the
-    // existing manner/attribute tests), so this path is intentionally NOT taken.
     false
 }
 
@@ -8202,6 +8334,12 @@ fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
 fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
     let leads: &[&str] = &[
         r"(?i)\bnot\s+from\b",
+        r"(?i)\bnot\b", // FIX-IF-01 (round 2026-09-25): "not X" was missing from
+        // the leads array. Only "not from X" was matched, so "not react vue or
+        // angular" never triggered the extractor — the protected-term boundary
+        // split code below was dead code. Adding plain "not" as a lead-in
+        // enables the "not X or Y / not X and Y" negation class end-to-end.
+        // Word-boundary anchored (\bnot\b) so "nothing"/"notice" are not matched.
         r"(?i)\bexcept\s+for\b",
         r"(?i)\bexcept\b",
         r"(?i)\bexcluding\b",
@@ -8238,6 +8376,17 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                 // Without this, "without oven or microwave" yielded the single compound
                 // "oven or microwave", which substring-matches no page title/content and
                 // silently let "Best Microwaves" rank #1.
+                //
+                // FIX-IF-01 (2026-09-24): the connector check below was DEAD CODE —
+                // "or"/"and" are in NL_NEG_STOPWORDS, so the trailing-stopword break
+                // fired FIRST and the list never split ("without oven or microwave" →
+                // only "oven"; "microwave" was never extracted). The connector check
+                // must run BEFORE the stopword break. A new negation lead-in word
+                // ("no dairy and no gelatin") is also a boundary: without it the
+                // second "no" was swept into the following entity ("no gelatin").
+                const EXPLICIT_NEG_LEADS: &[&str] = &[
+                    "except", "excluding", "without", "besides", "no", "not",
+                ];
                 let mut ent: Vec<String> = Vec::new();
                 while idx < words.len() && ent.len() < 5 {
                     let w = words[idx];
@@ -8251,11 +8400,16 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     {
                         break; // a fresh price constraint starts here
                     }
-                    if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
-                        break; // trailing stopword ends the entity
+                    // A new negation lead-in ends the clause whether or not an entity
+                    // is partially collected ("no dairy and no gelatin" → ["dairy"],
+                    // then the outer lead loop re-matches the second "no" → ["gelatin"]).
+                    if EXPLICIT_NEG_LEADS.contains(&wc.as_str()) {
+                        break;
                     }
                     // List connector ("or"/"and"/",") between exclusion targets: the
                     // current target is finalised and pushed, then we start a new one.
+                    // MUST precede the trailing-stopword break below — "or"/"and" are
+                    // stopwords, so checking them second made this branch unreachable.
                     let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
                     if !ent.is_empty() && (bare == "or" || bare == "and") {
                         let entity = ent.join(" ");
@@ -8265,6 +8419,26 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                         ent.clear();
                         idx += 1;
                         continue;
+                    }
+                    // Round 2026-09-24: protected-term boundary split. When both the
+                    // current accumulated entity AND the next token are protected terms,
+                    // they must be separate exclusions — "not react vue or angular" must
+                    // yield [react, vue, angular], not [react vue, angular]. Without
+                    // this, the compound "react vue" substring-matches no page and the
+                    // exclusion silently no-ops. The split is data-driven (same
+                    // PROTECTED_TERMS seed as is_protected_term), no per-query literals.
+                    if !ent.is_empty() && spell::is_protected_term(&wc) && spell::is_protected_term(&ent.join(" ")) {
+                        let entity = ent.join(" ");
+                        if !out.contains(&entity) {
+                            out.push(entity);
+                        }
+                        ent.clear();
+                        ent.push(wc);
+                        idx += 1;
+                        continue;
+                    }
+                    if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break; // trailing stopword ends the entity
                     }
                     ent.push(wc);
                     idx += 1;
@@ -10798,18 +10972,20 @@ fn merge_local_and_web(
                     relevance *= 1.10;
                 }
             } else if !price_signal {
-                // Fail-open: only demote price-less results when at least one merged
-                // result actually carries a detectable price. When NO result has a
-                // price (the normal web-snippet case), demoting every price-less
-                // result would collapse a valid product query to zero results — so
-                // the bound stays ranking-only and the gap is reported via
-                // `ignored_constraints`. This replaces the old PRICE FAIL-OPEN branch
-                // that MUTATED `structured_constraints` (deleting the user's stated
-                // price bound), which misrepresented the query to downstream
-                // consumers (notably commerce/shopping). Extraction truth is now
-                // preserved regardless of upstream price availability.
+                // Price-aware demotion for results with no detectable price.
+                // When priced results exist (priced_result_count > 0), a no-price
+                // result is clearly not the product asked for — demote strongly (0.45).
+                // When NO result carries a parseable price (the normal web case),
+                // the bound would otherwise be a complete no-op. Still demote, but
+                // gently (0.7): a transactional query with a price bound describing
+                // a product category means a result with NO price signal at all is
+                // very likely not a product page. This makes the bound MEANINGFUL at
+                // ranking time without collapsing results to zero. Generic; no
+                // hardcoded merchants or domains.
                 if priced_result_count > 0 {
                     relevance *= 0.45;
+                } else {
+                    relevance *= 0.7;
                 }
             }
         }
@@ -16437,6 +16613,47 @@ async fn handle_search(
             let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
             intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
         }
+
+        // Override 10: cooking/how-to queries with "without" pattern → how-to
+        // The intent-engine's linear probe misclassifies "cook X without Y" and
+        // "make X without Y" patterns as "comparison" (conf ~0.9) because the
+        // word "without" triggers comparison logic. But the distribution tells
+        // the truth: how-to is dominant (0.235 vs 0.077 comparison). Force
+        // how-to when:
+        //   (a) query contains a cooking/creation verb + "without", AND
+        //   (b) no genuine comparison markers (vs/versus/compare/alternative)
+        {
+            let cooking_verbs = [
+                "cook", "cooking", "bake", "baking", "make", "making",
+                "prepare", "preparing", "build", "building",
+            ];
+            let has_cooking_verb = cooking_verbs.iter().any(|v| q_has_word(&q_lower, v));
+            let has_without = q_has_word(&q_lower, "without");
+
+            let comparison_markers = [
+                "vs", "versus", "compare", "comparison",
+                "alternative", "replacement", "difference between",
+            ];
+            let has_comparison_marker = comparison_markers.iter().any(|m| q_lower.contains(m));
+
+            if has_cooking_verb && has_without && !has_comparison_marker
+                && intent.intent == "comparison"
+            {
+                tracing::info!(
+                    "INTENT OVERRIDE (STRONG): cooking/how-to query '{}' was 'comparison' (conf={:.3}) -> how-to",
+                    q, intent.confidence
+                );
+                intent.intent = "how-to".to_string();
+                intent.confidence = intent.confidence.max(0.80);
+                let howto_prob = intent.distribution.get("how-to").copied().unwrap_or(0.0);
+                let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+                intent.distribution.insert("how-to".to_string(), (howto_prob + current_top_prob * 0.5).min(0.85));
+                // Dampen the spurious comparison probability
+                if let Some(c) = intent.distribution.get_mut("comparison") {
+                    *c = (*c * 0.3).min(0.20);
+                }
+            }
+        }
     }
 
     let vector: Option<Vec<f32>> = match embed_res {
@@ -16518,13 +16735,23 @@ async fn handle_search(
         alt_queries.push(format!("{} alternatives", s_q));
         alt_queries.push(format!("{} comparison", s_q));
     }
-    for neg in &intent.structured_constraints.negative {
-        let n = neg.trim();
-        if n.is_empty() { continue; }
-        alt_queries.push(format!("alternative to {}", n));
-        alt_queries.push(format!("{} alternatives", n));
-        alt_queries.push(format!("best {} 2026", n));
-        if alt_queries.len() >= 9 { break; }
+    // FIX-IF-01 (2026-09-24): per-excluded-term alt queries are ONLY for
+    // contrastive framing ("alternative to uber", "instead of photoshop") —
+    // mirroring the query_is_contrastive gate the initial-fan-out injection
+    // already applies. For a plain how-to/tool exclusion ("cook salmon without
+    // oven or microwave", "biryani without a pressure cooker") seeding
+    // "alternative to oven" / "best oven 2026" fetches exactly the
+    // excluded-topic junk the user does not want (the round-0559Z sweetener/
+    // cooker symptom). The topic-anchored variants above already cover recall.
+    if query_is_contrastive(&q) {
+        for neg in &intent.structured_constraints.negative {
+            let n = neg.trim();
+            if n.is_empty() { continue; }
+            alt_queries.push(format!("alternative to {}", n));
+            alt_queries.push(format!("{} alternatives", n));
+            alt_queries.push(format!("best {} 2026", n));
+            if alt_queries.len() >= 9 { break; }
+        }
     }
     if let Some(ref s_q) = stripped_query {
         alt_queries.push(format!("best {} 2026", s_q));
@@ -17402,8 +17629,22 @@ async fn handle_search(
 
     // 6. Quality Gates (before merge)
     // Filter web results with very low semantic relevance
+    //
+    // FIX-IF-01 (2026-09-24): score against the NEGATION-STRIPPED query when one
+    // exists. Scoring against the raw query actively selects FOR excluded content:
+    // for "cook salmon without oven or microwave", a salmon page that never mentions
+    // "oven"/"microwave" (exactly what the user wants) loses lexical overlap to the
+    // excluded tokens and scores below the keep threshold, while an oven/microwave
+    // shopping page scores HIGHER. With >20 results the threshold is 0.15 and the
+    // genuine pages (~0.09-0.15) fell under it, collapsing the pool to the top-3
+    // floor — the "only 1-3 results" symptom. The stripped query ("cook salmon")
+    // is the user's actual topic; exclusion is enforced downstream (constraint
+    // scoring + post-merge hard drop), not by this quality gate.
+    let semantic_gate_query: String = stripped_query
+        .clone()
+        .unwrap_or_else(|| q.clone());
     let semantic_scores_web: Vec<f32> = web_results.iter()
-        .map(|res| semantic_relevance_score(&q, &res.title, &res.content))
+        .map(|res| semantic_relevance_score(&semantic_gate_query, &res.title, &res.content))
         .collect();
 
     // ── Relative Relevance: detect garbage clusters ──
@@ -17956,8 +18197,10 @@ async fn handle_search(
             && !url_lower.contains("/signup")
             && !url_lower.contains("/account")
             && !url_lower.contains("/cookie");
-        // Semantic relevance: same scoring as web results
-        let sem_score = semantic_relevance_score(&q, &r.title, &r.content);
+        // Semantic relevance: same scoring as web results. FIX-IF-01: use the
+        // negation-stripped query for the same reason as the web gate above —
+        // local pages lacking the EXCLUDED tokens must not be filtered out.
+        let sem_score = semantic_relevance_score(&semantic_gate_query, &r.title, &r.content);
         let sem_ok = sem_score >= 0.12;  // slightly lower threshold than web (0.18) since local has richer content
         if title_ok && not_error && !sem_ok {
             let trimmed: String = r.title.chars().take(50).collect();
@@ -18002,9 +18245,14 @@ async fn handle_search(
     // Clone data for CPU-intensive scoring on blocking thread
     let q_clone = q.clone();
     let intent_clone = intent.intent.clone();
-    let constraints_clone = intent.structured_constraints.clone();
     let distribution_clone = intent.distribution.clone();
     let geo_clone = geo_location.clone();
+    // NOTE (FIX-IF-01 2026-09-24): `constraints_clone` is deliberately NOT taken
+    // here. It used to be cloned at this point — BEFORE the negation gate below
+    // assigned `negative`/`soft_negatives` — so the merge received a STALE
+    // constraints snapshot (soft_negatives always empty, negatives pre-gating).
+    // It is now cloned after the gate (post D4b positive-purge) so the merge
+    // scores against the FINAL constraint set.
     
     // Apply hard negative filter to web_results for only-negative queries:
     // Drop results whose domain matches the excluded term's official site.
@@ -18077,6 +18325,19 @@ async fn handle_search(
             }
         })
         .collect();
+    // FIX-IF-01 (round 2026-09-25): engine_exclusions was DEAD CODE — computed
+    // but never used. The intent engine correctly tags multi-negation terms like
+    // "onion" and "garlic" in "recipe without onion and garlic" as Exclusion-role
+    // entities, but the gateway ignored this signal. The result: the explicit-neg
+    // path split on "and" correctly, but the manner-frame gate then dropped
+    // "onion" (not a protected term/country/appliance), collapsing the result set
+    // to ZERO. Now we feed engine_exclusions into raw_neg so the gating loop
+    // recognizes them as trusted directives that bypass the manner-frame gate.
+    for ee in &engine_exclusions {
+        if !raw_neg.contains(ee) {
+            raw_neg.push(ee.clone());
+        }
+    }
     let explicit_neg: Vec<String> = extract_explicit_negation_terms(&q_orig);
     for en in &explicit_neg {
         if !raw_neg.contains(en) {
@@ -18100,7 +18361,21 @@ async fn handle_search(
             // gate the other paths use; genuine source/contrastive negations
             // ("not from X", "except X", "other than X") carry no such frame
             // and keep their explicit-directive status.
-            if is_manner_frame(&q_orig, &n) {
+            //
+            // FIX-IF-01 (2026-09-24) — entity/contrastive carve-out: the manner
+            // frame must NOT swallow a RECOGNIZED entity or a contrastively-
+            // framed negation. "without django or flask" (protected terms) and
+            // "no dairy and no gelatin" (double negation → contrastive) were
+            // silently killed by the bare is_manner_frame gate — only the FIRST
+            // list member survived. A negated household appliance ("without
+            // oven or microwave") is covered by the same recognition helper
+            // (appliance seed). Everything unrecognized in a plain "without X"
+            // frame keeps the 0559Z manner behavior ("music background",
+            // "soap", "artificial sweeteners").
+            if is_manner_frame(&q_orig, &n)
+                && !negated_compound_is_recognized_entity(&n, &q_orig)
+                && !query_contrastive
+            {
                 continue; // manner qualifier: not an exclusion at all
             }
             if !explicit_survivors.contains(&n) {
@@ -18110,6 +18385,24 @@ async fn handle_search(
         }
         if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
             gated_neg_dedup.push(n);
+        } else if !is_manner_phrase(&n) && !is_manner_frame(&q_orig, &n) && !soft_negatives.contains(&n) {
+            // Soft negative: generic noun the gate declined but not a manner qualifier.
+            // Demoted in scoring (×0.3), never hard-dropped.
+            soft_negatives.push(n);
+        }
+    }
+    // query_neg_dropped: compounds the extractor already classified as non-manner
+    // declined candidates — these are soft negatives by definition. FIX-IF-01
+    // (2026-09-24): a term that ALREADY survived as a hard negative (explicit
+    // survivor or gated exclusion) must NOT also be reported as a soft negative —
+    // the API would show the same term applied as BOTH -term (hard) and a soft
+    // demotion, a direct contradiction.
+    for d in &query_neg_dropped {
+        if gated_neg_dedup.contains(d) || explicit_survivors.contains(d) {
+            continue;
+        }
+        if !soft_negatives.contains(d) {
+            soft_negatives.push(d.clone());
         }
     }
     gated_neg_dedup.extend(explicit_survivors.clone());
@@ -18201,6 +18494,14 @@ async fn handle_search(
             gated_neg_dedup.iter().map(|n| n.to_lowercase()).collect();
         intent.structured_constraints.positive.retain(|p| !neg_lc.contains(&p.to_lowercase()));
     }
+
+    // FIX-IF-01 (2026-09-24): clone the constraints for the merge HERE — after the
+    // negation gate has assigned `negative`/`soft_negatives` and the D4b purge has
+    // removed contradictory positives. The old clone site (above, pre-gate) handed
+    // the merge a stale snapshot: soft_negatives were always empty and negatives
+    // were pre-gating, so the soft-negative demotion in constraint_score never
+    // fired and manner-junk engine negatives leaked into merge scoring.
+    let constraints_clone = intent.structured_constraints.clone();
 
     let has_only_negative = intent.structured_constraints.positive.is_empty()
         && !gated_neg_dedup.is_empty();
@@ -18329,28 +18630,43 @@ let mut results = match tokio::task::spawn_blocking(move || {
         let negative_norm = negative_norm_expanded;
     // TITLE-ONLY HARD PENALTY: apply score reduction to results whose title
     // directly contains an excluded term. Relaxed for alt-listing pages.
+    // FIX-IF-01 (2026-09-24): also relaxed for FULFILLMENT pages — a title that
+    // carries the excluded term inside a negating frame ("How to Cook Salmon
+    // WITHOUT an Oven", "Protein Powder With NO Artificial Sweeteners") is the
+    // direct answer to a "without X" query, not a violation. Mirrors the
+    // term_in_negating_context boost constraint_score already applies to
+    // title/content matches. Without this exemption the hard-negative fix
+    // would crush the best results for exactly the queries it serves.
     for r in results.iter_mut() {
         let title_lower = r.title.to_lowercase();
         let has_neg_in_title = negative_norm.iter().any(|nt| {
             text_matches_negative(&title_lower, &nt.to_lowercase())
         });
         if has_neg_in_title {
-            let alt = is_alternative_listing_page(&r.title, &r.url, &r.content);
-            if alt > 0.6 {
-                // Strong alt-listing page - no title penalty needed (constraint_score
-                // already applies the single alt-page penalty). Pages like
-                // "Top 10 Chrome Alternatives" are highly relevant despite
-                // mentioning excluded terms in their title.
+            let title_fulfills = negative_norm.iter()
+                .filter(|nt| text_matches_negative(&title_lower, &nt.to_lowercase()))
+                .all(|nt| term_in_negating_context(&nt.to_lowercase(), &title_lower));
+            if title_fulfills {
                 let trimmed: String = r.title.chars().take(40).collect();
-                tracing::info!("TITLE PENALTY SKIPPED (strong alt): alt={:.2} for '{}'", alt, trimmed);
-            } else if alt > 0.3 {
-                // Moderate alt-listing page - mild penalty only
-                r.score *= 0.50;
-                let trimmed: String = r.title.chars().take(40).collect();
-                tracing::info!("TITLE HARD PENALTY (MODERATE): alt={:.2} for '{}' -> score *= 0.50", alt, trimmed);
+                tracing::info!("TITLE PENALTY SKIPPED (negating context): '{}' fulfills the exclusion", trimmed);
             } else {
-                r.score *= 0.01;
-                tracing::info!("TITLE HARD PENALTY: title contains excluded term -> score *= 0.01");
+                let alt = is_alternative_listing_page(&r.title, &r.url, &r.content);
+                if alt > 0.6 {
+                    // Strong alt-listing page - no title penalty needed (constraint_score
+                    // already applies the single alt-page penalty). Pages like
+                    // "Top 10 Chrome Alternatives" are highly relevant despite
+                    // mentioning excluded terms in their title.
+                    let trimmed: String = r.title.chars().take(40).collect();
+                    tracing::info!("TITLE PENALTY SKIPPED (strong alt): alt={:.2} for '{}'", alt, trimmed);
+                } else if alt > 0.3 {
+                    // Moderate alt-listing page - mild penalty only
+                    r.score *= 0.50;
+                    let trimmed: String = r.title.chars().take(40).collect();
+                    tracing::info!("TITLE HARD PENALTY (MODERATE): alt={:.2} for '{}' -> score *= 0.50", alt, trimmed);
+                } else {
+                    r.score *= 0.01;
+                    tracing::info!("TITLE HARD PENALTY: title contains excluded term -> score *= 0.01");
+                }
             }
         }
     }
@@ -18439,17 +18755,34 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 out
             };
 
+            let content_lower = r.content.to_lowercase();
             let should_keep = negative_norm.iter().all(|neg| {
                 let neg_lower = neg.to_lowercase();
                 let words: Vec<&str> = neg_lower.split_whitespace().collect();
-                if words.len() == 1 {
+                let matched = if words.len() == 1 {
                     // Word-boundary aware match — never substring. Prevents
                     // "not java" from dropping every "javascript" result.
-                    !text_matches_negative(&text_lower, &neg_lower)
+                    text_matches_negative(&text_lower, &neg_lower)
                 } else {
                     let joined = words.join(" ");
-                    !(text_lower.contains(&joined) || text_normalized.contains(&joined))
+                    text_lower.contains(&joined) || text_normalized.contains(&joined)
+                };
+                if !matched {
+                    return true; // this negative does not appear — no violation
                 }
+                // FIX-IF-01 (2026-09-24): FULFILLMENT exemption. A page that carries
+                // the excluded term inside a negating frame ("How to Cook Salmon
+                // WITHOUT an Oven", content saying "no oven needed") is satisfying
+                // the exclusion, not violating it — it is the direct answer to a
+                // "without X" query. Mirrors the term_in_negating_context boost
+                // constraint_score applies. Only a match that is NOT in a negating
+                // context (in title or content) counts as a violation here.
+                if term_in_negating_context(&neg_lower, &title_lower)
+                    || term_in_negating_context(&neg_lower, &content_lower)
+                {
+                    return true; // fulfillment page — keep
+                }
+                false
             });
 
             if !should_keep {
@@ -19037,20 +19370,29 @@ let mut results = match tokio::task::spawn_blocking(move || {
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
-            // The `shopping` block is surfaced whenever commercial intent is
-            // detected. Every result carries `commerce_provenance` (attached by
-            // `enrich_with_commerce`) which honestly records whether structured
-            // product data was found on that URL (`source: null` => checked, nothing)
-            // — this is the honest presentation signal, not a gate. Results that
-            // exposed structured data additionally carry a `commerce` block; the
-            // frontend renders both cases (affiliate-decorated URL + optional facts).
-            // Read-only multi-merchant offer comparison from the attached facts.
-            let mut block = serde_json::json!({ "results": shop_arr });
-            if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                let comparisons = build_offer_comparisons(arr_ref);
-                if !comparisons.is_empty() {
-                    block["offer_comparisons"] =
-                        serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+            // ROADMAP item 8: snippet-based price fallback — same as handle_shopping.
+            enrich_snippet_fallback(&mut shop_arr);
+            // ROADMAP item 7 (refinement): only surface the main-path `shopping`
+            // strip when at least one of the top-N ranked results actually exposed
+            // structured product data (a `commerce` block). A commercial-intent
+            // query whose top results are articles/reviews/guides with no product
+            // schema would otherwise render an empty strip of cards carrying only
+            // affiliate links — a low-value, link-farm-like surface that invites
+            // misuse of the affiliate thesis. Gating on a REAL `commerce` block
+            // keeps the block honest: it appears only when we have product facts to
+            // show. Pure post-enrichment signal, no query-specific logic, and the
+            // `results` ordering is untouched either way (no-manipulation holds).
+            if !shop_arr.iter().any(|r| r.get("commerce").is_some()) {
+                None
+            } else {
+                // Read-only multi-merchant offer comparison from the attached facts.
+                let mut block = serde_json::json!({ "results": shop_arr });
+                if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                    let comparisons = build_offer_comparisons(arr_ref);
+                    if !comparisons.is_empty() {
+                        block["offer_comparisons"] =
+                            serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+                    }
                 }
             }
             Some(block)
@@ -19568,6 +19910,23 @@ fn normalize_nl_operators(query: &str) -> String {
                         || wc == "min" || wc == "$" || wc.parse::<f64>().is_ok()
                     {
                         break;
+                    }
+                    // FIX-IF-01 (round 2026-09-25): list connector ("or"/"and") between
+                    // exclusion targets. When we already have a head and hit a connector,
+                    // finalize the current entity and push it to consumed, then start
+                    // a new entity. Without this, "recipe without onion and garlic" only
+                    // produces "onion" (the stopword break fires first); "garlic" is
+                    // left unconsumed and becomes a positive term. Mirrors the proven
+                    // pattern in extract_explicit_negation_terms (FIX-IF-01, 2026-09-24).
+                    let bare = w.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
+                    if !ent.is_empty() && (bare == "or" || bare == "and") {
+                        let entity = ent.join(" ");
+                        if !consumed.contains(&entity) {
+                            consumed.push(entity);
+                        }
+                        ent.clear();
+                        idx += 1;
+                        continue;
                     }
                     if NL_NEG_STOPWORDS.contains(&wc.as_str()) && !ent.is_empty() {
                         break; // stopword after we already have a head = end of entity
@@ -20244,6 +20603,159 @@ mod negation_scope_tests {
     #[test]
     fn plain_query_returns_none() {
         assert_eq!(simple_negation_strip("best laptop for programming"), None);
+    }
+}
+
+#[cfg(test)]
+mod explicit_negation_list_tests {
+    use super::*;
+
+    // FIX-IF-01 (2026-09-24): the "or"/"and" list-connector split in
+    // extract_explicit_negation_terms was DEAD CODE — the trailing-stopword
+    // break (NL_NEG_STOPWORDS contains "or"/"and") fired first, so
+    // "without oven or microwave" extracted only "oven" and "microwave" was
+    // silently never extracted as an explicit directive. These tests pin the
+    // split so the connector branch can never go dead again.
+
+    #[test]
+    fn without_x_or_y_extracts_both_targets() {
+        let out = extract_explicit_negation_terms("cook salmon without oven or microwave");
+        assert!(out.contains(&"oven".to_string()),
+            "oven must be an explicit exclusion, got {:?}", out);
+        assert!(out.contains(&"microwave".to_string()),
+            "microwave must be an explicit exclusion (was silently dropped by the dead connector branch), got {:?}", out);
+        assert!(!out.iter().any(|t| t.contains(" or ")),
+            "no compound may embed the connector, got {:?}", out);
+    }
+
+    #[test]
+    fn without_x_and_y_extracts_both_targets() {
+        let out = extract_explicit_negation_terms("healthy dinner recipes without onion and garlic");
+        assert!(out.contains(&"onion".to_string()), "onion missing: {:?}", out);
+        assert!(out.contains(&"garlic".to_string()), "garlic missing: {:?}", out);
+    }
+
+    #[test]
+    fn not_x_or_y_with_protected_terms_yields_all() {
+        // FIX-IF-01 (round 2026-09-25): "not react vue or angular" must yield
+        // [react, vue, angular] — the previous round's test never ran because
+        // CI was green-washed. Adding plain "not" as a lead-in enables this.
+        let out = extract_explicit_negation_terms("javascript frameworks not react vue or angular");
+        assert!(out.contains(&"react".to_string()), "react missing: {:?}", out);
+        assert!(out.contains(&"vue".to_string()), "vue missing: {:?}", out);
+        assert!(out.contains(&"angular".to_string()), "angular missing: {:?}", out);
+    }
+
+    #[test]
+    fn not_x_or_y_with_generic_terms_yields_all() {
+        // "not" as a plain lead-in also works for non-protected terms.
+        let out = extract_explicit_negation_terms("dinner recipes not pork or beef");
+        assert!(out.contains(&"pork".to_string()), "pork missing: {:?}", out);
+        assert!(out.contains(&"beef".to_string()), "beef missing: {:?}", out);
+    }
+
+    #[test]
+    fn not_from_still_works_after_not_lead_in() {
+        // Adding plain "not" must not break the "not from X" pattern.
+        let out = extract_explicit_negation_terms("restaurants in tokyo not from sushi chains");
+        assert!(out.contains(&"sushi chains".to_string()),
+            "entity after 'not from' must be captured: {:?}", out);
+    }
+
+    #[test]
+    fn no_x_and_no_y_does_not_sweep_lead_into_entity() {
+        // The second "no" is a NEW lead-in, not part of the following entity:
+        // the compound "no gelatin" must never be emitted.
+        let out = extract_explicit_negation_terms("recipes with no dairy and no gelatin");
+        assert!(out.contains(&"dairy".to_string()), "dairy missing: {:?}", out);
+        assert!(out.contains(&"gelatin".to_string()), "gelatin missing: {:?}", out);
+        assert!(!out.iter().any(|t| t.split_whitespace().any(|w| w == "no")),
+            "a lead-in word must never be swept into an entity, got {:?}", out);
+    }
+
+    #[test]
+    fn explicit_negation_still_stops_at_price_ops() {
+        let out = extract_explicit_negation_terms("laptops except gaming rigs under 80000 rupees");
+        assert!(out.contains(&"gaming".to_string()) || out.contains(&"gaming rigs".to_string()),
+            "entity before the price op must be captured, got {:?}", out);
+        assert!(!out.iter().any(|t| t.contains("80000")),
+            "price bound must terminate the entity, got {:?}", out);
+    }
+
+    #[test]
+    fn fulfillment_title_is_negating_context() {
+        // The post-merge fulfillment exemption keys on
+        // term_in_negating_context: a title that says "without an oven" is the
+        // ANSWER to "cook salmon without oven", not a violation.
+        assert!(term_in_negating_context("oven", "how to cook salmon without an oven"),
+            "\"without an oven\" must read as fulfillment");
+        assert!(term_in_negating_context("microwave", "brownies with no microwave needed"),
+            "\"no microwave needed\" must read as fulfillment");
+        assert!(!term_in_negating_context("oven", "how to cook salmon in the oven"),
+            "\"in the oven\" is a violation, not fulfillment");
+    }
+
+    #[test]
+    fn normalize_nl_operators_splits_on_and_or_connectors() {
+        // FIX-IF-01 (round 2026-09-25): normalize_nl_operators must split on
+        // "or"/"and" list connectors so "recipe without onion and garlic"
+        // produces BOTH -onion and -garlic, not just -onion. Without the split,
+        // only "onion" is consumed; "garlic" stays as a positive term.
+        let out = normalize_nl_operators("recipe without onion and garlic");
+        assert!(out.contains("-onion"), "must contain -onion, got: {}", out);
+        assert!(out.contains("-garlic"), "must contain -garlic, got: {}", out);
+        let out2 = normalize_nl_operators("laptop without apple or dell");
+        assert!(out2.contains("-apple"), "must contain -apple, got: {}", out2);
+        assert!(out2.contains("-dell"), "must contain -dell, got: {}", out2);
+    }
+
+    #[test]
+    fn household_appliance_seed_matches_tools_not_manner_nouns() {
+        // FIX-IF-01: the appliance carve-out exempts negated cooking tools from
+        // the manner-qualifier gate, while genuine manner qualifiers (noun-led
+        // or verb-led) keep the 0559Z behavior.
+        assert!(is_household_appliance("oven"), "oven is an appliance");
+        assert!(is_household_appliance("microwave"), "microwave is an appliance");
+        assert!(is_household_appliance("pressure cooker"), "multi-word appliance via full compound");
+        assert!(is_household_appliance("rice cooker"), "multi-word appliance via head token");
+        assert!(is_household_appliance("wok"), "wok is an appliance");
+        assert!(!is_household_appliance("music background"), "manner qualifier is NOT an appliance");
+        assert!(!is_household_appliance("soap"), "manner qualifier is NOT an appliance");
+        assert!(!is_household_appliance("artificial sweeteners"), "manner qualifier is NOT an appliance");
+        assert!(!is_household_appliance(""), "empty compound is never an appliance");
+    }
+
+    #[test]
+    fn appliance_negation_is_real_exclusion_without_contrastive_framing() {
+        // The seed check in is_real_exclusion must accept a negated appliance
+        // even when the query carries no contrastive marker (the exact
+        // FIX-IF-01 defect: "cook salmon without oven or microwave" was
+        // declined as a generic noun).
+        assert!(is_real_exclusion("oven", "cook salmon without oven or microwave", false));
+        assert!(is_real_exclusion("microwave", "cook salmon without oven or microwave", false));
+        assert!(is_real_exclusion("pressure cooker", "biryani without a pressure cooker", false));
+        // Non-appliance generic nouns keep the pre-FIX decline without
+        // contrastive framing (the conservative contract the manner/attribute
+        // tests pin).
+        assert!(!is_real_exclusion("soap", "how to clean a cast iron skillet without soap", false));
+        assert!(!is_real_exclusion("spicy", "healthy recipes not spicy", false));
+    }
+
+    #[test]
+    fn recognized_entity_survives_manner_frame() {
+        // FIX-IF-01: the entity-recognition core must accept a negated protected
+        // term / appliance regardless of the "without X" manner frame — the
+        // 0559Z exception was silently killing every entity that happened to
+        // directly follow "without" ("without django or flask" lost django).
+        assert!(negated_compound_is_recognized_entity("django", "python web frameworks without django or flask"));
+        assert!(negated_compound_is_recognized_entity("flask", "python web frameworks without django or flask"));
+        assert!(negated_compound_is_recognized_entity("oven", "cook salmon without oven or microwave"));
+        assert!(negated_compound_is_recognized_entity("microwave", "cook salmon without oven or microwave"));
+        // Unrecognized generic nouns in the same frame are NOT entities — they
+        // keep the manner-qualifier path.
+        assert!(!negated_compound_is_recognized_entity("music background", "how to learn guitar with no music background"));
+        assert!(!negated_compound_is_recognized_entity("soap", "how to clean a cast iron skillet without soap"));
+        assert!(!negated_compound_is_recognized_entity("artificial sweeteners", "protein powder without artificial sweeteners"));
     }
 }
 
@@ -21918,13 +22430,18 @@ mod spellcheck_endpoint_tests {
         assert!(excl.contains(&"typescript".to_string()), "typescript must be an exclusion: {:?}", excl);
 
         // Manner qualifier must not be an exclusion and must appear once.
+        // FIX-IF-01 (2026-09-24): contract updated — a negated household
+        // appliance ("without an oven") is a REAL exclusion, not a manner
+        // qualifier (the pre-FIX classification silently dropped the user's
+        // tool exclusion and let "How to Cook Salmon in the Oven" rank #1).
+        // The extractor, /analyze and /search must all agree on this.
         let r2 = build_inspect(&index, "best way to cook salmon without an oven");
         let excl2: Vec<String> = r2["negation"]["exclusions"].as_array().unwrap()
             .iter().map(|v| v.as_str().unwrap().to_string()).collect();
         let man2: Vec<String> = r2["negation"]["manner_qualifiers"].as_array().unwrap()
             .iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        assert!(!excl2.iter().any(|e| e.contains("oven")), "oven must NOT be an exclusion: {:?}", excl2);
-        assert!(man2.iter().any(|m| m.contains("oven")), "oven must be a manner qualifier: {:?}", man2);
+        assert!(excl2.iter().any(|e| e.contains("oven")), "oven must be an exclusion (FIX-IF-01 appliance carve-out): {:?}", excl2);
+        assert!(!man2.iter().any(|m| m.contains("oven")), "oven must NOT be a manner qualifier (FIX-IF-01): {:?}", man2);
     }
 
     #[test]
@@ -23458,6 +23975,112 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert_eq!(d.price, Some(49.99), "JSON-LD price must not be overwritten by MF2");
         assert_eq!(d.currency.as_deref(), Some("USD"), "JSON-LD currency must not be overwritten");
         assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    // ── ROADMAP item 8: snippet-based price fallback ────────────────────────
+    // When page enrichment yields nothing (bot-check pages), the search snippet
+    // is still a real upstream signal. These tests prove the fallback fires
+    // only as a last resort, never overwrites stronger signals, and is
+    // order-preserving (it's a pure post-pass read-only attach).
+
+    #[test]
+    fn snippet_fallback_extracts_price_from_dollar_snippet() {
+        // Simulates a result where page enrichment found nothing (commerce absent)
+        // but the snippet carries a price like "$248".
+        let mut results = vec![
+            serde_json::json!({
+                "url": "https://www.amazon.com/dp/B0C7XFLWN5",
+                "title": "Sony WH-1000XM5 Headphones",
+                "content": "Sony WH-1000XM5 Wireless Noise Canceling Headphones - now $248 at Amazon",
+                "score": 9.7,
+                "commerce_provenance": { "url": "https://www.amazon.com/dp/B0C7XFLWN5", "observed_at": "1790295033", "source": null, "data": null }
+            }),
+        ];
+        enrich_snippet_fallback(&mut results);
+        let c = results[0].get("commerce").expect("snippet fallback should attach commerce");
+        let d = c.get("data").unwrap();
+        assert_eq!(d["price"], serde_json::json!(248.0));
+        assert_eq!(d["currency"], serde_json::json!("USD"));
+        assert_eq!(c["source"], serde_json::json!("snippet_extracted"));
+        assert_eq!(results[0]["url"], serde_json::json!("https://www.amazon.com/dp/B0C7XFLWN5"), "url unchanged");
+    }
+
+    #[test]
+    fn snippet_fallback_extracts_inr_price_from_snippet() {
+        // ₹29,999 price in snippet
+        let mut results = vec![
+            serde_json::json!({
+                "url": "https://www.flipkart.com/sony-wh-1000xm5/p/123",
+                "title": "Sony WH-1000XM5",
+                "content": "Buy Sony WH-1000XM5 for ₹29,999 at Flipkart",
+                "score": 9.0,
+                "commerce_provenance": { "url": "https://www.flipkart.com/sony-wh-1000xm5/p/123", "observed_at": "1", "source": null, "data": null }
+            }),
+        ];
+        enrich_snippet_fallback(&mut results);
+        let c = results[0].get("commerce").expect("INR snippet fallback should attach commerce");
+        assert_eq!(c["data"]["price"], serde_json::json!(29999.0));
+        assert_eq!(c["data"]["currency"], serde_json::json!("INR"));
+        assert_eq!(c["source"], serde_json::json!("snippet_extracted"));
+    }
+
+    #[test]
+    fn snippet_fallback_does_not_overwrite_structured_commerce() {
+        // If structured enrichment already attached a commerce block, the snippet
+        // fallback must NOT overwrite it.
+        let mut results = vec![
+            serde_json::json!({
+                "url": "https://www.amazon.com/dp/B0C7XFLWN5",
+                "content": "Sony WH-1000XM5 for $248",
+                "score": 9.0,
+                "commerce": {
+                    "url": "https://www.amazon.com/dp/B0C7XFLWN5",
+                    "observed_at": "1790295033",
+                    "source": "json-ld",
+                    "data": { "price": 299.99, "currency": "USD" }
+                },
+                "commerce_provenance": { "url": "https://www.amazon.com/dp/B0C7XFLWN5", "observed_at": "1790295033", "source": "json-ld", "data": { "price": 299.99 } }
+            }),
+        ];
+        enrich_snippet_fallback(&mut results);
+        let c = results[0].get("commerce").unwrap();
+        // Structured commerce preserved — snippet fallback skipped
+        assert_eq!(c["data"]["price"], serde_json::json!(299.99));
+        assert_eq!(c["source"], serde_json::json!("json-ld"));
+    }
+
+    #[test]
+    fn snippet_fallback_ignores_snippets_without_currency() {
+        // A snippet without a currency symbol must NOT produce a price (no bare numbers).
+        let mut results = vec![
+            serde_json::json!({
+                "url": "https://blog.example.com/review",
+                "content": "The Sony WH-1000XM5 has 40-hour battery life and weighs 250 grams",
+                "score": 8.5,
+                "commerce_provenance": { "url": "https://blog.example.com/review", "observed_at": "1", "source": null, "data": null }
+            }),
+        ];
+        enrich_snippet_fallback(&mut results);
+        // No currency symbol — snippet fallback should NOT fire
+        assert!(results[0].get("commerce").is_none(), "no currency symbol => no commerce");
+    }
+
+    #[test]
+    fn snippet_fallback_preserves_order_and_urls() {
+        // Multiple results: order and URLs must be byte-identical before/after.
+        let mut results = vec![
+            serde_json::json!({ "url": "https://a.example.com/1", "content": "Buy for $299", "score": 9.0, "commerce_provenance": { "url": "https://a.example.com/1", "observed_at": "1", "source": null, "data": null } }),
+            serde_json::json!({ "url": "https://b.example.com/2", "content": "Price: €199", "score": 8.5, "commerce_provenance": { "url": "https://b.example.com/2", "observed_at": "1", "source": null, "data": null } }),
+            serde_json::json!({ "url": "https://c.example.com/3", "content": "No price here", "score": 8.0, "commerce_provenance": { "url": "https://c.example.com/3", "observed_at": "1", "source": null, "data": null } }),
+        ];
+        let before: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        enrich_snippet_fallback(&mut results);
+        let after: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        assert_eq!(before, after, "snippet fallback must preserve order");
+        // First two get commerce, third stays null
+        assert!(results[0].get("commerce").is_some());
+        assert!(results[1].get("commerce").is_some());
+        assert!(results[2].get("commerce").is_none());
     }
 }
 

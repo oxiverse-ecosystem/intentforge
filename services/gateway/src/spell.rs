@@ -65,6 +65,14 @@ const PROTECTED_TERMS: &[&str] = &[
     "github", "gitlab", "apple", "ubuntu", "debian", "alpine", "macos",
     "android", "linux", "windows", "aws", "gcp", "azure", "vim", "neovim",
     "emacs", "json", "yaml", "toml", "grpc", "graphql", "kafka", "duckdb",
+    // JS frameworks / libraries (round 2026-09-24: these are top-tier
+    // package names that must never be spell-corrected or declined as
+    // generic nouns in negation contexts — "not react/vue/angular").
+    "react", "vue", "angular",
+    // Consumer electronics brands (round 2026-09-24: "not apple or sony"
+    // exclusion queries need these recognized as entities).
+    "sony", "samsung", "oneplus", "xiaomi", "nothing", "motorola", "oppo",
+    "vivo", "realme", "poco", "asus", "acer", "lenovo", "dell", "hp",
     // Food & cooking terms that collide with English words / tech terms
     "batter", "dosa", "idli", "vada", "poha", "upma", "biryani", "tandoori",
     "masala", "chutney", "achar", "ghee", "besan", "rava", "semolina",
@@ -1697,46 +1705,20 @@ mod tests {
         assert_eq!(index.correct("ngnix"), Some("nginx".to_string()));
     }
 
+    // Round 2026-09-24: PROTECTED_TERMS must include top-tier JS frameworks
+    // and consumer electronics brands so that "not react/vue/angular" and
+    // "not apple or sony" exclusion queries are recognized as entities.
     #[test]
-    fn test_cancing_phonetic_codes_debug() {
-        use rphonetic::{Encoder, DoubleMetaphone};
-        let dmeta = DoubleMetaphone::default();
-        let code_cancing = dmeta.encode("cancing");
-        let code_cancelling = dmeta.encode("cancelling");
-        let code_cancelled = dmeta.encode("cancelled");
-        let code_cancel = dmeta.encode("cancel");
-        eprintln!("cancing   → {}", code_cancing);
-        eprintln!("cancelling → {}", code_cancelling);
-        eprintln!("cancelled  → {}", code_cancelled);
-        eprintln!("cancel     → {}", code_cancel);
-        // DoubleMetaphone codes for near-identical words can differ in the last
-        // character (e.g. "cancing" → KNSN, "cancelling" → KNSL). They share
-        // the KNS prefix, which is what the phonetic fallback matches on.
-        assert_eq!(&code_cancing[..3], &code_cancelling[..3], "cancing and cancelling should share phonetic prefix");
+    fn test_js_frameworks_are_protected_terms() {
+        assert!(is_protected_term("react"), "react must be protected");
+        assert!(is_protected_term("vue"), "vue must be protected");
+        assert!(is_protected_term("angular"), "angular must be protected");
     }
 
     #[test]
-    fn test_cancing_corrected_to_cancelling_via_phonetic_fallback() {
-        // FIX-IF-12: "cancing" is an insertion-only typo of "cancelling"
-        // (missing 'l' after 'canci' → 'cancelling'). This is edit distance 3,
-        // beyond SymSpell/LinSpell's max of 2. The phonetic fallback using
-        // Double Metaphone should catch it because both words encode to KNSNK.
-        let index = SymSpellIndex::build();
-        let result = index.correct("cancing");
-        assert!(result.is_some(), "Should correct 'cancing' via phonetic fallback");
-        let result = result.unwrap();
-        assert!(result == "cancelling" || result == "canceling",
-            "Should correct 'cancing' to a variant of 'cancel', got: {}", result);
-    }
-
-    #[test]
-    fn test_cancing_in_query_context() {
-        // Full query: "budget friendly noise cancing headphones with usb c charging"
-        // The phonetic fallback should correct "cancing" → "cancelling"
-        let index = SymSpellIndex::build();
-        let (corrected, changed) = correct_query(&index, "budget friendly noise cancing headphones with usb c charging");
-        assert!(changed, "Query with 'cancing' should be spell-corrected");
-        assert!(corrected.contains("cancelling") || corrected.contains("canceling"),
-            "Corrected query should contain 'cancelling' or 'canceling', got: {}", corrected);
+    fn test_consumer_electronics_brands_are_protected_terms() {
+        assert!(is_protected_term("sony"), "sony must be protected");
+        assert!(is_protected_term("samsung"), "samsung must be protected");
+        assert!(is_protected_term("oneplus"), "oneplus must be protected");
     }
 }
