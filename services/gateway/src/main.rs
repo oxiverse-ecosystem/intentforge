@@ -25519,7 +25519,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
-            8,
+            CommerceConfig::default().enrich_window,
         )
         .await;
         let elapsed = start.elapsed();
@@ -25613,7 +25613,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_millis(1),
-            4,
+            CommerceConfig::default().enrich_window,
         )
         .await;
 
@@ -25693,7 +25693,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
-            8,
+            CommerceConfig::default().enrich_window,
         )
         .await;
 
@@ -25814,7 +25814,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         )
         .await;
 
-        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2), 4).await;
+        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2), CommerceConfig::default().enrich_window).await;
 
         let with_commerce = ranked
             .iter()
