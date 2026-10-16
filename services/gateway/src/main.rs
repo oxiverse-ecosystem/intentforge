@@ -7368,11 +7368,19 @@ fn is_inferred_location(query: &str, loc: &geoloc::GeoLocation) -> bool {
         .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
         .filter(|t| !t.is_empty())
         .collect();
-    let q_has = |s: &str| {
+    let q_has = |s: &str| -> bool {
         let s = s.trim().to_lowercase();
-        !s.is_empty()
-            && (q_tokens.iter().any(|t| *t == s)
-                || q_lower.contains(&s))
+        if s.is_empty() {
+            return false;
+        }
+        // Use whole-token matching for short strings (e.g. country codes "IN",
+        // "US") so that "in" does not match inside "pipeline", "when", "join".
+        // Longer strings fall back to substring matching for multi-word tokens.
+        if s.len() <= 4 {
+            q_tokens.iter().any(|t| *t == s)
+        } else {
+            q_lower.contains(&s)
+        }
     };
     let city_named = loc.city.as_deref().map(|c| q_has(c)).unwrap_or(false);
     let country_named = loc
