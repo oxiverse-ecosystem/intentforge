@@ -34,16 +34,16 @@ mod affiliate_integration_tests;
 /// The gateway container shares gluetun's network namespace, so localhost
 /// does not reach sibling containers. These helpers centralize the lookup.
 fn intent_engine_url() -> String {
-    std::env::var("INTENT_ENGINE_URL").unwrap_or_else(|_| intent_engine_url().to_string())
+    std::env::var("INTENT_ENGINE_URL").unwrap_or_else(|_| "http://127.0.0.1:3005".to_string())
 }
 fn searxng_url() -> String {
-    std::env::var("SEARXNG_URL").unwrap_or_else(|_| searxng_url().to_string())
+    std::env::var("SEARXNG_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
 }
 fn indexer_url() -> String {
-    std::env::var("INDEXER_URL").unwrap_or_else(|_| indexer_url().to_string())
+    std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://127.0.0.1:6000".to_string())
 }
 fn crawler_url() -> String {
-    std::env::var("CRAWLER_URL").unwrap_or_else(|_| crawler_url().to_string())
+    std::env::var("CRAWLER_URL").unwrap_or_else(|_| "http://127.0.0.1:5001".to_string())
 }
 
 
@@ -13433,8 +13433,8 @@ async fn main() {
     let prewarm_searxng2 = state.searxng2_url.clone();
     tokio::spawn(async move {
         let mut prewarm_heads = vec![
-            prewarm_client.head(format!("{}/search", searxng_url())?q=prewarm&format=json&pageno=1").send(),
-            prewarm_client.head(format!("{}/search", indexer_url())?q=prewarm").send(),
+            prewarm_client.head(format!("{}/search?q=prewarm&format=json&pageno=1", searxng_url())).send(),
+            prewarm_client.head(format!("{}/search?q=prewarm", indexer_url())).send(),
         ];
         if let Some(ref s2_url) = prewarm_searxng2 {
             let url = format!("{}/search?q=prewarm&format=json&pageno=1", s2_url);
