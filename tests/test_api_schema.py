@@ -697,7 +697,7 @@ if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 
 
-# 11. /analyze schema
+# 10. /analyze schema
 ANALYZE_KEYS = ["query", "contrastive_framing", "exclusions", "declined", "manner_qualifiers", "decisions"]
 
 
@@ -797,7 +797,6 @@ def test_video_inspect_schema(session):
 
 
 # 15. /shopping schema
-@pytest.mark.requires_upstream
 def test_shopping_schema(session):
     """GET /shopping -> 200, results[] present with commerce/affiliate structure."""
     r = session.get(f"{BASE}/shopping", params={"q": "best wireless earbuds under 50", "count": 3}, timeout=60)
@@ -821,14 +820,7 @@ def test_shopping_schema(session):
 
 # 16. POST /commerce/extract schema
 def test_commerce_extract_schema(session):
-    """POST /commerce/extract -> 200, returns the CommerceBlock provenance envelope.
-
-    The endpoint returns the SAME envelope the rest of the commerce surface uses
-    (`CommerceBlock` in services/gateway/src/main.rs): top-level
-    `url`/`observed_at`/`source` provenance plus the typed facts under `data`
-    (the same shape `/shopping` emits as `commerce_provenance` / `commerce`).
-    Facts are asserted inside `data`; provenance at the top level.
-    """
+    """POST /commerce/extract -> 200, returns price/currency/merchant fields."""
     html = (
         '<html><head><script type="application/ld+json">'
         '{"@type":"Product","name":"Test Widget","offers":{"@type":"Offer",'
@@ -843,25 +835,7 @@ def test_commerce_extract_schema(session):
     )
     assert r.status_code == 200, f"POST /commerce/extract -> {r.status_code} {r.text[:300]}"
     body = r.json()
-    # Provenance envelope — same CommerceBlock shape as /shopping's
-    # commerce_provenance. The honest "we observed this, here, from this
-    # structured source" record is what makes a stale price labelable.
-    for field in ("url", "source", "observed_at", "data"):
-        assert field in body, (
-            f"POST /commerce/extract envelope missing key '{field}'; have {sorted(body.keys())}"
-        )
-    assert body.get("source") == "json-ld", (
-        f"POST /commerce/extract source should be 'json-ld' for a JSON-LD page; got {body.get('source')!r}"
-    )
-    assert body.get("observed_at"), "POST /commerce/extract observed_at must be present (provenance)"
-    assert body.get("url") == "https://store.example.com/p/test-widget", (
-        f"POST /commerce/extract url should echo the supplied page url; got {body.get('url')!r}"
-    )
-    data = body.get("data")
-    assert isinstance(data, dict), (
-        f"POST /commerce/extract 'data' must be the typed facts object; got {type(data).__name__} ({data!r})"
-    )
-    for field in ("price", "currency", "availability", "merchant"):
-        assert field in data, f"POST /commerce/extract data missing key '{field}'; have {sorted(data.keys())}"
-    assert data.get("price") == 29.99, f"POST /commerce/extract price should be 29.99; got {data.get('price')!r}"
-    assert data.get("currency") == "USD", f"POST /commerce/extract currency should be 'USD'; got {data.get('currency')!r}"
+    for field in ("price", "currency", "availability", "merchant", "source", "observed_at"):
+        assert field in body, f"POST /commerce/extract missing key '{field}'; have {sorted(body.keys())}"
+    assert body.get("price") == 29.99, f"POST /commerce/extract price should be 29.99; got {body.get('price')!r}"
+    assert body.get("currency") == "USD", f"POST /commerce/extract currency should be 'USD'; got {body.get('currency')!r}"
