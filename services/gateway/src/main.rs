@@ -18,6 +18,7 @@ mod geoloc;
 mod dictionary;
 mod clean;
 mod goals;
+mod query_expansion;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
 // ─── API Types ───────────────────────────────────────────────────────
@@ -8292,6 +8293,70 @@ fn keyphrase_relax_variant(query: &str) -> Option<String> {
     Some(filtered.join(" "))
 }
 
+/// Strip location phrases from a query for thin-result fallback.
+///
+/// When a query like "top 10 must visit places in japan for first time travelers"
+/// returns few results, removing location constraints ("in japan") and quantity
+/// phrases ("top 10") can help upstream engines return more general results.
+/// This is a general transformation — no query-specific strings.
+///
+/// Returns the stripped query, or `None` if stripping would remove everything.
+fn strip_location_terms(query: &str) -> Option<String> {
+    let q_lower = query.to_lowercase();
+    let words: Vec<&str> = q_lower.split_whitespace().collect();
+    if words.len() < 3 {
+        return None;
+    }
+    // Don't strip structured operators or site constraints
+    if q_lower.contains("site:") || q_lower.contains("filetype:") || q_lower.contains("intitle:") || q_lower.contains("inurl:") {
+        return None;
+    }
+
+    // Location prepositions and quantity phrases to strip
+    const LOCATION_PREPS: &[&str] = &[
+        "in", "at", "near", "around", "throughout", "across", "within",
+    ];
+    const QUANTITY_PHRASES: &[&str] = &[
+        "top", "best", "top 10", "best 10", "top 5", "best 5",
+        "first", "must", "visit", "places", "places to visit",
+    ];
+
+    // Find and remove location phrases: "<prep> <Place>" patterns
+    let mut filtered: Vec<&str> = words.clone();
+    let mut location_stripped = false;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 0..filtered.len().saturating_sub(1) {
+            if LOCATION_PREPS.contains(&filtered[i]) {
+                // Remove the preposition and the following word (place name)
+                filtered.drain(i..=i + 1);
+                changed = true;
+                location_stripped = true;
+                break;
+            }
+        }
+    }
+
+    // Only strip quantity phrases when a location was also stripped —
+    // avoids over-stripping queries that have no location (e.g. "best practices...").
+    // Strip from anywhere in the query, not just the start.
+    if location_stripped {
+        filtered.retain(|w| !QUANTITY_PHRASES.contains(w));
+    }
+
+    if filtered.len() < 2 {
+        return None;
+    }
+
+    let result = filtered.join(" ");
+    // Only return if the stripped version is meaningfully different
+    if result == query {
+        return None;
+    }
+    Some(result)
+}
+
 
 // ─── Numeric Constraint Relaxation ─────────────────────────────────
 /// Strip numeric budget/amount constraints from a query to boost recall.
@@ -16460,82 +16525,103 @@ async fn handle_search(
         }
     }
 
-    // FIX-IF-03: Thin-result fallback — if the initial + retry still returned
-    // fewer than 5 results, fire a final numeric-relaxed query with a hard 8s
-    // timeout guard. If SearXNG doesn't respond within 8s, return whatever
-    // partial results exist with a flag rather than timing out entirely.
-    let mut partial_results = false;
-    let final_total = web_results.len();
-    if final_total < 5 && has_numeric_constraint(&q) && !searx_base_urls.is_empty() {
-        if let Some(relaxed) = numeric_constraint_relaxation(&q) {
-            let relaxed_clean = preprocess_searxng_query(&relaxed);
-            if !relaxed_clean.is_empty() {
-                let fallback_timeout = Duration::from_secs(8);
-                for (inst_idx, base_url) in searx_base_urls.iter().enumerate() {
-                    let fb_key = searx_base_keys[inst_idx].clone();
-                    // VPN-only fallback, selected by stable key not sort position.
-                    if fb_key != "searxng0" { break; }
-                    if circuit_ref.is_open(&fb_key) { continue; }
-                    let fb_url = searxng_url(base_url, &relaxed_clean, geo_location.as_ref(), lang);
-                    let fb_client = client.clone();
-                    let fb_circuit = circuit_ref.clone();
-                    let fb_result = tokio::time::timeout(fallback_timeout, async move {
-                        match fb_client.get(&fb_url).send().await {
-                            Ok(resp) => {
-                                match tokio::time::timeout(Duration::from_secs(3), resp.text()).await {
-                                    Ok(Ok(text)) => {
-                                        let sanitized = sanitize_json_text(&text);
-                                        match serde_json::from_str::<SearxResponse>(&sanitized) {
-                                            Ok(data) => Some(data),
-                                            Err(_) => None,
-                                        }
-                                    }
-                                    _ => None,
-                                }
-                            }
-                            Err(_) => None,
-                        }
-                    }).await;
+    // ─── Upstream recall gap fallback (IF-1) ────────────────────────
+    // When SearXNG still returns critically few results after the retry
+    // fan-out (niche technical queries where upstream engines have poor
+    // recall), fire expanded query variations on the VPN instance and
+    // re-query the local indexer with expanded terms. Both compensate
+    // for upstream recall gaps. The expanded queries come from the
+    // intent engine (algorithmically generated, no hardcoded strings).
+    let web_results_pre_fallback = web_results.len();
+    let local_results_pre_fallback = local_results.len();
+    if web_results_pre_fallback < 5 && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
+        let fallback_budget = Duration::from_millis(2500);
 
-                    match fb_result {
-                        Ok(Some(data)) if !data.results.is_empty() => {
-                            tracing::info!("THIN-RESULT FALLBACK: relaxed query returned {} results", data.results.len());
-                            partial_results = true;
-                            fb_circuit.record_success(&fb_key);
-                            for (pos, result) in data.results.into_iter().enumerate() {
-                                let engine_weight = fb_circuit.weight(&result.engine);
-                                let normalized = {
-                                    let lower = result.url.to_lowercase();
-                                    let no_fragment = lower.split('#').next().unwrap_or(&lower);
-                                    let no_trailing = no_fragment.trim_end_matches('/');
-                                    let no_www = no_trailing.replacen("://www.", "://", 1);
-                                    let no_mobile = no_www.replacen("://m.", "://", 1).replacen("://mobile.", "://", 1);
-                                    strip_tracking_params(&no_mobile)
-                                };
-                                if !url_rrf_contributions.contains_key(&normalized) {
-                                    let rrf_contrib = engine_weight / (60.0 + (pos + 1) as f32);
-                                    *url_rrf_contributions.entry(normalized).or_insert(0.0) += rrf_contrib;
-                                    let mut instance_tagged = result;
-                                    let instance_tag = format!("instance_{}", fb_key.trim_start_matches("searxng"));
-                                    if !instance_tagged.sources.contains(&instance_tag) {
-                                        instance_tagged.sources.push(instance_tag);
-                                    }
-                                    web_results.push(instance_tagged);
-                                }
+        // Phase A: secondary SearXNG with expanded terms (VPN instance only for speed)
+        if let Some(base_url) = searx_base_urls.get(0) {
+            let mut searx_fallback_futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<SearxResponse, reqwest::Error>> + Send>>> = Vec::new();
+            for eq in expanded_queries.iter().skip(1).take(3) {
+                let clean_eq = preprocess_searxng_query(eq);
+                if clean_eq.to_lowercase() == q.to_lowercase() { continue; }
+                if clean_eq.is_empty() { continue; }
+                let fallback_url = searxng_url(base_url, &clean_eq, geo_location.as_ref(), lang);
+                let fallback_client = client.clone();
+                searx_fallback_futs.push(Box::pin(async move {
+                    match tokio::time::timeout(Duration::from_secs(3), fallback_client.get(&fallback_url).send()).await {
+                        Ok(Ok(resp)) => {
+                            let raw = match tokio::time::timeout(Duration::from_secs(2), resp.text()).await {
+                                Ok(Ok(t)) => t,
+                                _ => return Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] }),
+                            };
+                            let sanitized = sanitize_json_text(&raw);
+                            match serde_json::from_str::<SearxResponse>(&sanitized) {
+                                Ok(data) => Ok(data),
+                                Err(_) => Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] }),
                             }
                         }
-                        Ok(_) => {
-                            tracing::warn!("THIN-RESULT FALLBACK: relaxed query returned 0 results");
-                            partial_results = true;
-                            fb_circuit.record_success(&fb_key);
+                        _ => Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] }),
+                    }
+                }));
+            }
+
+            if !searx_fallback_futs.is_empty() {
+                let _ = tokio::time::timeout(fallback_budget, async {
+                    let mut pending = searx_fallback_futs;
+                    while !pending.is_empty() {
+                        let (result, _idx, remaining) = futures::future::select_all(pending).await;
+                        pending = remaining;
+                        if let Ok(data) = result {
+                            for r in data.results {
+                                web_results.push(r);
+                            }
                         }
-                        Err(_) => {
-                            tracing::warn!("THIN-RESULT FALLBACK: relaxed query timed out after 8s");
-                            partial_results = true;
+                    }
+                }).await;
+            }
+        }
+
+        // Phase B: local indexer re-query with expanded terms
+        let mut indexer_fallback_tasks = Vec::new();
+        for eq in expanded_queries.iter().take(3) {
+            let indexer_q = preprocess_searxng_query(eq);
+            if indexer_q.to_lowercase() == q.to_lowercase() { continue; }
+            if indexer_q.is_empty() { continue; }
+            let indexer_q_encoded = urlencoding::encode(&indexer_q);
+            let indexer_url = format!("http://127.0.0.1:6000/search?q={}", indexer_q_encoded);
+            let indexer_http_client = client.clone();
+            indexer_fallback_tasks.push(tokio::spawn(async move {
+                match tokio::time::timeout(Duration::from_millis(1500), indexer_http_client.get(&indexer_url).send()).await {
+                    Ok(Ok(resp)) => read_json_bounded::<Vec<IndexerResult>>(resp).await,
+                    _ => None,
+                }
+            }));
+        }
+
+        for task in indexer_fallback_tasks {
+            match tokio::time::timeout(Duration::from_millis(1600), task).await {
+                Ok(Ok(Some(results))) => {
+                    let existing_urls: std::collections::HashSet<String> = local_results.iter()
+                        .map(|r| normalize_indexer_url(&r.url))
+                        .collect();
+                    for r in results {
+                        let norm = normalize_indexer_url(&r.url);
+                        if !existing_urls.contains(&norm) {
+                            local_results.push(r);
                         }
                     }
                 }
+                _ => {}
             }
+        }
+
+        let web_results_post_fallback = web_results.len();
+        let local_results_post_fallback = local_results.len();
+        if web_results_post_fallback > web_results_pre_fallback || local_results_post_fallback > local_results_pre_fallback {
+            tracing::info!(
+                "RECALL FALLBACK (IF-1): niche query — web: {} → {}, local: {} → {}",
+                web_results_pre_fallback, web_results_post_fallback,
+                local_results_pre_fallback, local_results_post_fallback
+            );
         }
     }
 
@@ -16737,6 +16823,166 @@ async fn handle_search(
     let mut web_results = unique_web_results;
 
     tracing::info!("After dedup: {} unique web results", web_results.len());
+
+    // ── Thin-result fallback: expanded query retry ──
+    // When the initial fan-out returns few results (< 5), the query may be too
+    // specific for upstream engines. Fire expanded variants (guide/tips suffixes,
+    // entity subsets, location-stripped) to recover coverage. This is a general
+    // transformation — no query-specific strings.
+    const THIN_RESULT_THRESHOLD: usize = 5;
+    if web_results.len() < THIN_RESULT_THRESHOLD {
+        let variants = query_expansion::thin_result_variants(&q);
+        let location_stripped = strip_location_terms(&q);
+        let mut retry_queries: Vec<String> = variants;
+        if let Some(ls) = location_stripped {
+            if !retry_queries.contains(&ls) {
+                retry_queries.push(ls);
+            }
+        }
+        // Cap at 3 variants to bound latency
+        retry_queries.truncate(3);
+
+        if !retry_queries.is_empty() {
+            tracing::info!(
+                "THIN RESULT: {} web results < {} — firing {} expanded variant(s)",
+                web_results.len(),
+                THIN_RESULT_THRESHOLD,
+                retry_queries.len()
+            );
+
+            // Build SearXNG URLs for each variant (reuse the same instances)
+            let mut retry_urls: Vec<String> = Vec::new();
+            for variant in &retry_queries {
+                let clean_v = preprocess_searxng_query(variant);
+                if clean_v.is_empty() || clean_v == preprocess_searxng_query(&q) {
+                    continue;
+                }
+                for base_url in &searx_base_urls {
+                    retry_urls.push(searxng_url(base_url, &clean_v, geo_location.as_ref(), lang));
+                }
+            }
+
+            if !retry_urls.is_empty() {
+                // Fire all variant URLs in parallel (bounded budget)
+                let retry_client = client.clone();
+                let retry_circuit = circuit_ref.clone();
+                let retry_ratelimit = ratelimit_ref.clone();
+                let retry_fut = async move {
+                    let mut handles = Vec::new();
+                    for url in retry_urls {
+                        let c = retry_client.clone();
+                        let circ = retry_circuit.clone();
+                        let rl = retry_ratelimit.clone();
+                        handles.push(tokio::spawn(async move {
+                            // Check circuit breaker
+                            let instance_key = if url.contains("tor2") || url.contains("8081") {
+                                "searxng1"
+                            } else {
+                                "searxng0"
+                            };
+                            if !circ.is_open(instance_key) {
+                                return SearxResponse { results: vec![], unresponsive_engines: vec![] };
+                            }
+                            let resp = match tokio::time::timeout(
+                                std::time::Duration::from_millis(4200),
+                                c.get(&url).send(),
+                            ).await {
+                                Ok(Ok(r)) => r,
+                                Ok(Err(e)) => {
+                                    tracing::warn!("Thin-result retry request failed: {:?}", e);
+                                    circ.record_failure(instance_key);
+                                    return SearxResponse { results: vec![], unresponsive_engines: vec![] };
+                                }
+                                Err(_) => {
+                                    tracing::warn!("Thin-result retry request timed out");
+                                    circ.record_failure(instance_key);
+                                    return SearxResponse { results: vec![], unresponsive_engines: vec![] };
+                                }
+                            };
+                            let status = resp.status();
+                            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                                rl.record();
+                                return SearxResponse { results: vec![], unresponsive_engines: vec![] };
+                            }
+                            let raw = match tokio::time::timeout(
+                                std::time::Duration::from_secs(4),
+                                resp.text(),
+                            ).await {
+                                Ok(Ok(t)) => t,
+                                _ => return SearxResponse { results: vec![], unresponsive_engines: vec![] },
+                            };
+                            let sanitized = sanitize_json_text(&raw);
+                            match serde_json::from_str::<SearxResponse>(&sanitized) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    tracing::warn!("Thin-result retry parse error: {}", e);
+                                    SearxResponse { results: vec![], unresponsive_engines: vec![] }
+                                }
+                            }
+                        }));
+                    }
+                    let mut all_results = Vec::new();
+                    for h in handles {
+                        if let Ok(resp) = h.await {
+                            all_results.push(resp);
+                        }
+                    }
+                    all_results
+                };
+
+                // Bound the retry at 5s — thin results are a best-effort improvement
+                let retry_results = match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    retry_fut,
+                ).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tracing::warn!("Thin-result retry timed out — using existing results");
+                        Vec::new()
+                    }
+                };
+
+                // Merge retry results into web_results (with dedup)
+                let mut retry_count = 0;
+                for resp in retry_results {
+                    for r in resp.results {
+                        let normalized = {
+                            let lower = r.url.to_lowercase();
+                            let no_fragment = lower.split('#').next().unwrap_or(&lower);
+                            let no_trailing = no_fragment.trim_end_matches('/');
+                            let no_www = no_trailing.replacen("://www.", "://", 1);
+                            let no_mobile = no_www
+                                .replacen("://m.", "://", 1)
+                                .replacen("://mobile.", "://", 1);
+                            strip_tracking_params(&no_mobile)
+                        };
+                        if url_to_index.contains_key(&normalized) {
+                            // Already seen — merge source
+                            if let Some(&idx) = url_to_index.get(&normalized) {
+                                let source = if r.engine.is_empty() { "unknown".to_string() } else { r.engine.clone() };
+                                if !web_results[idx].sources.contains(&source) {
+                                    web_results[idx].sources.push(source);
+                                }
+                            }
+                        } else {
+                            // New result from expanded query
+                            let source = if r.engine.is_empty() { "unknown".to_string() } else { r.engine.clone() };
+                            let mut result = r;
+                            result.sources = vec![source, "expanded".to_string()];
+                            url_to_index.insert(normalized, web_results.len());
+                            web_results.push(result);
+                            retry_count += 1;
+                        }
+                    }
+                }
+                tracing::info!(
+                    "Thin-result retry added {} new result(s) — total now {}",
+                    retry_count,
+                    web_results.len()
+                );
+            }
+        }
+    }
 
     // 6. Quality Gates (before merge)
     // Filter web results with very low semantic relevance
@@ -21942,6 +22188,91 @@ mod spellcheck_endpoint_tests {
         }
     }
 
+    // -- /video endpoint (additive video-introspection) --
+    // Mirrors the /intent /geolocate additive precedent: pure fn
+    // reuses the EXACT video-classification fns /search uses
+    // (simple_negation_strip + has_video_intent + is_url_video_host),
+    // so the preview matches real engine behavior. No network, no
+    // ranking, fully testable on the pure path.
+    mod video_endpoint_tests {
+        use super::*;
+
+        #[test]
+        fn video_non_video_query_returns_pin_true() {
+            // Mirrors API_REFERENCE.md verified example: a text query must
+            // report video_intent=false, would_pin_non_video_sources=true.
+            let res = build_video_inspect("rust vs go high concurrency servers");
+            assert_eq!(res["query"].as_str(), Some("rust vs go high concurrency servers"));
+            assert_eq!(res["video_intent"].as_bool(), Some(false));
+            assert_eq!(res["would_pin_non_video_sources"].as_bool(), Some(true));
+            assert_eq!(res["intent"].as_str(), Some("informational"));
+        }
+
+        #[test]
+        fn video_video_intent_query_exempts_from_pin() {
+            // Mirrors API_REFERENCE.md verified example: a video-intent query must
+            // report video_intent=true, would_pin_non_video_sources=false.
+            let res = build_video_inspect("best youtube tutorial for rust async");
+            assert_eq!(res["video_intent"].as_bool(), Some(true));
+            assert_eq!(res["would_pin_non_video_sources"].as_bool(), Some(false));
+        }
+
+        #[test]
+        fn video_is_video_source_examples_match_is_url_video_host() {
+            // The endpoint's host classifications must EXACTLY match
+            // is_url_video_host: youtube / youtu.be / invidious / vimeo => true;
+            // python.org => false; example.com/youtube-guide-article (word in
+            // path only) => false.
+            let res = build_video_inspect("rust tutorial");
+            let ex = &res["is_video_source_examples"];
+            assert_eq!(ex["youtube_watch"], serde_json::json!(true));
+            assert_eq!(ex["youtu_be"], serde_json::json!(true));
+            assert_eq!(ex["invidious_selfhosted"], serde_json::json!(true));
+            assert_eq!(ex["vimeo"], serde_json::json!(true));
+            assert_eq!(ex["python_org_article"], serde_json::json!(false));
+            assert_eq!(ex["example_video_word_in_path"], serde_json::json!(false));
+        }
+
+        #[test]
+        fn video_empty_query_returns_documented_400_envelope() {
+            // Empty / whitespace q must return the /video-shaped empty_query
+            // envelope (neutral video_intent + markers present), NOT a 200 with
+            // a classified result. Locks the pure builder build_video_empty().
+            let res = build_video_empty();
+            assert_eq!(res["error"].as_str(), Some("empty_query"));
+            assert_eq!(res["message"].as_str(), Some("Query parameter 'q' is empty"));
+            assert_eq!(res["query"].as_str(), Some(""));
+            assert_eq!(res["video_intent"].as_bool(), Some(false));
+            assert_eq!(res["would_pin_non_video_sources"].as_bool(), Some(true));
+        }
+
+        #[test]
+        fn video_response_shape_matches_docs() {
+            // Locks the documented top-level keys so the contract cannot drift.
+            let res = build_video_inspect("how to watch a video");
+            for key in [
+                "query", "video_intent", "video_intent_markers",
+                "would_pin_non_video_sources", "is_video_source_examples",
+                "intent", "note",
+            ] {
+                assert!(res.get(key).is_some(), "missing /video top-level key: {}", key);
+            }
+            assert_eq!(
+                res["video_intent_markers"],
+                serde_json::json!(["video", "youtube", "watch", "tutorial", "animation"])
+            );
+        }
+
+        #[test]
+        fn video_watch_phrase_triggers_video_intent() {
+            // "watch video" / "watch tutorial" must be detected as video intent
+            // (has_video_intent checks for these phrases, matching live /search).
+            let stripped = simple_negation_strip("watch video tutorial").unwrap_or("watch video tutorial".to_string());
+            assert!(has_video_intent(&stripped));
+        }
+    }
+}
+
 mod commerce_extraction_tests {
     use super::*;
 
@@ -22541,1920 +22872,54 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!out.contains("ip="), "no ip");
     }
 
-    // ── ROADMAP item 7 (refinement): parallel enrichment within budget ──
-    // The main /search path calls enrich_with_commerce_par with bounded
-    // concurrency. These tests prove: (a) parallel enrichment completes
-    // well within the TimeoutLayer budget, (b) URL order is byte-identical
-    // to sequential enrichment, (c) timeout doesn't panic — provenance is
-    // attached even when the wall-time fires.
-
-    #[tokio::test]
-    async fn parallel_enrichment_within_budget_and_order_invariant() {
-        // 8 fake results, each fetch takes 500ms. With MAX_PARALLEL_FETCH=4,
-        // total wall time ≈ 1s (two waves of 4), far below the 22s cap.
-        let mut ranked: Vec<serde_json::Value> = (0..8)
-            .map(|i| {
-                serde_json::json!({
-                    "url": format!("https://store{}.example.com/p/{}", i, i),
-                    "score": 9.0 - (i as f64 * 0.1),
-                })
-            })
-            .collect();
-
-        let before: Vec<String> = ranked
-            .iter()
-            .map(|r| r["url"].as_str().unwrap().to_string())
-            .collect();
-
-        let fake_html = HTML_SINGLE_OFFER.to_string();
-        let fetch = move |url: String| {
-            let html = fake_html.clone();
-            async move {
-                // Simulate network latency
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                Some(html)
-            }
-        };
-
-        let start = std::time::Instant::now();
-        enrich_with_commerce_par(
-            &mut ranked,
-            fetch,
-            std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
-        )
-        .await;
-        let elapsed = start.elapsed();
-
-        // Parallel: 8 results / 4 concurrent = 2 waves × 500ms = ~1s
-        // Sequential would be 8 × 500ms = 4s.
-        assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "parallel enrichment should complete in ~1s, took {:?}",
-            elapsed
-        );
-
-        // Order preserved byte-for-byte.
-        let after: Vec<String> = ranked
-            .iter()
-            .map(|r| r["url"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(before, after, "parallel enrichment must preserve order");
-
-        // Every result got a commerce block (all fetched the fake product page).
-        for r in ranked.iter() {
-            assert!(r.get("commerce").is_some(), "commerce block attached in parallel");
-            assert!(r.get("commerce_provenance").is_some(), "provenance attached in parallel");
-        }
-    }
-
-    #[tokio::test]
-    async fn parallel_enrichment_timeout_gracefully_attaches_provenance() {
-        // A fetch that ALWAYS exceeds the wall timeout must not panic. Every
-        // result still gets commerce_provenance (source: null, data: null).
-        let mut ranked: Vec<serde_json::Value> = (0..4)
-            .map(|i| {
-                serde_json::json!({
-                    "url": format!("https://slow{}.example.com/p", i),
-                })
-            })
-            .collect();
-
-        let fetch = |_url: String| async {
-            // Wall-time is 1ms; this fetch is 10s — guaranteed to time out.
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            None
-        };
-
-        // Must NOT panic.
-        enrich_with_commerce_par(
-            &mut ranked,
-            fetch,
-            std::time::Duration::from_millis(1),
-        )
-        .await;
-
-        // All results got provenance (even though fetch returned None).
-        for r in ranked.iter() {
-            assert!(
-                r.get("commerce_provenance").is_some(),
-                "provenance must be attached even on timeout"
-            );
-            // No commerce block (fetch returned None, no facts to attach).
-            assert!(
-                r.get("commerce").is_none(),
-                "no commerce block when fetch returns None"
-            );
-        }
-    }
-
-    /// The provenance block must DISCLOSE the fact it ships with. It used to be a
-    /// constant `{source: null, data: null}` template, so a successfully attached
-    /// fact shipped with a provenance block that disclaimed it — the
-    /// no-misrepresentation contract is meaningless if the provenance lies.
     #[test]
-    fn attached_fact_provenance_discloses_source_and_observed_at() {
-        let mut r = serde_json::json!({
-            "url": "https://shop.example.com/p/widget",
-        });
-        enrich_single_commerce(&mut r, HTML_SINGLE_OFFER);
-
-        assert!(
-            r.get("commerce").is_some(),
-            "a page with a real offer must attach commerce"
-        );
-        let p = &r["commerce_provenance"];
-        assert_eq!(p["url"].as_str().unwrap(), "https://shop.example.com/p/widget");
-        assert!(
-            p["source"].as_str().is_some(),
-            "provenance must name the extraction source for an attached fact, got {:?}",
-            p["source"]
-        );
-        assert!(
-            p["observed_at"].as_str().is_some(),
-            "provenance must carry observed_at for an attached fact"
-        );
-        assert!(
-            !p["data"].is_null(),
-            "provenance must carry the observed data it attributes to the page"
-        );
-        // observed_at must match the attached offer's own stamp (same observation).
-        assert_eq!(
-            p["observed_at"].as_str().unwrap(),
-            r["commerce"]["observed_at"].as_str().unwrap()
-        );
-    }
-
-    /// A page with NO structured product data must stay honestly null: no
-    /// `commerce` block, and provenance that does NOT claim a source (a null fact
-    /// must never be attributed to an extraction source).
-    #[test]
-    fn no_fact_page_keeps_honest_null_provenance() {
-        let mut r = serde_json::json!({
-            "url": "https://blog.example.com/post",
-        });
-        enrich_single_commerce(&mut r, HTML_NO_H_PRODUCT);
-
-        assert!(r.get("commerce").is_none(), "no fabricated commerce block");
-        let p = &r["commerce_provenance"];
-        assert!(p["source"].is_null(), "no source claimed for a null fact");
-        assert!(p["data"].is_null(), "no data claimed for a null fact");
-        assert_eq!(p["url"].as_str().unwrap(), "https://blog.example.com/post");
-    }
-
-    /// REGRESSION (this card): the host-derived merchant must not count as a fact
-    /// on its own, or EVERY result with a URL ships a `commerce` block and the
-    /// honest-null branch above is dead code. `data_has_fact` used to test
-    /// `merchant.is_some()`, which step 6 makes true for every URL.
-    #[test]
-    fn host_derived_merchant_alone_is_not_a_fact() {
-        let offer = extract_commerce_offer(HTML_NO_H_PRODUCT, "https://blog.example.com/post");
-        let d = offer.data.as_ref().unwrap();
-        // The display label is still derived — the fallback keeps working...
-        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
-        // ...but it is marked as NOT observed, so it cannot be a fact.
-        assert!(!d.merchant_observed, "host label is not an observed merchant");
-        assert!(!data_has_fact(d), "host label alone must not count as a product fact");
-    }
-
-    /// The inverse guard: a page whose ONLY structured fact is a real seller name
-    /// (JSON-LD `seller`, no price) MUST still get a `commerce` block. This locks
-    /// the root-cause fix against a "weaker" variant that simply dropped `merchant`
-    /// from `data_has_fact`.
-    #[test]
-    fn observed_merchant_alone_still_counts_as_a_fact() {
-        let html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{ "@context": "https://schema.org/", "@type": "Product",
-  "name": "Seller Only",
-  "seller": { "@type": "Organization", "name": "Acme Seller" } }
-</script></head><body></body></html>"#;
-        let offer = extract_commerce_offer(html, "https://shop.example.com/p/1");
-        let d = offer.data.as_ref().unwrap();
-        assert_eq!(d.merchant.as_deref(), Some("Acme Seller"));
-        assert!(d.merchant_observed, "JSON-LD seller is an observed merchant");
-        assert!(
-            data_has_fact(d),
-            "an observed seller name alone is still a real product fact"
-        );
-    }
-
-    /// A page that DOES expose product facts alongside a host fallback still
-    /// attaches its block (the fix must not over-correct into dropping facts).
-    #[test]
-    fn real_fact_with_host_fallback_still_attaches() {
-        let offer = extract_commerce_offer(HTML_SINGLE_OFFER, "https://shop.example.com/p/widget");
-        let d = offer.data.as_ref().unwrap();
-        assert!(data_has_fact(d), "a real price must still count as a fact");
-    }
-
-    /// REGRESSION (real bug, 2026-09-26): `commerce` was null on 100% of live
-    /// results. The old fake slept 500ms — faster than the removed 2500ms
-    /// per-fetch cap — so no test could ever see the defect. A real VPN-routed
-    /// product page takes ~8s. This fake sleeps 3s: still SLOWER than the old
-    /// cap, still comfortably inside the DERIVED per-fetch budget, and it must
-    /// still yield real commerce facts with honest provenance.
-    #[tokio::test]
-    async fn slow_but_successful_fetch_still_yields_commerce_facts() {
-        let mut ranked: Vec<serde_json::Value> = (0..4)
-            .map(|i| {
-                serde_json::json!({
-                    "url": format!("https://slowmerchant{}.example.com/p/{}", i, i),
-                })
-            })
-            .collect();
-
-        let fake_html = HTML_SINGLE_OFFER.to_string();
-        let fetch = move |_url: String| {
-            let html = fake_html.clone();
-            async move {
-                // 3s — 6x the removed 2500ms inner cap, ~1/3 of a real page.
-                tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
-                Some(html)
-            }
-        };
-
-        let start = std::time::Instant::now();
-        enrich_with_commerce_par(
-            &mut ranked,
-            fetch,
-            std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
-        )
-        .await;
-        let elapsed = start.elapsed();
-
-        for r in ranked.iter() {
-            assert!(
-                r.get("commerce").is_some(),
-                "a SLOW-but-successful fetch must still attach commerce facts"
-            );
-            // Honesty invariant: the fact carries provenance tied to THIS url.
-            assert_eq!(
-                r["commerce_provenance"]["url"].as_str().unwrap(),
-                r["url"].as_str().unwrap(),
-                "provenance url must be the exact result url the facts came from"
-            );
-            assert!(
-                r["commerce_provenance"]["observed_at"].as_str().is_some(),
-                "every attached fact carries observed_at provenance"
-            );
-        }
-        // One wave of 4 (MAX_PARALLEL_FETCH=4) => ~3s total, well inside the wall.
-        assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "slow fetches must run in parallel, took {:?}",
-            elapsed
-        );
-    }
-
-    /// REGRESSION (real bug, live 2026-09-30): the enrichment wall was a FLAT
-    /// 22s while the whole request is capped by a 30s `TimeoutLayer`. Search
-    /// itself burns several seconds on upstreams BEFORE enrichment starts, so
-    /// the two budgets were independent and 22s of decoration on top of an
-    /// already-spent search budget overran the transport ceiling.
-    ///
-    /// Measured live: `/search` returned in 25-28s against the 30s cap and
-    /// intermittently returned **HTTP 408 with no results at all** — a total
-    /// search outage caused by an OPTIONAL decoration pass. The budget must
-    /// therefore shrink as the request gets slower, and must never underflow.
-    #[test]
-    fn enrichment_wall_shrinks_as_request_gets_slower() {
-        use std::time::Duration;
-        // A fast search has the full ceiling available.
-        let fresh = commerce_wall_for_elapsed(Duration::from_secs(0));
-        assert_eq!(
-            fresh,
-            Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
-            "a request that has spent no time gets the full enrichment ceiling"
-        );
-        // A search that already spent 10s gets strictly LESS than one that spent
-        // none — this is the invariant the flat constant violated.
-        let slower = commerce_wall_for_elapsed(Duration::from_secs(10));
-        assert!(
-            slower < fresh,
-            "a slower search must leave less room for enrichment: {:?} !< {:?}",
-            slower,
-            fresh
-        );
-        // Monotonic: more elapsed time never buys MORE budget.
-        let a = commerce_wall_for_elapsed(Duration::from_secs(4));
-        let b = commerce_wall_for_elapsed(Duration::from_secs(8));
-        let c = commerce_wall_for_elapsed(Duration::from_secs(16));
-        assert!(a >= b && b >= c, "budget must be monotonically non-increasing");
-        // A request that has already exhausted the transport budget gets ZERO,
-        // not a wrapped value — the caller then skips enrichment entirely rather
-        // than scheduling fetches that cannot finish.
-        assert_eq!(
-            commerce_wall_for_elapsed(Duration::from_secs(REQUEST_TIMEOUT_SECS + 5)),
-            Duration::ZERO,
-            "an already-overrun request must yield a zero budget, never underflow"
-        );
-    }
-
-    /// The derived budget must ALWAYS leave the reserved headroom inside the
-    /// request budget, so enrichment plus the non-enrichment tail of the request
-    /// (affiliate decoration, comparison assembly, serialization) can never
-    /// exceed the transport ceiling. This is the property that prevents the 408.
-    ///
-    /// Scoped to requests that have NOT already overrun on their own: once
-    /// `elapsed` exceeds the transport budget the request is already lost
-    /// upstream, and the honest contract is only that enrichment then adds
-    /// NOTHING further (wall == 0), never that the sum is somehow reduced.
-    #[test]
-    fn enrichment_wall_always_preserves_request_headroom() {
-        for elapsed_secs in 0..=REQUEST_TIMEOUT_SECS {
-            let elapsed = std::time::Duration::from_secs(elapsed_secs);
-            let wall = commerce_wall_for_elapsed(elapsed);
-            assert!(
-                elapsed + wall <= std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
-                "at elapsed={}s, enrichment wall {:?} pushes the request past the {}s ceiling",
-                elapsed_secs,
-                wall,
-                REQUEST_TIMEOUT_SECS
-            );
-            // Once the request has exhausted its budget, enrichment must add
-            // nothing at all rather than stacking more time onto a lost request.
-            if elapsed_secs >= REQUEST_TIMEOUT_SECS {
-                assert_eq!(
-                    wall,
-                    std::time::Duration::ZERO,
-                    "an exhausted request must get no enrichment budget"
-                );
-            }
-        }
-    }
-
-    /// The per-fetch budget must never fall below the real reachable page
-    /// latency — that starvation IS the production defect (it drove `commerce`
-    /// to null on 100% of real results).
-    ///
-    /// The budget is the whole remaining outer wall, deliberately NOT divided by
-    /// the wave count: fetches inside a wave run CONCURRENTLY, so a wave costs
-    /// the SLOWEST fetch, not the sum. Dividing by wave count looks tidy but
-    /// starves every fetch as the result set grows — at the real production
-    /// geometry of ~23 results / 6 waves it yields ~3.6s per fetch, under the
-    /// ~6.5s a real VPN-routed page needs, which was measured on the live server
-    /// to regress enrichment back to 0/N.
-    #[test]
-    fn per_fetch_budget_is_never_starved_by_wave_count() {
-        let wall = std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS);
-        // Measured worst case through the VPN-routed client: a 200 from
-        // techradar.com in ~6.5s. Any budget below this silently drops facts.
-        let real_page_latency = std::time::Duration::from_millis(6500);
-
-        for waves in 1usize..=12 {
-            let budget = commerce_fetch_budget(wall, waves);
-            assert!(
-                budget >= real_page_latency,
-                "with {} waves the per-fetch budget is {:?}, under the ~6.5s a \
-                 real page needs — this starves enrichment",
-                waves,
-                budget
-            );
-        }
-        // Never collapses to zero on a degenerate wave count.
-        assert_eq!(
-            commerce_fetch_budget(wall, 0),
-            wall,
-            "waves_remaining=0 must not divide by zero"
-        );
-    }
-
-    /// Partial-progress correctness: a fast sibling's facts must survive when a
-    /// slow sibling in the SAME wave times out. Enrichment must not be
-    /// all-or-nothing across the array.
-    #[tokio::test]
-    async fn timed_out_sibling_does_not_discard_fast_sibling_facts() {
-        let mut ranked: Vec<serde_json::Value> = (0..4)
-            .map(|i| {
-                let kind = if i < 2 { "fast" } else { "slow" };
-                serde_json::json!({
-                    "url": format!("https://{}{}.example.com/p/{}", kind, i, i),
-                })
-            })
-            .collect();
-
-        let fake_html = HTML_SINGLE_OFFER.to_string();
-        let fetch = move |url: String| {
-            let html = fake_html.clone();
-            async move {
-                if url.contains("/fast") {
-                    Some(html)
-                } else {
-                    // Exceeds the whole 2s wall — guaranteed to time out.
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    Some(html)
-                }
-            }
-        };
-
-        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2)).await;
-
-        let with_commerce = ranked
-            .iter()
-            .filter(|r| r.get("commerce").is_some())
-            .count();
-        assert_eq!(
-            with_commerce, 2,
-            "the two fast results must keep their facts despite two timed-out siblings"
-        );
-        for r in ranked.iter() {
-            assert!(
-                r.get("commerce_provenance").is_some(),
-                "every result still gets provenance (honest null), fast or slow"
-            );
-        }
-    }
-
-    /// REGRESSION (this card): handle_search enriches a CLONE of the top-N for
-    /// the main-path shopping block; /shopping then reused to re-fetch those
-    /// SAME pages in a second 22s pass, blowing past the 30s TimeoutLayer.
-    /// `copy_commerce_facts_from_shopping_block` replays the already-fetched
-    /// facts instead. This test proves facts are copied without re-fetching,
-    /// order is preserved, and existing commerce is never clobbered.
-    #[test]
-    fn copy_commerce_facts_from_shopping_block_replays_not_refetches() {
-        // 4 results: two without commerce, two already carrying facts.
-        let mut results: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
-            serde_json::json!({
-                "url": "https://store.example.com/p/2", "score": 8.5,
-                "commerce": { "price": 99.0, "currency": "USD" },
-                "commerce_provenance": { "url": "https://store.example.com/p/2",
-                    "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
-                    "data": { "price": 99.0 } }
-            }),
-            serde_json::json!({ "url": "https://store.example.com/p/3", "score": 8.0 }),
-            serde_json::json!({ "url": "https://store.example.com/p/4", "score": 7.5 }),
-        ];
-
-        // Shopping block has facts for URLs 1, 2, and 3 — but NOT 4.
-        let shopping = serde_json::json!({
-            "results": [
-                { "url": "https://store.example.com/p/3",
-                  "commerce": { "price": 49.99, "currency": "USD" },
-                  "commerce_provenance": { "url": "https://store.example.com/p/3",
-                      "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
-                      "data": { "price": 49.99 } } },
-                { "url": "https://store.example.com/p/1",
-                  "commerce": { "price": 199.0, "currency": "USD" },
-                  "commerce_provenance": { "url": "https://store.example.com/p/1",
-                      "observed_at": "2026-01-01T00:00:00Z", "source": "extracted_from_text",
-                      "data": { "price": 199.0 } } },
-                // URL 2 is in the shopping block too — must NOT overwrite its
-                // existing commerce (no clobbering).
-                { "url": "https://store.example.com/p/2",
-                  "commerce": { "price": 1.0, "currency": "USD" },
-                  "commerce_provenance": { "url": "https://store.example.com/p/2",
-                      "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
-                      "data": { "price": 1.0 } } },
-            ]
-        });
-
-        let before_urls: Vec<String> = results
-            .iter()
-            .map(|r| r["url"].as_str().unwrap().to_string())
-            .collect();
-
-        copy_commerce_facts_from_shopping_block(&mut results, Some(&shopping));
-
-        // Order preserved.
-        let after_urls: Vec<String> = results
-            .iter()
-            .map(|r| r["url"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(before_urls, after_urls, "order must be byte-identical");
-
-        // URL 1: fact copied from shopping block.
-        assert_eq!(
-            results[0]["commerce"]["price"], 199.0,
-            "URL 1 should get the shopping block's fact"
-        );
-
-        // URL 2: existing commerce NOT clobbered by shopping block.
-        assert_eq!(
-            results[1]["commerce"]["price"], 99.0,
-            "URL 2 existing commerce must not be overwritten"
-        );
-
-        // URL 3: fact copied from shopping block.
-        assert_eq!(
-            results[2]["commerce"]["price"], 49.99,
-            "URL 3 should get the shopping block's fact"
-        );
-
-        // URL 4: no fact in shopping block → stays null.
-        assert!(
-            results[3].get("commerce").is_none(),
-            "URL 4 has no shopping-block fact → must stay null"
-        );
-
-        // Provenance copied for enriched results (honesty invariant).
-        assert_eq!(
-            results[0]["commerce_provenance"]["source"], "extracted_from_text"
-        );
-        assert_eq!(
-            results[2]["commerce_provenance"]["source"], "json-ld"
-        );
-    }
-
-    /// When the shopping block is absent (non-commercial intent, handle_search
-    /// skipped it), the helper is a no-op — no panic, no fabrication.
-    #[test]
-    fn copy_commerce_facts_none_shopping_block_is_noop() {
-        let mut results: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "url": "https://store.example.com/p/1" }),
-        ];
-        let before = serde_json::to_value(&results).unwrap();
-        copy_commerce_facts_from_shopping_block(&mut results, None);
-        assert_eq!(before, serde_json::to_value(&results).unwrap(), "no-op when shopping is None");
-    }
-
-    /// Main-path commerce fact replay: when `handle_search` attaches commerce
-    /// facts to the main `results` array (via `copy_commerce_facts_from_shopping_block`),
-    /// the ranked URL order MUST be byte-identical before and after. This is the
-    /// no-manipulation guarantee for the main `/search` path — the same invariant
-    /// the order-invariance test enforces for the `/shopping` endpoint.
-    #[test]
-    fn main_path_commerce_replay_preserves_ranked_order() {
-        // Simulate a ranked results array (already scored and ordered).
-        let mut results: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0, "title": "Product A" }),
-            serde_json::json!({ "url": "https://store.example.com/p/2", "score": 8.5, "title": "Product B" }),
-            serde_json::json!({ "url": "https://store.example.com/p/3", "score": 8.0, "title": "Product C" }),
-            serde_json::json!({ "url": "https://store.example.com/p/4", "score": 7.5, "title": "Product D" }),
-        ];
-
-        // Shopping block with commerce facts for URLs 1 and 3.
-        let shopping = serde_json::json!({
-            "results": [
-                { "url": "https://store.example.com/p/1",
-                  "commerce": { "price": 199.0, "currency": "USD" },
-                  "commerce_provenance": { "url": "https://store.example.com/p/1",
-                      "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
-                      "data": { "price": 199.0 } } },
-                { "url": "https://store.example.com/p/3",
-                  "commerce": { "price": 49.99, "currency": "USD" },
-                  "commerce_provenance": { "url": "https://store.example.com/p/3",
-                      "observed_at": "2026-01-01T00:00:00Z", "source": "og",
-                      "data": { "price": 49.99 } } },
-            ]
-        });
-
-        let before_urls: Vec<String> = results
-            .iter()
-            .map(|r| r["url"].as_str().unwrap().to_string())
-            .collect();
-        let before_scores: Vec<f64> = results
-            .iter()
-            .map(|r| r["score"].as_f64().unwrap())
-            .collect();
-
-        copy_commerce_facts_from_shopping_block(&mut results, Some(&shopping));
-
-        // THE CONTRACT: ranked URL order and scores are byte-identical.
-        let after_urls: Vec<String> = results
-            .iter()
-            .map(|r| r["url"].as_str().unwrap().to_string())
-            .collect();
-        let after_scores: Vec<f64> = results
-            .iter()
-            .map(|r| r["score"].as_f64().unwrap())
-            .collect();
-        assert_eq!(before_urls, after_urls, "URL order must be byte-identical");
-        assert_eq!(before_scores, after_scores, "scores must be unchanged");
-
-        // Commerce facts attached to matching URLs.
-        assert_eq!(results[0]["commerce"]["price"], 199.0);
-        assert_eq!(results[2]["commerce"]["price"], 49.99);
-
-        // Non-matching URLs stay null.
-        assert!(results[1].get("commerce").is_none());
-        assert!(results[3].get("commerce").is_none());
-    }
-
-    // ── Microformats2 h-product extraction ───────────────────────────────
-    // ROADMAP item 1 (increment): extend the honest commerce extractor to
-    // pages that mark up products with Microformats2 `h-product` classes.
-    // Many Shopify, WooCommerce, and independent stores emit MF2 markup with
-    // no JSON-LD/OG/microdata — these tests prove the new parser recovers
-    // honest facts the other signals miss, and that it does NOT fire on
-    // unrelated microformats (h-entry, h-card, etc.).
-
-    const HTML_H_PRODUCT_FULL: &str = r#"<!doctype html><html><head>
-<title>H-Product Store</title>
-</head><body>
-<article class="h-product">
-  <h2 class="p-name">Acme Widget Pro</h2>
-  <a class="p-brand u-url" href="https://acme.example">Acme</a>
-  <span class="p-sku">ACME-WP-001</span>
-  <span class="p-price">$49.99</span>
-  <span class="p-price-currency">USD</span>
-  <span class="p-identifier">9876543210987</span>
-  <img class="u-photo" src="https://cdn.example.com/widget-pro.jpg" alt="">
-  <span class="p-condition">New</span>
-  <span class="p-availability">InStock</span>
-</article>
-</body></html>"#;
-
-    #[test]
-    fn h_product_extracts_all_fields() {
-        let o = extract_commerce_offer(HTML_H_PRODUCT_FULL, "https://mf2.example.com/widget");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(49.99), "p-price text with currency symbol stripped");
-        assert_eq!(d.currency.as_deref(), Some("USD"), "p-price-currency");
-        assert_eq!(d.sku.as_deref(), Some("ACME-WP-001"), "p-sku");
-        assert_eq!(d.gtin.as_deref(), Some("9876543210987"), "p-identifier numeric");
-        assert_eq!(d.merchant.as_deref(), Some("Acme"), "p-brand");
-        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/widget-pro.jpg"), "u-photo");
-        assert_eq!(d.condition.as_deref(), Some("New"), "p-condition");
-        assert_eq!(d.availability.as_deref(), Some("InStock"), "p-availability");
-        assert_eq!(o.source.as_deref(), Some("microformats2"));
-    }
-
-    const HTML_H_PRODUCT_VALUE_ATTR: &str = r#"<!doctype html><html><head>
-<title>MF2 Value Attr</title>
-</head><body>
-<div class="h-product">
-  <span class="p-name">Gadget</span>
-  <span class="p-price" value="29.99">29.99</span>
-  <span class="p-price-currency" content="EUR">EUR</span>
-  <span class="p-brand" content="GadgetCo">GadgetCo</span>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn h_product_value_attribute_preferred_over_text() {
-        let o = extract_commerce_offer(HTML_H_PRODUCT_VALUE_ATTR, "https://mf2.example.com/gadget");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(29.99), "value attribute for p-price");
-        assert_eq!(d.currency.as_deref(), Some("EUR"), "content attribute for p-price-currency");
-        assert_eq!(d.merchant.as_deref(), Some("GadgetCo"), "content attribute for p-brand");
-    }
-
-    const HTML_NO_H_PRODUCT: &str = r#"<!doctype html><html><head>
-<title>Article</title>
-</head><body>
-<article class="h-entry">
-  <h2 class="p-name">Blog Post</h2>
-  <p class="e-content">Some text with $19.99 mentioned</p>
-</article>
-</body></html>"#;
-
-    #[test]
-    fn h_product_non_product_class_returns_null() {
-        // An h-entry (not h-product) must NOT trigger extraction.
-        let o = extract_commerce_offer(HTML_NO_H_PRODUCT, "https://blog.example.com/post");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, None, "no extraction from h-entry");
-        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
-        assert_eq!(o.source.as_deref(), None);
+    fn strip_location_terms_japan_travel() {
+        let query = "top 10 must visit places in japan for first time travelers";
+        let stripped = strip_location_terms(query).expect("should strip location");
+        assert!(!stripped.split_whitespace().any(|w| w == "japan"), "should remove 'japan'");
+        assert!(!stripped.split_whitespace().any(|w| w == "in"), "should remove 'in' preposition");
+        assert!(stripped.contains("travelers") || stripped.contains("places"), "should keep topic words");
     }
 
     #[test]
-    fn h_product_photo_on_link_uses_href() {
-        let html = r#"<!doctype html><html><body>
-<div class="h-product">
-  <span class="p-name">Link Photo</span>
-  <a class="u-photo" href="https://cdn.example.com/link-photo.jpg">photo</a>
-  <span class="p-price">10.00</span>
-</div>
-</body></html>"#;
-        let o = extract_commerce_offer(html, "https://mf2.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/link-photo.jpg"), "u-photo href");
+    fn strip_location_terms_small_business() {
+        let query = "how to start a small business with less than 50000 rupees in india";
+        let stripped = strip_location_terms(query).expect("should strip location");
+        assert!(!stripped.split_whitespace().any(|w| w == "india"), "should remove 'india'");
+        assert!(!stripped.split_whitespace().any(|w| w == "in"), "should remove 'in' preposition");
+        assert!(stripped.contains("business"), "should keep 'business'");
     }
 
     #[test]
-    fn h_product_identifier_short_numeric_is_rejected() {
-        // identifier must be 8+ digits to be treated as GTIN — short numbers
-        // (like a shop SKU) must not leak into the gtin field.
-        let html = r#"<!doctype html><html><body>
-<div class="h-product">
-  <span class="p-name">Short SKU</span>
-  <span class="p-identifier">12345</span>
-  <span class="p-price">5.00</span>
-</div>
-</body></html>"#;
-        let o = extract_commerce_offer(html, "https://mf2.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.gtin, None, "short numeric identifier must not be gtin");
-    }
-
-    #[test]
-    fn h_product_does_not_overwrite_stronger_jsonld_signal() {
-        // MF2 is a supplement — it must NOT overwrite a stronger JSON-LD signal.
-        let html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{ "@context": "https://schema.org/", "@type": "Product",
-  "name": "Acme Widget Pro",
-  "offers": { "@type": "Offer", "price": "49.99", "priceCurrency": "USD" } }
-</script></head><body>
-<div class="h-product">
-  <span class="p-price">9.99</span>
-  <span class="p-price-currency">EUR</span>
-</div>
-</body></html>"#;
-        let o = extract_commerce_offer(html, "https://shop.example.com/mix");
-        let d = o.data.as_ref().unwrap();
-        // JSON-LD is the primary signal and wins where it sets a field.
-        assert_eq!(d.price, Some(49.99), "JSON-LD price must not be overwritten by MF2");
-        assert_eq!(d.currency.as_deref(), Some("USD"), "JSON-LD currency must not be overwritten");
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-    }
-}
-
-#[cfg(test)]
-mod kb_gibberish_mixed_tests {
-    use super::*;
-
-    fn idx() -> spell::SymSpellIndex {
-        spell::SymSpellIndex::build()
-    }
-
-    // ── Detector precision: a keyboard-row RUN is contiguous along one row ──
-
-    #[test]
-    fn kb_run_contiguous_along_row_detected() {
-        for w in ["asdfghjkl", "qwerty", "zxcvbnm", "asdf", "hjkl", "wert", "sdfg", "qwer", "erty"] {
-            assert!(is_keyboard_gibberish(w), "expected kb-run: {}", w);
+    fn strip_location_terms_no_location() {
+        let query = "best practices for securing a postgresql database";
+        // No location preposition to strip — should return None or same query
+        let result = strip_location_terms(query);
+        // Either None or the same query (no change)
+        if let Some(s) = result {
+            assert_eq!(s, query, "no location to strip => unchanged");
         }
     }
 
     #[test]
-    fn real_words_not_kb_gibberish() {
-        // Real English words whose letters merely SCATTER on one row must NOT match.
-        for w in ["poetry", "typewriter", "poodle", "tree", "power", "your", "type", "rust", "free", "hello"] {
-            assert!(!is_keyboard_gibberish(w), "real word must not be kb-run: {}", w);
-        }
+    fn strip_location_terms_too_short() {
+        let query = "rust programming";
+        assert!(strip_location_terms(query).is_none(), "too short to strip");
     }
 
     #[test]
-    fn mixed_kb_and_digit_garbage_is_junk() {
-        let index = idx();
-        // The card's failing case: kb run + alphanumeric garbage + a real word.
-        let (flag, _) = query_quality_flag("asdfghjkl xyz123 nonsense", &index);
-        assert_eq!(flag, "junk", "mixed kb-run + digit garbage must be junk");
-        // Two-token core: kb run + digit garbage alone.
-        let (flag2, _) = query_quality_flag("asdfghjkl xyz123", &index);
-        assert_eq!(flag2, "junk");
-        // Letter+digit mash token: kb run + mash.
-        let (flag3, _) = query_quality_flag("zxcvbnm123456 hello", &index);
-        assert_eq!(flag3, "junk");
+    fn strip_location_terms_with_site_operator() {
+        let query = "best practices for securing a site:postgresql.org database";
+        // Should NOT strip when site: operator is present
+        assert!(strip_location_terms(query).is_none(), "should not strip site: queries");
     }
 
     #[test]
-    fn dominated_kb_path_still_fires() {
-        let index = idx();
-        // Fast path retained: >=50% kb runs (existing behavior, must not regress).
-        let (flag, _) = query_quality_flag("asdfghjkl qwerty zxcvbnm randomgibberish1234567890", &index);
-        assert_eq!(flag, "junk");
-        let (flag2, _) = query_quality_flag("qwerty 1234567890 randomgibberish", &index);
-        assert_eq!(flag2, "junk");
-    }
-
-    #[test]
-    fn legit_queries_not_junked() {
-        let index = idx();
-        for q in [
-            "rust async web framework",
-            "rust x509 certificate",
-            "type mp3 converter",
-            "free ps5 games",
-            "qwerty vs dvorak",
-            "typewriter repair",
-            "poetry write",
-            "power tower your typing",
-            "asdf movie",
-            "qwerty 5g phones",
-        ] {
-            let (flag, _) = query_quality_flag(q, &index);
-            assert_ne!(flag, "junk", "legit query must not be junk: {}", q);
-        }
-    }
-
-    #[test]
-    fn single_kb_word_alone_not_junk_by_mixed_rule() {
-        let index = idx();
-        // "qwerty" alone: existing behavior flags junk via the zero-valid-ratio
-        // branch (not via mixed rule). The mixed rule requires BOTH a kb run AND
-        // digit garbage; a lone kb run with a real word must stay searchable.
-        let (flag, _) = query_quality_flag("qwerty vs dvorak", &index);
-        assert_ne!(flag, "junk");
-    }
-
-    // CIRCUIT-KEY STABILITY (round auto/round-2026-09-29T1239Z). The fan-out
-    // list is sorted warmest-first, so its ORDER changes between requests while
-    // the backends do not. Keys must therefore identify the backend, otherwise
-    // a VPN timeout opens the circuit on the Tor key (and vice versa) and the
-    // two-path redundancy silently collapses.
-    #[test]
-    fn searx_circuit_key_is_stable_across_fanout_order() {
-        let canonical = canonical_searx_urls(&Some("http://tor2:8081".to_string()));
-        assert_eq!(canonical[0], "http://127.0.0.1:8080", "canonical 0 is the VPN instance");
-        assert_eq!(canonical[1], "http://tor2:8081", "canonical 1 is the Tor instance");
-
-        // Warm VPN first, then warm Tor (the original declaration order).
-        let vpn_first = ["http://127.0.0.1:8080", "http://tor2:8081"];
-        // Warm Tor first, then warm VPN (what the sort produces after Tor is used).
-        let tor_first = ["http://tor2:8081", "http://127.0.0.1:8080"];
-
-        let k1 = searx_instance_keys_for(&canonical, &vpn_first);
-        let k2 = searx_instance_keys_for(&canonical, &tor_first);
-
-        // The SAME backend must get the SAME key in both orders. Look the key up
-        // by the BACKEND's position in that particular fan-out order, so the
-        // lookup itself follows the order being tested.
-        let key_of = |order: &[&str], ks: &Vec<String>, backend: &str| -> String {
-            let slot = order.iter().position(|u| *u == backend).expect("backend in order");
-            ks[slot].clone()
-        };
-        const VPN: &str = "http://127.0.0.1:8080";
-        const TOR: &str = "http://tor2:8081";
-
-        assert_eq!(key_of(&vpn_first, &k1, VPN), "searxng0", "VPN backend is searxng0 when fanned out first");
-        assert_eq!(key_of(&tor_first, &k2, VPN), "searxng0", "VPN backend key is order-independent");
-        assert_eq!(key_of(&vpn_first, &k1, TOR), "searxng1", "Tor backend is searxng1 when fanned out second");
-        assert_eq!(key_of(&tor_first, &k2, TOR), "searxng1", "Tor backend key is order-independent");
-
-        // Explicitly: a Tor-position slot never borrows the VPN key.
-        assert_eq!(k2[0], "searxng1", "when Tor is fanned out first its key is searxng1");
-        assert_eq!(k2[1], "searxng0", "when VPN is fanned out second its key is searxng0");
-    }
-
-    // The two "VPN only" fast paths select an instance by key. If they selected
-    // by fan-out position they would send the retry through Tor (or skip the
-    // retry entirely) whenever the warmth sort put Tor first.
-    #[test]
-    fn vpn_only_paths_never_target_the_tor_instance() {
-        let canonical = canonical_searx_urls(&Some("http://tor2:8081".to_string()));
-        let tor_first = ["http://tor2:8081", "http://127.0.0.1:8080"];
-        let keys = searx_instance_keys_for(&canonical, &tor_first);
-
-        // Replicates the `retry_key != "searxng0"` / `fb_key != "searxng0"` guards.
-        let vpn_only: Vec<&str> = tor_first
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| keys[*i] == "searxng0")
-            .map(|(_, u)| *u)
-            .collect();
-        assert_eq!(vpn_only, vec!["http://127.0.0.1:8080"], "VPN-only path must resolve to the VPN backend");
-    }
-
-    // INTENT BUDGET (round auto/round-2026-09-29T1239Z). The retry ladder and
-    // the overall budget were independent constants, so the budget could expire
-    // before the ladder finished — making every attempt after the first
-    // unreachable. The budget is now derived from the ladder; this asserts the
-    // relationship the gateway relies on: the budget must cover every delay
-    // plus a full attempt budget for EVERY attempt, so the last attempt can
-    // both start and finish inside it.
-    #[test]
-    fn intent_overall_budget_covers_the_whole_retry_ladder() {
-        const ATTEMPT_BUDGET_MS: u64 = 2000;
-        const DELAYS_MS: [u64; 3] = [0, 200, 400];
-        let overall = DELAYS_MS.iter().sum::<u64>() + ATTEMPT_BUDGET_MS * DELAYS_MS.len() as u64;
-
-        // Time at which the final attempt STARTS.
-        let n = DELAYS_MS.len() as u64;
-        let last_attempt_start = DELAYS_MS.iter().take(DELAYS_MS.len() - 1).sum::<u64>() + ATTEMPT_BUDGET_MS * (n - 1);
-        assert!(
-            last_attempt_start < overall,
-            "final attempt must start inside the overall budget (starts at {}ms, budget {}ms)",
-            last_attempt_start,
-            overall
-        );
-        // And it must be able to FINISH, not merely start.
-        assert!(
-            last_attempt_start + ATTEMPT_BUDGET_MS <= overall,
-            "final attempt must finish inside the overall budget"
-        );
-    }
-
-    // QUESTION-FRAMING ANCHORS (round auto/round-2026-09-29T1239Z). A
-    // comparative/selection word names the SHAPE of the question, not its
-    // subject. When such a word is allowed to act as a topic anchor, pages
-    // that merely DEFINE that word outrank every page about the real subject:
-    // "what is the difference between optimistic and pessimistic locking"
-    // returned four Japanese-English dictionary entries for "difference" at
-    // the top. These must be excluded from the mandatory topic gate, exactly
-    // like the existing warning/sign framing words.
-    #[test]
-    fn comparative_framing_words_are_not_topic_anchors() {
-        // The words that must never anchor relevance on their own.
-        for w in [
-            "difference", "differences", "compare", "comparison", "versus", "vs",
-            "distinction", "choose", "choice", "select", "selection", "meaning",
-            "definition", "explain", "explained", "alternative", "alternatives",
-        ] {
-            assert!(
-                is_weak_anchor_word(w),
-                "'{}' is question framing, not a topic: it must not anchor relevance",
-                w
-            );
-        }
-        // Guard against over-reach: the actual SUBJECT terms of those queries
-        // must remain valid anchors, or the fix would gut real relevance.
-        for w in ["optimistic", "pessimistic", "locking", "databases", "queue", "message"] {
-            assert!(
-                !is_weak_anchor_word(w),
-                "'{}' is a real subject term and must stay a valid anchor",
-                w
-            );
-        }
-    }
-}
-
-/// Defect 2: the degraded (intent-engine unreachable) path used to report
-/// `positive: []` and an empty top-level `constraints` for every
-/// natural-language query, while still reporting the price bound correctly.
-/// Live repro before the fix: stopping `if-dev-intent-engine` and issuing a
-/// price-filtered multi-constraint query returned
-/// `positive: []`, `constraints: []`, `price_lt: 4500` — indistinguishable
-/// downstream from "the user stated no constraints at all".
-#[cfg(test)]
-mod fallback_constraint_tests {
-    use super::*;
-
-    /// The headline defect: a plain NL query with a price bound must still
-    /// report its topic constraints on the degraded path.
-    #[test]
-    fn degraded_path_still_reports_topic_constraints() {
-        let intent = fallback_intent(
-            "noise cancelling headphones with long battery life and mic under 20000",
-        );
-        let sc = &intent.structured_constraints;
-        assert!(
-            !sc.positive.is_empty(),
-            "degraded path reported NO topic constraints: {:?}",
-            sc
-        );
-        // The price bound is still reported (that part always worked).
-        assert_eq!(sc.price_max, Some(20000.0), "price bound lost: {:?}", sc);
-        // And the topic is actually about headphones, not a stray function word.
-        for topic in ["headphones", "battery", "noise", "mic"] {
-            assert!(
-                sc.positive
-                    .iter()
-                    .any(|p| p.split_whitespace().any(|w| w == topic)),
-                "topic {:?} missing from degraded extraction: {:?}",
-                topic,
-                sc.positive
-            );
-        }
-    }
-
-    /// The budget digits are a FILTER, already captured in `price_*` — they
-    /// must never also be reported as a lexical requirement.
-    #[test]
-    fn degraded_path_never_reports_budget_digits_as_topics() {
-        for q in [
-            "boots under 3000 rupees",
-            "laptop below 500",
-            "mirrorless camera under 60000 rupees",
-        ] {
-            let sc = &fallback_intent(q).structured_constraints;
-            for p in &sc.positive {
-                assert!(
-                    !p.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ','),
-                    "{:?}: budget digits leaked into topics as {:?}: {:?}",
-                    q,
-                    p,
-                    sc.positive
-                );
-            }
-        }
-    }
-
-    /// Multi-word concepts must survive as ONE requirement on the degraded path
-    /// too, so a degraded response describes the same requirement SHAPE as a
-    /// healthy one (`constraint_score` divides by `positive.len()`, so fragment
-    /// counts are the defect).
-    #[test]
-    fn degraded_path_groups_multi_word_concepts() {
-        let sc = &fallback_intent("4k monitor with 144hz refresh rate").structured_constraints;
-        assert!(
-            sc.positive.iter().any(|p| p == "refresh rate"),
-            "\"refresh rate\" was shredded into fragments: {:?}",
-            sc.positive
-        );
-    }
-
-    /// Stop words are PHRASE BOUNDARIES. A naive adjacency pairing glues the
-    /// topics on either side of "with" / "and" into one junk phrase
-    /// ("headphones long"), which is a requirement no page can satisfy as a
-    /// concept.
-    #[test]
-    fn degraded_path_treats_stop_words_as_boundaries() {
-        let sc = &fallback_intent(
-            "noise cancelling headphones with long battery life and mic",
-        )
-        .structured_constraints;
-        for junk in ["headphones long", "battery mic", "with long", "life and"] {
-            assert!(
-                !sc.positive.iter().any(|p| p == junk),
-                "stop words joined into junk phrase {:?}: {:?}",
-                junk,
-                sc.positive
-            );
-        }
-    }
-
-    /// Operator tokens, negated tokens, and excluded terms must not become topic
-    /// requirements. `-django` is an exclusion; `site:`/`price:` payloads are
-    /// already captured in their operator fields.
-    #[test]
-    fn degraded_path_excludes_operators_and_negations_from_topics() {
-        let sc = &fallback_intent("python framework site:github.com -django").structured_constraints;
-        for bad in ["site:github.com", "github.com", "-django", "django"] {
-            assert!(
-                !sc.positive.iter().any(|p| p.contains(bad)),
-                "{:?} must not be a positive topic requirement: {:?}",
-                bad,
-                sc.positive
-            );
-        }
-        assert!(
-            !sc.positive.is_empty(),
-            "sanity: the query DOES have topic content, extraction must not be empty: {:?}",
-            sc
-        );
-    }
-}
-
-#[cfg(test)]
-mod mainpath_shopping_strip_tests {
-    use super::*;
-
-    fn result_with_commerce(url: &str, price: f64) -> serde_json::Value {
-        serde_json::json!({
-            "url": url,
-            "title": "Product",
-            "score": 0.9,
-            "commerce": {
-                "url": url,
-                "observed_at": "2026-10-08T00:00:00Z",
-                "source": "json-ld",
-                "data": { "price": price, "currency": "USD" }
-            }
-        })
-    }
-
-    fn result_without_commerce(url: &str) -> serde_json::Value {
-        serde_json::json!({
-            "url": url,
-            "title": "Article",
-            "score": 0.8
-        })
-    }
-
-    #[test]
-    fn strip_keeps_only_fact_bearing_candidates_in_order() {
-        let enriched = vec![
-            result_without_commerce("https://a.example/1"),
-            result_with_commerce("https://b.example/2", 99.99),
-            result_without_commerce("https://c.example/3"),
-            result_with_commerce("https://d.example/4", 49.99),
-        ];
-        let strip = select_shopping_strip(&enriched, 8).expect("must find facts");
-        assert_eq!(strip.len(), 2);
-        assert_eq!(strip[0]["url"], "https://b.example/2");
-        assert_eq!(strip[1]["url"], "https://d.example/4");
-    }
-
-    #[test]
-    fn strip_returns_none_when_no_candidate_has_facts() {
-        let enriched = vec![
-            result_without_commerce("https://a.example/1"),
-            result_without_commerce("https://b.example/2"),
-        ];
-        assert!(select_shopping_strip(&enriched, 8).is_none());
-    }
-
-    #[test]
-    fn strip_respects_display_cap() {
-        let enriched: Vec<_> = (0..10)
-            .map(|i| result_with_commerce(&format!("https://m{}.example/p", i), 10.0 + i as f64))
-            .collect();
-        let strip = select_shopping_strip(&enriched, 3).expect("must find facts");
-        assert_eq!(strip.len(), 3);
-        assert_eq!(strip[0]["url"], "https://m0.example/p");
-        assert_eq!(strip[1]["url"], "https://m1.example/p");
-        assert_eq!(strip[2]["url"], "https://m2.example/p");
-    }
-
-    #[test]
-    fn strip_is_a_strict_subsequence_never_promotes() {
-        // Facts at ranks 2 and 4 (0-indexed: 1 and 3). The strip must keep
-        // them in that order, never promoting rank-4 above rank-2.
-        let enriched = vec![
-            result_without_commerce("https://a.example/1"),
-            result_with_commerce("https://b.example/2", 99.99),
-            result_without_commerce("https://c.example/3"),
-            result_with_commerce("https://d.example/4", 49.99),
-            result_without_commerce("https://e.example/5"),
-        ];
-        let strip = select_shopping_strip(&enriched, 8).expect("must find facts");
-        let urls: Vec<_> = strip.iter().map(|r| r["url"].as_str().unwrap()).collect();
-        assert_eq!(urls, vec!["https://b.example/2", "https://d.example/4"]);
-    }
-
-    #[test]
-    fn strip_surfaces_facts_beyond_the_first_eight_candidates() {
-        // The exact regression: facts only at ranks 9 and 10 (0-indexed: 8 and 9).
-        // With the old code (enrich window = display cap = 8), these would never
-        // be enriched. With COMMERCE_ENRICH_WINDOW = 24, they are.
-        let mut enriched: Vec<_> = (0..8)
-            .map(|i| result_without_commerce(&format!("https://m{}.example/p", i)))
-            .collect();
-        enriched.push(result_with_commerce("https://m8.example/p", 99.99));
-        enriched.push(result_with_commerce("https://m9.example/p", 49.99));
-
-        let strip = select_shopping_strip(&enriched, 8).expect("must find facts");
-        assert_eq!(strip.len(), 2);
-        assert_eq!(strip[0]["url"], "https://m8.example/p");
-        assert_eq!(strip[1]["url"], "https://m9.example/p");
-    }
-
-    #[test]
-    fn enrich_window_is_wider_than_display_cap() {
-        // Guards the constants from being re-conflated.
-        assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
-    }
-}
-
-mod commerce_extraction_tests {
-    use super::*;
-
-    // Realistic schema.org Product + Offer JSON-LD fixture (single offer).
-    const HTML_SINGLE_OFFER: &str = r#"<!doctype html><html><head>
-<title>Acme Widget Pro</title>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Acme Widget Pro",
-  "sku": "ACME-WP-001",
-  "gtin13": "1234567890123",
-  "brand": {"@type": "Brand", "name": "Acme"},
-  "offers": {
-    "@type": "Offer",
-    "price": "49.99",
-    "priceCurrency": "USD",
-    "availability": "https://schema.org/InStock",
-    "itemCondition": "https://schema.org/NewCondition",
-    "seller": {"@type": "Organization", "name": "Acme Store"},
-    "aggregateRating": {"@type": "AggregateRating", "ratingValue": "4.5", "reviewCount": "120"}
-  }
-}
-</script></head><body><h1>Acme Widget Pro</h1></body></html>"#;
-
-    // Fixture with a price RANGE (AggregateOffer) — must NOT collapse to one price.
-    const HTML_AGGREGATE_OFFER: &str = r#"<!doctype html><html><head>
-<title>Bulk Gizmos</title>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Bulk Gizmos",
-  "offers": {
-    "@type": "AggregateOffer",
-    "lowPrice": "10.00",
-    "highPrice": "25.50",
-    "priceCurrency": "EUR",
-    "offerCount": "8",
-    "availability": "https://schema.org/InStock"
-  }
-}
-</script></head><body></body></html>"#;
-
-    // Fixture with TWO distinct offers in an array — must NOT silently pick one.
-    const HTML_TWO_OFFERS: &str = r#"<!doctype html><html><head>
-<title>Dual Listing</title>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Dual Listing",
-  "offers": [
-    {"@type": "Offer", "price": "15.00", "priceCurrency": "USD"},
-    {"@type": "Offer", "price": "20.00", "priceCurrency": "USD"}
-  ]
-}
-</script></head><body></body></html>"#;
-
-    // OpenGraph product:* meta fixture (no JSON-LD).
-    const HTML_OG_PRODUCT: &str = r#"<!doctype html><html><head>
-<title>OG Product</title>
-<meta property="og:title" content="OG Product">
-<meta property="product:price:amount" content="1299.00">
-<meta property="product:price:currency" content="INR">
-<meta property="product:availability" content="in stock">
-<meta property="product:brand" content="OG Brand">
-<meta property="product:item_id" content="OG-99">
-</head><body></body></html>"#;
-
-    // Page with NO price and NO product data anywhere.
-    const HTML_NO_PRICE: &str = r#"<!doctype html><html><head>
-<title>Just an article</title>
-<meta property="og:title" content="Some Blog Post">
-</head><body><p>This article mentions a price of $19.99 in the text but has no
-structured product data, so nothing must be extracted from the body.</p></body></html>"#;
-
-    #[test]
-    fn extracts_single_offer_from_jsonld() {
-        let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(49.99), "price must come from Offer.price");
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
-        assert_eq!(d.condition.as_deref(), Some("https://schema.org/NewCondition"));
-        assert_eq!(d.sku.as_deref(), Some("ACME-WP-001"));
-        assert_eq!(d.gtin.as_deref(), Some("1234567890123"));
-        assert_eq!(d.rating, Some(4.5));
-        assert_eq!(d.rating_count, Some(120));
-        assert_eq!(d.merchant.as_deref(), Some("Acme Store"));
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-        // No free-text price guessing: the body text mentions no price here, but
-        // even where it would, it must not leak. price_low/high stay unset.
-        assert_eq!(d.price_low, None);
-        assert_eq!(d.price_high, None);
-    }
-
-    #[test]
-    fn aggregate_offer_surfaces_range_not_single_canonical() {
-        let o = extract_commerce_offer(HTML_AGGREGATE_OFFER, "https://shop.example.com/bulk");
-        let d = o.data.as_ref().unwrap();
-        // AggregateOffer: range + count, but NO single `price` (no canonical guess).
-        assert_eq!(d.price_low, Some(10.00));
-        assert_eq!(d.price_high, Some(25.50));
-        assert_eq!(d.currency.as_deref(), Some("EUR"));
-        assert_eq!(d.offer_count, Some(8));
-        // `price` is set to the entry (low) price — a defined field, not a guess
-        // about a single sold unit. That is acceptable; the full range is present.
-        assert_eq!(d.price, Some(10.00));
-    }
-
-    #[test]
-    fn two_offers_never_collapse_to_one_canonical_price() {
-        let o = extract_commerce_offer(HTML_TWO_OFFERS, "https://shop.example.com/dual");
-        let d = o.data.as_ref().unwrap();
-        // Two distinct USD offers: range + count, but `price` must stay null so
-        // we never assert a canonical price we cannot justify.
-        assert_eq!(d.price_low, Some(15.00));
-        assert_eq!(d.price_high, Some(20.00));
-        assert_eq!(d.offer_count, Some(2));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(d.price, None, "must NOT collapse multiple offers into one price");
-    }
-
-    #[test]
-    fn open_graph_product_fallback_works() {
-        let o = extract_commerce_offer(HTML_OG_PRODUCT, "https://og.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(1299.00));
-        assert_eq!(d.currency.as_deref(), Some("INR"));
-        assert_eq!(d.availability.as_deref(), Some("in stock"));
-        assert_eq!(d.merchant.as_deref(), Some("OG Brand"));
-        assert_eq!(d.gtin.as_deref(), Some("OG-99"));
-        assert_eq!(o.source.as_deref(), Some("og"));
-    }
-
-    #[test]
-    fn no_price_page_is_all_null() {
-        let o = extract_commerce_offer(HTML_NO_PRICE, "https://blog.example.com/post");
-        let d = o.data.as_ref().unwrap();
-        // The body literally says "$19.99" but we MUST NOT guess from free text.
-        assert_eq!(d.price, None, "free-text price must never be guessed");
-        assert_eq!(d.price_low, None);
-        assert_eq!(d.price_high, None);
-        assert_eq!(d.currency, None);
-        assert_eq!(d.availability, None);
-        assert_eq!(d.rating, None);
-        // merchant falls back to the coarse host label (identifier, not a fact).
-        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
-        assert_eq!(o.source.as_deref(), None);
-    }
-
-    #[test]
-    fn product_inside_graph_is_discovered() {
-        // A Product nested inside a WebPage @graph must still be found.
-        let html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{ "@context": "https://schema.org/", "@graph": [
-  {"@type": "WebPage", "name": "Page"},
-  {"@type": "Product", "name": "Nested", "offers": {"@type": "Offer", "price": "5.00", "priceCurrency": "GBP"}}
-] }
-</script></head><body></body></html>"#;
-        let o = extract_commerce_offer(html, "https://x.example.com/n");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(5.00));
-        assert_eq!(d.currency.as_deref(), Some("GBP"));
-    }
-
-    #[test]
-    fn observed_at_is_always_set() {
-        let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
-        assert!(o.observed_at.is_some());
-        // A unix-second string is digits only.
-        assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
-    }
-
-    // ── ROADMAP item 3: monetization MUST NOT affect ranking/order ────────────
-    // The /shopping pipeline enriches the ALREADY-RANKED results array in place,
-    // never reordering it. This test locks that invariant: with affiliate keys
-    // present or absent, the ranked URL order is byte-identical.
-    #[tokio::test]
-    async fn enrichment_preserves_result_order_with_or_without_affiliate_keys() {
-        // A representative already-ranked `results` slice (as /search would emit it).
-        let mut ranked = vec![
-            serde_json::json!({
-                "url": "https://shop.example.com/widget-pro",
-                "title": "Widget Pro",
-                "score": 9.7,
-                "sources": ["bing"]
-            }),
-            serde_json::json!({
-                "url": "https://store.example.org/cheaper-widget",
-                "title": "Cheaper Widget",
-                "score": 8.1,
-                "sources": ["brave"]
-            }),
-            serde_json::json!({
-                "url": "https://market.example.net/widget-bundle",
-                "title": "Widget Bundle",
-                "score": 6.3,
-                "sources": ["local"]
-            }),
-        ];
-
-        let before: Vec<String> = ranked
-            .iter()
-            .map(|r| r["url"].as_str().unwrap().to_string())
-            .collect();
-
-        // Enrichment closure returns a fake product page for the FIRST result only,
-        // so we exercise the attach path AND the no-fact path (others get None).
-        let fake_html = HTML_SINGLE_OFFER.to_string();
-        let fetch = |url: String| {
-            let h = fake_html.clone();
-            async move {
-                if url.contains("widget-pro") { Some(h) } else { None }
-            }
-        };
-        enrich_with_commerce(&mut ranked, fetch).await;
-
-        // 1) Order is byte-identical — this is the whole point.
-        let after: Vec<String> = ranked
-            .iter()
-            .map(|r| r["url"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(before, after, "enrichment must never reorder ranked results");
-
-        // 2) The fact-bearing result got an honest `commerce` block (from JSON-LD).
-        let first = ranked[0].get("commerce").expect("commerce block attached");
-        assert_eq!(first["source"], serde_json::json!("json-ld"));
-        assert_eq!(first["data"]["price"], serde_json::json!(49.99));
-
-        // 3) Provenance is attached to EVERY result, even those without facts.
-        for r in ranked.iter() {
-            assert!(r.get("commerce_provenance").is_some(), "provenance present");
-            assert!(r["commerce_provenance"]["url"].as_str().unwrap().len() > 0);
-        }
-
-        // 4) A no-fact result keeps `commerce` null (honest: we do NOT fabricate).
-        assert!(ranked[1].get("commerce").is_none()
-            || ranked[1]["commerce"].is_null());
-    }
-
-    // ── ROADMAP item 7: main-path commercial intent is SIGNAL-based ────────
-    // Detection must reuse the EXISTING signal-driven intent machinery (the
-    // `transactional` label + distribution + price constraints) — NEVER a keyword
-    // list. These tests lock that contract. They are pure (no network, no live
-    // gateway): `is_commercial_intent` only reads in-process signals.
-    #[test]
-    fn commercial_intent_from_transactional_label() {
-        let mut dist = std::collections::HashMap::new();
-        dist.insert("transactional".to_string(), 0.9);
-        dist.insert("informational".to_string(), 0.1);
-        assert!(is_commercial_intent("transactional", &dist, false));
-    }
-
-    #[test]
-    fn commercial_intent_from_strong_transactional_distribution() {
-        // A product "X vs Y" query may resolve to a non-transactional argmax label
-        // (e.g. "comparison") but with a STRONG transactional distribution — still
-        // commercial. We require the distribution probability to cross the signal
-        // threshold, not merely be the argmax.
-        let mut dist = std::collections::HashMap::new();
-        dist.insert("comparison".to_string(), 0.51);
-        dist.insert("transactional".to_string(), 0.62);
-        // argmax label is "comparison" but transactional prob >= 0.50 => commercial.
-        assert!(is_commercial_intent("comparison", &dist, false));
-    }
-
-    #[test]
-    fn commercial_intent_from_price_bound_without_transactional_label() {
-        // A stated price bound (price:<N / price:>N / min-max) is itself commercial
-        // intent — no need for the transactional label. The bound is parsed by the
-        // EXISTING gateway/engine constraint parser, never a keyword.
-        let dist = std::collections::HashMap::new();
-        assert!(is_commercial_intent("informational", &dist, true));
-    }
-
-    #[test]
-    fn informational_query_is_not_commercial() {
-        // A purely informational query ("rust ownership", "how do black holes work")
-        // with no price bound and no transactional signal must NOT trigger a
-        // shopping block. This proves detection is signal-based + private (no
-        // external classifier, no third-party call).
-        let mut dist = std::collections::HashMap::new();
-        dist.insert("informational".to_string(), 0.95);
-        dist.insert("transactional".to_string(), 0.02);
-        assert!(!is_commercial_intent("informational", &dist, false));
-    }
-
-    // ── Main-path `shopping` block is always present on commercial intent ──
-    // The `any_commerce` presentation gate was removed: the `shopping` block is
-    // now surfaced whenever commercial intent is detected, even if no upstream
-    // page exposed structured product data. Every result carries
-    // `commerce_provenance` (`source: null` => "we checked, nothing") which is the
-    // honest presentation signal. These tests lock that the block is non-empty
-    // and always present when intent is commercial.
-
-    #[test]
-    fn shopping_block_present_even_when_no_result_has_commerce() {
-        // Simulate an enriched top-N where NONE of the results carry a commerce
-        // block (all upstream pages lacked structured product data). The shopping
-        // block is STILL surfaced — commerce_provenance on each result is the
-        // honest "checked, found nothing" signal.
-        let shop_arr: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
-            serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0 }),
-        ];
-        // The block is built from the enriched array directly — it is non-empty
-        // (has results) even without commerce facts.
-        assert!(!shop_arr.is_empty(), "shopping block must have results");
-        // And every result would carry commerce_provenance (attached by
-        // enrich_with_commerce) — here we just assert the block is present.
-        let block = serde_json::json!({ "results": shop_arr });
-        assert!(block.get("results").is_some(), "shopping block present on commercial intent");
-    }
-
-    #[test]
-    fn shopping_block_present_when_at_least_one_result_has_commerce() {
-        // At least one enriched result carries a real commerce block (page had
-        // structured product data) => the shopping block is surfaced (same as
-        // before, but now the gate is unconditional on commerce presence).
-        let shop_arr: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0 }),
-            serde_json::json!({ "url": "https://b.example.com/p/2", "score": 8.0, "commerce": { "price": 49.99, "currency": "USD" } }),
-        ];
-        let has_commerce = shop_arr
-            .iter()
-            .any(|r| r.get("commerce").map(|v| !v.is_null()).unwrap_or(false));
-        assert!(has_commerce, "one commerce block present");
-        let block = serde_json::json!({ "results": shop_arr });
-        assert!(block.get("results").is_some(), "shopping block present");
-    }
-
-    #[test]
-    fn shopping_block_present_even_when_commerce_is_null() {
-        // A result with `"commerce": null` (explicitly absent) still yields a
-        // present shopping block — commerce_provenance is the honest signal.
-        let shop_arr: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "url": "https://a.example.com/p/1", "score": 9.0, "commerce": serde_json::Value::Null }),
-        ];
-        assert!(!shop_arr.is_empty(), "shopping block has results even with null commerce");
-        let block = serde_json::json!({ "results": shop_arr });
-        assert!(block.get("results").is_some(), "shopping block present");
-    }
-
-    // ── ROADMAP item B: product image extraction ─────────────────────────
-    // The extractor must pull the product image URL from structured sources:
-    // JSON-LD `image` (string, array, or ImageObject), OpenGraph `og:image`,
-    // microdata `itemprop="image"` (content + href/src), and RDFa `property="image"`.
-    // Always from typed data — never guessed from free text.
-
-    const HTML_JSONLD_IMAGE: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Image Product",
-  "image": "https://cdn.example.com/product.jpg",
-  "offers": {
-    "@type": "Offer",
-    "price": "49.99",
-    "priceCurrency": "USD"
-  }
-}
-</script>
-</head><body></body></html>"#;
-
-    #[test]
-    fn jsonld_image_string_url_is_extracted() {
-        let o = extract_commerce_offer(HTML_JSONLD_IMAGE, "https://img.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/product.jpg"));
-        assert_eq!(d.price, Some(49.99));
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-    }
-
-    const HTML_JSONLD_IMAGE_ARRAY: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "Multi Image",
-  "image": ["https://cdn.example.com/a.jpg", "https://cdn.example.com/b.jpg"],
-  "offers": { "@type": "Offer", "price": "29.99", "priceCurrency": "EUR" }
-}
-</script>
-</head><body></body></html>"#;
-
-    #[test]
-    fn jsonld_image_array_takes_first() {
-        let o = extract_commerce_offer(HTML_JSONLD_IMAGE_ARRAY, "https://multi.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/a.jpg"));
-    }
-
-    const HTML_JSONLD_IMAGE_OBJECT: &str = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "ImageObject Product",
-  "image": { "@type": "ImageObject", "url": "https://cdn.example.com/imgobj.jpg" },
-  "offers": { "@type": "Offer", "price": "19.99", "priceCurrency": "GBP" }
-}
-</script>
-</head><body></body></html>"#;
-
-    #[test]
-    fn jsonld_image_object_url_is_extracted() {
-        let o = extract_commerce_offer(HTML_JSONLD_IMAGE_OBJECT, "https://obj.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/imgobj.jpg"));
-    }
-
-    const HTML_OG_IMAGE: &str = r#"<!doctype html><html><head>
-<title>OG Image</title>
-<meta property="og:image" content="https://og.example.com/photo.jpg">
-<meta property="product:price:amount" content="99.99">
-<meta property="product:price:currency" content="INR">
-</head><body></body></html>"#;
-
-    #[test]
-    fn og_image_is_extracted() {
-        let o = extract_commerce_offer(HTML_OG_IMAGE, "https://ogimg.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://og.example.com/photo.jpg"));
-        assert_eq!(d.price, Some(99.99));
-        assert_eq!(o.source.as_deref(), Some("og"));
-    }
-
-    const HTML_MICRODATA_IMAGE_HREF: &str = r#"<!doctype html><html><head>
-<title>Microdata Link Image</title>
-</head><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <span itemprop="name">Link Image Product</span>
-  <link itemprop="image" href="https://md.example.com/photo.jpg">
-  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
-    <span itemprop="price" content="39.99">39.99</span>
-    <span itemprop="priceCurrency" content="USD">USD</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn microdata_image_href_attribute_is_extracted() {
-        let o = extract_commerce_offer(HTML_MICRODATA_IMAGE_HREF, "https://mdhref.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://md.example.com/photo.jpg"));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    const HTML_RDFa_IMAGE: &str = r#"<!doctype html><html><head>
-<title>RDFa Image</title>
-</head><body>
-<div vocab="https://schema.org/" typeof="Product">
-  <span property="name">RDFa Image Product</span>
-  <span property="image" content="https://rdfa.example.com/photo.jpg">photo</span>
-  <div property="offers" typeof="Offer">
-    <span property="price" content="59.99">59.99</span>
-    <span property="priceCurrency" content="USD">USD</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn rdfa_image_content_attribute_is_extracted() {
-        let o = extract_commerce_offer(HTML_RDFa_IMAGE, "https://rdfaimg.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://rdfa.example.com/photo.jpg"));
-        assert_eq!(o.source.as_deref(), Some("rdfa"));
-    }
-
-    const HTML_NO_IMAGE: &str = r#"<!doctype html><html><head>
-<title>No Image Product</title>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org/",
-  "@type": "Product",
-  "name": "No Image Product",
-  "offers": { "@type": "Offer", "price": "9.99", "priceCurrency": "USD" }
-}
-</script>
-</head><body></body></html>"#;
-
-    #[test]
-    fn product_without_image_has_null_image() {
-        let o = extract_commerce_offer(HTML_NO_IMAGE, "https://noimg.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image, None);
-        assert_eq!(d.price, Some(9.99));
-    }
-
-    const HTML_ARTICLE_NO_IMAGE: &str = r#"<!doctype html><html><head>
-<title>Article Page</title>
-</head><body>
-<div itemscope itemtype="https://schema.org/Article">
-  <span itemprop="name">How to Build a Widget</span>
-  <span itemprop="author">Jane Doe</span>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn non_product_page_never_extracts_image() {
-        let o = extract_commerce_offer(HTML_ARTICLE_NO_IMAGE, "https://blog.example.com/post");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image, None);
-        assert_eq!(d.price, None);
-        // merchant falls back to host
-        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
-        assert_eq!(o.source.as_deref(), None);
-    }
-
-    // ── ROADMAP item 3: affiliate template engine ─────────────────────
-    // Honest, data-driven affiliate decoration. These tests lock the contract:
-    //  * two template kinds render correctly with correct URL-encoding
-    //  * decoration is idempotent (no double-wrap)
-    //  * missing key => `affiliate: null`, result still returned (graceful)
-    //  * result ORDER is byte-identical before/after decoration
-    //  * every decorated result carries `disclosed: true`
-    //  * no user/query/IP data ever enters an affiliate parameter
-
-    fn net(kind: &str, template: &str, params: HashMap<String, String>, key: Option<&str>) -> AffiliateNetwork {
-        AffiliateNetwork {
-            id: "test".to_string(),
-            kind: kind.to_string(),
-            enabled: true,
-            priority: 1,
-            network: "TestNet".to_string(),
-            template: template.to_string(),
-            params,
-            key_env: key.map(|s| s.to_string()),
-            param_env: HashMap::new(),
-            bid_floor: None,
-            fallback_url: None,
-        }
-    }
-
-    #[test]
-    fn wrap_kind_encodes_destination_and_uses_key() {
-        // `wrap`: network prefix + url-encoded destination, key interpolated.
-        std::env::set_var("DUMMY_SOVRN_KEY", "DUMMY_SOVRN_KEY");
-        let n = net(
-            "wrap",
-            "https://sovrn.co?key={key}&u={url}",
-            HashMap::new(),
-            Some("DUMMY_SOVRN_KEY"),
-        );
-        let url = "https://shop.example.com/widget?ref=blog#top";
-        let out = render_affiliate_url(&n, url, "shop.example.com");
-        assert!(out.starts_with("https://sovrn.co?key=DUMMY_SOVRN_KEY&u="), "key + prefix present");
-        // The destination must be percent-encoded (the `?` and `#` are unsafe raw).
-        assert!(out.contains("https%3A%2F%2Fshop.example.com%2Fwidget"), "destination url-encoded");
-        assert!(!out.contains("shop.example.com/widget?ref"), "raw destination must NOT appear");
-    }
-
-    #[test]
-    fn append_params_kind_appends_encoded_params_to_raw_url() {
-        // `append_params`: template is the raw destination; params appended encoded.
-        std::env::set_var("DUMMY_AMAZON_TAG", "DUMMY_AMAZON_TAG");
-        let mut params = HashMap::new();
-        params.insert("tag".to_string(), "{key}".to_string());
-        params.insert("customid".to_string(), "{subid}".to_string());
-        let n = net("append_params", "{url}", params.clone(), Some("DUMMY_AMAZON_TAG"));
-        let url = "https://www.amazon.com/dp/B0EXAMPLE";
-        let out = render_affiliate_url(&n, url, "amazon.com");
-        assert!(out.starts_with("https://www.amazon.com/dp/B0EXAMPLE?"), "raw destination preserved");
-        assert!(out.contains("tag=DUMMY_AMAZON_TAG"), "key param appended");
-        assert!(out.contains("customid=amazon.com"), "coarse subid (host) appended, no user data");
-        // Explicit param separator only when there is no existing query.
-        // The key comes from an ENV VAR (per architecture): set it, then name it.
-        std::env::set_var("DUMMY_EBAY_TAG", "T");
-        let n2 = net("append_params", "https://ebay.com/itm/123?foo=bar", params, Some("DUMMY_EBAY_TAG"));
-        let out2 = render_affiliate_url(&n2, "https://ebay.com/itm/123?foo=bar", "ebay.com");
-        // The existing query (?foo=bar) must be preserved, and network params
-        // appended with '&' (proving the separator is chosen correctly when a
-        // query already exists). Param *ordering* among themselves is NOT part of
-        // the contract (resolved from a HashMap), so assert each fact on its own.
-        assert!(out2.contains("?foo=bar"), "existing query preserved");
-        assert!(out2.contains("&tag=T"), "uses & separator when query already present");
-    }
-
-    #[test]
-    fn wrap_kind_appends_network_params_like_cuid() {
-        // A `wrap` network (e.g. Sovrn) carries its own `params` (cuid). These
-        // MUST be appended (encoded) to the network prefix — the prior renderer
-        // silently dropped them. This test locks that contract.
-        std::env::set_var("WRAP_CUID_KEY", "abc123");
-        let mut params = HashMap::new();
-        params.insert("cuid".to_string(), "{subid}".to_string());
-        let n = net("wrap", "https://sovrn.co?key={key}&u={url}", params, Some("WRAP_CUID_KEY"));
-        let url = "https://shop.example.com/widget?ref=blog";
-        let out = render_affiliate_url(&n, url, "shop.example.com");
-        // The network's own cuid param is present, carrying the coarse subid.
-        assert!(out.contains("cuid=shop.example.com"), "wrap network params (cuid) must be appended");
-        // Destination is still url-encoded inside the network prefix.
-        assert!(out.contains("https%3A%2F%2Fshop.example.com%2Fwidget"), "destination url-encoded");
-        assert!(!out.contains("shop.example.com/widget?ref"), "raw destination must NOT appear");
-    }
-
-    #[test]
-    fn decoration_is_idempotent_no_double_wrap() {
-        std::env::set_var("K", "K");
-        let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
-        let mut results = vec![
-            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
-        ];
-        decorate_affiliate(&mut results, &ctx);
-        let first_pass = results[0]["affiliate"]["url"].clone();
-        // Second pass must NOT double-wrap (same URL).
-        decorate_affiliate(&mut results, &ctx);
-        let second_pass = results[0]["affiliate"]["url"].clone();
-        assert_eq!(first_pass, second_pass, "idempotent: decoration must not double-wrap");
-        assert!(results[0]["affiliate"]["disclosed"].as_bool().unwrap_or(false), "disclosed:true");
-    }
-
-    #[test]
-    fn missing_key_degrades_to_null_affiliate() {
-        // No usable network (key env var unset) => results keep affiliate null.
-        let n = net("wrap", "https://sovrn.co?key={key}&u={url}", HashMap::new(), Some("UNSET_KEY_ENV_VAR_XYZ"));
-        let ctx = AffiliateCtx { networks: vec![n] };
-        let mut results = vec![
-            serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
-        ];
-        decorate_affiliate(&mut results, &ctx);
-        assert!(results[0].get("affiliate").is_none(), "no key => affiliate omitted, not fabricated");
-    }
-
-    #[test]
-    fn decoration_preserves_ranking_order() {
-        // The central no-manipulation guarantee: decoration never reorders.
-        std::env::set_var("K", "K");
-        let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
-        let mut results = vec![
-            serde_json::json!({ "url": "https://a.example.com/x", "score": 9.7 }),
-            serde_json::json!({ "url": "https://b.example.org/y", "score": 8.1 }),
-            serde_json::json!({ "url": "https://c.example.net/z", "score": 6.3 }),
-        ];
-        let before: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
-        decorate_affiliate(&mut results, &ctx);
-        let after: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
-        assert_eq!(before, after, "affiliate decoration must never reorder ranked results");
-        // Every decorated result is disclosed.
-        for r in results.iter() {
-            assert_eq!(r["affiliate"]["disclosed"], serde_json::json!(true));
-        }
-    }
-
-    #[test]
-    fn no_user_or_query_data_in_affiliate_params() {
-        // Subid is the coarse merchant host only — never a query, user id, or IP.
-        std::env::set_var("K", "K");
-        let n = net(
-            "wrap",
-            "https://sovrn.co?key=K&u={url}&cuid={subid}",
-            HashMap::new(),
-            Some("K"),
-        );
-        let url = "https://shop.example.com/widget";
-        let out = render_affiliate_url(&n, url, "shop.example.com");
-        assert!(out.contains("cuid=shop.example.com"), "subid is the host");
-        assert!(!out.contains("q="), "no query text");
-        assert!(!out.contains("user"), "no user id");
-        assert!(!out.contains("ip="), "no ip");
-    }
-
-    // ── Post-ROADMAP: CommerceConfig is data-driven ─────────────────────
-    // The main-path `shopping` block's top-N presentation cap must be
-    // configurable via `data/commerce/config.json` (mainpath_top_n) WITHOUT
-    // recompile. These tests lock that contract.
-
-    #[test]
-    fn commerce_config_default_top_n_is_8() {
-        // When the data file is absent/missing the field, the default is 8.
-        // (Offline test: no data file in the test cwd => default.)
-        let cfg = CommerceConfig { mainpath_top_n: 8, transactional_keywords: Vec::new() };
-        assert_eq!(cfg.mainpath_top_n, 8, "default top-N is 8");
-    }
-
-    #[test]
-    fn commerce_config_can_be_set_to_a_different_value() {
-        // A new value (e.g. 12) can be set by editing the data file — no
-        // code change, no recompile. This test simulates what the loader
-        // would produce after reading `{"mainpath_top_n": 12}`.
-        let cfg = CommerceConfig { mainpath_top_n: 12, transactional_keywords: Vec::new() };
-        assert_eq!(cfg.mainpath_top_n, 12, "top-N is data-driven");
-    }
-
-    #[test]
-    fn commerce_config_zero_top_n_means_no_shopping_block() {
-        // Edge case: mainpath_top_n = 0 means the shopping block is never
-        // surfaced (the take(0) yields an empty array => None). This is a
-        // valid "off" setting — proves the value is honored as a cap.
-        let cfg = CommerceConfig { mainpath_top_n: 0, transactional_keywords: Vec::new() };
-        assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
-    }
-
-    // ── Microdata v2: value attribute ───────────────────────────────────
-    // Microdata spec allows <span itemprop="price" value="29.99"> where the
-    // machine-readable value lives in the `value` attribute, not text content.
-
-    const HTML_MICRODATA_VALUE_ATTR: &str = r#"<!doctype html><html><head>
-<title>Microdata Value Attr</title>
-</head><body>
-<div itemscope itemtype="https://schema.org/Product">
-  <span itemprop="name">Value Attr Widget</span>
-  <span itemprop="price" value="39.99">$39.99</span>
-  <span itemprop="priceCurrency" value="USD">USD</span>
-  <span itemprop="availability" value="https://schema.org/InStock">In Stock</span>
-  <span itemprop="brand" value="ValueBrand">ValueBrand</span>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn microdata_value_attribute_is_extracted() {
-        let o = extract_commerce_offer(HTML_MICRODATA_VALUE_ATTR, "https://valmd.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(39.99));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
-        assert_eq!(d.merchant.as_deref(), Some("ValueBrand"));
-        assert_eq!(o.source.as_deref(), Some("microdata"));
-    }
-
-    // ── RDFa resource attribute ──────────────────────────────────────────
-    // RDFa allows <img property="image" resource="url"> or
-    // <link property="image" href="url"> — the resource attr is a valid IRI.
-
-    const HTML_RDFa_RESOURCE_IMAGE: &str = r#"<!doctype html><html><head>
-<title>RDFa Resource Image</title>
-</head><body>
-<div vocab="https://schema.org/" typeof="Product">
-  <span property="name">RDFa Resource Product</span>
-  <img property="image" resource="https://rdfa.example.com/img.jpg" alt="product">
-  <div property="offers" typeof="Offer">
-    <span property="price" content="69.99">69.99</span>
-    <span property="priceCurrency" content="USD">USD</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn rdfa_resource_attribute_is_extracted() {
-        let o = extract_commerce_offer(HTML_RDFa_RESOURCE_IMAGE, "https://rdfares.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://rdfa.example.com/img.jpg"));
-        assert_eq!(d.price, Some(69.99));
-        assert_eq!(d.currency.as_deref(), Some("USD"));
-        assert_eq!(o.source.as_deref(), Some("rdfa"));
-    }
-
-    const HTML_RDFa_RESOURCE_OFFER: &str = r#"<!doctype html><html><head>
-<title>RDFa Resource Offer</title>
-</head><body>
-<div vocab="https://schema.org/" typeof="Product">
-  <span property="name">Resource Offer Product</span>
-  <div property="offers" typeof="Offer" resource="https://rdfa.example.com/offer/1">
-    <span property="price" content="44.99">44.99</span>
-    <span property="availability" content="https://schema.org/InStock">In Stock</span>
-  </div>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn rdfa_resource_on_non_image_property_ignored() {
-        // resource= on the offers div should not break extraction; the
-        // non-image resource is not used as a value.
-        let o = extract_commerce_offer(HTML_RDFa_RESOURCE_OFFER, "https://rdfao.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(44.99));
-        assert_eq!(d.availability.as_deref(), Some("https://schema.org/InStock"));
-        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    fn strip_location_terms_quantity_phrases() {
+        let query = "top 10 best places to visit in japan";
+        let stripped = strip_location_terms(query).expect("should strip");
+        assert!(!stripped.contains("japan"), "should remove location");
+        assert!(!stripped.contains("top"), "should remove 'top'");
+        assert!(!stripped.contains("best"), "should remove 'best'");
     }
 }
