@@ -5183,7 +5183,6 @@ async fn enrich_with_commerce_par<F, Fut>(
     results: &mut [serde_json::Value],
     fetch: F,
     wall_timeout: std::time::Duration,
-    enrich_window: usize,
 ) where
     F: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Option<String>> + Send,
@@ -5213,7 +5212,7 @@ async fn enrich_with_commerce_par<F, Fut>(
             Some((idx, url.to_string()))
         })
         .map(|(idx, _)| idx)
-        .take(enrich_window)
+        .take(COMMERCE_ENRICH_WINDOW)
         .collect();
 
     // 2) Fetch in bounded-concurrency WAVES of max_par: every eligible result
