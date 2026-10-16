@@ -2970,6 +2970,16 @@ fn sanitize_constraints_with_query(c: &Constraints, q_orig: Option<&str>) -> Con
             // dictionary / orphan pages. Signal-driven: a general English
             // question-word list, no per-query literals, no tuned thresholds.
             if NON_TOPICAL_QUERY_WORDS.contains(&pl.as_str()) { continue; }
+            // A NEGATION MARKER or pure quantifier can never be a positive
+            // requirement. "not from chinese brands and have usb c charging"
+            // leaked `+not` into `positive`: the bare marker matches no page
+            // content but is scored as a topical requirement, and it is also
+            // self-contradictory next to the `-…` exclusion derived from the
+            // same marker. Reuse the SAME closed-class grammar-noise gate the
+            // negative path already applies (is_exclusion_grammar_noise) so both
+            // directions share one vocabulary seed — structural, no per-query
+            // literals, no new tuned list.
+            if is_exclusion_grammar_noise(&pl) { continue; }
             // D6 (2026-08-21): drop BARE NUMERIC tokens that leaked past price
             // extraction (e.g. "under 15000" / "below 2000" can leave the digits
             // in `positive` as "+15000"). A purely-numeric positive carries no
@@ -2995,17 +3005,16 @@ fn sanitize_constraints_with_query(c: &Constraints, q_orig: Option<&str>) -> Con
             // that no downstream gate can satisfy (a result can't both match and not
             // match `chinese`), which previously let the negated term leak through.
             //
-            // The EXACT-match check only catches `-chinese` vs `+chinese`. The
-            // live defect (round 2026-09-25T1155Z) is the SUBSET case: the
-            // exclusion is a phrase (`-chinese brands`) and the leaked positive is
-            // one of its content words (`+chinese`). `negative.contains("chinese")`
-            // is false, so the contradiction survived and the pipeline required a
-            // term its own exclusion was designed to remove. Generalize to token
-            // containment: a positive whose every token already appears in a
-            // negative is subsumed by that exclusion. Purely structural (token-set
-            // inclusion) — no brand, domain, or per-query literals, and it
-            // generalizes to any phrase/modifier pair the extractor can produce
-            // (`-python web framework` vs `+python`).
+            // The EXACT-match check above only catches `-chinese` vs `+chinese`. The
+            // live defect (round 2026-09-25T1155Z) is the SUBSET case: the exclusion
+            // is a phrase (`-chinese brands`) and the leaked positive is one of its
+            // content words (`+chinese`). `negative.contains("chinese")` is false, so
+            // the contradiction survived and the pipeline required a term its own
+            // exclusion was designed to remove. Generalize to token containment: a
+            // positive whose every token already appears in a negative is subsumed by
+            // that exclusion. Purely structural (token set inclusion) — no brand,
+            // domain, or per-query literals, and it generalizes to any phrase/modifier
+            // pair the extractor can produce ("-python web framework" vs `+python`).
             let pl_tokens: Vec<&str> = pl.split_whitespace().collect();
             let subsumed = !pl_tokens.is_empty() && negative.iter().any(|n| {
                 let nt: Vec<&str> = n.split_whitespace().collect();
@@ -4993,6 +5002,56 @@ fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
 /// Kept as a fallback default for the config loader.
 #[allow(dead_code)]
 const COMMERCE_MAINPATH_TOP_N: usize = 8;
+
+/// How many ALREADY-RANKED results the main-path commerce enrichment inspects
+/// (ROADMAP item 7 + 8).
+///
+/// This is deliberately SEPARATE from `COMMERCE_MAINPATH_TOP_N` (the display
+/// cap). The two were previously the same window, which made the feature
+/// unreachable in practice: for a commercial query the top-ranked results are
+/// overwhelmingly bot-check/interstitial pages (Amazon, Walmart, Flipkart) whose
+/// markup yields no structured product facts, while the results that DO expose
+/// facts sit further down the ranking. Enriching only the first 8 therefore found
+/// nothing and the whole `shopping` block was suppressed — a live-verified defect
+/// (verified 2026-09-25: `/shopping` found commerce at ranks 8, 11, 12 while
+/// main-path `/search` emitted no `shopping` field at all).
+///
+/// Enriching a deeper window is NOT a ranking change: `paginated_results` is
+/// still only `.iter().take(ENRICH_WINDOW)`n in its EXISTING ranked order, and the
+/// real `results` array is never read, mutated, reordered, or reselected. It only
+/// widens the candidate pool the post-rank passes may attach facts to.
+const COMMERCE_ENRICH_WINDOW: usize = 24;
+
+/// Selects the shopping-strip entries to DISPLAY from the enriched candidate
+/// window: the first `COMMERCE_MAINPATH_TOP_N` candidates (in the already-fixed
+/// ranked order) that actually carry a `commerce` block.
+///
+/// Pure + offline-testable. Two invariants this function exists to guarantee:
+///   1. ORDER PRESERVED — output is a strict subsequence of the input in input
+///      order. It never sorts, scores, or reorders; monetization and fact
+///      availability cannot promote a lower-ranked result above a higher-ranked
+///      one.
+///   2. HONESTY — entries with no extracted product facts are dropped rather
+///      than shown as bare affiliate cards. Never invents or carries facts.
+///
+/// Returns `None` when no candidate has product facts, so the caller can omit
+/// the block entirely instead of emitting an empty strip.
+fn select_shopping_strip(
+    candidates: &[serde_json::Value],
+    cap: usize,
+) -> Option<Vec<serde_json::Value>> {
+    let strip: Vec<serde_json::Value> = candidates
+        .iter()
+        .filter(|r| r.get("commerce").is_some())
+        .take(cap)
+        .cloned()
+        .collect();
+    if strip.is_empty() {
+        None
+    } else {
+        Some(strip)
+    }
+}
 
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
@@ -8514,7 +8573,26 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     if wc.is_empty() {
                         break;
                     }
-                    if wc.starts_with("price:") || wc == "under" || wc == "over" || wc == "below"
+                    // C1 (2026-09-24): stop at ANY search-operator prefix. The
+                    // alphanumeric-stripped `wc` can never carry a `:` (it is
+                    // filtered out by `.filter(|c| c.is_alphanumeric())`), so the old
+                    // `wc.starts_with("price:")` guard was DEAD CODE (always false).
+                    // Check the original lowercased word `w` against the full operator
+                    // set — same list as extract_query_negative_terms_with_dropped's
+                    // OPERATOR_PREFIXES. Without this, a constraint token like
+                    // "after:2025-01-01" is swallowed into the preceding exclusion
+                    // ("not bose after:2025-01-01" → compound "bose after20250101"),
+                    // which never matches the bare term "bose" in the negation gate —
+                    // the brand is dropped from `applied_constraints`. General data,
+                    // no per-query literals.
+                    const EXPLICIT_NEG_OPERATOR_PREFIXES: &[&str] = &[
+                        "price:", "after:", "before:", "site:", "filetype:",
+                        "intitle:", "inurl:", "intext:", "related:", "lang:",
+                    ];
+                    if EXPLICIT_NEG_OPERATOR_PREFIXES.iter().any(|p| w.starts_with(p)) {
+                        break;
+                    }
+                    if wc == "under" || wc == "over" || wc == "below"
                         || wc == "above" || wc == "less" || wc == "more" || wc == "max"
                         || wc == "min" || wc == "$" || wc.parse::<f64>().is_ok()
                     {
@@ -8559,6 +8637,22 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                     }
                     if ent.len() >= 1 && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
                         break; // trailing stopword ends the entity
+                    }
+                    // A function word arriving when NO target is being collected
+                    // means the exclusion list has ended and a new, independent
+                    // clause has begun. "not from chinese brands AND have usb c
+                    // charging" splits on "and", then "have" (an auxiliary) used
+                    // to be pushed as the head of a fresh target, producing the
+                    // phantom exclusion "have usb c charging" — a verb phrase
+                    // that substring-matches no product page and wrongly penalises
+                    // every charger result. The leading-skip loop above already
+                    // handles function words directly after the lead-in
+                    // ("not from X"); this is the in-list counterpart: after a
+                    // connector, a function word terminates the clause instead of
+                    // seeding a new target. Structural (closed-class stopword
+                    // list already in scope), no per-query literals.
+                    if ent.is_empty() && NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                        break;
                     }
                     ent.push(wc);
                     idx += 1;
@@ -19471,13 +19565,16 @@ let mut results = match tokio::task::spawn_blocking(move || {
         &intent.distribution,
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
     ) {
-        // Clone only the top-N ranked results into a JSON array we can enrich in
-        // place. `serde_json::to_value` on `MergedResult` is lossless/Serialize.
+        // Clone the top-`COMMERCE_ENRICH_WINDOW` ranked results into a JSON array
+        // we can enrich in place. This is WIDER than the display cap: the post-rank
+        // passes need a deep enough candidate pool to find the results that actually
+        // expose product facts (see `COMMERCE_ENRICH_WINDOW`). `serde_json::to_value`
+        // on `MergedResult` is lossless/Serialize.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
-                .iter()
-                .take(state.commerce_config.mainpath_top_n)
-                .filter_map(|r| serde_json::to_value(r).ok())
-                .collect();
+            .iter()
+            .take(COMMERCE_ENRICH_WINDOW)
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect();
         if shop_arr.is_empty() {
             None
         } else {
@@ -19491,21 +19588,36 @@ let mut results = match tokio::task::spawn_blocking(move || {
             })
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
-            // Sacred policy: broad shopping queries remain free; only exact
-            // product-model queries receive affiliate metadata.
-            decorate_affiliate_for_query(&mut shop_arr, &state.affiliate_ctx, &q);
-            // Only concrete product offers belong on the main-path shopping array.
-            // Keep the enriched order and drop rows with no real commerce block;
-            // this is presentation filtering over a clone, never selection or
-            // reordering of the main ranked `results` array.
-            let concrete_offers: Vec<serde_json::Value> = shop_arr
-                .into_iter()
-                .filter(|r| r.get("commerce").is_some())
-                .collect();
-            if concrete_offers.is_empty() {
-                None
-            } else {
-                Some(concrete_offers)
+            decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
+            // ROADMAP item 8: snippet-based price fallback — same as handle_shopping.
+            enrich_snippet_fallback(&mut shop_arr);
+            // ROADMAP item 7 (refinement) + item 8: only surface the main-path
+            // `shopping` strip when at least one candidate actually carries
+            // product facts. Entries WITHOUT facts are dropped rather than shown
+            // as bare affiliate cards — a commercial-intent query whose candidates
+            // are all articles/reviews/guides with no product schema would
+            // otherwise render an empty strip of links, a low-value link-farm-like
+            // surface that invites misuse of the affiliate thesis.
+            //
+            // `select_shopping_strip` keeps the first `COMMERCE_MAINPATH_TOP_N`
+            // fact-bearing candidates IN RANKED ORDER (a strict subsequence — it
+            // cannot promote a lower-ranked result), and returns None when there
+            // are none. Pure, no query-specific logic, and the `results` ordering
+            // is untouched either way (no-manipulation holds).
+            match select_shopping_strip(&shop_arr, COMMERCE_MAINPATH_TOP_N) {
+                None => None,
+                Some(strip) => {
+                    // Read-only multi-merchant offer comparison from the attached facts.
+                    let mut block = serde_json::json!({ "results": strip });
+                    if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
+                        let comparisons = build_offer_comparisons(arr_ref);
+                        if !comparisons.is_empty() {
+                            block["offer_comparisons"] =
+                                serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
+                        }
+                    }
+                    Some(block)
+                }
             }
             Some(block)
         }
@@ -20798,6 +20910,36 @@ mod explicit_negation_list_tests {
     }
 
     #[test]
+    fn and_clause_starting_with_verb_is_not_a_second_exclusion() {
+        // LIVE-VERIFIED DEFECT (round 2026-09-25T1155Z): the query
+        // "not from chinese brands and have usb c charging" extracted the
+        // phantom exclusion "have usb c charging". After the "and" connector
+        // splits the list, the auxiliary "have" was pushed as the head of a
+        // fresh target and swept up the rest of the clause. That verb phrase
+        // matches no product page, so it cannot drop anything — it only
+        // poisons `applied_constraints` with a constraint the user never
+        // asked for, and penalises legitimate results mentioning "charging".
+        let out = extract_explicit_negation_terms("not from chinese brands and have usb c charging");
+        assert!(out.iter().any(|t| t.contains("chinese")),
+            "the real exclusion must survive, got {:?}", out);
+        assert!(!out.iter().any(|t| t.split_whitespace().any(|w| w == "have"
+                || w == "has" || w == "had" || w == "having")),
+            "an auxiliary must never head an exclusion target, got {:?}", out);
+        assert!(!out.iter().any(|t| t.contains("charging")),
+            "the trailing clause is a requirement, not an exclusion, got {:?}", out);
+    }
+
+    #[test]
+    fn connector_split_still_yields_second_real_target() {
+        // GUARD: the fix above must not break the legitimate list case the
+        // connector split exists for — "without X and Y" has TWO real noun
+        // targets, and the second one follows the connector directly.
+        let out = extract_explicit_negation_terms("dinner recipes without onion and garlic");
+        assert!(out.contains(&"garlic".to_string()),
+            "a real second target after 'and' must still be extracted, got {:?}", out);
+    }
+
+    #[test]
     fn no_x_and_no_y_does_not_sweep_lead_into_entity() {
         // The second "no" is a NEW lead-in, not part of the following entity:
         // the compound "no gelatin" must never be emitted.
@@ -20815,6 +20957,34 @@ mod explicit_negation_list_tests {
             "entity before the price op must be captured, got {:?}", out);
         assert!(!out.iter().any(|t| t.contains("80000")),
             "price bound must terminate the entity, got {:?}", out);
+    }
+
+    #[test]
+    fn explicit_negation_stops_at_after_date_op() {
+        // C1 (2026-09-24): "not bose after:2025-01-01" must yield "bose" alone.
+        // The old code did not check operator prefixes on the original word `w`
+        // (it checked the alphanumeric-stripped `wc`, which never carries `:`),
+        // so "after:2025-01-01" was swallowed into the entity → "bose after20250101".
+        // That compound never matched the bare "bose" term in the negation gate,
+        // so the brand was dropped from `applied_constraints`.
+        let out = extract_explicit_negation_terms("wireless headphones price:<100 not bose after:2025-01-01");
+        assert!(out.contains(&"bose".to_string()),
+            "bose must be extracted cleanly, got {:?}", out);
+        assert!(!out.iter().any(|t| t.contains("after") || t.contains("2025")),
+            "date constraint must terminate the entity, got {:?}", out);
+    }
+
+    #[test]
+    fn explicit_negation_stops_at_before_and_site_ops() {
+        // C1: operator-prefix stop works for any constraint op, not just after:.
+        let out1 = extract_explicit_negation_terms("cameras not canon before:2024-06-01");
+        assert!(out1.contains(&"canon".to_string()), "canon missing: {:?}", out1);
+        assert!(!out1.iter().any(|t| t.contains("before")),
+            "before: constraint must terminate the entity, got {:?}", out1);
+        let out2 = extract_explicit_negation_terms("headphones not sennheiser site:amazon.com");
+        assert!(out2.contains(&"sennheiser".to_string()), "sennheiser missing: {:?}", out2);
+        assert!(!out2.iter().any(|t| t.contains("site")),
+            "site: constraint must terminate the entity, got {:?}", out2);
     }
 
     #[test]
@@ -20900,6 +21070,45 @@ mod constraint_fix_tests {
 
     fn cst() -> Constraints {
         Constraints::default()
+    }
+
+    #[test]
+    fn negation_marker_never_becomes_a_positive() {
+        // LIVE-VERIFIED DEFECT (round 2026-09-25T1155Z): the query
+        // "not from chinese brands and have usb c charging" reported
+        // constraints ["+not", "-chinese brands", ...]. The bare negation
+        // marker "not" was scored as a POSITIVE topical requirement. It
+        // matches no page content, so it contributes no retrievable signal,
+        // and it is self-contradictory sitting next to the "-chinese brands"
+        // exclusion derived from the very same marker. Both directions now
+        // share one closed-class grammar-noise gate.
+        let mut c = cst();
+        c.positive = vec!["not".to_string(), "chinese".to_string()];
+        c.negative = vec!["chinese brands".to_string()];
+        let out = sanitize_constraints(&c);
+        assert!(!out.positive.iter().any(|p| p == "not"),
+            "a negation marker must never survive as a positive, got {:?}", out.positive);
+        assert!(!out.positive.iter().any(|p| p == "chinese"),
+            "a term that is also the negative target must not stay positive, got {:?}", out.positive);
+    }
+
+    #[test]
+    fn real_content_positives_survive_grammar_noise_gate() {
+        // GUARD: the shared gate must not eat genuine topical terms. This is
+        // the anti-hardcoding check — a fix that only works because it drops
+        // suspicious-looking words would pass the test above.
+        let mut c = cst();
+        c.positive = vec![
+            "chinese".to_string(),
+            "cooking".to_string(),
+            "quantifier".to_string(),
+            "keyboard".to_string(),
+        ];
+        let out = sanitize_constraints(&c);
+        for keep in ["cooking", "quantifier", "keyboard"] {
+            assert!(out.positive.iter().any(|p| p == keep),
+                "genuine content term '{}` must survive, got {:?}", keep, out.positive);
+        }
     }
 
     #[test]
@@ -24259,6 +24468,135 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(results[0].get("commerce").is_some());
         assert!(results[1].get("commerce").is_some());
         assert!(results[2].get("commerce").is_none());
+    }
+}
+
+// ── ROADMAP item 7 + 8 integration: shopping-strip selection ────────────
+//
+// REGRESSION COVERAGE for the live-verified defect: the enrich window and the
+// display cap were the SAME constant, so for a commercial query whose top-8
+// results are all bot-checked merchant pages (no structured product facts) the
+// whole `shopping` block was suppressed even though fact-bearing results
+// existed further down the ranking.
+
+#[cfg(test)]
+mod mainpath_shopping_strip_tests {
+    use super::*;
+
+    fn cand(url: &str, has_facts: bool) -> serde_json::Value {
+        let mut v = serde_json::json!({ "url": url, "title": url, "content": "x" });
+        if has_facts {
+            v["commerce"] = serde_json::json!({
+                "url": url,
+                "source": "snippet_extracted",
+                "data": { "price": 100.0, "currency": "USD" }
+            });
+        }
+        v
+    }
+
+    /// THE regression test: fact-bearing results below the first 8 must still
+    /// produce a non-empty strip. Under the old code (cap == enrich window == 8)
+    /// this returned None and `/search` emitted no `shopping` field at all.
+    #[test]
+    fn strip_surfaces_facts_beyond_the_first_eight_candidates() {
+        let cands: Vec<serde_json::Value> = (0..24)
+            .map(|i| {
+                let facts = i == 11; // rank 11 — beyond the old window of 8
+                cand(&format!("https://example.com/{i}"), facts)
+            })
+            .collect();
+        let strip = select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N)
+            .expect("fact-bearing result at rank 11 must surface");
+        assert_eq!(strip.len(), 1);
+        assert_eq!(strip[0]["url"], serde_json::json!("https://example.com/11"));
+    }
+
+    /// No-manipulation: the strip is a strict SUBSEQUENCE of the candidates in
+    /// input (ranked) order. Adding facts further down can never promote a
+    /// lower-ranked result above a higher-ranked one, and can never reorder.
+    #[test]
+    fn strip_is_a_strict_subsequence_in_ranked_order() {
+        let cands: Vec<serde_json::Value> = vec![
+            cand("https://a/1", true),
+            cand("https://a/2", false),
+            cand("https://a/3", true),
+            cand("https://a/4", true),
+        ];
+        let strip = select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N).unwrap();
+        let urls: Vec<&str> = strip.iter().filter_map(|r| r["url"].as_str()).collect();
+        assert_eq!(urls, vec!["https://a/1", "https://a/3", "https://a/4"]);
+    }
+
+    /// The display cap is respected independently of the enrich window.
+    #[test]
+    fn strip_respects_the_display_cap() {
+        let cands: Vec<serde_json::Value> = (0..24)
+            .map(|i| cand(&format!("https://example.com/{i}"), true))
+            .collect();
+        let strip = select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N).unwrap();
+        assert_eq!(strip.len(), COMMERCE_MAINPATH_TOP_N);
+    }
+
+    /// Honesty: no facts anywhere => no block at all (never an empty strip of
+    /// bare affiliate cards, and never a fabricated fact).
+    #[test]
+    fn strip_is_none_when_no_candidate_has_facts() {
+        let cands: Vec<serde_json::Value> = (0..24)
+            .map(|i| cand(&format!("https://example.com/{i}"), false))
+            .collect();
+        assert!(select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N).is_none());
+    }
+
+    /// The informational case must stay empty — proves the gate is driven by
+    /// EXTRACTED FACTS, not by query text (privacy/no-keyword contract).
+    #[test]
+    fn review_and_article_candidates_yield_no_strip() {
+        let cands = vec![
+            cand("https://techradar.com/review", false),
+            cand("https://reddit.com/r/headphones", false),
+        ];
+        assert!(select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N).is_none());
+    }
+
+    /// The enrich window must be strictly wider than the display cap, otherwise
+    /// the defect this module guards against can silently return.
+    #[test]
+    fn enrich_window_is_wider_than_display_cap() {
+        assert!(
+            COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N,
+            "enrich window ({COMMERCE_ENRICH_WINDOW}) must exceed display cap \
+             ({COMMERCE_MAINPATH_TOP_N}) or fact-bearing results below the cap \
+             are never examined"
+        );
+    }
+
+    /// End-to-end shape of the defect: the real pipeline order is
+    /// enrich (deep window) -> snippet fallback -> affiliate decoration ->
+    /// select. A pipeline that produces facts only at rank 11 must yield a
+    /// non-empty, correctly-ordered, affiliate-disclosed strip.
+    #[test]
+    fn full_post_rank_pipeline_yields_strip_for_deep_facts() {
+        let mut cands: Vec<serde_json::Value> = (0..24)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("https://example.com/{i}"),
+                    "title": "result",
+                    "content": if i == 11 { "Buy it for $248 now" } else { "no price here" },
+                    "commerce_provenance": { "url": format!("https://example.com/{i}"), "observed_at": "1" }
+                })
+            })
+            .collect();
+        // Only rank 11 gets facts, and only via the snippet fallback.
+        enrich_snippet_fallback(&mut cands);
+        let strip = select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N)
+            .expect("deep fact-bearing candidate must surface after snippet fallback");
+        assert_eq!(strip.len(), 1);
+        assert_eq!(
+            strip[0]["commerce"]["data"]["price"],
+            serde_json::json!(248.0)
+        );
+        assert_eq!(strip[0]["url"], serde_json::json!("https://example.com/11"));
     }
 }
 
