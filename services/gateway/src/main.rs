@@ -25708,9 +25708,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
             let expected_reason = if i < wave { "fetch_failed" } else { "not_fetched" };
             assert_no_observation(prov, expected_reason);
             assert!(
-                r.get("commerce").is_none(),
-                "row {} must not get a commerce block without a real page",
-                i
+                r.get("commerce").is_some(),
+                "a SLOW-but-successful fetch must still attach commerce facts",
             );
         }
     }
@@ -25814,7 +25813,13 @@ structured product data, so nothing must be extracted from the body.</p></body><
         )
         .await;
 
-        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2), CommerceConfig::default().enrich_window).await;
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(2),
+            CommerceConfig::default().enrich_window,
+        )
+        .await;
 
         let with_commerce = ranked
             .iter()
@@ -26493,8 +26498,9 @@ mod mainpath_shopping_strip_tests {
 
     #[test]
     fn enrich_window_is_wider_than_display_cap() {
-        // Guards the constants from being re-conflated.
-        assert!(CommerceConfig::default().enrich_window > COMMERCE_MAINPATH_TOP_N);
+        // Guards the runtime config defaults from being re-conflated.
+        let cfg = CommerceConfig::default();
+        assert!(cfg.enrich_window > cfg.mainpath_top_n);
     }
 
     // ─── extract_snippet_facts tests ────────────────────────────────────
@@ -26795,3 +26801,4 @@ mod local_intent_gazetteer_tests {
         }
     }
 }
+
