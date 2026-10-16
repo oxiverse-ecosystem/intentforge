@@ -4863,18 +4863,25 @@ async fn enrich_with_commerce<F, Fut>(
         if r.get("commerce").is_some() {
             continue; // already enriched by an earlier step
         }
-        // The outcome is only known AFTER the fetch resolves, so provenance is
-        // built at the end. A `None` fetch means no page was observed, so its
-        // `observed_at` must be null — stamping the response-build time there
-        // would claim an observation that never happened.
-        let outcome = match fetch(url.clone()).await {
+        let mut attached = false;
+        let mut fetched_html: Option<String> = None;
+        match fetch(url.clone()).await {
             Some(h) => {
+                fetched_html = Some(h.clone());
                 let offer: CommerceOffer = extract_commerce_offer(&h, &url);
                 // Only attach a `commerce` block when the page actually exposed
                 // structured product data — never a guessed/fabricated fact.
                 if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
                     match serde_json::to_value(&offer) {
-                        Ok(v) => {
+                        Ok(mut v) => {
+                            // extract_commerce_offer labels HTML-pattern matches
+                            // as "extracted_from_text" (its internal step 5).
+                            // From enrich_with_commerce's perspective this IS
+                            // the html_pattern tier — upgrade the source so the
+                            // frontend labels it correctly.
+                            if v.get("source").and_then(|s| s.as_str()) == Some("extracted_from_text") {
+                                v["source"] = serde_json::json!("html_pattern");
+                            }
                             r["commerce"] = v;
                         }
                         Err(_) => {}
@@ -4910,9 +4917,71 @@ async fn enrich_with_commerce<F, Fut>(
                 // DOES carry a real observation time.
                 CommerceFetchOutcome::Fetched
             }
-            None => CommerceFetchOutcome::FetchFailed,
-        };
-        r["commerce_provenance"] = commerce_provenance_block(&url, outcome);
+            None => {}
+        }
+        // HTML-pattern fallback: when the page was fetched but structured
+        // extraction found nothing, try known e-commerce HTML price patterns
+        // (class="a-price", data-price, etc.) on the ACTUAL page content.
+        // This is a provenance-carrying intermediate tier — it looks at the
+        // real page HTML (not just the snippet), but marks the source as
+        // "html_pattern" so the frontend can label it as less certain than
+        // structured data. Never fabricates: only fires on a real pattern match.
+        if !attached {
+            if let Some(ref html) = fetched_html {
+                if let Some((amount, currency)) = extract_price_from_html_patterns(html) {
+                    let facts = OfferFacts {
+                        price: Some(amount),
+                        currency: Some(currency),
+                        ..Default::default()
+                    };
+                    let offer = CommerceOffer {
+                        url: Some(url.clone()),
+                        observed_at: Some(now_unix_string()),
+                        source: Some("html_pattern".to_string()),
+                        data: Some(facts),
+                    };
+                    if let Ok(v) = serde_json::to_value(&offer) {
+                        r["commerce"] = v;
+                        attached = true;
+                    }
+                }
+            }
+        }
+        // Snippet-based price fallback: when the page fetch failed or returned
+        // no structured data, try to extract a price from the search result
+        // snippet (title + content). This improves enrichment recall without
+        // fabricating facts — the price is marked with source="snippet_extracted"
+        // so the frontend can label it as less certain than structured data.
+        if !attached {
+            let snippet = format!(
+                "{} {}",
+                r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                r.get("content").and_then(|v| v.as_str()).unwrap_or("")
+            );
+            if let Some(price_info) = extract_price_from_text(&snippet) {
+                let facts = OfferFacts {
+                    price: Some(price_info.amount),
+                    currency: Some(price_info.currency),
+                    ..Default::default()
+                };
+                let offer = CommerceOffer {
+                    url: Some(url.clone()),
+                    observed_at: Some(now_unix_string()),
+                    source: Some("snippet_extracted".to_string()),
+                    data: Some(facts),
+                };
+                if let Ok(v) = serde_json::to_value(&offer) {
+                    r["commerce"] = v;
+                }
+            }
+        }
+        let provenance = serde_json::json!({
+            "url": url,
+            "observed_at": now_unix_string(),
+            "source": r.get("commerce").and_then(|c| c.get("source")).and_then(|s| s.as_str()),
+            "data": r.get("commerce").and_then(|c| c.get("data")),
+        });
+        r["commerce_provenance"] = provenance;
     }
 }
 
@@ -4948,8 +5017,16 @@ fn enrich_single_commerce(
         .unwrap_or("")
         .to_string();
     let offer: CommerceOffer = extract_commerce_offer(html, &url);
-    if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
-        if let Ok(v) = serde_json::to_value(&offer) {
+    let has_fact = offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false);
+    if has_fact {
+        if let Ok(mut v) = serde_json::to_value(&offer) {
+            // extract_commerce_offer labels HTML-pattern matches as
+            // "extracted_from_text" (its internal step 5). From the
+            // enrichment tier's perspective this IS the html_pattern tier —
+            // upgrade the source so the frontend labels it correctly.
+            if v.get("source").and_then(|s| s.as_str()) == Some("extracted_from_text") {
+                v["source"] = serde_json::json!("html_pattern");
+            }
             r["commerce"] = v;
         }
     } else if offer.data.as_ref().map(|d| d.price.is_none() && d.price_low.is_none()).unwrap_or(false)
@@ -26078,6 +26155,340 @@ mod kb_gibberish_mixed_tests {
                 "'{}' is a real subject term and must stay a valid anchor",
                 w
             );
+        }
+    }
+}
+
+/// Defect 2: the degraded (intent-engine unreachable) path used to report
+/// `positive: []` and an empty top-level `constraints` for every
+/// natural-language query, while still reporting the price bound correctly.
+/// Live repro before the fix: stopping `if-dev-intent-engine` and issuing a
+/// price-filtered multi-constraint query returned
+/// `positive: []`, `constraints: []`, `price_lt: 4500` — indistinguishable
+/// downstream from "the user stated no constraints at all".
+#[cfg(test)]
+mod fallback_constraint_tests {
+    use super::*;
+
+    /// The headline defect: a plain NL query with a price bound must still
+    /// report its topic constraints on the degraded path.
+    #[test]
+    fn degraded_path_still_reports_topic_constraints() {
+        let intent = fallback_intent(
+            "noise cancelling headphones with long battery life and mic under 20000",
+        );
+        let sc = &intent.structured_constraints;
+        assert!(
+            !sc.positive.is_empty(),
+            "degraded path reported NO topic constraints: {:?}",
+            sc
+        );
+        // The price bound is still reported (that part always worked).
+        assert_eq!(sc.price_max, Some(20000.0), "price bound lost: {:?}", sc);
+        // And the topic is actually about headphones, not a stray function word.
+        for topic in ["headphones", "battery", "noise", "mic"] {
+            assert!(
+                sc.positive
+                    .iter()
+                    .any(|p| p.split_whitespace().any(|w| w == topic)),
+                "topic {:?} missing from degraded extraction: {:?}",
+                topic,
+                sc.positive
+            );
+        }
+    }
+
+    /// The budget digits are a FILTER, already captured in `price_*` — they
+    /// must never also be reported as a lexical requirement.
+    #[test]
+    fn degraded_path_never_reports_budget_digits_as_topics() {
+        for q in [
+            "boots under 3000 rupees",
+            "laptop below 500",
+            "mirrorless camera under 60000 rupees",
+        ] {
+            let sc = &fallback_intent(q).structured_constraints;
+            for p in &sc.positive {
+                assert!(
+                    !p.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ','),
+                    "{:?}: budget digits leaked into topics as {:?}: {:?}",
+                    q,
+                    p,
+                    sc.positive
+                );
+            }
+        }
+    }
+
+    /// Multi-word concepts must survive as ONE requirement on the degraded path
+    /// too, so a degraded response describes the same requirement SHAPE as a
+    /// healthy one (`constraint_score` divides by `positive.len()`, so fragment
+    /// counts are the defect).
+    #[test]
+    fn degraded_path_groups_multi_word_concepts() {
+        let sc = &fallback_intent("4k monitor with 144hz refresh rate").structured_constraints;
+        assert!(
+            sc.positive.iter().any(|p| p == "refresh rate"),
+            "\"refresh rate\" was shredded into fragments: {:?}",
+            sc.positive
+        );
+    }
+
+    /// Stop words are PHRASE BOUNDARIES. A naive adjacency pairing glues the
+    /// topics on either side of "with" / "and" into one junk phrase
+    /// ("headphones long"), which is a requirement no page can satisfy as a
+    /// concept.
+    #[test]
+    fn degraded_path_treats_stop_words_as_boundaries() {
+        let sc = &fallback_intent(
+            "noise cancelling headphones with long battery life and mic",
+        )
+        .structured_constraints;
+        for junk in ["headphones long", "battery mic", "with long", "life and"] {
+            assert!(
+                !sc.positive.iter().any(|p| p == junk),
+                "stop words joined into junk phrase {:?}: {:?}",
+                junk,
+                sc.positive
+            );
+        }
+    }
+
+    /// Operator tokens, negated tokens, and excluded terms must not become topic
+    /// requirements. `-django` is an exclusion; `site:`/`price:` payloads are
+    /// already captured in their operator fields.
+    #[test]
+    fn degraded_path_excludes_operators_and_negations_from_topics() {
+        let sc = &fallback_intent("python framework site:github.com -django").structured_constraints;
+        for bad in ["site:github.com", "github.com", "-django", "django"] {
+            assert!(
+                !sc.positive.iter().any(|p| p.contains(bad)),
+                "{:?} must not be a positive topic requirement: {:?}",
+                bad,
+                sc.positive
+            );
+        }
+        assert!(
+            !sc.positive.is_empty(),
+            "sanity: the query DOES have topic content, extraction must not be empty: {:?}",
+            sc
+        );
+    }
+}
+
+#[cfg(test)]
+mod mainpath_shopping_strip_tests {
+    use super::*;
+
+    fn result_with_commerce(url: &str, price: f64) -> serde_json::Value {
+        serde_json::json!({
+            "url": url,
+            "title": "Product",
+            "score": 0.9,
+            "commerce": {
+                "url": url,
+                "observed_at": "2026-10-08T00:00:00Z",
+                "source": "json-ld",
+                "data": { "price": price, "currency": "USD" }
+            }
+        })
+    }
+
+    fn result_without_commerce(url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "url": url,
+            "title": "Article",
+            "score": 0.8
+        })
+    }
+
+    #[test]
+    fn strip_keeps_only_fact_bearing_candidates_in_order() {
+        let enriched = vec![
+            result_without_commerce("https://a.example/1"),
+            result_with_commerce("https://b.example/2", 99.99),
+            result_without_commerce("https://c.example/3"),
+            result_with_commerce("https://d.example/4", 49.99),
+        ];
+        let strip = select_shopping_strip(&enriched, 8).expect("must find facts");
+        assert_eq!(strip.len(), 2);
+        assert_eq!(strip[0]["url"], "https://b.example/2");
+        assert_eq!(strip[1]["url"], "https://d.example/4");
+    }
+
+    #[test]
+    fn strip_returns_none_when_no_candidate_has_facts() {
+        let enriched = vec![
+            result_without_commerce("https://a.example/1"),
+            result_without_commerce("https://b.example/2"),
+        ];
+        assert!(select_shopping_strip(&enriched, 8).is_none());
+    }
+
+    #[test]
+    fn strip_respects_display_cap() {
+        let enriched: Vec<_> = (0..10)
+            .map(|i| result_with_commerce(&format!("https://m{}.example/p", i), 10.0 + i as f64))
+            .collect();
+        let strip = select_shopping_strip(&enriched, 3).expect("must find facts");
+        assert_eq!(strip.len(), 3);
+        assert_eq!(strip[0]["url"], "https://m0.example/p");
+        assert_eq!(strip[1]["url"], "https://m1.example/p");
+        assert_eq!(strip[2]["url"], "https://m2.example/p");
+    }
+
+    #[test]
+    fn strip_is_a_strict_subsequence_never_promotes() {
+        // Facts at ranks 2 and 4 (0-indexed: 1 and 3). The strip must keep
+        // them in that order, never promoting rank-4 above rank-2.
+        let enriched = vec![
+            result_without_commerce("https://a.example/1"),
+            result_with_commerce("https://b.example/2", 99.99),
+            result_without_commerce("https://c.example/3"),
+            result_with_commerce("https://d.example/4", 49.99),
+            result_without_commerce("https://e.example/5"),
+        ];
+        let strip = select_shopping_strip(&enriched, 8).expect("must find facts");
+        let urls: Vec<_> = strip.iter().map(|r| r["url"].as_str().unwrap()).collect();
+        assert_eq!(urls, vec!["https://b.example/2", "https://d.example/4"]);
+    }
+
+    #[test]
+    fn strip_surfaces_facts_beyond_the_first_eight_candidates() {
+        // The exact regression: facts only at ranks 9 and 10 (0-indexed: 8 and 9).
+        // With the old code (enrich window = display cap = 8), these would never
+        // be enriched. With COMMERCE_ENRICH_WINDOW = 24, they are.
+        let mut enriched: Vec<_> = (0..8)
+            .map(|i| result_without_commerce(&format!("https://m{}.example/p", i)))
+            .collect();
+        enriched.push(result_with_commerce("https://m8.example/p", 99.99));
+        enriched.push(result_with_commerce("https://m9.example/p", 49.99));
+
+        let strip = select_shopping_strip(&enriched, 8).expect("must find facts");
+        assert_eq!(strip.len(), 2);
+        assert_eq!(strip[0]["url"], "https://m8.example/p");
+        assert_eq!(strip[1]["url"], "https://m9.example/p");
+    }
+
+    #[test]
+    fn enrich_window_is_wider_than_display_cap() {
+        // Guards the constants from being re-conflated.
+        assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
+    }
+
+    // ── HTML-pattern extraction tier (enrichment RECALL increment) ────────────
+    // When the page fetch succeeds but structured extraction (JSON-LD/OG/
+    // microdata) finds nothing, try known e-commerce HTML price patterns on
+    // the ACTUAL page content before falling back to the snippet. This is a
+    // provenance-carrying intermediate tier: source="html_pattern".
+
+    #[tokio::test]
+    async fn html_pattern_tier_extracts_price_when_structured_finds_nothing() {
+        // A page with NO structured markup but WITH a recognizable price container.
+        let html = r#"<!doctype html><html><head><title>Widget Store</title></head>
+<body><div class="product"><span class="a-price"><span class="a-offscreen">$1,199.00</span></span></div>
+</body></html>"#;
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://store.example.com/widget", "title": "Widget", "score": 9.0 }),
+        ];
+        let h = html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        let c = r.get("commerce").expect("commerce block attached via html_pattern");
+        assert_eq!(c["source"], serde_json::json!("html_pattern"));
+        assert_eq!(c["data"]["price"], serde_json::json!(1199.00));
+        assert!(c["data"]["currency"].as_str().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn html_pattern_tier_does_not_fire_when_structured_data_present() {
+        // When structured extraction succeeds, the html_pattern tier must NOT
+        // overwrite it (structured data is more reliable).
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{"@context":"https://schema.org/","@type":"Product","name":"Widget","offers":{"@type":"Offer","price":"49.99","priceCurrency":"USD"}}
+</script></head><body><span class="price">$99.99</span></body></html>"#;
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://store.example.com/widget", "title": "Widget", "score": 9.0 }),
+        ];
+        let h = html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        let c = r.get("commerce").expect("commerce block attached");
+        assert_eq!(c["source"], serde_json::json!("json-ld"), "structured wins over html_pattern");
+        assert_eq!(c["data"]["price"], serde_json::json!(49.99));
+    }
+
+    #[tokio::test]
+    async fn html_pattern_tier_falls_through_to_snippet_when_no_pattern_match() {
+        // A page with no structured data AND no recognizable price pattern.
+        // The html_pattern tier must NOT fire; the snippet fallback should.
+        let html = r#"<!doctype html><html><head><title>Just a page</title></head>
+<body><p>No price here, just text.</p></body></html>"#;
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://store.example.com/widget", "title": "Widget $49.99", "content": "Great widget", "score": 9.0 }),
+        ];
+        let h = html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        let c = r.get("commerce").expect("commerce block attached via snippet");
+        assert_eq!(c["source"], serde_json::json!("snippet_extracted"));
+        assert_eq!(c["data"]["price"], serde_json::json!(49.99));
+    }
+
+    #[tokio::test]
+    async fn html_pattern_tier_does_not_fire_when_fetch_fails() {
+        // When the page fetch returns None, the html_pattern tier must NOT
+        // fire (no HTML to parse). The snippet fallback should handle it.
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://store.example.com/widget", "title": "Widget $99.99", "content": "", "score": 9.0 }),
+        ];
+        let fetch = |_url: String| async move { None::<String> };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        let c = r.get("commerce").expect("commerce block attached via snippet");
+        assert_eq!(c["source"], serde_json::json!("snippet_extracted"));
+        assert_eq!(c["data"]["price"], serde_json::json!(99.99));
+    }
+
+    #[tokio::test]
+    async fn html_pattern_tier_never_reorders_results() {
+        // The html_pattern tier must never reorder ranked results.
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://a.example.com/x", "title": "A", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/y", "title": "B", "score": 8.0 }),
+            serde_json::json!({ "url": "https://c.example.com/z", "title": "C", "score": 7.0 }),
+        ];
+        let html = r#"<!doctype html><html><head><title>Store</title></head>
+<body><span class="price">$49.99</span></body></html>"#;
+        let h = html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let urls: Vec<_> = ranked.iter().map(|r| r["url"].as_str().unwrap()).collect();
+        assert_eq!(urls, vec![
+            "https://a.example.com/x",
+            "https://b.example.com/y",
+            "https://c.example.com/z",
+        ], "html_pattern tier must never reorder");
+        // All three should have html_pattern commerce blocks
+        for r in ranked.iter() {
+            let c = r.get("commerce").expect("commerce block attached");
+            assert_eq!(c["source"], serde_json::json!("html_pattern"));
         }
     }
 }
