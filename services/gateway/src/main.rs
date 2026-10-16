@@ -15689,7 +15689,7 @@ async fn handle_search(
                             if count > 0 {
                                 partial_collector_sub.lock().unwrap().push((orig_idx, Ok(data)));
                             }
-                            let is_primary = urls_cloned[orig_idx].starts_with(searxng_url());
+                            let is_primary = urls_cloned[orig_idx].starts_with(&searxng_url());
                             // FIX: do NOT early-return on the primary instance returning a
                             // small/medium set. SearXNG1 (127.0.0.1:8080) sits behind a flaky
                             // VPN and its Bing/Brave engines frequently return OFF-TOPIC junk
@@ -24149,9 +24149,9 @@ mod kb_gibberish_mixed_tests {
         assert_eq!(canonical[1], "http://tor2:8081", "canonical 1 is the Tor instance");
 
         // Warm VPN first, then warm Tor (the original declaration order).
-        let vpn_first = [searxng_url(), "http://tor2:8081"];
+        let vpn_first = [searxng_url(), "http://tor2:8081".to_string()];
         // Warm Tor first, then warm VPN (what the sort produces after Tor is used).
-        let tor_first = ["http://tor2:8081", searxng_url()];
+        let tor_first = ["http://tor2:8081".to_string(), searxng_url()];
 
         let k1 = searx_instance_keys_for(&canonical, &vpn_first);
         let k2 = searx_instance_keys_for(&canonical, &tor_first);
@@ -24159,11 +24159,11 @@ mod kb_gibberish_mixed_tests {
         // The SAME backend must get the SAME key in both orders. Look the key up
         // by the BACKEND's position in that particular fan-out order, so the
         // lookup itself follows the order being tested.
-        let key_of = |order: &[&str], ks: &Vec<String>, backend: &str| -> String {
+        let key_of = |order: &[String], ks: &Vec<String>, backend: &str| -> String {
             let slot = order.iter().position(|u| *u == backend).expect("backend in order");
             ks[slot].clone()
         };
-        const VPN: &str = searxng_url();
+        const VPN: &str = "http://127.0.0.1:8080"; // fallback matches searxng_url() default
         const TOR: &str = "http://tor2:8081";
 
         assert_eq!(key_of(&vpn_first, &k1, VPN), "searxng0", "VPN backend is searxng0 when fanned out first");
@@ -24182,17 +24182,18 @@ mod kb_gibberish_mixed_tests {
     #[test]
     fn vpn_only_paths_never_target_the_tor_instance() {
         let canonical = canonical_searx_urls(&Some("http://tor2:8081".to_string()));
-        let tor_first = ["http://tor2:8081", searxng_url()];
+        let tor_first = ["http://tor2:8081".to_string(), searxng_url()];
         let keys = searx_instance_keys_for(&canonical, &tor_first);
 
         // Replicates the `retry_key != "searxng0"` / `fb_key != "searxng0"` guards.
-        let vpn_only: Vec<&str> = tor_first
+        let vpn_only: Vec<String> = tor_first
             .iter()
             .enumerate()
             .filter(|(i, _)| keys[*i] == "searxng0")
-            .map(|(_, u)| *u)
+            .map(|(_, u)| u.clone())
             .collect();
         assert_eq!(vpn_only, vec![searxng_url()], "VPN-only path must resolve to the VPN backend");
+
     }
 
     // INTENT BUDGET (round auto/round-2026-09-29T1239Z). The retry ladder and
