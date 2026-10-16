@@ -77,7 +77,6 @@ services:
       - "4000:4000"
       - "6000:6000"
     restart: always
-    mem_limit: 512m
     mem_reservation: 256m
     healthcheck:
       test: ["CMD", "/gluetun-entrypoint", "healthcheck"]
@@ -105,7 +104,6 @@ services:
         condition: service_healthy
     network_mode: "service:gluetun"
     restart: always
-    mem_limit: 128m
     mem_reservation: 64m
 
   tor:
