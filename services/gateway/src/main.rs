@@ -5030,6 +5030,9 @@ async fn handle_shopping(
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
+    // Preserve the query before `params` is moved into the shared search pipeline.
+    // It is used only for in-process commerce/affiliate eligibility matching;
+    // it is never sent to an affiliate network.
     let commerce_query = params.q.clone().unwrap_or_default();
     let (status, body) = handle_search(
         state.clone(),
@@ -5225,7 +5228,11 @@ impl AffiliateCtx {
         self.exact_model_patterns
             .iter()
             .filter_map(|p| regex::Regex::new(p).ok())
-            .any(|re| re.is_match(query))
+            // Policy regexes are compiled with anchors in tests/config, but a
+            // caller may omit them. `is_match` deliberately remains a substring
+            // match by default; an explicit full-query boundary is opt-in via
+            // anchors in the policy source itself.
+            .any(|re| re.is_match(query.trim()))
     }
 
     /// The first enabled network that has its required key present in the env.
@@ -7541,48 +7548,84 @@ const COUNTRY_DEMONYMS: &[&str] = &[
     "australian", "australia",
 ];
 
-/// FIX-IF-01 (2026-09-24): seed list of household appliances / cooking tools.
-/// When a query negates one of these ("cook salmon without oven or microwave",
-/// "biryani without a pressure cooker", "fried rice without a wok",
-/// "brownies without an oven"), the appliance IS the genuine topical exclusion —
-/// a concrete tool the user wants removed from the method space, not a manner
-/// qualifier. This mirrors the COUNTRY_DEMONYMS precedent: a general data seed
-/// (like PROTECTED_TERMS) that closes the whole "prepare X without <appliance>"
-/// query class broadly — NOT a per-query literal list. Multi-word appliances are
-/// listed in full AND covered by their head noun token ("pressure cooker" via
-/// "cooker"), so compound and single-token lookups both work. Deliberately
-/// EXCLUDES ambiguous heads ("processor" alone would collide with CPUs;
-/// "maker" with "decision maker") — those only match as full compounds.
-const HOUSEHOLD_APPLIANCES: &[&str] = &[
-    // Ovens & cookers
-    "oven", "microwave", "toaster oven", "dutch oven", "pressure cooker",
-    "slow cooker", "rice cooker", "cooker", "crockpot", "crock pot", "instant pot",
-    "air fryer", "fryer", "steamer",
-    // Stovetop
-    "stove", "stovetop", "cooktop", "range", "wok", "grill", "tandoor",
-    "tawa", "kadai", "karahi",
-    // Small kitchen appliances
-    "blender", "immersion blender", "hand blender", "food processor",
-    "mixer", "stand mixer", "grinder", "juicer", "toaster", "kettle",
-    "coffee maker", "espresso machine", "microwave oven",
-    // Household utilities
-    "dishwasher", "washing machine", "dryer", "vacuum", "iron",
-    "refrigerator", "fridge", "freezer", "air conditioner", "heater",
+/// Frame vocabulary that marks a query's SUBJECT as instructional — the user is
+/// asking how to DO something, or for material that explains how. Used only to
+/// classify the subject that PRECEDES a prepositional negation; it never matches
+/// the negated object itself, so "dessert recipes without artificial sweeteners"
+/// (content subject) is unaffected.
+///
+/// Structural vocabulary (a closed class of English how-to frames), not per-query
+/// literals and not tuned thresholds — same pattern as `MANNER_VERBS` /
+/// `CONTRASTIVE_MARKERS` above.
+const INSTRUCTIONAL_FRAMES: &[&str] = &[
+    "how to", "how do i", "how can i", "how do you", "how can you", "ways to",
+    "way to", "best way to", "tutorial", "tutorials", "tutorial for", "tutorials for",
+    "guide", "guides", "guide to", "guides to", "walkthrough", "learn", "learning",
+    "teach", "lesson",
 ];
 
-/// FIX-IF-01: true when the negated compound names a household appliance /
-/// cooking tool (whole compound or any token matches the seed). Used to exempt
-/// a negated appliance from the manner-qualifier gate — "without oven" is a
-/// real exclusion even though "oven" sits in a "without X" manner frame.
-fn is_household_appliance(compound: &str) -> bool {
-    let lc = compound.trim().to_lowercase();
-    if lc.is_empty() {
+/// True when the query's subject (the span BEFORE the first negation marker) is
+/// instructional rather than topical. "how to clean a cast iron skillet without
+/// soap" → the subject is "how to clean a cast iron skillet" → instructional.
+/// "dessert recipes without artificial sweeteners" → subject "dessert recipes" →
+/// topical. This is the single discriminator that separates a HOW qualifier from a
+/// WHAT exclusion; the negation object is never inspected here, so no domain nouns
+/// are hardcoded.
+fn is_instructional_subject(q_orig: &str) -> bool {
+    let q_lower = q_orig.to_lowercase();
+    // Cut the query at the first negation marker so only the subject is judged.
+    let subject = ["without", "not", " no ", "except", "excluding", "minus", "other than", "besides"]
+        .iter()
+        .filter_map(|m| q_lower.find(m))
+        .min()
+        .map(|i| &q_lower[..i])
+        .unwrap_or(&q_lower);
+    let subject_tokens: Vec<String> = subject
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect();
+    INSTRUCTIONAL_FRAMES.iter().any(|frame| {
+        let f: Vec<String> = frame.split_whitespace().map(|t| t.to_string()).collect();
+        subject_tokens.windows(f.len()).any(|w| w == f.as_slice())
+    })
+}
+
+/// True when `compound` is the object of a PREPOSITIONAL negation — i.e. it sits
+/// inside a `without <optional articles> <compound>` or `with no <compound>` frame
+/// in the original query. This deliberately excludes the bare-`not` form, which
+/// carries no manner ambiguity and is already resolved by the entity/contrastive
+/// gates. Token-based, so a compound that merely appears elsewhere in the query
+/// (or a substring collision like "notebook" vs "not") does not match.
+fn negated_by_preposition(q_orig: &str, compound: &str) -> bool {
+    let q_tokens: Vec<String> = q_orig
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect();
+    let c_tokens: Vec<String> = compound
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect();
+    if c_tokens.is_empty() {
         return false;
     }
-    if HOUSEHOLD_APPLIANCES.contains(&lc.as_str()) {
-        return true;
+    for (i, tok) in q_tokens.iter().enumerate() {
+        let is_marker = tok == "without" || (tok == "no" && q_tokens.get(i.wrapping_sub(1)) == Some(&"with".to_string()));
+        if !is_marker {
+            continue;
+        }
+        let mut j = i + 1;
+        while matches!(q_tokens.get(j).map(|s| s.as_str()), Some("a") | Some("an") | Some("the") | Some("any")) {
+            j += 1;
+        }
+        if j + c_tokens.len() <= q_tokens.len() && q_tokens[j..j + c_tokens.len()] == c_tokens {
+            return true;
+        }
     }
-    lc.split_whitespace().any(|t| HOUSEHOLD_APPLIANCES.contains(&t))
+    false
 }
 
 /// D3: precise manner-frame detection at the PHRASE level (not the bare-token
@@ -7601,46 +7644,29 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     let lc = q_orig.to_lowercase();
     let compound_lower = compound.to_lowercase();
     let c_tokens: Vec<&str> = compound_lower.split_whitespace().collect();
-    // D2: the `pay`/`paying` family is genuinely AMBIGUOUS — a manner idiom
-    // ("without paying attention") describes HOW, while a monetary object
-    // ("without paying for a course") is a real exclusion the user refuses.
-    // The broad procedural rule below cannot tell them apart (both appear in
-    // `how to …` queries), so decide this family from the query's object
-    // vocabulary FIRST: a monetary object means it is NOT a manner frame.
-    if !c_tokens.is_empty() && c_tokens.iter().all(|t| *t == "pay" || *t == "paying") {
-        return !pay_exclusion_is_money(&lc);
-    }
-    // A negated clause whose HEAD noun names a TRAIT of the user (their
-    // background / experience / degree) rather than a property of the desired
-    // CONTENT states a prerequisite, not a topic to remove. "a tutorial with
-    // no music background" is a HOW/prerequisite qualifier; "dessert recipes
-    // with no nuts" names the content, so its head ("nuts") is untouched and
-    // it stays a real exclusion. Structural (head-noun class), no per-query
-    // literals. `is_verb_attribute_exclusion` uses the same trait class but
-    // requires EVERY token to be a trait noun, which a modifier phrase
-    // ("music background") never satisfies.
-    if let Some(head) = c_tokens.last() {
-        if USER_TRAIT_NOUNS.contains(head) {
-            return true;
-        }
-    }
-    // In a procedural request, a bare `without NOUN` / `no NOUN` states a
-    // constraint on HOW the user wants to accomplish the task (cleaning without
-    // soap, learning without a degree), not a result topic to remove. In a
-    // content request (dessert recipes without artificial sweeteners, recipes
-    // with no nuts) the same grammar names the thing the results must exclude.
-    // Detect the broad instruction/content frame structurally, not by domain
-    // nouns. Verb-led targets are handled below.
-    let procedural = ["how to ", "best way to ", "way to ", "tutorial for ", "guide to ", "learn "]
-        .iter()
-        .any(|frame| lc.starts_with(frame));
-    if procedural && c_tokens.iter().all(|t| !MANNER_PRONOUNS.contains(t)) {
-        return true;
-    }
 
     // A relation pronoun is an unambiguous manner signal wherever it occurs
     // ("does not track you as", "without offending the couple").
     if c_tokens.iter().any(|t| MANNER_PRONOUNS.contains(t)) {
+        return true;
+    }
+
+    // A prepositional negation (`without X` / `with no X`) inside an
+    // INSTRUCTIONAL subject constrains HOW the task is to be accomplished, not
+    // WHAT the results must contain: "how to clean a skillet without soap",
+    // "a tutorial with no music background", "learn machine learning without a
+    // computer science degree". The mirror case is a CONTENT subject — "dessert
+    // recipes without artificial sweeteners", "recipes with no nuts" — where the
+    // same grammar names a real exclusion.
+    //
+    // Both conditions are required. A blanket "any `without` in a how-to query is
+    // manner" rule (the bug this replaces) also swallowed genuine exclusions that
+    // ride inside an instructional query, e.g. the money sense of "without paying
+    // for a course" — `is_real_exclusion` resolves that separately, BEFORE it
+    // consults this frame. Scoping the rule to a prepositional negation also
+    // leaves the bare-`not` path alone, so "learn spanish not duolingo" is still
+    // decided by the entity/contrastive gates rather than by manner suppression.
+    if negated_by_preposition(q_orig, compound) && is_instructional_subject(q_orig) {
         return true;
     }
 
@@ -7886,22 +7912,6 @@ fn is_real_exclusion(
     q_orig: &str,
     query_is_contrastive: bool,
 ) -> bool {
-    // Resolve the ambiguous payment verb from nearby object context before the
-    // generic "without <X>" manner-frame check. A financial transaction is a
-    // real exclusion; "pay attention/respect" remains a manner qualifier.
-    let compound_lc = compound.to_lowercase();
-    if compound_lc == "pay" || compound_lc == "paying" {
-        if pay_exclusion_is_manner(q_orig) {
-            return false;
-        }
-        return pay_exclusion_is_money(q_orig);
-    }
-    // Manner phrases are never exclusions, regardless of framing. The
-    // phrase-level check also catches a verb-led frame whose target is the noun
-    // after the verb ("without using a library").
-    if is_manner_phrase(compound) || is_manner_frame(q_orig, compound) {
-        return false;
-    }
     let lc = compound.to_lowercase();
     // D2 (2026-08-19): the bare token "pay"/"paying" is ambiguous. If the query
     // context shows a MANNER object ("pay attention", "pay respect"), it is a
@@ -7910,42 +7920,20 @@ fn is_real_exclusion(
     // We require the money sense to be signalled; otherwise a bare "pay" with no
     // monetary object still defaults to declined (the manner guard's job). This
     // keeps "without paying attention" rejected while rescuing "without paying".
+    //
+    // ORDERING: this gate runs BEFORE the manner-frame guard below. Both senses
+    // live in the same `without <verb> ...` prepositional frame, so consulting
+    // the manner guard first would classify EVERY `without paying ...` clause as a
+    // HOW qualifier and the money exclusion ("how to learn programming without
+    // paying for a course") could never be honored. The money/manner object
+    // vocabulary is the specific signal, so it wins over the generic frame test.
     if compound == "pay" || compound == "paying" || lc == "pay" || lc == "paying" {
         return pay_exclusion_is_money(&q_orig);
     }
-    if negated_compound_is_recognized_entity(compound, q_orig) {
-        return true;
-    }
-    // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
-    // (e.g. "javascript not java not typescript" → java, typescript).
-    if query_is_contrastive {
-        return true;
-    }
-    // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
-    // acceptance here that unconditionally treated ANY object of `without`/`not`/`except`
-    // as a real exclusion. That over-reached: generic attribute/manner objects
-    // ("without soap", "recipes not spicy") were wrongly extracted as hard-filter
-    // exclusions, breaking the manner/attribute tests and degrading result sets. It
-    // had no unit test of its own and cannot distinguish "spicy" from "systemd" without
-    // a hardcoded allow-list (which the no-hardcoding doctrine forbids). The pre-c4317bc
-    // behavior — decline generic nouns unless they are protected terms, capitalized
-    // proper nouns, or in contrastive framing — is the correct contract (covered by the
-    // existing manner/attribute tests), so this path is intentionally NOT taken.
-    false
-}
-
-/// FIX-IF-01 (2026-09-24): the entity-recognition core of `is_real_exclusion`,
-/// extracted so the explicit-directive manner-frame exception in handle_search
-/// can consult the SAME recognition signals. A negated compound is a recognized
-/// entity when any token (or the whole compound) is a protected brand/tech
-/// term, a country-of-origin demonym, a household appliance/cooking tool
-/// (seed lists — general data, no per-query literals), or a capitalized proper
-/// noun the user named in the original query. Recognition is framing-independent:
-/// "without django" is a real exclusion because django is a recognized entity,
-/// even though it sits in a "without X" manner frame.
-fn negated_compound_is_recognized_entity(compound: &str, q_orig: &str) -> bool {
-    let lc = compound.trim().to_lowercase();
-    if lc.is_empty() {
+    // Manner phrases are never exclusions, regardless of framing. The
+    // phrase-level check also catches a verb-led frame whose target is the noun
+    // after the verb ("without using a library").
+    if is_manner_phrase(compound) || is_manner_frame(q_orig, compound) {
         return false;
     }
     let tokens: Vec<&str> = lc.split_whitespace().collect();
