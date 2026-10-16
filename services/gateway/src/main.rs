@@ -9399,7 +9399,7 @@ fn canonical_searx_urls(searxng2_url: &Option<String>) -> Vec<String> {
 /// next, so a timeout on the VPN path opened the circuit on the Tor key and
 /// suppressed a healthy, independent egress path for the full 10-minute
 /// connection-failure window.
-fn searx_instance_keys_for(canonical: &[String], fanout: &[&str]) -> Vec<String> {
+fn searx_instance_keys_for(canonical: &[String], fanout: &[String]) -> Vec<String> {
     fanout
         .iter()
         .map(|u| {
@@ -12842,7 +12842,7 @@ async fn handle_images(
 
     // Fan-out to both SearXNG instances in parallel (VPN + Tor)
     let searx_url = searxng_url_with_categories(
-        searxng_url(), &q, "images", geo_location.as_ref(), lang
+        &searxng_url(), &q, "images", geo_location.as_ref(), lang
     );
 
     let searx2_url = state.searxng2_url.as_ref().map(|base| {
@@ -12975,7 +12975,7 @@ async fn handle_videos(
     // Query Invidious and both SearXNG instances (categories=videos) in parallel
     let invidious_url = format!("http://invidious:3000/api/v1/search?q={}", urlencoding::encode(&q));
     let searx_video_url = searxng_url_with_categories(
-        searxng_url(), &q, "videos", geo_location.as_ref(), lang
+        &searxng_url(), &q, "videos", geo_location.as_ref(), lang
     );
     let searx2_video_url = state.searxng2_url.as_ref().map(|base| {
         searxng_url_with_categories(base, &q, "videos", geo_location.as_ref(), lang)
@@ -13183,7 +13183,7 @@ async fn handle_news(
 
     // Fan-out to both SearXNG instances in parallel (VPN + Tor)
     let searx_url = searxng_url_with_categories(
-        searxng_url(), &q, "news", geo_location.as_ref(), lang
+        &searxng_url(), &q, "news", geo_location.as_ref(), lang
     );
 
     let searx2_url = state.searxng2_url.as_ref().map(|base| {
@@ -15053,16 +15053,16 @@ async fn handle_search(
     // Sort instances by last-used time (warmest first) so join_all starts with
     // the connection that's most likely to have an idle pool entry, reducing
     // overall fan-out latency when one instance has cooled down.
-    let searx_base_urls: Vec<&str> = {
-        let mut urls: Vec<&str> = if state.searxng2_url.is_some() {
-            vec![searxng_url(), state.searxng2_url.as_deref().unwrap()]
+    let searx_base_urls: Vec<String> = {
+        let mut urls: Vec<String> = if state.searxng2_url.is_some() {
+            vec![searxng_url(), state.searxng2_url.clone().unwrap()]
         } else {
             vec![searxng_url()]
         };
         let searx_last_used = state.searx_last_used.lock();
         urls.sort_by(|a, b| {
-            let a_warm = searx_last_used.get(*a).copied().unwrap_or(std::time::Instant::now());
-            let b_warm = searx_last_used.get(*b).copied().unwrap_or(std::time::Instant::now());
+            let a_warm = searx_last_used.get(a.as_str()).copied().unwrap_or(std::time::Instant::now());
+            let b_warm = searx_last_used.get(b.as_str()).copied().unwrap_or(std::time::Instant::now());
             b_warm.cmp(&a_warm) // most recently used first
         });
         urls
@@ -15174,7 +15174,7 @@ async fn handle_search(
         if let Some(ref keyphrase) = keyphrase_relax_variant(&engine_q) {
             let clean_kp = preprocess_searxng_query(keyphrase);
             if !clean_kp.is_empty() && clean_kp != first_q {
-                searx_urls.push(searxng_url(base_url, &clean_kp, geo_location.as_ref(), lang));
+                searx_urls.push(searxng_url_with_geo(base_url, &clean_kp, geo_location.as_ref(), lang));
                 searx_instance_keys.push(key.clone());
             }
         }
@@ -15206,7 +15206,7 @@ async fn handle_search(
                 let clean_v = preprocess_searxng_query(v);
                 let clean_q_outer = preprocess_searxng_query(&q);
                 if !clean_v.is_empty() && clean_v != clean_q_outer {
-                    searx_urls.push(searxng_url(base_url, &clean_v, geo_location.as_ref(), lang));
+                    searx_urls.push(searxng_url_with_geo(base_url, &clean_v, geo_location.as_ref(), lang));
                     searx_instance_keys.push(key.clone());
                 }
             }
@@ -15482,7 +15482,7 @@ async fn handle_search(
             return Ok(SearxNewsResponse { results: vec![] });
         }
         let news_url = searxng_url_with_categories(
-            searxng_url(), &q, "news", geo_location.as_ref(), lang
+            &searxng_url(), &q, "news", geo_location.as_ref(), lang
         );
         // NOTE (flaky-connection fix): detached spawn + budget so a gluetun
         // stall can't hang the fan-out.
@@ -15514,7 +15514,7 @@ async fn handle_search(
             return Ok(SearxImageResponse { results: vec![] });
         }
         let image_url = searxng_url_with_categories(
-            searxng_url(), &q, "images", geo_location.as_ref(), lang
+            &searxng_url(), &q, "images", geo_location.as_ref(), lang
         );
         // NOTE (flaky-connection fix): detached spawn + budget so a gluetun
         // stall can't hang the fan-out.
@@ -15555,7 +15555,7 @@ async fn handle_search(
             return Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] });
         }
         let shop_url = searxng_url_with_categories(
-            searxng_url(), &q, "shopping", geo_location.as_ref(), lang
+            &searxng_url(), &q, "shopping", geo_location.as_ref(), lang
         );
         let s_client = client.clone();
         let task = tokio::spawn(async move {
@@ -16823,7 +16823,7 @@ async fn handle_search(
                 // the fast retry through Tor instead.
                 if !only_negative && intent.structured_constraints.negative.is_empty() && retry_key != "searxng0" { continue; }
                 if circuit_ref.is_open(&retry_key) { continue; }
-                let retry_url = searxng_url(base_url, &clean_eq, geo_location.as_ref(), lang);
+                let retry_url = searxng_url_with_geo(base_url, &clean_eq, geo_location.as_ref(), lang);
                 let client = client.clone();
                 let key = retry_key.clone();
                 let url_for_log = retry_url[..retry_url.find('?').unwrap_or(retry_url.len())].to_string();
@@ -16974,7 +16974,7 @@ async fn handle_search(
                     // VPN-only fallback, selected by stable key not sort position.
                     if fb_key != "searxng0" { break; }
                     if circuit_ref.is_open(&fb_key) { continue; }
-                    let fb_url = searxng_url(base_url, &relaxed_clean, geo_location.as_ref(), lang);
+                    let fb_url = searxng_url_with_geo(base_url, &relaxed_clean, geo_location.as_ref(), lang);
                     let fb_client = client.clone();
                     let fb_circuit = circuit_ref.clone();
                     let fb_result = tokio::time::timeout(fallback_timeout, async move {
