@@ -1137,19 +1137,6 @@ fn q_has_word(q_lower: &str, word: &str) -> bool {
         .any(|w| w == word)
 }
 
-/// Whole-word transactional intent signal: true when any purchase/commerce
-/// keyword appears as a whole word in the query. Whole-word matching is
-/// load-bearing — substring `contains("price ")` missed end-of-query ("iphone
-/// 16 pro max price"), and bare `contains("shop")` false-fired on "shopping",
-/// `contains("under")` on "thunder", `contains("price")` on "priceless".
-fn has_transactional_keyword(q_lower: &str) -> bool {
-    const TX_KEYWORDS: &[&str] = &[
-        "buy", "price", "pricing", "cheap", "purchase", "shop", "store",
-        "discount", "coupon", "under",
-    ];
-    TX_KEYWORDS.iter().any(|k| q_has_word(q_lower, k))
-}
-
 /// D6 (2026-08-17): relation/comparison FUNCTION words that describe *how* the user
 /// wants results related, not *what* they are about. Granting the generic
 /// title-relevance boost to these lets junk pages that merely contain the word
@@ -3148,6 +3135,11 @@ struct OfferFacts {
     price_high: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offer_count: Option<usize>,
+    /// Product image URL extracted from the page (JSON-LD `image`, OpenGraph
+    /// `og:image`, microdata `itemprop="image"`, or RDFa `property="image"`).
+    /// Always a URL string from structured data — never guessed from free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
 }
 
 /// A generic, serializable *container* for honest product facts of any kind `T`.
@@ -3357,10 +3349,63 @@ fn json_get_u64(v: &serde_json::Value) -> Option<u64> {
     }
 }
 
-/// Extract honest product facts from schema.org MICRODATA
-/// (`itemscope` + `itemprop`), the third structured-on-page signal alongside
-/// JSON-LD and OpenGraph. Real Shopify/legacy product pages emit microdata with
-/// no JSON-LD, so this recovers facts that would otherwise be missed.
+fn merge_offer_facts(dst: &mut OfferFacts, src: &OfferFacts) {
+    if dst.price.is_none() {
+        dst.price = src.price;
+    }
+    if dst.currency.is_none() {
+        dst.currency = src.currency.clone();
+    }
+    if dst.availability.is_none() {
+        dst.availability = src.availability.clone();
+    }
+    if dst.merchant.is_none() {
+        dst.merchant = src.merchant.clone();
+    }
+    if dst.condition.is_none() {
+        dst.condition = src.condition.clone();
+    }
+    if dst.sku.is_none() {
+        dst.sku = src.sku.clone();
+    }
+    if dst.gtin.is_none() {
+        dst.gtin = src.gtin.clone();
+    }
+    if dst.rating.is_none() {
+        dst.rating = src.rating;
+    }
+    if dst.rating_count.is_none() {
+        dst.rating_count = src.rating_count;
+    }
+    if dst.price_low.is_none() {
+        dst.price_low = src.price_low;
+    }
+    if dst.price_high.is_none() {
+        dst.price_high = src.price_high;
+    }
+    if dst.offer_count.is_none() {
+        dst.offer_count = src.offer_count;
+    }
+    if dst.image.is_none() {
+        dst.image = src.image.clone();
+    }
+}
+
+/// True when the page declares a Product or Offer via microdata `itemtype`.
+fn has_microdata_product(html: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)itemtype\s*=\s*["'][^"']*(?:product|offer)[^"']*["']"#,
+        )
+        .unwrap()
+    });
+    re.is_match(html)
+}
+
+/// Extract product facts from HTML microdata (itemprop/itemscope).
+/// Only fires when the page carries a Product/Offer `itemtype`, so
+/// non-product pages (Article, Event, …) never trigger it.
 ///
 /// Mapping (itemprop value -> `OfferFacts` field), matched on the standard
 /// schema.org/Product + Offer vocabulary — NOT a per-merchant list:
@@ -3562,20 +3607,9 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
                     facts.merchant = Some(content);
                 }
             }
-            "name" => {
-                // itemprop="name" inside a Brand scope (top of stack is Other) is the
-                // brand/merchant name, not the product name.
-                if stack.last() == Some(&Scope::Other) {
-                    if facts.merchant.is_none() && !content.is_empty() {
-                        facts.merchant = Some(content);
-                    }
-                } else if facts.name.is_none() && !content.is_empty() {
-                    facts.name = Some(content);
-                }
-            }
-            "pricevaliduntil" => {
-                if facts.price_valid_until.is_none() && !content.is_empty() {
-                    facts.price_valid_until = Some(content);
+            "reviewcount" | "ratingcount" => {
+                if o.rating_count.is_none() {
+                    o.rating_count = val.parse::<u64>().ok();
                 }
             }
             _ => {}
@@ -3615,21 +3649,190 @@ fn parse_microdata(html: &str) -> Option<OfferFacts> {
         }
     }
 
-    // Only return when at least one structured fact was found.
-    if facts.price.is_some()
-        || facts.price_low.is_some()
-        || facts.currency.is_some()
-        || facts.availability.is_some()
-        || facts.merchant.is_some()
-        || facts.condition.is_some()
-        || facts.sku.is_some()
-        || facts.gtin.is_some()
-        || facts.rating.is_some()
+    if o.price.is_none()
+        && o.currency.is_none()
+        && o.availability.is_none()
+        && o.merchant.is_none()
+        && o.condition.is_none()
+        && o.sku.is_none()
+        && o.gtin.is_none()
+        && o.rating.is_none()
+        && o.rating_count.is_none()
+        && o.image.is_none()
     {
         Some(facts)
     } else {
         None
     }
+    Some(o)
+}
+
+/// True when the page carries product-ish RDFa (typeof/property on Product/Offer/price).
+fn has_rdfa_product(html: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)(?:typeof|property)\s*=\s*["'][^"']*(?:product|offer|price|currency|availability|sku|gtin)[^"']*["']"#,
+        )
+        .unwrap()
+    });
+    re.is_match(html)
+}
+
+/// Extract product facts from RDFa (property attribute with `schema:` prefix or full URI).
+/// Only fires on pages that look product-ish.
+///
+/// Handles both `content` attribute form (`<meta property="price" content="9.99">)
+/// and text content form (`<span property="brand">Acme</span>`).
+fn parse_rdfa_product(html: &str) -> Option<OfferFacts> {
+    if !has_rdfa_product(html) {
+        return None;
+    }
+
+    static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tag_re = TAG_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)<\w+\b[^>]*property[^>]*>"#).unwrap()
+    });
+    static PROP_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let prop_re = PROP_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)property\s*=\s*["']([^"']+)["']"#).unwrap()
+    });
+    static CONTENT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let content_re = CONTENT_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)content\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static HREF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let href_re = HREF_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)href\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+    static SRC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let src_re = SRC_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)src\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+
+    let mut o = OfferFacts::default();
+
+    let mut apply = |prop: &str, val: &str| {
+        if val.is_empty() {
+            return;
+        }
+        // Strip schema: prefix or full schema.org URI.
+        let stripped = prop
+            .strip_prefix("schema:")
+            .or_else(|| prop.strip_prefix("http://schema.org/"))
+            .or_else(|| prop.strip_prefix("https://schema.org/"))
+            .unwrap_or(prop);
+        match stripped {
+            "price" => {
+                if o.price.is_none() {
+                    if let Ok(v) = val.replace(',', "").parse::<f64>() {
+                        o.price = Some(v);
+                    }
+                }
+            }
+            "pricecurrency" => {
+                if o.currency.is_none() {
+                    o.currency = Some(val.to_string());
+                }
+            }
+            "availability" => {
+                if o.availability.is_none() {
+                    o.availability = Some(val.to_string());
+                }
+            }
+            "itemcondition" => {
+                if o.condition.is_none() {
+                    o.condition = Some(val.to_string());
+                }
+            }
+            "sku" => {
+                if o.sku.is_none() {
+                    o.sku = Some(val.to_string());
+                }
+            }
+            "gtin13" | "gtin14" | "gtin8" | "gtin" | "mpn" => {
+                if o.gtin.is_none() {
+                    o.gtin = Some(val.to_string());
+                }
+            }
+            "brand" | "seller" => {
+                if o.merchant.is_none() {
+                    o.merchant = Some(val.to_string());
+                }
+            }
+            "image" => {
+                if o.image.is_none() {
+                    o.image = Some(val.to_string());
+                }
+            }
+            "ratingvalue" => {
+                if o.rating.is_none() {
+                    o.rating = val.parse::<f64>().ok();
+                }
+            }
+            "reviewcount" | "ratingcount" => {
+                if o.rating_count.is_none() {
+                    o.rating_count = val.parse::<u64>().ok();
+                }
+            }
+            _ => {}
+        }
+    };
+
+    for tag_cap in tag_re.captures_iter(html) {
+        let tag = tag_cap.get(0).unwrap().as_str();
+        let prop = prop_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_lowercase());
+        let content = content_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let href = href_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let src = src_re
+            .captures(tag)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        if let Some(p) = prop {
+            // For image, prefer href (link itemprop="image" href=...) then
+            // content (meta itemprop="image" content=...) then src.
+            if p == "image" {
+                if let Some(v) = href.or(content).or(src) {
+                    apply(&p, &v);
+                }
+            } else if let Some(v) = content {
+                apply(&p, &v);
+            } else {
+                // Text content form: extract text after the tag until the next '<'.
+                let after = &html[tag_cap.get(0).unwrap().end()..];
+                if let Some(end) = after.find('<') {
+                    let text = after[..end].trim();
+                    if !text.is_empty() {
+                        apply(&p, text);
+                    }
+                }
+            }
+        }
+    }
+
+    if o.price.is_none()
+        && o.currency.is_none()
+        && o.availability.is_none()
+        && o.merchant.is_none()
+        && o.condition.is_none()
+        && o.sku.is_none()
+        && o.gtin.is_none()
+        && o.rating.is_none()
+        && o.rating_count.is_none()
+        && o.image.is_none()
+    {
+        return None;
+    }
+    Some(o)
 }
 
 fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
@@ -3971,6 +4174,11 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
                     o.rating_count = content.parse::<u64>().ok();
                 }
             }
+            "og:image" | "product:image" => {
+                if o.image.is_none() {
+                    o.image = Some(content.clone());
+                }
+            }
             _ => {}
         }
     }
@@ -3980,6 +4188,7 @@ fn parse_og_product(html: &str) -> Option<OfferFacts> {
         && o.merchant.is_none()
         && o.gtin.is_none()
         && o.rating.is_none()
+        && o.image.is_none()
     {
         return None;
     }
@@ -4575,12 +4784,10 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
-                        // Distance/time-bound guard: "within 300 kilometers" or
-                        // "within 6 months" is a range, not a price — skip this
-                        // marker (let a later price marker, if any, match instead).
-                        // Pass text AFTER the number (like Pattern B does) so the
-                        // unit check sees "months", not "6".
-                        if is_distance_bound(&rest[m.end()..]) {
+                        // Distance-bound guard: "within 300 kilometers" is a
+                        // range, not a price — skip this marker (let a later
+                        // price marker, if any, match instead).
+                        if is_distance_bound(rest) {
                             continue;
                         }
                         // Currency-proximity guard: Pattern A is "<marker> <number>",
@@ -6119,7 +6326,6 @@ fn whole_word_contains(haystack: &str, needle: &str) -> bool {
 fn cross_location_mismatch_mult(
     title: &str,
     content: &str,
-    url: &str,
     geo: Option<&geoloc::GeoLocation>,
 ) -> f32 {
     let geo = match geo {
@@ -6620,47 +6826,6 @@ const IGNORED_CONSTRAINT_NOISE: &[&str] = &[
     "before", "after", "and", "or", "but", "is", "are", "was", "were",
 ];
 
-/// D4 (2026-09-15): seed list of consumer brands that are common exclusion
-/// targets ("not bose", "wireless headphones not sony", "not nike shoes").
-/// When a user negates a brand name, the brand IS the genuine topical
-/// exclusion — it must be honored even when the query lacks contrastive
-/// framing and the word is not a protected tech term. This mirrors the
-/// COUNTRY_DEMONYMS data-seed pattern: a general, non-hardcoded list so any
-/// negated brand passes the `is_real_exclusion` gate. Covers major audio,
-/// sportswear, electronics, and automotive brands.
-const KNOWN_BRANDS: &[&str] = &[
-    // Audio / headphones / earbuds
-    "bose", "sony", "sennheiser", "akg", "audio-technica", "beats",
-    "jabra", "jbl", "skullcandy", "sony", "bose", "sennheiser",
-    "senheiser", "fiio", "shure", "westone", "campfire", "moondrop",
-    // Sportswear / footwear
-    "nike", "adidas", "puma", "reebok", "new balance", "newbalance",
-    "asics", "converse", "vans", "under armour", "underarmour",
-    // Electronics / computing
-    "samsung", "lg", "hp", "dell", "lenovo", "asus", "acer",
-    "microsoft", "google", "xiaomi", "oneplus", "oppo", "vivo",
-    "realme", "nothing", "razer", "logitech", "corsair", "steelseries",
-    // Automotive
-    "toyota", "honda", "ford", "tesla", "bmw", "mercedes", "audi",
-    "volkswagen", "hyundai", "kia", "nissan", "chevrolet",
-];
-
-/// True if `term` is a known consumer brand. Brands are common negation
-/// targets ("not bose", "headphones not sony") and must pass the
-/// `is_real_exclusion` gate even without contrastive framing. Data-seed
-/// pattern (mirrors `COUNTRY_DEMONYMS`), not per-query literals.
-fn is_known_brand(term: &str) -> bool {
-    let lc = term.trim().to_lowercase();
-    if lc.is_empty() {
-        return false;
-    }
-    if KNOWN_BRANDS.contains(&lc.as_str()) {
-        return true;
-    }
-    let tokens: Vec<&str> = lc.split_whitespace().collect();
-    tokens.iter().any(|t| KNOWN_BRANDS.contains(t))
-}
-
 /// F3 (2026-08-17): seed list of country demonyms / origin adjectives. When a user
 /// excludes a COUNTRY-of-origin (e.g. "not from chinese brands", "alternatives to american
 /// cloud providers", "laptops not made in china"), the demonym IS the genuine topical
@@ -6950,15 +7115,6 @@ fn is_real_exclusion(
     if COUNTRY_DEMONYMS.contains(&lc.as_str())
         || tokens.iter().any(|t| COUNTRY_DEMONYMS.contains(t))
     {
-        return true;
-    }
-    // D4 (2026-09-15): a known consumer brand (e.g. "bose", "nike", "sony") is a
-    // genuine topical exclusion when negated ("not bose", "wireless headphones
-    // not sony"). Brands are common negation targets that the user explicitly
-    // named — they must pass the is_real_exclusion gate even without contrastive
-    // framing and even when not in PROTECTED_TERMS (which is tech-focused).
-    // Data-seed pattern mirrors COUNTRY_DEMONYMS; no per-query literals.
-    if is_known_brand(&lc) {
         return true;
     }
     // Entity: a term in the compound is capitalized in the original query
@@ -8006,7 +8162,7 @@ fn keyphrase_relax_variant(query: &str) -> Option<String> {
     ];
 
     let filtered: Vec<&str> = words.into_iter()
-        .filter(|w| !STOP_WORDS.contains(w) && (w.len() > 1 || w.chars().any(|c| c.is_ascii_digit())))
+        .filter(|w| !STOP_WORDS.contains(w) && w.len() > 1)
         .collect();
 
     let orig_count = query.split_whitespace().count();
@@ -10162,7 +10318,8 @@ fn merge_local_and_web(
             || r.sources.iter().any(|s| s == "arxiv" || s == "crossref" || s == "pubmed");
 
         let has_download = DOWNLOAD_KEYWORDS.iter().any(|k| q_lower_check.contains(k));
-        let has_tx = has_transactional_keyword(&q_lower_check);
+        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon"];
+        let has_tx = tx_keywords.iter().any(|k| q_lower_check.contains(k));
         let is_nav_or_download = intent == "navigational"
             || intent == "transactional"
             || has_download
@@ -10488,7 +10645,7 @@ fn merge_local_and_web(
         };
 
         let cross_loc_mult = if geo_is_explicit {
-            cross_location_mismatch_mult(&r.title, &r.content, &r.url, geo_location)
+            cross_location_mismatch_mult(&r.title, &r.content, geo_location)
         } else {
             1.0
         };
@@ -14880,7 +15037,8 @@ async fn handle_search(
         }
 
         // Override 6: transactional keywords OR an explicit price bound -> transactional
-        let has_tx_signal = has_transactional_keyword(&q_lower);
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
+        let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -14952,7 +15110,10 @@ async fn handle_search(
             intent.confidence = intent.confidence.max(0.88);
             let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
             intent.distribution.insert("navigational".to_string(), (nav_prob + 0.60).min(0.95));
-            true
+            intent.distribution.insert("download".to_string(), 0.90);
+        }
+
+        // Override 7: weather / forecast queries → fresh
         // WHOLE-WORD match only: a naive `contains("rain")` wrongly fired inside
         // "fe**rain**al" (a rescue-cat query) and forced fresh intent on a how-to
         // question, which then re-ranked results by recency instead of relevance.
@@ -16742,100 +16903,6 @@ let mut results = match tokio::task::spawn_blocking(move || {
             return err_resp;
         }
     };
-
-    // IFIX-A: Video dominance fix for thin out-of-vertical queries
-    // When upstream returns <3 non-video results for text queries, the P8 video
-    // cap (0.04) isn't enough because there's nothing else to replace them with.
-    // Detect via source types (invidious/video) and URL host class — no per-query
-    // literals. Two remediations:
-    //   (a) non-video < 3: crush video scores ×0.01 so any non-video outranks them
-    //   (b) non-video == 0: re-query SearXNG with categories=general to find
-    //       non-video results that the mixed-category fan-out missed
-    {
-        let non_video_top10 = results.iter()
-            .take(10)
-            .filter(|r| {
-                !r.sources.iter().any(|s| s == "invidious" || s == "video")
-                    && !is_url_video_host(&r.url)
-            })
-            .count();
-
-        if non_video_top10 < 3 && non_video_top10 > 0 && !has_video_intent(&q_trimmed) {
-            for r in results.iter_mut() {
-                let is_video = r.sources.iter().any(|s| s == "invidious" || s == "video")
-                    || is_url_video_host(&r.url);
-                if is_video {
-                    r.score *= 0.01;
-                }
-            }
-            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-            tracing::info!("IFIX-A: thin result set (non_video={}) — applied ×0.01 video crush for '{}'", non_video_top10, q_trimmed);
-        }
-
-        if non_video_top10 == 0 && !has_video_intent(&q_trimmed) {
-            let general_url = searxng_url_with_categories(
-                "http://127.0.0.1:8080",
-                &q_trimmed,
-                "general",
-                geo_location.as_ref(),
-                lang,
-            );
-
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                client.get(&general_url).send()
-            ).await {
-                Ok(Ok(resp)) => {
-                    if let Some(bytes) = read_body_bounded(resp).await {
-                        let raw = String::from_utf8_lossy(&bytes).into_owned();
-                        let sanitized = sanitize_json_text(&raw);
-                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&sanitized) {
-                            if let Some(results_arr) = data.get("results").and_then(|r| r.as_array()) {
-                                let mut added = 0;
-                                for r in results_arr {
-                                    let url = r.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
-                                    if is_url_video_host(&url) {
-                                        continue;
-                                    }
-                                    let title = r.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
-                                    let content = r.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
-                                    let score = r.get("score").and_then(|s| s.as_f64()).unwrap_or(0.5) as f32;
-                                    results.push(MergedResult {
-                                        url,
-                                        title,
-                                        content,
-                                        score,
-                                        authority: 0.5,
-                                        sources: vec!["web".to_string()],
-                                        is_local: false,
-                                        published_date: r.get("publishedDate").and_then(|d| d.as_str()).map(|s| s.to_string()),
-                                        price: None,
-                                        currency: None,
-                                        quality: 0.5,
-                                        post_cal_cap: None,
-                                        engine_trust_mult: 1.0,
-                                        commerce: None,
-                                        commerce_provenance: None,
-                                    });
-                                    added += 1;
-                                }
-                                if added > 0 {
-                                    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-                                    tracing::info!("IFIX-A: re-query added {} non-video results for '{}'", added, q_trimmed);
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("IFIX-A: re-query request failed for '{}': {:?}", q_trimmed, e);
-                }
-                Err(_) => {
-                    tracing::warn!("IFIX-A: re-query timed out for '{}'", q_trimmed);
-                }
-            }
-        }
-    }
 
     // 8b. Post-merge hard negative filter: apply negative constraints to ALL results
     // (local + web). The pre-merge filter only catches web results; local index
@@ -23242,6 +23309,173 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(block.get("results").is_some(), "shopping block present");
     }
 
+    // ── ROADMAP item B: product image extraction ─────────────────────────
+    // The extractor must pull the product image URL from structured sources:
+    // JSON-LD `image` (string, array, or ImageObject), OpenGraph `og:image`,
+    // microdata `itemprop="image"` (content + href/src), and RDFa `property="image"`.
+    // Always from typed data — never guessed from free text.
+
+    const HTML_JSONLD_IMAGE: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Image Product",
+  "image": "https://cdn.example.com/product.jpg",
+  "offers": {
+    "@type": "Offer",
+    "price": "49.99",
+    "priceCurrency": "USD"
+  }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_image_string_url_is_extracted() {
+        let o = extract_commerce_offer(HTML_JSONLD_IMAGE, "https://img.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/product.jpg"));
+        assert_eq!(d.price, Some(49.99));
+        assert_eq!(o.source.as_deref(), Some("json-ld"));
+    }
+
+    const HTML_JSONLD_IMAGE_ARRAY: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Multi Image",
+  "image": ["https://cdn.example.com/a.jpg", "https://cdn.example.com/b.jpg"],
+  "offers": { "@type": "Offer", "price": "29.99", "priceCurrency": "EUR" }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_image_array_takes_first() {
+        let o = extract_commerce_offer(HTML_JSONLD_IMAGE_ARRAY, "https://multi.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/a.jpg"));
+    }
+
+    const HTML_JSONLD_IMAGE_OBJECT: &str = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "ImageObject Product",
+  "image": { "@type": "ImageObject", "url": "https://cdn.example.com/imgobj.jpg" },
+  "offers": { "@type": "Offer", "price": "19.99", "priceCurrency": "GBP" }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn jsonld_image_object_url_is_extracted() {
+        let o = extract_commerce_offer(HTML_JSONLD_IMAGE_OBJECT, "https://obj.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/imgobj.jpg"));
+    }
+
+    const HTML_OG_IMAGE: &str = r#"<!doctype html><html><head>
+<title>OG Image</title>
+<meta property="og:image" content="https://og.example.com/photo.jpg">
+<meta property="product:price:amount" content="99.99">
+<meta property="product:price:currency" content="INR">
+</head><body></body></html>"#;
+
+    #[test]
+    fn og_image_is_extracted() {
+        let o = extract_commerce_offer(HTML_OG_IMAGE, "https://ogimg.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://og.example.com/photo.jpg"));
+        assert_eq!(d.price, Some(99.99));
+        assert_eq!(o.source.as_deref(), Some("og"));
+    }
+
+    const HTML_MICRODATA_IMAGE_HREF: &str = r#"<!doctype html><html><head>
+<title>Microdata Link Image</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Product">
+  <span itemprop="name">Link Image Product</span>
+  <link itemprop="image" href="https://md.example.com/photo.jpg">
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <span itemprop="price" content="39.99">39.99</span>
+    <span itemprop="priceCurrency" content="USD">USD</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn microdata_image_href_attribute_is_extracted() {
+        let o = extract_commerce_offer(HTML_MICRODATA_IMAGE_HREF, "https://mdhref.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://md.example.com/photo.jpg"));
+        assert_eq!(o.source.as_deref(), Some("microdata"));
+    }
+
+    const HTML_RDFa_IMAGE: &str = r#"<!doctype html><html><head>
+<title>RDFa Image</title>
+</head><body>
+<div vocab="https://schema.org/" typeof="Product">
+  <span property="name">RDFa Image Product</span>
+  <span property="image" content="https://rdfa.example.com/photo.jpg">photo</span>
+  <div property="offers" typeof="Offer">
+    <span property="price" content="59.99">59.99</span>
+    <span property="priceCurrency" content="USD">USD</span>
+  </div>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn rdfa_image_content_attribute_is_extracted() {
+        let o = extract_commerce_offer(HTML_RDFa_IMAGE, "https://rdfaimg.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image.as_deref(), Some("https://rdfa.example.com/photo.jpg"));
+        assert_eq!(o.source.as_deref(), Some("rdfa"));
+    }
+
+    const HTML_NO_IMAGE: &str = r#"<!doctype html><html><head>
+<title>No Image Product</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "No Image Product",
+  "offers": { "@type": "Offer", "price": "9.99", "priceCurrency": "USD" }
+}
+</script>
+</head><body></body></html>"#;
+
+    #[test]
+    fn product_without_image_has_null_image() {
+        let o = extract_commerce_offer(HTML_NO_IMAGE, "https://noimg.example.com/p");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image, None);
+        assert_eq!(d.price, Some(9.99));
+    }
+
+    const HTML_ARTICLE_NO_IMAGE: &str = r#"<!doctype html><html><head>
+<title>Article Page</title>
+</head><body>
+<div itemscope itemtype="https://schema.org/Article">
+  <span itemprop="name">How to Build a Widget</span>
+  <span itemprop="author">Jane Doe</span>
+</div>
+</body></html>"#;
+
+    #[test]
+    fn non_product_page_never_extracts_image() {
+        let o = extract_commerce_offer(HTML_ARTICLE_NO_IMAGE, "https://blog.example.com/post");
+        let d = o.data.as_ref().unwrap();
+        assert_eq!(d.image, None);
+        assert_eq!(d.price, None);
+        // merchant falls back to host
+        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
+        assert_eq!(o.source.as_deref(), None);
+    }
+
     // ── ROADMAP item 3: affiliate template engine ─────────────────────
     // Honest, data-driven affiliate decoration. These tests lock the contract:
     //  * two template kinds render correctly with correct URL-encoding
@@ -23426,66 +23660,5 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // valid "off" setting — proves the value is honored as a cap.
         let cfg = CommerceConfig { mainpath_top_n: 0 };
         assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
-    }
-
-    // ─── Transactional keyword whole-word matching ──────────────────────
-    // P4 fix: Override 6 used `contains("price ")` which missed end-of-query
-    // ("iphone 16 pro max price") and bare `contains("shop")` false-fired on
-    // "shopping". Whole-word matching via q_has_word fixes both.
-
-    #[test]
-    fn transactional_keyword_price_at_end_of_query() {
-        // The exact defect: "iphone 16 pro max price" — "price" has no
-        // trailing space, so `contains("price ")` was false.
-        assert!(has_transactional_keyword("iphone 16 pro max price"));
-        assert!(has_transactional_keyword("macbook pro m3 price"));
-    }
-
-    #[test]
-    fn transactional_keyword_buy() {
-        assert!(has_transactional_keyword("buy laptop"));
-        assert!(has_transactional_keyword("where to buy iphone"));
-    }
-
-    #[test]
-    fn transactional_keyword_under_as_budget() {
-        assert!(has_transactional_keyword("laptop under 60000"));
-        assert!(has_transactional_keyword("smartwatch under 5000"));
-    }
-
-    #[test]
-    fn transactional_keyword_discount_coupon() {
-        assert!(has_transactional_keyword("discount code"));
-        assert!(has_transactional_keyword("coupon for shoes"));
-    }
-
-    #[test]
-    fn transactional_keyword_shop_store_pricing_cheap() {
-        assert!(has_transactional_keyword("shop online"));
-        assert!(has_transactional_keyword("store near me"));
-        assert!(has_transactional_keyword("pricing for aws"));
-        assert!(has_transactional_keyword("cheap flights"));
-    }
-
-    #[test]
-    fn transactional_keyword_rejects_substring_false_positives() {
-        // "priceless" contains "price" as substring but is NOT a purchase query
-        assert!(!has_transactional_keyword("priceless art"));
-        // "shopping" contains "shop" but is NOT a purchase query
-        assert!(!has_transactional_keyword("shopping mall"));
-        // "thunder" contains "under" but is NOT a budget query
-        assert!(!has_transactional_keyword("thunder storm"));
-        // "storefront" contains "store" but is NOT a purchase query
-        assert!(!has_transactional_keyword("storefront design"));
-        // "buyer" contains "buy" but is NOT a purchase query (it's a role)
-        assert!(!has_transactional_keyword("buyer persona"));
-    }
-
-    #[test]
-    fn transactional_keyword_rejects_unrelated_queries() {
-        assert!(!has_transactional_keyword("how to build a rest api"));
-        assert!(!has_transactional_keyword("what is quantum computing"));
-        assert!(!has_transactional_keyword("react vs vue"));
-        assert!(!has_transactional_keyword("best laptop for programming"));
     }
 }
