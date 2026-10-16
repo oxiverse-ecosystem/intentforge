@@ -11825,7 +11825,17 @@ fn merge_local_and_web(
         };
 
         let cross_loc_mult = if geo_is_explicit {
-            cross_location_mismatch_mult(&r.title, &r.content, geo_location)
+            // EXPLICIT-ONLY (this round): the mismatch gate compares a result
+            // against the requested place, so it must only run when the user
+            // actually REQUESTED one. `geo_is_explicit` is true for any
+            // gazetteer hit — including an IP-derived location that happens to
+            // resolve to a gazetteer city — which let an inferred "New York"
+            // crush every result that named a different place. `is_inferred_location`
+            // is the structural test: the query's own words decide.
+            match geo_location {
+                Some(g) if is_inferred_location(query, g) => 1.0,
+                _ => cross_location_mismatch_mult(&r.title, &r.content, geo_location),
+            }
         } else {
             1.0
         };
@@ -13867,8 +13877,9 @@ async fn handle_spellcheck(
 ///      powered the round-2026-08-11T1556Z geo fix: a resolved `chennai` must win
 ///      so the off-topic gate can rescue chennai-specific results.
 ///   2. If no explicit location but the query has local intent ("near me" /
-///      "nearby" / "around me"), fall back to a stable default (New York, US) so
-///      local-query expansion has *something* to anchor on.
+///      "nearby" / "around me"), fall back to a country-level default (India) so
+///      local-query expansion has *something* to anchor on. Country-level only:
+///      a city-level default is a fabricated requirement the user never stated.
 ///
 /// An optional `ip` lets a client reproduce the third stage `/search` performs
 /// (IP-derived geolocation via the `geo_locator` DB) for parity — but it is
@@ -16127,25 +16138,39 @@ async fn handle_search(
 
     // P3 fix: inject detected location as a Target entity so structured_constraints.entities
     // reflects the explicit user location intent. Must happen AFTER intent is defined.
+    //
+    // EXPLICIT-ONLY (this round): only a location the QUERY ITSELF names may
+    // become a positive requirement. An IP-derived location, or the local-intent
+    // fallback, is INFERRED — it is a legitimate upstream hint (`source_country`)
+    // and a legitimate geo boost, but it must never be injected into `positive`,
+    // because `positive` is what `constraint_score` turns into a hard page
+    // requirement and what the cross-location gate compares against. That is
+    // exactly how "nearby restaurants" came back demanding a page mention
+    // "New York": the fallback city was injected as a positive Target and the
+    // user's own words were overridden by a place they never typed. General and
+    // structural — `is_inferred_location` tests the resolved location against the
+    // query's own tokens, so no per-query literals and no place allow-list.
     if let Some(ref loc) = geo_location {
-        if let Some(ref city) = loc.city {
-            if !intent.structured_constraints.entities.iter().any(|e| e.text == *city) {
-                intent.structured_constraints.entities.push(QueryEntity {
-                    text: city.clone(),
-                    role: EntityRole::Target,
-                });
-                if !intent.structured_constraints.positive.contains(&city) {
-                    intent.structured_constraints.positive.push(city.clone());
+        if !is_inferred_location(&q, loc) {
+            if let Some(ref city) = loc.city {
+                if !intent.structured_constraints.entities.iter().any(|e| e.text == *city) {
+                    intent.structured_constraints.entities.push(QueryEntity {
+                        text: city.clone(),
+                        role: EntityRole::Target,
+                    });
+                    if !intent.structured_constraints.positive.contains(city) {
+                        intent.structured_constraints.positive.push(city.clone());
+                    }
                 }
             }
-        }
-        if let Some(ref cc) = loc.country_code {
-            let country_lower = cc.to_lowercase();
-            if !intent.structured_constraints.entities.iter().any(|e| e.text == country_lower) {
-                intent.structured_constraints.entities.push(QueryEntity {
-                    text: country_lower.clone(),
-                    role: EntityRole::Target,
-                });
+            if let Some(ref cc) = loc.country_code {
+                let country_lower = cc.to_lowercase();
+                if !intent.structured_constraints.entities.iter().any(|e| e.text == country_lower) {
+                    intent.structured_constraints.entities.push(QueryEntity {
+                        text: country_lower.clone(),
+                        role: EntityRole::Target,
+                    });
+                }
             }
         }
     }
@@ -22352,13 +22377,20 @@ mod spellcheck_endpoint_tests {
         #[test]
         fn geolocate_local_intent_falls_back_to_default() {
             // A "near me" / "nearby" query with NO explicit place must resolve to
-            // the stable local-intent default (New York, US) — exactly as /search
-            // does for local-query expansion. No IP supplied => fallback, not "none".
+            // the stable local-intent default — exactly as /search does for
+            // local-query expansion. No IP supplied => fallback, not "none".
+            //
+            // The fallback is COUNTRY-LEVEL (India), never a city: a city-level
+            // default is a fabricated requirement the user never stated, and it
+            // is what previously injected "+New York" into the constraint set for
+            // a user in India.
             let loc = build_geolocate(None, "coffee shops near me open now", None);
             assert!(loc.local_intent);
             assert_eq!(loc.source, "local_intent_fallback");
-            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("New York"));
-            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("US"));
+            assert_eq!(loc.resolved.as_ref().unwrap().city, None,
+                "the fallback must not invent a city the query never named");
+            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("IN"));
+            assert_eq!(loc.resolved.as_ref().unwrap().country_name.as_deref(), Some("India"));
         }
 
         #[test]
@@ -24984,6 +25016,123 @@ mod local_intent_gazetteer_tests {
                 "traditional local query '{}' should still be detected",
                 q
             );
+        }
+    }
+}
+
+/// Regression lock for the geo-default defect (round 2026-10-16T1200Z).
+///
+/// Defect: "nearby restaurants" returned `["+nearby restaurants", "+New York"]`
+/// — the gateway's local-intent fallback defaulted to New York, US, and that
+/// city was then injected into `structured_constraints.positive`, so the result
+/// set was REQUIRED to mention a place the user never typed. For a user in
+/// India the results were wrong-region and the constraint was fabricated.
+///
+/// The fix has three parts, each locked here:
+///   1. the fallback is COUNTRY-LEVEL (India) and never invents a city;
+///   2. an INFERRED location (IP-derived or fallback) is never injected into
+///      `positive` / `entities` — only a place the query itself names is;
+///   3. the cross-location mismatch gate only runs for an explicit request.
+#[cfg(test)]
+mod geo_default_regression_tests {
+    use super::*;
+
+    fn loc(city: Option<&str>, country: Option<&str>) -> geoloc::GeoLocation {
+        geoloc::GeoLocation {
+            country_code: country.map(|s| s.to_string()),
+            country_name: country.map(|s| s.to_string()),
+            region: None,
+            city: city.map(|s| s.to_string()),
+            postal_code: None,
+            latitude: None,
+            longitude: None,
+            time_zone: None,
+        }
+    }
+
+    #[test]
+    fn inferred_location_is_recognised_as_inferred() {
+        // An IP-derived / fallback location is INFERRED: the query never named it.
+        assert!(is_inferred_location("nearby restaurants", &loc(Some("New York"), Some("US"))));
+        assert!(is_inferred_location("coffee shops near me", &loc(None, Some("IN"))));
+        assert!(is_inferred_location("how does a cpu pipeline work", &loc(Some("Mumbai"), Some("IN"))));
+    }
+
+    #[test]
+    fn query_named_location_is_not_inferred() {
+        // A place the user actually typed is EXPLICIT — it must stay a real
+        // requirement (this is what "restaurants in bangalore" depends on).
+        assert!(!is_inferred_location("restaurants in bangalore", &loc(Some("bangalore"), Some("IN"))));
+        assert!(!is_inferred_location("hotels in paris", &loc(Some("paris"), Some("FR"))));
+        // Country-level naming counts too.
+        assert!(!is_inferred_location("news from india", &loc(None, Some("India"))));
+    }
+
+    #[test]
+    fn nearby_query_never_adds_a_new_york_constraint() {
+        // ACCEPTANCE CRITERION 1: "nearby restaurants" must NOT add "+New York".
+        // The fallback is country-level, so there is no city to inject, and the
+        // injection gate refuses an inferred location anyway. Assert the exact
+        // shape the response reports: no positive constraint naming a place the
+        // query never contained.
+        let q = "nearby restaurants";
+        let fallback = loc(None, Some("IN"));
+        assert!(is_inferred_location(q, &fallback),
+            "the local-intent fallback must be treated as inferred");
+        // Whatever the fallback resolves to, it must not be a city the query
+        // never named — otherwise it would be injected as a positive Target.
+        assert!(fallback.city.is_none(),
+            "a city-level fallback would be injected as a fabricated requirement");
+        // And the query itself names no place, so nothing may be added.
+        assert!(detect_explicit_location(q).is_none());
+    }
+
+    #[test]
+    fn explicit_city_still_becomes_a_constraint() {
+        // ACCEPTANCE CRITERION 2: "restaurants in bangalore" must add
+        // "+bangalore". The gazetteer resolves it, the query names it, so the
+        // injection gate lets it through as a positive Target.
+        let q = "restaurants in bangalore";
+        let resolved = detect_explicit_location(q)
+            .expect("bangalore must resolve via the gazetteer");
+        assert_eq!(resolved.city.as_deref(), Some("bangalore"));
+        assert_eq!(resolved.country_code.as_deref(), Some("IN"));
+        assert!(!is_inferred_location(q, &resolved),
+            "a query-named place is explicit, not inferred");
+    }
+
+    #[test]
+    fn fallback_is_country_level_india() {
+        // The local-intent fallback must be country-level and must not carry a
+        // city/region/postal/coords — any of those would be a fabricated
+        // requirement for a user who typed no place.
+        let loc = build_geolocate(None, "nearby restaurants", None);
+        assert_eq!(loc.source, "local_intent_fallback");
+        let resolved = loc.resolved.expect("local intent must resolve");
+        assert_eq!(resolved.country_code.as_deref(), Some("IN"));
+        assert_eq!(resolved.country_name.as_deref(), Some("India"));
+        assert!(resolved.city.is_none());
+        assert!(resolved.region.is_none());
+        assert!(resolved.postal_code.is_none());
+        assert!(resolved.latitude.is_none());
+        assert!(resolved.longitude.is_none());
+        assert!(resolved.time_zone.is_none());
+    }
+
+    #[test]
+    fn no_inferred_location_is_ever_a_positive_requirement() {
+        // The injection gate's own contract: for ANY inferred location, the
+        // query's own words are the only thing that may become a positive
+        // requirement. Sweeps the fallback plus an IP-shaped location so the
+        // rule is not tuned to one fixture.
+        for (q, l) in [
+            ("nearby restaurants", loc(None, Some("IN"))),
+            ("coffee shops near me", loc(None, Some("IN"))),
+            ("best cafes around me", loc(Some("New York"), Some("US"))),
+            ("hotels close to me", loc(Some("Mumbai"), Some("IN"))),
+        ] {
+            assert!(is_inferred_location(q, &l),
+                "'{}' must treat {:?} as inferred", q, l.city);
         }
     }
 }
