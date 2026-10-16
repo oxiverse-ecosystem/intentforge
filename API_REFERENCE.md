@@ -152,7 +152,7 @@ Full search endpoint. Queries multiple backends (SearXNG via VPN, local index) i
 > `query`, `intent`, `category`, `confidence`, `constraints`, `structured_constraints`, `expanded_queries`, `distribution`, `results`, `results_before_filter`, `results_after_filter`, `total`, `limit`, `offset`, `has_more`.
 > Optionally present: `applied_constraints` (when operators/negations are applied), `spell_corrected_query` (when a correction fired), `query_quality` (only on `low`/`junk` queries), `deep_result`, `price_verified` (transactional), `recall_gap_terms` (when a distinctive query term is absent from every returned result — an honest upstream recall-gap signal; see [below](#honest-recall-gap-signal)).
 > `geo_location`, `warnings`, `ignored_constraints` were **absent** from all observed successful responses (declared-but-omitted `None` fields).
-> **`shopping`** (ROADMAP item 7, main-path commercial intent): present **only** when the resolved intent is commercial (the `transactional` label, a strong `transactional` distribution ≥ 0.50, or a stated price bound). It is a `serde_json::Value` object `{ "results": [ …up to COMMERCE_MAINPATH_TOP_N cloned top-ranked results… ], "offer_comparisons"?: [ … ] }` carrying the same honest `commerce` facts + post-rank `affiliate` blocks already produced by `GET /shopping`, built from a **clone** of the already-ranked results. The main `results` array is NEVER touched, so the `shopping` field is purely additive. An informational query (`rust ownership`, `how do black holes work`) returns **no** `shopping` field (verified live, 2026-08-30). Detection is SIGNAL-based — reuses the existing intent distribution + price constraints, no keyword list, no third-party call.
+> **`shopping`** (ROADMAP item 7, main-path commercial intent): present **only** when the resolved intent is commercial (the `transactional` label, a strong `transactional` distribution ≥ 0.50, or a stated price bound) **and** at least one top-ranked result page exposes a concrete `commerce` block. It is a direct JSON array; every entry is cloned from the already-ranked `results`, preserves that order, and carries real `commerce` facts plus post-rank `affiliate` metadata. Rows without structured product facts are omitted rather than shown as bare affiliate cards. The main `results` array is never touched, so `shopping` is purely additive. An informational query (`rust ownership`, `how do black holes work`) returns **no** `shopping` field. Detection is SIGNAL-based — reuses the existing intent distribution + price constraints, no keyword list, no third-party call.
 > **`confidence` is a real float in ~0.30–0.90**, not always `0.75` — the value depends on the query and the intent engine.
 
 Example (real response truncated; full body in `docs/_generated/api-transcript.md` block 12 — `python web framework not django`):
@@ -1577,7 +1577,13 @@ no user tracking or profiling. Two invariants govern every commerce feature:
    ordering. The `/shopping` endpoint reuses the *exact* `/search` ranking pipeline;
    affiliate decoration is a strict **post-rank** pass that only adds fields to
    already-ordered results. Result order is identical to `/search` (verified live below).
-2. **No product misrepresentation.** Every product fact (`price`, `currency`,
+2. **Exact-model-only monetization.** Affiliate metadata is emitted only when the
+   query names an exact product model (for example `iphone 16 pro max price` or
+   `sony wh-1000xm5`). Broad searches such as `best wireless earbuds under 50`
+   remain completely free of affiliate links. Eligibility regexes are runtime-loaded
+   from `services/gateway/data/commerce/affiliate.json`; no merchant/query keyword
+   branch is compiled into Rust.
+3. **No product misrepresentation.** Every product fact (`price`, `currency`,
    `availability`, `merchant`, `condition`, `sku`/`gtin`, `rating`) is **extracted
    from that result's own page** (schema.org/Product JSON-LD, OpenGraph `product:*`,
    microdata) — never inferred, never carried across URLs, never guessed from free
@@ -1593,9 +1599,10 @@ result:
   result whose page exposed no structured product data gets **no** `commerce` block.
 - `commerce_provenance` — `{ url, observed_at, source, data:null }` for **every**
   result, so the frontend can label facts and never show a stale price as current.
-- `affiliate` — added by the post-rank affiliate engine (see below). When no
-  network key is present in the environment, this field is omitted and the result is
-  still returned (graceful degradation). When a network with a configured bid floor /
+- `affiliate` — added only for exact-model queries by the post-rank affiliate engine
+  (see below). Broad product/category queries deliberately omit it, and search still
+  returns the same ranked URLs. When no network key is present in the environment,
+  this field is omitted and the result is still returned (graceful degradation). When a network with a configured bid floor /
   fallback is used, the block also carries `bid_floor` (the configured floor, for
   reporting) and `fallback` (the fallback URL), both `Optional` and **never**
   influencing ranking — see *Bid-floor / fallback (item 6)* below.

@@ -1,6 +1,13 @@
 {
   "version": 1,
   "note": "Runtime-loaded affiliate network config. Adding a merchant/network requires ONLY editing this file — no recompile. Keys/secrets come from ENVIRONMENT VARIABLES (see key_env / param_env), never hardcoded here. Two template kinds: 'wrap' (network prefix + url-encoded destination, e.g. Sovrn/Skimlinks) and 'append_params' (add query params to the merchant URL, e.g. eBay EPN / Amazon).",
+  "eligibility": {
+    "note": "Affiliate decoration is permitted only when at least one runtime regex matches an exact product-model query. Broad product/category queries remain free. Add or extend product families here without recompiling.",
+    "exact_model_patterns": [
+      "(?i)^\\s*(?:(?:buy|shop|order|get|find|compare|best)\\s+)?(?:(?:sony|apple|samsung|google|oneplus|xiaomi|poco|realme|nothing|asus|lenovo|hp|dell|canon|nikon|garmin|bose|jbl|logitech|razer|corsair|microsoft)\\s+)?(?:(?:[a-z0-9]*\\d[a-z0-9]*(?:[- ][a-z0-9]+)*)|(?:[a-z]+\\s+\\d{1,5}[a-z0-9]*))(?:\\s+(?:pro|max|plus|mini|ultra|se|turbo|fe))*(?:\\s+(?:price|cost|prices|deal|deals|coupon|offers?|in\\s+india))?\\s*$",
+      "(?i)^\\s*(?:(?:buy|shop|order|get|find|compare|best)\\s+)?(?:iphone|ipad|macbook|imac|galaxy|pixel|surface|watch)\\s+\\d{1,5}(?:\\s+(?:pro|max|plus|mini|ultra|se|turbo|fe))*(?:\\s+(?:price|cost|prices|deal|deals|coupon|offers?|in\\s+india))?\\s*$"
+    ]
+  },
   "networks": [
     {
       "id": "sovrn",

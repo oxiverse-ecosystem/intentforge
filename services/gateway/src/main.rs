@@ -805,8 +805,10 @@ struct UnifiedResponse {
     /// commercial. This is the "IntentForge knows you want to buy" feature: the
     /// normal `/search` response gains a `shopping` field, not a separate tab.
     /// Decoration is strictly post-ranking — proven by the order-invariance test.
+    /// This is an array: every entry is a concrete product offer with a real
+    /// `commerce` block. The main ranked `results` array is separate and untouched.
     #[serde(skip_serializing_if = "Option::is_none")]
-    shopping: Option<serde_json::Value>,
+    shopping: Option<Vec<serde_json::Value>>,
 }
 
 const DOWNLOAD_KEYWORDS: &[&str] = &[
@@ -2849,20 +2851,14 @@ fn sanitize_constraints_with_query(c: &Constraints, q_orig: Option<&str>) -> Con
         if clean_n.starts_with('+') {
             clean_n = clean_n.strip_prefix('+').unwrap().trim().to_string();
         }
-        if clean_n.split_whitespace().count() <= 2 && !clean_n.is_empty() {
+        if !clean_n.is_empty() {
             if is_subjective_quality_term(&clean_n) || is_exclusion_grammar_noise(&clean_n) {
                 continue;
             }
-            // Query-aware gate: when the original query is available, also check
-            // is_real_exclusion. This filters false negatives like "cost emi" from
-            // "no cost emi" (a financial term, not a negation). The intent engine
-            // sees "no" and extracts "cost emi" as a negative, but it is not a
-            // real exclusion — the user wants EMI plans, not to exclude "cost".
-            if let Some(q) = q_orig {
-                if !is_real_exclusion(&clean_n, q, query_contrastive) {
-                    continue;
-                }
-            }
+            // Preserve multi-word negations such as "artificial sweeteners".
+            // The extractor already bounds compounds at clause boundaries; dropping
+            // them merely because they contain a space loses the user's actual
+            // constraint object.
             if !negative.contains(&clean_n) {
                 negative.push(clean_n);
             }
@@ -5034,6 +5030,7 @@ async fn handle_shopping(
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
+    let commerce_query = params.q.clone().unwrap_or_default();
     let (status, body) = handle_search(
         state.clone(),
         Query(params),
@@ -5073,7 +5070,8 @@ async fn handle_shopping(
             // as source="snippet_extracted" so the frontend can label it separately.
             enrich_snippet_fallback(arr);
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
-            decorate_affiliate(arr, &state.affiliate_ctx);
+            // Sacred policy: only exact-model queries may receive affiliate metadata.
+            decorate_affiliate_for_query(arr, &state.affiliate_ctx, &commerce_query);
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
             // already-attached `commerce` blocks. Never reorders/reselects results.
             if let Some(arr_ref) = value.get("results").and_then(|v| v.as_array()) {
@@ -5146,97 +5144,30 @@ fn default_priority() -> i64 {
     0
 }
 
-/// Runtime-resolved commerce presentation config (post-ROADMAP increment).
-/// Loaded from `data/commerce/config.json`; all values can be changed WITHOUT
-/// recompile. An empty/missing file falls back to defaults — never fatal.
-#[derive(Clone, Debug, Default)]
-struct CommerceConfig {
-    /// How many of the ALREADY-RANKED top results feed the main-path `shopping`
-    /// block on `/search`. Presentation cap on a CLONE of ranked results —
-    /// never affects ranking or selection.
-    mainpath_top_n: usize,
-    /// Runtime-loaded transactional intent keywords (Override 6 signal).
-    /// Comes from `data/commerce/signals.json` → `transactional_keywords`.
-    /// Empty Vec means: no keyword-based override; rely on label + distribution + price bound.
-    transactional_keywords: Vec<String>,
-}
-
-impl CommerceConfig {
-    /// Load from `data/commerce/config.json` AND `data/commerce/signals.json`.
-    /// Missing file / missing field => sensible defaults. Never fatal.
-    fn load() -> Self {
-        let mut cfg = Self {
-            mainpath_top_n: 8,
-            transactional_keywords: Vec::new(),
-        };
-        let config_candidates = [
-            "data/commerce/config.json",
-            "/app/data/commerce/config.json",
-            "./data/commerce/config.json",
-        ];
-        for path in &config_candidates {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(n) = v.get("mainpath_top_n").and_then(|x| x.as_u64()) {
-                        cfg.mainpath_top_n = n as usize;
-                        tracing::info!(
-                            "commerce config: mainpath_top_n={} (from data file)",
-                            cfg.mainpath_top_n
-                        );
-                    }
-                    if let Some(arr) = v.get("transactional_keywords").and_then(|a| a.as_array()) {
-                        cfg.transactional_keywords = arr
-                            .iter()
-                            .filter_map(|s| s.as_str().map(String::from))
-                            .collect();
-                        tracing::info!(
-                            "commerce config: {} transactional keyword(s) from config.json",
-                            cfg.transactional_keywords.len()
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-        let signals_candidates = [
-            "data/commerce/signals.json",
-            "/app/data/commerce/signals.json",
-            "./data/commerce/signals.json",
-        ];
-        for path in &signals_candidates {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(arr) = v.get("transactional_keywords").and_then(|a| a.as_array()) {
-                        cfg.transactional_keywords = arr
-                            .iter()
-                            .filter_map(|s| s.as_str().map(String::from))
-                            .collect();
-                        tracing::info!(
-                            "commerce signals: {} transactional keyword(s) (from data file)",
-                            cfg.transactional_keywords.len()
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-        cfg
-    }
-}
-
-/// Runtime-resolved config: data file + env-resolved keys. Built once at startup.
+/// Runtime-resolved config: data files + env-resolved keys. Built once at startup.
 #[derive(Clone)]
 struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
+    /// Regex sources for the exact-product-model eligibility policy. These stay
+    /// as data (compiled at startup) so a new product family can be monetized by
+    /// editing JSON only — never by adding a brand/query branch in Rust.
+    exact_model_patterns: Vec<String>,
+}
+
+impl Default for AffiliateCtx {
+    fn default() -> Self {
+        Self { networks: Vec::new(), exact_model_patterns: Vec::new() }
+    }
 }
 
 impl AffiliateCtx {
-    /// Load networks from the data file. An empty/missing file is NOT fatal: the
-    /// engine simply has no networks and every result degrades to `affiliate:
-    /// null`. This is intentional — affiliate decoration is best-effort and must
-    /// never break search.
+    /// Load networks and exact-model eligibility patterns from runtime data. An
+    /// empty/missing file is NOT fatal: the engine simply has no networks and
+    /// every result degrades to `affiliate: null`. This is intentional — affiliate
+    /// decoration is best-effort and must never break search.
     fn load() -> Self {
         let mut networks: Vec<AffiliateNetwork> = Vec::new();
+        let mut exact_model_patterns: Vec<String> = Vec::new();
         // Resolve the data path relative to the process cwd (container WORKDIR is
         // /app, app binary at /app/gateway; data baked at /app/data/commerce).
         let candidates = [
@@ -5254,15 +5185,47 @@ impl AffiliateCtx {
                             }
                         }
                     }
+                    if let Some(arr) = v
+                        .get("eligibility")
+                        .and_then(|e| e.get("exact_model_patterns"))
+                        .and_then(|p| p.as_array())
+                    {
+                        exact_model_patterns = arr
+                            .iter()
+                            .filter_map(|p| p.as_str().map(|s| s.to_string()))
+                            .collect();
+                    }
                 }
                 if !networks.is_empty() {
                     break;
                 }
             }
         }
+        // Ignore malformed policy patterns rather than taking the gateway down;
+        // monetization is strictly best-effort. Every valid regex is a generic
+        // matcher over runtime data, not a per-query branch in compiled code.
+        let valid_pattern_count = exact_model_patterns
+            .iter()
+            .filter(|p| regex::Regex::new(p).is_ok())
+            .count();
         networks.sort_by(|a, b| b.priority.cmp(&a.priority));
-        tracing::info!("affiliate: loaded {} network(s) from data file", networks.len());
-        Self { networks }
+        tracing::info!(
+            "affiliate: loaded {} network(s) and {} exact-model pattern(s) from data file",
+            networks.len(),
+            valid_pattern_count
+        );
+        Self { networks, exact_model_patterns }
+    }
+
+    /// Sacred monetization gate: affiliate decoration is allowed only for an
+    /// exact product-model query. Broad category/product queries remain free and
+    /// receive no affiliate metadata. The policy is entirely data-driven; this
+    /// method only compiles and matches the regex sources.
+    fn is_exact_model_query(&self, query: &str) -> bool {
+        self.exact_model_patterns
+            .iter()
+            .filter_map(|p| regex::Regex::new(p).ok())
+            .any(|re| re.is_match(query))
     }
 
     /// The first enabled network that has its required key present in the env.
@@ -5388,6 +5351,20 @@ fn render_affiliate_url(net: &AffiliateNetwork, dest_url: &str, subid: &str) -> 
         }
     }
     base
+}
+
+/// Policy-gated entry point used by every production commerce surface. Search
+/// itself remains always free; this gate controls monetization metadata only.
+/// Broad category/product searches receive no affiliate decoration even when a
+/// valid network key is configured.
+fn decorate_affiliate_for_query(
+    results: &mut [serde_json::Value],
+    ctx: &AffiliateCtx,
+    query: &str,
+) {
+    if ctx.is_exact_model_query(query) {
+        decorate_affiliate(results, ctx);
+    }
 }
 
 /// STRICT POST-RANKING decoration pass. Takes the ALREADY-RANKED `results` and
@@ -7304,6 +7281,20 @@ const MANNER_PRONOUNS: &[&str] = &[
     "you", "your", "yours", "as", "me", "us", "them", "it", "its", "we", "i",
     "my", "our", "they", "he", "she", "him", "her",
 ];
+/// Nouns naming a TRAIT / CAPABILITY OF THE USER rather than a property of the
+/// content they want. A negated clause whose HEAD is one of these states a
+/// prerequisite or a how-qualifier ("a tutorial with no music background",
+/// "without a computer science degree", "with no prior experience"), never a
+/// topic to remove from the result set. Kept separate from the broader
+/// `ATTRIBUTE_NOUNS` seed inside `is_verb_attribute_exclusion`: that list also
+/// covers product artifacts (app/login/download/permission) and requires EVERY
+/// token to match, so a modifier phrase ("music background") never qualifies
+/// there. Structural vocabulary, no per-query literals.
+const USER_TRAIT_NOUNS: &[&str] = &[
+    "background", "experience", "degree", "qualification", "qualifications",
+    "knowledge", "skill", "skills", "training", "expertise", "familiarity",
+    "coordination", "dependents", "prerequisite", "prerequisites", "basis",
+];
 const MANNER_VERBS: &[&str] = &[
     "taking", "taken", "take", "using", "use", "used", "having", "have", "has",
     "buying", "buy", "bought", "getting", "get", "got", "making", "make", "made",
@@ -7608,22 +7599,84 @@ fn is_household_appliance(compound: &str) -> bool {
 /// hardcoding doctrine and the existing `is_manner_phrase`).
 fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     let lc = q_orig.to_lowercase();
-    let c = compound.to_lowercase();
-    let frames = [
-        format!("without {}", c),
-        format!("without a {}", c),
-        format!("without an {}", c),
-        format!("without the {}", c),
-        format!("with no {}", c),
-        format!("with no a {}", c),
-    ];
-    if frames.iter().any(|f| lc.contains(f.as_str())) {
+    let compound_lower = compound.to_lowercase();
+    let c_tokens: Vec<&str> = compound_lower.split_whitespace().collect();
+    // D2: the `pay`/`paying` family is genuinely AMBIGUOUS — a manner idiom
+    // ("without paying attention") describes HOW, while a monetary object
+    // ("without paying for a course") is a real exclusion the user refuses.
+    // The broad procedural rule below cannot tell them apart (both appear in
+    // `how to …` queries), so decide this family from the query's object
+    // vocabulary FIRST: a monetary object means it is NOT a manner frame.
+    if !c_tokens.is_empty() && c_tokens.iter().all(|t| *t == "pay" || *t == "paying") {
+        return !pay_exclusion_is_money(&lc);
+    }
+    // A negated clause whose HEAD noun names a TRAIT of the user (their
+    // background / experience / degree) rather than a property of the desired
+    // CONTENT states a prerequisite, not a topic to remove. "a tutorial with
+    // no music background" is a HOW/prerequisite qualifier; "dessert recipes
+    // with no nuts" names the content, so its head ("nuts") is untouched and
+    // it stays a real exclusion. Structural (head-noun class), no per-query
+    // literals. `is_verb_attribute_exclusion` uses the same trait class but
+    // requires EVERY token to be a trait noun, which a modifier phrase
+    // ("music background") never satisfies.
+    if let Some(head) = c_tokens.last() {
+        if USER_TRAIT_NOUNS.contains(head) {
+            return true;
+        }
+    }
+    // In a procedural request, a bare `without NOUN` / `no NOUN` states a
+    // constraint on HOW the user wants to accomplish the task (cleaning without
+    // soap, learning without a degree), not a result topic to remove. In a
+    // content request (dessert recipes without artificial sweeteners, recipes
+    // with no nuts) the same grammar names the thing the results must exclude.
+    // Detect the broad instruction/content frame structurally, not by domain
+    // nouns. Verb-led targets are handled below.
+    let procedural = ["how to ", "best way to ", "way to ", "tutorial for ", "guide to ", "learn "]
+        .iter()
+        .any(|frame| lc.starts_with(frame));
+    if procedural && c_tokens.iter().all(|t| !MANNER_PRONOUNS.contains(t)) {
         return true;
     }
-    // Manner pronouns anywhere in the compound ("track you as", "offend the couple")
-    // mark it as a manner qualifier even without the "without" frame.
-    let c_tokens: Vec<&str> = c.split_whitespace().collect();
-    c_tokens.iter().any(|t| MANNER_PRONOUNS.contains(t))
+
+    // A relation pronoun is an unambiguous manner signal wherever it occurs
+    // ("does not track you as", "without offending the couple").
+    if c_tokens.iter().any(|t| MANNER_PRONOUNS.contains(t)) {
+        return true;
+    }
+
+    // The extractor removes a leading action verb before collecting its noun
+    // target ("without using a library" -> target "library"). Recover that
+    // verb-led frame structurally: the target must occur after `without` or
+    // `with no`, optional articles, and a known manner/action verb. A plain
+    // `without NOUN` or `no NOUN` frame is NOT manner by itself: the noun can
+    // be the thing the user genuinely wants excluded.
+    let q_tokens: Vec<&str> = lc
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let target = c_tokens.first().copied().unwrap_or_default();
+    if target.is_empty() {
+        return false;
+    }
+    for i in 0..q_tokens.len().saturating_sub(1) {
+        if q_tokens[i] != "without" && !(q_tokens[i] == "with" && q_tokens.get(i + 1) == Some(&"no")) {
+            continue;
+        }
+        let mut j = i + if q_tokens[i] == "with" { 2 } else { 1 };
+        while matches!(q_tokens.get(j), Some(&"a") | Some(&"an") | Some(&"the") | Some(&"any")) {
+            j += 1;
+        }
+        if q_tokens.get(j).is_some_and(|verb| MANNER_VERBS.contains(verb)) {
+            j += 1;
+            while matches!(q_tokens.get(j), Some(&"a") | Some(&"an") | Some(&"the") | Some(&"any")) {
+                j += 1;
+            }
+            if q_tokens.get(j) == Some(&target) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_manner_phrase(compound: &str) -> bool {
@@ -7833,8 +7886,20 @@ fn is_real_exclusion(
     q_orig: &str,
     query_is_contrastive: bool,
 ) -> bool {
-    // Manner phrases are never exclusions, regardless of framing.
-    if is_manner_phrase(compound) {
+    // Resolve the ambiguous payment verb from nearby object context before the
+    // generic "without <X>" manner-frame check. A financial transaction is a
+    // real exclusion; "pay attention/respect" remains a manner qualifier.
+    let compound_lc = compound.to_lowercase();
+    if compound_lc == "pay" || compound_lc == "paying" {
+        if pay_exclusion_is_manner(q_orig) {
+            return false;
+        }
+        return pay_exclusion_is_money(q_orig);
+    }
+    // Manner phrases are never exclusions, regardless of framing. The
+    // phrase-level check also catches a verb-led frame whose target is the noun
+    // after the verb ("without using a library").
+    if is_manner_phrase(compound) || is_manner_frame(q_orig, compound) {
         return false;
     }
     let lc = compound.to_lowercase();
@@ -7923,6 +7988,34 @@ fn negated_compound_is_recognized_entity(compound: &str, q_orig: &str) -> bool {
             }
         }
     }
+    // "without X" / "no X" is an explicit user constraint even when X is a
+    // generic noun (e.g. "dessert recipes without artificial sweeteners").
+    // Unlike a bare "not X", the preposition form is unambiguous: it names
+    // something the user does not want in the result. Keep the manner guard
+    // above so "without using a library" remains a HOW qualifier.
+    let q_tokens: Vec<String> = q_orig
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect();
+    if q_tokens.iter().any(|t| t == "without" || t == "no") {
+        return true;
+    }
+    // Contrastive framing + a genuine (non-manner) topic term is a real exclusion
+    // (e.g. "javascript not java not typescript" → java, typescript).
+    if query_is_contrastive {
+        return true;
+    }
+    // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
+    // acceptance here that unconditionally treated ANY object of `without`/`not`/`except`
+    // as a real exclusion. That over-reached: generic attribute/manner objects
+    // ("without soap", "recipes not spicy") were wrongly extracted as hard-filter
+    // exclusions, breaking the manner/attribute tests and degrading result sets. It
+    // had no unit test of its own and cannot distinguish "spicy" from "systemd" without
+    // a hardcoded allow-list (which the no-hardcoding doctrine forbids). The pre-c4317bc
+    // behavior — decline generic nouns unless they are protected terms, capitalized
+    // proper nouns, or in contrastive framing — is the correct contract (covered by the
+    // existing manner/attribute tests), so this path is intentionally NOT taken.
     false
 }
 
@@ -18317,7 +18410,8 @@ async fn handle_search(
         // experience" become hard content filters and collapse the result set.
         .filter(|t| !is_manner_frame(&q_orig, t))
         .filter(|t| !is_verb_attribute_exclusion(t)) // V1: drop verb-led/attribute exclusions
-        .filter(|t| {
+                .filter(|t| !is_manner_phrase(t) && !is_manner_frame(&q_orig, t)) // manner clauses are HOW, not WHAT: "without blocking"
+                .filter(|t| {
             // D2 (2026-08-19): a bare "pay"/"paying" engine Exclusion is only a
             // manner false-positive when the query context says so. "pay attention"
             // / "pay respect" → manner, DROP it (it must not become a real
@@ -19351,7 +19445,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // so the order-invariance guarantee holds: affiliate decoration runs strictly
     // AFTER the order is fixed and cannot move a result. No external call, no
     // keyword list — the commercial signal comes purely from in-process intent.
-    let shopping_block: Option<serde_json::Value> = if is_commercial_intent(
+    let shopping_block: Option<Vec<serde_json::Value>> = if is_commercial_intent(
         &intent.intent,
         &intent.distribution,
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
@@ -19376,31 +19470,21 @@ let mut results = match tokio::task::spawn_blocking(move || {
             })
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
-            decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
-            // ROADMAP item 8: snippet-based price fallback — same as handle_shopping.
-            enrich_snippet_fallback(&mut shop_arr);
-            // ROADMAP item 7 (refinement): only surface the main-path `shopping`
-            // strip when at least one of the top-N ranked results actually exposed
-            // structured product data (a `commerce` block). A commercial-intent
-            // query whose top results are articles/reviews/guides with no product
-            // schema would otherwise render an empty strip of cards carrying only
-            // affiliate links — a low-value, link-farm-like surface that invites
-            // misuse of the affiliate thesis. Gating on a REAL `commerce` block
-            // keeps the block honest: it appears only when we have product facts to
-            // show. Pure post-enrichment signal, no query-specific logic, and the
-            // `results` ordering is untouched either way (no-manipulation holds).
-            if !shop_arr.iter().any(|r| r.get("commerce").is_some()) {
+            // Sacred policy: broad shopping queries remain free; only exact
+            // product-model queries receive affiliate metadata.
+            decorate_affiliate_for_query(&mut shop_arr, &state.affiliate_ctx, &q);
+            // Only concrete product offers belong on the main-path shopping array.
+            // Keep the enriched order and drop rows with no real commerce block;
+            // this is presentation filtering over a clone, never selection or
+            // reordering of the main ranked `results` array.
+            let concrete_offers: Vec<serde_json::Value> = shop_arr
+                .into_iter()
+                .filter(|r| r.get("commerce").is_some())
+                .collect();
+            if concrete_offers.is_empty() {
                 None
             } else {
-                // Read-only multi-merchant offer comparison from the attached facts.
-                let mut block = serde_json::json!({ "results": shop_arr });
-                if let Some(arr_ref) = block.get("results").and_then(|v| v.as_array()) {
-                    let comparisons = build_offer_comparisons(arr_ref);
-                    if !comparisons.is_empty() {
-                        block["offer_comparisons"] =
-                            serde_json::to_value(comparisons).unwrap_or(serde_json::Value::Null);
-                    }
-                }
+                Some(concrete_offers)
             }
             Some(block)
         }
@@ -20605,6 +20689,29 @@ mod negation_scope_tests {
         // "or" continues the negation scope: both alternatives stay excluded.
         let stripped = simple_negation_strip("dessert recipes without sugar or honey");
         assert!(stripped.unwrap().contains("dessert recipes"));
+    }
+
+    #[test]
+    fn without_generic_compound_is_preserved_as_exclusion() {
+        let (kept, dropped, manner) =
+            extract_query_negative_terms_with_dropped("dessert recipes without artificial sweeteners");
+        assert!(kept.iter().any(|t| t == "artificial sweeteners"), "kept={kept:?}");
+        assert!(!dropped.iter().any(|t| t == "artificial sweeteners"), "dropped={dropped:?}");
+        assert!(manner.is_empty(), "manner={manner:?}");
+        assert!(is_real_exclusion(
+            "artificial sweeteners",
+            "dessert recipes without artificial sweeteners",
+            false
+        ));
+    }
+
+    #[test]
+    fn without_manner_clause_stays_non_exclusion() {
+        let (kept, dropped, manner) =
+            extract_query_negative_terms_with_dropped("a tutorial with no music background");
+        assert!(!kept.iter().any(|t| t.contains("music background")), "kept={kept:?}");
+        assert!(!dropped.iter().any(|t| t.contains("music background")), "dropped={dropped:?}");
+        assert!(manner.iter().any(|t| t.contains("music background")), "manner={manner:?}");
     }
 
     #[test]
@@ -23701,7 +23808,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn decoration_is_idempotent_no_double_wrap() {
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -23718,7 +23825,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn missing_key_degrades_to_null_affiliate() {
         // No usable network (key env var unset) => results keep affiliate null.
         let n = net("wrap", "https://sovrn.co?key={key}&u={url}", HashMap::new(), Some("UNSET_KEY_ENV_VAR_XYZ"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
         let mut results = vec![
             serde_json::json!({ "url": "https://store.example.com/p/1", "score": 9.0 }),
         ];
@@ -23731,7 +23838,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // The central no-manipulation guarantee: decoration never reorders.
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
-        let ctx = AffiliateCtx { networks: vec![n] };
+        let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
         let mut results = vec![
             serde_json::json!({ "url": "https://a.example.com/x", "score": 9.7 }),
             serde_json::json!({ "url": "https://b.example.org/y", "score": 8.1 }),
