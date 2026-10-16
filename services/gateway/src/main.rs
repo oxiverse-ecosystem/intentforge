@@ -13446,7 +13446,7 @@ async fn main() {
         tracing::info!("Prewarming — polling intent engine until ready...");
         // Poll intent engine with exponential backoff until it responds
         for attempt in 1..=20 {
-            match prewarm_client.get(format!("{}/analyze", intent_engine_url())?q=warmup").send().await {
+            match prewarm_client.get(format!("{}/analyze?q=warmup", intent_engine_url())).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     tracing::info!("Intent engine ready after {} attempt(s)", attempt);
                     break;
@@ -13463,8 +13463,8 @@ async fn main() {
         }
         // Fire SearXNG + embed warmup in parallel (non-critical)
         let mut prewarm_futs = vec![
-            prewarm_client.get(format!("{}/search", searxng_url())?q=warmup&format=json&pageno=1").send(),
-            prewarm_client.get(format!("{}/embed", intent_engine_url())?text=warmup").send(),
+            prewarm_client.get(format!("{}/search?q=warmup&format=json&pageno=1", searxng_url())).send(),
+            prewarm_client.get(format!("{}/embed?text=warmup", intent_engine_url())).send(),
         ];
         if let Some(ref s2_url) = prewarm_searxng2 {
             let url = format!("{}/search?q=warmup&format=json&pageno=1", s2_url);
@@ -14966,8 +14966,8 @@ async fn handle_search(
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
     // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
     // spell correction can never change classification/constraints.
-    let intent_url = format!(format!("{}/analyze", intent_engine_url())?q={}", urlencoding::encode(&q_orig));
-    let embed_url = format!(format!("{}/embed", intent_engine_url())?text={}", urlencoding::encode(&q_orig));
+    let intent_url = format!("{}/analyze?q={}", intent_engine_url(), urlencoding::encode(&q_orig));
+    let embed_url = format!("{}/embed?text={}", intent_engine_url(), urlencoding::encode(&q_orig));
 
     // Retry intent engine up to 2 extra times with backoff.
     // Handles cold-start after container restart (model load takes 5-15s).
@@ -15221,7 +15221,7 @@ async fn handle_search(
         q.clone()
     };
     let indexer_q_encoded = urlencoding::encode(&indexer_q);
-    let indexer_query_raw = format!(format!("{}/search", indexer_url())?q={}", indexer_q_encoded);
+    let indexer_query_raw = format!("{}/search?q={}", indexer_url(), indexer_q_encoded);
 
     let client_ref = &client;
     let circuit_ref = &state.circuit;
@@ -16632,7 +16632,8 @@ async fn handle_search(
         };
         let indexer_q_encoded = urlencoding::encode(&indexer_q);
         let indexer_url_vec = format!(
-            format!("{}/search", indexer_url())?q={}&vector={}",
+            "{}/search?q={}&vector={}",
+            indexer_url(),
             indexer_q_encoded,
             urlencoding::encode(&vec_str)
         );
@@ -19979,7 +19980,7 @@ async fn handle_search_fast(
     }
 
     // Query local index only — no network calls except to indexer
-    let indexer_url = format!(format!("{}/search", indexer_url())?q={}", q_encoded);
+    let indexer_url = format!("{}/search?q={}", indexer_url(), q_encoded);
     let results = match state.http_client.get(&indexer_url).send().await {
         Ok(resp) => {
             match read_json_bounded::<Vec<IndexerResult>>(resp).await {
