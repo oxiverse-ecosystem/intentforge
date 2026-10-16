@@ -23,7 +23,8 @@
   - [GET /inspect](#get-inspect)
   - [GET /geolocate](#get-geolocate)
   - [GET /intent](#get-intent)
-  - [GET /video](#get-video)
+  - [GET /shopping](#get-shopping) (commerce — honest affiliate, no ranking effect)
+  - [POST /commerce/extract](#post-commerceextract) (verification primitive, no monetization)
   - [POST /goals](#post-goals)
   - [POST /goals/quick](#post-goalsquick)
   - [GET /goals/:goal_id](#get-goalsgoal_id)
@@ -1590,24 +1591,14 @@ result:
 - `commerce` — honest product facts extracted from the result's own page
   (`source` is `"json-ld"` / `"og"` / `null`; every sub-field is `Optional`). A
   result whose page exposed no structured product data gets **no** `commerce` block.
-- `commerce_provenance` — `{ url, observed_at, fetched, reason, source, data:null }`
-  for **every** result, so the frontend can label facts and never show a stale price
-  as current. `observed_at` (Unix seconds) is present **only** when the result's own
-  page was actually fetched in this request; otherwise it is `null`, `fetched` is
-  `false`, and `reason` says why: `"fetched"` (page retrieved — `observed_at` is
-  real, even if the page exposed no structured facts), `"fetch_failed"` (a fetch was
-  issued but returned nothing — error, non-2xx, or timeout), or `"not_fetched"`
-  (no fetch was ever issued, e.g. beyond the fetch budget). A client must treat a
-  `null` `observed_at` as "no observation exists", never as "observed now".
+- `commerce_provenance` — `{ url, observed_at, source, data:null }` for **every**
+  result, so the frontend can label facts and never show a stale price as current.
 - `affiliate` — added by the post-rank affiliate engine (see below). When no
   network key is present in the environment, this field is omitted and the result is
   still returned (graceful degradation). When a network with a configured bid floor /
   fallback is used, the block also carries `bid_floor` (the configured floor, for
-  reporting) and, when a fallback is configured AND its host is a real merchant,
-  `fallback` (the fallback URL). Both are `Optional` and **never** influence ranking —
-  see *Bid-floor / fallback (item 6)* and *`fbu` may never point at a documentation
-  host* below. A fallback whose host is IANA documentation space is dropped at load
-  time, so no `fallback` field and no `fbu=` param ever appear for it.
+  reporting) and `fallback` (the fallback URL), both `Optional` and **never**
+  influencing ranking — see *Bid-floor / fallback (item 6)* below.
 - `offer_comparisons` — a top-level array (sibling of `results`) of multi-merchant
   offer groups for the same product, built **read-only** from already-attached
   `commerce` blocks (matched by shared `gtin`/`sku`). See *Offer comparison (item 5)*
@@ -1644,8 +1635,9 @@ Top result (truncated):
   "affiliate": {
     "disclosed": true,
     "network": "Sovrn Commerce",
-    "url": "https://sovrn.co?key=dummy-test-key-do-not-use&u=https%3A%2F%2Fpowersof10.com%2Fbest-wireless-earbuds-under-50%2F&cuid=powersof10.com&bf=0.10",
-    "bid_floor": "0.10"
+    "url": "https://sovrn.co?key=dummy-test-key-do-not-use&u=https%3A%2F%2Fpowersof10.com%2Fbest-wireless-earbuds-under-50%2F&cuid=powersof10.com&bf=0.10&fbu=https%3A%2F%2Fwww.example-merchant.com%2F",
+    "bid_floor": "0.10",
+    "fallback": "https://www.example-merchant.com/"
   }
 ```
 
@@ -1657,115 +1649,10 @@ Top result (truncated):
 > from the network's data-configured `bid_floor` / `fallback_url` fields and are for
 > reporting / fallback only — they never affect ranking.
 
-> **No fabricated fallback destinations.** `fbu` is where a user is *sent* when a
-> link's bid does not clear `bf`. A fallback pointing at an IANA-reserved
-> documentation domain (RFC 2606/6761 — `example.com`, `*.example`, `.test`,
-> `.invalid`, `localhost`, and their subdomains) is not a merchant, so the gateway
-> **rejects it at config load**: the `fallback_url` field is dropped, the network
-> still decorates normally, and no `fbu=` param and no `fallback` field is ever
-> emitted. The shipped config sets `"fallback_url": null`. This checks against a
-> published IANA standard, not a list of merchants — a genuine merchant fallback
-> passes through untouched. Locked in CI by
-> `shipped_affiliate_data_file_has_no_placeholder_fallback` and
-> `placeholder_fallback_never_reaches_a_decorated_result`.
-
 **No-manipulation guarantee (verified live):** the ranked URL order from
 `/shopping` is byte-identical to `/search` for the same query. This is locked in CI
 by a Rust unit test (`enrichment_preserves_result_order_with_or_without_affiliate_keys`
 and `decoration_preserves_ranking_order`).
-
-### Main-path `shopping` field on `/search` (ROADMAP item 7)
-
-The PRIMARY `/search` endpoint now *knows you want to buy*. When the resolved intent
-is commercial, the **same** `/search` JSON response gains a `shopping` field — you do
-not have to visit a separate `/shopping` tab. The block reuses the exact same
-`extract_commerce_offer` + `decorate_affiliate` + `build_offer_comparisons` passes
-already written for `GET /shopping`, applied to a **clone** of the top-N already-ranked
-results. The main `results` ordering is untouched, so the no-manipulation guarantee
-holds for the main path too (the order-invariance test covers it).
-
-**Signal-based detection (no external call, no hardcoded keyword list):** `is_commercial_intent`
-returns true when the in-process intent signals say "wants to buy":
-- the resolved intent `label == "transactional"`, **or**
-- the `transactional` probability in the intent `distribution` is ≥ 0.50 (covers
-  "X vs Y" product queries that resolve to a non-transactional argmax label but carry
-  a strong transactional distribution), **or**
-- a price bound was parsed by the existing constraint parser (`price:<N` / `price:>N`
-  / `price_min` / `price_max`), **or**
-- the query contains a transactional keyword from `data/commerce/signals.json`
-  (whole-word match, data-driven — edit the file to add/remove keywords, no recompile).
-  This is a WEAK signal boost that supplements the intent engine; it never replaces
-  the label/distribution check.
-
-The `shopping` block is surfaced whenever commercial intent is detected, even
-if no upstream page exposed structured product data — every result carries
-`commerce_provenance` (`source: null` => "we checked, nothing") which is the
-honest presentation signal. A result that *did* expose structured data
-additionally carries a `commerce` block with price/currency/availability etc.
-
-**Example (real, verified live 2026-09-24):**
-
-```bash
-curl -s "localhost:4000/search?q=buy%20iphone%2016%20pro%20max%20price&count=8"
-# intent= transactional
-# shopping present= True
-# shopping results= 8
-# first result url= https://www.bestbuy.com/site/all-iphone/iphone-16-pro-max/pc...
-# first affiliate disclosed= True  network= Sovrn Commerce
-# first commerce_provenance source= None  observed= 1790241030
-# first commerce= null  (no structured product markup found on upstream page)
-# third affiliate network= Sovrn Commerce  cuid=www.flipkart.com  bf=0.10
-```
-
-```bash
-curl -s "localhost:4000/search?q=rust%20ownership%20explained"
-# intent= technical  shopping present= False
-```
-
-**Fix applied this round:** `GET /shopping` was using the sequential `enrich_with_commerce`
-(36s for 5 pages → 408 timeout). Switched to the bounded-parallel `enrich_with_commerce_par`
-with a 22s wall cap — same enrichment + decoration pipeline, now consistent with the main-path
-`/search` code path. Every result still carries `commerce_provenance` + `affiliate` with
-`disclosed: true`.
-
-> The `shopping` field carries the same `commerce` / `commerce_provenance` / `affiliate`
-> structure as `GET /shopping`. Every `affiliate` block has `disclosed: true`; no
-> user id / query text / session id / IP ever reaches an affiliate parameter (locked by
-> `test_affiliate_decoration_does_not_change_ranking` + the contract tests in
-> `commerce_contract_tests.rs`).
->
-> **Tuning the presentation cap (post-ROADMAP):** the number of enriched shopping
-> cards surfaced is capped at `mainpath_top_n` (default 8, configurable via
-> `data/commerce/config.json` — no recompile needed). The enrichment window is
-> `COMMERCE_ENRICH_WINDOW = 24` — the number of already-ranked results that are
-> enriched before the display cap is applied. This decoupling is the main-path
-> reachability fix: commercial queries often have bot-checked merchant pages
-> (Amazon/Walmart/Flipkart) in the top 8 with no structured markup, so enriching only 8
-> finds nothing and the strip is suppressed. A wider window (24) lets enrichment reach
-> past those to pages that DO carry product facts. Both values are presentation-only;
-> they never influence ranking, selection, or ordering.
-
-### Snippet-based fallback enrichment (post-ROADMAP)
-
-When the page fetch fails or returns no structured product data, the gateway
-falls back to extracting product facts from the search result snippet (title +
-content). This improves enrichment recall without fabricating facts — all
-snippet-derived facts are marked with `source: "snippet_extracted"` so the
-frontend can label them as less certain than structured data.
-
-The snippet fallback extracts:
-- **Price + currency** — via `extract_price_from_text` (same well-tested function
-  used for HTML price extraction)
-- **Product name** — from the title, truncated at the first delimiter
-  (`|`, `—`, `–`), filtered to exclude question/how-to phrases
-- **Merchant/brand** — from the URL host (with `merchant_observed: false` —
-  derived from the URL, not observed on the page)
-- **Availability** — from snippet text (`"in stock"`, `"out of stock"`, etc.)
-
-All facts are marked with `source: "snippet_extracted"` and proper provenance.
-The `data_has_fact` gate applies: a snippet with no price, no availability, and
-no product name does NOT produce a `commerce` block (merchant alone doesn't
-count — `merchant_observed` is false for URL-derived merchants).
 
 ### POST /commerce/extract
 
@@ -1780,34 +1667,10 @@ would attach, or in tests/fixtures.
 { "html": "<html>…schema.org/Product JSON-LD or OG meta…</html>", "url": "https://store.example.com/p/1" }
 ```
 
-**Response** — a `CommerceBlock` **provenance envelope**, the same shape the rest of
-the commerce surface uses (`commerce_provenance` / `commerce` on `GET /shopping`):
-
-```json
-{
-  "url": "https://store.example.com/p/1",
-  "observed_at": "1790420068",
-  "source": "json-ld",
-  "data": {
-    "price": 29.99,
-    "currency": "USD",
-    "availability": "https://schema.org/InStock",
-    "merchant": "TestStore",
-    "name": "Test Widget"
-  }
-}
-```
-
-- Top level = **provenance**: `url` (the page the facts came from), `observed_at`
-  (Unix seconds, UTC — lets a client label a stale price instead of presenting it as
-  current), `source` (`"json-ld"` / `"og"` / `"none"`), and `data` (the typed facts).
-- `data` = the typed fact fields: `price`, `currency`, `availability`, `merchant`,
-  `condition`, `sku`, `gtin`, `rating`, `price_low`, `price_high`, `offer_count`,
-  `author`, `isbn`, `event_start`, `event_location`.
-- All fact fields are `Optional`. If the page has no structured product data, `data`
-  is `null` (no guess). For an `Event` page, `event_start` (ISO 8601 `startDate`) and
-  `event_location` (`location.name` or `location.address`) are extracted from the same
-  typed structured signals.
+**Response** — a `CommerceOffer` JSON object (`price`, `currency`, `availability`,
+`merchant`, `condition`, `sku`, `gtin`, `rating`, `price_low`, `price_high`,
+`offer_count`, `observed_at`, `source`). All fields `Optional`. If the page has no
+structured product data, the returned object carries `null` for every fact (no guess).
 
 **Honesty properties (locked by unit tests):**
 
@@ -1839,22 +1702,12 @@ after the ranked order is fixed, so they cannot move a result. Adding `bf`/`fbu`
 support for a new network is a pure data edit (no recompile); the dev config already
 sets `bid_floor: "0.10"` on the Sovrn row.
 
-**`fallback_url` is validated at config load (2026-09-25).** Because `fbu` is a
-destination a user is actually *sent* to, a placeholder value there is a
-fabricated merchant. `AffiliateCtx::load()` now drops any `fallback_url` whose
-host is an IANA-reserved documentation domain (RFC 2606/6761: `example.com`,
-`example.net`, `example.org`, `example`, `test`, `invalid`, `localhost`, and any
-subdomain of those). The network row itself is kept, so decoration and `bf`
-still work — only the unusable fallback is discarded. The shipped Sovrn row
-therefore sets `"fallback_url": null`.
-
-**Verified live** (`GET /shopping?q=sony%20wh-1000xm5%20headphones`, decoration ON
-with the dev key) — the `fbu=` param and the `fallback` field are both gone,
-`bf` and disclosure are unaffected:
+**Verified live** (`GET /shopping?q=sony%20wh-1000xm5%20headphones`, 6 results,
+decoration ON with the dev key):
 
 ```
-affiliate sample keys: ['bid_floor', 'disclosed', 'network', 'url']
-bid_floor = 0.10   disclosed = true   (no fbu=, no fallback)
+affiliate sample keys: ['bid_floor', 'disclosed', 'fallback', 'network', 'url']
+bid_floor = 0.10   fallback = https://www.example-merchant.com/   disclosed = true
 ```
 
 #### Offer comparison (item 5, 2026-08-29)
@@ -2117,16 +1970,22 @@ Returns all goals sorted by score (descending). Max 50 entries.
   {
     "goal_id": "goal_0001",
     "goal": "build a full-stack web app...",
+    "goal_id": "goal_0003",
+    "goal": "learn rust programming language",
     "user_name": "Anonymous",
     "score": 0,
     "completed_phases": 0,
     "total_phases": 4,
     "created_at": "2026-07-29T12:00:00Z"
+    "created_at": "2026-08-25T07:44:57Z"
   }
 ]
 ```
 
 > Note: the response is the list of entries directly. There is no `{"entries": [...], "total_entries": N}` wrapper — `len(response)` gives the entry count and each element is a goal object.
+The response is a **bare JSON array** (NOT an `{"entries":[...],"total_entries":N}` wrapper). The
+above is an actual live response captured after `POST /goals` → `POST /goals/:id/answers` generated
+a roadmap. The entry count is `len(array)`. Max 50 entries, sorted by `score` descending.
 
 ---
 

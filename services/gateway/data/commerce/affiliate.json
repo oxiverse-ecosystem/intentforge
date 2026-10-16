@@ -13,8 +13,7 @@
       "key_env": "SOVRN_COMMERCE_KEY",
       "param_env": {},
       "bid_floor": "0.10",
-      "fallback_url": null,
-      "bid_check_url": "https://api.viglink.com/api/bid?key={key}&out={url}"
+      "fallback_url": "https://www.example-merchant.com/"
     },
     {
       "id": "skimlinks",
@@ -55,17 +54,6 @@
       "params": { "tag": "{key}" },
       "key_env": "AMAZON_ASSOCIATES_TAG",
       "param_env": {}
-    },
-    {
-      "id": "rakuten_advertising",
-      "kind": "wrap",
-      "enabled": true,
-      "priority": 60,
-      "network": "Rakuten Advertising",
-      "template": "https://click.linksynergy.com/deeplink?id={key}&mid={param:merchant_id}&murl={url}",
-      "params": {},
-      "key_env": "RAKUTEN_LINKSYNERGY_ID",
-      "param_env": { "merchant_id": "RAKUTEN_MERCHANT_ID" }
     }
   ]
 }
