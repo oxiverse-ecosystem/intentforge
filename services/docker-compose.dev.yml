@@ -118,7 +118,6 @@ services:
       - ./privacy-layer/tor/data:/var/lib/tor
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
     restart: always
-    mem_limit: 128m
     mem_reservation: 64m
     logging:
       driver: "json-file"
@@ -146,7 +145,6 @@ services:
         aliases:
           - searxng2
     restart: always
-    mem_limit: 128m
     mem_reservation: 64m
     logging:
       driver: "json-file"
@@ -175,7 +173,6 @@ services:
       - ./meta-search-engines/searxng/searxng:/etc/searxng:rw
       - ./shared-signals/resolv-searxng-host.conf:/etc/resolv.conf:ro
     restart: always
-    mem_limit: 768m
     mem_reservation: 256m
     cap_drop:
       - ALL
@@ -205,7 +202,6 @@ services:
     volumes:
       - ./meta-search-engines/searxng/searxng2:/etc/searxng:rw
     restart: always
-    mem_limit: 768m
     mem_reservation: 256m
     cap_drop:
       - ALL
@@ -224,7 +220,6 @@ services:
     mem_limit: 512m
     image: postgres:14-alpine
     restart: always
-    mem_limit: 256m
     mem_reservation: 128m
     environment:
       - POSTGRES_DB=invidious
@@ -237,7 +232,6 @@ services:
     container_name: if-dev-invidious
     mem_limit: 512m
     image: quay.io/invidious/invidious:latest
-    mem_limit: 512m
     mem_reservation: 256m
     depends_on:
       - invidious-db
