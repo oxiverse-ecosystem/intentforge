@@ -4986,12 +4986,17 @@ async fn handle_shopping(
             // the call in `async move` moves the cloned client and the owned `url` into the
             // future, so no borrow escapes.
             let http_client = state.http_client.clone();
-            enrich_with_commerce(arr, move |url: String| {
-                let client = http_client.clone();
-                async move {
-                    fetch_page_html(&client, &url).await
-                }
-            }).await;
+            enrich_with_commerce_par(
+                arr,
+                move |url: String| {
+                    let client = http_client.clone();
+                    async move {
+                        fetch_page_html(&client, &url).await
+                    }
+                },
+                Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            )
+            .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
             decorate_affiliate(arr, &state.affiliate_ctx);
             // ROADMAP item 5: read-only multi-merchant offer comparison built from the
@@ -11678,140 +11683,7 @@ fn merge_local_and_web(
         };
 
         let p2d_mult = if p2d_offtopic { 0.05 } else { 1.0 };
-        // IF-15: entity-aware ranking signal for transactional queries.
-        // When a product entity is detected (e.g. "macbook air m2"), boost results
-        // that mention the entity and demote those that don't. This prevents
-        // irrelevant recipe/commercial pages from outranking actual product pages.
-        let entity_mult = if !product_entities.is_empty() {
-            entity_match_score(&r.title, &r.content, &r.url, &product_entities)
-        } else {
-            1.0
-        };
-        // IF-15: retailer/vendor boost for transactional queries with product entities.
-        // When intent=transactional AND a product entity is detected, boost results
-        // from known retailer/vendor domains (amazon, bestbuy, apple, etc.) that
-        // mention the exact model. This ensures product pages from reputable stores
-        // outrank generic commercial pages (recipe sites, unrelated marketplaces).
-        let retailer_boost = if !product_entities.is_empty() && intent == "transactional" {
-            if let Ok(parsed_url) = reqwest::Url::parse(&r.url) {
-                if let Some(host) = parsed_url.host_str() {
-                    if is_retailer_host(host) {
-                        // Retailer domain: additional boost on top of entity match
-                        // Strong entity match → extra boost, weak match → smaller boost
-                        if entity_mult > 1.2 { 1.30 }
-                        else if entity_mult > 0.8 { 1.15 }
-                        else { 1.0 }
-                    } else { 1.0 }
-                } else { 1.0 }
-            } else { 1.0 }
-        } else { 1.0 };
-        // Phrase-fidelity gate (P12): penalize results whose title matches
-        // only scattered single tokens from a multi-word phrase. A query like
-        // "zero knowledge proof" should NOT match "0 - Wikipedia" just because
-        // "zero" is present. Compute the longest contiguous run of strong
-        // distinctive terms in the result title; if the query has a 2+ term
-        // run but the title has no 2+ contiguous run, apply a soft penalty
-        // (×0.55) so the result stays but ranks below genuine phrase matches.
-        let phrase_fidelity_mult = if !query_strong_runs.is_empty() {
-            let title_lower = r.title.to_lowercase();
-            let title_words: Vec<&str> = title_lower.split_whitespace().collect();
-            // Check if any query run appears as a contiguous subsequence
-            let mut max_run_len = 0usize;
-            for run in &query_strong_runs {
-                if run.len() < 2 { continue; }
-                // Sliding window: check if run appears contiguously in title_words
-                for window in title_words.windows(run.len()) {
-                    if window.iter().all(|w| run.iter().any(|s| s.as_str() == *w)) {
-                        max_run_len = max_run_len.max(run.len());
-                        break;
-                    }
-                }
-            }
-            if max_run_len >= 2 {
-                1.0 // contiguous phrase match found — full weight
-            } else {
-                // No contiguous phrase match — penalize so scattered-token
-                // pages rank below ones that contain the actual phrase.
-                0.55
-            }
-        } else {
-            1.0
-        };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * entity_mult * phrase_fidelity_mult * retailer_boost;
-
-        // ── Modifier-word demotion (P1-FIXIF08 analog) ──
-        // Common English modifier words ("possible", "effective", "traditional", "learn",
-        // "quiet") are SEARCH MODIFIERS, not the user's intended search target — the query
-        // also contains a more specific topical entity. Results that rank purely because
-        // they contain the modifier (dictionary entries, companies named after the word,
-        // thesaurus pages) must be demoted below results that name the actual topic.
-        // Same structural signal as the superlative penalty (FIX-IF-08): the result's TITLE
-        // contains the modifier word but NONE of the core topic terms. When the modifier
-        // IS the only substantive word in the query (no other topic words), the gate does
-        // not fire — "what is effective" genuinely wants the definition.
-        // Word class only — no per-query literals, no brand/domain lists.
-        let general_modifier_terms: &[&str] = &[
-            "possible", "impossible", "effective", "ineffective", "efficient", "inefficient",
-            "traditional", "untraditional", "conventional", "practical", "impractical",
-            "learn", "learning", "quiet", "loud", "fast", "slow", "easy", "difficult",
-            "hard", "simple", "complex", "cheap", "expensive", "good", "bad",
-            "better", "worse", "worst", "great", "small", "large", "big", "tiny",
-            "old", "new", "young", "hot", "cold", "warm", "cool", "safe", "unsafe",
-            "dangerous", "risky", "reliable", "unreliable", "stable", "unstable",
-            "accurate", "inaccurate", "exact", "precise", "correct", "incorrect", "wrong",
-            "right", "proper", "improper", "appropriate", "inappropriate", "relevant",
-            "irrelevant", "useful", "useless", "helpful", "powerful",
-            "powerless", "strong", "weak", "active", "inactive",
-            "passive", "busy", "occupied", "empty", "full", "complete",
-            "incomplete", "perfect", "imperfect", "ideal", "realistic", "unrealistic",
-            "reasonable", "unreasonable", "fair", "unfair", "just", "unjust", "legal",
-            "illegitimate", "invalid", "formal",
-            "informal", "official", "unofficial", "public", "private", "personal",
-            "professional", "casual", "serious", "trivial", "major", "minor", "significant",
-            "insignificant", "important", "unimportant", "necessary", "unnecessary",
-            "essential", "nonessential", "optional", "mandatory", "voluntary", "automatic",
-            "manual", "natural", "artificial", "synthetic", "organic", "inorganic",
-            "physical", "mental", "emotional", "rational", "irrational", "logical",
-            "illogical", "experimental", "empirical",
-        ];
-        let modifier_word_in_query = q_words.iter().any(|w| {
-            general_modifier_terms.contains(&w.to_lowercase().as_str())
-        });
-        // Only fire when the modifier is NOT the only topical query word — there must be
-        // at least one strong distinctive term besides the modifier itself. Otherwise we
-        // would demote definition pages for a bare "what is X" query, which is wrong.
-        let modifier_not_search_target = modifier_word_in_query
-            && !strong_distinctive_terms.is_empty()
-            && strong_distinctive_terms.iter().any(|t| {
-                !general_modifier_terms.contains(&t.to_lowercase().as_str())
-            });
-        let modifier_demotion_mult = if modifier_not_search_target {
-            let active_modifiers: Vec<&str> = q_words
-                .iter()
-                .filter(|w| general_modifier_terms.contains(&w.to_lowercase().as_str()))
-                .map(|w| *w)
-                .collect();
-            let title_has_modifier = active_modifiers.iter().any(|m| title_lower.contains(m));
-            let title_has_topic = core_topic_terms.iter().any(|t| {
-                let tl = t.to_lowercase();
-                title_lower.contains(&tl) || title_lower.contains(tl.trim_end_matches('s'))
-            });
-            if title_has_modifier && !title_has_topic {
-                0.45 // same demotion factor as the superlative penalty
-            } else {
-                1.0
-            }
-        } else {
-            1.0
-        };
-        r.score *= modifier_demotion_mult;
-        if modifier_demotion_mult < 1.0 {
-            tracing::info!(
-                "MODIFIER-WORD DEMOTION: '{}' (score ×{:.2}) — title mentions the query's modifier word but not its topic",
-                title_lower.chars().take(50).collect::<String>(),
-                modifier_demotion_mult
-            );
-        }
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * audio_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult;
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
@@ -22678,6 +22550,94 @@ mod spellcheck_endpoint_tests {
             // (has_video_intent checks for these phrases, matching live /search).
             let stripped = simple_negation_strip("watch video tutorial").unwrap_or("watch video tutorial".to_string());
             assert!(has_video_intent(&stripped));
+        }
+    }
+
+    // -- audio demotion tests (mirrors video_endpoint_tests pattern) --
+    // Locks the audio-classification pure fns: has_audio_intent, is_url_audio_host.
+    // These mirror the P8 video tests — same structural host-class check.
+    mod audio_demotion_tests {
+        use super::*;
+
+        #[test]
+        fn audio_news_query_returns_pin_true() {
+            let res = build_audio_inspect("what happened in the ipl auction today");
+            assert_eq!(res["query"].as_str(), Some("what happened in the ipl auction today"));
+            assert_eq!(res["audio_intent"].as_bool(), Some(false));
+            assert_eq!(res["would_pin_non_audio_sources"].as_bool(), Some(true));
+            assert_eq!(res["intent"].as_str(), Some("informational"));
+        }
+
+        #[test]
+        fn audio_podcast_query_exempts_from_pin() {
+            let res = build_audio_inspect("ipl auction podcast discussion");
+            assert_eq!(res["audio_intent"].as_bool(), Some(true));
+            assert_eq!(res["would_pin_non_audio_sources"].as_bool(), Some(false));
+        }
+
+        #[test]
+        fn audio_is_audio_source_examples_match_is_url_audio_host() {
+            let res = build_audio_inspect("some query");
+            let ex = &res["is_audio_source_examples"];
+            assert_eq!(ex["apple_podcasts"], serde_json::json!(true));
+            assert_eq!(ex["anchor_fm"], serde_json::json!(true));
+            assert_eq!(ex["soundcloud"], serde_json::json!(true));
+            assert_eq!(ex["spotify_episode"], serde_json::json!(true));
+            assert_eq!(ex["podcast_word_in_path"], serde_json::json!(false));
+            assert_eq!(ex["python_org_article"], serde_json::json!(false));
+        }
+
+        #[test]
+        fn audio_empty_query_returns_documented_envelope() {
+            // Empty / whitespace q must return an audio-shaped empty_query
+            // envelope (neutral audio_intent + markers present), NOT a 200 with
+            // a classified result.
+            let res = build_audio_empty();
+            assert_eq!(res["error"].as_str(), Some("empty_query"));
+            assert_eq!(res["message"].as_str(), Some("Query parameter 'q' is empty"));
+            assert_eq!(res["query"].as_str(), Some(""));
+            assert_eq!(res["audio_intent"].as_bool(), Some(false));
+            assert_eq!(res["would_pin_non_audio_sources"].as_bool(), Some(true));
+        }
+
+        #[test]
+        fn audio_response_shape_matches_docs() {
+            // Locks the documented top-level keys so the contract cannot drift.
+            let res = build_audio_inspect("best podcast for rust async");
+            for key in [
+                "query", "audio_intent", "audio_intent_markers",
+                "would_pin_non_audio_sources", "is_audio_source_examples",
+                "intent", "note",
+            ] {
+                assert!(res.get(key).is_some(), "missing /audio top-level key: {}", key);
+            }
+            assert_eq!(
+                res["audio_intent_markers"],
+                serde_json::json!(audio_intent_markers())
+            );
+        }
+
+        #[test]
+        fn audio_podcast_phrase_triggers_audio_intent() {
+            // "podcast" must be detected as audio intent (has_audio_intent
+            // checks for these markers, matching live /search).
+            assert!(has_audio_intent("best podcast for rust async"));
+            assert!(has_audio_intent("listen to this episode"));
+            assert!(has_audio_intent("audio book recommendations"));
+            assert!(has_audio_intent("radio stations online"));
+            assert!(!has_audio_intent("what happened in the ipl auction today"));
+        }
+
+        #[test]
+        fn audio_is_url_audio_host_matches_known_platforms() {
+            // Mirrors the video is_url_video_host tests — known audio platforms
+            // must be detected; unrelated URLs must not.
+            assert!(is_url_audio_host("https://podcasts.apple.com/us/podcast/ep123"));
+            assert!(is_url_audio_host("https://anchor.fm/show/episodes/ep123"));
+            assert!(is_url_audio_host("https://soundcloud.com/artist/track"));
+            assert!(is_url_audio_host("https://open.spotify.com/episode/abc123"));
+            assert!(!is_url_audio_host("https://docs.python.org/3/tutorial/"));
+            assert!(!is_url_audio_host("https://example.com/podcast-guide-article"));
         }
     }
 }
