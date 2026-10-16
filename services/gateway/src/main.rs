@@ -685,16 +685,6 @@ struct MergedResult {
     #[serde(skip)]
     engine_trust_mult: f32,
 
-    /// Honest product facts extracted by the /shopping pipeline from the result's
-    /// own page. Only present when the page exposed structured product data.
-    /// NEVER carries a fact not extracted from this exact URL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    commerce: Option<CommerceBlock<OfferFacts>>,
-    /// Provenance for the commerce block: the source URL it was extracted from and
-    /// when. Kept separate so the frontend can attribute facts to a page even when
-    /// `commerce` itself is null (e.g. "we looked, found nothing on that URL").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    commerce_provenance: Option<CommerceBlock<()>>,
 }
 
 fn default_f32_one() -> f32 { 1.0 }
@@ -9639,9 +9629,7 @@ fn merge_local_and_web(
             currency: r.currency,
             quality: r.quality,
             post_cal_cap: None,
-            engine_trust_mult: 1.0,
-            commerce: None,
-            commerce_provenance: None,
+                engine_trust_mult: 1.0,
         };
         url_to_idx.insert(norm, merged.len());
         merged.push(entry);
@@ -9698,8 +9686,6 @@ fn merge_local_and_web(
                 quality: 1.0,
                 post_cal_cap: None,
                 engine_trust_mult: 1.0,
-                commerce: None,
-                commerce_provenance: None,
             };
             url_to_idx.insert(norm, merged.len());
             merged.push(entry);
@@ -12971,6 +12957,110 @@ fn compute_recall_gap_terms(
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+
+/// Generic stopwords shared by the recall-gap / distinctive-term extractors.
+/// A general, fixed set (no query/domain-specific entries) so the gap signal
+/// never keys on a particular phrase. Mirrors the broad stopword philosophy
+/// used by the off-topic guard's distinctive-term set.
+fn recall_gap_stopwords() -> std::collections::HashSet<&'static str> {
+    [
+        // articles / conjunctions / prepositions
+        "the", "a", "an", "and", "or", "but", "if", "then", "else", "of", "to",
+        "in", "on", "at", "by", "for", "with", "without", "from", "into", "onto",
+        "as", "is", "are", "was", "were", "be", "been", "being", "it", "this",
+        "that", "these", "those", "my", "your", "our", "their", "his", "her",
+        "i", "you", "he", "she", "we", "they", "me", "us", "him", "them",
+        // common question / framing verbs and helpers
+        "how", "what", "when", "where", "why", "who", "which", "way", "ways",
+        "best", "good", "great", "better", "top", "free", "cheap", "easy",
+        "simple", "quick", "fast", "new", "recent", "latest", "safe", "natural",
+        "home", "house", "make", "making", "get", "getting", "use", "using",
+        "find", "finding", "help", "need", "want", "like", "near", "nearby",
+        // negations (handled as constraints, not recall gaps)
+        "not", "no", "without", "except", "besides", "minus", "other", "than",
+        "nor",
+        // temporal fillers (fresh intent keys off these; not a topical gap)
+        "today", "tonight", "now", "this", "week", "weeks", "month", "months",
+        "year", "years", "day", "days", "past", "last", "upcoming",
+    ]
+    .iter()
+    .copied()
+    .collect()
+}
+
+
+/// Extract the salient (distinctive) query terms worth checking for recall
+/// coverage. These are the query's content-bearing words after removing
+/// generic stopwords, weak anchor words, pure numbers, and single chars.
+/// Pure function of the query — no per-query strings, no domain lists.
+fn distinctive_query_terms(query: &str) -> Vec<String> {
+    let stops = recall_gap_stopwords();
+    query
+        .split_whitespace()
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            lower.len() >= 3
+                && !stops.contains(lower.as_str())
+                && !is_weak_anchor_word(&lower)
+                && !lower.chars().all(|c| c.is_ascii_digit())
+        })
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+
+/// Honest recall-gap detector (round-2026-08-12T1234Z D2 disposition).
+///
+/// Given the final merged results and the original query, returns the subset of
+/// the query's distinctive terms that appear in NONE of the returned results'
+/// title/content/url. Those terms represent facets of the query the upstream
+/// index could not supply — an honest signal to the user, NOT a ranking defect
+/// and NOT a reason to fabricate a result. When the empty/!single-doc-facet
+/// case (e.g. a single leading result that legitimately dominates) would be
+/// mis-flagged, the caller decides; this fn is pure and general.
+///
+/// Returns `None` when there are no results at all (nothing to compare against)
+/// so the signal is never emitted for an empty SERP (that's a different problem
+/// class — see `warnings`).
+fn compute_recall_gap_terms(
+    query: &str,
+    results: &[MergedResult],
+) -> Option<Vec<String>> {
+    if results.is_empty() {
+        return None;
+    }
+    let topics = distinctive_query_terms(query);
+    if topics.is_empty() {
+        return None;
+    }
+    // Build one lowercase haystack per result (title + content preview + url),
+    // matching the off-topic guard's overlap check shape.
+    let covered: std::collections::HashSet<String> = results
+        .iter()
+        .map(|r| {
+            let preview = r.content.chars().take(500).collect::<String>();
+            format!(
+                "{} {} {}",
+                r.title.to_lowercase(),
+                preview.to_lowercase(),
+                r.url.to_lowercase()
+            )
+        })
+        .collect::<std::collections::HashSet<String>>();
+
+    let missing: Vec<String> = topics
+        .into_iter()
+        .filter(|t| !covered.iter().any(|hay| hay.contains(t.as_str())))
+        .collect();
+
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing)
+    }
+}
+
+
 async fn main() {
     tracing_subscriber::fmt::init();
 
@@ -18510,7 +18600,6 @@ let mut results = match tokio::task::spawn_blocking(move || {
             && (sc.price_lt.is_some() || sc.price_gt.is_some() || sc.price_min.is_some() || sc.price_max.is_some())
         { Some(priced_result_count) } else { None },
         recall_gap_terms,
-        shopping: shopping_block.clone(),
     };
 
     // Cache for 5 minutes — but never cache empty results
@@ -19493,9 +19582,7 @@ async fn handle_search_fast(
                         currency: r.currency,
                         quality: r.quality,
                         post_cal_cap: None,
-                        engine_trust_mult: 1.0,
-                        commerce: None,
-                        commerce_provenance: None,
+                engine_trust_mult: 1.0,
                     }).collect::<Vec<_>>()
                 }
                 None => vec![]
