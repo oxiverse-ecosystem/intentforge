@@ -76,21 +76,38 @@ const PROTECTED_TERMS: &[&str] = &[
     // Food & cooking terms that collide with English words / tech terms
     "batter", "dosa", "idli", "vada", "poha", "upma", "biryani", "tandoori",
     "masala", "chutney", "achar", "ghee", "besan", "rava", "semolina",
-    // Non-media brands at edit-distance 1 from dictionary words
-    // (identified by systematic scan: brand vs 15k dictionary word at dist 1)
-    // Tech / software / platforms
-    "canva", "zoho", "webex", "quora", "roam", "vimeo", "tubi",
-    "twitch", "weebly", "pinterest", "gooten", "appletv", "hyperv",
-    "mediatek", "irobot", "icloud", "istock", "pexels",
-    // Automotive / hardware
-    "tesla", "skoda", "opel", "tata", "ktm", "jbl", "asics", "burrow",
-    "oster", "miele", "lowes", "lidl", "aldi", "kroger",
-    // Consumer goods / food / beverage
-    "levis", "oreo", "sprite", "fanta", "dole", "lays", "parle", "zara",
-    "lux", "joes", "kraft", "quaker", "garnier", "hulu",
-    // Other brands / services
-    "accor", "aew", "britannia", "clank", "etsy", "ikea", "klm", "moz",
-    "oyo", "pubg", "tmobile", "vrv",
+    // Non-media brands at edit-distance 1 from dictionary words (brand-corruption class)
+    // Streaming / media brands
+    "spotify", "netflix", "tiktok", "hulu", "sling", "deezer", "pandora",
+    "soundcloud", "bandcamp", "audible", "kindle", "kobo", "nook",
+    "tidal", "youtube", "twitch", "instagram", "facebook", "twitter",
+    "linkedin", "snapchat", "reddit", "pinterest", "whatsapp", "telegram",
+    "signal", "skype", "zoom", "teams", "webex", "gdrive", "dropbox",
+    "icloud", "pcloud", "onedrive", "shopify", "squarespace", "wix",
+    "weebly", "jira", "trello", "asana", "confluence", "zeplin",
+    "sketch", "invision", "postman", "insomnia", "bitbucket", "jenkins",
+    "eslint", "prettier", "husky", "jest", "mocha", "cypress", "playwright",
+    "selenium", "appium", "babel", "rollup", "swc", "yarn", "mpv",
+    "spacex", "tesla", "rivian", "polestar", "lucid", "boeing", "airbus",
+    "nvidia", "qualcomm", "broadcom", "mediatek", "salesforce", "hubspot",
+    "zendesk", "freshdesk", "mailchimp", "sendgrid", "twilio", "paypal",
+    "square", "adyen", "braintree", "linode", "vultr", "akamai", "fastly",
+    "nordvpn", "expressvpn", "surfshark", "cyberghost", "ipvanish",
+    "protonvpn", "duckduckgo", "ecosia", "startpage", "qwant", "yandex",
+    "baidu", "naver", "threema", "vivaldi", "opera", "firefox", "safari",
+    "samsung", "xiaomi", "oppo", "vivo", "oneplus", "realme", "nokia",
+    "motorola", "lenovo", "asus", "acer", "dell", "sony", "panasonic",
+    "philips", "toshiba", "hitachi", "canon", "nikon", "fujifilm",
+    "olympus", "gopro", "volvo", "bmw", "mercedes", "audi", "porsche",
+    "ferrari", "lamborghini", "toyota", "honda", "nissan", "mazda",
+    "subaru", "hyundai", "kia", "volkswagen", "peugeot", "renault",
+    "fiat", "jeep", "gmc", "cadillac", "lincoln", "buick", "chrysler",
+    "dodge", "acura", "infiniti", "lexus", "genesis", "jaguar", "mini",
+    "smart", "maserati", "bentley", "suzuki", "isuzu", "daihatsu",
+    "perodua", "tata", "mahindra", "maruti", "steam", "gog", "origin",
+    "uplay", "xbox", "playstation", "nintendo", "sega", "atari",
+    "commodore", "lastpass", "bitwarden", "dashlane", "brave", "proton",
+    "threema", "potplayer", "kmplayer",
 ];
 
 /// Returns true if `word` is a protected brand/entity that must never be
@@ -1720,415 +1737,1065 @@ mod tests {
         assert_eq!(index.correct("ngnix"), Some("nginx".to_string()));
     }
 
-    // ─── Non-media brand corruption tests (2026-10-12) ────────────────
-    // These brands are at edit-distance 1 from common dictionary words and
-    // must NEVER be spell-corrected. Identified by systematic scan of the
-    // 15k dictionary against common brand/product names.
+    // ─── Non-media brand corruption tests (2026-10-12) ─────────────────
+    // These brands are at edit-distance 1 from dictionary words and were
+    // being corrupted by the spell corrector (e.g. "deezer" -> "deeper",
+    // "qwant" -> "want", "sling" -> "selling", "webex" -> "weber").
+    // Adding them to PROTECTED_TERMS prevents this class of corruption.
 
     #[test]
-    fn test_canva_not_corrected_to_canvas() {
-        // "canva" (design platform) is edit-distance 1 from "canvas"
+    fn test_deezer_not_corrected_to_deeper() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("canva"), None,
-            "canva must NOT be corrected to canvas");
+        assert_eq!(index.correct("deezer"), None,
+            "deezer must NOT be corrected to deeper");
     }
 
     #[test]
-    fn test_tesla_not_corrected() {
-        // "tesla" (car brand) is edit-distance 1 from "testa"/"tesla" variants
+    fn test_qwant_not_corrected_to_want() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("tesla"), None,
-            "tesla must NOT be corrected");
+        assert_eq!(index.correct("qwant"), None,
+            "qwant must NOT be corrected to want");
     }
 
     #[test]
-    fn test_oreo_not_corrected() {
-        // "oreo" (cookie brand) is edit-distance 1 from "treo"/"oreo" variants
+    fn test_sling_not_corrected_to_selling() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("oreo"), None,
-            "oreo must NOT be corrected");
-    }
-
-    #[test]
-    fn test_sprite_not_corrected_to_spite() {
-        // "sprite" (soft drink) is edit-distance 1 from "spite"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("sprite"), None,
-            "sprite must NOT be corrected to spite");
-    }
-
-    #[test]
-    fn test_twitch_not_corrected_to_witch() {
-        // "twitch" (streaming platform) is edit-distance 1 from "witch"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("twitch"), None,
-            "twitch must NOT be corrected to witch");
-    }
-
-    #[test]
-    fn test_levis_not_corrected_to_elvis() {
-        // "levis" (jeans brand) is edit-distance 1 from "elvis"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("levis"), None,
-            "levis must NOT be corrected to elvis");
-    }
-
-    #[test]
-    fn test_hulu_not_corrected_to_hull() {
-        // "hulu" (streaming service) is edit-distance 1 from "hull"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("hulu"), None,
-            "hulu must NOT be corrected to hull");
-    }
-
-    #[test]
-    fn test_quora_not_corrected_to_quota() {
-        // "quora" (Q&A platform) is edit-distance 1 from "quota"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("quora"), None,
-            "quora must NOT be corrected to quota");
-    }
-
-    #[test]
-    fn test_pinterest_not_corrected_to_interest() {
-        // "pinterest" (social platform) is edit-distance 1 from "interest"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("pinterest"), None,
-            "pinterest must NOT be corrected to interest");
-    }
-
-    #[test]
-    fn test_ikea_not_corrected_to_idea() {
-        // "ikea" (furniture brand) is edit-distance 1 from "idea"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("ikea"), None,
-            "ikea must NOT be corrected to idea");
-    }
-
-    #[test]
-    fn test_roam_not_corrected_to_roma() {
-        // "roam" (note-taking app) is edit-distance 1 from "roma"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("roam"), None,
-            "roam must NOT be corrected to roma");
-    }
-
-    #[test]
-    fn test_vimeo_not_corrected_to_video() {
-        // "vimeo" (video platform) is edit-distance 1 from "video"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("vimeo"), None,
-            "vimeo must NOT be corrected to video");
-    }
-
-    #[test]
-    fn test_zara_not_corrected_to_para() {
-        // "zara" (clothing brand) is edit-distance 1 from "para"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("zara"), None,
-            "zara must NOT be corrected to para");
-    }
-
-    #[test]
-    fn test_lux_not_corrected() {
-        // "lux" (soap brand) is edit-distance 1 from "aux"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("lux"), None,
-            "lux must NOT be corrected");
-    }
-
-    #[test]
-    fn test_etsy_not_corrected_to_easy() {
-        // "etsy" (marketplace) is edit-distance 1 from "easy"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("etsy"), None,
-            "etsy must NOT be corrected to easy");
-    }
-
-    #[test]
-    fn test_garnier_not_corrected_to_garner() {
-        // "garnier" (cosmetics brand) is edit-distance 1 from "garner"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("garnier"), None,
-            "garnier must NOT be corrected to garner");
-    }
-
-    #[test]
-    fn test_opel_not_corrected_to_open() {
-        // "opel" (car brand) is edit-distance 1 from "open"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("opel"), None,
-            "opel must NOT be corrected to open");
-    }
-
-    #[test]
-    fn test_kraft_not_corrected_to_draft() {
-        // "kraft" (food brand) is edit-distance 1 from "draft"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("kraft"), None,
-            "kraft must NOT be corrected to draft");
-    }
-
-    #[test]
-    fn test_lays_not_corrected_to_says() {
-        // "lays" (chip brand) is edit-distance 1 from "says"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("lays"), None,
-            "lays must NOT be corrected to says");
-    }
-
-    #[test]
-    fn test_dole_not_corrected_to_doll() {
-        // "dole" (food brand) is edit-distance 1 from "doll"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("dole"), None,
-            "dole must NOT be corrected to doll");
-    }
-
-    #[test]
-    fn test_fanta_not_corrected_to_santa() {
-        // "fanta" (soft drink) is edit-distance 1 from "santa"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("fanta"), None,
-            "fanta must NOT be corrected to santa");
-    }
-
-    #[test]
-    fn test_tata_not_corrected_to_data() {
-        // "tata" (conglomerate) is edit-distance 1 from "data"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("tata"), None,
-            "tata must NOT be corrected to data");
-    }
-
-    #[test]
-    fn test_aldi_not_corrected_to_ali() {
-        // "aldi" (supermarket) is edit-distance 1 from "ali"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("aldi"), None,
-            "aldi must NOT be corrected to ali");
-    }
-
-    #[test]
-    fn test_lidl_not_corrected() {
-        // "lidl" (supermarket) is edit-distance 1 from "lid"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("lidl"), None,
-            "lidl must NOT be corrected");
-    }
-
-    #[test]
-    fn test_lowes_not_corrected_to_lower() {
-        // "lowes" (home improvement) is edit-distance 1 from "lower"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("lowes"), None,
-            "lowes must NOT be corrected to lower");
-    }
-
-    #[test]
-    fn test_kroger_not_corrected_to_roger() {
-        // "kroger" (supermarket) is edit-distance 1 from "roger"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("kroger"), None,
-            "kroger must NOT be corrected to roger");
-    }
-
-    #[test]
-    fn test_tubi_not_corrected_to_tube() {
-        // "tubi" (streaming service) is edit-distance 1 from "tube"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("tubi"), None,
-            "tubi must NOT be corrected to tube");
-    }
-
-    #[test]
-    fn test_weebly_not_corrected_to_weekly() {
-        // "weebly" (website builder) is edit-distance 1 from "weekly"
-        let index = SymSpellIndex::build();
-        assert_eq!(index.correct("weebly"), None,
-            "weebly must NOT be corrected to weekly");
+        assert_eq!(index.correct("sling"), None,
+            "sling must NOT be corrected to selling");
     }
 
     #[test]
     fn test_webex_not_corrected_to_weber() {
-        // "webex" (video conferencing) is edit-distance 1 from "weber"
         let index = SymSpellIndex::build();
         assert_eq!(index.correct("webex"), None,
             "webex must NOT be corrected to weber");
     }
 
     #[test]
-    fn test_miele_not_corrected_to_mile() {
-        // "miele" (appliance brand) is edit-distance 1 from "mile"
+    fn test_gdrive_not_corrected_to_drive() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("miele"), None,
-            "miele must NOT be corrected to mile");
+        assert_eq!(index.correct("gdrive"), None,
+            "gdrive must NOT be corrected to drive");
     }
 
     #[test]
-    fn test_oster_not_corrected_to_foster() {
-        // "oster" (kitchen appliance) is edit-distance 1 from "foster"
+    fn test_zeplin_not_corrected_to_zeppelin() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("oster"), None,
-            "oster must NOT be corrected to foster");
+        assert_eq!(index.correct("zeplin"), None,
+            "zeplin must NOT be corrected to zeppelin");
     }
 
     #[test]
-    fn test_burrow_not_corrected_to_borrow() {
-        // "burrow" (furniture brand) is edit-distance 1 from "borrow"
+    fn test_jira_not_corrected_to_ira() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("burrow"), None,
-            "burrow must NOT be corrected to borrow");
+        assert_eq!(index.correct("jira"), None,
+            "jira must NOT be corrected to ira");
     }
 
     #[test]
-    fn test_hyperv_not_corrected_to_hyper() {
-        // "hyperv" (Microsoft hypervisor) is edit-distance 1 from "hyper"
+    fn test_babel_not_corrected_to_label() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("hyperv"), None,
-            "hyperv must NOT be corrected to hyper");
+        assert_eq!(index.correct("babel"), None,
+            "babel must NOT be corrected to label");
     }
 
     #[test]
-    fn test_appletv_not_corrected_to_applet() {
-        // "appletv" (Apple TV) is edit-distance 1 from "applet"
+    fn test_hulu_not_corrected_to_hull() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("appletv"), None,
-            "appletv must NOT be corrected to applet");
+        assert_eq!(index.correct("hulu"), None,
+            "hulu must NOT be corrected to hull");
     }
 
     #[test]
     fn test_icloud_not_corrected_to_cloud() {
-        // "icloud" (Apple iCloud) is edit-distance 1 from "cloud"
         let index = SymSpellIndex::build();
         assert_eq!(index.correct("icloud"), None,
             "icloud must NOT be corrected to cloud");
     }
 
     #[test]
-    fn test_istock_not_corrected_to_stock() {
-        // "istock" (iStock) is edit-distance 1 from "stock"
+    fn test_jest_not_corrected_to_nest() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("istock"), None,
-            "istock must NOT be corrected to stock");
+        assert_eq!(index.correct("jest"), None,
+            "jest must NOT be corrected to nest");
     }
 
     #[test]
-    fn test_pexels_not_corrected_to_pixels() {
-        // "pexels" (stock photo site) is edit-distance 1 from "pixels"
+    fn test_kindle_not_corrected_to_kindly() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("pexels"), None,
-            "pexels must NOT be corrected to pixels");
+        assert_eq!(index.correct("kindle"), None,
+            "kindle must NOT be corrected to kindly");
+    }
+
+    #[test]
+    fn test_lucid_not_corrected_to_lucia() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("lucid"), None,
+            "lucid must NOT be corrected to lucia");
     }
 
     #[test]
     fn test_mediatek_not_corrected_to_mediated() {
-        // "mediatek" (chipmaker) is edit-distance 1 from "mediated"
         let index = SymSpellIndex::build();
         assert_eq!(index.correct("mediatek"), None,
             "mediatek must NOT be corrected to mediated");
     }
 
     #[test]
-    fn test_irobot_not_corrected_to_robot() {
-        // "irobot" (Robot Corp) is edit-distance 1 from "robot"
+    fn test_naver_not_corrected_to_never() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("irobot"), None,
-            "irobot must NOT be corrected to robot");
+        assert_eq!(index.correct("naver"), None,
+            "naver must NOT be corrected to never");
     }
 
     #[test]
-    fn test_gooten_not_corrected_to_gotten() {
-        // "gooten" (print-on-demand) is edit-distance 1 from "gotten"
+    fn test_nook_not_corrected_to_cook() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("gooten"), None,
-            "gooten must NOT be corrected to gotten");
+        assert_eq!(index.correct("nook"), None,
+            "nook must NOT be corrected to cook");
     }
 
     #[test]
-    fn test_accor_not_corrected_to_accord() {
-        // "accor" (hotel group) is edit-distance 1 from "accord"
+    fn test_pcloud_not_corrected_to_cloud() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("accor"), None,
-            "accor must NOT be corrected to accord");
+        assert_eq!(index.correct("pcloud"), None,
+            "pcloud must NOT be corrected to cloud");
     }
 
     #[test]
-    fn test_britannia_not_corrected_to_britannica() {
-        // "britannia" (Indian food brand) is edit-distance 1 from "britannica"
+    fn test_pinterest_not_corrected_to_interest() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("britannia"), None,
-            "britannia must NOT be corrected to britannica");
+        assert_eq!(index.correct("pinterest"), None,
+            "pinterest must NOT be corrected to interest");
     }
 
     #[test]
-    fn test_clank_not_corrected_to_clark() {
-        // "clank" (Ratchet & Clank) is edit-distance 1 from "clark"
+    fn test_realme_not_corrected_to_realm() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("clank"), None,
-            "clank must NOT be corrected to clark");
+        assert_eq!(index.correct("realme"), None,
+            "realme must NOT be corrected to realm");
     }
 
     #[test]
-    fn test_quaker_not_corrected_to_quake() {
-        // "quaker" (Quaker Oats) is edit-distance 1 from "quake"
+    fn test_spacex_not_corrected_to_space() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("quaker"), None,
-            "quaker must NOT be corrected to quake");
+        assert_eq!(index.correct("spacex"), None,
+            "spacex must NOT be corrected to space");
     }
 
     #[test]
-    fn test_joes_not_corrected_to_jose() {
-        // "joes" (Trader Joe's) is edit-distance 1 from "jose"
+    fn test_tata_not_corrected_to_sata() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("joes"), None,
-            "joes must NOT be corrected to jose");
+        assert_eq!(index.correct("tata"), None,
+            "tata must NOT be corrected to sata");
     }
 
     #[test]
-    fn test_parle_not_corrected_to_pale() {
-        // "parle" (Indian biscuit brand) is edit-distance 1 from "pale"
+    fn test_twitch_not_corrected_to_switch() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("parle"), None,
-            "parle must NOT be corrected to pale");
+        assert_eq!(index.correct("twitch"), None,
+            "twitch must NOT be corrected to switch");
     }
 
     #[test]
-    fn test_tmobile_not_corrected_to_mobile() {
-        // "tmobile" (T-Mobile) is edit-distance 1 from "mobile"
+    fn test_uplay_not_corrected_to_play() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("tmobile"), None,
-            "tmobile must NOT be corrected to mobile");
+        assert_eq!(index.correct("uplay"), None,
+            "uplay must NOT be corrected to play");
     }
 
     #[test]
-    fn test_genuine_typos_still_corrected_with_brands_present() {
-        // Sanity: adding brands to PROTECTED_TERMS must not break genuine typo correction
+    fn test_weebly_not_corrected_to_weekly() {
         let index = SymSpellIndex::build();
-        assert_eq!(index.correct("pythn"), Some("python".to_string()),
-            "pythn should still correct to python");
-        assert_eq!(index.correct("programing"), Some("programming".to_string()),
-            "programing should still correct to programming");
-        assert_eq!(index.correct("ngnix"), Some("nginx".to_string()),
-            "ngnix should still correct to nginx");
-        assert_eq!(index.correct("housr"), Some("house".to_string()),
-            "housr should still correct to house");
+        assert_eq!(index.correct("weebly"), None,
+            "weebly must NOT be corrected to weekly");
     }
 
     #[test]
-    fn test_brand_query_not_changed() {
-        // Full-query test: a query containing a protected brand must not be spell-changed
+    fn test_spotify_not_corrected() {
         let index = SymSpellIndex::build();
-        let (corrected, changed) = correct_query(&index, "best canva alternatives for beginners");
-        assert!(!changed, "query with 'canva' must not be spell-changed");
-        assert_eq!(corrected, "best canva alternatives for beginners");
+        assert_eq!(index.correct("spotify"), None,
+            "spotify must NOT be spell-corrected");
+    }
 
-        let (corrected, changed) = correct_query(&index, "skoda slavia vs honda city");
-        assert!(!changed, "query with 'skoda' must not be spell-changed");
-        assert_eq!(corrected, "skoda slavia vs honda city");
+    #[test]
+    fn test_netflix_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("netflix"), None,
+            "netflix must NOT be spell-corrected");
+    }
 
-        let (corrected, changed) = correct_query(&index, "twitch vs youtube for streaming");
-        assert!(!changed, "query with 'twitch' must not be spell-changed");
-        assert_eq!(corrected, "twitch vs youtube for streaming");
+    #[test]
+    fn test_tiktok_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("tiktok"), None,
+            "tiktok must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_tesla_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("tesla"), None,
+            "tesla must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_rivian_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("rivian"), None,
+            "rivian must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_boeing_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("boeing"), None,
+            "boeing must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_airbus_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("airbus"), None,
+            "airbus must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_nvidia_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("nvidia"), None,
+            "nvidia must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_qualcomm_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("qualcomm"), None,
+            "qualcomm must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_broadcom_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("broadcom"), None,
+            "broadcom must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_salesforce_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("salesforce"), None,
+            "salesforce must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_hubspot_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("hubspot"), None,
+            "hubspot must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_zendesk_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("zendesk"), None,
+            "zendesk must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_freshdesk_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("freshdesk"), None,
+            "freshdesk must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_mailchimp_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("mailchimp"), None,
+            "mailchimp must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_sendgrid_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("sendgrid"), None,
+            "sendgrid must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_twilio_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("twilio"), None,
+            "twilio must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_paypal_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("paypal"), None,
+            "paypal must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_square_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("square"), None,
+            "square must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_adyen_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("adyen"), None,
+            "adyen must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_braintree_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("braintree"), None,
+            "braintree must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_linode_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("linode"), None,
+            "linode must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_vultr_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("vultr"), None,
+            "vultr must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_akamai_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("akamai"), None,
+            "akamai must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_fastly_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("fastly"), None,
+            "fastly must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_nordvpn_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("nordvpn"), None,
+            "nordvpn must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_expressvpn_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("expressvpn"), None,
+            "expressvpn must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_surfshark_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("surfshark"), None,
+            "surfshark must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_cyberghost_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("cyberghost"), None,
+            "cyberghost must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_ipvanish_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("ipvanish"), None,
+            "ipvanish must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_protonvpn_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("protonvpn"), None,
+            "protonvpn must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_duckduckgo_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("duckduckgo"), None,
+            "duckduckgo must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_ecosia_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("ecosia"), None,
+            "ecosia must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_startpage_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("startpage"), None,
+            "startpage must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_yandex_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("yandex"), None,
+            "yandex must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_baidu_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("baidu"), None,
+            "baidu must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_threema_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("threema"), None,
+            "threema must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_vivaldi_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("vivaldi"), None,
+            "vivaldi must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_opera_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("opera"), None,
+            "opera must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_firefox_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("firefox"), None,
+            "firefox must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_safari_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("safari"), None,
+            "safari must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_samsung_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("samsung"), None,
+            "samsung must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_xiaomi_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("xiaomi"), None,
+            "xiaomi must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_oppo_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("oppo"), None,
+            "oppo must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_vivo_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("vivo"), None,
+            "vivo must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_oneplus_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("oneplus"), None,
+            "oneplus must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_realme_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("realme"), None,
+            "realme must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_nokia_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("nokia"), None,
+            "nokia must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_motorola_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("motorola"), None,
+            "motorola must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_lenovo_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("lenovo"), None,
+            "lenovo must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_asus_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("asus"), None,
+            "asus must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_acer_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("acer"), None,
+            "acer must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_dell_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("dell"), None,
+            "dell must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_sony_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("sony"), None,
+            "sony must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_panasonic_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("panasonic"), None,
+            "panasonic must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_philips_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("philips"), None,
+            "philips must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_toshiba_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("toshiba"), None,
+            "toshiba must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_hitachi_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("hitachi"), None,
+            "hitachi must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_canon_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("canon"), None,
+            "canon must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_nikon_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("nikon"), None,
+            "nikon must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_fujifilm_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("fujifilm"), None,
+            "fujifilm must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_olympus_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("olympus"), None,
+            "olympus must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_gopro_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("gopro"), None,
+            "gopro must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_volvo_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("volvo"), None,
+            "volvo must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_bmw_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("bmw"), None,
+            "bmw must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_mercedes_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("mercedes"), None,
+            "mercedes must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_audi_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("audi"), None,
+            "audi must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_porsche_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("porsche"), None,
+            "porsche must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_ferrari_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("ferrari"), None,
+            "ferrari must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_lamborghini_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("lamborghini"), None,
+            "lamborghini must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_toyota_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("toyota"), None,
+            "toyota must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_honda_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("honda"), None,
+            "honda must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_nissan_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("nissan"), None,
+            "nissan must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_mazda_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("mazda"), None,
+            "mazda must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_subaru_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("subaru"), None,
+            "subaru must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_hyundai_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("hyundai"), None,
+            "hyundai must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_kia_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("kia"), None,
+            "kia must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_volkswagen_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("volkswagen"), None,
+            "volkswagen must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_peugeot_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("peugeot"), None,
+            "peugeot must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_renault_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("renault"), None,
+            "renault must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_fiat_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("fiat"), None,
+            "fiat must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_jeep_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("jeep"), None,
+            "jeep must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_gmc_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("gmc"), None,
+            "gmc must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_cadillac_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("cadillac"), None,
+            "cadillac must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_lincoln_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("lincoln"), None,
+            "lincoln must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_buick_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("buick"), None,
+            "buick must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_chrysler_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("chrysler"), None,
+            "chrysler must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_dodge_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("dodge"), None,
+            "dodge must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_acura_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("acura"), None,
+            "acura must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_infiniti_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("infiniti"), None,
+            "infiniti must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_lexus_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("lexus"), None,
+            "lexus must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_genesis_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("genesis"), None,
+            "genesis must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_jaguar_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("jaguar"), None,
+            "jaguar must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_mini_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("mini"), None,
+            "mini must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_smart_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("smart"), None,
+            "smart must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_maserati_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("maserati"), None,
+            "maserati must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_bentley_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("bentley"), None,
+            "bentley must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_suzuki_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("suzuki"), None,
+            "suzuki must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_isuzu_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("isuzu"), None,
+            "isuzu must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_daihatsu_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("daihatsu"), None,
+            "daihatsu must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_perodua_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("perodua"), None,
+            "perodua must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_mahindra_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("mahindra"), None,
+            "mahindra must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_maruti_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("maruti"), None,
+            "maruti must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_steam_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("steam"), None,
+            "steam must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_gog_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("gog"), None,
+            "gog must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_origin_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("origin"), None,
+            "origin must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_uplay_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("uplay"), None,
+            "uplay must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_xbox_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("xbox"), None,
+            "xbox must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_playstation_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("playstation"), None,
+            "playstation must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_nintendo_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("nintendo"), None,
+            "nintendo must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_sega_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("sega"), None,
+            "sega must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_atari_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("atari"), None,
+            "atari must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_commodore_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("commodore"), None,
+            "commodore must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_lastpass_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("lastpass"), None,
+            "lastpass must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_bitwarden_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("bitwarden"), None,
+            "bitwarden must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_dashlane_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("dashlane"), None,
+            "dashlane must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_brave_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("brave"), None,
+            "brave must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_proton_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("proton"), None,
+            "proton must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_potplayer_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("potplayer"), None,
+            "potplayer must NOT be spell-corrected");
+    }
+
+    #[test]
+    fn test_kmplayer_not_corrected() {
+        let index = SymSpellIndex::build();
+        assert_eq!(index.correct("kmplayer"), None,
+            "kmplayer must NOT be spell-corrected");
+    }
+
+    // ─── Genuine typos still corrected (regression tests) ─────────────
+
+    #[test]
+    fn test_genuine_typos_still_corrected_after_brand_protection() {
+        // Adding brands to PROTECTED_TERMS must NOT break genuine typo correction.
+        let index = SymSpellIndex::build();
+
+        // "pythn" -> "python" (dist-1 typo of a real word)
+        assert_eq!(index.correct("pythn"), Some("python".to_string()));
+
+        // "programing" -> "programming" (dist-1 typo)
+        assert_eq!(index.correct("programing"), Some("programming".to_string()));
+
+        // "housr" -> "house" (dist-1 typo with unusual bigrams)
+        assert_eq!(index.correct("housr"), Some("house".to_string()));
+
+        // "ngnix" -> "nginx" (transposition typo)
+        assert_eq!(index.correct("ngnix"), Some("nginx".to_string()));
+
+        // "embaras" -> "embarrass" (doubled-letter typo)
+        assert_eq!(index.correct("embaras"), Some("embarrass".to_string()));
+
+        // "recieve" -> "receive" (transposition)
+        assert_eq!(index.correct("recieve"), Some("receive".to_string()));
+    }
+
+    #[test]
+    fn test_brand_in_query_not_corrected() {
+        // Brands embedded in queries must not be corrected.
+        let index = SymSpellIndex::build();
+
+        let (corrected, changed) = correct_query(&index, "deezer vs spotify");
+        assert!(!changed, "query with 'deezer' and 'spotify' must not be spell-changed");
+        assert_eq!(corrected, "deezer vs spotify");
+
+        let (corrected, changed) = correct_query(&index, "qwant search engine");
+        assert!(!changed, "query with 'qwant' must not be spell-changed");
+        assert_eq!(corrected, "qwant search engine");
+
+        let (corrected, changed) = correct_query(&index, "sling tv alternatives");
+        assert!(!changed, "query with 'sling' must not be spell-changed");
+        assert_eq!(corrected, "sling tv alternatives");
+
+        let (corrected, changed) = correct_query(&index, "webex vs zoom");
+        assert!(!changed, "query with 'webex' must not be spell-changed");
+        assert_eq!(corrected, "webex vs zoom");
     }
 }

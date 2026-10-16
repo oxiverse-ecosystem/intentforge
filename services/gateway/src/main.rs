@@ -17249,6 +17249,35 @@ async fn handle_search(
     };
 
     intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
+    // MERGE gateway-extracted constraints with engine constraints (gateway parser
+    // may catch operators the engine missed).
+
+    // The upstream classifier can mistake causal/how-to language for a freshness
+    // label when the topic itself contains a food-safety adjective (e.g. "yogurt
+    // spoil faster"). Freshness is a recency intent only when the query carries an
+    // actual temporal signal; without one, preserve the natural-language intent
+    // shape instead of applying a freshness/date-sensitive ranking profile.
+    if intent.intent == "fresh" && derive_recency_window(&q.to_lowercase()).is_none() {
+        let ql = q.to_lowercase();
+        intent.intent = if ql.starts_with("how to ") || ql.starts_with("how do i ") || ql.starts_with("how can i ") {
+            "how-to".to_string()
+        } else if ql.starts_with("how does ") || ql.starts_with("how is ") || ql.starts_with("how are ") {
+            "informational".to_string()
+        } else if ql.starts_with("why ") || ql.starts_with("what causes") {
+            "informational".to_string()
+        } else {
+            intent.intent.clone()
+        };
+    }
+    // "how does X work" / "how does X happen" is an explanatory question, not a
+    // how-to guide. The intent engine may return "how-to" because it sees "how"
+    // at the start, but the query is asking for an explanation, not instructions.
+    if intent.intent == "how-to" {
+        let ql = q.to_lowercase();
+        if ql.starts_with("how does ") || ql.starts_with("how is ") || ql.starts_with("how are ") {
+            intent.intent = "informational".to_string();
+        }
+    }
     
     // Merge constraints parsed directly by the gateway to prevent any loss of operators
     let gateway_extracted = extract_gateway_constraints(&q_orig);
@@ -17577,7 +17606,20 @@ async fn handle_search(
         }
 
         // Override 6: transactional keywords OR an explicit price bound -> transactional
-        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under ", "deal", "deals", "refurbished", "sale", "offer"];
+        // GUARD: do not fire the keyword-based override on queries whose primary intent
+        // is clearly informational/how-to. A how-to query like "how to convert PDF to
+        // Word under 5 minutes" or "how to calculate conversion rate" contains "under "
+        // or "rate" but is NOT transactional. The keyword list is a weak signal; the
+        // how-to/informational starter is a strong one. Only an explicit price bound
+        // (parsed from NL) can override a how-to starter — that is a decisive signal.
+        let informational_starters = [
+            "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
+            "what is ", "what are ", "what was ", "what were ", "why ", "why is ",
+            "why are ", "why does ", "why do ", "guide to ", "tutorial", "explain ",
+            "understand ", "learn ", "teach me ",
+        ];
+        let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+        let tx_keywords = ["buy ", "price ", "pricing", "cheap ", "purchase ", "shop ", "store ", "discount ", "coupon ", "under "];
         let has_tx_signal = tx_keywords.iter().any(|k| q_lower.starts_with(k) || q_lower.contains(k));
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
