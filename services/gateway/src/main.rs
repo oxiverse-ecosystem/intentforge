@@ -7164,7 +7164,7 @@ fn map_lang_to_country(lang: &str) -> Option<&'static str> {
 
 /// Build a SearXNG search URL with optional geolocation parameters.
 /// Appends `source_country` and `language` when location data is available.
-fn searxng_url(base: &str, query: &str, geo: Option<&geoloc::GeoLocation>, lang: Option<&str>) -> String {
+fn searxng_url_with_geo(base: &str, query: &str, geo: Option<&geoloc::GeoLocation>, lang: Option<&str>) -> String {
     searxng_url_with_categories(base, query, "", geo, lang)
 }
 
@@ -15152,11 +15152,11 @@ async fn handle_search(
             None => (clean_q.clone(), String::new()),
         };
         // Primary query URL (with geolocation parameters)
-        searx_urls.push(searxng_url(base_url, &first_q, geo_location.as_ref(), lang));
+        searx_urls.push(searxng_url_with_geo(base_url, &first_q, geo_location.as_ref(), lang));
         searx_instance_keys.push(key.clone());
         // Secondary (raw when a stripped variant fired first, else nothing)
         if !second_q.is_empty() && second_q != first_q {
-            searx_urls.push(searxng_url(base_url, &second_q, geo_location.as_ref(), lang));
+            searx_urls.push(searxng_url_with_geo(base_url, &second_q, geo_location.as_ref(), lang));
             searx_instance_keys.push(key.clone());
         }
         // P1-compound: filetype-relaxed variant (site: kept, filetype: dropped)
@@ -15165,7 +15165,7 @@ async fn handle_search(
         if let Some(ref relaxed) = filetype_relax_variant(&engine_q) {
             let clean_relaxed = preprocess_searxng_query(relaxed);
             if !clean_relaxed.is_empty() && clean_relaxed != first_q {
-                searx_urls.push(searxng_url(base_url, &clean_relaxed, geo_location.as_ref(), lang));
+                searx_urls.push(searxng_url_with_geo(base_url, &clean_relaxed, geo_location.as_ref(), lang));
                 searx_instance_keys.push(key.clone());
             }
         }
