@@ -18375,6 +18375,7 @@ async fn handle_search(
             if is_manner_frame(&q_orig, &n)
                 && !negated_compound_is_recognized_entity(&n, &q_orig)
                 && !query_contrastive
+                && !engine_exclusions.contains(&n)
             {
                 continue; // manner qualifier: not an exclusion at all
             }
