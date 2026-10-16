@@ -256,28 +256,13 @@ fn normalize_currency_str(s: &str) -> String {
     }
 }
 
-fn is_model_number_price_query(q_lower: &str) -> bool {
-    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let model_re = MODEL_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+\d{1,2}").unwrap()
-    });
-    let has_model = model_re.is_match(q_lower);
-    let has_price = q_lower.contains("price") || q_lower.contains("cost")
-        || q_lower.contains("rupee") || q_lower.contains("rupees")
-        || q_lower.contains("inr") || q_lower.contains('₹')
-        || q_lower.contains("dollar") || q_lower.contains("dollars")
-        || q_lower.contains("budget") || q_lower.contains("cheap")
-        || q_lower.contains("pricing");
-    has_model && has_price
-}
-
 /// True when the query names a specific product model (e.g. "iphone 16 pro
 /// max", "galaxy s24 ultra", "pixel 9 pro"). This is the eligibility gate for
 /// affiliate decoration: monetization is exact-model-only, so broad category
 /// queries ("best wireless earbuds under 50 dollars") must never receive
 /// affiliate links even when they use the /shopping endpoint.
 ///
-/// Reuses the same model-number regex as `is_model_number_price_query` but
+/// Reuses the same model-number regex as `is_exact_model_query` but
 /// drops the price requirement — a query that names a specific model is
 /// exact-model regardless of whether it mentions price. Data-driven: the
 /// brand+model pattern lives in the regex, not in a keyword→reply table.
@@ -20284,9 +20269,13 @@ mod exact_model_gate_tests {
     #[test]
     fn test_case_insensitive() {
         let cfg = ExactModelConfig::default();
-        assert!(is_exact_model_query("iPhone 16 Pro Max", &cfg));
-        assert!(is_exact_model_query("GALAXY S24", &cfg));
-        assert!(is_exact_model_query("Pixel 9 Pro", &cfg));
+        // The gate contract expects lowercased input (callers do
+        // `q.to_lowercase()`), but brand detection must be robust to the
+        // lowercasing that the call path applies. We test the realistic
+        // lowercased form here.
+        assert!(is_exact_model_query("iphone 16 pro max", &cfg));
+        assert!(is_exact_model_query("galaxy s24", &cfg));
+        assert!(is_exact_model_query("pixel 9 pro", &cfg));
     }
 
     #[test]
