@@ -4987,6 +4987,7 @@ async fn handle_shopping(
                     }
                 },
                 second_pass_wall,
+                state.commerce_config.enrich_window,
             )
             .await;
             // ROADMAP item 3: strict post-rank affiliate decoration (never reorders).
@@ -18744,6 +18745,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     async move { fetch_page_html(&c, &url).await }
                 },
                 enrichment_wall,
+                state.commerce_config.enrich_window,
             )
             .await;
             // Select only the fact-bearing candidates for display, in their
@@ -23187,6 +23189,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            CommerceConfig::default().enrich_window,
         )
         .await;
         let elapsed = start.elapsed();
@@ -23236,6 +23239,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_millis(1),
+            CommerceConfig::default().enrich_window,
         )
         .await;
 
@@ -23384,6 +23388,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            CommerceConfig::default().enrich_window,
         )
         .await;
         let elapsed = start.elapsed();
@@ -23553,7 +23558,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             }
         };
 
-        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2)).await;
+        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2), CommerceConfig::default().enrich_window).await;
 
         let with_commerce = ranked
             .iter()
@@ -24219,8 +24224,9 @@ mod mainpath_shopping_strip_tests {
 
     #[test]
     fn enrich_window_is_wider_than_display_cap() {
-        // Guards the constants from being re-conflated.
-        assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
+        // Guards the config defaults from being re-conflated.
+        let cfg = CommerceConfig::default();
+        assert!(cfg.enrich_window > cfg.mainpath_top_n);
     }
 
     // ─── extract_snippet_facts tests ────────────────────────────────────
