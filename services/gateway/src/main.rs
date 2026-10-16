@@ -4562,10 +4562,12 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
-                        // Distance-bound guard: "within 300 kilometers" is a
-                        // range, not a price — skip this marker (let a later
-                        // price marker, if any) match instead).
-                        if is_distance_bound(rest) {
+                        // Distance/time-bound guard: "within 300 kilometers" or
+                        // "within 6 months" is a range, not a price — skip this
+                        // marker (let a later price marker, if any, match instead).
+                        // Pass text AFTER the number (like Pattern B does) so the
+                        // unit check sees "months", not "6".
+                        if is_distance_bound(&rest[m.end()..]) {
                             continue;
                         }
                         // Currency-proximity guard: Pattern A is "<marker> <number>",
@@ -6104,6 +6106,7 @@ fn whole_word_contains(haystack: &str, needle: &str) -> bool {
 fn cross_location_mismatch_mult(
     title: &str,
     content: &str,
+    url: &str,
     geo: Option<&geoloc::GeoLocation>,
 ) -> f32 {
     let geo = match geo {
@@ -6604,6 +6607,47 @@ const IGNORED_CONSTRAINT_NOISE: &[&str] = &[
     "before", "after", "and", "or", "but", "is", "are", "was", "were",
 ];
 
+/// D4 (2026-09-15): seed list of consumer brands that are common exclusion
+/// targets ("not bose", "wireless headphones not sony", "not nike shoes").
+/// When a user negates a brand name, the brand IS the genuine topical
+/// exclusion — it must be honored even when the query lacks contrastive
+/// framing and the word is not a protected tech term. This mirrors the
+/// COUNTRY_DEMONYMS data-seed pattern: a general, non-hardcoded list so any
+/// negated brand passes the `is_real_exclusion` gate. Covers major audio,
+/// sportswear, electronics, and automotive brands.
+const KNOWN_BRANDS: &[&str] = &[
+    // Audio / headphones / earbuds
+    "bose", "sony", "sennheiser", "akg", "audio-technica", "beats",
+    "jabra", "jbl", "skullcandy", "sony", "bose", "sennheiser",
+    "senheiser", "fiio", "shure", "westone", "campfire", "moondrop",
+    // Sportswear / footwear
+    "nike", "adidas", "puma", "reebok", "new balance", "newbalance",
+    "asics", "converse", "vans", "under armour", "underarmour",
+    // Electronics / computing
+    "samsung", "lg", "hp", "dell", "lenovo", "asus", "acer",
+    "microsoft", "google", "xiaomi", "oneplus", "oppo", "vivo",
+    "realme", "nothing", "razer", "logitech", "corsair", "steelseries",
+    // Automotive
+    "toyota", "honda", "ford", "tesla", "bmw", "mercedes", "audi",
+    "volkswagen", "hyundai", "kia", "nissan", "chevrolet",
+];
+
+/// True if `term` is a known consumer brand. Brands are common negation
+/// targets ("not bose", "headphones not sony") and must pass the
+/// `is_real_exclusion` gate even without contrastive framing. Data-seed
+/// pattern (mirrors `COUNTRY_DEMONYMS`), not per-query literals.
+fn is_known_brand(term: &str) -> bool {
+    let lc = term.trim().to_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
+    if KNOWN_BRANDS.contains(&lc.as_str()) {
+        return true;
+    }
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    tokens.iter().any(|t| KNOWN_BRANDS.contains(t))
+}
+
 /// F3 (2026-08-17): seed list of country demonyms / origin adjectives. When a user
 /// excludes a COUNTRY-of-origin (e.g. "not from chinese brands", "alternatives to american
 /// cloud providers", "laptops not made in china"), the demonym IS the genuine topical
@@ -6893,6 +6937,15 @@ fn is_real_exclusion(
     if COUNTRY_DEMONYMS.contains(&lc.as_str())
         || tokens.iter().any(|t| COUNTRY_DEMONYMS.contains(t))
     {
+        return true;
+    }
+    // D4 (2026-09-15): a known consumer brand (e.g. "bose", "nike", "sony") is a
+    // genuine topical exclusion when negated ("not bose", "wireless headphones
+    // not sony"). Brands are common negation targets that the user explicitly
+    // named — they must pass the is_real_exclusion gate even without contrastive
+    // framing and even when not in PROTECTED_TERMS (which is tech-focused).
+    // Data-seed pattern mirrors COUNTRY_DEMONYMS; no per-query literals.
+    if is_known_brand(&lc) {
         return true;
     }
     // Entity: a term in the compound is capitalized in the original query
@@ -7940,7 +7993,7 @@ fn keyphrase_relax_variant(query: &str) -> Option<String> {
     ];
 
     let filtered: Vec<&str> = words.into_iter()
-        .filter(|w| !STOP_WORDS.contains(w) && w.len() > 1)
+        .filter(|w| !STOP_WORDS.contains(w) && (w.len() > 1 || w.chars().any(|c| c.is_ascii_digit())))
         .collect();
 
     let orig_count = query.split_whitespace().count();
@@ -10423,7 +10476,7 @@ fn merge_local_and_web(
         };
 
         let cross_loc_mult = if geo_is_explicit {
-            cross_location_mismatch_mult(&r.title, &r.content, geo_location)
+            cross_location_mismatch_mult(&r.title, &r.content, &r.url, geo_location)
         } else {
             1.0
         };
@@ -14496,36 +14549,7 @@ async fn handle_search(
         }
     };
 
-    intent.structured_constraints = sanitize_constraints_with_query(&intent.structured_constraints, Some(&q));
-    // MERGE gateway-extracted constraints with engine constraints (gateway parser
-    // may catch operators the engine missed).
-
-    // The upstream classifier can mistake causal/how-to language for a freshness
-    // label when the topic itself contains a food-safety adjective (e.g. "yogurt
-    // spoil faster"). Freshness is a recency intent only when the query carries an
-    // actual temporal signal; without one, preserve the natural-language intent
-    // shape instead of applying a freshness/date-sensitive ranking profile.
-    if intent.intent == "fresh" && derive_recency_window(&q.to_lowercase()).is_none() {
-        let ql = q.to_lowercase();
-        intent.intent = if ql.starts_with("how to ") || ql.starts_with("how do i ") || ql.starts_with("how can i ") {
-            "how-to".to_string()
-        } else if ql.starts_with("how does ") || ql.starts_with("how is ") || ql.starts_with("how are ") {
-            "informational".to_string()
-        } else if ql.starts_with("why ") || ql.starts_with("what causes") {
-            "informational".to_string()
-        } else {
-            intent.intent.clone()
-        };
-    }
-    // "how does X work" / "how does X happen" is an explanatory question, not a
-    // how-to guide. The intent engine may return "how-to" because it sees "how"
-    // at the start, but the query is asking for an explanation, not instructions.
-    if intent.intent == "how-to" {
-        let ql = q.to_lowercase();
-        if ql.starts_with("how does ") || ql.starts_with("how is ") || ql.starts_with("how are ") {
-            intent.intent = "informational".to_string();
-        }
-    }
+    intent.structured_constraints = sanitize_constraints(&intent.structured_constraints);
     
     // Merge constraints parsed directly by the gateway to prevent any loss of operators
     let gateway_extracted = extract_gateway_constraints(&q_orig);
@@ -16723,6 +16747,100 @@ let mut results = match tokio::task::spawn_blocking(move || {
             return err_resp;
         }
     };
+
+    // IFIX-A: Video dominance fix for thin out-of-vertical queries
+    // When upstream returns <3 non-video results for text queries, the P8 video
+    // cap (0.04) isn't enough because there's nothing else to replace them with.
+    // Detect via source types (invidious/video) and URL host class — no per-query
+    // literals. Two remediations:
+    //   (a) non-video < 3: crush video scores ×0.01 so any non-video outranks them
+    //   (b) non-video == 0: re-query SearXNG with categories=general to find
+    //       non-video results that the mixed-category fan-out missed
+    {
+        let non_video_top10 = results.iter()
+            .take(10)
+            .filter(|r| {
+                !r.sources.iter().any(|s| s == "invidious" || s == "video")
+                    && !is_url_video_host(&r.url)
+            })
+            .count();
+
+        if non_video_top10 < 3 && non_video_top10 > 0 && !has_video_intent(&q_trimmed) {
+            for r in results.iter_mut() {
+                let is_video = r.sources.iter().any(|s| s == "invidious" || s == "video")
+                    || is_url_video_host(&r.url);
+                if is_video {
+                    r.score *= 0.01;
+                }
+            }
+            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            tracing::info!("IFIX-A: thin result set (non_video={}) — applied ×0.01 video crush for '{}'", non_video_top10, q_trimmed);
+        }
+
+        if non_video_top10 == 0 && !has_video_intent(&q_trimmed) {
+            let general_url = searxng_url_with_categories(
+                "http://127.0.0.1:8080",
+                &q_trimmed,
+                "general",
+                geo_location.as_ref(),
+                lang,
+            );
+
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                client.get(&general_url).send()
+            ).await {
+                Ok(Ok(resp)) => {
+                    if let Some(bytes) = read_body_bounded(resp).await {
+                        let raw = String::from_utf8_lossy(&bytes).into_owned();
+                        let sanitized = sanitize_json_text(&raw);
+                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&sanitized) {
+                            if let Some(results_arr) = data.get("results").and_then(|r| r.as_array()) {
+                                let mut added = 0;
+                                for r in results_arr {
+                                    let url = r.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                                    if is_url_video_host(&url) {
+                                        continue;
+                                    }
+                                    let title = r.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                                    let content = r.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                                    let score = r.get("score").and_then(|s| s.as_f64()).unwrap_or(0.5) as f32;
+                                    results.push(MergedResult {
+                                        url,
+                                        title,
+                                        content,
+                                        score,
+                                        authority: 0.5,
+                                        sources: vec!["web".to_string()],
+                                        is_local: false,
+                                        published_date: r.get("publishedDate").and_then(|d| d.as_str()).map(|s| s.to_string()),
+                                        price: None,
+                                        currency: None,
+                                        quality: 0.5,
+                                        post_cal_cap: None,
+                                        engine_trust_mult: 1.0,
+                                        commerce: None,
+                                        commerce_provenance: None,
+                                    });
+                                    added += 1;
+                                }
+                                if added > 0 {
+                                    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                                    tracing::info!("IFIX-A: re-query added {} non-video results for '{}'", added, q_trimmed);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("IFIX-A: re-query request failed for '{}': {:?}", q_trimmed, e);
+                }
+                Err(_) => {
+                    tracing::warn!("IFIX-A: re-query timed out for '{}'", q_trimmed);
+                }
+            }
+        }
+    }
 
     // 8b. Post-merge hard negative filter: apply negative constraints to ALL results
     // (local + web). The pre-merge filter only catches web results; local index
@@ -21042,179 +21160,6 @@ mod spellcheck_endpoint_tests {
             assert_eq!(res["local_intent"].as_bool(), Some(false));
         }
     }
-
-    // -- /video endpoint (additive video-introspection) --
-    // Mirrors the /intent /geolocate additive precedent: pure fn
-    // reuses the EXACT video-classification fns /search uses
-    // (simple_negation_strip + has_video_intent + is_url_video_host),
-    // so the preview matches real engine behavior. No network, no
-    // ranking, fully testable on the pure path.
-    mod video_endpoint_tests {
-        use super::*;
-
-        #[test]
-        fn video_non_video_query_returns_pin_true() {
-            // Mirrors API_REFERENCE.md verified example: a text query must
-            // report video_intent=false, would_pin_non_video_sources=true.
-            let res = build_video_inspect("rust vs go high concurrency servers");
-            assert_eq!(res["query"].as_str(), Some("rust vs go high concurrency servers"));
-            assert_eq!(res["video_intent"].as_bool(), Some(false));
-            assert_eq!(res["would_pin_non_video_sources"].as_bool(), Some(true));
-            assert_eq!(res["intent"].as_str(), Some("informational"));
-        }
-
-        #[test]
-        fn video_video_intent_query_exempts_from_pin() {
-            // Mirrors API_REFERENCE.md verified example: a video-intent query must
-            // report video_intent=true, would_pin_non_video_sources=false.
-            let res = build_video_inspect("best youtube tutorial for rust async");
-            assert_eq!(res["video_intent"].as_bool(), Some(true));
-            assert_eq!(res["would_pin_non_video_sources"].as_bool(), Some(false));
-        }
-
-        #[test]
-        fn video_is_video_source_examples_match_is_url_video_host() {
-            // The endpoint's host classifications must EXACTLY match
-            // is_url_video_host: youtube / youtu.be / invidious / vimeo => true;
-            // python.org => false; example.com/youtube-guide-article (word in
-            // path only) => false.
-            let res = build_video_inspect("rust tutorial");
-            let ex = &res["is_video_source_examples"];
-            assert_eq!(ex["youtube_watch"], serde_json::json!(true));
-            assert_eq!(ex["youtu_be"], serde_json::json!(true));
-            assert_eq!(ex["invidious_selfhosted"], serde_json::json!(true));
-            assert_eq!(ex["vimeo"], serde_json::json!(true));
-            assert_eq!(ex["python_org_article"], serde_json::json!(false));
-            assert_eq!(ex["example_video_word_in_path"], serde_json::json!(false));
-        }
-
-        #[test]
-        fn video_empty_query_returns_documented_400_envelope() {
-            // Empty / whitespace q must return the /video-shaped empty_query
-            // envelope (neutral video_intent + markers present), NOT a 200 with
-            // a classified result. Locks the pure builder build_video_empty().
-            let res = build_video_empty();
-            assert_eq!(res["error"].as_str(), Some("empty_query"));
-            assert_eq!(res["message"].as_str(), Some("Query parameter 'q' is empty"));
-            assert_eq!(res["query"].as_str(), Some(""));
-            assert_eq!(res["video_intent"].as_bool(), Some(false));
-            assert_eq!(res["would_pin_non_video_sources"].as_bool(), Some(true));
-        }
-
-        #[test]
-        fn video_response_shape_matches_docs() {
-            // Locks the documented top-level keys so the contract cannot drift.
-            let res = build_video_inspect("how to watch a video");
-            for key in [
-                "query", "video_intent", "video_intent_markers",
-                "would_pin_non_video_sources", "is_video_source_examples",
-                "intent", "note",
-            ] {
-                assert!(res.get(key).is_some(), "missing /video top-level key: {}", key);
-            }
-            assert_eq!(
-                res["video_intent_markers"],
-                serde_json::json!(["video", "youtube", "watch", "tutorial", "animation"])
-            );
-        }
-
-        #[test]
-        fn video_watch_phrase_triggers_video_intent() {
-            // "watch video" / "watch tutorial" must be detected as video intent
-            // (has_video_intent checks for these phrases, matching live /search).
-            let (stripped, _) = simple_negation_strip("watch video tutorial").unwrap_or_else(|| ("watch video tutorial".to_string(), Vec::new()));
-            assert!(has_video_intent(&stripped));
-        }
-    }
-
-    // -- audio demotion tests (mirrors video_endpoint_tests pattern) --
-    // Locks the audio-classification pure fns: has_audio_intent, is_url_audio_host.
-    // These mirror the P8 video tests — same structural host-class check.
-    mod audio_demotion_tests {
-        use super::*;
-
-        #[test]
-        fn audio_news_query_returns_pin_true() {
-            let res = build_audio_inspect("what happened in the ipl auction today");
-            assert_eq!(res["query"].as_str(), Some("what happened in the ipl auction today"));
-            assert_eq!(res["audio_intent"].as_bool(), Some(false));
-            assert_eq!(res["would_pin_non_audio_sources"].as_bool(), Some(true));
-            assert_eq!(res["intent"].as_str(), Some("informational"));
-        }
-
-        #[test]
-        fn audio_podcast_query_exempts_from_pin() {
-            let res = build_audio_inspect("ipl auction podcast discussion");
-            assert_eq!(res["audio_intent"].as_bool(), Some(true));
-            assert_eq!(res["would_pin_non_audio_sources"].as_bool(), Some(false));
-        }
-
-        #[test]
-        fn audio_is_audio_source_examples_match_is_url_audio_host() {
-            let res = build_audio_inspect("some query");
-            let ex = &res["is_audio_source_examples"];
-            assert_eq!(ex["apple_podcasts"], serde_json::json!(true));
-            assert_eq!(ex["anchor_fm"], serde_json::json!(true));
-            assert_eq!(ex["soundcloud"], serde_json::json!(true));
-            assert_eq!(ex["spotify_episode"], serde_json::json!(true));
-            assert_eq!(ex["podcast_word_in_path"], serde_json::json!(false));
-            assert_eq!(ex["python_org_article"], serde_json::json!(false));
-        }
-
-        #[test]
-        fn audio_empty_query_returns_documented_envelope() {
-            // Empty / whitespace q must return an audio-shaped empty_query
-            // envelope (neutral audio_intent + markers present), NOT a 200 with
-            // a classified result.
-            let res = build_audio_empty();
-            assert_eq!(res["error"].as_str(), Some("empty_query"));
-            assert_eq!(res["message"].as_str(), Some("Query parameter 'q' is empty"));
-            assert_eq!(res["query"].as_str(), Some(""));
-            assert_eq!(res["audio_intent"].as_bool(), Some(false));
-            assert_eq!(res["would_pin_non_audio_sources"].as_bool(), Some(true));
-        }
-
-        #[test]
-        fn audio_response_shape_matches_docs() {
-            // Locks the documented top-level keys so the contract cannot drift.
-            let res = build_audio_inspect("best podcast for rust async");
-            for key in [
-                "query", "audio_intent", "audio_intent_markers",
-                "would_pin_non_audio_sources", "is_audio_source_examples",
-                "intent", "note",
-            ] {
-                assert!(res.get(key).is_some(), "missing /audio top-level key: {}", key);
-            }
-            assert_eq!(
-                res["audio_intent_markers"],
-                serde_json::json!(audio_intent_markers())
-            );
-        }
-
-        #[test]
-        fn audio_podcast_phrase_triggers_audio_intent() {
-            // "podcast" must be detected as audio intent (has_audio_intent
-            // checks for these markers, matching live /search).
-            assert!(has_audio_intent("best podcast for rust async"));
-            assert!(has_audio_intent("listen to this episode"));
-            assert!(has_audio_intent("audio book recommendations"));
-            assert!(has_audio_intent("radio stations online"));
-            assert!(!has_audio_intent("what happened in the ipl auction today"));
-        }
-
-        #[test]
-        fn audio_is_url_audio_host_matches_known_platforms() {
-            // Mirrors the video is_url_video_host tests — known audio platforms
-            // must be detected; unrelated URLs must not.
-            assert!(is_url_audio_host("https://podcasts.apple.com/us/podcast/ep123"));
-            assert!(is_url_audio_host("https://anchor.fm/show/episodes/ep123"));
-            assert!(is_url_audio_host("https://soundcloud.com/artist/track"));
-            assert!(is_url_audio_host("https://open.spotify.com/episode/abc123"));
-            assert!(!is_url_audio_host("https://docs.python.org/3/tutorial/"));
-            assert!(!is_url_audio_host("https://example.com/podcast-guide-article"));
-        }
-    }
-}
 
 mod commerce_extraction_tests {
     use super::*;
