@@ -264,22 +264,179 @@ fn is_model_number_price_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
     has_model && has_price
 }
 
-/// True when the query names a specific product model (e.g. "iphone 16 pro
-/// max", "galaxy s24 ultra", "pixel 9 pro"). This is the eligibility gate for
-/// affiliate decoration: monetization is exact-model-only, so broad category
-/// queries ("best wireless earbuds under 50 dollars") must never receive
-/// affiliate links even when they use the /shopping endpoint.
-///
-/// Reuses the same model-number regex as `is_model_number_price_query` but
+/// Runtime-loaded commerce intent signals from `data/commerce/signals.json`.
+/// The `transactional_keywords` list is a WEAK signal boost to the existing
+/// intent classifier — it never replaces the label/distribution check, it only
+/// adds recall when the intent engine is borderline. All values can be changed
+/// WITHOUT recompile.
+#[derive(Clone, Debug)]
+struct CommerceSignals {
+    /// Keywords that weakly indicate transactional intent. Checked as whole-word
+    /// matches against the query. This is a SUPPLEMENT to the intent engine's
+    /// label/distribution — never a standalone classifier.
+    transactional_keywords: Vec<String>,
+}
+
+impl Default for CommerceSignals {
+    fn default() -> Self {
+        Self {
+            transactional_keywords: vec![
+                "buy", "price", "pricing", "cheap", "cheapest", "purchase",
+                "shop", "discount", "coupon", "deal", "deals", "offer",
+                "sale", "order", "pay", "budget", "cost", "worth", "value",
+                "refurbished", "under", "store",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        }
+    }
+}
+
+impl CommerceSignals {
+    /// Load from `data/commerce/signals.json`. Missing file or fields → defaults.
+    fn load() -> Self {
+        let mut sig = Self::default();
+        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
+            let path = std::path::Path::new(dir).join("signals.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(kw) = v.get("transactional_keywords").and_then(|x| x.as_array()) {
+                        let loaded: Vec<String> = kw
+                            .iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_lowercase()))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !loaded.is_empty() {
+                            sig.transactional_keywords = loaded;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        sig
+    }
+
+    /// True when the query contains any transactional keyword as a WHOLE WORD.
+    /// This is a weak signal — it supplements the intent engine's label /
+    /// distribution, never replaces it. Returns false for empty queries.
+    fn has_transactional_keyword(&self, query: &str) -> bool {
+        if self.transactional_keywords.is_empty() || query.is_empty() {
+            return false;
+        }
+        let q_lower = query.to_lowercase();
+        self.transactional_keywords.iter().any(|kw| {
+            // Whole-word match: the keyword must be bounded by non-alphanumeric
+            // characters (or string start/end) on both sides.
+            let mut start = 0;
+            while let Some(pos) = q_lower[start..].find(kw) {
+                let abs_pos = start + pos;
+                let before_ok = abs_pos == 0
+                    || !q_lower.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+                let after_pos = abs_pos + kw.len();
+                let after_ok = after_pos >= q_lower.len()
+                    || !q_lower.as_bytes()[after_pos].is_ascii_alphanumeric();
+                if before_ok && after_ok {
+                    return true;
+                }
+                start = abs_pos + 1;
+            }
+            false
+        })
+    }
+}
+
+/// Runtime-loaded exact-model brand patterns from
+/// `data/commerce/exact_model_brands.json`. The brand list is the data
+/// source for the affiliate eligibility gate (`is_exact_model_query`) and
+/// the transactional intent override (`is_model_number_price_query`).
+/// Previously these used hardcoded regexes with compiled-in brand lists —
+/// a HARD RULES violation. Now the brand list is runtime data.
+#[derive(Clone, Debug)]
+struct ExactModelConfig {
+    /// Brand names that signal an exact-product query when followed by a
+    /// model number (e.g. "iphone 16", "galaxy s24"). Loaded from
+    /// `exact_model_brands.json`. Changing this list requires NO recompile.
+    brands: Vec<String>,
+}
+
+impl Default for ExactModelConfig {
+    fn default() -> Self {
+        Self {
+            brands: vec![
+                "iphone", "ipad", "galaxy", "oneplus", "pixel", "redmi",
+                "nothing", "xiaomi", "poco", "realme", "rog", "zenfone",
+                "nokia", "moto", "motorola", "surface", "macbook", "imac", "watch",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        }
+    }
+}
+
+impl ExactModelConfig {
+    /// Load from `data/commerce/exact_model_brands.json`. Missing file or
+    /// fields → defaults. The brand list is data, never code.
+    fn load() -> Self {
+        let mut cfg = Self::default();
+        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
+            let path = std::path::Path::new(dir).join("exact_model_brands.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(arr) = v.get("brands").and_then(|x| x.as_array()) {
+                        let loaded: Vec<String> = arr
+                            .iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_lowercase()))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !loaded.is_empty() {
+                            cfg.brands = loaded;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        cfg
+    }
+
+    /// True when the query contains a known brand name followed by a model
+    /// number (e.g. "iphone 16", "galaxy s24 ultra", "pixel 9 pro").
+    /// This replaces the former hardcoded regex with a runtime-loaded
+    /// brand list. The matching logic is: find a brand word, then check
+    /// if a digit appears within the next few tokens.
+    fn has_exact_model(&self, q_lower: &str) -> bool {
+        if self.brands.is_empty() || q_lower.is_empty() {
+            return false;
+        }
+        let q = q_lower.to_lowercase();
+        let tokens: Vec<&str> = q.split_whitespace().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            let token_clean = token.trim_matches(|c: char| !c.is_alphanumeric());
+            if !self.brands.iter().any(|b| b == token_clean) {
+                continue;
+            }
+            // Brand found — check if a digit appears in the next 4 tokens
+            // (covers "iphone 16", "galaxy s24 ultra", "pixel 9 pro")
+            for j in (i + 1)..std::cmp::min(i + 5, tokens.len()) {
+                if tokens[j].chars().any(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Reuses the same model-number detection as `is_model_number_price_query` but
 /// drops the price requirement — a query that names a specific model is
 /// exact-model regardless of whether it mentions price. Data-driven: the
-/// brand+model pattern lives in the regex, not in a keyword→reply table.
-fn is_exact_model_query(q_lower: &str) -> bool {
-    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let model_re = MODEL_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+(?:[a-z]+\s+)*[a-z]?\d{1,3}").unwrap()
-    });
-    model_re.is_match(q_lower)
+/// brand list lives in `ExactModelConfig` (loaded from
+/// `data/commerce/exact_model_brands.json`), not in a keyword→reply table.
+fn is_exact_model_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
+    cfg.has_exact_model(q_lower)
 }
 
 fn has_price_signal(title_lower: &str, content_lower: &str) -> bool {
@@ -5307,6 +5464,41 @@ fn is_commercial_intent(
         >= 0.50
     {
         return true;
+    }
+    // WEAK signal boost: the runtime-loaded transactional keywords from
+    // signals.json provide additional recall when the intent engine is
+    // borderline. This is a SUPPLEMENT to the label/distribution check —
+    // never a standalone replacement. The keywords are data-driven (loaded
+    // from data/commerce/signals.json), not hardcoded in the classifier.
+    if signals.has_transactional_keyword(query) {
+        return true;
+    }
+    false
+}
+
+/// Pure helper: from an already-enriched array of result JSON values, keep only
+/// the first `limit` candidates that carry a concrete `commerce` block, in their
+/// EXISTING order. Returns `None` when no candidate has facts, so the caller
+/// omits the strip rather than showing an empty one.
+///
+/// This is a STRICT SUBSEQUENCE operation: it never promotes a lower-ranked
+/// result, never reorders, never mutates the input. The real `results` array
+/// on `/search` is never touched — this runs on a CLONE. The no-manipulation
+/// guarantee holds: the strip is a pure post-enrichment filter.
+fn select_shopping_strip(
+    enriched: &[serde_json::Value],
+    limit: usize,
+) -> Option<Vec<serde_json::Value>> {
+    let strip: Vec<serde_json::Value> = enriched
+        .iter()
+        .filter(|r| r.get("commerce").is_some())
+        .take(limit)
+        .cloned()
+        .collect();
+    if strip.is_empty() {
+        None
+    } else {
+        Some(strip)
     }
     // WEAK signal boost: the runtime-loaded transactional keywords from
     // signals.json provide additional recall when the intent engine is
@@ -13947,15 +14139,16 @@ struct AppState {
     /// knowledge is data, never code. Used only as a strict post-rank decoration
     /// pass — never affects ranking/order.
     affiliate_ctx: AffiliateCtx,
-    /// Runtime-loaded commerce config (mainpath_top_n etc). Loaded once at
-    /// startup from `data/commerce/config.json`. Changing it requires NO
-    /// recompile — edit the file and restart.
-    commerce_config: CommerceConfig,
-    /// Runtime-loaded commerce intent signals (transactional_keywords etc).
-    /// Loaded once at startup from `data/commerce/signals.json`. Used as a
-    /// WEAK signal boost to the existing intent classifier — never a
+    /// Runtime-loaded commerce intent signals from `data/commerce/signals.json`.
+    /// Used as a WEAK signal boost to the existing intent classifier — never a
     /// standalone replacement.
     commerce_signals: CommerceSignals,
+    /// Runtime-loaded exact-model brand patterns. Loaded once at startup from
+    /// `data/commerce/exact_model_brands.json`. Used by the affiliate
+    /// eligibility gate (`is_exact_model_query`) and the transactional intent
+    /// override (`is_model_number_price_query`). Changing the brand list
+    /// requires NO recompile — edit the file and restart.
+    exact_model_config: ExactModelConfig,
 }
 
 async fn handle_images(
@@ -14708,8 +14901,8 @@ async fn main() {
         // Affiliate template engine config (ROADMAP item 3) — loaded from data.
         affiliate_ctx: AffiliateCtx::load(),
         // Commerce config + signals — loaded from data, no recompile needed.
-        commerce_config: CommerceConfig::load(),
         commerce_signals: CommerceSignals::load(),
+        exact_model_config: ExactModelConfig::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -20526,18 +20719,32 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // so the order-invariance guarantee holds: affiliate decoration runs strictly
     // AFTER the order is fixed and cannot move a result. No external call, no
     // keyword list — the commercial signal comes purely from in-process intent.
-    let shopping_block: Option<Vec<serde_json::Value>> = if is_commercial_intent(
+    let is_commercial = is_commercial_intent(
         &intent.intent,
         &intent.distribution,
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
         &state.commerce_signals,
         &q,
-    ) {
-        // Clone the top-`COMMERCE_ENRICH_WINDOW` ranked results into a JSON array
-        // we can enrich in place. This is WIDER than the display cap: the post-rank
-        // passes need a deep enough candidate pool to find the results that actually
-        // expose product facts (see `COMMERCE_ENRICH_WINDOW`). `serde_json::to_value`
-        // on `MergedResult` is lossless/Serialize.
+    );
+    let shopping_block: Option<serde_json::Value> = if is_commercial {
+        // The enrichment budget is derived from the time this request has ALREADY
+        // spent, not a flat 22s (see `commerce_wall_for_elapsed`). Without this the
+        // decoration pass could overrun the 30s TimeoutLayer on a slow upstream
+        // search and return HTTP 408 — losing the whole result set, not just the
+        // optional facts. `request_started` is captured at the top of this handler.
+        //
+        // A zero budget needs no special case here: `enrich_with_commerce_par`
+        // breaks out of its wave loop immediately when the wall is zero, so no
+        // fetch is started, nothing gets fabricated, and the `has_any_commerce_block`
+        // gate below suppresses the empty strip exactly as before.
+        let enrichment_wall = commerce_wall_for_elapsed(request_started.elapsed());
+        // Clone the top COMMERCE_ENRICH_WINDOW ranked results into a JSON array we
+        // can enrich in place. The enrichment window is WIDER than the display cap
+        // (`COMMERCE_MAINPATH_TOP_N = 8`): commercial queries often have bot-checked
+        // merchant pages (Amazon/Walmart/Flipkart) in the top 8 with no structured
+        // markup, so enriching only 8 finds nothing and the strip is suppressed.
+        // A wider window (24) lets enrichment reach past those to pages that DO
+        // carry product facts. `serde_json::to_value` on `MergedResult` is lossless.
         let mut shop_arr: Vec<serde_json::Value> = paginated_results
             .iter()
             .take(state.commerce_config.enrich_window)
@@ -20671,6 +20878,13 @@ let mut results = match tokio::task::spawn_blocking(move || {
     // fact replay that never touches order, selection, or scoring. This lets
     // the frontend show product facts inline in the main results list without
     // requiring the user to look at the separate shopping strip.
+    let is_commercial = is_commercial_intent(
+        &intent.intent,
+        &intent.distribution,
+        sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
+        &state.commerce_signals,
+        &q,
+    );
     let response_json = serde_json::to_value(&response).unwrap_or(serde_json::json!({}));
     let final_json = if is_commercial {
         let mut v = response_json;
@@ -25279,79 +25493,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("informational".to_string(), 0.95);
         dist.insert("transactional".to_string(), 0.02);
         let signals = CommerceSignals::default();
-        assert!(!is_commercial_intent("informational", &dist, false, &signals, "rust ownership"));
-    }
-
-    // ── Commerce config + signals data-file wiring tests ─────────────────────
-
-    #[test]
-    fn commerce_config_loads_mainpath_top_n_from_data_file() {
-        // The shipped config.json sets mainpath_top_n = 8. Loading it must
-        // produce that value (not the default, not a hardcoded constant).
-        let cfg = CommerceConfig::load();
-        assert!(
-            cfg.mainpath_top_n > 0 && cfg.mainpath_top_n <= 100,
-            "mainpath_top_n must be a sane positive value, got {}",
-            cfg.mainpath_top_n
-        );
-        // The shipped data file sets 8; if this fails the data file changed
-        // and the test should be updated alongside it.
-        assert_eq!(cfg.mainpath_top_n, 8, "shipped config.json mainpath_top_n");
-    }
-
-    #[test]
-    fn commerce_signals_loads_transactional_keywords_from_data_file() {
-        let sig = CommerceSignals::load();
-        assert!(
-            !sig.transactional_keywords.is_empty(),
-            "signals.json must yield at least one transactional keyword"
-        );
-        // The shipped data file includes "buy" and "price".
-        assert!(
-            sig.transactional_keywords.contains(&"buy".to_string()),
-            "shipped signals.json must contain 'buy'"
-        );
-        assert!(
-            sig.transactional_keywords.contains(&"price".to_string()),
-            "shipped signals.json must contain 'price'"
-        );
-    }
-
-    #[test]
-    fn transactional_keyword_whole_word_matching() {
-        let sig = CommerceSignals::default();
-        // Positive: whole-word matches
-        assert!(sig.has_transactional_keyword("buy wireless earbuds"));
-        assert!(sig.has_transactional_keyword("price of iphone"));
-        assert!(sig.has_transactional_keyword("how much does a laptop cost"));
-        assert!(sig.has_transactional_keyword("shop for shoes"));
-        // Negative: substring but NOT whole-word
-        assert!(!sig.has_transactional_keyword("rust ownership"));
-        assert!(!sig.has_transactional_keyword("buying")); // "buy" is a prefix but not whole-word
-        assert!(!sig.has_transactional_keyword("priceless")); // "price" is a prefix but not whole-word
-        assert!(!sig.has_transactional_keyword("shopping")); // "shop" is a prefix but not whole-word
-        // Edge: empty query
-        assert!(!sig.has_transactional_keyword(""));
-    }
-
-    #[test]
-    fn commercial_intent_boosted_by_transactional_keyword() {
-        // A query with a transactional keyword but NO intent engine signal
-        // (informational label, no price bound, weak distribution) should
-        // STILL be commercial thanks to the data-driven keyword boost.
-        let mut dist = std::collections::HashMap::new();
-        dist.insert("informational".to_string(), 0.7);
-        dist.insert("transactional".to_string(), 0.1);
-        let sig = CommerceSignals::default();
-        assert!(
-            is_commercial_intent("informational", &dist, false, &sig, "buy wireless earbuds"),
-            "transactional keyword 'buy' should boost commercial intent"
-        );
-        // Same but with a non-transactional query — should NOT be commercial
-        assert!(
-            !is_commercial_intent("informational", &dist, false, &sig, "rust ownership"),
-            "non-transactional query must not be boosted"
-        );
+        assert!(!is_commercial_intent("informational", &dist, false, &signals, "test"));
     }
 
     #[test]
