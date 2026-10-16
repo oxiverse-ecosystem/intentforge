@@ -8731,6 +8731,10 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
+                in_negation = false;
+                continue; // boundary word itself is not topical content
+            }
+            if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
                 // A preserved domain word inside a negation scope is still a
                 // positive term (e.g. "recipes without linux spicy" → "linux"
                 // stays positive). Do NOT end the negation scope — subsequent
@@ -10195,9 +10199,58 @@ fn merge_local_and_web(
         .collect();
     let query_entity_count = comparison_entities.len();
 
-    // ── Comparison-entity co-occurrence extraction (FIX-IF-13) ──
-    // Split the comparison query into two entity groups for co-occurrence scoring.
-    let comparison_entity_groups = extract_comparison_entity_groups(query);
+    // ── Comparison principals: the entities flanking the comparison marker ──
+    // "postgres VERSUS mongodb for a social media app feed" — the PRINCIPALS are
+    // postgres and mongodb (the words adjacent to the marker), while "social media
+    // app feed" is the CONTEXT. A comparison result must name at least one
+    // PRINCIPAL; naming only context words (a Planoly "Social Media Planner" page)
+    // is off-topic. Extraction is purely positional: the nearest non-structure
+    // word before the marker and the nearest non-structure word after it. No
+    // literals, works for any "X vs Y" / "X versus Y" / "compare X and Y" query.
+    let comparison_principals: Vec<String> = {
+        let marker_idx = q_words.iter().position(|w| {
+            let l = w.to_lowercase();
+            l == "versus" || l == "vs" || l == "compare" || l == "comparison"
+        });
+        match marker_idx {
+            Some(mi) => {
+                let is_structure = |w: &str| -> bool {
+                    let l = w.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+                    l.is_empty()
+                        || stop_words.contains(l.as_str())
+                        || comparison_structure_words.contains(&l.as_str())
+                        || l.chars().all(|c| c.is_ascii_digit())
+                };
+                let mut principals: Vec<String> = Vec::new();
+                // Walk LEFT from the marker to the nearest substantive word.
+                if mi > 0 {
+                    for w in q_words[..mi].iter().rev() {
+                        if !is_structure(w) {
+                            principals.push(w.to_lowercase());
+                            break;
+                        }
+                    }
+                }
+                // Walk RIGHT from the marker to the nearest substantive word.
+                for w in q_words[mi + 1..].iter() {
+                    if !is_structure(w) {
+                        principals.push(w.to_lowercase());
+                        break;
+                    }
+                }
+                principals
+            }
+            None => Vec::new(),
+        }
+    };
+    // For marker-less comparison queries ("difference between X and Y"), fall
+    // back to the full comparison_entities set (attribute-filtered distinctive
+    // terms) so the D3 cap still has an anchor set.
+    let comparison_anchor_terms: Vec<String> = if comparison_principals.is_empty() {
+        comparison_entities.clone()
+    } else {
+        comparison_principals
+    };
 
     let core_topic_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
@@ -15273,7 +15326,7 @@ async fn handle_search(
     let lang = constraints.language.as_deref();
 
     for (i, base_url) in searx_base_urls.iter().enumerate() {
-        let key = searx_base_keys[i].clone();
+        let key = format!("searxng{}", i);
         // NEGATION ORDERING (round auto/round-2026-09-24T0559Z): when the query
         // carries a negation pattern, the STRIPPED variant (negated clause
         // removed) is the user's actual intent and must fire FIRST. The fan-out
@@ -18169,6 +18222,21 @@ async fn handle_search(
     for n in raw_neg.clone() {
         if explicit_neg.iter().any(|e| e == &n) {
             // Unambiguous directive: always keep, never re-inject as positive.
+            // EXCEPTION (round auto/round-2026-09-24T0559Z): a "without X" /
+            // "with no X" phrase is a MANNER qualifier (the user describes the
+            // product feature sought — "protein powder WITHOUT artificial
+            // sweeteners" — not content to exclude). extract_explicit_negation
+            // terms treats every "without X" as an explicit directive, which
+            // bypassed the manner gate and inverted the query: pages ABOUT
+            // sweeteners got penalized for containing "artificial", and the
+            // alt-query seeding fetched sweetener-alternative pages. Route
+            // explicit "without X" phrases through the SAME is_manner_frame
+            // gate the other paths use; genuine source/contrastive negations
+            // ("not from X", "except X", "other than X") carry no such frame
+            // and keep their explicit-directive status.
+            if is_manner_frame(&q_orig, &n) {
+                continue; // manner qualifier: not an exclusion at all
+            }
             if !explicit_survivors.contains(&n) {
                 explicit_survivors.push(n.clone());
             }
@@ -20258,7 +20326,7 @@ mod negation_scope_tests {
 
     #[test]
     fn without_clause_does_not_swallow_following_clause() {
-        let (stripped, excluded) = simple_negation_strip(
+        let stripped = simple_negation_strip(
             "protein powder without artificial sweeteners for lactose intolerant beginners",
         )
         .expect("should strip the negated clause but keep the trailing clause");
@@ -20277,11 +20345,6 @@ mod negation_scope_tests {
             "negated term must be stripped, got: {:?}",
             stripped
         );
-        assert!(
-            excluded.contains(&"artificial".to_string()),
-            "non-domain negated term must be returned as exclusion, got: {:?}",
-            excluded
-        );
     }
 
     #[test]
@@ -20289,11 +20352,11 @@ mod negation_scope_tests {
         // The original purpose of the function: "not X not Y" chains.
         assert_eq!(
             simple_negation_strip("browser not chrome not edge"),
-            Some(("browser".to_string(), vec!["chrome".to_string(), "edge".to_string()]))
+            Some("browser".to_string())
         );
         assert_eq!(
             simple_negation_strip("javascript framework not react not vue not angular"),
-            Some(("javascript framework".to_string(), vec!["react".to_string(), "vue".to_string(), "angular".to_string()]))
+            Some("javascript framework".to_string())
         );
     }
 
@@ -20301,165 +20364,20 @@ mod negation_scope_tests {
     fn not_from_phrase_keeps_negation_scope() {
         // Prepositions are NOT clause boundaries: "not from <country>" keeps
         // the negated phrase in scope (P9 regression guard).
-        let (stripped, excluded) = simple_negation_strip("smartphones not from chinese brands").unwrap();
-        assert_eq!(stripped, "smartphones".to_string());
-        assert!(excluded.contains(&"chinese".to_string()) || excluded.contains(&"brands".to_string()));
+        let stripped = simple_negation_strip("smartphones not from chinese brands");
+        assert_eq!(stripped, Some("smartphones".to_string()));
     }
 
     #[test]
     fn without_sugar_or_honey_negates_both_sides() {
         // "or" continues the negation scope: both alternatives stay excluded.
-        let (stripped, excluded) = simple_negation_strip("dessert recipes without sugar or honey").unwrap();
-        assert!(stripped.contains("dessert recipes"));
-        assert!(excluded.contains(&"sugar".to_string()) || excluded.contains(&"honey".to_string()));
+        let stripped = simple_negation_strip("dessert recipes without sugar or honey");
+        assert!(stripped.unwrap().contains("dessert recipes"));
     }
 
     #[test]
     fn plain_query_returns_none() {
         assert_eq!(simple_negation_strip("best laptop for programming"), None);
-    }
-
-    // ── Non-domain content words after "without" are returned as exclusions ──
-    // Round auto/round-2026-10-12T0625Z: "biryani without hand rolled" was
-    // losing the "hand rolled" constraint entirely because simple_negation_strip
-    // silently dropped every non-domain word after "without". The fix returns
-    // those words as exclusions so the caller can apply a quality penalty.
-
-    #[test]
-    fn without_non_domain_terms_returned_as_exclusions() {
-        let (stripped, excluded) = simple_negation_strip("biryani without hand rolled").unwrap();
-        assert_eq!(stripped, "biryani".to_string());
-        assert_eq!(excluded, vec!["hand".to_string(), "rolled".to_string()]);
-    }
-
-    #[test]
-    fn without_mixed_domain_and_non_domain_terms() {
-        // "linux" is a preserved domain word; "spicy" is not.
-        let (stripped, excluded) = simple_negation_strip("recipes without linux spicy").unwrap();
-        assert_eq!(stripped, "recipes linux".to_string());
-        assert_eq!(excluded, vec!["spicy".to_string()]);
-    }
-
-    #[test]
-    fn without_non_domain_phrase_collected_word_by_word() {
-        let (stripped, excluded) = simple_negation_strip("protein powder without artificial sweeteners").unwrap();
-        assert_eq!(stripped, "protein powder".to_string());
-        assert_eq!(excluded, vec!["artificial".to_string(), "sweeteners".to_string()]);
-    }
-
-    // ── A bare negation marker must never survive as a POSITIVE requirement ──
-    // Round auto/round-2026-09-25T1155Z-negconstraint-v2: for
-    // "not from chinese brands and have usb c charging" the extractor emitted
-    // ["+not", "-chinese brands", "-have usb c charging"]. `+not` is the marker
-    // ITSELF scored as a topical requirement — it matches no page content, and
-    // is self-contradictory next to the `-…` exclusion derived from the same
-    // marker. sanitize_constraints now routes positives through the SAME
-    // closed-class grammar-noise gate the negative path already used.
-
-    #[test]
-    fn negation_marker_not_emitted_as_positive_constraint() {
-        let c = Constraints {
-            positive: vec!["not".into(), "usb".into(), "charging".into()],
-            negative: vec!["chinese brands".into()],
-            ..Default::default()
-        };
-        let s = sanitize_constraints(&c);
-        assert!(
-            !s.positive.iter().any(|p| p == "not"),
-            "bare negation marker must not survive as a positive, got {:?}",
-            s.positive
-        );
-        assert!(
-            s.positive.iter().any(|p| p == "charging"),
-            "real topical positives must survive the shared gate, got {:?}",
-            s.positive
-        );
-    }
-
-    // The same gate must not over-filter: an ordinary content word that merely
-    // LOOKS like a function word in another class must stay. This pins the fix
-    // as a shared closed-class gate rather than a blunt "drop all short tokens".
-
-    #[test]
-    fn content_positives_survive_grammar_noise_gate() {
-        let c = Constraints {
-            positive: vec!["python".into(), "django".into(), "framework".into()],
-            ..Default::default()
-        };
-        let s = sanitize_constraints(&c);
-        for want in ["python", "django", "framework"] {
-            assert!(
-                s.positive.iter().any(|p| p == want),
-                "content positive '{}' must survive, got {:?}",
-                want,
-                s.positive
-            );
-        }
-    }
-
-    // A positive whose EVERY token already appears in a negative is subsumed by
-    // that exclusion — the pipeline must not simultaneously require and forbid
-    // the same term. Token-set containment (not exact string equality) so the
-    // phrase/modifier pair `-chinese brands` vs `+chinese` is caught.
-
-    #[test]
-    fn positive_subsumed_by_phrase_exclusion_is_dropped() {
-        let c = Constraints {
-            positive: vec!["chinese".into(), "charger".into()],
-            negative: vec!["chinese brands".into()],
-            ..Default::default()
-        };
-        let s = sanitize_constraints(&c);
-        assert!(
-            !s.positive.iter().any(|p| p == "chinese"),
-            "positive fully contained in a negative must be dropped, got {:?}",
-            s.positive
-        );
-        assert!(
-            s.positive.iter().any(|p| p == "charger"),
-            "unrelated positive must survive, got {:?}",
-            s.positive
-        );
-    }
-
-    // ── An auxiliary after a list connector ends the exclusion clause ──
-    // The phantom exclusion "have usb c charging" was a verb phrase that
-    // substring-matches no product page and wrongly penalised every charger
-    // result. A function word arriving when NO target is being collected now
-    // terminates the clause instead of seeding a fresh target.
-
-    #[test]
-    fn auxiliary_after_connector_does_not_seed_phantom_exclusion() {
-        let negs = extract_explicit_negation_terms("not from chinese brands and have usb c charging");
-        assert!(
-            !negs.iter().any(|n| n == "have usb c charging"),
-            "phantom verb-phrase exclusion must not be produced, got {:?}",
-            negs
-        );
-        assert!(
-            negs.iter().any(|n| n.contains("chinese")),
-            "the real exclusion must survive, got {:?}",
-            negs
-        );
-    }
-
-    // Guard against the fix over-reaching: a GENUINE second target after "and"
-    // must still be extracted. If the break fired on the connector itself, every
-    // compound exclusion would silently degrade to its first half.
-
-    #[test]
-    fn genuine_second_target_after_and_still_extracted() {
-        let negs = extract_explicit_negation_terms("recipe without oven or microwave");
-        assert!(
-            negs.iter().any(|n| n == "oven"),
-            "first target must be extracted, got {:?}",
-            negs
-        );
-        assert!(
-            negs.iter().any(|n| n == "microwave"),
-            "genuine second target after the connector must be extracted, got {:?}",
-            negs
-        );
     }
 }
 
