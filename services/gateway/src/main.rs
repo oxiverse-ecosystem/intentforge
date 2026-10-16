@@ -8060,90 +8060,80 @@ fn negated_by_preposition(q_orig: &str, compound: &str) -> bool {
 /// NOT be surfaced in `ignored_constraints` — surfacing "not:soap — exclusion not
 /// applied" would be confusing and contradict the round's manner-suppression.
 ///
-/// Structural, not per-query: it tests whether the *extracted compound* sits in a
-/// known manner frame within the query. Reuses the open-class `MANNER_PRONOUNS`
-/// set; no per-query literals, no tuned thresholds (consistent with the
-/// hardcoding doctrine and the existing `is_manner_phrase`).
+/// The `manner_qualifiers` bucket is INERT: no ranking or filtering code reads
+/// it (it is surfaced only by the /analyze and /inspect introspection
+/// endpoints). So every compound this function claims is not merely demoted —
+/// the user's constraint is DISCARDED. That asymmetry is what makes
+/// over-claiming here expensive, and it is why the frame alone is not enough
+/// evidence.
+///
+/// ## Why the frame alone is not evidence
+///
+/// An earlier version of this function returned `true` for ANY compound sitting
+/// in a "with no X" / "without X" frame. That made every negation frame a
+/// manner qualifier, so "dessert recipes without artificial sweeteners" and
+/// "a tutorial with no wifi" were both swallowed and had zero effect, while
+/// the pinned manner cases still passed (they are all "how to ..." queries).
+/// The frame marks the SYNTAX of a negation; it says nothing about what the
+/// negated noun denotes.
+///
+/// ## The discriminator used instead: request vs. content frame
+///
+/// What separates "without soap" (manner) from "without artificial sweeteners"
+/// (content exclusion) is not the noun — it is whether the query is asking for
+/// INSTRUCTIONAL content. In a how-to / procedural request the negated noun
+/// qualifies the METHOD the user should use ("clean this skillet without
+/// soap", "learn guitar with no music background"): pages that discuss the
+/// method are exactly what the user wants, so demoting them is wrong. In a
+/// CONTENT request ("dessert recipes without artificial sweeteners", "a tutorial
+/// with no wifi") the negated noun is a property of the sought page, so pages
+/// carrying it are pages the user does not want.
+///
+/// This is a structural test over the token stream — the query's HEAD frame —
+/// not a noun allow/deny list. It reuses the existing open-class
+/// `NON_LOCAL_HEAD_FRAMES` request-frame vocabulary already in this file (the
+/// P10/P11 precedent: a fixed structural vocabulary of request openers, gated
+/// on the head, never on the content noun). A prior attempt at this fix
+/// substituted a 6-noun `ATTRIBUTE_OBJECTS` allow-list for the missing signal
+/// and was correctly rejected under the hardcoding doctrine; this replaces the
+/// signal rather than the list.
+///
+/// Precedence note: an already-recognized ENTITY inside a how-to frame stays a
+/// real exclusion, because `is_real_exclusion` runs first in the gate chain and
+/// its entity/contrastive/source-entity acceptances are independent of this
+/// function. "how to deploy without nginx" still excludes nginx.
+///
+/// Structural, not per-query: no per-query literals, no tuned thresholds.
 fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     let lc = q_orig.to_lowercase();
-    let compound_lower = compound.to_lowercase();
-    let c_tokens: Vec<&str> = compound_lower.split_whitespace().collect();
-    // D2: the `pay`/`paying` family is genuinely AMBIGUOUS — a manner idiom
-    // ("without paying attention") describes HOW, while a monetary object
-    // ("without paying for a course") is a real exclusion the user refuses.
-    // The broad procedural rule below cannot tell them apart (both appear in
-    // `how to …` queries), so decide this family from the query's object
-    // vocabulary FIRST: a monetary object means it is NOT a manner frame.
-    if !c_tokens.is_empty() && c_tokens.iter().all(|t| *t == "pay" || *t == "paying") {
-        return !pay_exclusion_is_money(&lc);
-    }
-    // A negated clause whose HEAD noun names a TRAIT of the user (their
-    // background / experience / degree) rather than a property of the desired
-    // CONTENT states a prerequisite, not a topic to remove. "a tutorial with
-    // no music background" is a HOW/prerequisite qualifier; "dessert recipes
-    // with no nuts" names the content, so its head ("nuts") is untouched and
-    // it stays a real exclusion. Structural (head-noun class), no per-query
-    // literals. `is_verb_attribute_exclusion` uses the same trait class but
-    // requires EVERY token to be a trait noun, which a modifier phrase
-    // ("music background") never satisfies.
-    if let Some(head) = c_tokens.last() {
-        if USER_TRAIT_NOUNS.contains(head) {
-            return true;
-        }
-    }
-    // In a procedural request, a bare `without NOUN` / `no NOUN` states a
-    // constraint on HOW the user wants to accomplish the task (cleaning without
-    // soap, learning without a degree), not a result topic to remove. In a
-    // content request (dessert recipes without artificial sweeteners, recipes
-    // with no nuts) the same grammar names the thing the results must exclude.
-    // Detect the broad instruction/content frame structurally, not by domain
-    // nouns. Verb-led targets are handled below.
-    let procedural = ["how to ", "best way to ", "way to ", "tutorial for ", "guide to ", "learn "]
-        .iter()
-        .any(|frame| lc.starts_with(frame));
-    if procedural && c_tokens.iter().all(|t| !MANNER_PRONOUNS.contains(t)) {
-        return true;
-    }
-
-    // A relation pronoun is an unambiguous manner signal wherever it occurs
-    // ("does not track you as", "without offending the couple").
+    let c = compound.to_lowercase();
+    // Manner pronouns anywhere in the compound ("track you as", "offend the
+    // couple") are direct evidence of a requester-attached phrase, independent
+    // of any frame. Checked FIRST: it is the strongest signal and needs no
+    // frame at all.
+    let c_tokens: Vec<&str> = c.split_whitespace().collect();
     if c_tokens.iter().any(|t| MANNER_PRONOUNS.contains(t)) {
         return true;
     }
-
-    // The extractor removes a leading action verb before collecting its noun
-    // target ("without using a library" -> target "library"). Recover that
-    // verb-led frame structurally: the target must occur after `without` or
-    // `with no`, optional articles, and a known manner/action verb. A plain
-    // `without NOUN` or `no NOUN` frame is NOT manner by itself: the noun can
-    // be the thing the user genuinely wants excluded.
-    let q_tokens: Vec<&str> = lc
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .collect();
-    let target = c_tokens.first().copied().unwrap_or_default();
-    if target.is_empty() {
+    // The compound must actually sit in a "with no X" / "without X" frame — a
+    // bare "not X" is a different construction handled by the caller.
+    let frames = [
+        format!("without {}", c),
+        format!("without a {}", c),
+        format!("without an {}", c),
+        format!("without the {}", c),
+        format!("with no {}", c),
+        format!("with no a {}", c),
+    ];
+    if !frames.iter().any(|f| lc.contains(f.as_str())) {
         return false;
     }
-    for i in 0..q_tokens.len().saturating_sub(1) {
-        if q_tokens[i] != "without" && !(q_tokens[i] == "with" && q_tokens.get(i + 1) == Some(&"no")) {
-            continue;
-        }
-        let mut j = i + if q_tokens[i] == "with" { 2 } else { 1 };
-        while matches!(q_tokens.get(j), Some(&"a") | Some(&"an") | Some(&"the") | Some(&"any")) {
-            j += 1;
-        }
-        if q_tokens.get(j).is_some_and(|verb| MANNER_VERBS.contains(verb)) {
-            j += 1;
-            while matches!(q_tokens.get(j), Some(&"a") | Some(&"an") | Some(&"the") | Some(&"any")) {
-                j += 1;
-            }
-            if q_tokens.get(j) == Some(&target) {
-                return true;
-            }
-        }
-    }
-    false
+    // Being in the frame is necessary but NOT sufficient: the query must be an
+    // instructional/procedural REQUEST for the negated noun to describe the
+    // method rather than the content. Gate on the query's head frame against
+    // the existing open-class request-frame vocabulary.
+    let head = lc.trim_start();
+    NON_LOCAL_HEAD_FRAMES.iter().any(|f| head.starts_with(f))
 }
 
 fn is_manner_phrase(compound: &str) -> bool {
@@ -22139,11 +22129,74 @@ mod constraint_fix_tests {
     }
 
     #[test]
-    fn negation_with_site_operator_no_phantom_negative() {
+fn d3_content_negation_frame_is_not_manner() {
+        // A `with no X` / `without X` frame is NOT on its own evidence of manner.
+        // `manner_qualifiers` is INERT — nothing in ranking consumes it (it is
+        // surfaced only by /analyze and /inspect), so any genuine content
+        // exclusion the frame swallows has ZERO effect on results: the user's
+        // constraint is silently discarded rather than merely demoted.
+        //
+        // These four queries name something the user does not want IN the result
+        // (the topic of the sought page), not a way of doing the task, so each
+        // must land in a bucket that ranking actually consumes: `kept` (hard
+        // exclusion) or `dropped` (soft negative, demoted x0.1) — never `manner`.
+        //
+        // This asserts BEHAVIOUR (which bucket), never a noun list.
+        for q in [
+            "a guitar tutorial with no music theory",
+            "dessert recipes without artificial sweeteners",
+            "best laptop for gaming without a dedicated gpu",
+            "a tutorial with no wifi",
+        ] {
+            let (kept, dropped, manner) = extract_query_negative_terms_with_dropped(q);
+            assert!(
+                manner.is_empty(),
+                "content exclusion '{}' must NOT be swallowed as an inert manner qualifier: manner={:?}",
+                q,
+                manner
+            );
+            assert!(
+                !kept.is_empty() || !dropped.is_empty(),
+                "content exclusion '{}' must reach a bucket ranking consumes (kept/dropped), not vanish: kept={:?} dropped={:?} manner={:?}",
+                q,
+                kept,
+                dropped,
+                manner
+            );
+        }
+    }
+
+    #[test]
+    fn d3_manner_cases_stay_out_of_exclusions_after_frame_narrowing() {
+        // Narrowing `is_manner_frame` must not promote any pinned manner case
+        // into a real exclusion. These are the same queries the pre-existing
+        // manner tests pin; re-asserted here so a regression in the frame
+        // discriminator fails as a MANNER failure, not as a silent quality
+        // change nobody notices.
+        for q in [
+            "how to clean a cast iron skillet without soap after cooking eggs",
+            "how to learn guitar with no music background",
+            "how to learn to play the guitar as an adult with no music background",
+            "how to politely decline a wedding invitation without offending the couple",
+            "how to remove a stripped screw from a laptop without damaging the board",
+            "how to teach a child to ride a bicycle without training wheels patiently",
+        ] {
+            let (kept, _dropped, _manner) = extract_query_negative_terms_with_dropped(q);
+            assert!(
+                kept.is_empty(),
+                "manner qualifier '{}' must never become a hard exclusion: kept={:?}",
+                q,
+                kept
+            );
+        }
+    }
+
+    #[test]
+        fn negation_with_site_operator_no_phantom_negative() {
         // D3 phantom-negation regression: a `not <X> site:<Y>` clause must NOT
-        // emit the bogus compound exclusion "X siteY" (colon stripped then swept
-        // into the negative). The bare noun is the only exclusion; the site is a
-        // positive `sites` filter handled elsewhere. Pure operator-token skip —
+// emit the bogus compound exclusion "X siteY" (colon stripped then swept
+// into the negative). The bare noun is the only exclusion; the site is a
+// positive `sites` filter handled elsewhere. Pure operator-token skip —
         // no per-query literals / denylists.
         for q in [
             "python web framework not django site:github.com",
