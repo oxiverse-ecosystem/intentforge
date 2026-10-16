@@ -264,6 +264,10 @@ services:
     container_name: if-dev-indexer
     mem_limit: 2048m
     mem_reservation: 512m
+    # CPU was previously UNBOUNDED (no cpus: on any service). Measured
+    # 2026-09-25: indexer sustained 31-58% of a core. It is a batch worker,
+    # not latency-critical, so cap it at 1 core.
+    cpus: "1.0"
     volumes:
       - ./indexer/index_data:/app/index_data
       - ./shared-signals/resolv-gluetun.conf:/etc/resolv.conf:ro
@@ -278,8 +282,13 @@ services:
       context: ./crawler
       dockerfile: Dockerfile
     container_name: if-dev-crawler
-    mem_limit: 2048m
+    # Lowered 2048m -> 1536m: measured 1.20-1.44 GiB steady, i.e. sitting
+    # right against the old 2GB ceiling. 1536m keeps headroom without OOM.
+    mem_limit: 1536m
     mem_reservation: 512m
+    # CPU was previously UNBOUNDED. Measured 2026-09-25: crawler swung
+    # 17-98% of a core. Batch worker, not latency-critical -> cap at 1 core.
+    cpus: "1.0"
     environment:
       # crawler=debug surfaces the per-page "Content length: raw= truncated= cap="
       # line used for raw-length distribution measurement (cap tuning).

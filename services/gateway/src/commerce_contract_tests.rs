@@ -94,20 +94,18 @@ fn collect_affiliate_urls(payload: &Value) -> Vec<String> {
 
 #[test]
 fn affiliate_policy_allows_exact_model_and_rejects_broad_product_query() {
-    let ctx = AffiliateCtx {
-        exact_model_patterns: vec![
-            r"(?i)^\s*(?:buy\s+)?iphone\s+\d{1,5}(?:\s+(?:pro|max|plus))*(?:\s+price)?\s*$".to_string(),
-        ],
-        ..AffiliateCtx::default()
-    };
+    let ctx = AffiliateCtx::default();
     assert!(ctx.is_exact_model_query("iphone 16 pro max price"));
-    assert!(ctx.is_exact_model_query("buy iphone 15 pro"));
+    assert!(ctx.is_exact_model_query("acme nova x7 headset"));
     assert!(!ctx.is_exact_model_query("best wireless earbuds under 50 dollars"));
     assert!(!ctx.is_exact_model_query("steel water bottle"));
 }
 
 #[test]
 fn affiliate_policy_gate_decorates_exact_model_but_not_broad_query() {
+    // Env var is process-global and `cargo test` is multithreaded: take the
+    // shared lock so this test cannot race another test's key set/remove.
+    let _env_guard = crate::ENV_TEST_LOCK.lock();
     std::env::set_var("EXACT_MODEL_POLICY_TEST_KEY", "present");
     let n = contract_net(
         "wrap",
@@ -115,12 +113,7 @@ fn affiliate_policy_gate_decorates_exact_model_but_not_broad_query() {
         HashMap::new(),
         Some("EXACT_MODEL_POLICY_TEST_KEY"),
     );
-    let ctx = AffiliateCtx {
-        networks: vec![n],
-        exact_model_patterns: vec![
-            r"(?i)^\s*sony\s+[a-z0-9-]*\d[a-z0-9-]*\s*$".to_string(),
-        ],
-    };
+    let ctx = AffiliateCtx { networks: vec![n] };
 
     let exact = vec![json!({"url": "https://shop.example/product/sony-wh-1000xm5"})];
     let broad = vec![json!({"url": "https://shop.example/headphones"})];
@@ -134,6 +127,9 @@ fn affiliate_policy_gate_decorates_exact_model_but_not_broad_query() {
 
 #[test]
 fn contract_disclosure_present_on_every_decorated_result() {
+    // Env var is process-global and `cargo test` is multithreaded: take the
+    // shared lock so this test cannot race another test's key set/remove.
+    let _env_guard = crate::ENV_TEST_LOCK.lock();
     // A wrap network (Sovrn-like) that also carries a cuid subid param.
     std::env::set_var("CONTRACT_SOVRN_KEY", "CONTRACT_SOVRN_KEY");
     let mut params = HashMap::new();
@@ -174,6 +170,9 @@ fn contract_disclosure_present_on_every_decorated_result() {
 
 #[test]
 fn contract_no_query_user_or_ip_in_affiliate_urls() {
+    // Env var is process-global and `cargo test` is multithreaded: take the
+    // shared lock so this test cannot race another test's key set/remove.
+    let _env_guard = crate::ENV_TEST_LOCK.lock();
     std::env::set_var("CONTRACT_SOVRN_KEY", "CONTRACT_SOVRN_KEY");
     let mut params = HashMap::new();
     params.insert("cuid".to_string(), "{subid}".to_string());
@@ -231,6 +230,9 @@ fn contract_no_query_user_or_ip_in_affiliate_urls() {
 
 #[test]
 fn contract_subid_is_coarse_host_not_user_identifying() {
+    // Env var is process-global and `cargo test` is multithreaded: take the
+    // shared lock so this test cannot race another test's key set/remove.
+    let _env_guard = crate::ENV_TEST_LOCK.lock();
     // Even when the destination merchant URL itself carries tracking params
     // (utm_source, ref), the subid placed into the affiliate param surface MUST
     // be ONLY the coarse host — never the merchant's own tracking junk, and never
@@ -271,6 +273,9 @@ fn contract_subid_is_coarse_host_not_user_identifying() {
 
 #[test]
 fn contract_decoration_is_idempotent_and_order_preserved() {
+    // Env var is process-global and `cargo test` is multithreaded: take the
+    // shared lock so this test cannot race another test's key set/remove.
+    let _env_guard = crate::ENV_TEST_LOCK.lock();
     // The no-manipulation guarantee, locked at the contract level: decorating
     // twice yields the same URL (no double-wrap) and the ranked order is
     // byte-identical before/after.
@@ -398,6 +403,9 @@ fn collect_ranked_urls(payload: &Value) -> Vec<String> {
 /// `decorate_affiliate` pass.
 #[test]
 fn test_affiliate_decoration_does_not_change_ranking() {
+    // Env var is process-global and `cargo test` is multithreaded: take the
+    // shared lock so this test cannot race another test's key set/remove.
+    let _env_guard = crate::ENV_TEST_LOCK.lock();
     // Representative already-ranked results for a shopping query shape
     // ("buy wireless earbuds under 200" — triggers shopping intent downstream).
     let ranked_input = representative_shopping_payload("buy wireless earbuds under 200");
@@ -482,6 +490,9 @@ fn test_affiliate_decoration_does_not_change_ranking() {
 /// enforced structurally, not just asserted.
 #[test]
 fn test_affiliate_decoration_writes_affiliate_field_not_url() {
+    // Env var is process-global and `cargo test` is multithreaded: take the
+    // shared lock so this test cannot race another test's key set/remove.
+    let _env_guard = crate::ENV_TEST_LOCK.lock();
     std::env::set_var("SOVRN_COMMERCE_KEY", "DUMMY_ENABLED");
     let net = contract_net(
         "wrap",
@@ -569,6 +580,9 @@ fn contract_net_with_bf(
 
 #[test]
 fn item6_bid_floor_and_fallback_appended_and_reported() {
+    // Env var is process-global and `cargo test` is multithreaded: take the
+    // shared lock so this test cannot race another test's key set/remove.
+    let _env_guard = crate::ENV_TEST_LOCK.lock();
     std::env::set_var("CONTRACT_SOVRN_BF_KEY", "CONTRACT_SOVRN_BF_KEY");
     let mut params = HashMap::new();
     params.insert("cuid".to_string(), "{subid}".to_string());
@@ -629,6 +643,9 @@ fn item6_bid_floor_and_fallback_appended_and_reported() {
 
 #[test]
 fn item6_bf_fbu_never_change_ranking() {
+    // Env var is process-global and `cargo test` is multithreaded: take the
+    // shared lock so this test cannot race another test's key set/remove.
+    let _env_guard = crate::ENV_TEST_LOCK.lock();
     // Same order-invariance guarantee, now WITH bf/fbu present (the hardest case).
     std::env::set_var("SOVRN_COMMERCE_KEY", "DUMMY_ENABLED");
     let mut params = HashMap::new();

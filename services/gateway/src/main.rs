@@ -13,6 +13,21 @@ use tower_http::timeout::TimeoutLayer;
 use axum::http::HeaderMap;
 use std::net::IpAddr;
 
+/// Serializes every test that mutates process-global environment variables.
+///
+/// `cargo test` runs test functions in parallel threads, but `std::env` is
+/// process-global. Any test that toggles an affiliate network's `key_env` var
+/// therefore races every other test that reads or writes the same var — most
+/// visibly `commerce_contract_tests` setting `SOVRN_COMMERCE_KEY` while
+/// `real_data_order_tests` asserts that key is ABSENT. The symptom is a flaky
+/// 1-or-2 test failure whose failing set varies per run, and which disappears
+/// entirely under `--test-threads=1`.
+///
+/// This is a test-harness concern only; production reads these vars at startup
+/// and is unaffected.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 mod spell;
 mod geoloc;
 mod dictionary;
@@ -21,6 +36,9 @@ mod goals;
 mod query_expansion;
 // ROADMAP item 4: explicit disclosure + no-tracking CI contract (test-only module).
 mod commerce_contract_tests;
+// ROADMAP item 6: order invariance driven by the REAL shipped affiliate data
+// (every network, keys present vs absent) — the offline CI lock.
+mod real_data_order_tests;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
@@ -5151,26 +5169,21 @@ fn default_priority() -> i64 {
 #[derive(Clone)]
 struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
-    /// Regex sources for the exact-product-model eligibility policy. These stay
-    /// as data (compiled at startup) so a new product family can be monetized by
-    /// editing JSON only — never by adding a brand/query branch in Rust.
-    exact_model_patterns: Vec<String>,
 }
 
 impl Default for AffiliateCtx {
     fn default() -> Self {
-        Self { networks: Vec::new(), exact_model_patterns: Vec::new() }
+        Self { networks: Vec::new() }
     }
 }
 
 impl AffiliateCtx {
-    /// Load networks and exact-model eligibility patterns from runtime data. An
-    /// empty/missing file is NOT fatal: the engine simply has no networks and
-    /// every result degrades to `affiliate: null`. This is intentional — affiliate
-    /// decoration is best-effort and must never break search.
+    /// Load networks from runtime data. An empty/missing file is NOT fatal: the
+    /// engine simply has no networks and every result degrades to
+    /// `affiliate: null`. This is intentional — affiliate decoration is
+    /// best-effort and must never break search.
     fn load() -> Self {
         let mut networks: Vec<AffiliateNetwork> = Vec::new();
-        let mut exact_model_patterns: Vec<String> = Vec::new();
         // Resolve the data path relative to the process cwd (container WORKDIR is
         // /app, app binary at /app/gateway; data baked at /app/data/commerce).
         let candidates = [
@@ -5188,51 +5201,42 @@ impl AffiliateCtx {
                             }
                         }
                     }
-                    if let Some(arr) = v
-                        .get("eligibility")
-                        .and_then(|e| e.get("exact_model_patterns"))
-                        .and_then(|p| p.as_array())
-                    {
-                        exact_model_patterns = arr
-                            .iter()
-                            .filter_map(|p| p.as_str().map(|s| s.to_string()))
-                            .collect();
-                    }
                 }
                 if !networks.is_empty() {
                     break;
                 }
             }
         }
-        // Ignore malformed policy patterns rather than taking the gateway down;
-        // monetization is strictly best-effort. Every valid regex is a generic
-        // matcher over runtime data, not a per-query branch in compiled code.
-        let valid_pattern_count = exact_model_patterns
-            .iter()
-            .filter(|p| regex::Regex::new(p).is_ok())
-            .count();
         networks.sort_by(|a, b| b.priority.cmp(&a.priority));
-        tracing::info!(
-            "affiliate: loaded {} network(s) and {} exact-model pattern(s) from data file",
-            networks.len(),
-            valid_pattern_count
-        );
-        Self { networks, exact_model_patterns }
+        tracing::info!("affiliate: loaded {} network(s) from data file", networks.len());
+        Self { networks }
     }
 
-    /// Sacred monetization gate: affiliate decoration is allowed only for an
-    /// exact product-model query. Broad category/product queries remain free and
-    /// receive no affiliate metadata. The policy is entirely data-driven; this
-    /// method only compiles and matches the regex sources.
+    /// Sacred monetization gate: affiliate decoration is allowed only for a
+    /// structurally identifiable exact product model. This deliberately derives
+    /// the policy from token shape rather than a maintained brand/family list:
+    /// a short query containing a model-bearing alphanumeric token (a standalone
+    /// number or an alphanumeric SKU) and no comparison/budget clause. The
+    /// policy therefore covers unknown/new brands without authored vocabulary.
     fn is_exact_model_query(&self, query: &str) -> bool {
-        self.exact_model_patterns
-            .iter()
-            .filter_map(|p| regex::Regex::new(p).ok())
-            // Policy regexes are compiled with anchors in tests/config, but a
-            // caller may omit them. `is_match` deliberately remains a substring
-            // match by default; an explicit full-query boundary is opt-in via
-            // anchors in the policy source itself.
-            .any(|re| re.is_match(query.trim()))
+        let normalized: Vec<String> = query
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '-').to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if normalized.len() < 2 || normalized.len() > 6 {
+            return false;
+        }
+        let has_model_token = normalized.iter().any(|t| {
+            let has_digit = t.chars().any(|c| c.is_ascii_digit());
+            let has_alpha = t.chars().any(|c| c.is_ascii_alphabetic());
+            let all_numeric = t.chars().all(|c| c.is_ascii_digit());
+            (all_numeric && t.len() <= 5) || (has_digit && has_alpha)
+        });
+        // Reject only price/budget expressions. The model-bearing token itself
+        // distinguishes a SKU from a broad category without consulting authored
+        // brand or category vocabulary.
+        has_model_token && extract_nl_price_bound(query).is_none()
     }
 
     /// The first enabled network that has its required key present in the env.
@@ -5479,20 +5483,37 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                             continue;
                         }
                         // Currency-proximity guard: Pattern A is "<marker> <number>",
-                        // but a discourse marker like "about" can be followed by an
-                        // unrelated number that is NOT a price (e.g. "gpt 5",
-                        // "chapter 3", "version 2"). Require a currency word to
-                        // appear IMMEDIATELY after the number (within 20 chars),
-                        // not anywhere in the rest of the query. Without a nearby
-                        // currency word, this is not a price bound — skip and try
-                        // the next marker. General guard; no per-query literals.
+                        // and for a DISCOURSE marker ("about", "around", "up to")
+                        // a trailing number may be unrelated to price ("gpt 5",
+                        // "chapter 3", "version 2"). For those, require a currency
+                        // word near the number.
+                        //
+                        // A DEFINITIONAL comparison marker ("under", "below", "at
+                        // most", "max", ...) is different: a bare number after it IS
+                        // the bound, with or without a currency word ("under 50",
+                        // "under 50 dollars"). Requiring currency there made
+                        // "wireless headphones under 50" parse as having NO price
+                        // bound at all, so the bare "50" was then mistaken for a
+                        // product-model token and the broad query was wrongly
+                        // treated as exact-model (and monetized).
+                        //
+                        // The split is grammatical (definitional vs discourse), not
+                        // per-query; no authored query literals. Note this is scoped
+                        // to the UPPER-marker loop; NL lower bounds are handled
+                        // separately below and are not yet wired to price_gt.
                         let after_num = &rest[m.end()..];
+                        let marker_is_definitional = matches!(
+                            marker,
+                            "under" | "below" | "less than" | "cheaper than"
+                                | "at most" | "no more than" | "min" | "minimum"
+                                | "max" | "maximum"
+                        );
                         let near_currency = currency_words.iter().any(|c| {
                             after_num.len() >= c.len() && after_num[..c.len()].starts_with(c)
                                 || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
                                 || after_num[..after_num.len().min(20)].contains(c)
                         });
-                        if !near_currency {
+                        if !marker_is_definitional && !near_currency {
                             continue;
                         }
                         let currency = currency_words.iter().find(|c| after_num[..after_num.len().min(20)].contains(*c))
@@ -8438,12 +8459,7 @@ fn extract_query_negative_terms(q_orig: &str) -> Vec<String> {
 fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
     let leads: &[&str] = &[
         r"(?i)\bnot\s+from\b",
-        r"(?i)\bnot\b", // FIX-IF-01 (round 2026-09-25): "not X" was missing from
-        // the leads array. Only "not from X" was matched, so "not react vue or
-        // angular" never triggered the extractor — the protected-term boundary
-        // split code below was dead code. Adding plain "not" as a lead-in
-        // enables the "not X or Y / not X and Y" negation class end-to-end.
-        // Word-boundary anchored (\bnot\b) so "nothing"/"notice" are not matched.
+        r"(?i)\bnot\b",
         r"(?i)\bexcept\s+for\b",
         r"(?i)\bexcept\b",
         r"(?i)\bexcluding\b",
@@ -23686,6 +23702,43 @@ structured product data, so nothing must be extracted from the body.</p></body><
     }
 
     #[test]
+    fn price_bound_definitional_marker_needs_no_currency_word() {
+        // A DEFINITIONAL comparison marker plus a bare number IS a price bound,
+        // with or without a currency word. Without this, "under 50" parsed as
+        // having NO bound at all, so the bare "50" was then mistaken for a
+        // product-model token and the broad query was wrongly monetized.
+        //
+        // Scoped to the UPPER-marker set: NL lower bounds ("over N", "at least
+        // N") are deliberately not yet wired to price_gt (see the lower_markers
+        // loop in extract_nl_price_bound), so they are NOT asserted here.
+        for q in [
+            "wireless headphones under 50",
+            "wireless headphones under 50 dollars",
+            "laptops below 1000",
+            "monitors at most 300",
+            "tablets maximum 900",
+        ] {
+            assert!(
+                extract_nl_price_bound(q).is_some(),
+                "{q:?} must parse as a price bound"
+            );
+        }
+    }
+
+    #[test]
+    fn price_bound_discourse_marker_still_requires_currency_word() {
+        // The counterpart guard, which must NOT be weakened: a DISCOURSE marker
+        // ("about", "around") may be followed by an unrelated number that is not
+        // a price ("gpt 5", "chapter 3", "version 2").
+        for q in ["gpt 5", "about chapter 3", "version 2 guide", "around 300 options"] {
+            assert!(
+                extract_nl_price_bound(q).is_none(),
+                "{q:?} must NOT parse as a price bound"
+            );
+        }
+    }
+
+    #[test]
     fn informational_query_is_not_commercial() {
         // A purely informational query ("rust ownership", "how do black holes work")
         // with no price bound and no transactional signal must NOT trigger a
@@ -23749,6 +23802,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
     #[test]
     fn wrap_kind_encodes_destination_and_uses_key() {
+        let _env_guard = ENV_TEST_LOCK.lock();
         // `wrap`: network prefix + url-encoded destination, key interpolated.
         std::env::set_var("DUMMY_SOVRN_KEY", "DUMMY_SOVRN_KEY");
         let n = net(
@@ -23767,6 +23821,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
     #[test]
     fn append_params_kind_appends_encoded_params_to_raw_url() {
+        let _env_guard = ENV_TEST_LOCK.lock();
         // `append_params`: template is the raw destination; params appended encoded.
         std::env::set_var("DUMMY_AMAZON_TAG", "DUMMY_AMAZON_TAG");
         let mut params = HashMap::new();
@@ -23793,6 +23848,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
     #[test]
     fn wrap_kind_appends_network_params_like_cuid() {
+        let _env_guard = ENV_TEST_LOCK.lock();
         // A `wrap` network (e.g. Sovrn) carries its own `params` (cuid). These
         // MUST be appended (encoded) to the network prefix — the prior renderer
         // silently dropped them. This test locks that contract.
@@ -23811,6 +23867,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
     #[test]
     fn decoration_is_idempotent_no_double_wrap() {
+        let _env_guard = ENV_TEST_LOCK.lock();
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
         let ctx = AffiliateCtx { networks: vec![n], ..AffiliateCtx::default() };
@@ -23840,6 +23897,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
     #[test]
     fn decoration_preserves_ranking_order() {
+        let _env_guard = ENV_TEST_LOCK.lock();
         // The central no-manipulation guarantee: decoration never reorders.
         std::env::set_var("K", "K");
         let n = net("wrap", "https://sovrn.co?key=K&u={url}", HashMap::new(), Some("K"));
@@ -23861,6 +23919,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
 
     #[test]
     fn no_user_or_query_data_in_affiliate_params() {
+        let _env_guard = ENV_TEST_LOCK.lock();
         // Subid is the coarse merchant host only — never a query, user id, or IP.
         std::env::set_var("K", "K");
         let n = net(
