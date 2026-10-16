@@ -1654,6 +1654,48 @@ Top result (truncated):
 by a Rust unit test (`enrichment_preserves_result_order_with_or_without_affiliate_keys`
 and `decoration_preserves_ranking_order`).
 
+### Main-path `shopping` field on `/search` (ROADMAP item 7)
+
+The PRIMARY `/search` endpoint now *knows you want to buy*. When the resolved intent
+is commercial, the **same** `/search` JSON response gains a `shopping` field — you do
+not have to visit a separate `/shopping` tab. The block reuses the exact same
+`extract_commerce_offer` + `decorate_affiliate` + `build_offer_comparisons` passes
+already written for `GET /shopping`, applied to a **clone** of the top-N already-ranked
+results. The main `results` ordering is untouched, so the no-manipulation guarantee
+holds for the main path too (the order-invariance test covers it).
+
+**Signal-based detection (no external call, no keyword list):** `is_commercial_intent`
+returns true when the in-process intent signals say "wants to buy":
+- the resolved intent `label == "transactional"`, **or**
+- the `transactional` probability in the intent `distribution` is ≥ 0.50 (covers
+  "X vs Y" product queries that resolve to a non-transactional argmax label but carry
+  a strong transactional distribution), **or**
+- a price bound was parsed by the existing constraint parser (`price:<N` / `price:>N`
+  / `price_min` / `price_max`).
+
+**Example (real, 2026-08-30, `localhost:4000`, verified live):**
+
+```bash
+curl -s "localhost:4000/search?q=buy%20sony%20wh-1000xm5%20headphones" | python -c "import sys,json; d=json.load(sys.stdin); print('intent=',d.get('intent')); print('shopping present=', 'shopping' in d); s=d.get('shopping') or {}; print('shopping results=', len(s.get('results',[]))); print('first shopping url=', s.get('results',[{}])[0].get('url')); print('first affiliate disclosed=', s.get('results',[{}])[0].get('affiliate',{}).get('disclosed'))"
+# intent= transactional
+# shopping present= True
+# shopping results= 8
+# first shopping url= https://gizmodo.com/sonys-flagship-wh-1000xm5-headphones-hit-nearly-40-off-on-amazon-now-priced-like-earbuds-2000795720
+# first affiliate disclosed= True
+```
+
+```bash
+curl -s "localhost:4000/search?q=rust%20ownership%20explained" | python -c "import sys,json; d=json.load(sys.stdin); print('intent=',d.get('intent')); print('shopping present=', 'shopping' in d)"
+# intent= technical
+# shopping present= False
+```
+
+> The `shopping` field carries the same `commerce` / `commerce_provenance` / `affiliate`
+> structure as `GET /shopping`. Every `affiliate` block has `disclosed: true`; no
+> user id / query text / session id / IP ever reaches an affiliate parameter (locked by
+> `test_affiliate_decoration_does_not_change_ranking` + the contract tests in
+> `commerce_contract_tests.rs`).
+
 ### POST /commerce/extract
 
 A **verification primitive** — runs the honest commerce extractor on supplied HTML
