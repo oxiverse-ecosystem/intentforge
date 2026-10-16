@@ -3340,6 +3340,281 @@ fn json_get_u64(v: &serde_json::Value) -> Option<u64> {
     }
 }
 
+/// Extract honest product facts from schema.org MICRODATA
+/// (`itemscope` + `itemprop`), the third structured-on-page signal alongside
+/// JSON-LD and OpenGraph. Real Shopify/legacy product pages emit microdata with
+/// no JSON-LD, so this recovers facts that would otherwise be missed.
+///
+/// Mapping (itemprop value -> `OfferFacts` field), matched on the standard
+/// schema.org/Product + Offer vocabulary — NOT a per-merchant list:
+///   name            -> (used only for soft signal; not stored as a fact)
+///   price           -> price / price_low+price_high when a range (x-y) appears
+///   priceCurrency   -> currency
+///   availability    -> availability (raw value, e.g. InStock/LimitedAvailability)
+///   itemCondition   -> condition
+///   sku             -> sku
+///   gtin13/gtin14/gtin8/gtin/mpn -> gtin
+///   ratingValue     -> rating (also rating/Value)
+///   ratingCount     -> rating_count
+///   seller/brand    -> merchant
+///
+/// Honesty rules (same as the JSON-LD/OG paths):
+///   * A price is captured ONLY from a typed `itemprop="price"` field — never
+///     guessed from free text.
+///   * A multi-offer page (several `itemprop="price"` under separate offers)
+///     surfaces price_low/price_high + offer_count and leaves `price` null,
+///     exactly like the JSON-LD two-offer case — never a silent canonical pick.
+///   * `source` is set to "microdata" only when at least one field was filled.
+fn parse_microdata(html: &str) -> Option<OfferFacts> {
+    // Scan <...> tokens manually with a permissive regex that captures every
+    // attribute name="value" pair (itemprops live in attributes, not meta-only).
+    // NOTE: the regex must match closing tags too (char after '<' may be '/'),
+    // otherwise </div> is invisible and scopes never pop.
+    static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tag_re = TAG_RE
+        .get_or_init(|| regex::Regex::new(r#"(?i)<[a-zA-Z/][^>]*>"#).unwrap());
+    static ATTR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let attr_re = ATTR_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)([a-zA-Z_][-a-zA-Z0-9_:.]*)\s*=\s*["']([^"']*)["']"#).unwrap()
+    });
+
+    // Track nested itemscope kinds on a stack so we only collect itemprops that
+    // belong to a Product/Offer scope (or a Brand nested within one). This avoids
+    // grabbing unrelated itemprops (e.g. a breadcrumb's `itemprop="price"`).
+    #[derive(PartialEq, Clone, Copy)]
+    enum Scope {
+        Product,
+        Offer,
+        Other,
+    }
+    let mut stack: Vec<Scope> = Vec::new();
+    // Parallel stack tracking which TAG NAMES pushed a scope, so closing tags
+    // only pop when they match the opening tag (a </span> must NOT pop a scope
+    // pushed by a <div itemscope>).
+    let mut scope_tags: Vec<String> = Vec::new();
+    let mut facts = OfferFacts::default();
+    let mut prices: Vec<(f64, Option<String>)> = Vec::new();
+
+    for m in tag_re.find_iter(html) {
+        let tag = m.as_str();
+        let lower = tag.to_ascii_lowercase();
+        let is_close = lower.starts_with("</");
+        if is_close {
+            // Only pop if this closing tag matches the opening tag that pushed
+            // the current scope. Extract tag name: first word after '</'.
+            let tag_name = tag[2..].trim_end_matches('>').trim().to_ascii_lowercase();
+            if scope_tags.last() == Some(&tag_name) {
+                scope_tags.pop();
+                stack.pop();
+            }
+            continue;
+        }
+        // Collect attributes.
+        let mut attrs: Vec<(String, String)> = Vec::new();
+        for cap in attr_re.captures_iter(tag) {
+            let k = cap.get(1).map(|x| x.as_str().to_ascii_lowercase()).unwrap_or_default();
+            let v = cap.get(2).map(|x| x.as_str().to_string()).unwrap_or_default();
+            attrs.push((k, v));
+        }
+        // Boolean attributes (e.g. itemscope without =value) are not captured by
+        // attr_re (which requires ="value"). Detect itemscope explicitly so the
+        // scope stack is pushed even for <div itemscope itemtype="...">.
+        if lower.split_whitespace().any(|w| w == "itemscope")
+            && !attrs.iter().any(|(k, _)| k == "itemscope")
+        {
+            attrs.push(("itemscope".to_string(), String::new()));
+        }
+        let has = |name: &str| attrs.iter().any(|(k, _)| k == name);
+        let val_of = |name: &str| {
+            attrs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+
+        if has("itemscope") {
+            // Entering a new scope. Classify by itemtype so we know whether we're
+            // inside a Product/Offer (collect) or something else (e.g. Brand).
+            // ROADMAP item 1 (increment): extend to schema.org's digital-product
+            // itemtypes — `SoftwareApplication`, `VideoGame`, `Service` — which
+            // carry the SAME structured commerce facts (price, rating, brand/
+            // publisher) as a physical Product. The itemprop mapping below is
+            // identical for all of them, so a single Scope::Product branch
+            // covers every product-like type without per-type logic.
+            let itype = val_of("itemtype").unwrap_or_default().to_ascii_lowercase();
+            let kind = if itype.contains("product")
+                || itype.contains("software")
+                || itype.contains("video")
+                || itype.contains("service")
+            {
+                Scope::Product
+            } else if itype.contains("offer") {
+                Scope::Offer
+            } else {
+                Scope::Other
+            };
+            // Inline brand form: <span itemprop="brand">Name</span> (no nested scope).
+            if kind == Scope::Other && has("itemprop") {
+                let prop = val_of("itemprop").unwrap_or_default().to_ascii_lowercase();
+                if prop == "brand" {
+                    let c = val_of("content").or_else(|| val_of("itemid")).unwrap_or_default();
+                    if !c.is_empty() && facts.merchant.is_none() {
+                        facts.merchant = Some(c);
+                    }
+                }
+            }
+            stack.push(kind);
+            // Record the tag name so the matching closing tag pops this scope.
+            let tag_name = tag[1..].split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            scope_tags.push(tag_name);
+        }
+
+        // Only collect itemprops inside a Product/Offer scope (an ancestor in the
+        // stack). Stray itemprops outside any such scope are ignored.
+        let in_prod = stack.iter().any(|s| *s == Scope::Product || *s == Scope::Offer);
+        if !in_prod {
+            continue;
+        }
+        if !has("itemprop") {
+            continue;
+        }
+        let prop = val_of("itemprop").unwrap_or_default().to_ascii_lowercase();
+        // Prefer typed attributes (content/itemid), then href (for <link> elements
+        // like availability/itemCondition), then text content between open and
+        // close tags (e.g. <span itemprop="price">29.99</span>).
+        let attr_content = val_of("content")
+            .or_else(|| val_of("itemid"))
+            .or_else(|| val_of("href"))
+            .unwrap_or_default();
+        let content = if attr_content.is_empty() {
+            let after = &html[m.end()..];
+            let end = after.find('<').unwrap_or(after.len());
+            after[..end].trim().to_string()
+        } else {
+            attr_content
+        };
+        // Prefer a typed/attr value; text-node fallback only when no attribute.
+        let set_str = |f: &mut Option<String>, v: String| {
+            if f.is_none() && !v.is_empty() {
+                *f = Some(v);
+            }
+        };
+        match prop.as_str() {
+            "price" => {
+                let c = content.replace(',', " ").replace("  ", " ").trim().to_string();
+                // Range like "10.00 - 25.50" or "10-25".
+                if let Some(dash) = c.find(|ch| ch == '-' || ch == '–' || ch == '—') {
+                    let lo = c[..dash].trim().parse::<f64>().ok();
+                    let hi = c[dash + 1..].trim().parse::<f64>().ok();
+                    if let (Some(l), Some(h)) = (lo, hi) {
+                        prices.push((l, None));
+                        prices.push((h, None));
+                    } else if let Some(p) = lo.or(hi) {
+                        prices.push((p, None));
+                    }
+                } else if let Ok(p) = c.parse::<f64>() {
+                    let cur = val_of("pricecurrency").map(|s| s.to_uppercase());
+                    prices.push((p, cur));
+                }
+            }
+            "pricecurrency" => {
+                if facts.currency.is_none() && !content.is_empty() {
+                    facts.currency = Some(content.to_uppercase());
+                }
+            }
+            "availability" => set_str(&mut facts.availability, content),
+            "itemcondition" => set_str(&mut facts.condition, content),
+            "sku" => set_str(&mut facts.sku, content),
+            "gtin13" | "gtin14" | "gtin8" | "gtin" | "mpn" => {
+                if facts.gtin.is_none() && !content.is_empty() {
+                    facts.gtin = Some(content);
+                }
+            }
+            "ratingvalue" | "rating" => {
+                if facts.rating.is_none() {
+                    facts.rating = content.replace(',', "").parse::<f64>().ok();
+                }
+            }
+            "ratingcount" | "reviewcount" => {
+                if facts.rating_count.is_none() {
+                    facts.rating_count = content.replace(',', "").parse::<u64>().ok();
+                }
+            }
+            "seller" | "brand" => {
+                if facts.merchant.is_none() && !content.is_empty() {
+                    facts.merchant = Some(content);
+                }
+            }
+            "name" => {
+                // itemprop="name" inside a Brand scope (top of stack is Other) is the
+                // brand/merchant name, not the product name.
+                if stack.last() == Some(&Scope::Other) {
+                    if facts.merchant.is_none() && !content.is_empty() {
+                        facts.merchant = Some(content);
+                    }
+                } else if facts.name.is_none() && !content.is_empty() {
+                    facts.name = Some(content);
+                }
+            }
+            "pricevaliduntil" => {
+                if facts.price_valid_until.is_none() && !content.is_empty() {
+                    facts.price_valid_until = Some(content);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Resolve multiple prices the same way as JSON-LD: single -> canonical,
+    // multiple -> range + count, never a silent pick.
+    if prices.len() == 1 {
+        let (p, c) = &prices[0];
+        facts.price = Some(*p);
+        if facts.currency.is_none() {
+            if let Some(cur) = c {
+                facts.currency = Some(cur.clone());
+            }
+        }
+        if facts.offer_count.is_none() {
+            facts.offer_count = Some(1);
+        }
+    } else if !prices.is_empty() {
+        let mut lo = f64::MAX;
+        let mut hi = f64::MIN;
+        for (p, _c) in &prices {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        // Currency agreement: only surface a currency when every price carried the
+        // SAME one. Mixed currencies on one page => leave currency null (never
+        // guess). Clean Option<String> comparison (no borrow pitfalls).
+        let first_cur = prices.first().and_then(|(_, c)| c.clone());
+        let all_agree = prices.iter().all(|(_, c)| *c == first_cur);
+        facts.price_low = Some(lo);
+        facts.price_high = Some(hi);
+        facts.offer_count = Some(prices.len());
+        if facts.currency.is_none() && all_agree {
+            facts.currency = first_cur;
+        }
+    }
+
+    // Only return when at least one structured fact was found.
+    if facts.price.is_some()
+        || facts.price_low.is_some()
+        || facts.currency.is_some()
+        || facts.availability.is_some()
+        || facts.merchant.is_some()
+        || facts.condition.is_some()
+        || facts.sku.is_some()
+        || facts.gtin.is_some()
+        || facts.rating.is_some()
+    {
+        Some(facts)
+    } else {
+        None
+    }
+}
+
 fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
     let mut facts = OfferFacts::default();
     let mut source: Option<String> = None;
@@ -3368,7 +3643,37 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         }
     }
 
-    // 3) Merchant fallback: derive a coarse host label only when no page-provided
+    // 3) Third structured signal: schema.org MICRODATA (itemscope + itemprop).
+    //    Real Shopify/legacy product pages emit microdata with no JSON-LD/OG —
+    //    this recovers honest facts the other two signals miss. Pure SUPPLEMENT:
+    //    it only fills fields still `None` and never overwrites a stronger signal,
+    //    and it reuses the EXACT SAME `OfferFacts` field mapping (no per-merchant
+    //    code). A price is taken only from a typed `itemprop="price"` (range ->
+    //    price_low/price_high + offer_count, `price` left null), exactly like the
+    //    JSON-LD path — never guessed from free text.
+    if let Some(md) = parse_microdata(html) {
+        if facts.price.is_none() && facts.price_low.is_none() {
+            if facts.price.is_none() { facts.price = md.price; }
+            if facts.price_low.is_none() { facts.price_low = md.price_low; }
+            if facts.price_high.is_none() { facts.price_high = md.price_high; }
+            if facts.offer_count.is_none() { facts.offer_count = md.offer_count; }
+        }
+        if facts.currency.is_none() { facts.currency = md.currency; }
+        if facts.availability.is_none() { facts.availability = md.availability; }
+        if facts.condition.is_none() { facts.condition = md.condition; }
+        if facts.sku.is_none() { facts.sku = md.sku; }
+        if facts.gtin.is_none() { facts.gtin = md.gtin; }
+        if facts.rating.is_none() { facts.rating = md.rating; }
+        if facts.rating_count.is_none() { facts.rating_count = md.rating_count; }
+        if facts.merchant.is_none() { facts.merchant = md.merchant; }
+        if facts.name.is_none() { facts.name = md.name; }
+        if facts.price_valid_until.is_none() { facts.price_valid_until = md.price_valid_until; }
+        if source.is_none() {
+            source = Some("microdata".to_string());
+        }
+    }
+
+    // 4) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
