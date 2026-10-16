@@ -25519,7 +25519,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
-            24,
+            8,
         )
         .await;
         let elapsed = start.elapsed();
@@ -25613,7 +25613,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_millis(1),
-            24,
+            4,
         )
         .await;
 
@@ -25693,7 +25693,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
-            24,
+            8,
         )
         .await;
 
@@ -25814,7 +25814,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         )
         .await;
 
-        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2), 24).await;
+        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2), 4).await;
 
         let with_commerce = ranked
             .iter()
@@ -26494,7 +26494,7 @@ mod mainpath_shopping_strip_tests {
     #[test]
     fn enrich_window_is_wider_than_display_cap() {
         // Guards the constants from being re-conflated.
-        assert!(24 > COMMERCE_MAINPATH_TOP_N);
+        assert!(CommerceConfig::default().enrich_window > COMMERCE_MAINPATH_TOP_N);
     }
 
     // ─── extract_snippet_facts tests ────────────────────────────────────
