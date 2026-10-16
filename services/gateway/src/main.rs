@@ -13915,8 +13915,9 @@ fn is_pronounceable(w: &str) -> bool {
     true
 }
 
-/// Detect keyboard-walk queries like "asdfghjkl" or "qwerty"
-/// by checking for long consonant runs (>= 7) in tokens absent from the spell dictionary.
+/// Phase 7b: keyboard-walk / consonant-mash rejection (FIX-IF-03).
+/// Detects pure keyboard-mashing patterns like "asdfghjkl", "zxcvbnm"
+/// that pass the vowel/consonant ratio check because they contain vowels.
 fn is_keyboard_walk_query(q: &str, spell_index: &spell::SymSpellIndex) -> bool {
     for token in q.split_whitespace() {
         let lower = token.to_lowercase();
@@ -13944,7 +13945,6 @@ fn is_keyboard_walk_query(q: &str, spell_index: &spell::SymSpellIndex) -> bool {
     }
     false
 }
-
 
 fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f32) {
     let words: Vec<&str> = q.split_whitespace().filter(|w| w.chars().any(|c| c.is_alphabetic())).collect();
@@ -14204,6 +14204,8 @@ fn error_chain_is_dns(e: &(dyn std::error::Error + 'static)) -> bool {
     }
     false
 }
+
+
 
 fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bool) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let response = UnifiedResponse {

@@ -232,6 +232,28 @@ impl SymSpellIndex {
             phonetic_dict.len()
         );
 
+        // Build phonetic dictionary from word frequencies
+        let mut phonetic_dict: HashMap<String, Vec<String>> = HashMap::new();
+        let double_metaphone = rphonetic::DoubleMetaphone::default();
+        for (word, _freq) in crate::dictionary::WORD_FREQUENCIES {
+            let word_lower = word.to_lowercase();
+            // Only include ASCII words (rphonetic panics on non-ASCII)
+            if !word_lower.is_ascii() {
+                continue;
+            }
+            // DoubleMetaphone returns primary and alternate codes — index both
+            // so that lookups match either variant (e.g. "cancing" codes to KNSN
+            // while "cancelling" codes to KNSL; indexing under both links them).
+            let primary = double_metaphone.encode(&word_lower);
+            let alternate = double_metaphone.encode_alternate(&word_lower);
+            if !primary.is_empty() {
+                phonetic_dict.entry(primary.clone()).or_default().push(word_lower.clone());
+            }
+            if !alternate.is_empty() && alternate != primary {
+                phonetic_dict.entry(alternate).or_default().push(word_lower);
+            }
+        }
+
         Self {
             deletions,
             words,
@@ -851,6 +873,95 @@ impl SymSpellIndex {
                 None
             }
         })
+    }
+
+    /// Phonetic fallback: find a correction candidate via DoubleMetaphone encoding.
+    ///
+    /// Encodes the input word with DoubleMetaphone and looks up dictionary words
+    /// sharing the same primary phonetic code. Returns the best candidate:
+    /// the one with the lowest edit distance (ties broken by frequency).
+    ///
+    /// Guards (all must pass):
+    ///   1. Input must be a letter-drop typo of the candidate (input is a
+    ///      subsequence of the candidate — this is an insertion-only typo).
+    ///   2. Edit distance must be ≤ 3 (already enforced by the caller).
+    ///   3. Input is NOT in the dictionary (absent-word guard, enforced by caller).
+    ///
+    /// This handles insertion-only typos beyond edit distance 2 (e.g. "cancing"
+    /// → "cancelling") where SymSpell/LinSpell cannot reach.
+    fn phonetic_fallback(&self, word: &str) -> Option<String> {
+        let double_metaphone = rphonetic::DoubleMetaphone::default();
+        let code = double_metaphone.encode(word);
+        if code.is_empty() {
+            return None;
+        }
+
+        // Look up candidates by phonetic code prefix matching.
+        // DoubleMetaphone codes for near-identical words can differ in the last
+        // character (e.g. "cancing" → KNSN, "cancelling" → KNSL). Matching on
+        // the first 3 characters of the code groups phonetically-similar words
+        // without requiring exact code equality.
+        let prefix_len = code.len().min(3);
+        let code_prefix = &code[..prefix_len];
+        let mut all_candidates: Vec<&String> = Vec::new();
+        for (key, cands) in self.phonetic_dict.iter() {
+            if key.len() >= prefix_len && &key[..prefix_len] == code_prefix {
+                all_candidates.extend(cands);
+            }
+        }
+        if all_candidates.is_empty() {
+            return None;
+        }
+
+        // Pick the best candidate: lowest edit distance, then highest frequency.
+        // Only accept candidates where the input is a letter-drop typo (subsequence).
+        let mut best_candidate: Option<(&String, f64, usize)> = None; // (word, freq, dist)
+        for candidate in all_candidates {
+            // Must be a letter-drop typo: input is a subsequence of candidate
+            if !Self::is_subsequence(word, candidate) {
+                continue;
+            }
+            let freq = self.exact_map
+                .get(candidate)
+                .map(|&id| self.frequencies[id as usize])
+                .unwrap_or(0.0);
+            let dist = self.compute_edit_distance(word, candidate);
+            if dist == 0 {
+                continue; // Skip exact matches (already handled)
+            }
+            match best_candidate {
+                None => best_candidate = Some((candidate, freq, dist)),
+                Some((_, best_freq, best_dist)) => {
+                    if dist < best_dist || (dist == best_dist && freq > best_freq) {
+                        best_candidate = Some((candidate, freq, dist));
+                    }
+                }
+            }
+        }
+
+        best_candidate.map(|(word, _, _)| word.clone())
+    }
+
+    /// Check if `input` is a subsequence of `candidate` (letter-drop typo).
+    /// A letter-drop typo means the input can be formed by deleting one or more
+    /// characters from the candidate (e.g. "cancing" is "cancelling" with "el" dropped).
+    fn is_subsequence(input: &str, candidate: &str) -> bool {
+        let input_chars: Vec<char> = input.chars().collect();
+        let cand_chars: Vec<char> = candidate.chars().collect();
+        if input_chars.len() >= cand_chars.len() {
+            return false;
+        }
+        let mut i = 0;
+        let mut j = 0;
+        while i < input_chars.len() && j < cand_chars.len() {
+            if input_chars[i] == cand_chars[j] {
+                i += 1;
+                j += 1;
+            } else {
+                j += 1;
+            }
+        }
+        i == input_chars.len()
     }
 
     /// Compute Damerau-Levenshtein edit distance between two strings.
