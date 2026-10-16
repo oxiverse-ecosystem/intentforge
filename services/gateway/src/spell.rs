@@ -65,45 +65,9 @@ const PROTECTED_TERMS: &[&str] = &[
     "github", "gitlab", "apple", "ubuntu", "debian", "alpine", "macos",
     "android", "linux", "windows", "aws", "gcp", "azure", "vim", "neovim",
     "emacs", "json", "yaml", "toml", "grpc", "graphql", "kafka", "duckdb",
-    // Media server / streaming brands (plex→alex, emby→ember corruption class)
-    "plex", "emby", "jellyfin", "kodi", "vlc", "roku", "firetv", "chromecast",
     // Food & cooking terms that collide with English words / tech terms
     "batter", "dosa", "idli", "vada", "poha", "upma", "biryani", "tandoori",
     "masala", "chutney", "achar", "ghee", "besan", "rava", "semolina",
-    // Non-media brands at edit-distance 1 from dictionary words (brand-corruption class)
-    // Streaming / media brands
-    "spotify", "netflix", "tiktok", "hulu", "sling", "deezer", "pandora",
-    "soundcloud", "bandcamp", "audible", "kindle", "kobo", "nook",
-    "tidal", "youtube", "twitch", "instagram", "facebook", "twitter",
-    "linkedin", "snapchat", "reddit", "pinterest", "whatsapp", "telegram",
-    "signal", "skype", "zoom", "teams", "webex", "gdrive", "dropbox",
-    "icloud", "pcloud", "onedrive", "shopify", "squarespace", "wix",
-    "weebly", "jira", "trello", "asana", "confluence", "zeplin",
-    "sketch", "invision", "postman", "insomnia", "bitbucket", "jenkins",
-    "eslint", "prettier", "husky", "jest", "mocha", "cypress", "playwright",
-    "selenium", "appium", "babel", "rollup", "swc", "yarn", "mpv",
-    "spacex", "tesla", "rivian", "polestar", "lucid", "boeing", "airbus",
-    "nvidia", "qualcomm", "broadcom", "mediatek", "salesforce", "hubspot",
-    "zendesk", "freshdesk", "mailchimp", "sendgrid", "twilio", "paypal",
-    "square", "adyen", "braintree", "linode", "vultr", "akamai", "fastly",
-    "nordvpn", "expressvpn", "surfshark", "cyberghost", "ipvanish",
-    "protonvpn", "duckduckgo", "ecosia", "startpage", "qwant", "yandex",
-    "baidu", "naver", "threema", "vivaldi", "opera", "firefox", "safari",
-    "samsung", "xiaomi", "oppo", "vivo", "oneplus", "realme", "nokia",
-    "motorola", "lenovo", "asus", "acer", "dell", "sony", "panasonic",
-    "philips", "toshiba", "hitachi", "canon", "nikon", "fujifilm",
-    "olympus", "gopro", "volvo", "bmw", "mercedes", "audi", "porsche",
-    "ferrari", "lamborghini", "toyota", "honda", "nissan", "mazda",
-    "subaru", "hyundai", "kia", "volkswagen", "peugeot", "renault",
-    "fiat", "jeep", "gmc", "cadillac", "lincoln", "buick", "chrysler",
-    "dodge", "acura", "infiniti", "lexus", "genesis", "jaguar", "mini",
-    "smart", "maserati", "bentley", "suzuki", "isuzu", "daihatsu",
-    "perodua", "tata", "mahindra", "maruti", "steam", "gog", "origin",
-    "uplay", "xbox", "playstation", "nintendo", "sega", "atari",
-    "commodore", "lastpass", "bitwarden", "dashlane", "brave", "proton",
-    "threema", "potplayer", "kmplayer",
-    // Indian degree abbreviations (edit-distance 1 from English words — "btech"→"tech", "mtech"→"tech")
-    "btech", "mtech", "bca", "mca", "be", "me", "mba", "phd", "bsc", "msc", "ba", "ma", "bcom", "mcom",
 ];
 
 /// Returns true if `word` is a protected brand/entity that must never be
