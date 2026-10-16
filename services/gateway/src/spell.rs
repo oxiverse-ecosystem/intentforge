@@ -108,6 +108,12 @@ const PROTECTED_TERMS: &[&str] = &[
     "uplay", "xbox", "playstation", "nintendo", "sega", "atari",
     "commodore", "lastpass", "bitwarden", "dashlane", "brave", "proton",
     "threema", "potplayer", "kmplayer",
+    // Indian degree abbreviations (edit-distance 1 from English words — "btech"→"tech", "mtech"→"tech")
+    "btech", "mtech", "bca", "mca", "be", "me", "mba", "phd", "bsc", "msc", "ba", "ma", "bcom", "mcom",
+    // Car brands at edit-distance 1 from common English/dictionary words (brand-corruption class)
+    "skoda", "seat", "saab",
+    // Tech brands at edit-distance 1 from common English words (brand-corruption class)
+    "iphone", "ipad", "ipod", "imac",
 ];
 
 /// Returns true if `word` is a protected brand/entity that must never be
@@ -458,7 +464,23 @@ impl SymSpellIndex {
                 // ratio >= 1.4) -> allow the correction. Unconditional blocking
                 // here previously broke legitimate typos (regression:
                 // test_housr_corrected_to_house).
-                if !self.is_genuine_dist1_typo(word, &best) {
+                //
+                // REFINEMENT (2026-10-16): a missing-letter typo of a common
+                // English word (e.g. "refrigeratr"->"refrigerator", "compresor"
+                // ->"compressor") has NATURAL bigrams because it is 95% identical
+                // to the real word — is_genuine_dist1_typo returns false and the
+                // guard blocked it. But these are the most common typo class in
+                // real queries. The discriminator: when the candidate is a
+                // HIGH-FREQUENCY dictionary word (freq >= 0.01, i.e. a common
+                // English word, not a rare brand), a distance-1 absent-word
+                // correction is almost certainly a genuine typo. Brand-protection
+                // is already handled by is_protected_term above and the
+                // single-substitution guard below, so this relaxation does NOT
+                // reopen the skoda->soda hole (soda is not high-freq enough, and
+                // skoda is a protected term).
+                let best_freq_val = candidate_freq(best);
+                let is_common_candidate = best_freq_val >= 0.01;
+                if !is_common_candidate && !self.is_genuine_dist1_typo(word, &best) {
                     return None;
                 }
             }

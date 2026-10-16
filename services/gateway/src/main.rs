@@ -17105,8 +17105,15 @@ async fn handle_search(
         // attempt 1. A successful attempt 1 breaks early (has_usable is true), so
         // there is ZERO added latency for queries that already have results — the
         // retry only costs time on the queries that would otherwise return empty.
-        //   attempt1 = 10s budget (non-site) / 4500ms (site); backoff 150ms;
-        //   attempt2 = 10s (non-site, force re-probe) / 15s (site, cold-tor2).
+        //   attempt1 = 15s budget (non-site) / 4500ms (site); backoff 150ms;
+        //   attempt2 = 15s (non-site, force re-probe) / 15s (site, cold-tor2).
+        // 2026-10-16: raised non-site budget from 10s to 15s. Three long-tail
+        // queries (refrigerator compressor, habitable zone goldilocks zone,
+        // excel alternatives linux) timed out at 15s+20s retry — SearXNG needs
+        // more time to fetch results from upstream engines (Bing/Brave/Google)
+        // for technical long-tail queries. 15s gives the VPN path a fair shot
+        // while staying within the 30s TimeoutLayer budget (15 + 0.15 + 15 = 30.15s
+        // worst case, but the retry only fires when attempt 1 returns no results).
         let max_attempts: usize = 2;
         let attempt_budget_ms = |attempt: usize| -> u64 {
             if has_site {
@@ -17120,8 +17127,10 @@ async fn handle_search(
                 if attempt == 1 { 4500 } else { 15000 }
             } else {
                 // Non-site queries also fan out to tor2; allow its cold-circuit
-                // time so it can serve as a true redundant path.
-                10000
+                // time so it can serve as a true redundant path. 15s gives
+                // long-tail technical queries enough time for upstream engines
+                // to respond, while the 30s TimeoutLayer remains the backstop.
+                15000
             }
         };
         let min_early_return: usize = 15;
@@ -17735,16 +17744,12 @@ async fn handle_search(
             "understand ", "learn ", "teach me ",
         ];
         let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
-        // Word-boundary matching: each keyword must appear as a complete word,
-        // not as a substring of another word (e.g. "price" must not match
-        // "priceless"). The trailing-space convention ("price ") missed queries
-        // ending with the keyword ("sony wh-1000xm5 price"). \b word boundaries
-        // fix both ends without per-query literals.
-        let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
-        let has_tx_signal = tx_keywords.iter().any(|k| {
-            let pattern = format!(r"\b{}\b", regex::escape(k));
-            regex::Regex::new(&pattern).map(|re| re.is_match(&q_lower)).unwrap_or(false)
-        });
+        // Use the runtime-loaded CommerceSignals whole-word matcher instead of a
+        // hardcoded substring list. The old `contains("price ")` check missed
+        // "price" at the END of a query (no trailing space), so "sony wh-1000xm5
+        // price" and "iphone 16 pro max price" were not detected as transactional.
+        // The keyword list lives in data/commerce/signals.json — no recompile.
+        let has_tx_signal = state.commerce_signals.has_transactional_keyword(&q_lower);
         // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
         // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
         // `comparison` on the generic "best ... under" signal — but a budget-anchored
@@ -17776,24 +17781,6 @@ async fn handle_search(
                         q, intent.intent, intent.confidence
                     );
                 }
-                intent.intent = "transactional".to_string();
-                intent.confidence = intent.confidence.max(0.80);
-                let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
-                intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
-            }
-        }
-
-        // Override 7: Model-number + price/cost terms → transactional
-        // The classifier misses model-number patterns ("iphone 16 pro max price",
-        // "oneplus 12 price") — the word "price" alone is weak signal. When a known
-        // brand+model pattern co-occurs with a price/cost term, the intent is
-        // decisively transactional (P10/P11 style compensation for the linear probe).
-        if is_model_number_price_query(&q_lower, &state.exact_model_config) {
-            if intent.intent != "transactional" || intent.confidence < 0.60 {
-                tracing::info!(
-                    "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
-                    q, intent.intent, intent.confidence
-                );
                 intent.intent = "transactional".to_string();
                 intent.confidence = intent.confidence.max(0.80);
                 let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
@@ -17987,6 +17974,26 @@ async fn handle_search(
         }
     }
 
+    // Override 7: Model-number + price/cost terms → transactional
+    // The classifier misses model-number patterns ("iphone 16 pro max price",
+    // "oneplus 12 price") — the word "price" alone is weak signal. When a known
+    // brand+model pattern co-occurs with a price/cost term, the intent is
+    // decisively transactional (P10/P11 style compensation for the linear probe).
+    // MOVED OUTSIDE the confidence gate (2026-10-16): a decisive pattern match
+    // must not be suppressed by a high-confidence misclassification.
+    if is_model_number_price_query(&q_lower, &state.exact_model_config) {
+        if intent.intent != "transactional" || intent.confidence < 0.60 {
+            tracing::info!(
+                "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "transactional".to_string();
+            intent.confidence = intent.confidence.max(0.80);
+            let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
+            intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
+        }
+    }
+
     let vector: Option<Vec<f32>> = match embed_res {
         Some(resp) => {
             if let Some(json) = read_json_bounded::<serde_json::Value>(resp).await {
@@ -18130,6 +18137,75 @@ async fn handle_search(
                 tracing::info!(target:"expansion.debug", "numeric-relaxed expanded query: {:?}", relaxed_clean);
                 let insert_pos = 1.min(expanded_queries.len());
                 expanded_queries.insert(insert_pos, relaxed_clean);
+            }
+        }
+    }
+
+    // ─── Query expansion drift guard ────────────────────────────────────
+    // The intent engine's expanded_queries can drop specific entities from the
+    // original query (e.g. "butter chicken" → "chicken at home"), causing
+    // cross-cuisine contamination (biryani recipes for a butter chicken query).
+    // Fix: when the original query contains a multi-word entity that is missing
+    // from ALL expanded queries, inject a drift-corrected variant that preserves
+    // the entity. This is general — no per-query literals, no hardcoded dishes.
+    // The signal: extract the longest multi-word run of non-stopword tokens from
+    // the original query; if no expanded query contains that run, prepend a
+    // variant that does.
+    {
+        let q_lower = q.to_lowercase();
+        let q_tokens: Vec<&str> = q_lower.split_whitespace().collect();
+        // Build the longest contiguous non-stopword run from the query.
+        let stopwords: std::collections::HashSet<&str> = [
+            "how", "do", "does", "i", "what", "is", "are", "the", "a", "an", "and", "or",
+            "but", "if", "then", "else", "of", "to", "in", "on", "at", "by", "for", "with",
+            "without", "from", "into", "onto", "as", "was", "were", "be", "been", "being",
+            "it", "this", "that", "these", "those", "my", "your", "our", "their", "his",
+            "her", "you", "he", "she", "we", "they", "me", "us", "him", "them", "not", "no",
+            "can", "could", "should", "would", "will", "shall", "may", "might", "must",
+            "have", "has", "had", "having", "make", "making", "get", "getting", "use",
+            "using", "find", "finding", "help", "need", "want", "like", "near", "nearby",
+            "best", "good", "great", "better", "top", "free", "cheap", "easy", "simple",
+            "quick", "fast", "new", "recent", "latest", "safe", "natural", "home", "house",
+            "way", "ways", "difference", "between", "actually", "really", "some", "any",
+            "every", "each", "all", "both", "either", "neither", "other", "another", "such",
+            "same", "different", "own", "just", "only", "also", "too", "very", "so", "than",
+            "when", "where", "why", "who", "which", "whom", "whose", "how", "much", "many",
+            "more", "most", "less", "least", "few", "several", "various", "certain",
+            "particular", "specific", "general", "main", "major", "key", "important", "basic",
+            "common", "normal", "usual", "regular", "standard", "typical", "traditional",
+            "authentic", "perfect", "complete", "full", "whole", "entire", "total", "long",
+            "term", "daily", "long", "short", "high", "low", "big", "small", "large", "little",
+        ].iter().cloned().collect();
+        let mut longest_run: Vec<&str> = Vec::new();
+        let mut current_run: Vec<&str> = Vec::new();
+        for tok in &q_tokens {
+            if stopwords.contains(tok) {
+                if current_run.len() > longest_run.len() {
+                    longest_run = current_run.clone();
+                }
+                current_run.clear();
+            } else {
+                current_run.push(tok);
+            }
+        }
+        if current_run.len() > longest_run.len() {
+            longest_run = current_run;
+        }
+        if longest_run.len() >= 2 {
+            let entity = longest_run.join(" ");
+            let entity_present = expanded_queries.iter().any(|eq| {
+                eq.to_lowercase().contains(&entity)
+            });
+            if !entity_present {
+                // Inject a drift-corrected variant: the original query with the
+                // entity preserved. Use the original query itself as the anchor.
+                tracing::info!(
+                    target: "expansion.debug",
+                    entity = %entity,
+                    query = %q,
+                    "Query expansion drift detected — injecting entity-preserving variant"
+                );
+                expanded_queries.push(q.clone());
             }
         }
     }
