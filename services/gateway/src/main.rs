@@ -3148,7 +3148,7 @@ fn is_question_or_howto(text: &str) -> bool {
 ///
 /// Only fires when structured extraction (JSON-LD, OG, microdata) found nothing,
 /// and only extracts the FIRST visible price — no aggregation or guessing.
-/// The resulting OfferFacts is marked source="extracted_from_text" by the caller.
+/// The resulting OfferFacts is marked source="html_pattern" by the caller.
 ///
 /// Returns Some((price, currency)) on the first match, None otherwise.
 fn extract_price_from_html_patterns(html: &str) -> Option<(f64, String)> {
@@ -4182,26 +4182,7 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
         }
     }
 
-    // 5) Secondary commerce extraction: parse common HTML price patterns from the
-    //    page when structured extraction (JSON-LD, OG, microdata, MF2) found nothing.
-    //    Many product pages (Amazon, eBay, Walmart, etc.) embed prices in custom
-    //    HTML (e.g., <span class="a-price">) that don't conform to any standard
-    //    schema. This fallback ONLY fires when primary extraction returned no price,
-    //    and ONLY sets price + currency — never merchant, rating, or other facts
-    //    that would require more context. Marked with source="extracted_from_text"
-    //    so the frontend can label it distinctly from structured data. This is NOT
-    //    regex guessing on body text — it targets known e-commerce HTML patterns.
-    if facts.price.is_none() && facts.price_low.is_none() {
-        if let Some((price, currency)) = extract_price_from_html_patterns(html) {
-            facts.price = Some(price);
-            facts.currency = Some(currency);
-            source = Some("extracted_from_text".to_string());
-        }
-    }
-
-
-
-    // 6) Merchant fallback: derive a coarse host label only when no page-provided
+    // 5) Merchant fallback: derive a coarse host label only when no page-provided
     //    seller name exists. This is a last-resort identifier, not a product fact.
     if facts.merchant.is_none() {
         if let Ok(parsed) = reqwest::Url::parse(url) {
@@ -4842,8 +4823,10 @@ async fn enrich_with_commerce<F, Fut>(
             continue; // already enriched by an earlier step
         }
         let mut attached = false;
+        let mut fetched_html: Option<String> = None;
         match fetch(url.clone()).await {
             Some(h) => {
+                fetched_html = Some(h.clone());
                 let offer: CommerceOffer = extract_commerce_offer(&h, &url);
                 // Only attach a `commerce` block when the page actually exposed
                 // structured product data — never a guessed/fabricated fact.
@@ -4887,8 +4870,36 @@ async fn enrich_with_commerce<F, Fut>(
             }
             None => {}
         }
-        // Snippet-based fallback: when the page fetch failed or returned
-        // no structured data, try to extract product facts from the search result
+        // HTML-pattern fallback: when the page was fetched but structured
+        // extraction found nothing, try known e-commerce HTML price patterns
+        // (class="a-price", data-price, etc.) on the ACTUAL page content.
+        // This is a provenance-carrying intermediate tier — it looks at the
+        // real page HTML (not just the snippet), but marks the source as
+        // "html_pattern" so the frontend can label it as less certain than
+        // structured data. Never fabricates: only fires on a real pattern match.
+        if !attached {
+            if let Some(ref html) = fetched_html {
+                if let Some((amount, currency)) = extract_price_from_html_patterns(html) {
+                    let facts = OfferFacts {
+                        price: Some(amount),
+                        currency: Some(currency),
+                        ..Default::default()
+                    };
+                    let offer = CommerceOffer {
+                        url: Some(url.clone()),
+                        observed_at: Some(now_unix_string()),
+                        source: Some("html_pattern".to_string()),
+                        data: Some(facts),
+                    };
+                    if let Ok(v) = serde_json::to_value(&offer) {
+                        r["commerce"] = v;
+                        attached = true;
+                    }
+                }
+            }
+        }
+        // Snippet-based price fallback: when the page fetch failed or returned
+        // no structured data, try to extract a price from the search result
         // snippet (title + content). This improves enrichment recall without
         // fabricating facts — all snippet-derived facts are marked with
         // source="snippet_extracted" so the frontend can label them as less
@@ -5559,9 +5570,73 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     None
 }
 
+/// P6 fail-open: decide whether the hard date window should be cleared.
+/// Returns true when the window should be removed (recency becomes scoring-only).
+///
+/// The hard date window (after_date/before_date) is only meaningful when at
+/// least one web result carries a parseable date. When NO result has a date,
+/// the window cannot discriminate between results — it would drop relevant
+/// results that happen to have a date outside the window while keeping only
+/// date-less ones. In that case, clear the window and use recency as a pure
+/// scoring boost (freshness half-life) instead.
+///
+/// Also clears when the window would empty or near-empty the result set
+/// (survivors == 0, or survivors < 3 with a survivor fraction < 25%).
+fn should_clear_date_window(
+    dated_result_count: usize,
+    pre_filter_count: usize,
+    survivors_after_window: usize,
+) -> bool {
+    if pre_filter_count == 0 {
+        return false;
+    }
+    if dated_result_count == 0 {
+        return true;
+    }
+    if survivors_after_window == 0 {
+        return true;
+    }
+    let survivor_fraction = survivors_after_window as f32 / pre_filter_count as f32;
+    survivors_after_window < 3 && survivor_fraction < 0.25
+}
+
 fn should_filter_by_constraints(
     title: &str, content: &str, url: &str, published_date: Option<&str>, constraints: &Constraints,
 ) -> bool {
+    // 0. Hard-drop results that match ZERO positive constraints.
+    // When a query carries positive constraints (e.g. "note taking app"),
+    // a result that matches none of them is off-topic and must be dropped,
+    // not just softly penalised. Without this, "note taking app" returns
+    // privacy apps (LibreWolf, Tuta calendar) because they get a 0.60x
+    // penalty but still appear in results.
+    if !constraints.positive.is_empty() {
+        let text_lower = format!("{} {} {}", title.to_lowercase(), content.to_lowercase(), url.to_lowercase());
+        let any_positive_matched = constraints.positive.iter().any(|pos| {
+            let pos_lower = pos.to_lowercase();
+            let pos_normalized: String = pos_lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
+            let pos_words: Vec<&str> = pos_lower.split_whitespace().collect();
+            if pos_words.len() == 1 {
+                text_lower.split_whitespace().any(|w| {
+                    w == pos_lower
+                    || w.trim_matches(|c: char| !c.is_alphanumeric()) == pos_lower
+                    || w.chars().filter(|c| c.is_alphanumeric()).collect::<String>() == pos_normalized
+                })
+                || (pos_normalized.len() >= 3 && text_lower.contains(&pos_normalized))
+            } else {
+                text_lower.contains(&pos_lower)
+                || pos_words.iter().all(|w| {
+                    let w_clean = w.chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+                    text_lower.split_whitespace().any(|tw| {
+                        tw == *w || tw.trim_matches(|c: char| !c.is_alphanumeric()) == *w
+                    }) || (w_clean.len() >= 3 && text_lower.contains(&w_clean))
+                })
+            }
+        });
+        if !any_positive_matched {
+            return true;
+        }
+    }
+
     // 1. Hard filter on file_types
     if !constraints.file_types.is_empty() {
         if let Ok(parsed_url) = reqwest::Url::parse(url) {
@@ -5675,31 +5750,34 @@ fn should_filter_by_constraints(
     }
 
     // 3. Hard filter on date bounds
-    // Policy: a date bound filters ONLY results that carry a parseable
-    // published date. Results without a resolvable date are KEPT, never
-    // dropped — dropping them silently removes the majority of general web
-    // results (most pages expose no machine-readable date), which previously
-    // zeroed out queries like "python after:2024" even though plenty of
-    // relevant content existed. We report the coverage gap via
-    // `ignored_constraints` (dated_result_count==0) instead of silently
-    // filtering everything. This is the fail-open choice: a dateless result is
-    // assumed in-range rather than out-of-range.
+    // Policy: a date bound filters ONLY results that carry an explicit
+    // published_date. Results with published_date == None are KEPT (fail-open) —
+    // dropping them silently removes the majority of general web results (most
+    // pages expose no machine-readable date), which previously zeroed out queries
+    // like "python after:2024" even though plenty of relevant content existed.
+    // We report the coverage gap via `ignored_constraints` (dated_result_count==0)
+    // instead of silently filtering everything.
+    // NOTE: we do NOT call resolve_item_date here because it extracts dates from
+    // URLs (e.g. /2024/03/15/) and content text, which would cause date-less
+    // results to be dropped — defeating the fail-open policy.
     if let Some(ref ad) = constraints.after_date {
         if let Some(limit) = parse_date_to_comparable(ad) {
-            if let Some(p_date) = published_date.and_then(parse_date_to_comparable)
-                .or_else(|| extract_full_date_from_text(&format!("{} {}", title, content))) {
-                if !date_gte(p_date, limit) {
-                    return true;
+            if let Some(pd) = published_date {
+                if let Some(p_date) = parse_date_to_comparable(pd) {
+                    if !date_gte(p_date, limit) {
+                        return true;
+                    }
                 }
             }
         }
     }
     if let Some(ref bd) = constraints.before_date {
         if let Some(limit) = parse_date_to_comparable(bd) {
-            if let Some(p_date) = published_date.and_then(parse_date_to_comparable)
-                .or_else(|| extract_full_date_from_text(&format!("{} {}", title, content))) {
-                if !date_lte(p_date, limit) {
-                    return true;
+            if let Some(pd) = published_date {
+                if let Some(p_date) = parse_date_to_comparable(pd) {
+                    if !date_lte(p_date, limit) {
+                        return true;
+                    }
                 }
             }
         }
@@ -7149,16 +7227,9 @@ fn has_local_intent(query: &str) -> bool {
         // LOCATION_GAZETTEER, the query has explicit local intent. General guard —
         // no per-query literals, reuses the same gazetteer reference data as geo
         // detection (line 1542) so the policy is consistent and future-proof.
-        //
-        // SHORT-QUERY GUARD: a local intent query is typically short ("restaurants
-        // in bangalore", "hotels in paris"). A long conversational query (e.g. a
-        // career/advice question like "i have been working as a network
-        // administrator for five years ... job market in india") uses " in
-        // <country>" as CONTEXT, not as a local intent marker. Without this,
-        // career/advice queries get misclassified as "local" and return
-        // irrelevant results. General: query length threshold, no per-query
-        // literals. A 10-word threshold cleanly separates short local queries
-        // from long conversational ones.
+        // FIX: exclude country-level gazetteer entries — "in india" is a national
+        // scope, not a local search. A query like "organic farm in india" or
+        // "credit score in india" is a how-to/informational query, not local.
         || {
             let word_count = lower.split_whitespace().count();
             if word_count > 10 {
@@ -7167,11 +7238,20 @@ fn has_local_intent(query: &str) -> bool {
             let parts: Vec<&str> = lower.split(" in ").collect();
             if let Some(after_in) = parts.last() {
                 let after_in = *after_in;  // deref &&str -> &str
-                LOCATION_GAZETTEER.iter().any(|(name, _)| {
-                    let name_lower = name.to_lowercase();
-                    whole_word_contains(after_in, &name_lower)
-                        || after_in.starts_with(name_lower.as_str())
-                })
+                const COUNTRY_CODES: &[&str] = &[
+                    "US", "GB", "CA", "AU", "NZ", "DE", "FR", "ES", "IT", "PT", "NL",
+                    "IE", "SE", "NO", "DK", "FI", "PL", "AT", "CH", "BE", "RU", "UA",
+                    "TR", "GR", "JP", "CN", "KR", "IN", "SG", "HK", "BR", "MX", "AR",
+                    "AE", "SA", "EG", "IL", "TH", "VN", "ID", "MY", "PH", "ZA", "NG",
+                    "KE", "CZ", "HU", "RO", "HR", "SI",
+                ];
+                LOCATION_GAZETTEER.iter()
+                    .filter(|(_, cc)| !COUNTRY_CODES.contains(cc))
+                    .any(|(name, _)| {
+                        let name_lower = name.to_lowercase();
+                        whole_word_contains(after_in, &name_lower)
+                            || after_in.starts_with(name_lower.as_str())
+                    })
             } else {
                 false
             }
@@ -9157,10 +9237,11 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                // Preserved domain word: keep it in the result, but do NOT end
-                // the negation scope. Subsequent non-preserved words are still
-                // negated (e.g. "recipes without linux spicy" → "recipes linux",
-                // excluded: ["spicy"]). The scope only ends at a clause boundary.
+                // A preserved domain word inside negation scope is kept as a
+                // positive term, but it does NOT end the negation scope —
+                // subsequent non-preserved words are still exclusions.
+                // (e.g. "recipes without linux spicy" -> "linux" stays,
+                //  "spicy" is excluded)
                 result.push(w);
             } else {
                 // Non-domain content word after a negation trigger: treat as an
@@ -17217,27 +17298,62 @@ async fn handle_search(
             "comparison", "fresh", "transactional", "local",
         ];
         if !SUPPORTED.contains(&intent.intent.as_str()) {
-            let best = SUPPORTED.iter()
-                .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            match best {
-                Some((lbl, prob)) => {
+            // chitchat is semantically closest to informational (both are
+            // non-navigational, non-actionable queries). The old code picked
+            // the max-probability supported class, which for chitchat was
+            // often navigational — sending "what causes migraines" to the
+            // navigational ranking path (domain boost, academic-paper crush).
+            // Fix: for chitchat, prefer informational unless another supported
+            // class has a decisively higher probability (> 0.5).
+            if intent.intent == "chitchat" {
+                let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+                let best_other = SUPPORTED.iter()
+                    .filter(|l| **l != "informational")
+                    .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                let use_info = match best_other {
+                    Some((lbl, prob)) if prob > 0.5 && prob > info_prob * 2.0 => false,
+                    _ => true,
+                };
+                if use_info {
                     tracing::warn!(
-                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' — remapping to '{}' (top supported class)",
-                        intent.intent, q, lbl
-                    );
-                    intent.intent = (*lbl).to_string();
-                    // Use the distribution probability for the selected supported class
-                    // rather than the original unsupported-class confidence.
-                    intent.confidence = prob;
-                }
-                None => {
-                    tracing::warn!(
-                        "INTENT CONTRACT: engine returned unsupported '{}' for '{}' with no supported distribution entry — falling back to informational",
-                        intent.intent, q
+                        "INTENT CONTRACT: engine returned 'chitchat' for '{}' — remapping to 'informational' (chitchat is not navigational)",
+                        q
                     );
                     intent.intent = "informational".to_string();
+                    intent.confidence = info_prob.max(0.35);
+                } else if let Some((lbl, prob)) = best_other {
+                    tracing::warn!(
+                        "INTENT CONTRACT: engine returned 'chitchat' for '{}' — remapping to '{}' (decisive {:.3})",
+                        q, lbl, prob
+                    );
+                    intent.intent = (*lbl).to_string();
+                    intent.confidence = prob;
+                } else {
+                    intent.intent = "informational".to_string();
                     intent.confidence = 0.35;
+                }
+            } else {
+                let best = SUPPORTED.iter()
+                    .filter_map(|l| intent.distribution.get(*l).map(|p| (l, *p)))
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                match best {
+                    Some((lbl, prob)) => {
+                        tracing::warn!(
+                            "INTENT CONTRACT: engine returned unsupported '{}' for '{}' — remapping to '{}' (top supported class)",
+                            intent.intent, q, lbl
+                        );
+                        intent.intent = (*lbl).to_string();
+                        intent.confidence = prob;
+                    }
+                    None => {
+                        tracing::warn!(
+                            "INTENT CONTRACT: engine returned unsupported '{}' for '{}' with no supported distribution entry — falling back to informational",
+                            intent.intent, q
+                        );
+                        intent.intent = "informational".to_string();
+                        intent.confidence = 0.35;
+                    }
                 }
             }
         }
@@ -18040,8 +18156,8 @@ async fn handle_search(
     // Count-based retry (no relevance needed yet — fires before Invidious/news/image)
     if (needs_more_results || has_contrastive_negatives) && expanded_queries.len() > 1 && !searx_base_urls.is_empty() {
         let mut retry_futs = Vec::new();
-        let retry_timeout = Duration::from_secs(4); // shorter than initial 5s
-        let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 6 } else { 3 };
+        let retry_timeout = Duration::from_secs(2); // shorter than initial 5s; 2s is enough for a retry
+        let max_variations: usize = if only_negative || !intent.structured_constraints.negative.is_empty() { 4 } else { 2 };
         for (eq_idx, eq) in expanded_queries.iter().enumerate().skip(1) {
             if eq_idx > max_variations { break; }
             let clean_eq = preprocess_searxng_query(eq);
@@ -18833,8 +18949,12 @@ async fn handle_search(
     // date / detectable price. These let us report applied-vs-ignored
     // constraints honestly instead of silently returning empty or unfiltered.
     let pre_filter_count = web_results.len();
+    // Count only results with an EXPLICIT published_date that parses — not dates
+    // extracted from URL patterns or free-text snippets. The FRESH_OVERRIDE hard
+    // window must only bite when upstream actually surfaced real dates; otherwise
+    // date-less results get dropped by extracted dates that fall outside the window.
     let dated_result_count = web_results.iter().filter(|r| {
-        resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
+        r.published_date.as_deref().and_then(parse_date_to_comparable).is_some()
     }).count();
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
 
@@ -18853,6 +18973,24 @@ async fn handle_search(
     // SCORING boost (freshness half-life) and the results survive. Fail-open is
     // keyed on "the hard window would remove every result", not on any specific
     // query/domain/window — so it is general and never over-drops.
+    // P6 FIX: apply the hard date window ONLY when at least 1 web result has an
+    // explicit parseable published_date. When NO result carries a real date, the
+    // hard window is cleared so recency stays a pure scoring boost (freshness
+    // half-life) — otherwise date-less results get dropped by dates extracted
+    // from URL patterns / free-text snippets that fall outside the narrow window.
+    // This is the root-cause fix for "gaganyaan latest news" returning 5 results
+    // via /search but 21 via /news: the FRESH_OVERRIDE 7-day window was dropping
+    // results whose only "date" came from extract_year_from_url or text matching.
+    if dated_result_count == 0 && (intent.structured_constraints.after_date.is_some()
+        || intent.structured_constraints.before_date.is_some())
+    {
+        tracing::info!(
+            "DATE WINDOW FAIL-OPEN (no explicit dates): 0/{} web results have a parseable published_date — clearing hard recency window (recency stays scoring-only)",
+            pre_filter_count
+        );
+        intent.structured_constraints.after_date = None;
+        intent.structured_constraints.before_date = None;
+    }
     let date_window_present = intent.structured_constraints.after_date.is_some()
         || intent.structured_constraints.before_date.is_some();
     if date_window_present && pre_filter_count > 0 {
@@ -18877,24 +19015,23 @@ async fn handle_search(
             }
             ok
         }).count();
-        // (A) no dates at all, or (B) all dated-but-out-of-range -> would empty.
-        // (C) RESIDUAL P6: the window keeps SOME results but crushes the set
-        //     pathologically (e.g. date-less upstream snippets for "latest X this
-        //     week" → 8/9 dropped, 1 survives = 11%). A near-empty result set is
-        //     the same user-facing failure as a zero one: relevant, date-less
-        //     results get discarded in favour of a single stale-but-dated item.
-        //     Fail-open when the surviving fraction is below a general 25% floor
-        //     AND the surviving count is too small to be useful (< 3). This is
-        //     keyed on survival ratio, not on any query/window, so it stays general.
-        let survivor_fraction = if pre_filter_count > 0 {
-            survivors_after_window as f32 / pre_filter_count as f32
-        } else {
-            1.0
-        };
-        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.25;
-        if survivors_after_window == 0 || fraction_too_low {
+        // P6 FIX: apply the hard date window ONLY when at least 1 web result has a
+        // parseable date. When NO result carries a date, the window is meaningless
+        // — it cannot discriminate between results, and applying it would drop
+        // relevant results that happen to have a date outside the window while
+        // keeping only date-less ones. In that case, clear the window and use
+        // recency as a pure scoring boost (freshness half-life) instead.
+        //
+        // Also fail-open when the window would empty or near-empty the result set
+        // (survivors == 0, or survivors < 3 with a survivor fraction < 25%).
+        if should_clear_date_window(dated_result_count, pre_filter_count, survivors_after_window) {
+            let survivor_fraction = if pre_filter_count > 0 {
+                survivors_after_window as f32 / pre_filter_count as f32
+            } else {
+                1.0
+            };
             tracing::info!(
-                "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
+                "DATE WINDOW FAIL-OPEN: {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
                 pre_filter_count, survivors_after_window, survivor_fraction, dated_result_count
             );
             intent.structured_constraints.after_date = None;
@@ -22067,7 +22204,7 @@ mod constraint_fix_tests {
             "Old article",
             "This was published on March 3, 2021 and is stale.",
             "https://example.com/a",
-            None,
+            Some("2021-03-03"),
             &c,
         );
         assert!(old, "result dated 2021 should be filtered by after:2024");
@@ -22076,10 +22213,51 @@ mod constraint_fix_tests {
             "New article",
             "This was published on March 3, 2025 and is current.",
             "https://example.com/b",
-            None,
+            Some("2025-03-03"),
             &c,
         );
         assert!(!fresh, "result dated 2025 should pass after:2024");
+    }
+
+    #[test]
+    fn p6_no_dated_results_clears_date_window() {
+        // P6 regression: when NO web result carries a parseable date, the hard
+        // date window must be cleared (recency becomes scoring-only). Before
+        // the fix, the window stayed set and dropped results that had a date
+        // outside the 7-day window, while keeping only date-less ones.
+        assert!(
+            should_clear_date_window(0, 10, 10),
+            "0 dated results out of 10 — window must be cleared"
+        );
+        assert!(
+            should_clear_date_window(0, 5, 5),
+            "0 dated results out of 5 — window must be cleared"
+        );
+        // When at least 1 result has a date, the window is meaningful and
+        // should NOT be cleared (unless it would empty the set).
+        assert!(
+            !should_clear_date_window(3, 10, 3),
+            "3 dated results, 3 survivors — window is meaningful"
+        );
+        assert!(
+            !should_clear_date_window(5, 20, 5),
+            "5 dated results, 5 survivors — window is meaningful"
+        );
+        // When the window would empty the set, clear it.
+        assert!(
+            should_clear_date_window(5, 10, 0),
+            "0 survivors — window must be cleared"
+        );
+        // Near-empty: survivors < 3 and fraction < 25%.
+        assert!(
+            should_clear_date_window(5, 20, 2),
+            "2 survivors out of 20 (10%) — window must be cleared"
+        );
+        // Edge: pre_filter_count == 0 — nothing to filter, don't clear.
+        assert!(
+            !should_clear_date_window(0, 0, 0),
+            "no results at all — nothing to clear"
+        );
     }
 
     #[test]
@@ -23033,8 +23211,141 @@ fn d3_content_negation_frame_is_not_manner() {
             "NOT:flask must appear in applied_constraints as 'not:flask', got: {:?}", applied);
     }
 
+    // P6 regression: the FRESH_OVERRIDE hard date window must only apply when at
+    // least 1 web result has an explicit parseable published_date. When no result
+    // carries a real date, the hard window is cleared so recency stays a scoring
+    // boost only — otherwise date-less results get dropped by dates extracted
+    // from URL patterns / free-text snippets that fall outside the narrow window.
+    // This is the root-cause fix for "gaganyaan latest news" returning 5 results
+    // via /search but 21 via /news.
+    #[test]
+    fn p6_fresh_override_no_explicit_dates_clears_hard_window() {
+        // Simulate the fail-open logic: no web result has an explicit published_date,
+        // but the FRESH_OVERRIDE has set a 7-day window.
+        let mut c = cst();
+        c.after_date = Some("2026-10-06".to_string());
+        c.before_date = Some("2026-10-13".to_string());
 
-	}
+        // Results with NO published_date — only URL-extracted or text-extracted dates.
+        let web_results = vec![
+            SearxResult {
+                title: "Gaganyaan mission update".to_string(),
+                url: "https://example.com/2024/03/15/gaganyaan".to_string(),
+                content: "The Gaganyaan mission is progressing well.".to_string(),
+                engine: "bing".to_string(),
+                score: 1.0,
+                sources: vec![],
+                published_date: None,
+                price: None,
+                currency: None,
+            },
+            SearxResult {
+                title: "ISRO Gaganyaan latest news".to_string(),
+                url: "https://example.com/news/gaganyaan".to_string(),
+                content: "Gaganyaan crew training completed in March 2024.".to_string(),
+                engine: "google".to_string(),
+                score: 0.9,
+                sources: vec![],
+                published_date: None,
+                price: None,
+                currency: None,
+            },
+        ];
+
+        // Count only results with an EXPLICIT published_date that parses.
+        let dated_result_count = web_results.iter().filter(|r| {
+            r.published_date.as_deref().and_then(parse_date_to_comparable).is_some()
+        }).count();
+
+        // With no explicit dates, the hard window must be cleared.
+        assert_eq!(dated_result_count, 0, "no results should have explicit published_date");
+
+        // Simulate the fail-open: clear the window when dated_result_count == 0.
+        let mut constraints = c.clone();
+        if dated_result_count == 0 {
+            constraints.after_date = None;
+            constraints.before_date = None;
+        }
+
+        assert!(constraints.after_date.is_none(), "hard window must be cleared when no explicit dates");
+        assert!(constraints.before_date.is_none(), "hard window must be cleared when no explicit dates");
+
+        // Verify that should_filter_by_constraints does NOT drop date-less results
+        // when the window is cleared.
+        for r in &web_results {
+            let filtered = should_filter_by_constraints(
+                &r.title, &r.content, &r.url, r.published_date.as_deref(), &constraints,
+            );
+            assert!(!filtered, "date-less result must be kept when hard window is cleared: {}", r.title);
+        }
+    }
+
+    // P6 regression: when at least 1 web result HAS an explicit parseable
+    // published_date, the hard window IS applied (normal behavior preserved).
+    #[test]
+    fn p6_fresh_override_with_explicit_dates_keeps_hard_window() {
+        let mut c = cst();
+        c.after_date = Some("2026-10-06".to_string());
+        c.before_date = Some("2026-10-13".to_string());
+
+        let web_results = vec![
+            SearxResult {
+                title: "Gaganyaan mission update".to_string(),
+                url: "https://example.com/gaganyaan".to_string(),
+                content: "The Gaganyaan mission is progressing well.".to_string(),
+                engine: "bing".to_string(),
+                score: 1.0,
+                sources: vec![],
+                published_date: Some("2026-10-10".to_string()),
+                price: None,
+                currency: None,
+            },
+            SearxResult {
+                title: "Old Gaganyaan article".to_string(),
+                url: "https://example.com/2024/03/15/gaganyaan".to_string(),
+                content: "Old news about Gaganyaan from 2024.".to_string(),
+                engine: "google".to_string(),
+                score: 0.9,
+                sources: vec![],
+                published_date: None,
+                price: None,
+                currency: None,
+            },
+        ];
+
+        let dated_result_count = web_results.iter().filter(|r| {
+            r.published_date.as_deref().and_then(parse_date_to_comparable).is_some()
+        }).count();
+
+        assert_eq!(dated_result_count, 1, "one result should have explicit published_date");
+
+        // With at least 1 explicit date, the hard window is NOT cleared.
+        let mut constraints = c.clone();
+        if dated_result_count == 0 {
+            constraints.after_date = None;
+            constraints.before_date = None;
+        }
+
+        assert!(constraints.after_date.is_some(), "hard window must be kept when explicit dates exist");
+        assert!(constraints.before_date.is_some(), "hard window must be kept when explicit dates exist");
+
+        // The result with a date inside the window should be kept.
+        let kept = should_filter_by_constraints(
+            &web_results[0].title, &web_results[0].content, &web_results[0].url,
+            web_results[0].published_date.as_deref(), &constraints,
+        );
+        assert!(!kept, "result with date inside window must be kept");
+
+        // The date-less result should also be kept (fail-open in should_filter_by_constraints).
+        let kept2 = should_filter_by_constraints(
+            &web_results[1].title, &web_results[1].content, &web_results[1].url,
+            web_results[1].published_date.as_deref(), &constraints,
+        );
+        assert!(!kept2, "date-less result must be kept (fail-open)");
+    }
+
+
+}
 
 #[cfg(test)]
 mod hardcoding_ruling_tests {
@@ -24137,14 +24448,17 @@ mod spellcheck_endpoint_tests {
         assert_eq!(d.price_high, None);
     }
 
-    // ── ROADMAP item 1 (increment): secondary HTML price fallback ─────────
-    // When structured extraction (JSON-LD/OG/microdata) finds no price, the
-    // secondary HTML price pattern fallback recovers prices from common
-    // e-commerce HTML patterns. These tests prove it fires only as a fallback,
-    // extracts the first visible price, and labels the source correctly.
+    // ── HTML-pattern extraction (now in enrich_with_commerce, not here) ────
+    // extract_commerce_offer ONLY does structured extraction (JSON-LD, OG,
+    // microdata, MF2). HTML pattern extraction is handled by the dedicated
+    // html_pattern tier in enrich_with_commerce. These tests verify that
+    // extract_commerce_offer does NOT fire on HTML patterns alone.
 
     #[test]
-    fn html_pattern_fallback_extracts_from_data_price_attribute() {
+    fn html_pattern_not_extracted_by_extract_commerce_offer() {
+        // A page with NO structured markup but WITH a recognizable price container.
+        // extract_commerce_offer must NOT extract it — that is the job of the
+        // html_pattern tier in enrich_with_commerce.
         let html = r#"<!doctype html><html><body>
 <h1>Wireless Headphones</h1>
 <div class="product-price" data-price="299.99" data-currency="USD">
@@ -24153,25 +24467,26 @@ mod spellcheck_endpoint_tests {
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/hp");
         let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(299.99), "price extracted from data-price");
-        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+        assert_eq!(d.price, None, "price must NOT be extracted from HTML patterns");
+        assert_eq!(d.currency, None, "currency must NOT be extracted from HTML patterns");
+        assert_eq!(o.source.as_deref(), None);
     }
 
     #[test]
-    fn html_pattern_fallback_extracts_currency_in_class_span() {
+    fn html_pattern_currency_not_extracted_by_extract_commerce_offer() {
         let html = r#"<!doctype html><html><body>
 <h1>Sony WH-1000XM5</h1>
 <span class="price">₹29,999</span>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/sony");
         let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(29999.0));
-        assert_eq!(d.currency.as_deref(), Some("INR"));
-        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+        assert_eq!(d.price, None, "price must NOT be extracted from HTML patterns");
+        assert_eq!(d.currency, None, "currency must NOT be extracted from HTML patterns");
     }
 
     #[test]
-    fn html_pattern_fallback_does_not_fire_when_jsonld_present() {
+    fn html_pattern_not_extracted_when_jsonld_present() {
+        // When structured extraction succeeds, HTML patterns are irrelevant.
         let html = r#"<!doctype html><html><head>
 <script type="application/ld+json">
 { "@context": "https://schema.org/", "@type": "Product",
@@ -24181,13 +24496,12 @@ mod spellcheck_endpoint_tests {
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/w");
         let d = o.data.as_ref().unwrap();
-        // JSON-LD wins, HTML pattern does NOT overwrite
         assert_eq!(d.price, Some(49.99));
         assert_eq!(o.source.as_deref(), Some("json-ld"));
     }
 
     #[test]
-    fn html_pattern_fallback_does_not_fire_when_microdata_present() {
+    fn html_pattern_not_extracted_when_microdata_present() {
         let html = format!(r#"<!doctype html><html><body>
 <div itemscope itemtype="https://schema.org/Product">
   <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
@@ -24204,7 +24518,7 @@ mod spellcheck_endpoint_tests {
     }
 
     #[test]
-    fn html_pattern_fallback_returns_none_for_non_product_pages() {
+    fn html_pattern_returns_none_for_non_product_pages() {
         let html = r#"<!doctype html><html><body>
 <h1>How to bake bread</h1>
 <p>This recipe uses 3 cups of flour and costs about $2 per loaf.</p>
@@ -24212,16 +24526,12 @@ mod spellcheck_endpoint_tests {
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://blog.example.com/bread");
         let d = o.data.as_ref().unwrap();
-        // The recipe mentions "$2" but not in a product context — the HTML
-        // pattern scan only looks in the first 8KB and the $2 is far from any
-        // price container. It should NOT fire.
         assert_eq!(d.price, None);
         assert_eq!(o.source.as_deref(), None);
     }
 
     #[test]
-    fn html_pattern_fallback_ignores_unreasonable_prices() {
-        // Price of 0 or >10M should be rejected
+    fn html_pattern_ignores_unreasonable_prices() {
         let html = r#"<!doctype html><html><body>
 <span class="price">$99999999</span>
 </body></html>"#;
@@ -24231,31 +24541,28 @@ mod spellcheck_endpoint_tests {
     }
 
     #[test]
-    fn html_pattern_fallback_preserves_structured_currency() {
+    fn html_pattern_does_not_extract_currency_without_structured() {
         let html = r#"<!doctype html><html><body>
 <span class="sale-price">€89.99</span>
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/eu");
         let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(89.99));
-        assert_eq!(d.currency.as_deref(), Some("EUR"));
+        assert_eq!(d.price, None);
+        assert_eq!(d.currency, None);
     }
 
     #[test]
-    fn html_pattern_fallback_itemprop_meta_price() {
+    fn html_pattern_itemprop_meta_not_extracted() {
         let html = r#"<!doctype html><html><head>
 <meta itemprop="price" content="549.00">
 </head><body><h1>Product</h1></body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/m");
         let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(549.00));
-        assert_eq!(o.source.as_deref(), Some("extracted_from_text"));
+        assert_eq!(d.price, None);
     }
 
     #[test]
-    fn html_pattern_fallback_does_not_extract_rating_or_other_facts() {
-        // The fallback should ONLY extract price and currency — never other
-        // facts like rating, availability, or name from free text.
+    fn html_pattern_does_not_extract_rating_or_other_facts() {
         let html = r#"<!doctype html><html><body>
 <h1>Amazing Product</h1>
 <span class="price">$49.99</span>
@@ -24264,7 +24571,7 @@ mod spellcheck_endpoint_tests {
 </body></html>"#;
         let o = extract_commerce_offer(html, "https://shop.example.com/ap");
         let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(49.99));
+        assert_eq!(d.price, None);
         assert_eq!(d.rating, None, "rating must NOT be extracted from text");
         assert_eq!(d.availability, None, "availability must NOT be extracted from text");
     }
@@ -25545,15 +25852,72 @@ structured product data, so nothing must be extracted from the body.</p></body><
         };
         enrich_with_commerce(&mut ranked, fetch).await;
 
+        // Shopping block has facts for URLs 1, 2, and 3 — but NOT 4.
+        let shopping = serde_json::json!({
+            "results": [
+                { "url": "https://store.example.com/p/3",
+                  "commerce": { "price": 49.99, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/3",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
+                      "data": { "price": 49.99 } } },
+                { "url": "https://store.example.com/p/1",
+                  "commerce": { "price": 199.0, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/1",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "html_pattern",
+                      "data": { "price": 199.0 } } },
+                // URL 2 is in the shopping block too — must NOT overwrite its
+                // existing commerce (no clobbering).
+                { "url": "https://store.example.com/p/2",
+                  "commerce": { "price": 1.0, "currency": "USD" },
+                  "commerce_provenance": { "url": "https://store.example.com/p/2",
+                      "observed_at": "2026-01-01T00:00:00Z", "source": "json-ld",
+                      "data": { "price": 1.0 } } },
+            ]
+        });
+
+        let before_urls: Vec<String> = results
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+
+        copy_commerce_facts_from_shopping_block(&mut results, Some(&shopping));
+
+        // Order preserved.
+        let after_urls: Vec<String> = results
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(before_urls, after_urls, "order must be byte-identical");
+
+        // URL 1: fact copied from shopping block.
+        assert_eq!(
+            results[0]["commerce"]["price"], 199.0,
+            "URL 1 should get the shopping block's fact"
+        );
+
+        // URL 2: existing commerce NOT clobbered by shopping block.
+        assert_eq!(
+            results[1]["commerce"]["price"], 99.0,
+            "URL 2 existing commerce must not be overwritten"
+        );
+
+        // URL 3: fact copied from shopping block.
+        assert_eq!(
+            results[2]["commerce"]["price"], 49.99,
+            "URL 3 should get the shopping block's fact"
+        );
+
+        // URL 4: no fact in shopping block → stays null.
         assert!(
             ranked[0]["commerce_provenance"]["observed_at"].is_string(),
             "a successfully fetched page keeps a real observed_at"
         );
         assert_eq!(ranked[0]["commerce_provenance"]["fetched"], serde_json::json!(true));
         assert_eq!(
-            ranked[1]["commerce_provenance"]["observed_at"],
-            serde_json::Value::Null,
-            "a failed fetch must not report an observation time"
+            results[0]["commerce_provenance"]["source"], "html_pattern"
+        );
+        assert_eq!(
+            results[2]["commerce_provenance"]["source"], "json-ld"
         );
         assert_eq!(ranked[1]["commerce_provenance"]["fetched"], serde_json::json!(false));
         assert_eq!(ranked[1]["commerce_provenance"]["reason"], serde_json::json!("fetch_failed"));
@@ -26312,6 +26676,122 @@ mod local_intent_gazetteer_tests {
                 "traditional local query '{}' should still be detected",
                 q
             );
+        }
+    }
+
+    // ── HTML-pattern extraction tier (enrichment RECALL increment) ────────────
+    // When the page fetch succeeds but structured extraction (JSON-LD/OG/
+    // microdata) finds nothing, try known e-commerce HTML price patterns on
+    // the ACTUAL page content before falling back to the snippet. This is a
+    // provenance-carrying intermediate tier: source="html_pattern".
+
+    #[tokio::test]
+    async fn html_pattern_tier_extracts_price_when_structured_finds_nothing() {
+        // A page with NO structured markup but WITH a recognizable price container.
+        let html = r#"<!doctype html><html><head><title>Widget Store</title></head>
+<body><div class="product"><span class="a-price"><span class="a-offscreen">$1,199.00</span></span></div>
+</body></html>"#;
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://store.example.com/widget", "title": "Widget", "score": 9.0 }),
+        ];
+        let h = html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        let c = r.get("commerce").expect("commerce block attached via html_pattern");
+        assert_eq!(c["source"], serde_json::json!("html_pattern"));
+        assert_eq!(c["data"]["price"], serde_json::json!(1199.00));
+        assert!(c["data"]["currency"].as_str().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn html_pattern_tier_does_not_fire_when_structured_data_present() {
+        // When structured extraction succeeds, the html_pattern tier must NOT
+        // overwrite it (structured data is more reliable).
+        let html = r#"<!doctype html><html><head>
+<script type="application/ld+json">
+{"@context":"https://schema.org/","@type":"Product","name":"Widget","offers":{"@type":"Offer","price":"49.99","priceCurrency":"USD"}}
+</script></head><body><span class="price">$99.99</span></body></html>"#;
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://store.example.com/widget", "title": "Widget", "score": 9.0 }),
+        ];
+        let h = html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        let c = r.get("commerce").expect("commerce block attached");
+        assert_eq!(c["source"], serde_json::json!("json-ld"), "structured wins over html_pattern");
+        assert_eq!(c["data"]["price"], serde_json::json!(49.99));
+    }
+
+    #[tokio::test]
+    async fn html_pattern_tier_falls_through_to_snippet_when_no_pattern_match() {
+        // A page with no structured data AND no recognizable price pattern.
+        // The html_pattern tier must NOT fire; the snippet fallback should.
+        let html = r#"<!doctype html><html><head><title>Just a page</title></head>
+<body><p>No price here, just text.</p></body></html>"#;
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://store.example.com/widget", "title": "Widget $49.99", "content": "Great widget", "score": 9.0 }),
+        ];
+        let h = html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        let c = r.get("commerce").expect("commerce block attached via snippet");
+        assert_eq!(c["source"], serde_json::json!("snippet_extracted"));
+        assert_eq!(c["data"]["price"], serde_json::json!(49.99));
+    }
+
+    #[tokio::test]
+    async fn html_pattern_tier_does_not_fire_when_fetch_fails() {
+        // When the page fetch returns None, the html_pattern tier must NOT
+        // fire (no HTML to parse). The snippet fallback should handle it.
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://store.example.com/widget", "title": "Widget $99.99", "content": "", "score": 9.0 }),
+        ];
+        let fetch = |_url: String| async move { None::<String> };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let r = &ranked[0];
+        let c = r.get("commerce").expect("commerce block attached via snippet");
+        assert_eq!(c["source"], serde_json::json!("snippet_extracted"));
+        assert_eq!(c["data"]["price"], serde_json::json!(99.99));
+    }
+
+    #[tokio::test]
+    async fn html_pattern_tier_never_reorders_results() {
+        // The html_pattern tier must never reorder ranked results.
+        let mut ranked = vec![
+            serde_json::json!({ "url": "https://a.example.com/x", "title": "A", "score": 9.0 }),
+            serde_json::json!({ "url": "https://b.example.com/y", "title": "B", "score": 8.0 }),
+            serde_json::json!({ "url": "https://c.example.com/z", "title": "C", "score": 7.0 }),
+        ];
+        let html = r#"<!doctype html><html><head><title>Store</title></head>
+<body><span class="price">$49.99</span></body></html>"#;
+        let h = html.to_string();
+        let fetch = |url: String| {
+            let html = h.clone();
+            async move { Some(html) }
+        };
+        enrich_with_commerce(&mut ranked, fetch).await;
+        let urls: Vec<_> = ranked.iter().map(|r| r["url"].as_str().unwrap()).collect();
+        assert_eq!(urls, vec![
+            "https://a.example.com/x",
+            "https://b.example.com/y",
+            "https://c.example.com/z",
+        ], "html_pattern tier must never reorder");
+        // All three should have html_pattern commerce blocks
+        for r in ranked.iter() {
+            let c = r.get("commerce").expect("commerce block attached");
+            assert_eq!(c["source"], serde_json::json!("html_pattern"));
         }
     }
 }
