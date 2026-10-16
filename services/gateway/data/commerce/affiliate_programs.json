@@ -17,7 +17,8 @@
       "param_env": {},
       "bid_floor": "0.10",
       "fallback_url": null,
-      "bid_check_url": "https://api.viglink.com/api/bid?key={key}&out={url}"
+      "bid_check_url": "https://api.viglink.com/api/bid?key={key}&out={url}",
+      "disclosed": true
     },
     {
       "id": "skimlinks",
@@ -29,7 +30,8 @@
       "template": "https://go.redirectingat.com/?xid={key}&url={url}",
       "params": {},
       "key_env": "SKIMLINKS_XID",
-      "param_env": {}
+      "param_env": {},
+      "disclosed": true
     },
     {
       "id": "ebay_epn",
@@ -50,7 +52,8 @@
       "key_env": "EBAY_EPN_ROTATION_ID",
       "param_env": {
         "campaign_id": "EBAY_EPN_CAMPAIGN_ID"
-      }
+      },
+      "disclosed": true
     },
     {
       "id": "amazon_associates",
@@ -64,7 +67,8 @@
         "tag": "{key}"
       },
       "key_env": "AMAZON_ASSOCIATES_TAG",
-      "param_env": {}
+      "param_env": {},
+      "disclosed": true
     },
     {
       "id": "rakuten_advertising",
@@ -77,8 +81,122 @@
       "params": {},
       "key_env": "RAKTUEN_LINKSYNERGY_ID",
       "param_env": {
-        "merchant_id": "RAKTUEN_MERCHANT_ID"
-      }
+        "merchant_id": "RAKUTEN_MERCHANT_ID"
+      },
+      "disclosed": true
+    },
+    {
+      "id": "shareasale",
+      "name": "ShareASale",
+      "network": "ShareASale",
+      "host_suffix": null,
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 50,
+      "template": "https://shareasale.com/r.cfm?b={param:affiliate_id}&u={param:merchant_id}&m={param:merchant_id}&urllink={url}",
+      "params": {},
+      "key_env": "SHAREASALE_AFFILIATE_ID",
+      "param_env": {
+        "affiliate_id": "SHAREASALE_AFFILIATE_ID",
+        "merchant_id": "SHAREASALE_MERCHANT_ID"
+      },
+      "disclosed": true
+    },
+    {
+      "id": "cj_affiliate",
+      "name": "CJ Affiliate",
+      "network": "CJ Affiliate",
+      "host_suffix": null,
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 45,
+      "template": "https://www.dpbolvw.net/click-{}?url={url}",
+      "params": {
+        "sid": "{subid}"
+      },
+      "key_env": "CJ_AFFILIATE_PID",
+      "param_env": {},
+      "disclosed": true
+    },
+    {
+      "id": "awin",
+      "name": "Awin",
+      "network": "Awin",
+      "host_suffix": null,
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 40,
+      "template": "https://www.awin1.com/awclick.php?awinmid={param:merchant_id}&awinaffid={key}&clickref={subid}&ued={url}",
+      "params": {},
+      "key_env": "AWIN_AFFILIATE_ID",
+      "param_env": {
+        "merchant_id": "AWIN_MERCHANT_ID"
+      },
+      "disclosed": true
+    },
+    {
+      "id": "impact",
+      "name": "Impact",
+      "network": "Impact",
+      "host_suffix": null,
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 35,
+      "template": "https://impact.com/redirect?campaign={param:campaign_id}&key={key}&url={url}&subId={subid}",
+      "params": {},
+      "key_env": "IMPACT_ACCOUNT_SID",
+      "param_env": {
+        "campaign_id": "IMPACT_CAMPAIGN_ID"
+      },
+      "disclosed": true
+    },
+    {
+      "id": "clickbank",
+      "name": "ClickBank",
+      "network": "ClickBank",
+      "host_suffix": null,
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 30,
+      "template": "https://{key}.hop.clickbank.net/?vendor={param:vendor_id}&tid={subid}&url={url}",
+      "params": {},
+      "key_env": "CLICKBANK_HOPLINK_ID",
+      "param_env": {
+        "vendor_id": "CLICKBANK_VENDOR_ID"
+      },
+      "disclosed": true
+    },
+    {
+      "id": "partnerstack",
+      "name": "PartnerStack",
+      "network": "PartnerStack",
+      "host_suffix": null,
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 25,
+      "template": "https://{key}.partnersstack.com/r/{param:partner_id}?url={url}&subId={subid}",
+      "params": {},
+      "key_env": "PARTNERSTACK_COMPANY_ID",
+      "param_env": {
+        "partner_id": "PARTNERSTACK_PARTNER_ID"
+      },
+      "disclosed": true
+    },
+    {
+      "id": "flexoffers",
+      "name": "FlexOffers",
+      "network": "FlexOffers",
+      "host_suffix": null,
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 20,
+      "template": "https://track.flexoffers.com/aff_c?offer_id={param:offer_id}&aff_id={key}&url={url}&sub1={subid}",
+      "params": {},
+      "key_env": "FLEXOFFERS_AFF_ID",
+      "param_env": {
+        "offer_id": "FLEXOFFERS_OFFER_ID"
+      },
+      "disclosed": true
     }
   ]
 }

@@ -36,6 +36,55 @@
       "disclosure_label": "Rakuten Advertising",
       "subid_policy": "merchant_host",
       "subid_description": "Coarse, non-identifying: the destination merchant host only. No user id, session id, IP, or query text."
+    },
+    {
+      "id": "shareasale",
+      "name": "ShareASale",
+      "disclosure_label": "ShareASale",
+      "subid_policy": "merchant_host",
+      "subid_description": "Coarse, non-identifying: the destination merchant host only. No user id, session id, IP, or query text."
+    },
+    {
+      "id": "cj_affiliate",
+      "name": "CJ Affiliate",
+      "disclosure_label": "CJ Affiliate",
+      "subid_policy": "merchant_host",
+      "subid_description": "Coarse, non-identifying: the destination merchant host only. No user id, session id, IP, or query text."
+    },
+    {
+      "id": "awin",
+      "name": "Awin",
+      "disclosure_label": "Awin",
+      "subid_policy": "merchant_host",
+      "subid_description": "Coarse, non-identifying: the destination merchant host only. No user id, session id, IP, or query text."
+    },
+    {
+      "id": "impact",
+      "name": "Impact",
+      "disclosure_label": "Impact",
+      "subid_policy": "merchant_host",
+      "subid_description": "Coarse, non-identifying: the destination merchant host only. No user id, session id, IP, or query text."
+    },
+    {
+      "id": "clickbank",
+      "name": "ClickBank",
+      "disclosure_label": "ClickBank",
+      "subid_policy": "none",
+      "subid_description": "No subid parameter is added. The ClickBank hoplink id alone identifies the program."
+    },
+    {
+      "id": "partnerstack",
+      "name": "PartnerStack",
+      "disclosure_label": "PartnerStack",
+      "subid_policy": "merchant_host",
+      "subid_description": "Coarse, non-identifying: the destination merchant host only. No user id, session id, IP, or query text."
+    },
+    {
+      "id": "flexoffers",
+      "name": "FlexOffers",
+      "disclosure_label": "FlexOffers",
+      "subid_policy": "merchant_host",
+      "subid_description": "Coarse, non-identifying: the destination merchant host only. No user id, session id, IP, or query text."
     }
   ]
 }
