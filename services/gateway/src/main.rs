@@ -439,6 +439,7 @@ fn is_exact_model_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
     cfg.has_exact_model(q_lower)
 }
 
+/// Runtime-loaded commerce intent signals from `data/commerce/signals.json`.
 fn has_price_signal(title_lower: &str, content_lower: &str) -> bool {
     static RS_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let rs_re = RS_REGEX.get_or_init(|| regex::Regex::new(r"(?i)\b(rs\.?|rupee|rupees|inr)\b|₹").unwrap());
