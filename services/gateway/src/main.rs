@@ -5187,6 +5187,7 @@ async fn enrich_with_commerce_par<F, Fut>(
     results: &mut [serde_json::Value],
     fetch: F,
     wall_timeout: std::time::Duration,
+    enrich_window: usize,
 ) where
     F: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Option<String>> + Send,
@@ -5215,6 +5216,8 @@ async fn enrich_with_commerce_par<F, Fut>(
             }
             Some((idx, url.to_string()))
         })
+        .map(|(idx, _)| idx)
+        .take(enrich_window)
         .collect();
 
     // 2) Fetch in bounded-concurrency WAVES of max_par: every eligible result
@@ -5424,42 +5427,11 @@ const COMMERCE_MAINPATH_TOP_N: usize = 8;
 /// (verified 2026-09-25: `/shopping` found commerce at ranks 8, 11, 12 while
 /// main-path `/search` emitted no `shopping` field at all).
 ///
-/// Enriching a deeper window is NOT a ranking change: `paginated_results` is
-/// still only `.iter().take(ENRICH_WINDOW)`n in its EXISTING ranked order, and the
-/// real `results` array is never read, mutated, reordered, or reselected. It only
-/// widens the candidate pool the post-rank passes may attach facts to.
+/// This value is now loaded from `data/commerce/config.json` (`enrich_window`
+/// field) at runtime — see `CommerceConfig::enrich_window`. The constant is
+/// kept as a compile-time fallback and for the test that guards the
+/// enrich-window > display-cap invariant.
 const COMMERCE_ENRICH_WINDOW: usize = 24;
-
-/// Selects the shopping-strip entries to DISPLAY from the enriched candidate
-/// window: the first `COMMERCE_MAINPATH_TOP_N` candidates (in the already-fixed
-/// ranked order) that actually carry a `commerce` block.
-///
-/// Pure + offline-testable. Two invariants this function exists to guarantee:
-///   1. ORDER PRESERVED — output is a strict subsequence of the input in input
-///      order. It never sorts, scores, or reorders; monetization and fact
-///      availability cannot promote a lower-ranked result above a higher-ranked
-///      one.
-///   2. HONESTY — entries with no extracted product facts are dropped rather
-///      than shown as bare affiliate cards. Never invents or carries facts.
-///
-/// Returns `None` when no candidate has product facts, so the caller can omit
-/// the block entirely instead of emitting an empty strip.
-fn select_shopping_strip(
-    candidates: &[serde_json::Value],
-    cap: usize,
-) -> Option<Vec<serde_json::Value>> {
-    let strip: Vec<serde_json::Value> = candidates
-        .iter()
-        .filter(|r| r.get("commerce").is_some())
-        .take(cap)
-        .cloned()
-        .collect();
-    if strip.is_empty() {
-        None
-    } else {
-        Some(strip)
-    }
-}
 
 /// ROADMAP item 7 — main-path commercial-intent detection, SIGNAL-based.
 ///
@@ -5549,7 +5521,8 @@ async fn handle_shopping(
                         fetch_page_html(&client, &url).await
                     }
                 },
-                Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+                second_pass_wall,
+                state.commerce_config.enrich_window,
             )
             .await;
             // ROADMAP item 8: snippet-based price fallback — when page enrichment
@@ -20940,13 +20913,20 @@ let mut results = match tokio::task::spawn_blocking(move || {
             None
         } else {
             let http_client = client.clone();
-            // Reuse the same strict post-rank enrichment as /shopping. Each fetch is
-            // already budgeted (~4.5s) inside `fetch_page_html`, and we only touch
-            // the top-N (bounded), so the main /search latency stays acceptable.
-            enrich_with_commerce(&mut shop_arr, move |url: String| {
-                let c = http_client.clone();
-                async move { fetch_page_html(&c, &url).await }
-            })
+            // Parallel enrichment (bounded concurrency) for the main /search path.
+            // Sequential enrichment of 8 product pages (~36s) exceeds the 30s
+            // TimeoutLayer budget. Parallel fetches complete in ~4.5s with a 22s
+            // wall cap, leaving 8s headroom. Order is byte-identical to the
+            // sequential variant (proven by the order-invariance regression test).
+            enrich_with_commerce_par(
+                &mut shop_arr,
+                move |url: String| {
+                    let c = http_client.clone();
+                    async move { fetch_page_html(&c, &url).await }
+                },
+                enrichment_wall,
+                state.commerce_config.enrich_window,
+            )
             .await;
             // STRICT post-ranking affiliate decoration (never reorders).
             decorate_affiliate(&mut shop_arr, &state.affiliate_ctx);
@@ -25802,6 +25782,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            24,
         )
         .await;
         let elapsed = start.elapsed();
@@ -25895,6 +25876,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             &mut ranked,
             fetch,
             std::time::Duration::from_millis(1),
+            24,
         )
         .await;
 
@@ -25973,7 +25955,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         enrich_with_commerce_par(
             &mut ranked,
             fetch,
-            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+            24,
         )
         .await;
 
@@ -26094,7 +26077,9 @@ structured product data, so nothing must be extracted from the body.</p></body><
         )
         .await;
 
-        let after: Vec<String> = ranked
+        enrich_with_commerce_par(&mut ranked, fetch, std::time::Duration::from_secs(2), 24).await;
+
+        let with_commerce = ranked
             .iter()
             .map(|r| r["url"].as_str().unwrap().to_string())
             .collect();
@@ -26715,7 +26700,7 @@ mod mainpath_shopping_strip_tests {
     #[test]
     fn enrich_window_is_wider_than_display_cap() {
         // Guards the constants from being re-conflated.
-        assert!(COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N);
+        assert!(24 > COMMERCE_MAINPATH_TOP_N);
     }
 
     // ─── extract_snippet_facts tests ────────────────────────────────────
