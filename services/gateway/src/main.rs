@@ -4791,6 +4791,10 @@ async fn enrich_with_commerce_par<F, Fut>(
     F: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Option<String>> + Send,
 {
+    let max_par = MAX_PARALLEL_FETCH.min(results.len());
+
+    // 1) Collect indices eligible for enrichment: object results with a URL
+    //    that don't already carry a commerce block from an earlier step.
     let eligible: Vec<usize> = results
         .iter()
         .enumerate()
@@ -4810,7 +4814,6 @@ async fn enrich_with_commerce_par<F, Fut>(
     //    /search must stay inside its 30s TimeoutLayer budget) — on expiry the
     //    remaining fetches are abandoned and those results keep commerce: null
     //    but still receive provenance in step 4 (honest, never fabricated).
-    let max_par = MAX_PARALLEL_FETCH.min(results.len());
     let deadline = std::time::Instant::now() + wall_timeout;
     let mut fetched: Vec<(usize, String)> = Vec::new();
     for wave in eligible.chunks(max_par.max(1)) {
@@ -4834,6 +4837,9 @@ async fn enrich_with_commerce_par<F, Fut>(
             .collect();
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
+            // Budget exhausted — abandon pending waves (handles are dropped;
+            // tokio detaches the tasks, matching the pre-existing semantics
+            // where a slow fetch could never block the response past the cap).
             break;
         }
         match tokio::time::timeout(remaining, async {
@@ -4841,7 +4847,7 @@ async fn enrich_with_commerce_par<F, Fut>(
             for (_, handle) in tasks {
                 match handle.await {
                     Ok(Some((idx, html))) => wave_results.push((idx, html)),
-                    _ => {}
+                    _ => {} // task panicked or returned None — skip
                 }
             }
             wave_results
@@ -4849,7 +4855,7 @@ async fn enrich_with_commerce_par<F, Fut>(
         .await
         {
             Ok(wave_results) => fetched.extend(wave_results),
-            Err(_) => break,
+            Err(_) => break, // wall clock expired mid-wave — stop fetching
         }
     }
 
