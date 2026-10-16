@@ -23048,7 +23048,10 @@ structured product data, so nothing must be extracted from the body.</p></body><
             .collect();
 
         let fake_html = HTML_SINGLE_OFFER.to_string();
-        let fetch = move |url: String| {
+        // `move` is required: enrich_with_commerce_par bounds F with 'static
+        // (the closure is cloned into spawned tasks), so it must OWN fake_html.
+        // Each call clones the owned String, keeping the closure Fn (not FnMut).
+        let fetch = move |_url: String| {
             let html = fake_html.clone();
             async move {
                 // Simulate network latency
