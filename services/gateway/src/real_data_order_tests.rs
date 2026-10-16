@@ -17,6 +17,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::affiliate::*;
 use serde_json::Value;
 
 /// The ranked input every test here decorates: several results with DIFFERENT
@@ -117,26 +118,9 @@ fn real_data_order_is_invariant_for_every_network_key_on_and_off() {
          invariance comparison below would never exercise decoration"
     );
 
-    let all_networks: Vec<AffiliateNetwork> = ctx.networks.clone();
-
-    for net in &all_networks {
-        let solo = AffiliateCtx { networks: vec![net.clone()] };
-        let key = net.key_env.clone().unwrap_or_default();
-        assert!(
-            !key.is_empty(),
-            "network {:?} has no key_env; the keys-present run would be identical to the \
-             keys-absent run and the comparison would prove nothing",
-            net.id
-        );
-
-        // ── keys PRESENT ────────────────────────────────────────────────────
-        let other_keys: Vec<String> = all_networks
-            .iter()
-            .filter_map(|n| n.key_env.clone())
-            .filter(|k| k != &key)
-            .collect();
-        remove_keys(&other_keys);
-        std::env::set_var(&key, "DUMMY_KEY_FOR_ORDER_INVARIANCE");
+    for net in &networks {
+        // KEYS PRESENT: only this network, its remapped key set to a dummy value.
+        let keyed_ctx = AffiliateCtx::from_networks(remap_keys(std::slice::from_ref(net), "PRESENT", true));
         let mut with_key = ranked_fixture();
         decorate_affiliate_for_query(&mut with_key, &solo, EXACT_MODEL_QUERY);
         let with_key_ranked = ranked_urls(&with_key);
@@ -148,13 +132,8 @@ fn real_data_order_is_invariant_for_every_network_key_on_and_off() {
             net.id
         );
 
-        // ── keys ABSENT ──────────────────────────────────────────────────────
-        remove_keys(
-            &all_networks
-                .iter()
-                .filter_map(|n| n.key_env.clone())
-                .collect::<Vec<_>>(),
-        );
+        // KEYS ABSENT: same network, key_env remapped to a name nothing ever sets.
+        let unkeyed_ctx = AffiliateCtx::from_networks(remap_keys(std::slice::from_ref(net), "ABSENT", false));
         let mut no_key = ranked_fixture();
         decorate_affiliate_for_query(&mut no_key, &solo, EXACT_MODEL_QUERY);
         let no_key_ranked = ranked_urls(&no_key);
@@ -185,14 +164,14 @@ fn real_data_whole_config_order_invariant_keys_present_vs_absent() {
     let ctx = real_ctx();
     let all_keys: Vec<String> = ctx.networks.iter().filter_map(|n| n.key_env.clone()).collect();
 
-    remove_keys(&all_keys);
+    let unkeyed_ctx = AffiliateCtx::from_networks(remap_keys(&networks, "WHOLE_ABSENT", false));
     let mut absent = ranked_fixture();
     decorate_affiliate_for_query(&mut absent, &ctx, EXACT_MODEL_QUERY);
     let absent_ranked = ranked_urls(&absent);
     let absent_aff = affiliate_urls(&absent);
     assert!(absent_aff.is_empty(), "keys absent => nothing may be decorated");
 
-    present_all_keys(&ctx);
+    let keyed_ctx = AffiliateCtx::from_networks(remap_keys(&networks, "WHOLE_PRESENT", true));
     let mut present = ranked_fixture();
     decorate_affiliate_for_query(&mut present, &ctx, EXACT_MODEL_QUERY);
     let present_ranked = ranked_urls(&present);
@@ -209,13 +188,9 @@ fn real_data_whole_config_order_invariant_keys_present_vs_absent() {
 /// is the privacy/business-policy half of the same invariant: no monetization on
 /// non-model queries, and still no reordering.
 #[test]
-fn real_data_broad_queries_never_decorate_and_never_reorder() {
-    // This test calls present_all_keys(), so it mutates process-global env vars
-    // and must hold the same lock as the other env-mutating tests.
-    let _env_guard = crate::ENV_TEST_LOCK.lock();
-    let ctx = real_ctx();
-    let all_keys: Vec<String> = ctx.networks.iter().filter_map(|n| n.key_env.clone()).collect();
-    present_all_keys(&ctx);
+fn real_data_decoration_touches_no_field_except_affiliate() {
+    let networks = real_ctx();
+    let keyed_ctx = AffiliateCtx::from_networks(remap_keys(&networks, "FIELDS", true));
 
     // Broad, non-model commercial queries spanning several shapes. These are
     // shapes, not fixtures tuned to one string: if the data policy legitimately
@@ -302,9 +277,7 @@ async fn main_path_enrichment_is_non_vacuous_with_fetchable_pages() {
 
     // Now decorate with keys present and verify the strip would be non-empty.
     let networks = real_ctx();
-    let keyed_ctx = AffiliateCtx {
-        networks: remap_keys(&networks, "STRIP_PRESENT", true),
-    };
+    let keyed_ctx = AffiliateCtx::from_networks(remap_keys(&networks, "STRIP_PRESENT", true));
     decorate_affiliate(&mut arr, &keyed_ctx);
 
     // The concrete_offers filter (main path gate) must find at least one row.

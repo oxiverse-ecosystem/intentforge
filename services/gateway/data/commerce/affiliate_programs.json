@@ -1,89 +1,60 @@
 {
   "version": 1,
-  "note": "Runtime-loaded per-merchant affiliate program config. Each entry describes HOW to build an affiliate link for a specific merchant or marketplace. Adding a new merchant requires ONLY editing this file — no recompile. All credentials come from ENVIRONMENT VARIABLES (see key_env / param_env), never hardcoded here. A merchant matches when the result URL's host equals or ends with the 'host_suffix' field (label-boundary match, case-insensitive).",
+  "note": "Runtime-loaded merchant-to-affiliate-program mapping. Each entry maps a merchant domain (or domain pattern) to the affiliate network that covers it and the program-specific parameters. Adding a new merchant requires ONLY editing this file — no recompile. The 'network' field references an entry in networks.json by its 'id'. The 'program_id' field is the merchant's ID within that network (e.g. eBay marketplace rotation id, Rakuten merchant id). The 'env_var' field names the ENVIRONMENT VARIABLE from which the program-specific value is read — never hardcode the value here.",
   "programs": [
     {
-      "id": "sovrn_commerce",
-      "name": "Sovrn Commerce",
-      "network": "Sovrn Commerce",
-      "host_suffix": null,
-      "kind": "wrap",
-      "enabled": true,
-      "priority": 100,
-      "template": "https://sovrn.co?key={key}&u={url}",
-      "params": {
-        "cuid": "{subid}"
-      },
-      "key_env": "SOVRN_COMMERCE_KEY",
-      "param_env": {},
-      "bid_floor": "0.10",
-      "fallback_url": null,
-      "bid_check_url": "https://api.viglink.com/api/bid?key={key}&out={url}"
+      "domain": "ebay.com",
+      "network": "ebay_epn",
+      "program_id_env": "EBAY_EPN_ROTATION_ID_EBAY_COM",
+      "note": "eBay.com marketplace rotation id"
     },
     {
-      "id": "skimlinks",
-      "name": "Skimlinks",
-      "network": "Skimlinks",
-      "host_suffix": null,
-      "kind": "wrap",
-      "enabled": true,
-      "priority": 90,
-      "template": "https://go.redirectingat.com/?xid={key}&url={url}",
-      "params": {},
-      "key_env": "SKIMLINKS_XID",
-      "param_env": {}
+      "domain": "ebay.co.uk",
+      "network": "ebay_epn",
+      "program_id_env": "EBAY_EPN_ROTATION_ID_EBAY_CO_UK",
+      "note": "eBay.co.uk marketplace rotation id"
     },
     {
-      "id": "ebay_epn",
-      "name": "eBay Partner Network",
-      "network": "eBay Partner Network",
-      "host_suffix": "ebay.",
-      "kind": "append_params",
-      "enabled": true,
-      "priority": 80,
-      "template": "{url}",
-      "params": {
-        "mkevt": "1",
-        "mkcid": "1",
-        "mkrid": "{key}",
-        "campid": "{param:campaign_id}",
-        "toolid": "10001",
-        "customid": "{subid}"
-      },
-      "key_env": "EBAY_EPN_ROTATION_ID",
-      "param_env": {
-        "campaign_id": "EBAY_EPN_CAMPAIGN_ID"
-      }
+      "domain": "ebay.de",
+      "network": "ebay_epn",
+      "program_id_env": "EBAY_EPN_ROTATION_ID_EBAY_DE",
+      "note": "eBay.de marketplace rotation id"
     },
     {
-      "id": "amazon_associates",
-      "name": "Amazon Associates",
-      "network": "Amazon Associates",
-      "host_suffix": "amazon.",
-      "kind": "append_params",
-      "enabled": true,
-      "priority": 70,
-      "template": "{url}",
-      "params": {
-        "tag": "{key}"
-      },
-      "key_env": "AMAZON_ASSOCIATES_TAG",
-      "param_env": {}
+      "domain": "ebay.ca",
+      "network": "ebay_epn",
+      "program_id_env": "EBAY_EPN_ROTATION_ID_EBAY_CA",
+      "note": "eBay.ca marketplace rotation id"
     },
     {
-      "id": "rakuten_advertising",
-      "name": "Rakuten Advertising",
-      "network": "Rakuten Advertising",
-      "host_suffix": null,
-      "kind": "wrap",
-      "enabled": true,
-      "priority": 60,
-      "template": "https://click.linksynergy.com/deeplink?id={key}&mid={param:merchant_id}&murl={url}",
-      "params": {},
-      "key_env": "RAKUTEN_LINKSYNERGY_ID",
-      "param_env": {
-        "merchant_id": "RAKUTEN_MERCHANT_ID"
-      }
+      "domain": "ebay.com.au",
+      "network": "ebay_epn",
+      "program_id_env": "EBAY_EPN_ROTATION_ID_EBAY_COM_AU",
+      "note": "eBay.com.au marketplace rotation id"
+    },
+    {
+      "domain": "amazon.com",
+      "network": "amazon_associates",
+      "program_id_env": "AMAZON_ASSOCIATES_TAG_US",
+      "note": "Amazon US associate tag"
+    },
+    {
+      "domain": "amazon.co.uk",
+      "network": "amazon_associates",
+      "program_id_env": "AMAZON_ASSOCIATES_TAG_UK",
+      "note": "Amazon UK associate tag"
+    },
+    {
+      "domain": "amazon.de",
+      "network": "amazon_associates",
+      "program_id_env": "AMAZON_ASSOCIATES_TAG_DE",
+      "note": "Amazon DE associate tag"
+    },
+    {
+      "domain": "amazon.in",
+      "network": "amazon_associates",
+      "program_id_env": "AMAZON_ASSOCIATES_TAG_IN",
+      "note": "Amazon IN associate tag"
     }
   ]
 }

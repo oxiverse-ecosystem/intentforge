@@ -1,41 +1,76 @@
 {
   "version": 1,
-  "note": "Runtime-loaded affiliate network metadata. Each entry describes a network's disclosure label, subid policy, and link-building behavior. Adding a new network requires ONLY editing this file — no recompile. The 'subid_policy' field controls what value is placed in the affiliate subid/cuid slot: 'merchant_host' (coarse, non-identifying — the destination host only), 'none' (no subid at all), or 'category' (a coarse product category, never user-identifying). The 'disclosure_label' is the human-readable text the frontend should show next to every affiliate-decorated result for this network.",
+  "note": "Runtime-loaded affiliate network definitions. Each entry describes ONE affiliate network's URL construction template, required env vars, and disclosure metadata. Adding a new network requires ONLY editing this file — no recompile. Keys/secrets come from ENVIRONMENT VARIABLES (see key_env / param_env), never hardcoded here. Two template kinds: 'wrap' (network prefix + url-encoded destination, e.g. Sovrn/Skimlinks) and 'append_params' (add query params to the merchant URL, e.g. eBay EPN / Amazon).",
   "networks": [
     {
-      "id": "sovrn_commerce",
-      "name": "Sovrn Commerce",
-      "disclosure_label": "Sovrn Commerce",
-      "subid_policy": "merchant_host",
-      "subid_description": "Coarse, non-identifying: the destination merchant host only (e.g. 'amazon.com'). No user id, session id, IP, or query text."
+      "id": "sovrn",
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 100,
+      "network": "Sovrn Commerce",
+      "template": "https://sovrn.co?key={key}&u={url}",
+      "params": { "cuid": "{subid}" },
+      "key_env": "SOVRN_COMMERCE_KEY",
+      "param_env": {},
+      "bid_floor": "0.10",
+      "fallback_url": null,
+      "bid_check_url": "https://api.viglink.com/api/bid?key={key}&out={url}",
+      "disclosure_text": "As an affiliate, we earn from qualifying purchases."
     },
     {
       "id": "skimlinks",
-      "name": "Skimlinks",
-      "disclosure_label": "Skimlinks",
-      "subid_policy": "none",
-      "subid_description": "No subid parameter is added. The network key alone identifies the program."
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 90,
+      "network": "Skimlinks",
+      "template": "https://go.redirectingat.com/?xid={key}&url={url}",
+      "params": {},
+      "key_env": "SKIMLINKS_XID",
+      "param_env": {},
+      "disclosure_text": "As an affiliate, we earn from qualifying purchases."
     },
     {
       "id": "ebay_epn",
-      "name": "eBay Partner Network",
-      "disclosure_label": "eBay Partner Network",
-      "subid_policy": "merchant_host",
-      "subid_description": "Coarse, non-identifying: the destination eBay marketplace host (e.g. 'ebay.co.uk'). No user id, session id, IP, or query text."
+      "kind": "append_params",
+      "enabled": true,
+      "priority": 80,
+      "network": "eBay Partner Network",
+      "template": "{url}",
+      "params": {
+        "mkevt": "1",
+        "mkcid": "1",
+        "mkrid": "{key}",
+        "campid": "{param:campaign_id}",
+        "toolid": "10001",
+        "customid": "{subid}"
+      },
+      "key_env": "EBAY_EPN_ROTATION_ID",
+      "param_env": { "campaign_id": "EBAY_EPN_CAMPAIGN_ID" },
+      "disclosure_text": "As an eBay Partner, we earn from qualifying purchases."
     },
     {
       "id": "amazon_associates",
-      "name": "Amazon Associates",
-      "disclosure_label": "Amazon Associates",
-      "subid_policy": "none",
-      "subid_description": "No subid parameter is added. The associate tag alone identifies the program."
+      "kind": "append_params",
+      "enabled": true,
+      "priority": 70,
+      "network": "Amazon Associates",
+      "template": "{url}",
+      "params": { "tag": "{key}" },
+      "key_env": "AMAZON_ASSOCIATES_TAG",
+      "param_env": {},
+      "disclosure_text": "As an Amazon Associate, we earn from qualifying purchases."
     },
     {
       "id": "rakuten_advertising",
-      "name": "Rakuten Advertising",
-      "disclosure_label": "Rakuten Advertising",
-      "subid_policy": "merchant_host",
-      "subid_description": "Coarse, non-identifying: the destination merchant host only. No user id, session id, IP, or query text."
+      "kind": "wrap",
+      "enabled": true,
+      "priority": 60,
+      "network": "Rakuten Advertising",
+      "template": "https://click.linksynergy.com/deeplink?id={key}&mid={param:merchant_id}&murl={url}",
+      "params": {},
+      "key_env": "RAKTUEN_LINKSYNERGY_ID",
+      "param_env": { "merchant_id": "RAKTUEN_MERCHANT_ID" },
+      "disclosure_text": "As a Rakuten affiliate, we earn from qualifying purchases."
     }
   ]
 }
