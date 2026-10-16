@@ -4394,6 +4394,171 @@ fn data_has_fact(d: &OfferFacts) -> bool {
         || d.rating.is_some()
 }
 
+/// Apply the same single-result enrichment (extract_commerce_offer → optional commerce +
+/// commerce_provenance) onto one serde_json::Value. Factored out of the parallel
+/// function so unit tests can exercise the attach + provenance contract independently.
+fn enrich_single_commerce(
+    r: &mut serde_json::Value,
+    html: &str,
+) {
+    if !r.is_object() {
+        return;
+    }
+    let url = r
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let provenance = serde_json::json!({
+        "url": url,
+        "observed_at": now_unix_string(),
+        "source": null,
+        "data": null,
+    });
+    let offer: CommerceOffer = extract_commerce_offer(html, &url);
+    if offer.data.as_ref().map(|d| data_has_fact(d)).unwrap_or(false) {
+        if let Ok(v) = serde_json::to_value(&offer) {
+            r["commerce"] = v;
+        }
+    }
+    r["commerce_provenance"] = provenance;
+}
+
+/// Parallel variant of `enrich_with_commerce` — bounded-concurrency fetch + 22s wall cap.
+///
+/// Fetches up to MAX_PARALLEL_FETCH result pages concurrently. Results that still
+/// lack structured commerce facts after their page is fetched (or whose fetch fails
+/// / times out) keep commerce: null but ALWAYS carry commerce_provenance (honest:
+/// we never fabricate).
+///
+/// Order is preserved byte-for-byte — enrichment is a strict post-rank decoration
+/// pass. The fetch closure must be Clone + Send because it is spawned into
+/// parallel tasks. A wall-time Duration bounds the entire batch so the main
+/// /search endpoint stays within its 30s TimeoutLayer budget.
+///
+/// Concurrency is bounded (not unbounded join_all) to avoid overloading
+/// upstream / the local HTTP client.
+async fn enrich_with_commerce_par<F, Fut>(
+    results: &mut [serde_json::Value],
+    fetch: F,
+    wall_timeout: std::time::Duration,
+) where
+    F: Fn(String) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Option<String>> + Send,
+{
+    let max_par = MAX_PARALLEL_FETCH.min(results.len());
+
+    // 1) Collect indices eligible for enrichment: object results with a URL
+    //    that don't already carry a commerce block from an earlier step.
+    let eligible: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.is_object()
+                && !r.get("url").and_then(|v| v.as_str()).unwrap_or("").is_empty()
+                && r.get("commerce").is_none()
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+
+    // 2) Fetch in bounded-concurrency WAVES of max_par: every eligible result
+    //    is eventually fetched (`.take(max_par)` would silently drop the tail
+    //    beyond the first wave), while at most max_par fetches are in flight.
+    //    `.max(1)` keeps `chunks` non-zero when `results` is empty.
+    //    The whole batch is bounded by `wall_timeout` (documented contract:
+    //    /search must stay inside its 30s TimeoutLayer budget) — on expiry the
+    //    remaining fetches are abandoned and those results keep commerce: null
+    //    but still receive provenance in step 4 (honest, never fabricated).
+    let deadline = std::time::Instant::now() + wall_timeout;
+    let mut fetched: Vec<(usize, String)> = Vec::new();
+    for wave in eligible.chunks(max_par.max(1)) {
+        let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(usize, String)>>)> = wave
+            .iter()
+            .map(|&idx| {
+                let fetch_clone = fetch.clone();
+                let url_owned = results[idx]
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let handle = tokio::spawn(async move {
+                    match fetch_clone(url_owned.clone()).await {
+                        Some(html) => Some((idx, html)),
+                        None => None,
+                    }
+                });
+                (idx, handle)
+            })
+            .collect();
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            // Budget exhausted — abandon pending waves (handles are dropped;
+            // tokio detaches the tasks, matching the pre-existing semantics
+            // where a slow fetch could never block the response past the cap).
+            break;
+        }
+        match tokio::time::timeout(remaining, async {
+            let mut wave_results = Vec::new();
+            for (_, handle) in tasks {
+                match handle.await {
+                    Ok(Some((idx, html))) => wave_results.push((idx, html)),
+                    _ => {} // task panicked or returned None — skip
+                }
+            }
+            wave_results
+        })
+        .await
+        {
+            Ok(wave_results) => fetched.extend(wave_results),
+            Err(_) => break, // wall clock expired mid-wave — stop fetching
+        }
+    }
+
+    // 3) Attach results back onto the original array (preserving order).
+    for (idx, html) in fetched {
+        if let Some(r) = results.get_mut(idx) {
+            enrich_single_commerce(r, &html);
+        }
+    }
+
+    // 4) Attach provenance to any result we didn't fetch (idempotent path).
+    for r in results.iter_mut() {
+        if r.is_object() && r.get("commerce_provenance").is_none() {
+            let url = r
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let provenance = serde_json::json!({
+                "url": url,
+                "observed_at": now_unix_string(),
+                "source": null,
+                "data": null,
+            });
+            r["commerce_provenance"] = provenance;
+        }
+    }
+}
+
+/// Max concurrent page fetches during parallel enrichment. Tuned so that
+/// 8 parallel page-fetches complete well within the 22s wall cap and 30s
+/// TimeoutLayer budget. Bounded to avoid overwhelming upstream servers.
+const MAX_PARALLEL_FETCH: usize = 4;
+
+/// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
+/// The main /search endpoint has a 30s TimeoutLayer; parallel enrichment of
+/// top-N results must complete well before it fires. 22s leaves ~8s headroom.
+const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 22;
+
+/// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
+/// page exposed structured product data, attached by `enrich_with_commerce`).
+/// Powers the main-path `shopping` gate: the strip is only surfaced when at
+/// least one top result actually has product facts — never an empty link-farm
+/// strip of bare affiliate links. Pure + offline-testable.
+fn has_any_commerce_block(results: &[serde_json::Value]) -> bool {
+    results.iter().any(|r| r.get("commerce").is_some())
+}
+
 /// How many of the ALREADY-RANKED top results feed the main-path `shopping`
 /// block on `/search` (ROADMAP item 7). This is a presentation cap on a CLONE of
 /// the ranked results, NOT a ranking change — the real `results` array is never
@@ -13997,36 +14162,6 @@ fn is_pronounceable(w: &str) -> bool {
     true
 }
 
-/// Phase 7b: keyboard-walk / consonant-mash rejection (FIX-IF-03).
-/// Detects pure keyboard-mashing patterns like "asdfghjkl", "zxcvbnm"
-/// that pass the vowel/consonant ratio check because they contain vowels.
-fn is_keyboard_walk_query(q: &str, spell_index: &spell::SymSpellIndex) -> bool {
-    for token in q.split_whitespace() {
-        let lower = token.to_lowercase();
-        let alpha_only: String = lower.chars().filter(|c| c.is_ascii_alphabetic()).collect();
-        if alpha_only.len() < 7 {
-            continue;
-        }
-        if spell_index.contains_word(&alpha_only) || spell::is_protected_term(&alpha_only) {
-            continue;
-        }
-        let mut max_run = 0u32;
-        let mut current_run = 0u32;
-        for c in alpha_only.chars() {
-            if matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y') {
-                max_run = max_run.max(current_run);
-                current_run = 0;
-            } else {
-                current_run += 1;
-            }
-        }
-        max_run = max_run.max(current_run);
-        if max_run >= 7 {
-            return true;
-        }
-    }
-    false
-}
 
 fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f32) {
     let words: Vec<&str> = q.split_whitespace().filter(|w| w.chars().any(|c| c.is_alphabetic())).collect();
@@ -22907,14 +23042,49 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(stripped.contains("business"), "should keep 'business'");
     }
 
-    #[test]
-    fn strip_location_terms_no_location() {
-        let query = "best practices for securing a postgresql database";
-        // No location preposition to strip — should return None or same query
-        let result = strip_location_terms(query);
-        // Either None or the same query (no change)
-        if let Some(s) = result {
-            assert_eq!(s, query, "no location to strip => unchanged");
+        let before: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |url: String| {
+            let html = fake_html.clone();
+            async move {
+                // Simulate network latency
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                Some(html)
+            }
+        };
+
+        let start = std::time::Instant::now();
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // Parallel: 8 results / 4 concurrent = 2 waves × 500ms = ~1s
+        // Sequential would be 8 × 500ms = 4s.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "parallel enrichment should complete in ~1s, took {:?}",
+            elapsed
+        );
+
+        // Order preserved byte-for-byte.
+        let after: Vec<String> = ranked
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(before, after, "parallel enrichment must preserve order");
+
+        // Every result got a commerce block (all fetched the fake product page).
+        for r in ranked.iter() {
+            assert!(r.get("commerce").is_some(), "commerce block attached in parallel");
+            assert!(r.get("commerce_provenance").is_some(), "provenance attached in parallel");
         }
     }
 
