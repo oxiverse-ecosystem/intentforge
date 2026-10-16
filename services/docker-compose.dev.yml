@@ -321,11 +321,11 @@ services:
     mem_limit: 512m
     mem_reservation: 256m
     environment:
-      - INTENT_ENGINE_URL=http://localhost:3005
-      - SEARXNG_URL=http://localhost:8080
-      - SEARXNG2_URL=http://tor2:8081
-      - CRAWLER_URL=http://localhost:5001
-      - INDEXER_URL=http://localhost:6000
+      - INTENT_ENGINE_URL=http://if-dev-intent-engine:3005
+      - SEARXNG_URL=http://if-dev-searxng:8080
+      - SEARXNG2_URL=http://if-dev-searxng2:8081
+      - CRAWLER_URL=http://if-dev-crawler:5001
+      - INDEXER_URL=http://if-dev-indexer:6000
       # Affiliate network keys (ROADMAP item 3). Absent => /shopping degrades to
       # `affiliate: null` (graceful). Set a value here only to exercise the path
       # locally; NEVER commit real keys. Production keys come from the runtime env.
