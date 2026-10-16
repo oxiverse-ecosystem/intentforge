@@ -2326,8 +2326,34 @@ fn constraint_score(
                 }
             })
         } else {
-            title_lower.contains(&neg_lower) || title_normalized.contains(&neg_normalized)
-            || url.to_lowercase().contains(&neg_lower)
+            // Multi-word negative: exact phrase match first (strongest signal).
+            // Fallback: match any content word (non-stopword, len >= 3) of the
+            // negative. Without this, "adobe photoshop" would only penalize pages
+            // containing the full phrase, letting "Adobe Creative Cloud" / "Adobe
+            // Stock" escape entirely — the exact opposite of the user's intent for
+            // "alternatives to adobe photoshop".
+            let phrase_matched = title_lower.contains(&neg_lower)
+                || title_normalized.contains(&neg_normalized)
+                || url.to_lowercase().contains(&neg_lower);
+            if phrase_matched {
+                true
+            } else {
+                // Collect content words from the negative (skip stopwords and short tokens)
+                let content_words: Vec<&str> = neg_words.iter()
+                    .filter(|w| {
+                        let wl = w.to_lowercase();
+                        wl.len() >= 3 && !STOPWORDS.contains(&wl.as_str())
+                    })
+                    .copied()
+                    .collect();
+                // Require at least one content word to match — otherwise a purely
+                // stopword negative (shouldn't happen, but guard anyway) would match nothing.
+                !content_words.is_empty() && content_words.iter().any(|w| {
+                    let wl = w.to_lowercase();
+                    title_lower.contains(&wl) || title_normalized.contains(&wl)
+                        || url.to_lowercase().contains(&wl)
+                })
+            }
         };
 
         let content_matched = if neg_words.len() == 1 {
@@ -4544,19 +4570,26 @@ struct CommerceConfig {
     /// block on `/search`. Presentation cap on a CLONE of ranked results —
     /// never affects ranking or selection.
     mainpath_top_n: usize,
+    /// Runtime-loaded transactional intent keywords (Override 6 signal).
+    /// Comes from `data/commerce/signals.json` → `transactional_keywords`.
+    /// Empty Vec means: no keyword-based override; rely on label + distribution + price bound.
+    transactional_keywords: Vec<String>,
 }
 
 impl CommerceConfig {
-    /// Load from `data/commerce/config.json`. Missing file / missing field =>
-    /// defaults (8). Never fatal — commerce presentation is best-effort.
+    /// Load from `data/commerce/config.json` AND `data/commerce/signals.json`.
+    /// Missing file / missing field => sensible defaults. Never fatal.
     fn load() -> Self {
-        let mut cfg = Self { mainpath_top_n: 8 };
-        let candidates = [
+        let mut cfg = Self {
+            mainpath_top_n: 8,
+            transactional_keywords: Vec::new(),
+        };
+        let config_candidates = [
             "data/commerce/config.json",
             "/app/data/commerce/config.json",
             "./data/commerce/config.json",
         ];
-        for path in candidates {
+        for path in &config_candidates {
             if let Ok(text) = std::fs::read_to_string(path) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(n) = v.get("mainpath_top_n").and_then(|x| x.as_u64()) {
@@ -4565,8 +4598,40 @@ impl CommerceConfig {
                             "commerce config: mainpath_top_n={} (from data file)",
                             cfg.mainpath_top_n
                         );
-                        break;
                     }
+                    if let Some(arr) = v.get("transactional_keywords").and_then(|a| a.as_array()) {
+                        cfg.transactional_keywords = arr
+                            .iter()
+                            .filter_map(|s| s.as_str().map(String::from))
+                            .collect();
+                        tracing::info!(
+                            "commerce config: {} transactional keyword(s) from config.json",
+                            cfg.transactional_keywords.len()
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        let signals_candidates = [
+            "data/commerce/signals.json",
+            "/app/data/commerce/signals.json",
+            "./data/commerce/signals.json",
+        ];
+        for path in &signals_candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("transactional_keywords").and_then(|a| a.as_array()) {
+                        cfg.transactional_keywords = arr
+                            .iter()
+                            .filter_map(|s| s.as_str().map(String::from))
+                            .collect();
+                        tracing::info!(
+                            "commerce signals: {} transactional keyword(s) (from data file)",
+                            cfg.transactional_keywords.len()
+                        );
+                    }
+                    break;
                 }
             }
         }
@@ -13850,6 +13915,35 @@ fn is_pronounceable(w: &str) -> bool {
     true
 }
 
+/// Detect keyboard-walk queries like "asdfghjkl" or "qwerty"
+/// by checking for long consonant runs (>= 7) in tokens absent from the spell dictionary.
+fn is_keyboard_walk_query(q: &str, spell_index: &spell::SymSpellIndex) -> bool {
+    for token in q.split_whitespace() {
+        let lower = token.to_lowercase();
+        let alpha_only: String = lower.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        if alpha_only.len() < 7 {
+            continue;
+        }
+        if spell_index.contains_word(&alpha_only) || spell::is_protected_term(&alpha_only) {
+            continue;
+        }
+        let mut max_run = 0u32;
+        let mut current_run = 0u32;
+        for c in alpha_only.chars() {
+            if matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y') {
+                max_run = max_run.max(current_run);
+                current_run = 0;
+            } else {
+                current_run += 1;
+            }
+        }
+        max_run = max_run.max(current_run);
+        if max_run >= 7 {
+            return true;
+        }
+    }
+    false
+}
 
 fn query_quality_flag(q: &str, spell_index: &spell::SymSpellIndex) -> (String, f32) {
     let words: Vec<&str> = q.split_whitespace().filter(|w| w.chars().any(|c| c.is_alphabetic())).collect();
@@ -14238,6 +14332,13 @@ async fn handle_search(
     // Phase 7: graceful degradation for gibberish / low-quality input.
     let (qflag, _valid_ratio) = query_quality_flag(&q_cleaned_spelling, &state.spell_index);
     if qflag == "junk" {
+        return make_error_response(q_trimmed, "invalid_query", "Query appears to be gibberish; no results returned", true);
+    }
+
+    // FIX-IF-03: keyboard-walk detector — pre-gate check for pure keyboard-mashing
+    // patterns (asdfghjkl, zxcvbnm, etc.) that pass the vowel/consonant ratio check
+    // because they contain vowels.
+    if is_keyboard_walk_query(&q_cleaned_spelling, &state.spell_index) {
         return make_error_response(q_trimmed, "invalid_query", "Query appears to be gibberish; no results returned", true);
     }
 
@@ -24255,7 +24356,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn commerce_config_default_top_n_is_8() {
         // When the data file is absent/missing the field, the default is 8.
         // (Offline test: no data file in the test cwd => default.)
-        let cfg = CommerceConfig { mainpath_top_n: 8 };
+        let cfg = CommerceConfig { mainpath_top_n: 8, transactional_keywords: Vec::new() };
         assert_eq!(cfg.mainpath_top_n, 8, "default top-N is 8");
     }
 
@@ -24264,7 +24365,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // A new value (e.g. 12) can be set by editing the data file — no
         // code change, no recompile. This test simulates what the loader
         // would produce after reading `{"mainpath_top_n": 12}`.
-        let cfg = CommerceConfig { mainpath_top_n: 12 };
+        let cfg = CommerceConfig { mainpath_top_n: 12, transactional_keywords: Vec::new() };
         assert_eq!(cfg.mainpath_top_n, 12, "top-N is data-driven");
     }
 
@@ -24273,7 +24374,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // Edge case: mainpath_top_n = 0 means the shopping block is never
         // surfaced (the take(0) yields an empty array => None). This is a
         // valid "off" setting — proves the value is honored as a cap.
-        let cfg = CommerceConfig { mainpath_top_n: 0 };
+        let cfg = CommerceConfig { mainpath_top_n: 0, transactional_keywords: Vec::new() };
         assert_eq!(cfg.mainpath_top_n, 0, "zero is a valid off-switch");
     }
 
