@@ -7644,29 +7644,46 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     let lc = q_orig.to_lowercase();
     let compound_lower = compound.to_lowercase();
     let c_tokens: Vec<&str> = compound_lower.split_whitespace().collect();
+    // D2: the `pay`/`paying` family is genuinely AMBIGUOUS — a manner idiom
+    // ("without paying attention") describes HOW, while a monetary object
+    // ("without paying for a course") is a real exclusion the user refuses.
+    // The broad procedural rule below cannot tell them apart (both appear in
+    // `how to …` queries), so decide this family from the query's object
+    // vocabulary FIRST: a monetary object means it is NOT a manner frame.
+    if !c_tokens.is_empty() && c_tokens.iter().all(|t| *t == "pay" || *t == "paying") {
+        return !pay_exclusion_is_money(&lc);
+    }
+    // A negated clause whose HEAD noun names a TRAIT of the user (their
+    // background / experience / degree) rather than a property of the desired
+    // CONTENT states a prerequisite, not a topic to remove. "a tutorial with
+    // no music background" is a HOW/prerequisite qualifier; "dessert recipes
+    // with no nuts" names the content, so its head ("nuts") is untouched and
+    // it stays a real exclusion. Structural (head-noun class), no per-query
+    // literals. `is_verb_attribute_exclusion` uses the same trait class but
+    // requires EVERY token to be a trait noun, which a modifier phrase
+    // ("music background") never satisfies.
+    if let Some(head) = c_tokens.last() {
+        if USER_TRAIT_NOUNS.contains(head) {
+            return true;
+        }
+    }
+    // In a procedural request, a bare `without NOUN` / `no NOUN` states a
+    // constraint on HOW the user wants to accomplish the task (cleaning without
+    // soap, learning without a degree), not a result topic to remove. In a
+    // content request (dessert recipes without artificial sweeteners, recipes
+    // with no nuts) the same grammar names the thing the results must exclude.
+    // Detect the broad instruction/content frame structurally, not by domain
+    // nouns. Verb-led targets are handled below.
+    let procedural = ["how to ", "best way to ", "way to ", "tutorial for ", "guide to ", "learn "]
+        .iter()
+        .any(|frame| lc.starts_with(frame));
+    if procedural && c_tokens.iter().all(|t| !MANNER_PRONOUNS.contains(t)) {
+        return true;
+    }
 
     // A relation pronoun is an unambiguous manner signal wherever it occurs
     // ("does not track you as", "without offending the couple").
     if c_tokens.iter().any(|t| MANNER_PRONOUNS.contains(t)) {
-        return true;
-    }
-
-    // A prepositional negation (`without X` / `with no X`) inside an
-    // INSTRUCTIONAL subject constrains HOW the task is to be accomplished, not
-    // WHAT the results must contain: "how to clean a skillet without soap",
-    // "a tutorial with no music background", "learn machine learning without a
-    // computer science degree". The mirror case is a CONTENT subject — "dessert
-    // recipes without artificial sweeteners", "recipes with no nuts" — where the
-    // same grammar names a real exclusion.
-    //
-    // Both conditions are required. A blanket "any `without` in a how-to query is
-    // manner" rule (the bug this replaces) also swallowed genuine exclusions that
-    // ride inside an instructional query, e.g. the money sense of "without paying
-    // for a course" — `is_real_exclusion` resolves that separately, BEFORE it
-    // consults this frame. Scoping the rule to a prepositional negation also
-    // leaves the bare-`not` path alone, so "learn spanish not duolingo" is still
-    // decided by the entity/contrastive gates rather than by manner suppression.
-    if negated_by_preposition(q_orig, compound) && is_instructional_subject(q_orig) {
         return true;
     }
 
