@@ -23226,3 +23226,83 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(!stripped.contains("best"), "should remove 'best'");
     }
 }
+
+#[cfg(test)]
+mod kb_gibberish_mixed_tests {
+    use super::*;
+
+    fn idx() -> spell::SymSpellIndex {
+        spell::SymSpellIndex::build()
+    }
+
+    // ── Detector precision: a keyboard-row RUN is contiguous along one row ──
+
+    #[test]
+    fn kb_run_contiguous_along_row_detected() {
+        for w in ["asdfghjkl", "qwerty", "zxcvbnm", "asdf", "hjkl", "wert", "sdfg", "qwer", "erty"] {
+            assert!(is_keyboard_gibberish(w), "expected kb-run: {}", w);
+        }
+    }
+
+    #[test]
+    fn real_words_not_kb_gibberish() {
+        // Real English words whose letters merely SCATTER on one row must NOT match.
+        for w in ["poetry", "typewriter", "poodle", "tree", "power", "your", "type", "rust", "free", "hello"] {
+            assert!(!is_keyboard_gibberish(w), "real word must not be kb-run: {}", w);
+        }
+    }
+
+    #[test]
+    fn mixed_kb_and_digit_garbage_is_junk() {
+        let index = idx();
+        // The card's failing case: kb run + alphanumeric garbage + a real word.
+        let (flag, _) = query_quality_flag("asdfghjkl xyz123 nonsense", &index);
+        assert_eq!(flag, "junk", "mixed kb-run + digit garbage must be junk");
+        // Two-token core: kb run + digit garbage alone.
+        let (flag2, _) = query_quality_flag("asdfghjkl xyz123", &index);
+        assert_eq!(flag2, "junk");
+        // Letter+digit mash token: kb run + mash.
+        let (flag3, _) = query_quality_flag("zxcvbnm123456 hello", &index);
+        assert_eq!(flag3, "junk");
+    }
+
+    #[test]
+    fn dominated_kb_path_still_fires() {
+        let index = idx();
+        // Fast path retained: >=50% kb runs (existing behavior, must not regress).
+        let (flag, _) = query_quality_flag("asdfghjkl qwerty zxcvbnm randomgibberish1234567890", &index);
+        assert_eq!(flag, "junk");
+        let (flag2, _) = query_quality_flag("qwerty 1234567890 randomgibberish", &index);
+        assert_eq!(flag2, "junk");
+    }
+
+    #[test]
+    fn legit_queries_not_junked() {
+        let index = idx();
+        for q in [
+            "rust async web framework",
+            "rust x509 certificate",
+            "type mp3 converter",
+            "free ps5 games",
+            "qwerty vs dvorak",
+            "typewriter repair",
+            "poetry write",
+            "power tower your typing",
+            "asdf movie",
+            "qwerty 5g phones",
+        ] {
+            let (flag, _) = query_quality_flag(q, &index);
+            assert_ne!(flag, "junk", "legit query must not be junk: {}", q);
+        }
+    }
+
+    #[test]
+    fn single_kb_word_alone_not_junk_by_mixed_rule() {
+        let index = idx();
+        // "qwerty" alone: existing behavior flags junk via the zero-valid-ratio
+        // branch (not via mixed rule). The mixed rule requires BOTH a kb run AND
+        // digit garbage; a lone kb run with a real word must stay searchable.
+        let (flag, _) = query_quality_flag("qwerty vs dvorak", &index);
+        assert_ne!(flag, "junk");
+    }
+}
