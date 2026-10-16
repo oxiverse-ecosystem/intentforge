@@ -370,7 +370,13 @@ impl SymSpellIndex {
         let best_dist = self.compute_edit_distance(word, best);
         let absent = !self.exact_map.contains_key(&word.to_lowercase())
             && !self.is_known_misspelling(word);
-        if absent && best_dist >= 1 && best_dist <= 2 {
+        // EXEMPTION: if the candidate is a protected term (PROTECTED_TERMS),
+        // allow the correction even when the input is absent from the dictionary.
+        // A typo of a known, common, protected term (e.g. "javascrpt"->"javascript",
+        // "awiat"->"await", "kubrnetes"->"kubernetes") should always be corrected.
+        // The protected-term list IS the seed knowledge that these are real terms.
+        let candidate_is_protected = is_protected_term(&best);
+        if absent && best_dist >= 1 && best_dist <= 2 && !candidate_is_protected {
             if best_dist >= 2 {
                 // Allow the doubled-letter typo exception (embaras->embarrass etc.)
                 // via collapse_doubles equivalence — but only when the input is itself a
