@@ -1672,8 +1672,6 @@ fn negative_term_matches_token(term_clean: &str, token_clean: &str) -> bool {
 fn text_matches_negative(text_lower: &str, term_lower: &str) -> bool {
     let term_words: Vec<&str> = term_lower.split_whitespace().collect();
     if term_words.len() > 1 {
-        // Multi-word constraint: require the full phrase (word-boundary safe
-        // enough for phrases; single-word collisions are the real hazard).
         return text_lower.contains(term_lower);
     }
     let term_clean: String = term_lower.chars().filter(|c| c.is_alphanumeric()).collect();
@@ -1683,6 +1681,32 @@ fn text_matches_negative(text_lower: &str, term_lower: &str) -> bool {
         .collect();
     words.iter().any(|w| {
         negative_term_matches_token(&term_clean, w)
+    })
+}
+
+/// Returns true if a multi-word negative constraint matches a text via
+/// partial-word fallback: when the exact phrase is absent, match if ANY
+/// content word (non-stopword, len >= 3) of the negative appears in the text.
+/// This handles cases like "alternatives to adobe photoshop" not matching
+/// "Adobe Creative Cloud" pages — the content word "adobe" still signals
+/// the excluded entity.
+fn multi_word_negative_matches_text(neg_lower: &str, text_lower: &str) -> bool {
+    if text_lower.contains(neg_lower) {
+        return true;
+    }
+    let neg_words: Vec<&str> = neg_lower.split_whitespace().collect();
+    let text_words: Vec<&str> = text_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    neg_words.iter().any(|nw| {
+        let nw_clean: String = nw.chars().filter(|c| c.is_alphanumeric()).collect();
+        if nw_clean.len() < 3 || STOPWORDS.contains(&nw_clean.as_str()) {
+            return false;
+        }
+        text_words.iter().any(|tw| {
+            negative_term_matches_token(&nw_clean, tw)
+        })
     })
 }
 
@@ -2246,40 +2270,15 @@ fn constraint_score(
                 }
             })
         } else {
-            // Multi-word negative: exact phrase match first (strongest signal).
-            // Fallback: match any content word (non-stopword, len >= 3) of the
-            // negative. Without this, "adobe photoshop" would only penalize pages
-            // containing the full phrase, letting "Adobe Creative Cloud" / "Adobe
-            // Stock" escape entirely — the exact opposite of the user's intent for
-            // "alternatives to adobe photoshop".
-            let phrase_matched = title_lower.contains(&neg_lower)
-                || title_normalized.contains(&neg_normalized)
-                || url.to_lowercase().contains(&neg_lower);
-            if phrase_matched {
-                true
-            } else {
-                // Collect content words from the negative (skip stopwords and short tokens)
-                let content_words: Vec<&str> = neg_words.iter()
-                    .filter(|w| {
-                        let wl = w.to_lowercase();
-                        wl.len() >= 3 && !STOPWORDS.contains(&wl.as_str())
-                    })
-                    .copied()
-                    .collect();
-                // Require at least one content word to match — otherwise a purely
-                // stopword negative (shouldn't happen, but guard anyway) would match nothing.
-                !content_words.is_empty() && content_words.iter().any(|w| {
-                    let wl = w.to_lowercase();
-                    title_lower.contains(&wl) || title_normalized.contains(&wl)
-                        || url.to_lowercase().contains(&wl)
-                })
-            }
+            multi_word_negative_matches_text(&neg_lower, &title_lower)
+            || multi_word_negative_matches_text(&neg_lower, &title_normalized)
+            || multi_word_negative_matches_text(&neg_lower, &url.to_lowercase())
         };
 
         let content_matched = if neg_words.len() == 1 {
             text_matches_negative(&content.to_lowercase(), &neg_lower)
         } else {
-            content.to_lowercase().contains(&neg_lower)
+            multi_word_negative_matches_text(&neg_lower, &content.to_lowercase())
         };
 
         if title_or_url_matched {
@@ -9237,11 +9236,10 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
                 continue; // boundary word itself is not topical content
             }
             if preserved_words.contains(clean_w) || preserved_words.contains(w_lower.as_str()) {
-                // A preserved domain word inside negation scope is kept as a
-                // positive term, but it does NOT end the negation scope —
-                // subsequent non-preserved words are still exclusions.
-                // (e.g. "recipes without linux spicy" -> "linux" stays,
-                //  "spicy" is excluded)
+                // Preserved domain word: keep it in the result, but do NOT end
+                // the negation scope. Subsequent non-preserved words are still
+                // negated (e.g. "recipes without linux spicy" → "recipes linux",
+                // excluded: ["spicy"]). The scope only ends at a clause boundary.
                 result.push(w);
             } else {
                 // Non-domain content word after a negation trigger: treat as an
@@ -19284,8 +19282,7 @@ async fn handle_search(
                         if words.len() == 1 {
                             text_matches_negative(&text_lower, &neg_lower)
                         } else {
-                            let joined = words.join(" ");
-                            text_lower.contains(&joined)
+                            multi_word_negative_matches_text(&neg_lower, &text_lower)
                         }
                     });
                     // No hard drop — soft penalty applied later in scoring.
@@ -19952,11 +19949,8 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     // "not java" from dropping every "javascript" result.
                     text_matches_negative(&text_lower, &neg_lower)
                 } else {
-                    let joined = words.join(" ");
-                    text_lower.contains(&joined) || text_normalized.contains(&joined)
-                };
-                if !matched {
-                    return true; // this negative does not appear — no violation
+                    !(multi_word_negative_matches_text(&neg_lower, &text_lower)
+                      || multi_word_negative_matches_text(&neg_lower, &text_normalized))
                 }
                 // FIX-IF-01 (2026-09-24): FULFILLMENT exemption. A page that carries
                 // the excluded term inside a negating frame ("How to Cook Salmon
@@ -22109,6 +22103,81 @@ mod explicit_negation_list_tests {
         assert!(!negated_compound_is_recognized_entity("music background", "how to learn guitar with no music background"));
         assert!(!negated_compound_is_recognized_entity("soap", "how to clean a cast iron skillet without soap"));
         assert!(!negated_compound_is_recognized_entity("artificial sweeteners", "protein powder without artificial sweeteners"));
+    }
+}
+
+#[cfg(test)]
+mod multi_word_negative_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn multi_word_negative_partial_word_fallback_matches() {
+        assert!(
+            multi_word_negative_matches_text("adobe photoshop", "adobe creative cloud subscription"),
+            "multi-word negative should match via content word fallback"
+        );
+    }
+
+    #[test]
+    fn multi_word_negative_exact_phrase_still_matches() {
+        assert!(
+            multi_word_negative_matches_text("adobe photoshop", "best adobe photoshop alternatives"),
+            "exact phrase match must still work"
+        );
+    }
+
+    #[test]
+    fn multi_word_negative_stopwords_do_not_match() {
+        assert!(
+            !multi_word_negative_matches_text("alternatives to adobe", "creative cloud subscription"),
+            "stopword-only content words must not trigger a match"
+        );
+    }
+
+    #[test]
+    fn multi_word_negative_short_words_do_not_match() {
+        assert!(
+            !multi_word_negative_matches_text("go lang", "golang programming"),
+            "words shorter than 3 chars must not trigger a match"
+        );
+    }
+
+    #[test]
+    fn constraint_score_penalizes_partial_word_match() {
+        let constraints = Constraints {
+            negative: vec!["adobe photoshop".to_string()],
+            ..Default::default()
+        };
+        let score = constraint_score(
+            "Adobe Creative Cloud Subscription",
+            "Creative cloud plans and pricing",
+            "https://example.com/adobe-creative-cloud",
+            &constraints,
+        );
+        assert!(
+            score < 1.0,
+            "constraint_score should penalize partial-word match, got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn constraint_score_no_false_positive() {
+        let constraints = Constraints {
+            negative: vec!["adobe photoshop".to_string()],
+            ..Default::default()
+        };
+        let score = constraint_score(
+            "Best Free Image Editors",
+            "A guide to free image editing software",
+            "https://example.com/free-image-editors",
+            &constraints,
+        );
+        assert!(
+            score == 1.0,
+            "constraint_score should not penalize unrelated results, got {}",
+            score
+        );
     }
 }
 
