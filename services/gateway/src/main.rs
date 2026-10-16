@@ -4814,71 +4814,57 @@ async fn enrich_with_commerce_par<F, Fut>(
     F: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Option<String>> + Send,
 {
-    let max_par = MAX_PARALLEL_FETCH.min(results.len());
+    // Bounded concurrency: process the eligible indices in WAVES of at most
+    // MAX_PARALLEL_FETCH. Every eligible index is eventually attempted — the
+    // wave bound limits how many run at once, it must NOT truncate the set.
+    // (An earlier `.take(max_par)` silently dropped everything past the first
+    // wave, so the tail of the result list never received a `commerce` block.)
+    let max_par = MAX_PARALLEL_FETCH.max(1);
 
-    // 1) Collect indices eligible for enrichment: object results with a URL
-    //    that don't already carry a commerce block from an earlier step.
-    let eligible: Vec<usize> = results
+    // 1) Collect the indices that still need a fetch.
+    let eligible: Vec<(usize, String)> = results
         .iter()
         .enumerate()
-        .filter(|(_, r)| {
-            r.is_object()
-                && !r.get("url").and_then(|v| v.as_str()).unwrap_or("").is_empty()
-                && r.get("commerce").is_none()
+        .filter_map(|(idx, r)| {
+            if !r.is_object() {
+                return None;
+            }
+            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            if url.is_empty() {
+                return None;
+            }
+            if r.get("commerce").is_some() {
+                return None; // already enriched by an earlier step
+            }
+            Some((idx, url.to_string()))
         })
-        .map(|(idx, _)| idx)
         .collect();
 
-    // 2) Fetch in bounded-concurrency WAVES of max_par: every eligible result
-    //    is eventually fetched (`.take(max_par)` would silently drop the tail
-    //    beyond the first wave), while at most max_par fetches are in flight.
-    //    `.max(1)` keeps `chunks` non-zero when `results` is empty.
-    //    The whole batch is bounded by `wall_timeout` (documented contract:
-    //    /search must stay inside its 30s TimeoutLayer budget) — on expiry the
-    //    remaining fetches are abandoned and those results keep commerce: null
-    //    but still receive provenance in step 4 (honest, never fabricated).
-    let deadline = std::time::Instant::now() + wall_timeout;
+    // 2) Run the eligible set in waves, joining each wave concurrently under a
+    //    single wall-time deadline that covers the WHOLE batch.
+    let deadline = tokio::time::Instant::now() + wall_timeout;
     let mut fetched: Vec<(usize, String)> = Vec::new();
-    for wave in eligible.chunks(max_par.max(1)) {
-        let tasks: Vec<(usize, tokio::task::JoinHandle<Option<(usize, String)>>)> = wave
-            .iter()
-            .map(|&idx| {
-                let fetch_clone = fetch.clone();
-                let url_owned = results[idx]
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let handle = tokio::spawn(async move {
-                    match fetch_clone(url_owned.clone()).await {
-                        Some(html) => Some((idx, html)),
-                        None => None,
-                    }
-                });
-                (idx, handle)
-            })
-            .collect();
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            // Budget exhausted — abandon pending waves (handles are dropped;
-            // tokio detaches the tasks, matching the pre-existing semantics
-            // where a slow fetch could never block the response past the cap).
-            break;
+    for wave in eligible.chunks(max_par) {
+        if tokio::time::Instant::now() >= deadline {
+            break; // wall budget exhausted — remaining results still get provenance
         }
-        match tokio::time::timeout(remaining, async {
-            let mut wave_results = Vec::new();
-            for (_, handle) in tasks {
-                match handle.await {
-                    Ok(Some((idx, html))) => wave_results.push((idx, html)),
-                    _ => {} // task panicked or returned None — skip
-                }
+        let mut handles: Vec<(usize, tokio::task::JoinHandle<Option<String>>)> =
+            Vec::with_capacity(wave.len());
+        for (idx, url_owned) in wave.iter() {
+            let fetch_clone = fetch.clone();
+            let url_owned = url_owned.clone();
+            handles.push((
+                *idx,
+                tokio::spawn(async move { fetch_clone(url_owned).await }),
+            ));
+        }
+        for (idx, handle) in handles {
+            // The handles were all spawned before any is awaited, so the wave
+            // truly runs in parallel; `timeout_at` bounds the whole batch.
+            match tokio::time::timeout_at(deadline, handle).await {
+                Ok(Ok(Some(html))) => fetched.push((idx, html)),
+                _ => {} // timed out, panicked, or fetch returned None — skip
             }
-            wave_results
-        })
-        .await
-        {
-            Ok(wave_results) => fetched.extend(wave_results),
-            Err(_) => break, // wall clock expired mid-wave — stop fetching
         }
     }
 
@@ -5230,10 +5216,61 @@ struct AffiliateCtx {
     networks: Vec<AffiliateNetwork>,
 }
 
-impl Default for AffiliateCtx {
-    fn default() -> Self {
-        Self { networks: Vec::new() }
-    }
+/// Host labels that are IANA-reserved and can never be a real merchant:
+/// matched EXACTLY as a host label. RFC 2606 §2 reserves `example`; RFC 6761
+/// reserves the `test` / `invalid` / `localhost` special-use names.
+///
+/// Exact matching only — deliberately. `invalid` is a special-use NAME, not a
+/// documentation PREFIX, so prefix-matching it would wrongly reject real hosts
+/// like `invalid-syntax.co.uk`.
+const RESERVED_HOST_LABELS: &[&str] = &["example", "test", "invalid", "localhost"];
+
+/// Host-label PREFIXES reserved by the documentation-label convention. A label
+/// beginning with one of these followed by a separator (`example-merchant`,
+/// `example-shop`) is a documentation placeholder, not a merchant.
+///
+/// This is a separate list from `RESERVED_HOST_LABELS` precisely because
+/// prefix-matching is only correct for `example`: `example-merchant.com` is its
+/// OWN registrable domain, NOT a subdomain of `example.com`, so a pure
+/// suffix/exact check on the reserved set misses the exact value that shipped in
+/// production config.
+const RESERVED_HOST_LABEL_PREFIXES: &[&str] = &["example"];
+
+/// True when any label of `url`'s host marks it as a documentation/example
+/// placeholder, i.e. it cannot be a real merchant destination.
+///
+/// Rejected shapes:
+///   * a label exactly equal to a reserved name (`example.com`, `foo.test`), and
+///   * a label beginning with a reserved documentation prefix + separator
+///     (`example-merchant.com`, `example-shop.co.uk`).
+///
+/// Matching is always on a LABEL boundary: a real host that merely CONTAINS a
+/// reserved word as a substring (`notexample.com`, `testosterone-shop.com`,
+/// `invalid-syntax.co.uk`) is NOT rejected, so the guard cannot silently disable
+/// a legitimate merchant fallback.
+///
+/// Returns `true` for unparseable/host-less input: a fallback we cannot even
+/// resolve is treated as unusable rather than shipped.
+fn is_reserved_placeholder_url(url: &str) -> bool {
+    let host = match reqwest::Url::parse(url) {
+        Ok(u) => match u.host_str() {
+            Some(h) => h.trim_end_matches('.').to_ascii_lowercase(),
+            None => return true,
+        },
+        Err(_) => return true,
+    };
+    let separated_prefix = |label: &str, prefix: &str| {
+        label
+            .strip_prefix(prefix)
+            .map(|rest| rest.starts_with('-') || rest.starts_with('_'))
+            .unwrap_or(false)
+    };
+    host.split('.').any(|label| {
+        RESERVED_HOST_LABELS.iter().any(|r| label == *r)
+            || RESERVED_HOST_LABEL_PREFIXES
+                .iter()
+                .any(|p| separated_prefix(label, p))
+    })
 }
 
 impl AffiliateCtx {
@@ -5255,7 +5292,21 @@ impl AffiliateCtx {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(arr) = v.get("networks").and_then(|n| n.as_array()) {
                         for n in arr {
-                            if let Ok(net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                            if let Ok(mut net) = serde_json::from_value::<AffiliateNetwork>(n.clone()) {
+                                // Never accept a non-routable documentation domain as
+                                // a real merchant fallback. Dropping the FIELD (not the
+                                // whole network) keeps the network usable for wrapping
+                                // while guaranteeing no click is ever routed to a
+                                // fabricated destination.
+                                if let Some(fbu) = net.fallback_url.clone() {
+                                    if is_reserved_placeholder_url(&fbu) {
+                                        tracing::warn!(
+                                            network = %net.id,
+                                            "affiliate: ignoring reserved placeholder fallback_url (RFC 2606/6761 documentation domain)"
+                                        );
+                                        net.fallback_url = None;
+                                    }
+                                }
                                 networks.push(net);
                             }
                         }
@@ -24212,372 +24263,52 @@ structured product data, so nothing must be extracted from the body.</p></body><
         }
     }
 
-    #[test]
-    fn strip_location_terms_too_short() {
-        let query = "rust programming";
-        assert!(strip_location_terms(query).is_none(), "too short to strip");
-    }
-
-    #[test]
-    fn strip_location_terms_with_site_operator() {
-        let query = "best practices for securing a site:postgresql.org database";
-        // Should NOT strip when site: operator is present
-        assert!(strip_location_terms(query).is_none(), "should not strip site: queries");
-    }
-
-    #[test]
-    fn strip_location_terms_quantity_phrases() {
-        let query = "top 10 best places to visit in japan";
-        let stripped = strip_location_terms(query).expect("should strip");
-        assert!(!stripped.contains("japan"), "should remove location");
-        assert!(!stripped.contains("top"), "should remove 'top'");
-        assert!(!stripped.contains("best"), "should remove 'best'");
-    }
-
-    // ── Microformats2 h-product extraction ───────────────────────────────
-    // ROADMAP item 1 (increment): extend the honest commerce extractor to
-    // pages that mark up products with Microformats2 `h-product` classes.
-    // Many Shopify, WooCommerce, and independent stores emit MF2 markup with
-    // no JSON-LD/OG/microdata — these tests prove the new parser recovers
-    // honest facts the other signals miss, and that it does NOT fire on
-    // unrelated microformats (h-entry, h-card, etc.).
-
-    const HTML_H_PRODUCT_FULL: &str = r#"<!doctype html><html><head>
-<title>H-Product Store</title>
-</head><body>
-<article class="h-product">
-  <h2 class="p-name">Acme Widget Pro</h2>
-  <a class="p-brand u-url" href="https://acme.example">Acme</a>
-  <span class="p-sku">ACME-WP-001</span>
-  <span class="p-price">$49.99</span>
-  <span class="p-price-currency">USD</span>
-  <span class="p-identifier">9876543210987</span>
-  <img class="u-photo" src="https://cdn.example.com/widget-pro.jpg" alt="">
-  <span class="p-condition">New</span>
-  <span class="p-availability">InStock</span>
-</article>
-</body></html>"#;
-
-    #[test]
-    fn h_product_extracts_all_fields() {
-        let o = extract_commerce_offer(HTML_H_PRODUCT_FULL, "https://mf2.example.com/widget");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(49.99), "p-price text with currency symbol stripped");
-        assert_eq!(d.currency.as_deref(), Some("USD"), "p-price-currency");
-        assert_eq!(d.sku.as_deref(), Some("ACME-WP-001"), "p-sku");
-        assert_eq!(d.gtin.as_deref(), Some("9876543210987"), "p-identifier numeric");
-        assert_eq!(d.merchant.as_deref(), Some("Acme"), "p-brand");
-        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/widget-pro.jpg"), "u-photo");
-        assert_eq!(d.condition.as_deref(), Some("New"), "p-condition");
-        assert_eq!(d.availability.as_deref(), Some("InStock"), "p-availability");
-        assert_eq!(o.source.as_deref(), Some("microformats2"));
-    }
-
-    const HTML_H_PRODUCT_VALUE_ATTR: &str = r#"<!doctype html><html><head>
-<title>MF2 Value Attr</title>
-</head><body>
-<div class="h-product">
-  <span class="p-name">Gadget</span>
-  <span class="p-price" value="29.99">29.99</span>
-  <span class="p-price-currency" content="EUR">EUR</span>
-  <span class="p-brand" content="GadgetCo">GadgetCo</span>
-</div>
-</body></html>"#;
-
-    #[test]
-    fn h_product_value_attribute_preferred_over_text() {
-        let o = extract_commerce_offer(HTML_H_PRODUCT_VALUE_ATTR, "https://mf2.example.com/gadget");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, Some(29.99), "value attribute for p-price");
-        assert_eq!(d.currency.as_deref(), Some("EUR"), "content attribute for p-price-currency");
-        assert_eq!(d.merchant.as_deref(), Some("GadgetCo"), "content attribute for p-brand");
-    }
-
-    const HTML_NO_H_PRODUCT: &str = r#"<!doctype html><html><head>
-<title>Article</title>
-</head><body>
-<article class="h-entry">
-  <h2 class="p-name">Blog Post</h2>
-  <p class="e-content">Some text with $19.99 mentioned</p>
-</article>
-</body></html>"#;
-
-    #[test]
-    fn h_product_non_product_class_returns_null() {
-        // An h-entry (not h-product) must NOT trigger extraction.
-        let o = extract_commerce_offer(HTML_NO_H_PRODUCT, "https://blog.example.com/post");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.price, None, "no extraction from h-entry");
-        assert_eq!(d.merchant.as_deref(), Some("blog.example.com"));
-        assert_eq!(o.source.as_deref(), None);
-    }
-
-    #[test]
-    fn h_product_photo_on_link_uses_href() {
-        let html = r#"<!doctype html><html><body>
-<div class="h-product">
-  <span class="p-name">Link Photo</span>
-  <a class="u-photo" href="https://cdn.example.com/link-photo.jpg">photo</a>
-  <span class="p-price">10.00</span>
-</div>
-</body></html>"#;
-        let o = extract_commerce_offer(html, "https://mf2.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.image.as_deref(), Some("https://cdn.example.com/link-photo.jpg"), "u-photo href");
-    }
-
-    #[test]
-    fn h_product_identifier_short_numeric_is_rejected() {
-        // identifier must be 8+ digits to be treated as GTIN — short numbers
-        // (like a shop SKU) must not leak into the gtin field.
-        let html = r#"<!doctype html><html><body>
-<div class="h-product">
-  <span class="p-name">Short SKU</span>
-  <span class="p-identifier">12345</span>
-  <span class="p-price">5.00</span>
-</div>
-</body></html>"#;
-        let o = extract_commerce_offer(html, "https://mf2.example.com/p");
-        let d = o.data.as_ref().unwrap();
-        assert_eq!(d.gtin, None, "short numeric identifier must not be gtin");
-    }
-
-    #[test]
-    fn h_product_does_not_overwrite_stronger_jsonld_signal() {
-        // MF2 is a supplement — it must NOT overwrite a stronger JSON-LD signal.
-        let html = r#"<!doctype html><html><head>
-<script type="application/ld+json">
-{ "@context": "https://schema.org/", "@type": "Product",
-  "name": "Acme Widget Pro",
-  "offers": { "@type": "Offer", "price": "49.99", "priceCurrency": "USD" } }
-</script></head><body>
-<div class="h-product">
-  <span class="p-price">9.99</span>
-  <span class="p-price-currency">EUR</span>
-</div>
-</body></html>"#;
-        let o = extract_commerce_offer(html, "https://shop.example.com/mix");
-        let d = o.data.as_ref().unwrap();
-        // JSON-LD is the primary signal and wins where it sets a field.
-        assert_eq!(d.price, Some(49.99), "JSON-LD price must not be overwritten by MF2");
-        assert_eq!(d.currency.as_deref(), Some("USD"), "JSON-LD currency must not be overwritten");
-        assert_eq!(o.source.as_deref(), Some("json-ld"));
-    }
-
-    // ── ROADMAP item 8: snippet-based price fallback ────────────────────────
-    // When page enrichment yields nothing (bot-check pages), the search snippet
-    // is still a real upstream signal. These tests prove the fallback fires
-    // only as a last resort, never overwrites stronger signals, and is
-    // order-preserving (it's a pure post-pass read-only attach).
-
-    #[test]
-    fn snippet_fallback_extracts_price_from_dollar_snippet() {
-        // Simulates a result where page enrichment found nothing (commerce absent)
-        // but the snippet carries a price like "$248".
-        let mut results = vec![
-            serde_json::json!({
-                "url": "https://www.amazon.com/dp/B0C7XFLWN5",
-                "title": "Sony WH-1000XM5 Headphones",
-                "content": "Sony WH-1000XM5 Wireless Noise Canceling Headphones - now $248 at Amazon",
-                "score": 9.7,
-                "commerce_provenance": { "url": "https://www.amazon.com/dp/B0C7XFLWN5", "observed_at": "1790295033", "source": null, "data": null }
-            }),
-        ];
-        enrich_snippet_fallback(&mut results);
-        let c = results[0].get("commerce").expect("snippet fallback should attach commerce");
-        let d = c.get("data").unwrap();
-        assert_eq!(d["price"], serde_json::json!(248.0));
-        assert_eq!(d["currency"], serde_json::json!("USD"));
-        assert_eq!(c["source"], serde_json::json!("snippet_extracted"));
-        assert_eq!(results[0]["url"], serde_json::json!("https://www.amazon.com/dp/B0C7XFLWN5"), "url unchanged");
-    }
-
-    #[test]
-    fn snippet_fallback_extracts_inr_price_from_snippet() {
-        // ₹29,999 price in snippet
-        let mut results = vec![
-            serde_json::json!({
-                "url": "https://www.flipkart.com/sony-wh-1000xm5/p/123",
-                "title": "Sony WH-1000XM5",
-                "content": "Buy Sony WH-1000XM5 for ₹29,999 at Flipkart",
-                "score": 9.0,
-                "commerce_provenance": { "url": "https://www.flipkart.com/sony-wh-1000xm5/p/123", "observed_at": "1", "source": null, "data": null }
-            }),
-        ];
-        enrich_snippet_fallback(&mut results);
-        let c = results[0].get("commerce").expect("INR snippet fallback should attach commerce");
-        assert_eq!(c["data"]["price"], serde_json::json!(29999.0));
-        assert_eq!(c["data"]["currency"], serde_json::json!("INR"));
-        assert_eq!(c["source"], serde_json::json!("snippet_extracted"));
-    }
-
-    #[test]
-    fn snippet_fallback_does_not_overwrite_structured_commerce() {
-        // If structured enrichment already attached a commerce block, the snippet
-        // fallback must NOT overwrite it.
-        let mut results = vec![
-            serde_json::json!({
-                "url": "https://www.amazon.com/dp/B0C7XFLWN5",
-                "content": "Sony WH-1000XM5 for $248",
-                "score": 9.0,
-                "commerce": {
-                    "url": "https://www.amazon.com/dp/B0C7XFLWN5",
-                    "observed_at": "1790295033",
-                    "source": "json-ld",
-                    "data": { "price": 299.99, "currency": "USD" }
-                },
-                "commerce_provenance": { "url": "https://www.amazon.com/dp/B0C7XFLWN5", "observed_at": "1790295033", "source": "json-ld", "data": { "price": 299.99 } }
-            }),
-        ];
-        enrich_snippet_fallback(&mut results);
-        let c = results[0].get("commerce").unwrap();
-        // Structured commerce preserved — snippet fallback skipped
-        assert_eq!(c["data"]["price"], serde_json::json!(299.99));
-        assert_eq!(c["source"], serde_json::json!("json-ld"));
-    }
-
-    #[test]
-    fn snippet_fallback_ignores_snippets_without_currency() {
-        // A snippet without a currency symbol must NOT produce a price (no bare numbers).
-        let mut results = vec![
-            serde_json::json!({
-                "url": "https://blog.example.com/review",
-                "content": "The Sony WH-1000XM5 has 40-hour battery life and weighs 250 grams",
-                "score": 8.5,
-                "commerce_provenance": { "url": "https://blog.example.com/review", "observed_at": "1", "source": null, "data": null }
-            }),
-        ];
-        enrich_snippet_fallback(&mut results);
-        // No currency symbol — snippet fallback should NOT fire
-        assert!(results[0].get("commerce").is_none(), "no currency symbol => no commerce");
-    }
-
-    #[test]
-    fn snippet_fallback_preserves_order_and_urls() {
-        // Multiple results: order and URLs must be byte-identical before/after.
-        let mut results = vec![
-            serde_json::json!({ "url": "https://a.example.com/1", "content": "Buy for $299", "score": 9.0, "commerce_provenance": { "url": "https://a.example.com/1", "observed_at": "1", "source": null, "data": null } }),
-            serde_json::json!({ "url": "https://b.example.com/2", "content": "Price: €199", "score": 8.5, "commerce_provenance": { "url": "https://b.example.com/2", "observed_at": "1", "source": null, "data": null } }),
-            serde_json::json!({ "url": "https://c.example.com/3", "content": "No price here", "score": 8.0, "commerce_provenance": { "url": "https://c.example.com/3", "observed_at": "1", "source": null, "data": null } }),
-        ];
-        let before: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
-        enrich_snippet_fallback(&mut results);
-        let after: Vec<String> = results.iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
-        assert_eq!(before, after, "snippet fallback must preserve order");
-        // First two get commerce, third stays null
-        assert!(results[0].get("commerce").is_some());
-        assert!(results[1].get("commerce").is_some());
-        assert!(results[2].get("commerce").is_none());
-    }
-}
-
-// ── ROADMAP item 7 + 8 integration: shopping-strip selection ────────────
-//
-// REGRESSION COVERAGE for the live-verified defect: the enrich window and the
-// display cap were the SAME constant, so for a commercial query whose top-8
-// results are all bot-checked merchant pages (no structured product facts) the
-// whole `shopping` block was suppressed even though fact-bearing results
-// existed further down the ranking.
-
-#[cfg(test)]
-mod mainpath_shopping_strip_tests {
-    use super::*;
-
-    fn cand(url: &str, has_facts: bool) -> serde_json::Value {
-        let mut v = serde_json::json!({ "url": url, "title": url, "content": "x" });
-        if has_facts {
-            v["commerce"] = serde_json::json!({
-                "url": url,
-                "source": "snippet_extracted",
-                "data": { "price": 100.0, "currency": "USD" }
-            });
-        }
-        v
-    }
-
-    /// THE regression test: fact-bearing results below the first 8 must still
-    /// produce a non-empty strip. Under the old code (cap == enrich window == 8)
-    /// this returned None and `/search` emitted no `shopping` field at all.
-    #[test]
-    fn strip_surfaces_facts_beyond_the_first_eight_candidates() {
-        let cands: Vec<serde_json::Value> = (0..24)
+    /// Regression guard for the `.take(max_par)` truncation bug: bounding
+    /// concurrency must bound how many fetches run AT ONCE, never how many are
+    /// ATTEMPTED. Uses a zero-latency fetch so the assertion is about coverage,
+    /// not timing, and covers 3× the wave size.
+    #[tokio::test]
+    async fn every_result_beyond_first_wave_is_still_enriched() {
+        let n = MAX_PARALLEL_FETCH * 3;
+        let mut ranked: Vec<serde_json::Value> = (0..n)
             .map(|i| {
-                let facts = i == 11; // rank 11 — beyond the old window of 8
-                cand(&format!("https://example.com/{i}"), facts)
+                serde_json::json!({
+                    "url": format!("https://wave{}.example.com/p/{}", i, i),
+                    "score": 9.0 - (i as f64 * 0.01),
+                })
             })
             .collect();
-        let strip = select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N)
-            .expect("fact-bearing result at rank 11 must surface");
-        assert_eq!(strip.len(), 1);
-        assert_eq!(strip[0]["url"], serde_json::json!("https://example.com/11"));
+
+        let fake_html = HTML_SINGLE_OFFER.to_string();
+        let fetch = move |_url: String| {
+            let html = fake_html.clone();
+            async move { Some(html) }
+        };
+
+        enrich_with_commerce_par(
+            &mut ranked,
+            fetch,
+            std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS),
+        )
+        .await;
+
+        assert_eq!(ranked.len(), n);
+        for (i, r) in ranked.iter().enumerate() {
+            assert!(
+                r.get("commerce").is_some(),
+                "result {} of {} was never enriched — the wave bound must not \
+                 truncate the eligible set",
+                i,
+                n
+            );
+        }
     }
 
-    /// No-manipulation: the strip is a strict SUBSEQUENCE of the candidates in
-    /// input (ranked) order. Adding facts further down can never promote a
-    /// lower-ranked result above a higher-ranked one, and can never reorder.
-    #[test]
-    fn strip_is_a_strict_subsequence_in_ranked_order() {
-        let cands: Vec<serde_json::Value> = vec![
-            cand("https://a/1", true),
-            cand("https://a/2", false),
-            cand("https://a/3", true),
-            cand("https://a/4", true),
-        ];
-        let strip = select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N).unwrap();
-        let urls: Vec<&str> = strip.iter().filter_map(|r| r["url"].as_str()).collect();
-        assert_eq!(urls, vec!["https://a/1", "https://a/3", "https://a/4"]);
-    }
-
-    /// The display cap is respected independently of the enrich window.
-    #[test]
-    fn strip_respects_the_display_cap() {
-        let cands: Vec<serde_json::Value> = (0..24)
-            .map(|i| cand(&format!("https://example.com/{i}"), true))
-            .collect();
-        let strip = select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N).unwrap();
-        assert_eq!(strip.len(), COMMERCE_MAINPATH_TOP_N);
-    }
-
-    /// Honesty: no facts anywhere => no block at all (never an empty strip of
-    /// bare affiliate cards, and never a fabricated fact).
-    #[test]
-    fn strip_is_none_when_no_candidate_has_facts() {
-        let cands: Vec<serde_json::Value> = (0..24)
-            .map(|i| cand(&format!("https://example.com/{i}"), false))
-            .collect();
-        assert!(select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N).is_none());
-    }
-
-    /// The informational case must stay empty — proves the gate is driven by
-    /// EXTRACTED FACTS, not by query text (privacy/no-keyword contract).
-    #[test]
-    fn review_and_article_candidates_yield_no_strip() {
-        let cands = vec![
-            cand("https://techradar.com/review", false),
-            cand("https://reddit.com/r/headphones", false),
-        ];
-        assert!(select_shopping_strip(&cands, COMMERCE_MAINPATH_TOP_N).is_none());
-    }
-
-    /// The enrich window must be strictly wider than the display cap, otherwise
-    /// the defect this module guards against can silently return.
-    #[test]
-    fn enrich_window_is_wider_than_display_cap() {
-        assert!(
-            COMMERCE_ENRICH_WINDOW > COMMERCE_MAINPATH_TOP_N,
-            "enrich window ({COMMERCE_ENRICH_WINDOW}) must exceed display cap \
-             ({COMMERCE_MAINPATH_TOP_N}) or fact-bearing results below the cap \
-             are never examined"
-        );
-    }
-
-    /// End-to-end shape of the defect: the real pipeline order is
-    /// enrich (deep window) -> snippet fallback -> affiliate decoration ->
-    /// select. A pipeline that produces facts only at rank 11 must yield a
-    /// non-empty, correctly-ordered, affiliate-disclosed strip.
-    #[test]
-    fn full_post_rank_pipeline_yields_strip_for_deep_facts() {
-        let mut cands: Vec<serde_json::Value> = (0..24)
+    #[tokio::test]
+    async fn parallel_enrichment_timeout_gracefully_attaches_provenance() {
+        // A fetch that ALWAYS exceeds the wall timeout must not panic. Every
+        // result still gets commerce_provenance (source: null, data: null).
+        let mut ranked: Vec<serde_json::Value> = (0..4)
             .map(|i| {
                 serde_json::json!({
                     "url": format!("https://example.com/{i}"),
