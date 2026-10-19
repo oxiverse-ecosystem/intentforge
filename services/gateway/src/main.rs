@@ -6127,6 +6127,21 @@ fn should_filter_by_constraints(
     }
 
     // 4f. Hard filter on price:
+    // P3 fix: the filter was a no-op for results with no detectable price —
+    // `dummy.get_price()` returns None for most web/local snippets (no structured
+    // price in title/content), so the `if let Some(p_info)` block never executed
+    // and every result passed through regardless of the price constraint.
+    //
+    // Now: when a price bound is present, a result with NO detectable price AND
+    // NO price signal (lexical indicators like "price", "cost", "₹", "buy") is
+    // hard-dropped — it is almost certainly not the priced product the user is
+    // looking for. When the result HAS a price signal but no parseable price,
+    // it is kept (it might be the product, just with a price we couldn't parse).
+    //
+    // This works WITH the existing fail-open (line ~17657): the fail-open clears
+    // the bound when `priced_result_count == 0` (no results have prices at all),
+    // so this hard filter only fires when at least some results have prices —
+    // meaning the price-less drop won't collapse the set to zero.
     if constraints.price_min.is_some() || constraints.price_max.is_some()
         || constraints.price_lt.is_some() || constraints.price_gt.is_some()
     {
@@ -6157,6 +6172,16 @@ fn should_filter_by_constraints(
             }
             if let Some(pgt) = bound_to_usd(constraints.price_gt, cur) {
                 if p_usd < pgt { return true; }
+            }
+        } else {
+            // No detectable price — check for price signal (lexical indicators).
+            // If the result has NO price signal either, it is almost certainly
+            // not the priced product the user is looking for → hard drop.
+            let title_lower = title.to_lowercase();
+            let content_lower = content.to_lowercase();
+            let price_signal = has_price_signal(&title_lower, &content_lower);
+            if !price_signal {
+                return true;
             }
         }
     }
@@ -20697,6 +20722,75 @@ mod constraint_fix_tests {
         c.price_currency = Some("INR".to_string());
         let s = sanitize_constraints(&c);
         assert_eq!(s.price_currency.as_deref(), Some("INR"));
+    }
+
+    // ── P3 regression: price filter must constrain price-less results ────────
+    //
+    // The hard filter was a no-op for results with no detectable price —
+    // `dummy.get_price()` returned None for most web/local snippets (no
+    // structured price in title/content), so the `if let Some(p_info)` block
+    // never executed and every result passed through regardless of the price
+    // constraint. The fix: when a price bound is present, a result with NO
+    // detectable price AND NO price signal (lexical indicators like "price",
+    // "cost", "₹", "buy") is hard-dropped.
+    #[test]
+    fn p3_price_filter_drops_results_with_no_price_and_no_signal() {
+        let mut c = cst();
+        c.price_max = Some(500.0);
+        c.price_lt = Some(500.0);
+
+        // A result with no price and no price signal → must be dropped.
+        let dropped = should_filter_by_constraints(
+            "Random article about laptops",
+            "This article discusses various laptop models and their features.",
+            "https://example.com/laptop-article",
+            None,
+            &c,
+        );
+        assert!(dropped, "result with no price and no price signal must be dropped when a price bound is present");
+
+        // A result with a price signal (e.g. "price" in title) but no parseable
+        // price → must be KEPT (it might be the product, just with a price
+        // we couldn't parse).
+        let kept = should_filter_by_constraints(
+            "Laptop price guide",
+            "This page discusses laptop prices and features.",
+            "https://example.com/laptop-prices",
+            None,
+            &c,
+        );
+        assert!(!kept, "result with a price signal must be kept even without a parseable price");
+
+        // A result with a detectable price within budget → must be KEPT.
+        let in_budget = should_filter_by_constraints(
+            "Laptop for $300",
+            "This laptop costs $300 and has great features.",
+            "https://example.com/laptop-300",
+            None,
+            &c,
+        );
+        assert!(!in_budget, "result with price within budget must be kept");
+
+        // A result with a detectable price over budget → must be DROPPED.
+        let over_budget = should_filter_by_constraints(
+            "Laptop for $800",
+            "This laptop costs $800 and has great features.",
+            "https://example.com/laptop-800",
+            None,
+            &c,
+        );
+        assert!(over_budget, "result with price over budget must be dropped");
+
+        // No price bound → nothing is dropped regardless of price signal.
+        let no_bound = cst();
+        let no_bound_result = should_filter_by_constraints(
+            "Random article about laptops",
+            "This article discusses various laptop models.",
+            "https://example.com/laptop-article",
+            None,
+            &no_bound,
+        );
+        assert!(!no_bound_result, "no price bound means no price filtering");
     }
 
     #[test]
