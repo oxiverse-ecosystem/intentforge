@@ -26468,6 +26468,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
     }
 }
 
+} // mod commerce_extraction_tests
+
 #[cfg(test)]
 mod kb_gibberish_mixed_tests {
     use super::*;
