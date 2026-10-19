@@ -18735,6 +18735,7 @@ async fn handle_search(
             );
         }
     }
+    }
 
     match invidious_res {
         Ok(invidious_data) => {
@@ -21020,7 +21021,6 @@ let mut results = match tokio::task::spawn_blocking(move || {
         response_json
     };
     (axum::http::StatusCode::OK, Json(final_json))
-    }
 }
 
 fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
