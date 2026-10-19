@@ -44,6 +44,24 @@ use affiliate::*;
 // ─── API Types ───────────────────────────────────────────────────────
 
 // Helper: deserialize null/missing string fields as empty String
+
+/// Service discovery: read Docker DNS URLs from env, fallback to localhost.
+/// The gateway container shares gluetun's network namespace, so localhost
+/// does not reach sibling containers. These helpers centralize the lookup.
+fn intent_engine_url() -> String {
+    std::env::var("INTENT_ENGINE_URL").unwrap_or_else(|_| "http://127.0.0.1:3005".to_string())
+}
+fn searxng_url() -> String {
+    std::env::var("SEARXNG_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+}
+fn indexer_url() -> String {
+    std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://127.0.0.1:6000".to_string())
+}
+fn crawler_url() -> String {
+    std::env::var("CRAWLER_URL").unwrap_or_else(|_| "http://127.0.0.1:5001".to_string())
+}
+
+
 fn deserialize_null_as_default<'de, D>(deserializer: D) -> Result<String, D::Error>
 where D: serde::Deserializer<'de> {
     let opt: Option<String> = Option::deserialize(deserializer)?;
@@ -6573,7 +6591,7 @@ async fn compute_web_semantic(
 
     let body = serde_json::json!({ "texts": texts });
     let req = client
-        .post("http://127.0.0.1:3005/embed_batch")
+        .post(&format!("{}/embed_batch", intent_engine_url()))
         .json(&body)
         .timeout(std::time::Duration::from_millis(2000));
     let embeddings: Option<Vec<Vec<f32>>> = match req.send().await {
@@ -7241,7 +7259,7 @@ fn map_lang_to_country(lang: &str) -> Option<&'static str> {
 
 /// Build a SearXNG search URL with optional geolocation parameters.
 /// Appends `source_country` and `language` when location data is available.
-fn searxng_url(base: &str, query: &str, geo: Option<&geoloc::GeoLocation>, lang: Option<&str>) -> String {
+fn searxng_url_with_geo(base: &str, query: &str, geo: Option<&geoloc::GeoLocation>, lang: Option<&str>) -> String {
     searxng_url_with_categories(base, query, "", geo, lang)
 }
 
@@ -9772,7 +9790,7 @@ struct CircuitBreaker {
 /// instance. This order is what circuit-breaker keys are derived from, so it
 /// must never be re-sorted — only `searx_base_urls` (the fan-out order) is.
 fn canonical_searx_urls(searxng2_url: &Option<String>) -> Vec<String> {
-    let mut urls = vec!["http://127.0.0.1:8080".to_string()];
+    let mut urls = vec![searxng_url().to_string()];
     if let Some(u) = searxng2_url {
         urls.push(u.clone());
     }
@@ -9789,7 +9807,7 @@ fn canonical_searx_urls(searxng2_url: &Option<String>) -> Vec<String> {
 /// next, so a timeout on the VPN path opened the circuit on the Tor key and
 /// suppressed a healthy, independent egress path for the full 10-minute
 /// connection-failure window.
-fn searx_instance_keys_for(canonical: &[String], fanout: &[&str]) -> Vec<String> {
+fn searx_instance_keys_for(canonical: &[String], fanout: &[String]) -> Vec<String> {
     fanout
         .iter()
         .map(|u| {
@@ -14214,7 +14232,7 @@ async fn handle_images(
 
     // Fan-out to both SearXNG instances in parallel (VPN + Tor)
     let searx_url = searxng_url_with_categories(
-        "http://127.0.0.1:8080", &q, "images", geo_location.as_ref(), lang
+        &searxng_url(), &q, "images", geo_location.as_ref(), lang
     );
 
     let searx2_url = state.searxng2_url.as_ref().map(|base| {
@@ -14347,7 +14365,7 @@ async fn handle_videos(
     // Query Invidious and both SearXNG instances (categories=videos) in parallel
     let invidious_url = format!("http://invidious:3000/api/v1/search?q={}", urlencoding::encode(&q));
     let searx_video_url = searxng_url_with_categories(
-        "http://127.0.0.1:8080", &q, "videos", geo_location.as_ref(), lang
+        &searxng_url(), &q, "videos", geo_location.as_ref(), lang
     );
     let searx2_video_url = state.searxng2_url.as_ref().map(|base| {
         searxng_url_with_categories(base, &q, "videos", geo_location.as_ref(), lang)
@@ -14555,7 +14573,7 @@ async fn handle_news(
 
     // Fan-out to both SearXNG instances in parallel (VPN + Tor)
     let searx_url = searxng_url_with_categories(
-        "http://127.0.0.1:8080", &q, "news", geo_location.as_ref(), lang
+        &searxng_url(), &q, "news", geo_location.as_ref(), lang
     );
 
     let searx2_url = state.searxng2_url.as_ref().map(|base| {
@@ -14923,8 +14941,8 @@ async fn main() {
     let prewarm_searxng2 = state.searxng2_url.clone();
     tokio::spawn(async move {
         let mut prewarm_heads = vec![
-            prewarm_client.head("http://127.0.0.1:8080/search?q=prewarm&format=json&pageno=1").send(),
-            prewarm_client.head("http://127.0.0.1:6000/search?q=prewarm").send(),
+            prewarm_client.head(format!("{}/search?q=prewarm&format=json&pageno=1", searxng_url())).send(),
+            prewarm_client.head(format!("{}/search?q=prewarm", indexer_url())).send(),
         ];
         if let Some(ref s2_url) = prewarm_searxng2 {
             let url = format!("{}/search?q=prewarm&format=json&pageno=1", s2_url);
@@ -14936,7 +14954,7 @@ async fn main() {
         tracing::info!("Prewarming — polling intent engine until ready...");
         // Poll intent engine with exponential backoff until it responds
         for attempt in 1..=20 {
-            match prewarm_client.get("http://127.0.0.1:3005/analyze?q=warmup").send().await {
+            match prewarm_client.get(format!("{}/analyze?q=warmup", intent_engine_url())).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     tracing::info!("Intent engine ready after {} attempt(s)", attempt);
                     break;
@@ -14953,8 +14971,8 @@ async fn main() {
         }
         // Fire SearXNG + embed warmup in parallel (non-critical)
         let mut prewarm_futs = vec![
-            prewarm_client.get("http://127.0.0.1:8080/search?q=warmup&format=json&pageno=1").send(),
-            prewarm_client.get("http://127.0.0.1:3005/embed?text=warmup").send(),
+            prewarm_client.get(format!("{}/search?q=warmup&format=json&pageno=1", searxng_url())).send(),
+            prewarm_client.get(format!("{}/embed?text=warmup", intent_engine_url())).send(),
         ];
         if let Some(ref s2_url) = prewarm_searxng2 {
             let url = format!("{}/search?q=warmup&format=json&pageno=1", s2_url);
@@ -16460,8 +16478,8 @@ async fn handle_search(
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
     // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
     // spell correction can never change classification/constraints.
-    let intent_url = format!("http://127.0.0.1:3005/analyze?q={}", urlencoding::encode(&q_orig));
-    let embed_url = format!("http://127.0.0.1:3005/embed?text={}", urlencoding::encode(&q_orig));
+    let intent_url = format!("{}/analyze?q={}", intent_engine_url(), urlencoding::encode(&q_orig));
+    let embed_url = format!("{}/embed?text={}", intent_engine_url(), urlencoding::encode(&q_orig));
 
     // Retry intent engine up to 2 extra times with backoff.
     // Handles cold-start after container restart (model load takes 5-15s).
@@ -16547,16 +16565,16 @@ async fn handle_search(
     // Sort instances by last-used time (warmest first) so join_all starts with
     // the connection that's most likely to have an idle pool entry, reducing
     // overall fan-out latency when one instance has cooled down.
-    let searx_base_urls: Vec<&str> = {
-        let mut urls: Vec<&str> = if state.searxng2_url.is_some() {
-            vec!["http://127.0.0.1:8080", state.searxng2_url.as_deref().unwrap()]
+    let searx_base_urls: Vec<String> = {
+        let mut urls: Vec<String> = if state.searxng2_url.is_some() {
+            vec![searxng_url(), state.searxng2_url.clone().unwrap()]
         } else {
-            vec!["http://127.0.0.1:8080"]
+            vec![searxng_url()]
         };
         let searx_last_used = state.searx_last_used.lock();
         urls.sort_by(|a, b| {
-            let a_warm = searx_last_used.get(*a).copied().unwrap_or(std::time::Instant::now());
-            let b_warm = searx_last_used.get(*b).copied().unwrap_or(std::time::Instant::now());
+            let a_warm = searx_last_used.get(a.as_str()).copied().unwrap_or(std::time::Instant::now());
+            let b_warm = searx_last_used.get(b.as_str()).copied().unwrap_or(std::time::Instant::now());
             b_warm.cmp(&a_warm) // most recently used first
         });
         urls
@@ -16646,11 +16664,11 @@ async fn handle_search(
             None => (clean_q.clone(), String::new()),
         };
         // Primary query URL (with geolocation parameters)
-        searx_urls.push(searxng_url(base_url, &first_q, geo_location.as_ref(), lang));
+        searx_urls.push(searxng_url_with_geo(base_url, &first_q, geo_location.as_ref(), lang));
         searx_instance_keys.push(key.clone());
         // Secondary (raw when a stripped variant fired first, else nothing)
         if !second_q.is_empty() && second_q != first_q {
-            searx_urls.push(searxng_url(base_url, &second_q, geo_location.as_ref(), lang));
+            searx_urls.push(searxng_url_with_geo(base_url, &second_q, geo_location.as_ref(), lang));
             searx_instance_keys.push(key.clone());
         }
         // P1-compound: filetype-relaxed variant (site: kept, filetype: dropped)
@@ -16659,7 +16677,7 @@ async fn handle_search(
         if let Some(ref relaxed) = filetype_relax_variant(&engine_q) {
             let clean_relaxed = preprocess_searxng_query(relaxed);
             if !clean_relaxed.is_empty() && clean_relaxed != first_q {
-                searx_urls.push(searxng_url(base_url, &clean_relaxed, geo_location.as_ref(), lang));
+                searx_urls.push(searxng_url_with_geo(base_url, &clean_relaxed, geo_location.as_ref(), lang));
                 searx_instance_keys.push(key.clone());
             }
         }
@@ -16668,7 +16686,7 @@ async fn handle_search(
         if let Some(ref keyphrase) = keyphrase_relax_variant(&engine_q) {
             let clean_kp = preprocess_searxng_query(keyphrase);
             if !clean_kp.is_empty() && clean_kp != first_q {
-                searx_urls.push(searxng_url(base_url, &clean_kp, geo_location.as_ref(), lang));
+                searx_urls.push(searxng_url_with_geo(base_url, &clean_kp, geo_location.as_ref(), lang));
                 searx_instance_keys.push(key.clone());
             }
         }
@@ -16700,7 +16718,7 @@ async fn handle_search(
                 let clean_v = preprocess_searxng_query(v);
                 let clean_q_outer = preprocess_searxng_query(&q);
                 if !clean_v.is_empty() && clean_v != clean_q_outer {
-                    searx_urls.push(searxng_url(base_url, &clean_v, geo_location.as_ref(), lang));
+                    searx_urls.push(searxng_url_with_geo(base_url, &clean_v, geo_location.as_ref(), lang));
                     searx_instance_keys.push(key.clone());
                 }
             }
@@ -16715,7 +16733,7 @@ async fn handle_search(
         q.clone()
     };
     let indexer_q_encoded = urlencoding::encode(&indexer_q);
-    let indexer_query_raw = format!("http://127.0.0.1:6000/search?q={}", indexer_q_encoded);
+    let indexer_query_raw = format!("{}/search?q={}", indexer_url(), indexer_q_encoded);
 
     let client_ref = &client;
     let circuit_ref = &state.circuit;
@@ -16976,7 +16994,7 @@ async fn handle_search(
             return Ok(SearxNewsResponse { results: vec![] });
         }
         let news_url = searxng_url_with_categories(
-            "http://127.0.0.1:8080", &q, "news", geo_location.as_ref(), lang
+            &searxng_url(), &q, "news", geo_location.as_ref(), lang
         );
         // NOTE (flaky-connection fix): detached spawn + budget so a gluetun
         // stall can't hang the fan-out.
@@ -17008,7 +17026,7 @@ async fn handle_search(
             return Ok(SearxImageResponse { results: vec![] });
         }
         let image_url = searxng_url_with_categories(
-            "http://127.0.0.1:8080", &q, "images", geo_location.as_ref(), lang
+            &searxng_url(), &q, "images", geo_location.as_ref(), lang
         );
         // NOTE (flaky-connection fix): detached spawn + budget so a gluetun
         // stall can't hang the fan-out.
@@ -17049,7 +17067,7 @@ async fn handle_search(
             return Ok(SearxResponse { results: vec![], unresponsive_engines: vec![] });
         }
         let shop_url = searxng_url_with_categories(
-            "http://127.0.0.1:8080", &q, "shopping", geo_location.as_ref(), lang
+            &searxng_url(), &q, "shopping", geo_location.as_ref(), lang
         );
         let s_client = client.clone();
         let task = tokio::spawn(async move {
@@ -17184,7 +17202,7 @@ async fn handle_search(
                             if count > 0 {
                                 partial_collector_sub.lock().unwrap().push((orig_idx, Ok(data)));
                             }
-                            let is_primary = urls_cloned[orig_idx].starts_with("http://127.0.0.1:8080");
+                            let is_primary = urls_cloned[orig_idx].starts_with(&searxng_url());
                             // FIX: do NOT early-return on the primary instance returning a
                             // small/medium set. SearXNG1 (127.0.0.1:8080) sits behind a flaky
                             // VPN and its Bing/Brave engines frequently return OFF-TOPIC junk
@@ -18261,7 +18279,8 @@ async fn handle_search(
         };
         let indexer_q_encoded = urlencoding::encode(&indexer_q);
         let indexer_url_vec = format!(
-            "http://127.0.0.1:6000/search?q={}&vector={}",
+            "{}/search?q={}&vector={}",
+            indexer_url(),
             indexer_q_encoded,
             urlencoding::encode(&vec_str)
         );
@@ -18476,7 +18495,7 @@ async fn handle_search(
                 // the fast retry through Tor instead.
                 if !only_negative && intent.structured_constraints.negative.is_empty() && retry_key != "searxng0" { continue; }
                 if circuit_ref.is_open(&retry_key) { continue; }
-                let retry_url = searxng_url(base_url, &clean_eq, geo_location.as_ref(), lang);
+                let retry_url = searxng_url_with_geo(base_url, &clean_eq, geo_location.as_ref(), lang);
                 let client = client.clone();
                 let key = retry_key.clone();
                 let url_for_log = retry_url[..retry_url.find('?').unwrap_or(retry_url.len())].to_string();
@@ -18627,7 +18646,7 @@ async fn handle_search(
                     // VPN-only fallback, selected by stable key not sort position.
                     if fb_key != "searxng0" { break; }
                     if circuit_ref.is_open(&fb_key) { continue; }
-                    let fb_url = searxng_url(base_url, &relaxed_clean, geo_location.as_ref(), lang);
+                    let fb_url = searxng_url_with_geo(base_url, &relaxed_clean, geo_location.as_ref(), lang);
                     let fb_client = client.clone();
                     let fb_circuit = circuit_ref.clone();
                     let fb_result = tokio::time::timeout(fallback_timeout, async move {
@@ -19715,7 +19734,7 @@ async fn handle_search(
         tokio::spawn(async move {
             let client = reqwest::Client::new();
             let payload = serde_json::json!({ "urls": crawl_urls });
-            let _ = client.post("http://127.0.0.1:5001/enqueue")
+            let _ = client.post(format!("{}/enqueue", crawler_url()))
                 .json(&payload)
                 .send()
                 .await;
@@ -22009,7 +22028,7 @@ async fn handle_search_fast(
     }
 
     // Query local index only — no network calls except to indexer
-    let indexer_url = format!("http://127.0.0.1:6000/search?q={}", q_encoded);
+    let indexer_url = format!("{}/search?q={}", indexer_url(), q_encoded);
     let results = match state.http_client.get(&indexer_url).send().await {
         Ok(resp) => {
             match read_json_bounded::<Vec<IndexerResult>>(resp).await {
@@ -26562,13 +26581,13 @@ mod kb_gibberish_mixed_tests {
     #[test]
     fn searx_circuit_key_is_stable_across_fanout_order() {
         let canonical = canonical_searx_urls(&Some("http://tor2:8081".to_string()));
-        assert_eq!(canonical[0], "http://127.0.0.1:8080", "canonical 0 is the VPN instance");
+        assert_eq!(canonical[0], searxng_url(), "canonical 0 is the VPN instance");
         assert_eq!(canonical[1], "http://tor2:8081", "canonical 1 is the Tor instance");
 
         // Warm VPN first, then warm Tor (the original declaration order).
-        let vpn_first = ["http://127.0.0.1:8080", "http://tor2:8081"];
+        let vpn_first = [searxng_url(), "http://tor2:8081".to_string()];
         // Warm Tor first, then warm VPN (what the sort produces after Tor is used).
-        let tor_first = ["http://tor2:8081", "http://127.0.0.1:8080"];
+        let tor_first = ["http://tor2:8081".to_string(), searxng_url()];
 
         let k1 = searx_instance_keys_for(&canonical, &vpn_first);
         let k2 = searx_instance_keys_for(&canonical, &tor_first);
@@ -26576,11 +26595,11 @@ mod kb_gibberish_mixed_tests {
         // The SAME backend must get the SAME key in both orders. Look the key up
         // by the BACKEND's position in that particular fan-out order, so the
         // lookup itself follows the order being tested.
-        let key_of = |order: &[&str], ks: &Vec<String>, backend: &str| -> String {
+        let key_of = |order: &[String], ks: &Vec<String>, backend: &str| -> String {
             let slot = order.iter().position(|u| *u == backend).expect("backend in order");
             ks[slot].clone()
         };
-        const VPN: &str = "http://127.0.0.1:8080";
+        const VPN: &str = "http://127.0.0.1:8080"; // fallback matches searxng_url() default
         const TOR: &str = "http://tor2:8081";
 
         assert_eq!(key_of(&vpn_first, &k1, VPN), "searxng0", "VPN backend is searxng0 when fanned out first");
@@ -26599,17 +26618,18 @@ mod kb_gibberish_mixed_tests {
     #[test]
     fn vpn_only_paths_never_target_the_tor_instance() {
         let canonical = canonical_searx_urls(&Some("http://tor2:8081".to_string()));
-        let tor_first = ["http://tor2:8081", "http://127.0.0.1:8080"];
+        let tor_first = ["http://tor2:8081".to_string(), searxng_url()];
         let keys = searx_instance_keys_for(&canonical, &tor_first);
 
         // Replicates the `retry_key != "searxng0"` / `fb_key != "searxng0"` guards.
-        let vpn_only: Vec<&str> = tor_first
+        let vpn_only: Vec<String> = tor_first
             .iter()
             .enumerate()
             .filter(|(i, _)| keys[*i] == "searxng0")
-            .map(|(_, u)| *u)
+            .map(|(_, u)| u.clone())
             .collect();
-        assert_eq!(vpn_only, vec!["http://127.0.0.1:8080"], "VPN-only path must resolve to the VPN backend");
+        assert_eq!(vpn_only, vec![searxng_url()], "VPN-only path must resolve to the VPN backend");
+
     }
 
     // INTENT BUDGET (round auto/round-2026-09-29T1239Z). The retry ladder and
@@ -26994,6 +27014,7 @@ mod mainpath_shopping_strip_tests {
         assert_eq!(facts.merchant, Some("www.bestbuy.com".to_string()));
     }
 }
+
 
 #[cfg(test)]
 mod local_intent_gazetteer_tests {
