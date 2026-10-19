@@ -25819,6 +25819,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         assert!(stripped.contains("business"), "should keep 'business'");
     }
 
+    #[tokio::test]
+    async fn parallel_enrichment_preserves_order() {
         let before: Vec<String> = ranked
             .iter()
             .map(|r| r["url"].as_str().unwrap().to_string())
