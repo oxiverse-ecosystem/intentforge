@@ -5447,6 +5447,7 @@ fn is_commercial_intent(
     has_price_bound: bool,
     signals: &CommerceSignals,
     query: &str,
+    exact_model_cfg: &ExactModelConfig,
 ) -> bool {
     if has_price_bound {
         return true;
@@ -5463,6 +5464,14 @@ fn is_commercial_intent(
         .unwrap_or(0.0)
         >= 0.50
     {
+        return true;
+    }
+    // Exact-model signal: a query that names a specific product model (brand +
+    // model number from the runtime-loaded exact_model_brands.json) is inherently
+    // commercial — the user is researching or buying a specific product. This is
+    // data-driven (the brand list lives in a data file, not a keyword list in
+    // code) and supplements the intent engine's label/distribution check.
+    if exact_model_cfg.has_exact_model(query) {
         return true;
     }
     // WEAK signal boost: the runtime-loaded transactional keywords from
@@ -17994,26 +18003,6 @@ async fn handle_search(
         }
     }
 
-    // Override 7: Model-number + price/cost terms → transactional
-    // The classifier misses model-number patterns ("iphone 16 pro max price",
-    // "oneplus 12 price") — the word "price" alone is weak signal. When a known
-    // brand+model pattern co-occurs with a price/cost term, the intent is
-    // decisively transactional (P10/P11 style compensation for the linear probe).
-    // MOVED OUTSIDE the confidence gate (2026-10-16): a decisive pattern match
-    // must not be suppressed by a high-confidence misclassification.
-    if is_model_number_price_query(&q_lower, &state.exact_model_config) {
-        if intent.intent != "transactional" || intent.confidence < 0.60 {
-            tracing::info!(
-                "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
-                q, intent.intent, intent.confidence
-            );
-            intent.intent = "transactional".to_string();
-            intent.confidence = intent.confidence.max(0.80);
-            let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
-            intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
-        }
-    }
-
     let vector: Option<Vec<f32>> = match embed_res {
         Some(resp) => {
             if let Some(json) = read_json_bounded::<serde_json::Value>(resp).await {
@@ -20821,6 +20810,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
         &state.commerce_signals,
         &q,
+        &state.exact_model_config,
     );
     let shopping_block: Option<serde_json::Value> = if is_commercial {
         // The enrichment budget is derived from the time this request has ALREADY

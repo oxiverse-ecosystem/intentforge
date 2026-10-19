@@ -38,6 +38,8 @@ services:
       # independent paths" fallback to a single dead-end whenever tor2 is the
       # one that's up. 172.19.0.0/16 is the services_default bridge subnet.
       - FIREWALL_OUTBOUND_SUBNETS=172.19.0.0/16
+      - HEALTH_VPN_DURATION_INITIAL=60s
+      - HEALTH_SUCCESS_WAIT_DURATION=15s
     # ──────────────────────────────────────────────────────────────────
     # Service names for everything that shares THIS container's network
     # namespace (`network_mode: "service:gluetun"`).
@@ -82,8 +84,8 @@ services:
       test: ["CMD", "/gluetun-entrypoint", "healthcheck"]
       interval: 20s
       timeout: 8s
-      start_period: 120s
-      retries: 6
+      start_period: 240s
+      retries: 15
     logging:
       driver: "json-file"
       options:
@@ -341,11 +343,11 @@ services:
     mem_limit: 1024m
     mem_reservation: 512m
     environment:
-      - INTENT_ENGINE_URL=http://localhost:3005
-      - SEARXNG_URL=http://localhost:8080
-      - SEARXNG2_URL=http://tor2:8081
-      - CRAWLER_URL=http://localhost:5001
-      - INDEXER_URL=http://localhost:6000
+      - INTENT_ENGINE_URL=http://intent-engine:3005
+      - SEARXNG_URL=http://searxng:8080
+      - SEARXNG2_URL=http://searxng2:8081
+      - CRAWLER_URL=http://crawler:5001
+      - INDEXER_URL=http://indexer:6000
       # Affiliate network keys (ROADMAP item 3). Absent => /shopping degrades to
       # `affiliate: null` (graceful). Set a value here only to exercise the path
       # locally; NEVER commit real keys. Production keys come from the runtime env.
