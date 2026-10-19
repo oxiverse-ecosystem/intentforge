@@ -20269,7 +20269,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 {
                     return true; // fulfillment page — keep
                 }
-                false
+                false;
             });
 
             if !should_keep {
