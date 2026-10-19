@@ -5511,15 +5511,6 @@ fn select_shopping_strip(
     } else {
         Some(strip)
     }
-    // WEAK signal boost: the runtime-loaded transactional keywords from
-    // signals.json provide additional recall when the intent engine is
-    // borderline. This is a SUPPLEMENT to the label/distribution check —
-    // never a standalone replacement. The keywords are data-driven (loaded
-    // from data/commerce/signals.json), not hardcoded in the classifier.
-    if signals.has_transactional_keyword(query) {
-        return true;
-    }
-    false
 }
 
 /// GET /shopping — the user-facing commerce search endpoint (ROADMAP item 2).
