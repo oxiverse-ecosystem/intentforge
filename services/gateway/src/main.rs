@@ -3966,7 +3966,9 @@ fn parse_microdata_product(html: &str) -> Option<OfferFacts> {
         if facts.offer_count.is_none() {
             facts.offer_count = Some(1);
         }
-    } else if !prices.is_empty() {
+    }
+
+    if !prices.is_empty() {
         let mut lo = f64::MAX;
         let mut hi = f64::MIN;
         for (p, _c) in &prices {
