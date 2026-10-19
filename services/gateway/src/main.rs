@@ -18339,25 +18339,50 @@ async fn handle_search(
             Ok(searx_data) => {
                 let n = searx_data.results.len();
                 tracing::info!("SearXNG variation {} returned {} results", orig_idx, n);
-                // Record success for any valid parsed response (including zero-result)
-                // to clear open_until and reset circuit breaker state
-                circuit_ref.record_success(instance_key);
                 // Track last-used time for connection-cooldown aware routing
                 if let Some(url) = searx_key_to_url.get(instance_key) {
-                    state.searx_last_used.lock().insert(url.clone(), Instant::now());
+                    state.searx_last_used.lock().insert(url.to_string(), Instant::now());
                 }
                 if n > 0 {
                     searx_instances_ok += 1;
+                    // Record success for any response with actual results — this
+                    // clears open_until and resets circuit breaker state.
+                    circuit_ref.record_success(instance_key);
                     // Record result count metrics only when there are actual results
                     circuit_ref.record_results(instance_key, n as u64);
                     for r in &searx_data.results {
                         *engine_counts.entry(r.engine.clone()).or_insert(0) += 1;
                     }
                 } else {
-                    // 0 results ≠ failure — the instance is healthy but returned no
-                    // matches (e.g. niche query, all engines temporarily suspended).
-                    // Only record actual errors (timeout, connection refused) as failures.
-                    // This prevents niche queries from cascading the circuit to 300s.
+                    // 0 results: distinguish "healthy but no matches" from "dead path".
+                    // When ALL upstream engines are unresponsive (timeout), the
+                    // instance itself is unreachable (e.g. VPN down, all engines
+                    // timing out) — this is a dead-path signal, not a niche query.
+                    // Open the circuit so subsequent queries skip this path
+                    // instead of burning the full branch timeout on every request.
+                    // We use record_failure (not record_connection_failure)
+                    // because the HTTP connection succeeds — it's the upstream
+                    // engines that are dead. A moderate backoff (15s+) lets the
+                    // path recover without a 10-minute lockout.
+                    let all_unresponsive = !searx_data.unresponsive_engines.is_empty()
+                        && searx_data.unresponsive_engines.iter().all(|e| {
+                            e.get(1).map(|msg| {
+                                let m = msg.to_lowercase();
+                                m.contains("timeout") || m.contains("unreachable") || m.contains("error")
+                            }).unwrap_or(false)
+                        });
+                    if all_unresponsive {
+                        tracing::warn!(
+                            "SearXNG instance '{}' returned 0 results with ALL engines unresponsive — opening circuit",
+                            instance_key
+                        );
+                        circuit_ref.record_failure(instance_key);
+                    } else {
+                        // 0 results but engines responded (just no matches) —
+                        // this is a healthy instance with no results for this
+                        // query. Record success to keep the circuit closed.
+                        circuit_ref.record_success(instance_key);
+                    }
                 }
                 for (pos, result) in searx_data.results.into_iter().enumerate() {
                     let engine_weight = circuit_ref.weight(&result.engine);
