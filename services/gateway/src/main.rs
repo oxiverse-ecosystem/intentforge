@@ -17776,10 +17776,37 @@ async fn handle_search(
             0
         };
 
-        let kept: Vec<usize> = scored.iter()
+        let mut kept: Vec<usize> = scored.iter()
             .filter(|(_, _, v)| *v <= violation_threshold)
             .map(|(i, _, _)| *i)
             .collect();
+
+        // MINIMUM RETENTION GUARANTEE: never let the negative constraint filter
+        // collapse the result set below 50% of its original size (or below 5
+        // results, whichever is larger). When the clean set is too small, relax
+        // the threshold upward until the retention floor is met. Results with
+        // more violations are still demoted via the graduated score penalty
+        // (0.5^violations) applied below, so ranking quality is preserved —
+        // we simply refuse to eliminate them entirely.
+        let retention_floor = (before_count / 2).max(5).min(before_count);
+        if kept.len() < retention_floor && kept.len() < before_count {
+            // Find the minimum threshold that satisfies the retention floor.
+            // Try progressively higher thresholds: threshold+1, threshold+2, ...
+            let mut relaxed_threshold = violation_threshold;
+            while kept.len() < retention_floor && relaxed_threshold < max_violations {
+                relaxed_threshold += 1;
+                kept = scored.iter()
+                    .filter(|(_, _, v)| *v <= relaxed_threshold)
+                    .map(|(i, _, _)| *i)
+                    .collect();
+            }
+            if relaxed_threshold > violation_threshold {
+                tracing::info!(
+                    "NEGATIVE CONSTRAINT RETENTION: relaxed threshold {} -> {} to keep {}/{} results (floor={})",
+                    violation_threshold, relaxed_threshold, kept.len(), before_count, retention_floor
+                );
+            }
+        }
 
         let removed = before_count.saturating_sub(kept.len());
         if removed > 0 {
@@ -25225,5 +25252,220 @@ mod geo_default_regression_tests {
             assert!(is_inferred_location(q, &l),
                 "'{}' must treat {:?} as inferred", q, l.city);
         }
+    }
+}
+
+#[cfg(test)]
+mod negative_constraint_retention_tests {
+    use super::*;
+
+    /// REGRESSION: negative constraint filter must not collapse result sets.
+    ///
+    /// The post-merge hard filter (main.rs ~17698) counts how many negative
+    /// terms each result violates, then keeps only results with violations <= threshold.
+    /// When min_violations == 0 (at least one clean result exists), the threshold
+    /// is 0 — meaning ONLY clean results are kept. For queries like
+    /// "programming not java", most programming pages mention Java somewhere,
+    /// so the filter kept only the few that didn't, collapsing the result set.
+    ///
+    /// The fix adds a minimum retention guarantee: never drop below 50% of the
+    /// original count (or 5 results, whichever is larger). This test verifies
+    /// the retention floor logic by simulating the filter's decision process.
+
+    /// Simulate the post-merge filter's retention logic and verify it never
+    /// collapses below the retention floor.
+    fn simulate_retention(
+        violation_counts: &[usize],
+        original_count: usize,
+    ) -> usize {
+        let max_violations = violation_counts.iter().copied().max().unwrap_or(0);
+        let min_violations = violation_counts.iter().copied().min().unwrap_or(0);
+        let total_violations: usize = violation_counts.iter().sum();
+        let avg_violations = total_violations as f32 / violation_counts.len().max(1) as f32;
+        let is_goldilocks = avg_violations > 1.5 && min_violations >= 1;
+
+        let violation_threshold = if is_goldilocks {
+            (max_violations / 2).max(1)
+        } else if min_violations == 0 {
+            0
+        } else {
+            0
+        };
+
+        let mut kept: Vec<usize> = violation_counts
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v <= violation_threshold)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Retention floor logic (mirrors the fix in main.rs)
+        let retention_floor = (original_count / 2).max(5).min(original_count);
+        if kept.len() < retention_floor && kept.len() < original_count {
+            let mut relaxed_threshold = violation_threshold;
+            while kept.len() < retention_floor && relaxed_threshold < max_violations {
+                relaxed_threshold += 1;
+                kept = violation_counts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| **v <= relaxed_threshold)
+                    .map(|(i, _)| i)
+                    .collect();
+            }
+        }
+
+        kept.len()
+    }
+
+    #[test]
+    fn retention_floor_prevents_collapse_when_most_results_violate() {
+        // Scenario: 20 results, 17 mention "java" (1 violation each), 3 are clean.
+        // Without the fix: threshold=0, kept=3 (collapse from 20 to 3).
+        // With the fix: retention_floor = max(20/2, 5) = 10, so threshold relaxes
+        // until at least 10 results are kept.
+        let violations: Vec<usize> = (0..20)
+            .map(|i| if i < 3 { 0 } else { 1 })
+            .collect();
+        let kept = simulate_retention(&violations, 20);
+        assert!(
+            kept >= 10,
+            "retention floor should keep >= 10 results, kept only {}",
+            kept
+        );
+    }
+
+    #[test]
+    fn retention_floor_prevents_collapse_with_multiple_negatives() {
+        // Scenario: 15 results, all mention at least one of 3 negative terms.
+        // min_violations=1, avg=1.33 (below Goldilocks 1.5 threshold).
+        // Without the fix: threshold=0, kept=0 (total collapse).
+        // With the fix: retention_floor = max(15/2, 5) = 7, so threshold relaxes.
+        let violations: Vec<usize> = (0..15)
+            .map(|i| 1 + (i % 2))
+            .collect();
+        let kept = simulate_retention(&violations, 15);
+        assert!(
+            kept >= 7,
+            "retention floor should keep >= 7 results, kept only {}",
+            kept
+        );
+    }
+
+    #[test]
+    fn no_collapse_when_all_results_are_clean() {
+        // Scenario: all results have 0 violations — nothing to filter.
+        let violations: Vec<usize> = vec![0; 10];
+        let kept = simulate_retention(&violations, 10);
+        assert_eq!(kept, 10, "all clean results should be kept");
+    }
+
+    #[test]
+    fn no_collapse_when_enough_clean_results_exist() {
+        // Scenario: 20 results, 12 clean (0 violations), 8 with violations.
+        // Without the fix: threshold=0, kept=12 (acceptable).
+        // With the fix: retention_floor=10, 12 >= 10, so no relaxation needed.
+        let violations: Vec<usize> = (0..20)
+            .map(|i| if i < 12 { 0 } else { 1 })
+            .collect();
+        let kept = simulate_retention(&violations, 20);
+        assert_eq!(kept, 12, "12 clean results should be kept without relaxation");
+    }
+
+    #[test]
+    fn goldilocks_relaxation_still_works() {
+        // Scenario: all results have high violations, avg > 1.5.
+        // Goldilocks should fire and relax the threshold.
+        let violations: Vec<usize> = vec![2, 3, 2, 3, 2, 3, 2, 3, 2, 3];
+        let kept = simulate_retention(&violations, 10);
+        // Goldilocks: threshold = max/2 = 3/2 = 1, but all have >= 2 violations.
+        // So kept=0 without retention. With retention_floor=5, threshold relaxes to 2.
+        assert!(
+            kept >= 5,
+            "Goldilocks + retention should keep >= 5 results, kept only {}",
+            kept
+        );
+    }
+
+    #[test]
+    fn small_result_set_retention_floor() {
+        // Scenario: only 3 results, 2 violate. Retention floor = max(3/2, 5) = 5,
+        // but min(5, 3) = 3. So all 3 should be kept.
+        let violations: Vec<usize> = vec![0, 1, 1];
+        let kept = simulate_retention(&violations, 3);
+        assert_eq!(kept, 3, "small result sets should not be collapsed below their size");
+    }
+
+    #[test]
+    fn should_filter_does_not_hard_drop_bare_negative_terms() {
+        // REGRESSION: should_filter_by_constraints must NOT hard-drop on bare
+        // negative terms (e.g. "java" from "python not java"). Only structural
+        // operators (site:/filetype: negatives, date bounds, phrases) should
+        // hard-drop. This is the P5 fix.
+        let mut c = Constraints::default();
+        c.negative = vec!["java".to_string()];
+
+        // A result that mentions "java" in content should NOT be dropped
+        let title = "Python Programming Guide";
+        let content = "This guide compares Python with Java and other languages.";
+        let url = "https://example.com/python-guide";
+
+        assert!(
+            !should_filter_by_constraints(title, content, url, None, &c),
+            "bare negative term 'java' must NOT hard-drop a result"
+        );
+    }
+
+    #[test]
+    fn should_filter_still_drops_on_structural_negatives() {
+        // site: negatives should still hard-drop
+        let mut c = Constraints::default();
+        c.negative = vec!["site:reddit.com".to_string()];
+
+        let title = "Python Guide";
+        let content = "Some content";
+        let url = "https://www.reddit.com/r/python";
+
+        assert!(
+            should_filter_by_constraints(title, content, url, None, &c),
+            "site: negative must hard-drop matching results"
+        );
+    }
+
+    #[test]
+    fn constraint_score_does_not_zero_for_content_mention() {
+        // REGRESSION: constraint_score should NOT return 0.0 for a result
+        // that merely mentions a negative term in content (not title-dominated).
+        // A score of 0.0 effectively removes the result from visibility.
+        let mut c = Constraints::default();
+        c.negative = vec!["java".to_string()];
+
+        let title = "Python Programming Guide";
+        let content = "This guide compares Python with Java and other languages.";
+        let url = "https://example.com/python-guide";
+
+        let score = constraint_score(title, content, url, &c);
+        assert!(
+            score > 0.0,
+            "constraint_score must not be 0.0 for a content mention, got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn constraint_score_zero_for_title_dominated() {
+        // A result whose TITLE is dominated by the excluded term SHOULD get 0.0.
+        let mut c = Constraints::default();
+        c.negative = vec!["java".to_string()];
+
+        let title = "Java Programming Language";
+        let content = "Some content about programming.";
+        let url = "https://example.com/java";
+
+        let score = constraint_score(title, content, url, &c);
+        assert_eq!(
+            score, 0.0,
+            "title-dominated result should get score 0.0, got {}",
+            score
+        );
     }
 }
