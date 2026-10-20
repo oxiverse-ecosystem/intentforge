@@ -8176,7 +8176,6 @@ fn is_real_exclusion(
     // "music background") stay declined — they constrain the learner, not result
     // content. Fully structural / data-driven: no per-query literals.
     if is_explicit_without_directive(q_orig, &lc, compound) {
-        tracing::info!("[DBG-nego] nego TRUE compound='{}' q='{}'", compound, q_orig);
         return true;
     }
     false
@@ -8186,14 +8185,18 @@ fn is_real_exclusion(
 /// query as a real exclusion, gated by the manner/attribute/verb-led/grammar-noise/
 /// subjective classifiers so predicate negations are NOT promoted. No per-query
 /// literals; relies on existing seed lists (ATTRIBUTE_NOUNS, etc.).
-fn is_explicit_without_directive(q_orig: &str, lc: &str, compound: &str) -> bool {
+fn is_explicit_without_directive(q_orig: &str, _lc: &str, compound: &str) -> bool {
     let comp = compound.to_lowercase();
     if comp.is_empty() || comp == "none" {
         return false;
     }
+    // The directive check (and the HOW-query head gate) must scan the FULL query,
+    // not the compound — `lc`/`_lc` here is the lowercased compound passed by the
+    // caller, so recompute from q_orig.
+    let q_lc = q_orig.to_lowercase();
     // Only the explicit selection prepositions qualify — predicate negations use
     // `not`/`without` as verb-argument scope, not as a direct object directive.
-    let has_directive = lc.contains("without") || lc.contains("with no");
+    let has_directive = q_lc.contains("without") || q_lc.contains("with no");
     if !has_directive {
         return false;
     }
@@ -8221,9 +8224,9 @@ fn is_explicit_without_directive(q_orig: &str, lc: &str, compound: &str) -> bool
     // qualifier (a constraint the user accepts), not a result filter. Mirror
     // is_manner_frame's how-to head-gate (commit 2b6a4de) so the directive is
     // rejected before final acceptance.
-    if lc.contains("how to") || lc.contains("how do") || lc.contains("how can")
-        || lc.contains("ways to") || lc.contains("best way") || lc.contains("tips for")
-        || lc.contains("guide to") || lc.contains("how to learn")
+    if q_lc.contains("how to") || q_lc.contains("how do") || q_lc.contains("how can")
+        || q_lc.contains("ways to") || q_lc.contains("best way") || q_lc.contains("tips for")
+        || q_lc.contains("guide to") || q_lc.contains("how to learn")
     {
         return false;
     }
