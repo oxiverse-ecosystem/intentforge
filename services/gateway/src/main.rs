@@ -2418,16 +2418,6 @@ fn constraint_score(
         score *= alt_penalty;
     }
 
-    // FIX-IF-02: Multi-negation soft-penalty floor.
-    // With multiple negative constraints, per-term multiplicative penalties
-    // compound and crush results to near-zero even if they match only some
-    // exclusions. A result matching ANY negative should not be demoted below
-    // 0.15 of its original score — "not react not angular not vue" means
-    // "show me none of these", so a Vue result should still appear (demoted),
-    // not be eliminated. The hard-drop check below catches genuinely dominated
-    // titles, so this floor only lifts results that survive that gate.
-    score = score.max(0.15);
-
     // ── BUG P0: hard-exclude pages whose TOPIC IS the excluded term ──
     // Soft penalties alone let "best python ide NOT pycharm" surface PyCharm
     // in the top 5 (47% of results still mentioned it). But we must NOT drop
@@ -2480,7 +2470,24 @@ fn constraint_score(
                 })
             }).count();
             let dom_frac = dominated as f32 / title_tokens.len() as f32;
-            if dom_frac >= 0.5 {
+            // Adaptive threshold: ≥50% tokens dominated is always enough, but a
+            // SHORT title (≤4 content tokens) where a single token is an exact
+            // match for the excluded term is ALSO dominated — e.g. "Java
+            // Programming Language" (3 tokens, 1 = "java") is unambiguously about
+            // Java, so the 0.5 ratio (0.33) would wrongly let it survive only to
+            // be resurrected by the soft-penalty floor below. The single-token
+            // exact-match guard only fires when the excluded term IS the title's
+            // topic word; "Python Programming Guide" + "java" has 0 dominant tokens
+            // and is unaffected.
+            let single_token_dominant = title_tokens.len() <= 4
+                && dominated >= 1
+                && title_tokens.iter().filter(|tok| {
+                    expanded_negatives.iter().any(|neg| {
+                        let n = neg.trim().to_lowercase();
+                        **tok == n && !negatives_in_negating_context.contains(neg)
+                    })
+                }).count() >= 1;
+            if dom_frac >= 0.5 || single_token_dominant {
                 tracing::info!(
                     "NEG HARD-DROP (topic match): '{}' dominated by excluded term(s) ({}/{} tokens)",
                     title, dominated, title_tokens.len()
@@ -2489,6 +2496,17 @@ fn constraint_score(
             }
         }
     }
+
+    // FIX-IF-02: Multi-negation soft-penalty floor.
+    // With multiple negative constraints, per-term multiplicative penalties
+    // compound and crush results to near-zero even if they match only some
+    // exclusions. A result matching ANY negative should not be demoted below
+    // 0.15 of its original score — "not react not angular not vue" means
+    // "show me none of these", so a Vue result should still appear (demoted),
+    // not be eliminated. The hard-drop check above catches genuinely dominated
+    // titles and returns 0.0, so this floor only lifts results that survive
+    // that gate (the comment's intent now matches the code's ordering).
+    score = score.max(0.12);
 
     // Positive constraints: boost for each match (fuzzy matching)
     if !constraints.positive.is_empty() {
