@@ -1189,7 +1189,7 @@ pub(crate) const WORD_FREQUENCIES: &[(&str, f64)] = &[
     ("tragedy", 0.085), ("julian", 0.085), ("nest", 0.085), ("pam", 0.085), ("dryer", 0.085), ("painful", 0.085), ("velvet", 0.085), ("tribunal", 0.085),
     ("ruled", 0.085), ("nato", 0.085), ("pensions", 0.085), ("prayers", 0.085), ("funky", 0.085), ("secretariat", 0.085), ("nowhere", 0.085), ("cop", 0.085),
     ("paragraphs", 0.085), ("gale", 0.085), ("joins", 0.085), ("adolescent", 0.085), ("nominations", 0.085), ("wesley", 0.085), ("dim", 0.085), ("lately", 0.085),
-    ("cancelled", 0.085), ("cancelling", 0.085), ("scary", 0.085), ("mattress", 0.084), ("mpegs", 0.084), ("brunei", 0.084), ("likewise", 0.084), ("banana", 0.084), ("introductory", 0.084),
+    ("cancelled", 0.085), ("cancelling", 0.100), ("canceling", 0.080), ("scary", 0.085), ("mattress", 0.084), ("mpegs", 0.084), ("brunei", 0.084), ("likewise", 0.084), ("banana", 0.084), ("introductory", 0.084),
     ("slovak", 0.084), ("cakes", 0.084), ("stan", 0.084), ("reservoir", 0.084), ("occurrence", 0.084), ("idol", 0.084), ("bloody", 0.084), ("mixer", 0.084),
     ("remind", 0.084), ("wc", 0.084), ("worcester", 0.084), ("sbjct", 0.084), ("demographic", 0.084), ("charming", 0.084), ("mai", 0.084), ("tooth", 0.084),
     ("disciplinary", 0.084), ("annoying", 0.084), ("respected", 0.084), ("stays", 0.084), ("disclose", 0.084), ("affair", 0.084), ("drove", 0.084), ("washer", 0.084),
@@ -1902,7 +1902,6 @@ pub(crate) const WORD_FREQUENCIES: &[(&str, f64)] = &[
     ("pythn", 0.0010), ("pthon", 0.0010), ("housr", 0.0010), ("ngnix", 0.0010),
     ("perfom", 0.0010), ("editer", 0.0010), ("begginners", 0.0010), ("orcale", 0.0010), ("agular", 0.0010), ("pypeline", 0.0010), ("surprize", 0.0010),
     ("tranfer", 0.0010), ("bluetooh", 0.0010),
-    ("cancing", 0.0010),
 ];
 
 /// Look up a lowercase word's corpus frequency. Returns None when the word is

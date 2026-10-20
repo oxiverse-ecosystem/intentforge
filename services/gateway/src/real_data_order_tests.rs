@@ -3,21 +3,43 @@
 //
 // The order-invariance tests in commerce_contract_tests.rs build synthetic
 // networks. This file closes the remaining gap: the production data file
-// `data/commerce/affiliate.json` ships FIVE networks with different template
-// kinds (`wrap` and `append_params`) and different `params`/`bid_floor`/
-// `fallback_url` shapes. A rendering bug in any of those shapes could, in
-// principle, alter a result. These tests load the ACTUAL file the gateway loads
-// at startup (`AffiliateCtx::load()` — the very same function production uses)
-// and assert, for EVERY network and EVERY key-presence configuration, that the
-// ranked URL list is byte-identical.
+// `data/commerce/affiliate.json` ships FIVE networks spanning both template
+// kinds (`wrap` and `append_params`) with different `params` / `bid_floor` /
+// `fallback_url` shapes. A rendering bug in any of those shapes could in
+// principle alter a result. These tests load the ACTUAL file the gateway loads
+// at startup (`AffiliateCtx::load()` — the same function production uses) and
+// assert that the ranked URL list is byte-identical whether the network's key
+// is PRESENT or ABSENT.
+//
+// PORT NOTE (this file was ported onto the round branch from
+// `commerce/fbu-guard-t_caef42c9`, whose HEAD-of-file variant also asserted an
+// `exact_model_patterns` / `is_exact_model_query` eligibility gate). That gate
+// does not exist on this lineage, so the broad-query eligibility test could not
+// be ported as written; inventing a gate here would be a FEATURE, not a port.
+// Only the order-invariance invariant is asserted below, which is the mandate.
+// See the eligibility gap noted on the originating card.
+//
+// ── WHY THESE TESTS NEVER DELETE AN ENV VAR ──────────────────────────────────
+// `first_usable()` reads the process environment, so "key present" normally
+// means `set_var` and "key absent" means `remove_var`. That is UNSAFE in a test
+// binary: `cargo test` runs test functions on parallel threads sharing one
+// process environment, so a `remove_var` here deletes a variable another test
+// just set and makes an unrelated test fail non-deterministically. (An earlier
+// draft of this file did exactly that and broke four unrelated tests.)
+//
+// Instead we vary key PRESENCE WITHOUT MUTATION: each network clone is given a
+// `key_env` name that is either (a) freshly set to a dummy value, or (b) a name
+// that is never set anywhere in the suite. Both paths run the identical real
+// production code (`decorate_affiliate` -> `first_usable` ->
+// `render_affiliate_url`); only the resolvability of the declared key differs.
+// That is exactly the variable under test, with zero cross-test interference.
 //
 // The live two-process counterpart is scripts/verify_affiliate_order_invariance.py
-// (real gateways, keys present vs absent). This file is the offline CI lock.
+// (real gateways, one with keys, two without). This file is the offline CI lock.
 // ─────────────────────────────────────────────────────────────────────────────
 #![cfg(test)]
 
 use super::*;
-use crate::affiliate::*;
 use serde_json::Value;
 
 /// The ranked input every test here decorates: several results with DIFFERENT
@@ -50,98 +72,119 @@ fn ranked_fixture() -> Vec<Value> {
 
 fn ranked_urls(arr: &[Value]) -> Vec<String> {
     arr.iter()
-        .map(|r| r.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string())
+        .map(|r| {
+            r.get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
         .collect()
 }
 
 fn affiliate_urls(arr: &[Value]) -> Vec<String> {
     arr.iter()
-        .filter_map(|r| r.get("affiliate").and_then(|a| a.get("url")).and_then(|v| v.as_str()))
+        .filter_map(|r| {
+            r.get("affiliate")
+                .and_then(|a| a.get("url"))
+                .and_then(|v| v.as_str())
+        })
         .map(|s| s.to_string())
         .collect()
 }
 
-/// A query the shipped eligibility patterns must accept. It is asserted at
-/// runtime (not assumed) so this test fails loudly if the data policy drifts,
-/// rather than silently becoming vacuous.
-const EXACT_MODEL_QUERY: &str = "iphone 16 pro max price";
-
 /// Load the real runtime config and assert it is actually usable, so a broken or
-/// missing data file fails here instead of making every invariance test below
+/// missing data file FAILS here instead of making every invariance test below
 /// pass by decorating nothing.
-fn real_ctx() -> AffiliateCtx {
+///
+/// This is the guard the card asked for: without it an empty/mis-mounted
+/// `data/commerce/affiliate.json` turns both comparison runs into no-ops and the
+/// order-invariance guarantee reports success while testing nothing.
+fn real_ctx() -> Vec<AffiliateNetwork> {
     let ctx = AffiliateCtx::load();
     assert!(
         !ctx.networks.is_empty(),
-        "data/commerce/affiliate.json yielded no networks — invariance tests would be vacuous"
+        "data/commerce/affiliate.json yielded no networks — the order-invariance \
+         tests would be VACUOUS (both runs would decorate nothing and compare \
+         equal). Check that the test image COPYs data/ into the working dir."
     );
-    ctx
+    // The fixture spans both renderer kinds, so asserting both are present
+    // catches a config that silently lost a whole template kind.
+    assert!(
+        ctx.networks.iter().any(|n| n.kind == "wrap"),
+        "shipped config has no `wrap` network — the fixture would not exercise the \
+         network-prefix renderer"
+    );
+    assert!(
+        ctx.networks.iter().any(|n| n.kind == "append_params"),
+        "shipped config has no `append_params` network — the fixture would not \
+         exercise the param-append renderer"
+    );
+    ctx.networks
 }
 
-/// Present every network's declared key env var with a dummy value, so
-/// `first_usable()` can select networks in priority order. The VALUES are
-/// irrelevant to ordering; only their presence/absence is under test.
-fn present_all_keys(ctx: &AffiliateCtx) -> Vec<String> {
-    let mut set = Vec::new();
-    for n in &ctx.networks {
-        if let Some(k) = &n.key_env {
-            std::env::set_var(k, "DUMMY_KEY_FOR_ORDER_INVARIANCE");
-            set.push(k.clone());
+/// Clone the real networks with every `key_env` remapped to names that are
+/// guaranteed either SET (dummy value) or UNSET. Nothing is ever removed from
+/// the process environment, so these tests cannot disturb any other test.
+fn remap_keys(
+    networks: &[AffiliateNetwork],
+    suffix: &str,
+    set_them: bool,
+) -> Vec<AffiliateNetwork> {
+    let mut cloned: Vec<AffiliateNetwork> = networks.to_vec();
+    for n in cloned.iter_mut() {
+        // Sanitize the id so the env-var name is always a legal identifier.
+        let id: String = n
+            .id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let var = format!("ORDERINV_{}_{}", id.to_uppercase(), suffix);
+        if set_them {
+            std::env::set_var(&var, "DUMMY_KEY_FOR_ORDER_INVARIANCE");
         }
+        n.key_env = Some(var);
     }
-    set
-}
-
-fn remove_keys(keys: &[String]) {
-    for k in keys {
-        std::env::remove_var(k);
-    }
+    cloned
 }
 
 /// THE ORDER-INVARIANCE LOCK, driven by the REAL data file.
 ///
 /// For each shipped network in isolation: decorate the same already-ranked input
-/// twice — once with that network's key PRESENT, once with it ABSENT (and every
-/// other network's key removed so no network is usable at all) — and require the
-/// ranked URL list to be byte-identical. Non-vacuity is enforced in both
-/// directions: the keyed run MUST have decorated, the keyless run MUST NOT.
+/// once with that network's key resolvable and once with it unresolvable, and
+/// require the ranked URL list to be byte-identical. Non-vacuity is enforced in
+/// both directions — the keyed run MUST have decorated, the keyless run MUST NOT
+/// — so this can never "pass" by comparing two no-op runs.
 #[test]
 fn real_data_order_is_invariant_for_every_network_key_on_and_off() {
-    // Serialize against every other env-mutating test: these assertions depend
-    // on process-global key vars being exactly as we left them.
-    let _env_guard = crate::ENV_TEST_LOCK.lock();
-    let ctx = real_ctx();
-    // Queries the shipped policy must treat as exact-model. Asserted, not assumed.
-    assert!(
-        ctx.is_exact_model_query(EXACT_MODEL_QUERY),
-        "shipped eligibility patterns must accept {EXACT_MODEL_QUERY:?} — otherwise the \
-         invariance comparison below would never exercise decoration"
-    );
+    let networks = real_ctx();
 
     for net in &networks {
         // KEYS PRESENT: only this network, its remapped key set to a dummy value.
-        let keyed_ctx = AffiliateCtx { networks: remap_keys(std::slice::from_ref(net), "PRESENT", true) };
+        let keyed_ctx = AffiliateCtx::from_networks(remap_keys(std::slice::from_ref(net), "PRESENT", true));
         let mut with_key = ranked_fixture();
-        decorate_affiliate_for_query(&mut with_key, &solo, EXACT_MODEL_QUERY);
+        decorate_affiliate(&mut with_key, &keyed_ctx);
         let with_key_ranked = ranked_urls(&with_key);
         let with_key_aff = affiliate_urls(&with_key);
         assert!(
             !with_key_aff.is_empty(),
-            "network {:?}: keys-present run must actually decorate (affiliate urls present); \
-             an empty decoration makes the comparison vacuous",
-            net.id
+            "network {:?} ({:?}): the keys-present run must actually decorate \
+             (affiliate urls present); an empty decoration makes the comparison vacuous",
+            net.id,
+            net.kind
         );
 
         // KEYS ABSENT: same network, key_env remapped to a name nothing ever sets.
-        let unkeyed_ctx = AffiliateCtx { networks: remap_keys(std::slice::from_ref(net), "ABSENT", false) };
+        let unkeyed_ctx = AffiliateCtx::from_networks(remap_keys(std::slice::from_ref(net), "ABSENT", false));
         let mut no_key = ranked_fixture();
-        decorate_affiliate_for_query(&mut no_key, &solo, EXACT_MODEL_QUERY);
+        decorate_affiliate(&mut no_key, &unkeyed_ctx);
         let no_key_ranked = ranked_urls(&no_key);
         let no_key_aff = affiliate_urls(&no_key);
         assert!(
             no_key_aff.is_empty(),
-            "network {:?}: keys-absent run must NOT decorate (affiliate urls absent)",
-            net.id
+            "network {:?} ({:?}): the keys-absent run must NOT decorate \
+             (affiliate urls absent)",
+            net.id,
+            net.kind
         );
 
         assert_eq!(
@@ -153,30 +196,30 @@ fn real_data_order_is_invariant_for_every_network_key_on_and_off() {
     }
 }
 
-/// The whole production config, keys present, vs the whole production config,
-/// keys absent. This is the closest offline analogue of the live probe: same
-/// `AffiliateCtx::load()` production uses, only the env key presence differs.
+/// The WHOLE production config, keys resolvable vs keys unresolvable — the
+/// closest offline analogue of the live probe: same `AffiliateCtx::load()`
+/// production uses, only the resolvability of the declared keys differs.
 #[test]
 fn real_data_whole_config_order_invariant_keys_present_vs_absent() {
-    // Serialize against every other env-mutating test: these assertions depend
-    // on process-global key vars being exactly as we left them.
-    let _env_guard = crate::ENV_TEST_LOCK.lock();
-    let ctx = real_ctx();
-    let all_keys: Vec<String> = ctx.networks.iter().filter_map(|n| n.key_env.clone()).collect();
+    let networks = real_ctx();
 
-    let unkeyed_ctx = AffiliateCtx { networks: remap_keys(&networks, "WHOLE_ABSENT", false) };
+    let unkeyed_ctx = AffiliateCtx::from_networks(remap_keys(&networks, "WHOLE_ABSENT", false));
     let mut absent = ranked_fixture();
-    decorate_affiliate_for_query(&mut absent, &ctx, EXACT_MODEL_QUERY);
+    decorate_affiliate(&mut absent, &unkeyed_ctx);
     let absent_ranked = ranked_urls(&absent);
-    let absent_aff = affiliate_urls(&absent);
-    assert!(absent_aff.is_empty(), "keys absent => nothing may be decorated");
+    assert!(
+        affiliate_urls(&absent).is_empty(),
+        "keys unresolvable => nothing may be decorated"
+    );
 
-    let keyed_ctx = AffiliateCtx { networks: remap_keys(&networks, "WHOLE_PRESENT", true) };
+    let keyed_ctx = AffiliateCtx::from_networks(remap_keys(&networks, "WHOLE_PRESENT", true));
     let mut present = ranked_fixture();
-    decorate_affiliate_for_query(&mut present, &ctx, EXACT_MODEL_QUERY);
+    decorate_affiliate(&mut present, &keyed_ctx);
     let present_ranked = ranked_urls(&present);
-    let present_aff = affiliate_urls(&present);
-    assert!(!present_aff.is_empty(), "keys present => decoration must happen");
+    assert!(
+        !affiliate_urls(&present).is_empty(),
+        "keys resolvable => decoration must happen"
+    );
 
     assert_eq!(
         present_ranked, absent_ranked,
@@ -184,46 +227,43 @@ fn real_data_whole_config_order_invariant_keys_present_vs_absent() {
     );
 }
 
-/// Broad category queries must stay free AND must not move anything either. This
-/// is the privacy/business-policy half of the same invariant: no monetization on
-/// non-model queries, and still no reordering.
+/// Decoration must be a PURE post-ranking pass over the real config: the
+/// complete serialized result array (not just the URL column) is byte-identical
+/// once the `affiliate` block is removed. This catches a decoration path that
+/// mutates a field nobody diffs by eye — score, title, metadata — which a
+/// URL-only comparison would miss.
 #[test]
 fn real_data_decoration_touches_no_field_except_affiliate() {
     let networks = real_ctx();
-    let keyed_ctx = AffiliateCtx { networks: remap_keys(&networks, "FIELDS", true) };
+    let keyed_ctx = AffiliateCtx::from_networks(remap_keys(&networks, "FIELDS", true));
 
-    // Broad, non-model commercial queries spanning several shapes. These are
-    // shapes, not fixtures tuned to one string: if the data policy legitimately
-    // grows to monetize one of them, the assertions below fail and the test is
-    // updated deliberately rather than silently drifting.
-    let broad = [
-        "best wireless earbuds under 50 dollars",
-        "wireless earbuds",
-        "steel water bottle",
-        "under 50 dollars",
-    ];
-    for q in broad {
-        assert!(
-            !ctx.is_exact_model_query(q),
-            "broad query {q:?} must not be eligible for affiliate decoration"
-        );
-        let baseline = ranked_fixture();
-        let baseline_ranked = ranked_urls(&baseline);
-        let mut arr = ranked_fixture();
-        decorate_affiliate_for_query(&mut arr, &ctx, q);
-        assert!(
-            affiliate_urls(&arr).is_empty(),
-            "broad query {q:?} received affiliate decoration: {:?}",
-            affiliate_urls(&arr)
-        );
-        assert_eq!(
-            ranked_urls(&arr),
-            baseline_ranked,
-            "broad query {q:?}: the no-op decoration path altered the ranked order"
-        );
+    let mut decorated = ranked_fixture();
+    decorate_affiliate(&mut decorated, &keyed_ctx);
+    assert!(
+        !affiliate_urls(&decorated).is_empty(),
+        "the keyed run must actually decorate, otherwise this test is vacuous"
+    );
+
+    // Strip the affiliate block and compare against the untouched fixture.
+    let mut stripped = decorated.clone();
+    for r in stripped.iter_mut() {
+        if let Some(obj) = r.as_object_mut() {
+            obj.remove("affiliate");
+        }
     }
+    assert_eq!(
+        ranked_fixture(),
+        stripped,
+        "decoration mutated a field other than `affiliate` — it is a strict \
+         post-ranking pass and must touch nothing else"
+    );
 
-    remove_keys(&all_keys);
+    // And the rank ORDER itself must survive, unchanged and complete.
+    assert_eq!(
+        ranked_urls(&ranked_fixture()),
+        ranked_urls(&decorated),
+        "decoration changed the ranked URL order"
+    );
 }
 
 /// NON-VACUITY ASSERTION for the main path (card t_a46a53d3).
@@ -277,7 +317,7 @@ async fn main_path_enrichment_is_non_vacuous_with_fetchable_pages() {
 
     // Now decorate with keys present and verify the strip would be non-empty.
     let networks = real_ctx();
-    let keyed_ctx = AffiliateCtx { networks: remap_keys(&networks, "STRIP_PRESENT", true) };
+    let keyed_ctx = AffiliateCtx::from_networks(remap_keys(&networks, "STRIP_PRESENT", true));
     decorate_affiliate(&mut arr, &keyed_ctx);
 
     // The concrete_offers filter (main path gate) must find at least one row.

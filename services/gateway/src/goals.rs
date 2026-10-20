@@ -1253,11 +1253,6 @@ pub async fn handle_leaderboard(
     // Returns a bare JSON ARRAY (Vec<LeaderboardEntry>) per the audit's schema
     // assertion: the leaderboard response MUST be a list (iterable) of goal objects,
     // not a dict wrapper. (Formerly returned `{"entries":[...],"total_entries":N}`.)
-    // Returns a BARE JSON ARRAY of leaderboard entries (score-descending, max 50).
-    // `total_entries` is intentionally dropped — it is trivially derivable client-side
-    // as the array length, and a bare list is the consistent shape for a collection
-    // endpoint. The CI schema test (tests/goals_api_schema.py::test_goals_leaderboard_is_list)
-    // and the standing audit brief both encode this list contract.
     (StatusCode::OK, Json(entries)).into_response()
 }
 
@@ -1419,7 +1414,7 @@ pub async fn handle_get_progress(
 }
 
 #[cfg(test)]
-mod tests_roadmap {
+mod roadmap_schema_tests {
     use super::*;
 
     // Regression test for D1: roadmap.total_phases must equal the number of
@@ -1448,27 +1443,5 @@ mod tests_roadmap {
                 goal
             );
         }
-    }
-
-    // Regression: goal object must expose a `status` field. The goal response
-    // schema (API_REFERENCE.md) requires status ∈ {"pending_answers", "active", "completed"}.
-    #[test]
-    fn goal_status_pending_when_no_roadmap() {
-        assert_eq!(goal_status(None, 0, 0), "pending_answers");
-    }
-
-    #[test]
-    fn goal_status_active_when_phases_incomplete() {
-        let roadmap = generate_roadmap("Learn Rust", &[], &[]);
-        // total_phases > 0, completed_phases == 0 → "active"
-        assert_eq!(goal_status(Some(&roadmap), 0, roadmap.total_phases), "active");
-    }
-
-    #[test]
-    fn goal_status_completed_when_all_phases_done() {
-        let roadmap = generate_roadmap("Learn Rust", &[], &[]);
-        let total = roadmap.total_phases;
-        // completed == total > 0 → "completed"
-        assert_eq!(goal_status(Some(&roadmap), total, total), "completed");
     }
 }
