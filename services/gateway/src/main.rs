@@ -19632,6 +19632,7 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     // scanning for operators so the gateway's own parsing matches the engine
     // query and the intent engine's extraction.
     let q = normalize_nl_operators(q);
+    tracing::info!("DEBUG extract_gateway_constraints: normalized q='{}'", q);
     let mut file_types = Vec::new();
     let mut sites = Vec::new();
     let mut phrases = Vec::new();
