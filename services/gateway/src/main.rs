@@ -19567,14 +19567,20 @@ fn normalize_nl_operators(query: &str) -> String {
             }
         }
         to_skip_ranges.sort_by_key(|r| r.0);
+        // Phase 2: rebuild the query by walking the ORIGINAL string from 0
+        // and dropping each negation span. Must NOT reuse `cursor` — Phase 1
+        // (entity collection) left it at the last span_end, which would skip
+        // the entire prefix before the negation span, silently deleting tokens
+        // like `price:<50000` that precede the negated clause.
+        let mut rebuild_cursor = 0usize;
         for (s, e) in to_skip_ranges {
-            if s > cursor {
-                rebuilt.push_str(&out[cursor..s]);
+            if s > rebuild_cursor {
+                rebuilt.push_str(&out[rebuild_cursor..s]);
             }
-            cursor = e;
+            rebuild_cursor = e;
         }
-        if cursor < out.len() {
-            rebuilt.push_str(&out[cursor..]);
+        if rebuild_cursor < out.len() {
+            rebuilt.push_str(&out[rebuild_cursor..]);
         }
         let neg_suffix: Vec<String> = consumed
             .iter()
@@ -19632,7 +19638,6 @@ fn extract_gateway_constraints(q: &str) -> Constraints {
     // scanning for operators so the gateway's own parsing matches the engine
     // query and the intent engine's extraction.
     let q = normalize_nl_operators(q);
-    tracing::info!("DEBUG extract_gateway_constraints: normalized q='{}'", q);
     let mut file_types = Vec::new();
     let mut sites = Vec::new();
     let mut phrases = Vec::new();
