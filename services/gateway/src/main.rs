@@ -2484,7 +2484,7 @@ fn constraint_score(
                 && title_tokens.iter().filter(|tok| {
                     expanded_negatives.iter().any(|neg| {
                         let n = neg.trim().to_lowercase();
-                        **tok == n && !negatives_in_negating_context.contains(neg)
+                        **tok == n && !negatives_in_negating_context.contains(&neg)
                     })
                 }).count() >= 1;
             if dom_frac >= 0.5 || single_token_dominant {
