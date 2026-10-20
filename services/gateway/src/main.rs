@@ -8176,6 +8176,7 @@ fn is_real_exclusion(
     // "music background") stay declined — they constrain the learner, not result
     // content. Fully structural / data-driven: no per-query literals.
     if is_explicit_without_directive(q_orig, &lc, compound) {
+        tracing::info!("[DBG-nego] nego TRUE compound='{}' q='{}'", compound, q_orig);
         return true;
     }
     false
