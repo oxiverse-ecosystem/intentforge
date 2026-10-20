@@ -8220,6 +8220,12 @@ fn is_explicit_without_directive(q_orig: &str, _lc: &str, compound: &str) -> boo
     if ATTRIBUTE_NOUNS.iter().any(|a| comp_tokens.contains(&a)) {
         return false;
     }
+    // Multi-token compounds whose HEAD (first token) is a verb are predicate/manner
+    // phrases ("paying attention", "tracking cookies"), not content topics to filter.
+    // is_verb_attribute_exclusion on the lone head token returns true for verb heads.
+    if comp_tokens.len() > 1 && is_verb_attribute_exclusion(comp_tokens[0]) {
+        return false;
+    }
     // (3) HOW-query manner head gate: `without X` inside a how-to query is a manner
     // qualifier (a constraint the user accepts), not a result filter. Mirror
     // is_manner_frame's how-to head-gate (commit 2b6a4de) so the directive is
