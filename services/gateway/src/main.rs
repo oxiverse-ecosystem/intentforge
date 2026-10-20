@@ -7861,10 +7861,35 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
         format!("with no a {}", c),
     ];
     if frames.iter().any(|f| lc.contains(f.as_str())) {
-        return true;
+        // A "without X" / "with no X" frame alone is NOT sufficient to treat X
+        // as a manner qualifier. X may be a genuine content exclusion the user
+        // wants filtered out ("laptop under $500 without bloatware" → exclude
+        // bloatware; "shoes without laces" → exclude laces), not a HOW-style
+        // qualifier. The frame only describes manner when the query is an
+        // instructional/procedural request ("how to ...") where "without X"
+        // describes the method, not the content topic.
+        //
+        // This is structural, not per-query: the head frames are a general
+        // open-class seed (how-to / ways-to / tips / best-practices style),
+        // not a brand or domain list (no hardcoding doctrine).
+        let head = lc.trim_start();
+        let head_frames: &[&str] = &[
+            "how to", "how do", "how can", "how should", "how would",
+            "how i", "ways to", "ways of", "best way",
+            "best ways", "tips for", "tip for", "guide to", "guide for",
+            "trick to", "tricks for", "how to get rid of",
+        ];
+        if head_frames.iter().any(|f| head.starts_with(f)) {
+            return true;
+        }
+        // Non-instructional queries: "without X" names content to exclude,
+        // not manner. Fall through to the pronoun check below (a compound
+        // like "track you as" still catches manner via MANNER_PRONOUNS even
+        // outside a how-to query).
     }
-    // Manner pronouns anywhere in the compound ("track you as", "offend the couple")
-    // mark it as a manner qualifier even without the "without" frame.
+    // Manner pronouns anywhere in the compound ("track you as", "offend the
+    // couple") are direct evidence of a requester-attached phrase, independent
+    // of any frame or query head.
     let c_tokens: Vec<&str> = c.split_whitespace().collect();
     c_tokens.iter().any(|t| MANNER_PRONOUNS.contains(t))
 }
