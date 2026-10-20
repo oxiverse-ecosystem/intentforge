@@ -20401,6 +20401,34 @@ mod negation_scope_tests {
             negs
         );
     }
+
+    #[test]
+    fn negation_rewrite_preserves_preceding_price_constraint() {
+        // Regression: a negation clause ("without X") following a price bound
+        // ("under 50000") must NOT delete the price token. The negation
+        // rewrite's span-dropping reused a cursor that Phase 1 had already
+        // advanced to span_end, so the rebuild phase skipped the query prefix —
+        // dropping "price:<50000" and yielding price_lt=None. Verified live:
+        // the normalized output was "-bloatware" (price gone) instead of
+        // "best laptop price:<50000 -bloatware".
+        let out = normalize_nl_operators("best laptop under 50000 without bloatware");
+        assert!(
+            out.contains("price:<50000"),
+            "price:<50000 must survive the negation rewrite, got: {:?}",
+            out
+        );
+        assert!(
+            out.contains("-bloatware"),
+            "negation suffix must be appended, got: {:?}",
+            out
+        );
+        let out2 = normalize_nl_operators("best laptop under 50000");
+        assert!(
+            out2.contains("price:<50000"),
+            "price:<50000 must survive without negation, got: {:?}",
+            out2
+        );
+    }
 }
 
 #[cfg(test)]
