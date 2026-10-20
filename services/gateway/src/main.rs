@@ -8059,13 +8059,14 @@ fn negated_by_preposition(q_orig: &str, compound: &str) -> bool {
 /// carrying it are pages the user does not want.
 ///
 /// This is a structural test over the token stream — the query's HEAD frame —
-/// not a noun allow/deny list. It reuses the existing open-class
-/// `NON_LOCAL_HEAD_FRAMES` request-frame vocabulary already in this file (the
-/// P10/P11 precedent: a fixed structural vocabulary of request openers, gated
-/// on the head, never on the content noun). A prior attempt at this fix
-/// substituted a 6-noun `ATTRIBUTE_OBJECTS` allow-list for the missing signal
-/// and was correctly rejected under the hardcoding doctrine; this replaces the
-/// signal rather than the list.
+/// not a noun allow/deny list. It uses a self-contained open-class seed of
+/// instructional request openers (how-to / ways-to / tips / best-practices
+/// style), gated on the query head, never on the content noun (the P10/P11
+/// precedent: a fixed structural vocabulary of request openers, never on the
+/// negated noun). A prior attempt at this fix substituted a 6-noun
+/// `ATTRIBUTE_OBJECTS` allow-list for the missing signal and was correctly
+/// rejected under the hardcoding doctrine; this replaces the signal rather
+/// than the list.
 ///
 /// Precedence note: an already-recognized ENTITY inside a how-to frame stays a
 /// real exclusion, because `is_real_exclusion` runs first in the gate chain and
@@ -8097,12 +8098,31 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
     if !frames.iter().any(|f| lc.contains(f.as_str())) {
         return false;
     }
-    // Being in the frame is necessary but NOT sufficient: the query must be an
-    // instructional/procedural REQUEST for the negated noun to describe the
-    // method rather than the content. Gate on the query's head frame against
-    // the existing open-class request-frame vocabulary.
+    // Being in the "without X" / "with no X" frame is necessary but NOT sufficient
+    // to treat X as a manner qualifier. X may be a genuine content exclusion the
+    // user wants filtered out ("laptop under $500 without bloatware" -> exclude
+    // bloatware; "shoes without laces" -> exclude laces), not a HOW-style
+    // qualifier. The frame only describes manner when the query is an
+    // instructional/procedural request ("how to ...") where "without X"
+    // describes the method, not the content topic.
+    //
+    // This is structural, not per-query: the head frames are a general
+    // open-class seed (how-to / ways-to / tips / best-practices style),
+    // not a brand or domain list (no hardcoding doctrine).
     let head = lc.trim_start();
-    NON_LOCAL_HEAD_FRAMES.iter().any(|f| head.starts_with(f))
+    let head_frames: &[&str] = &[
+        "how to", "how do", "how can", "how should", "how would",
+        "how i", "ways to", "ways of", "best way",
+        "best ways", "tips for", "tip for", "guide to", "guide for",
+        "trick to", "tricks for", "how to get rid of",
+    ];
+    if !head_frames.iter().any(|f| head.starts_with(f)) {
+        return false;
+    }
+    // Instructional/procedural frames: "without X" qualifies the method, not
+    // the content. Manner pronouns (already checked above) are the stronger
+    // signal; this is the frame-based tail.
+    true
 }
 
 fn is_manner_phrase(compound: &str) -> bool {
@@ -22232,6 +22252,49 @@ mod negation_scope_tests {
         assert!(!kept.iter().any(|t| t.contains("music background")), "kept={kept:?}");
         assert!(!dropped.iter().any(|t| t.contains("music background")), "dropped={dropped:?}");
         assert!(manner.iter().any(|t| t.contains("music background")), "manner={manner:?}");
+    }
+
+    #[test]
+    fn without_exclusion_honored_on_non_howto_queries() {
+        // REGRESSION (t_de3b8241): `is_manner_frame` used to claim EVERY
+        // "without X" / "with no X" phrase as a manner qualifier, so product
+        // nouns the user clearly wants filtered out (bloatware, charger, rgb)
+        // were routed to `manner_qualifiers` and DISCARDED (the bucket is inert
+        // — no ranking/filtering code reads it). They must instead fall through
+        // to `is_real_exclusion`, which decides kept-vs-declined on entity /
+        // contrastive grounds.
+        //
+        // Non-how-to queries: the "without X" target must NOT be a manner
+        // qualifier. It must be a real exclusion candidate (kept or declined),
+        // never silently discarded into `manner`.
+        for (q, target) in [
+            ("best laptop without bloatware", "bloatware"),
+            ("laptop under 50000 without bloatware", "bloatware"),
+            ("phone without charger", "charger"),
+            ("laptop without rgb lighting", "rgb lighting"),
+            ("shoes without laces", "laces"),
+            ("laptop without bloatware and good battery", "bloatware"),
+        ] {
+            let (kept, dropped, manner) =
+                extract_query_negative_terms_with_dropped(q);
+            let joined = format!("{} {} ", kept.join(" "), dropped.join(" "));
+            assert!(
+                joined.contains(target),
+                "non-how-to 'without X' target '{}' must reach a ranking bucket (kept/dropped), not vanish: q={:?} kept={:?} dropped={:?}",
+                target, q, kept, dropped
+            );
+            assert!(
+                !manner.iter().any(|m| m == target),
+                "non-how-to 'without X' must NOT be a manner qualifier: q={:?} manner={:?}",
+                q, manner
+            );
+        }
+        // HOW-query path is unchanged: the same "without X" frame on an
+        // instructional query still routes X to manner_qualifiers.
+        let (kept, dropped, manner) =
+            extract_query_negative_terms_with_dropped("how to clean a cast iron skillet without soap");
+        assert!(kept.is_empty() && dropped.is_empty(), "how-to manner must not produce exclusions: kept={:?} dropped={:?}", kept, dropped);
+        assert!(manner.iter().any(|m| m == "soap"), "how-to manner qualifier must surface in manner: manner={:?}", manner);
     }
 
     #[test]
