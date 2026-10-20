@@ -7741,19 +7741,22 @@ fn pay_exclusion_is_money(q_orig: &str) -> bool {
 /// "apps that do not track you and respect privacy") is caught generally. A
 /// genuine topical exclusion (brand / place / noun the user named) is never in
 /// this set, so real exclusions survive.
+/// Personal-attribute / trait nouns that describe the USER, not a content topic.
+/// Promoted to module scope so both `is_verb_attribute_exclusion` and
+/// `is_explicit_without_directive` can consult it (no per-query hardcoding).
+const ATTRIBUTE_NOUNS: &[&str] = &[
+    "coordination", "dependents", "experience", "background", "training",
+    "skill", "skills", "knowledge", "degree", "qualification", "qualifications",
+    "subscription", "account", "accounts", "registration", "signup", "sign-up",
+    "login", "log-in", "app", "apps", "application", "applications", "download",
+    "downloading", "install", "installing", "permission", "permissions",
+];
+
 fn is_verb_attribute_exclusion(term: &str) -> bool {
     let lc = term.trim().to_lowercase();
     if lc.is_empty() {
         return true;
     }
-    // Personal-attribute / trait nouns that describe the USER, not a content topic.
-    const ATTRIBUTE_NOUNS: &[&str] = &[
-        "coordination", "dependents", "experience", "background", "training",
-        "skill", "skills", "knowledge", "degree", "qualification", "qualifications",
-        "subscription", "account", "accounts", "registration", "signup", "sign-up",
-        "login", "log-in", "app", "apps", "application", "applications", "download",
-        "downloading", "install", "installing", "permission", "permissions",
-    ];
     // Open-class verb seed (reuses MANNER_VERBS where overlapping) — the head of a
     // negated clause that is a verb is describing an action, not a topic to drop.
     const VERB_HEADS: &[&str] = &[
@@ -8162,17 +8165,71 @@ fn is_real_exclusion(
     if is_bare_not_selection(q_orig, &lc) {
         return true;
     }
-    // NOTE: a prior autonomous-QA commit (c4317bc) added an `is_explicit_negation_object`
-    // acceptance here that unconditionally treated ANY object of `without`/`not`/`except`
-    // as a real exclusion. That over-reached: generic attribute/manner objects
-    // ("without soap", "recipes not spicy") were wrongly extracted as hard-filter
-    // exclusions, breaking the manner/attribute tests and degrading result sets. It
-    // had no unit test of its own and cannot distinguish "spicy" from "systemd" without
-    // a hardcoded allow-list (which the no-hardcoding doctrine forbids). The pre-c4317bc
-    // behavior — decline generic nouns unless they are protected terms, capitalized
-    // proper nouns, or in contrastive framing — is the correct contract (covered by the
-    // existing manner/attribute tests), so this path is intentionally NOT taken.
+    // RESTEPPED FIX (t_de3b8241): a bare `without <entity>` directive on a
+    // WHAT/transactional/comparison query is an explicit user exclusion directive
+    // (the user named a topic they want filtered out) — it must surface as a real
+    // exclusion so the hard-drop/penalty logic actually removes pages about
+    // bloatware/charger/rgb. The manner/attribute/verb-led/grammar-noise/subjective
+    // classifiers gate it so predicate negations ("without soap", "recipes not
+    // spicy", "without paying attention") are NOT promoted. Eligibility/qualifier
+    // compounds containing an ATTRIBUTE_NOUN (e.g. "computer science degree",
+    // "music background") stay declined — they constrain the learner, not result
+    // content. Fully structural / data-driven: no per-query literals.
+    if is_explicit_without_directive(q_orig, &lc, compound) {
+        return true;
+    }
     false
+}
+
+/// Accepts a bare `without <entity>` / `with no <entity>` directive on a non-how-to
+/// query as a real exclusion, gated by the manner/attribute/verb-led/grammar-noise/
+/// subjective classifiers so predicate negations are NOT promoted. No per-query
+/// literals; relies on existing seed lists (ATTRIBUTE_NOUNS, etc.).
+fn is_explicit_without_directive(q_orig: &str, lc: &str, compound: &str) -> bool {
+    let comp = compound.to_lowercase();
+    if comp.is_empty() || comp == "none" {
+        return false;
+    }
+    // Only the explicit selection prepositions qualify — predicate negations use
+    // `not`/`without` as verb-argument scope, not as a direct object directive.
+    let has_directive = lc.contains("without") || lc.contains("with no");
+    if !has_directive {
+        return false;
+    }
+    // (1) Manner-frame / verb-led / predicate negations stay declined.
+    if is_manner_phrase(&comp) {
+        return false;
+    }
+    if is_verb_attribute_exclusion(&comp) {
+        return false;
+    }
+    if is_subjective_quality_term(&comp) {
+        return false;
+    }
+    if is_exclusion_grammar_noise(&comp) {
+        return false;
+    }
+    // (2) Eligibility / qualifier phrases constrain the learner, not a content topic.
+    // ATTRIBUTE_NOUNS (degree/qualification/skill/...) declines e.g.
+    // "computer science degree", "music background".
+    let comp_tokens: Vec<&str> = comp.split_whitespace().collect();
+    if ATTRIBUTE_NOUNS.iter().any(|a| comp_tokens.contains(&a)) {
+        return false;
+    }
+    // (3) HOW-query manner head gate: `without X` inside a how-to query is a manner
+    // qualifier (a constraint the user accepts), not a result filter. Mirror
+    // is_manner_frame's how-to head-gate (commit 2b6a4de) so the directive is
+    // rejected before final acceptance.
+    if lc.contains("how to") || lc.contains("how do") || lc.contains("how can")
+        || lc.contains("ways to") || lc.contains("best way") || lc.contains("tips for")
+        || lc.contains("guide to") || lc.contains("how to learn")
+    {
+        return false;
+    }
+    // (4) `without`/`with no` is the same directive class here as `not` for protected
+    // entities (handled above via is_bare_not_selection) — accept the compound as a
+    // real exclusion.
+    true
 }
 
 /// Returns true if the query uses contrastive/exclusion framing (comparison,
@@ -20894,6 +20951,68 @@ mod constraint_fix_tests {
             extract_query_negative_terms("learn machine learning without a computer science degree").is_empty(),
             "context qualifier 'without a computer science degree' must not be an exclusion"
         );
+    }
+
+    #[test]
+    fn without_exclusion_honored_on_non_howto_queries() {
+        // DEFECT: a bare `without <concrete noun>` on a WHAT/transactional query is
+        // an explicit user exclusion directive (the user named a topic to filter out),
+        // NOT a manner qualifier. It must surface as a real exclusion so the hard-drop
+        // / penalty logic actually removes pages about bloatware/charger/rgb.
+        // Manner guards (is_manner_phrase / is_verb_attribute_exclusion / etc.) and
+        // the ATTRIBUTE_NOUNS qualifier guard below keep the HOW-query and
+        // eligibility-qualifier cases from re-over-reaching.
+        //
+        // (1) Concrete product/attribute nouns after `without` → real exclusions.
+        assert!(
+            extract_query_negative_terms("laptop without bloatware").contains(&"bloatware".to_string()),
+            "'without bloatware' must be a real exclusion, got: {:?}",
+            extract_query_negative_terms("laptop without bloatware")
+        );
+        assert!(
+            extract_query_negative_terms("phone without charger").contains(&"charger".to_string()),
+            "'without charger' must be a real exclusion, got: {:?}",
+            extract_query_negative_terms("phone without charger")
+        );
+        assert!(
+            extract_query_negative_terms("laptop without rgb lighting").contains(&"rgb lighting".to_string()),
+            "'without rgb lighting' must be a real exclusion, got: {:?}",
+            extract_query_negative_terms("laptop without rgb lighting")
+        );
+        // `not` framing is already honored; `without` must match the same contract.
+        assert!(
+            extract_query_negative_terms("laptop not broken").contains(&"broken".to_string()),
+            "'not broken' (protected) must still be a real exclusion"
+        );
+        // (2) The manner how-to path is unchanged: `without soap` in a HOW query stays
+        // a manner qualifier, NOT an exclusion (is_manner_frame's how-to head gate).
+        let (kept, declined, manner) =
+            extract_query_negative_terms_with_dropped(
+                "how to clean a cast iron skillet without soap after cooking eggs",
+            );
+        assert!(kept.is_empty(), "how-to 'without soap' must not be an exclusion: {:?}", kept);
+        assert!(manner.iter().any(|m| m.contains("soap")), "soap must be manner_qualifier: {:?}", manner);
+        // (3) Eligibility/qualifier phrases survive declined — `computer science
+        // degree` contains the ATTRIBUTE_NOUN `degree` (an eligibility/qualifier, not
+        // a content topic) so it must NOT be promoted to a hard exclusion.
+        assert!(
+            extract_query_negative_terms("learn machine learning without a computer science degree").is_empty(),
+            "eligibility qualifier 'without a computer science degree' must NOT be a real exclusion (protected by ATTRIBUTE_NOUNS guard)"
+        );
+        // (4) HOW-query manner qualifiers that are NOT how-to-headed but are still
+        // manner/attribute/verb-led are declined, not promoted: `with no music
+        // background` is manner (music is not a topic to exclude), `without paying
+        // attention` is manner (pay context), `recipes not spicy` is attribute.
+        let (k2, d2, m2) = extract_query_negative_terms_with_dropped(
+            "how to learn guitar with no music background",
+        );
+        assert!(k2.is_empty(), "manner 'with no music background' must not be an exclusion: {:?}", k2);
+        let (k3, _d3, _m3) = extract_query_negative_terms_with_dropped("recipes not spicy");
+        assert!(k3.is_empty(), "attribute 'not spicy' must not be a hard exclusion: {:?}", k3);
+        let (k4, _d4, _m4) = extract_query_negative_terms_with_dropped(
+            "study without paying attention to the lecture"
+        );
+        assert!(k4.is_empty(), "'without paying attention' (manner pay) must not be an exclusion: {:?}", k4);
     }
 
     #[test]
