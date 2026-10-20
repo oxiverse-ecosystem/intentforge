@@ -1118,13 +1118,6 @@ pub fn is_adult_explicit(title_lc: &str, url_lc: &str) -> bool {
         "cunnilingus", "sodom", "cuckold", "creampie", "deepthroat", "assfuck", "buttfuck",
         "adultvideo", "adult film", "adult movie", "adult content", "hardcore", "softcore",
         "lingerie model", "webcam model", "camgirl", "cam boy", "only fans",
-        // Non-English adult lexicon (whole-word via the tokenizer below; these
-        // carry no innocent homographs, so whole-word match is safe and
-        // future-proofs against foreign-language adult domains/pages — e.g.
-        // Indonesian "bokep" (porn) which the English-only list missed, letting
-        // onlybokep.org / bokeplik.com surface in /search for a benign query).
-        "bokep", "bokepindo", "bokep18", "colmek", "ngentot", "porno", "pornos",
-        "xvideos", "xnxx", "sexo", "puta", "porno", "pornhub", "youporn",
     ];
     // URL-only adult tokens: "adult" is too broad for titles (e.g. "Adult
     // Education") but a strong signal in URL path segments (e.g. "/adult-games/").
