@@ -20296,7 +20296,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 } else {
                     !(multi_word_negative_matches_text(&neg_lower, &text_lower)
                       || multi_word_negative_matches_text(&neg_lower, &text_normalized))
-                }
+                };
                 // FIX-IF-01 (2026-09-24): FULFILLMENT exemption. A page that carries
                 // the excluded term inside a negating frame ("How to Cook Salmon
                 // WITHOUT an Oven", content saying "no oven needed") is satisfying
@@ -21060,6 +21060,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         response_json
     };
     (axum::http::StatusCode::OK, Json(final_json))
+}
 }
 
 fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
