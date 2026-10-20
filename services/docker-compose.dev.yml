@@ -59,10 +59,15 @@ services:
       default:
         aliases:
           - searxng
+          - if-dev-searxng
           - intent-engine
+          - if-dev-intent-engine
           - crawler
+          - if-dev-crawler
           - indexer
+          - if-dev-indexer
           - tor
+          - if-dev-tor
     ports:
       - "18888:8888/tcp"
       - "8388:8388/tcp"
@@ -140,6 +145,7 @@ services:
       default:
         aliases:
           - searxng2
+          - if-dev-searxng2
     restart: always
     logging:
       driver: "json-file"
