@@ -9236,10 +9236,6 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
         let w_lower = w.to_lowercase();
         let clean_w = w_lower.trim_matches(|c: char| !c.is_alphanumeric());
 
-    for w in &words {
-        let w_lower = w.to_lowercase();
-        let clean_w = w_lower.trim_matches(|c: char| !c.is_alphanumeric());
-
         let is_neg_trigger = neg_triggers.contains(w_lower.as_str()) || w_lower.starts_with("-");
         // F3 (finance): when the negation trigger begins a finance-offer phrase
         // (e.g. "no cost emi", "no zero interest"), the subsequent tokens describe a
