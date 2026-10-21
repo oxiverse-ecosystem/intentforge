@@ -9246,9 +9246,9 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
         // co-occurring finance phrase elsewhere in the query.
         if is_neg_trigger {
             // Build the phrase from this trigger onward
-            let idx = words.iter().position(|x| *x == w).unwrap_or(0);
-            let rest: Vec<&str> = words[idx..].iter().map(|t| t.to_lowercase()).collect();
-            let phrase = rest.join(" ");
+            let idx = words.iter().position(|x| *x == *w).unwrap_or(0);
+            let rest: String = words[idx..].iter().map(|t| t.to_lowercase()).collect::<Vec<_>>().join(" ");
+            let phrase = rest;
             if FINANCE_PHRASES.iter().any(|fp| phrase.starts_with(fp)) {
                 // Finance offer starting at this trigger — preserve all tokens.
                 result.push(w);
