@@ -22814,6 +22814,69 @@ mod spellcheck_endpoint_tests {
         }
 
         #[test]
+        fn intent_matches_search_for_exact_model_price_queries() {
+            // REGRESSION (t_a9ca23d2): `/intent` called bare `fallback_intent` and
+            // never applied the override chain `/search` runs, so the two
+            // endpoints disagreed on every override-rewritten label. Verified
+            // live: `/intent?q=iphone 16 pro max price` → informational @ 0.30
+            // while `/search?q=…` → transactional @ 0.80.
+            //
+            // The override chain is pure, so `build_intent` must produce the
+            // SAME label `/search` produces on its offline (fallback) baseline.
+            // Asserted on the exact-model price class the defect was reported on.
+            for q in [
+                "iphone 16 pro max price",
+                "galaxy s24 ultra price",
+                "oneplus 12 price in india",
+                "sony wh-1000xm5 price",
+            ] {
+                let preview = build_intent(q);
+                // The preview must carry the override-rewritten label, not the
+                // raw classifier's informational fallback.
+                assert_eq!(
+                    preview["intent"].as_str(),
+                    Some("transactional"),
+                    "/intent must report transactional for exact-model price query {:?}, got {:?}",
+                    q,
+                    preview["intent"]
+                );
+                assert!(
+                    preview["confidence"].as_f64().unwrap() >= 0.60,
+                    "/intent confidence must reflect the override for {:?}, got {:?}",
+                    q,
+                    preview["confidence"]
+                );
+                // And the parent category must follow the label.
+                assert_eq!(preview["category"].as_str(), Some("transactional"));
+            }
+        }
+
+        #[test]
+        fn intent_matches_search_for_non_transactional_queries() {
+            // The wiring must not over-fire: queries whose label an override
+            // leaves alone must keep the fallback label. Guards against a fix
+            // that simply forces transactional everywhere.
+            for (q, want) in [
+                ("why is the sky blue", "informational"),
+                ("what is the conversion rate", "informational"),
+                ("how to build a rest api in rust", "technical"),
+                ("react vs vue", "comparison"),
+                ("latest ai news today", "fresh"),
+                ("cafes near me", "local"),
+            ] {
+                let preview = build_intent(q);
+                assert_eq!(
+                    preview["intent"].as_str(),
+                    Some(want),
+                    "/intent label for {:?} must stay {:?}, got {:?}",
+                    q,
+                    want,
+                    preview["intent"]
+                );
+            }
+        }
+
+        #[test]
         fn intent_empty_query_envelope_distinct_from_search() {
             // The empty envelope carries the /intent key set (so clients can
             // distinguish it from /search /spellcheck empty responses) but with
