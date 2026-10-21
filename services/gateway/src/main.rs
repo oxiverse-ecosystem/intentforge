@@ -16061,6 +16061,13 @@ async fn handle_search(
     if gateway_extracted.price_lt.is_some() {
         intent.structured_constraints.price_lt = gateway_extracted.price_lt;
         intent.structured_constraints.price_max = intent.structured_constraints.price_max.or(gateway_extracted.price_lt);
+        // If the intent engine did not set a currency (e.g. "under 60000" with no
+        // currency word), try the NL extractor for a currency; default to USD when
+        // none is found so bound_to_usd compares like-units against USD-priced results.
+        if intent.structured_constraints.price_currency.is_none() {
+            let nl_cur = extract_nl_price_bound(&q_orig).map(|(_, c)| c);
+            intent.structured_constraints.price_currency = nl_cur.or_else(|| Some("usd".to_string()));
+        }
     }
     if gateway_extracted.price_gt.is_some() {
         intent.structured_constraints.price_gt = gateway_extracted.price_gt;
