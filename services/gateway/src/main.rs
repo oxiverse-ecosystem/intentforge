@@ -19334,6 +19334,7 @@ fn apply_search_intent_overrides(intent: &mut IntentResponse, q: &str) {
     } else if has_howto_signal
         && (intent.intent == "navigational" || intent.confidence < 0.40)
         && intent.intent != "how-to"
+        && intent.intent != "technical"
     {
         tracing::info!(
             "INTENT OVERRIDE (STRONG): how-to query '{}' was '{}' (conf={:.3}) → how-to",
