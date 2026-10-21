@@ -7857,6 +7857,8 @@ const FINANCE_PHRASES: &[&str] = &[
     "no cost emi",
     "no-cost emi",
     "nocost emi",
+    "no zero interest",
+    "no zero-interest",
     "zero interest",
     "zero-interest",
     "zero % interest",
@@ -9234,8 +9236,28 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
         let w_lower = w.to_lowercase();
         let clean_w = w_lower.trim_matches(|c: char| !c.is_alphanumeric());
 
+    for w in &words {
+        let w_lower = w.to_lowercase();
+        let clean_w = w_lower.trim_matches(|c: char| !c.is_alphanumeric());
+
         let is_neg_trigger = neg_triggers.contains(w_lower.as_str()) || w_lower.starts_with("-");
+        // F3 (finance): when the negation trigger begins a finance-offer phrase
+        // (e.g. "no cost emi", "no zero interest"), the subsequent tokens describe a
+        // PRODUCT FEATURE the user WANTS, not content to exclude. Preserve them in
+        // the result instead of stripping/collecting as exclusion.
+        // We check the trigger position + the following words to form a phrase,
+        // so a real negation ("not from chinese brands") is NOT affected by a
+        // co-occurring finance phrase elsewhere in the query.
         if is_neg_trigger {
+            // Build the phrase from this trigger onward
+            let idx = words.iter().position(|x| *x == w).unwrap_or(0);
+            let rest: Vec<&str> = words[idx..].iter().map(|t| t.to_lowercase()).collect();
+            let phrase = rest.join(" ");
+            if FINANCE_PHRASES.iter().any(|fp| phrase.starts_with(fp)) {
+                // Finance offer starting at this trigger — preserve all tokens.
+                result.push(w);
+                continue;
+            }
             in_negation = true;
             continue;
         }
