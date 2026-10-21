@@ -22876,6 +22876,76 @@ mod spellcheck_endpoint_tests {
             assert_eq!(eq[0].as_str(), Some("best sushi restaurants in new york"));
         }
 
+        #[test]
+        fn intent_matches_search_for_exact_model_price_queries() {
+            // REGRESSION (t_a9ca23d2): /intent called bare fallback_intent()
+            // and never applied the override chain /search runs, so the two
+            // endpoints disagreed on every override-rewritten label. Verified
+            // live: /intent?q=iphone 16 pro max price -> informational @ 0.30
+            // while /search?q=... -> transactional @ 0.80.
+            //
+            // Now build_intent runs apply_search_intent_overrides with
+            // ExactModelConfig::default(), so /intent must produce the SAME
+            // label /search produces on its offline (fallback) baseline.
+            for q in [
+                "iphone 16 pro max price",
+                "galaxy s24 ultra price",
+                "oneplus 12 price in india",
+                "sony wh-1000xm5 price",
+            ] {
+                let preview = build_intent(q);
+                assert_eq!(
+                    preview["intent"].as_str(),
+                    Some("transactional"),
+                    "/intent must report transactional for exact-model price query {:?}, got {:?}",
+                    q, preview["intent"]
+                );
+                assert!(
+                    preview["confidence"].as_f64().unwrap() >= 0.60,
+                    "/intent confidence must reflect the override for {:?}, got {:?}",
+                    q, preview["confidence"]
+                );
+                assert_eq!(preview["category"].as_str(), Some("transactional"));
+            }
+        }
+
+        #[test]
+        fn intent_matches_search_for_non_transactional_queries() {
+            // The wiring must not over-fire: queries whose label an override
+            // leaves alone must keep the fallback label. Guards against a fix
+            // that simply forces transactional everywhere.
+            for (q, want) in [
+                ("why is the sky blue", "informational"),
+                ("what is quantum computing", "informational"),
+                ("how to convert units in excel", "how-to"),
+                ("react vs vue", "comparison"),
+                ("latest ai news today", "fresh"),
+                ("cafes near me", "local"),
+            ] {
+                let preview = build_intent(q);
+                assert_eq!(
+                    preview["intent"].as_str(),
+                    Some(want),
+                    "/intent label for {:?} must stay {:?}, got {:?}",
+                    q, want, preview["intent"]
+                );
+            }
+        }
+
+        #[test]
+        fn intent_technical_how_to_stays_technical() {
+            // "how to build a rest api in rust" must NOT be collapsed to
+            // generic how-to — the technical-implementation guard keeps it
+            // technical (Override 8a).
+            let preview = build_intent("how to build a rest api in rust");
+            assert_eq!(
+                preview["intent"].as_str(),
+                Some("technical"),
+                "technical how-to must stay technical, got {:?}",
+                preview["intent"]
+            );
+        }
+
     // ── ROADMAP item 1 (increment): schema.org MICRODATA extraction ─────
     // Third structured signal alongside JSON-LD and OpenGraph. Real Shopify/
     // legacy product pages emit microdata with no JSON-LD — these tests prove
