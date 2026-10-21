@@ -20286,6 +20286,12 @@ fn apply_search_intent_overrides(
         // start with a how-to signal AND contain a build/implementation action.
         // The query topic is technical, so it stays technical instead of being
         // collapsed into the generic how-to bucket.
+        // NOTE: howto_starters / has_howto_starter are defined below (Override 8)
+        // but hoisted here because 8a and 8 both depend on them.
+        let howto_starters = [
+            "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
+        ];
+        let has_howto_starter = howto_starters.iter().any(|s| q_lower.starts_with(s));
         let technical_build_actions = [
             "build ", "build from", "compile", "debug", "troubleshoot", "resolve",
             "workaround", "configure", "install", "upgrade", "uninstall", "set up",
@@ -20296,7 +20302,7 @@ fn apply_search_intent_overrides(
         let has_technical_build_signal = has_howto_starter
             && technical_build_actions.iter().any(|s| q_lower.contains(s));
         if has_technical_build_signal
-            && (intent.intent == \"navigational\" || intent.confidence < 0.40)
+            && (intent.intent == "navigational" || intent.confidence < 0.40)
             && intent.intent != "technical"
         {
             tracing::info!(
@@ -20319,10 +20325,6 @@ fn apply_search_intent_overrides(
         // appears as a secondary clause in an informational query (e.g. "why do some
         // people get altitude sickness and how can i prevent it" is primarily about
         // causes, not a how-to guide).
-        let howto_starters = [
-            "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
-        ];
-        let has_howto_starter = howto_starters.iter().any(|s| q_lower.starts_with(s));
         let howto_mid_signals = [
             "tutorial", "step by step", "step-by-step", "ways to", "guide to", "guide:",
             "find files", "find the", "modified", "fix ", "install", "configure",
