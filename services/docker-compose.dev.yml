@@ -28,6 +28,8 @@ services:
       - HTTP_CONTROL_SERVER_ADDRESS=:8000
       - HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE=public
       - OPENVPN_OPTIONS=--route-nopull
+      - HEALTH_VPN_DURATION_INITIAL=30s
+      - HEALTH_SUCCESS_WAIT_DURATION=10s
       - OPENVPN_ENDPOINT_PORT=443
       # Allow the gateway (which shares this netns) to reach the OTHER egress
       # path (tor2 / SearXNG2 on the docker bridge) WITHOUT tunnelling it
@@ -83,10 +85,10 @@ services:
     restart: always
     healthcheck:
       test: ["CMD", "/gluetun-entrypoint", "healthcheck"]
-      interval: 20s
-      timeout: 8s
-      start_period: 45s
-      retries: 6
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 12
     logging:
       driver: "json-file"
       options:

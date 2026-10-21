@@ -4,6 +4,8 @@
   "brands": [
     "iphone", "ipad", "galaxy", "oneplus", "pixel", "redmi",
     "nothing", "xiaomi", "poco", "realme", "rog", "zenfone",
-    "nokia", "moto", "motorola", "surface", "macbook", "imac", "watch"
+    "nokia", "moto", "motorola", "surface", "macbook", "imac", "watch",
+    "sony", "bose", "samsung", "lg", "hp", "dell", "lenovo", "asus",
+    "acer", "msi", "razer", "jbl", "sennheiser", "audio-technica"
   ]
 }

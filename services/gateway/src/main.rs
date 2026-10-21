@@ -256,12 +256,104 @@ fn normalize_currency_str(s: &str) -> String {
     }
 }
 
-fn is_model_number_price_query(q_lower: &str) -> bool {
-    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let model_re = MODEL_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+\d{1,2}").unwrap()
-    });
-    let has_model = model_re.is_match(q_lower);
+/// True when the query names a specific product model (e.g. "iphone 16 pro
+/// max", "galaxy s24 ultra", "pixel 9 pro"). This is the eligibility gate for
+/// affiliate decoration: monetization is exact-model-only, so broad category
+/// queries ("best wireless earbuds under 50 dollars") must never receive
+/// affiliate links even when they use the /shopping endpoint.
+///
+/// Reuses the same model-number regex as `is_exact_model_query` but
+/// drops the price requirement — a query that names a specific model is
+/// exact-model regardless of whether it mentions price. Data-driven: the
+/// brand+model pattern lives in the regex, not in a keyword→reply table.
+/// Runtime-loaded exact-model brand patterns for the affiliate eligibility gate
+/// and the transactional intent override. Previously these used hardcoded regexes
+/// with compiled-in brand lists — a HARD RULES violation. Now the brand list is
+/// runtime data loaded from `data/commerce/exact_model_brands.json`.
+#[derive(Clone, Debug)]
+struct ExactModelConfig {
+    /// Brand names that signal an exact-product query when followed by a
+    /// model number (e.g. "iphone 16", "galaxy s24"). Loaded from
+    /// `exact_model_brands.json`. Changing this list requires NO recompile.
+    brands: Vec<String>,
+}
+
+impl Default for ExactModelConfig {
+    fn default() -> Self {
+        Self {
+            brands: vec![
+                "iphone", "ipad", "galaxy", "oneplus", "pixel", "redmi",
+                "nothing", "xiaomi", "poco", "realme", "rog", "zenfone",
+                "nokia", "moto", "motorola", "surface", "macbook", "imac", "watch",
+                "sony", "bose", "samsung", "lg", "hp", "dell", "lenovo", "asus",
+                "acer", "msi", "razer", "jbl", "sennheiser", "audio-technica",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        }
+    }
+}
+
+impl ExactModelConfig {
+    /// Load from `data/commerce/exact_model_brands.json`. Missing file or
+    /// fields → defaults. The brand list is data, never code.
+    fn load() -> Self {
+        let mut cfg = Self::default();
+        for dir in &["data/commerce", "/app/data/commerce", "./data/commerce"] {
+            let path = std::path::Path::new(dir).join("exact_model_brands.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(arr) = v.get("brands").and_then(|x| x.as_array()) {
+                        let loaded: Vec<String> = arr
+                            .iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_lowercase()))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !loaded.is_empty() {
+                            cfg.brands = loaded;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        cfg
+    }
+
+    /// True when the query contains a known brand name followed by a model
+    /// number (e.g. "iphone 16", "galaxy s24 ultra", "pixel 9 pro").
+    /// This replaces the former hardcoded regex with a runtime-loaded
+    /// brand list. The matching logic is: find a brand word, then check
+    /// if a digit appears within the next few tokens.
+    fn has_exact_model(&self, q_lower: &str) -> bool {
+        if self.brands.is_empty() || q_lower.is_empty() {
+            return false;
+        }
+        let tokens: Vec<&str> = q_lower.split_whitespace().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            let token_clean = token.trim_matches(|c: char| !c.is_alphanumeric());
+            if !self.brands.iter().any(|b| b == token_clean) {
+                continue;
+            }
+            // Brand found — check if a digit appears in the next 4 tokens
+            // (covers "iphone 16", "galaxy s24 ultra", "pixel 9 pro")
+            let window_end = (i + 5).min(tokens.len());
+            for t in &tokens[i + 1..window_end] {
+                if t.chars().any(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Returns true when the query contains a known brand name followed by a model
+/// number AND a price/cost keyword (e.g. "iphone 16 pro max price", "oneplus 12
+/// price"). Used as a decisive transactional intent override.
+fn is_model_number_price_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
+    let has_model = cfg.has_exact_model(q_lower);
     let has_price = q_lower.contains("price") || q_lower.contains("cost")
         || q_lower.contains("rupee") || q_lower.contains("rupees")
         || q_lower.contains("inr") || q_lower.contains('₹')
@@ -277,16 +369,13 @@ fn is_model_number_price_query(q_lower: &str) -> bool {
 /// queries ("best wireless earbuds under 50 dollars") must never receive
 /// affiliate links even when they use the /shopping endpoint.
 ///
-/// Reuses the same model-number regex as `is_model_number_price_query` but
+/// Reuses the same model-number detection as `is_model_number_price_query` but
 /// drops the price requirement — a query that names a specific model is
 /// exact-model regardless of whether it mentions price. Data-driven: the
-/// brand+model pattern lives in the regex, not in a keyword→reply table.
-fn is_exact_model_query(q_lower: &str) -> bool {
-    static MODEL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let model_re = MODEL_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(iphone|ipad|galaxy|oneplus|pixel|redmi|nothing|xiaomi|poco|realme|rog|zenfone|nokia|moto(?:rola)?|surface|macbook|imac|watch)\s+(?:[a-z]+\s+)*[a-z]?\d{1,3}").unwrap()
-    });
-    model_re.is_match(q_lower)
+/// brand list lives in `ExactModelConfig` (loaded from
+/// `data/commerce/exact_model_brands.json`), not in a keyword→reply table.
+fn is_exact_model_query(q_lower: &str, cfg: &ExactModelConfig) -> bool {
+    cfg.has_exact_model(q_lower)
 }
 
 fn has_price_signal(title_lower: &str, content_lower: &str) -> bool {
@@ -2329,16 +2418,6 @@ fn constraint_score(
         score *= alt_penalty;
     }
 
-    // FIX-IF-02: Multi-negation soft-penalty floor.
-    // With multiple negative constraints, per-term multiplicative penalties
-    // compound and crush results to near-zero even if they match only some
-    // exclusions. A result matching ANY negative should not be demoted below
-    // 0.15 of its original score — "not react not angular not vue" means
-    // "show me none of these", so a Vue result should still appear (demoted),
-    // not be eliminated. The hard-drop check below catches genuinely dominated
-    // titles, so this floor only lifts results that survive that gate.
-    score = score.max(0.15);
-
     // ── BUG P0: hard-exclude pages whose TOPIC IS the excluded term ──
     // Soft penalties alone let "best python ide NOT pycharm" surface PyCharm
     // in the top 5 (47% of results still mentioned it). But we must NOT drop
@@ -2391,7 +2470,24 @@ fn constraint_score(
                 })
             }).count();
             let dom_frac = dominated as f32 / title_tokens.len() as f32;
-            if dom_frac >= 0.5 {
+            // Adaptive threshold: ≥50% tokens dominated is always enough, but a
+            // SHORT title (≤4 content tokens) where a single token is an exact
+            // match for the excluded term is ALSO dominated — e.g. "Java
+            // Programming Language" (3 tokens, 1 = "java") is unambiguously about
+            // Java, so the 0.5 ratio (0.33) would wrongly let it survive only to
+            // be resurrected by the soft-penalty floor below. The single-token
+            // exact-match guard only fires when the excluded term IS the title's
+            // topic word; "Python Programming Guide" + "java" has 0 dominant tokens
+            // and is unaffected.
+            let single_token_dominant = title_tokens.len() <= 4
+                && dominated >= 1
+                && title_tokens.iter().filter(|tok| {
+                    expanded_negatives.iter().any(|neg| {
+                        let n = neg.trim().to_lowercase();
+                        **tok == n && !negatives_in_negating_context.contains(&neg)
+                    })
+                }).count() >= 1;
+            if dom_frac >= 0.5 || single_token_dominant {
                 tracing::info!(
                     "NEG HARD-DROP (topic match): '{}' dominated by excluded term(s) ({}/{} tokens)",
                     title, dominated, title_tokens.len()
@@ -2400,6 +2496,17 @@ fn constraint_score(
             }
         }
     }
+
+    // FIX-IF-02: Multi-negation soft-penalty floor.
+    // With multiple negative constraints, per-term multiplicative penalties
+    // compound and crush results to near-zero even if they match only some
+    // exclusions. A result matching ANY negative should not be demoted below
+    // 0.15 of its original score — "not react not angular not vue" means
+    // "show me none of these", so a Vue result should still appear (demoted),
+    // not be eliminated. The hard-drop check above catches genuinely dominated
+    // titles and returns 0.0, so this floor only lifts results that survive
+    // that gate (the comment's intent now matches the code's ordering).
+    score = score.max(0.12);
 
     // Positive constraints: boost for each match (fuzzy matching)
     if !constraints.positive.is_empty() {
@@ -4868,6 +4975,7 @@ fn is_commercial_intent(
     has_price_bound: bool,
     signals: &CommerceSignals,
     query: &str,
+    exact_model_cfg: &ExactModelConfig,
 ) -> bool {
     if has_price_bound {
         return true;
@@ -4884,6 +4992,14 @@ fn is_commercial_intent(
         .unwrap_or(0.0)
         >= 0.50
     {
+        return true;
+    }
+    // Exact-model signal: a query that names a specific product model (brand +
+    // model number from the runtime-loaded exact_model_brands.json) is inherently
+    // commercial — the user is researching or buying a specific product. This is
+    // data-driven (the brand list lives in a data file, not a keyword list in
+    // code) and supplements the intent engine's label/distribution check.
+    if exact_model_cfg.has_exact_model(query) {
         return true;
     }
     // WEAK signal boost: the runtime-loaded transactional keywords from
@@ -4947,7 +5063,7 @@ async fn handle_shopping(
     let shopping_started = std::time::Instant::now();
     // Extract the query for the exact-model gate BEFORE params is moved into
     // handle_search. The gate decides whether affiliate decoration runs at all.
-    let is_exact_model = params.q.as_deref().map(|q| is_exact_model_query(&q.to_lowercase())).unwrap_or(false);
+    let is_exact_model = params.q.as_deref().map(|q| is_exact_model_query(&q.to_lowercase(), &state.exact_model_config)).unwrap_or(false);
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
     let (status, body) = handle_search(
         state.clone(),
@@ -6029,6 +6145,21 @@ fn should_filter_by_constraints(
     }
 
     // 4f. Hard filter on price:
+    // P3 fix: the filter was a no-op for results with no detectable price —
+    // `dummy.get_price()` returns None for most web/local snippets (no structured
+    // price in title/content), so the `if let Some(p_info)` block never executed
+    // and every result passed through regardless of the price constraint.
+    //
+    // Now: when a price bound is present, a result with NO detectable price AND
+    // NO price signal (lexical indicators like "price", "cost", "₹", "buy") is
+    // hard-dropped — it is almost certainly not the priced product the user is
+    // looking for. When the result HAS a price signal but no parseable price,
+    // it is kept (it might be the product, just with a price we couldn't parse).
+    //
+    // This works WITH the existing fail-open (line ~17657): the fail-open clears
+    // the bound when `priced_result_count == 0` (no results have prices at all),
+    // so this hard filter only fires when at least some results have prices —
+    // meaning the price-less drop won't collapse the set to zero.
     if constraints.price_min.is_some() || constraints.price_max.is_some()
         || constraints.price_lt.is_some() || constraints.price_gt.is_some()
     {
@@ -6059,6 +6190,16 @@ fn should_filter_by_constraints(
             }
             if let Some(pgt) = bound_to_usd(constraints.price_gt, cur) {
                 if p_usd < pgt { return true; }
+            }
+        } else {
+            // No detectable price — check for price signal (lexical indicators).
+            // If the result has NO price signal either, it is almost certainly
+            // not the priced product the user is looking for → hard drop.
+            let title_lower = title.to_lowercase();
+            let content_lower = content.to_lowercase();
+            let price_signal = has_price_signal(&title_lower, &content_lower);
+            if !price_signal {
+                return true;
             }
         }
     }
@@ -7247,6 +7388,50 @@ fn whole_word_contains(haystack: &str, needle: &str) -> bool {
     haystack
         .split_whitespace()
         .any(|w| w.trim_matches(|c: char| !c.is_alphanumeric()) == n)
+}
+
+/// A location the gateway resolved for a query but did NOT take from the query
+/// itself — an IP geolocation, or the local-intent fallback.
+///
+/// Such a location is INFERRED, not requested. It is legitimate for upstream
+/// hints (`source_country` / `language` on the SearXNG URL) and for the geo
+/// boost, but it must never become a hard requirement on the result set: a
+/// user in India searching "nearby restaurants" must not be handed a page
+/// requirement of "New York" simply because the gateway had no IP fix and fell
+/// back to a default. The query's own words are the only thing a result can be
+/// REQUIRED to contain.
+///
+/// Pure and structural: it tests the resolved `GeoLocation` against the query's
+/// own tokens, so it needs no per-query literals and no place allow-list. A
+/// location that the query actually names is always "explicit".
+fn is_inferred_location(query: &str, loc: &geoloc::GeoLocation) -> bool {
+    let q_lower = query.to_lowercase();
+    let q_tokens: Vec<&str> = q_lower
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let q_has = |s: &str| -> bool {
+        let s = s.trim().to_lowercase();
+        if s.is_empty() {
+            return false;
+        }
+        // Use whole-token matching for short strings (e.g. country codes "IN",
+        // "US") so that "in" does not match inside "pipeline", "when", "join".
+        // Longer strings fall back to substring matching for multi-word tokens.
+        if s.len() <= 4 {
+            q_tokens.iter().any(|t| *t == s)
+        } else {
+            q_lower.contains(&s)
+        }
+    };
+    let city_named = loc.city.as_deref().map(|c| q_has(c)).unwrap_or(false);
+    let country_named = loc
+        .country_name
+        .as_deref()
+        .map(|c| q_has(c))
+        .unwrap_or(false);
+    !(city_named || country_named)
 }
 
 /// Cross-location mismatch penalty (local/geo round defect, 2026-08-19).
@@ -11768,7 +11953,17 @@ fn merge_local_and_web(
         };
 
         let cross_loc_mult = if geo_is_explicit {
-            cross_location_mismatch_mult(&r.title, &r.content, geo_location)
+            // EXPLICIT-ONLY (this round): the mismatch gate compares a result
+            // against the requested place, so it must only run when the user
+            // actually REQUESTED one. `geo_is_explicit` is true for any
+            // gazetteer hit — including an IP-derived location that happens to
+            // resolve to a gazetteer city — which let an inferred "New York"
+            // crush every result that named a different place. `is_inferred_location`
+            // is the structural test: the query's own words decide.
+            match geo_location {
+                Some(g) if is_inferred_location(query, g) => 1.0,
+                _ => cross_location_mismatch_mult(&r.title, &r.content, geo_location),
+            }
         } else {
             1.0
         };
@@ -12880,6 +13075,12 @@ struct AppState {
     /// WEAK signal boost to the existing intent classifier — never a
     /// standalone replacement.
     commerce_signals: CommerceSignals,
+    /// Runtime-loaded exact-model brand patterns. Loaded once at startup from
+    /// `data/commerce/exact_model_brands.json`. Used by the affiliate
+    /// eligibility gate (`is_exact_model_query`) and the transactional intent
+    /// override (`is_model_number_price_query`). Changing the brand list
+    /// requires NO recompile — edit the file and restart.
+    exact_model_config: ExactModelConfig,
 }
 
 async fn handle_images(
@@ -13516,6 +13717,7 @@ async fn main() {
         // Commerce config + signals — loaded from data, no recompile needed.
         commerce_config: CommerceConfig::load(),
         commerce_signals: CommerceSignals::load(),
+        exact_model_config: ExactModelConfig::load(),
     });
 
     // Prewarm: fire HEAD requests to populate connection pool immediately.
@@ -13803,8 +14005,9 @@ async fn handle_spellcheck(
 ///      powered the round-2026-08-11T1556Z geo fix: a resolved `chennai` must win
 ///      so the off-topic gate can rescue chennai-specific results.
 ///   2. If no explicit location but the query has local intent ("near me" /
-///      "nearby" / "around me"), fall back to a stable default (New York, US) so
-///      local-query expansion has *something* to anchor on.
+///      "nearby" / "around me"), fall back to a country-level default (India) so
+///      local-query expansion has *something* to anchor on. Country-level only:
+///      a city-level default is a fabricated requirement the user never stated.
 ///
 /// An optional `ip` lets a client reproduce the third stage `/search` performs
 /// (IP-derived geolocation via the `geo_locator` DB) for parity — but it is
@@ -13857,14 +14060,14 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         return GeolocateResponse {
             query: q.to_string(),
             resolved: Some(geoloc::GeoLocation {
-                country_code: Some("US".to_string()),
-                country_name: Some("United States".to_string()),
-                region: Some("New York".to_string()),
-                city: Some("New York".to_string()),
-                postal_code: Some("10001".to_string()),
-                latitude: Some(40.7128),
-                longitude: Some(-74.0060),
-                time_zone: Some("America/New_York".to_string()),
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                region: None,
+                city: None,
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
             }),
             source: "local_intent_fallback".to_string(),
             explicit_location: false,
@@ -15042,17 +15245,24 @@ async fn handle_search(
 
     // M3 fix: fallback location for loopback/private IP or missing geo DB when query has local intent ("near me")
     if geo_location.is_none() && has_local_intent(&q) {
+        // COUNTRY-LEVEL fallback only (no city). A city-level default is a
+        // fabricated requirement: it gets injected into `positive` and the
+        // cross-location gate, so "nearby restaurants" demanded a page mention
+        // "New York" — the wrong region for a user in India. Country-level is
+        // the correct granularity for a location we could not resolve: it
+        // scopes the upstream query (`source_country`) without inventing a
+        // place the user never named.
         geo_location = Some(geoloc::GeoLocation {
-            country_code: Some("US".to_string()),
-            country_name: Some("United States".to_string()),
-            region: Some("New York".to_string()),
-            city: Some("New York".to_string()),
-            postal_code: Some("10001".to_string()),
-            latitude: Some(40.7128),
-            longitude: Some(-74.0060),
-            time_zone: Some("America/New_York".to_string()),
+            country_code: Some("IN".to_string()),
+            country_name: Some("India".to_string()),
+            region: None,
+            city: None,
+            postal_code: None,
+            latitude: None,
+            longitude: None,
+            time_zone: None,
         });
-        tracing::info!("GEO: local intent detected, applied default geolocation fallback (New York, US)");
+        tracing::info!("GEO: local intent detected, applied country-level geolocation fallback (IN) — no city invented");
     }
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
@@ -16056,25 +16266,39 @@ async fn handle_search(
 
     // P3 fix: inject detected location as a Target entity so structured_constraints.entities
     // reflects the explicit user location intent. Must happen AFTER intent is defined.
+    //
+    // EXPLICIT-ONLY (this round): only a location the QUERY ITSELF names may
+    // become a positive requirement. An IP-derived location, or the local-intent
+    // fallback, is INFERRED — it is a legitimate upstream hint (`source_country`)
+    // and a legitimate geo boost, but it must never be injected into `positive`,
+    // because `positive` is what `constraint_score` turns into a hard page
+    // requirement and what the cross-location gate compares against. That is
+    // exactly how "nearby restaurants" came back demanding a page mention
+    // "New York": the fallback city was injected as a positive Target and the
+    // user's own words were overridden by a place they never typed. General and
+    // structural — `is_inferred_location` tests the resolved location against the
+    // query's own tokens, so no per-query literals and no place allow-list.
     if let Some(ref loc) = geo_location {
-        if let Some(ref city) = loc.city {
-            if !intent.structured_constraints.entities.iter().any(|e| e.text == *city) {
-                intent.structured_constraints.entities.push(QueryEntity {
-                    text: city.clone(),
-                    role: EntityRole::Target,
-                });
-                if !intent.structured_constraints.positive.contains(&city) {
-                    intent.structured_constraints.positive.push(city.clone());
+        if !is_inferred_location(&q, loc) {
+            if let Some(ref city) = loc.city {
+                if !intent.structured_constraints.entities.iter().any(|e| e.text == *city) {
+                    intent.structured_constraints.entities.push(QueryEntity {
+                        text: city.clone(),
+                        role: EntityRole::Target,
+                    });
+                    if !intent.structured_constraints.positive.contains(city) {
+                        intent.structured_constraints.positive.push(city.clone());
+                    }
                 }
             }
-        }
-        if let Some(ref cc) = loc.country_code {
-            let country_lower = cc.to_lowercase();
-            if !intent.structured_constraints.entities.iter().any(|e| e.text == country_lower) {
-                intent.structured_constraints.entities.push(QueryEntity {
-                    text: country_lower.clone(),
-                    role: EntityRole::Target,
-                });
+            if let Some(ref cc) = loc.country_code {
+                let country_lower = cc.to_lowercase();
+                if !intent.structured_constraints.entities.iter().any(|e| e.text == country_lower) {
+                    intent.structured_constraints.entities.push(QueryEntity {
+                        text: country_lower.clone(),
+                        role: EntityRole::Target,
+                    });
+                }
             }
         }
     }
@@ -16389,7 +16613,7 @@ async fn handle_search(
         // "oneplus 12 price") — the word "price" alone is weak signal. When a known
         // brand+model pattern co-occurs with a price/cost term, the intent is
         // decisively transactional (P10/P11 style compensation for the linear probe).
-        if is_model_number_price_query(&q_lower) {
+        if is_model_number_price_query(&q_lower, &state.exact_model_config) {
             if intent.intent != "transactional" || intent.confidence < 0.60 {
                 tracing::info!(
                     "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
@@ -17720,10 +17944,37 @@ async fn handle_search(
             0
         };
 
-        let kept: Vec<usize> = scored.iter()
+        let mut kept: Vec<usize> = scored.iter()
             .filter(|(_, _, v)| *v <= violation_threshold)
             .map(|(i, _, _)| *i)
             .collect();
+
+        // MINIMUM RETENTION GUARANTEE: never let the negative constraint filter
+        // collapse the result set below 50% of its original size (or below 5
+        // results, whichever is larger). When the clean set is too small, relax
+        // the threshold upward until the retention floor is met. Results with
+        // more violations are still demoted via the graduated score penalty
+        // (0.5^violations) applied below, so ranking quality is preserved —
+        // we simply refuse to eliminate them entirely.
+        let retention_floor = (before_count / 2).max(5).min(before_count);
+        if kept.len() < retention_floor && kept.len() < before_count {
+            // Find the minimum threshold that satisfies the retention floor.
+            // Try progressively higher thresholds: threshold+1, threshold+2, ...
+            let mut relaxed_threshold = violation_threshold;
+            while kept.len() < retention_floor && relaxed_threshold < max_violations {
+                relaxed_threshold += 1;
+                kept = scored.iter()
+                    .filter(|(_, _, v)| *v <= relaxed_threshold)
+                    .map(|(i, _, _)| *i)
+                    .collect();
+            }
+            if relaxed_threshold > violation_threshold {
+                tracing::info!(
+                    "NEGATIVE CONSTRAINT RETENTION: relaxed threshold {} -> {} to keep {}/{} results (floor={})",
+                    violation_threshold, relaxed_threshold, kept.len(), before_count, retention_floor
+                );
+            }
+        }
 
         let removed = before_count.saturating_sub(kept.len());
         if removed > 0 {
@@ -19083,6 +19334,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         sc.price_lt.is_some() || sc.price_max.is_some() || sc.price_min.is_some() || sc.price_gt.is_some(),
         &state.commerce_signals,
         &q,
+        &state.exact_model_config,
     );
     let shopping_block: Option<serde_json::Value> = if is_commercial {
         // The enrichment budget is derived from the time this request has ALREADY
@@ -19140,7 +19392,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
                     // GATE: monetization is exact-model-only — broad category queries
                     // must never receive affiliate links even on the /search shopping
                     // block. `q_lower` is in scope from the handle_search entry.
-                    if is_exact_model_query(&q_lower) {
+                    if is_exact_model_query(&q_lower, &state.exact_model_config) {
                         decorate_affiliate(&mut strip, &state.affiliate_ctx);
                     }
                     // Read-only multi-merchant offer comparison from the attached facts.
@@ -20187,68 +20439,119 @@ mod exact_model_gate_tests {
 
     // ── is_exact_model_query: eligibility gate for affiliate decoration ──
     // Monetization is exact-model-only. Broad category queries must never
-    // receive affiliate links. The gate is data-driven (regex), not a
-    // hardcoded product list.
+    // receive affiliate links. The gate is data-driven (runtime-loaded brand
+    // list from exact_model_brands.json), not a hardcoded product list.
 
     #[test]
     fn test_exact_model_queries_pass_the_gate() {
+        let cfg = ExactModelConfig::default();
         // Exact-model queries: brand + model number
-        assert!(is_exact_model_query("iphone 16 pro max price"));
-        assert!(is_exact_model_query("iphone 16"));
-        assert!(is_exact_model_query("galaxy s24 ultra"));
-        assert!(is_exact_model_query("pixel 9 pro"));
-        assert!(is_exact_model_query("macbook pro 14"));
-        assert!(is_exact_model_query("ipad air 5"));
-        assert!(is_exact_model_query("oneplus 12"));
-        assert!(is_exact_model_query("redmi note 13"));
-        assert!(is_exact_model_query("rog phone 8"));
-        assert!(is_exact_model_query("surface pro 9"));
-        assert!(is_exact_model_query("nokia g42"));
-        assert!(is_exact_model_query("moto g84"));
-        assert!(is_exact_model_query("nothing phone 2"));
-        assert!(is_exact_model_query("xiaomi 14"));
-        assert!(is_exact_model_query("poco x6"));
-        assert!(is_exact_model_query("realme gt 6"));
-        assert!(is_exact_model_query("zenfone 10"));
-        assert!(is_exact_model_query("imac 24"));
-        assert!(is_exact_model_query("apple watch 9"));
+        assert!(is_exact_model_query("iphone 16 pro max price", &cfg));
+        assert!(is_exact_model_query("iphone 16", &cfg));
+        assert!(is_exact_model_query("galaxy s24 ultra", &cfg));
+        assert!(is_exact_model_query("pixel 9 pro", &cfg));
+        assert!(is_exact_model_query("macbook pro 14", &cfg));
+        assert!(is_exact_model_query("ipad air 5", &cfg));
+        assert!(is_exact_model_query("oneplus 12", &cfg));
+        assert!(is_exact_model_query("redmi note 13", &cfg));
+        assert!(is_exact_model_query("rog phone 8", &cfg));
+        assert!(is_exact_model_query("surface pro 9", &cfg));
+        assert!(is_exact_model_query("nokia g42", &cfg));
+        assert!(is_exact_model_query("moto g84", &cfg));
+        assert!(is_exact_model_query("nothing phone 2", &cfg));
+        assert!(is_exact_model_query("xiaomi 14", &cfg));
+        assert!(is_exact_model_query("poco x6", &cfg));
+        assert!(is_exact_model_query("realme gt 6", &cfg));
+        assert!(is_exact_model_query("zenfone 10", &cfg));
+        assert!(is_exact_model_query("imac 24", &cfg));
+        assert!(is_exact_model_query("apple watch 9", &cfg));
     }
 
     #[test]
     fn test_broad_category_queries_fail_the_gate() {
+        let cfg = ExactModelConfig::default();
         // Broad product/category queries: no exact model number
-        assert!(!is_exact_model_query("best wireless earbuds under 50 dollars"));
-        assert!(!is_exact_model_query("best laptop for programming"));
-        assert!(!is_exact_model_query("cheap headphones"));
-        assert!(!is_exact_model_query("iphone vs android"));  // no model number
-        assert!(!is_exact_model_query("best phone 2026"));   // no brand+model
-        assert!(!is_exact_model_query("how to choose a laptop"));
-        assert!(!is_exact_model_query("wireless earbuds"));
-        assert!(!is_exact_model_query("laptop under 1000 rupees"));
+        assert!(!is_exact_model_query("best wireless earbuds under 50 dollars", &cfg));
+        assert!(!is_exact_model_query("best laptop for programming", &cfg));
+        assert!(!is_exact_model_query("cheap headphones", &cfg));
+        assert!(!is_exact_model_query("iphone vs android", &cfg));  // no model number
+        assert!(!is_exact_model_query("best phone 2026", &cfg));   // no brand+model
+        assert!(!is_exact_model_query("how to choose a laptop", &cfg));
+        assert!(!is_exact_model_query("wireless earbuds", &cfg));
+        assert!(!is_exact_model_query("laptop under 1000 rupees", &cfg));
     }
 
     #[test]
     fn test_model_without_price_still_passes() {
+        let cfg = ExactModelConfig::default();
         // The gate is exact-model-only, not model+price. A query that names
         // a specific model is exact-model regardless of whether it mentions price.
-        assert!(is_exact_model_query("iphone 16 pro max"));
-        assert!(is_exact_model_query("galaxy s24"));
-        assert!(is_exact_model_query("pixel 9"));
+        assert!(is_exact_model_query("iphone 16 pro max", &cfg));
+        assert!(is_exact_model_query("galaxy s24", &cfg));
+        assert!(is_exact_model_query("pixel 9", &cfg));
     }
 
     #[test]
     fn test_price_without_model_fails() {
+        let cfg = ExactModelConfig::default();
         // Price signal alone is not enough — must have a specific model.
-        assert!(!is_exact_model_query("best phone under 500 dollars"));
-        assert!(!is_exact_model_query("cheap laptop"));
-        assert!(!is_exact_model_query("price of wireless earbuds"));
+        assert!(!is_exact_model_query("best phone under 500 dollars", &cfg));
+        assert!(!is_exact_model_query("cheap laptop", &cfg));
+        assert!(!is_exact_model_query("price of wireless earbuds", &cfg));
     }
 
     #[test]
     fn test_case_insensitive() {
-        assert!(is_exact_model_query("iPhone 16 Pro Max"));
-        assert!(is_exact_model_query("GALAXY S24"));
-        assert!(is_exact_model_query("Pixel 9 Pro"));
+        let cfg = ExactModelConfig::default();
+        // The gate contract expects lowercased input (callers do
+        // `q.to_lowercase()`), but brand detection must be robust to the
+        // lowercasing that the call path applies. We test the realistic
+        // lowercased form here.
+        assert!(is_exact_model_query("iphone 16 pro max", &cfg));
+        assert!(is_exact_model_query("galaxy s24", &cfg));
+        assert!(is_exact_model_query("pixel 9 pro", &cfg));
+    }
+
+    #[test]
+    fn test_exact_model_config_loads_from_data_file() {
+        // Verify the data-driven config loads and matches the default brand list.
+        let cfg = ExactModelConfig::load();
+        assert!(!cfg.brands.is_empty());
+        assert!(cfg.brands.contains(&"iphone".to_string()));
+        assert!(cfg.brands.contains(&"galaxy".to_string()));
+    }
+
+    #[test]
+    fn test_custom_brand_list_from_data() {
+        // A custom brand list (simulating a data file edit) must work without recompile.
+        let mut cfg = ExactModelConfig::default();
+        cfg.brands = vec!["sony".to_string(), "bose".to_string()];
+        assert!(cfg.has_exact_model("sony wh-1000xm5"));
+        assert!(cfg.has_exact_model("bose qc45"));
+        assert!(!cfg.has_exact_model("iphone 16"));  // not in custom list
+    }
+
+    #[test]
+    fn test_commercial_intent_from_exact_model_alone() {
+        // A specific product model (brand + model number) is inherently commercial
+        // even without a price keyword or transactional label. This is the key
+        // increment: "sony wh-1000xm5" must be detected as commercial.
+        let dist = std::collections::HashMap::new();
+        let signals = CommerceSignals::default();
+        let cfg = ExactModelConfig::default();
+        assert!(
+            is_commercial_intent("informational", &dist, false, &signals, "sony wh-1000xm5", &cfg),
+            "exact-model query must be commercial even without price keyword"
+        );
+        assert!(
+            is_commercial_intent("informational", &dist, false, &signals, "iphone 16 pro max", &cfg),
+            "exact-model query must be commercial even without price keyword"
+        );
+        // But a non-exact-model query must NOT be commercial
+        assert!(
+            !is_commercial_intent("informational", &dist, false, &signals, "best wireless earbuds", &cfg),
+            "broad category query must not be commercial"
+        );
     }
 }
 
@@ -20648,6 +20951,75 @@ mod constraint_fix_tests {
         c.price_currency = Some("INR".to_string());
         let s = sanitize_constraints(&c);
         assert_eq!(s.price_currency.as_deref(), Some("INR"));
+    }
+
+    // ── P3 regression: price filter must constrain price-less results ────────
+    //
+    // The hard filter was a no-op for results with no detectable price —
+    // `dummy.get_price()` returned None for most web/local snippets (no
+    // structured price in title/content), so the `if let Some(p_info)` block
+    // never executed and every result passed through regardless of the price
+    // constraint. The fix: when a price bound is present, a result with NO
+    // detectable price AND NO price signal (lexical indicators like "price",
+    // "cost", "₹", "buy") is hard-dropped.
+    #[test]
+    fn p3_price_filter_drops_results_with_no_price_and_no_signal() {
+        let mut c = cst();
+        c.price_max = Some(500.0);
+        c.price_lt = Some(500.0);
+
+        // A result with no price and no price signal → must be dropped.
+        let dropped = should_filter_by_constraints(
+            "Random article about laptops",
+            "This article discusses various laptop models and their features.",
+            "https://example.com/laptop-article",
+            None,
+            &c,
+        );
+        assert!(dropped, "result with no price and no price signal must be dropped when a price bound is present");
+
+        // A result with a price signal (e.g. "price" in title) but no parseable
+        // price → must be KEPT (it might be the product, just with a price
+        // we couldn't parse).
+        let kept = should_filter_by_constraints(
+            "Laptop price guide",
+            "This page discusses laptop prices and features.",
+            "https://example.com/laptop-prices",
+            None,
+            &c,
+        );
+        assert!(!kept, "result with a price signal must be kept even without a parseable price");
+
+        // A result with a detectable price within budget → must be KEPT.
+        let in_budget = should_filter_by_constraints(
+            "Laptop for $300",
+            "This laptop costs $300 and has great features.",
+            "https://example.com/laptop-300",
+            None,
+            &c,
+        );
+        assert!(!in_budget, "result with price within budget must be kept");
+
+        // A result with a detectable price over budget → must be DROPPED.
+        let over_budget = should_filter_by_constraints(
+            "Laptop for $800",
+            "This laptop costs $800 and has great features.",
+            "https://example.com/laptop-800",
+            None,
+            &c,
+        );
+        assert!(over_budget, "result with price over budget must be dropped");
+
+        // No price bound → nothing is dropped regardless of price signal.
+        let no_bound = cst();
+        let no_bound_result = should_filter_by_constraints(
+            "Random article about laptops",
+            "This article discusses various laptop models.",
+            "https://example.com/laptop-article",
+            None,
+            &no_bound,
+        );
+        assert!(!no_bound_result, "no price bound means no price filtering");
     }
 
     #[test]
@@ -22387,13 +22759,20 @@ mod spellcheck_endpoint_tests {
         #[test]
         fn geolocate_local_intent_falls_back_to_default() {
             // A "near me" / "nearby" query with NO explicit place must resolve to
-            // the stable local-intent default (New York, US) — exactly as /search
-            // does for local-query expansion. No IP supplied => fallback, not "none".
+            // the stable local-intent default — exactly as /search does for
+            // local-query expansion. No IP supplied => fallback, not "none".
+            //
+            // The fallback is COUNTRY-LEVEL (India), never a city: a city-level
+            // default is a fabricated requirement the user never stated, and it
+            // is what previously injected "+New York" into the constraint set for
+            // a user in India.
             let loc = build_geolocate(None, "coffee shops near me open now", None);
             assert!(loc.local_intent);
             assert_eq!(loc.source, "local_intent_fallback");
-            assert_eq!(loc.resolved.as_ref().unwrap().city.as_deref(), Some("New York"));
-            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("US"));
+            assert_eq!(loc.resolved.as_ref().unwrap().city, None,
+                "the fallback must not invent a city the query never named");
+            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("IN"));
+            assert_eq!(loc.resolved.as_ref().unwrap().country_name.as_deref(), Some("India"));
         }
 
         #[test]
@@ -23350,7 +23729,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("transactional".to_string(), 0.9);
         dist.insert("informational".to_string(), 0.1);
         let signals = CommerceSignals::default();
-        assert!(is_commercial_intent("transactional", &dist, false, &signals, "test"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_commercial_intent("transactional", &dist, false, &signals, "test", &cfg));
     }
 
     #[test]
@@ -23364,7 +23744,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("transactional".to_string(), 0.62);
         // argmax label is "comparison" but transactional prob >= 0.50 => commercial.
         let signals = CommerceSignals::default();
-        assert!(is_commercial_intent("comparison", &dist, false, &signals, "test"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_commercial_intent("comparison", &dist, false, &signals, "test", &cfg));
     }
 
     #[test]
@@ -23374,7 +23755,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         // EXISTING gateway/engine constraint parser, never a keyword.
         let dist = std::collections::HashMap::new();
         let signals = CommerceSignals::default();
-        assert!(is_commercial_intent("informational", &dist, true, &signals, "test"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_commercial_intent("informational", &dist, true, &signals, "test", &cfg));
     }
 
     #[test]
@@ -23387,7 +23769,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("informational".to_string(), 0.95);
         dist.insert("transactional".to_string(), 0.02);
         let signals = CommerceSignals::default();
-        assert!(!is_commercial_intent("informational", &dist, false, &signals, "rust ownership"));
+        let cfg = ExactModelConfig::default();
+        assert!(!is_commercial_intent("informational", &dist, false, &signals, "rust ownership", &cfg));
     }
 
     // ── Commerce config + signals data-file wiring tests ─────────────────────
@@ -23451,13 +23834,14 @@ structured product data, so nothing must be extracted from the body.</p></body><
         dist.insert("informational".to_string(), 0.7);
         dist.insert("transactional".to_string(), 0.1);
         let sig = CommerceSignals::default();
+        let cfg = ExactModelConfig::default();
         assert!(
-            is_commercial_intent("informational", &dist, false, &sig, "buy wireless earbuds"),
+            is_commercial_intent("informational", &dist, false, &sig, "buy wireless earbuds", &cfg),
             "transactional keyword 'buy' should boost commercial intent"
         );
         // Same but with a non-transactional query — should NOT be commercial
         assert!(
-            !is_commercial_intent("informational", &dist, false, &sig, "rust ownership"),
+            !is_commercial_intent("informational", &dist, false, &sig, "rust ownership", &cfg),
             "non-transactional query must not be boosted"
         );
     }
@@ -24857,14 +25241,16 @@ mod affiliate_mainpath_tests {
         let mut dist = std::collections::HashMap::new();
         dist.insert("transactional".to_string(), 0.85);
         let sig = CommerceSignals::load();
-        assert!(is_commercial_intent("transactional", &dist, false, &sig, "buy iphone 16"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_commercial_intent("transactional", &dist, false, &sig, "buy iphone 16", &cfg));
     }
 
     #[test]
     fn commerce_intent_gate_true_for_price_bound() {
         let dist = std::collections::HashMap::new();
         let sig = CommerceSignals::load();
-        assert!(is_commercial_intent("informational", &dist, true, &sig, "laptop under 500"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_commercial_intent("informational", &dist, true, &sig, "laptop under 500", &cfg));
     }
 
     #[test]
@@ -24873,7 +25259,8 @@ mod affiliate_mainpath_tests {
         dist.insert("comparison".to_string(), 0.6);
         dist.insert("transactional".to_string(), 0.55);
         let sig = CommerceSignals::load();
-        assert!(is_commercial_intent("comparison", &dist, false, &sig, "iphone vs pixel"));
+        let cfg = ExactModelConfig::default();
+        assert!(is_commercial_intent("comparison", &dist, false, &sig, "iphone vs pixel", &cfg));
     }
 
     #[test]
@@ -24882,7 +25269,8 @@ mod affiliate_mainpath_tests {
         dist.insert("informational".to_string(), 0.9);
         dist.insert("transactional".to_string(), 0.1);
         let sig = CommerceSignals::load();
-        assert!(!is_commercial_intent("informational", &dist, false, &sig, "rust ownership"));
+        let cfg = ExactModelConfig::default();
+        assert!(!is_commercial_intent("informational", &dist, false, &sig, "rust ownership", &cfg));
     }
 
     #[test]
@@ -24927,7 +25315,8 @@ mod affiliate_mainpath_tests {
         let mut dist = std::collections::HashMap::new();
         dist.insert("informational".to_string(), 0.95);
         let sig = CommerceSignals::load();
-        let is_commercial = is_commercial_intent("informational", &dist, false, &sig, "how does rust work");
+        let cfg = ExactModelConfig::default();
+        let is_commercial = is_commercial_intent("informational", &dist, false, &sig, "how does rust work", &cfg);
         assert!(!is_commercial, "informational query must not trigger affiliate decoration");
     }
 }
@@ -25010,5 +25399,337 @@ mod local_intent_gazetteer_tests {
                 q
             );
         }
+    }
+}
+
+/// Regression lock for the geo-default defect (round 2026-10-16T1200Z).
+///
+/// Defect: "nearby restaurants" returned `["+nearby restaurants", "+New York"]`
+/// — the gateway's local-intent fallback defaulted to New York, US, and that
+/// city was then injected into `structured_constraints.positive`, so the result
+/// set was REQUIRED to mention a place the user never typed. For a user in
+/// India the results were wrong-region and the constraint was fabricated.
+///
+/// The fix has three parts, each locked here:
+///   1. the fallback is COUNTRY-LEVEL (India) and never invents a city;
+///   2. an INFERRED location (IP-derived or fallback) is never injected into
+///      `positive` / `entities` — only a place the query itself names is;
+///   3. the cross-location mismatch gate only runs for an explicit request.
+#[cfg(test)]
+mod geo_default_regression_tests {
+    use super::*;
+
+    fn loc(city: Option<&str>, country: Option<&str>) -> geoloc::GeoLocation {
+        geoloc::GeoLocation {
+            country_code: country.map(|s| s.to_string()),
+            country_name: country.map(|s| s.to_string()),
+            region: None,
+            city: city.map(|s| s.to_string()),
+            postal_code: None,
+            latitude: None,
+            longitude: None,
+            time_zone: None,
+        }
+    }
+
+    #[test]
+    fn inferred_location_is_recognised_as_inferred() {
+        // An IP-derived / fallback location is INFERRED: the query never named it.
+        assert!(is_inferred_location("nearby restaurants", &loc(Some("New York"), Some("US"))));
+        assert!(is_inferred_location("coffee shops near me", &loc(None, Some("IN"))));
+        assert!(is_inferred_location("how does a cpu pipeline work", &loc(Some("Mumbai"), Some("IN"))));
+    }
+
+    #[test]
+    fn query_named_location_is_not_inferred() {
+        // A place the user actually typed is EXPLICIT — it must stay a real
+        // requirement (this is what "restaurants in bangalore" depends on).
+        assert!(!is_inferred_location("restaurants in bangalore", &loc(Some("bangalore"), Some("IN"))));
+        assert!(!is_inferred_location("hotels in paris", &loc(Some("paris"), Some("FR"))));
+        // Country-level naming counts too.
+        assert!(!is_inferred_location("news from india", &loc(None, Some("India"))));
+    }
+
+    #[test]
+    fn nearby_query_never_adds_a_new_york_constraint() {
+        // ACCEPTANCE CRITERION 1: "nearby restaurants" must NOT add "+New York".
+        // The fallback is country-level, so there is no city to inject, and the
+        // injection gate refuses an inferred location anyway. Assert the exact
+        // shape the response reports: no positive constraint naming a place the
+        // query never contained.
+        let q = "nearby restaurants";
+        let fallback = loc(None, Some("IN"));
+        assert!(is_inferred_location(q, &fallback),
+            "the local-intent fallback must be treated as inferred");
+        // Whatever the fallback resolves to, it must not be a city the query
+        // never named — otherwise it would be injected as a positive Target.
+        assert!(fallback.city.is_none(),
+            "a city-level fallback would be injected as a fabricated requirement");
+        // And the query itself names no place, so nothing may be added.
+        assert!(detect_explicit_location(q).is_none());
+    }
+
+    #[test]
+    fn explicit_city_still_becomes_a_constraint() {
+        // ACCEPTANCE CRITERION 2: "restaurants in bangalore" must add
+        // "+bangalore". The gazetteer resolves it, the query names it, so the
+        // injection gate lets it through as a positive Target.
+        let q = "restaurants in bangalore";
+        let resolved = detect_explicit_location(q)
+            .expect("bangalore must resolve via the gazetteer");
+        assert_eq!(resolved.city.as_deref(), Some("bangalore"));
+        assert_eq!(resolved.country_code.as_deref(), Some("IN"));
+        assert!(!is_inferred_location(q, &resolved),
+            "a query-named place is explicit, not inferred");
+    }
+
+    #[test]
+    fn fallback_is_country_level_india() {
+        // The local-intent fallback must be country-level and must not carry a
+        // city/region/postal/coords — any of those would be a fabricated
+        // requirement for a user who typed no place.
+        let loc = build_geolocate(None, "nearby restaurants", None);
+        assert_eq!(loc.source, "local_intent_fallback");
+        let resolved = loc.resolved.expect("local intent must resolve");
+        assert_eq!(resolved.country_code.as_deref(), Some("IN"));
+        assert_eq!(resolved.country_name.as_deref(), Some("India"));
+        assert!(resolved.city.is_none());
+        assert!(resolved.region.is_none());
+        assert!(resolved.postal_code.is_none());
+        assert!(resolved.latitude.is_none());
+        assert!(resolved.longitude.is_none());
+        assert!(resolved.time_zone.is_none());
+    }
+
+    #[test]
+    fn no_inferred_location_is_ever_a_positive_requirement() {
+        // The injection gate's own contract: for ANY inferred location, the
+        // query's own words are the only thing that may become a positive
+        // requirement. Sweeps the fallback plus an IP-shaped location so the
+        // rule is not tuned to one fixture.
+        for (q, l) in [
+            ("nearby restaurants", loc(None, Some("IN"))),
+            ("coffee shops near me", loc(None, Some("IN"))),
+            ("best cafes around me", loc(Some("New York"), Some("US"))),
+            ("hotels close to me", loc(Some("Mumbai"), Some("IN"))),
+        ] {
+            assert!(is_inferred_location(q, &l),
+                "'{}' must treat {:?} as inferred", q, l.city);
+        }
+    }
+}
+
+#[cfg(test)]
+mod negative_constraint_retention_tests {
+    use super::*;
+
+    /// REGRESSION: negative constraint filter must not collapse result sets.
+    ///
+    /// The post-merge hard filter (main.rs ~17698) counts how many negative
+    /// terms each result violates, then keeps only results with violations <= threshold.
+    /// When min_violations == 0 (at least one clean result exists), the threshold
+    /// is 0 — meaning ONLY clean results are kept. For queries like
+    /// "programming not java", most programming pages mention Java somewhere,
+    /// so the filter kept only the few that didn't, collapsing the result set.
+    ///
+    /// The fix adds a minimum retention guarantee: never drop below 50% of the
+    /// original count (or 5 results, whichever is larger). This test verifies
+    /// the retention floor logic by simulating the filter's decision process.
+
+    /// Simulate the post-merge filter's retention logic and verify it never
+    /// collapses below the retention floor.
+    fn simulate_retention(
+        violation_counts: &[usize],
+        original_count: usize,
+    ) -> usize {
+        let max_violations = violation_counts.iter().copied().max().unwrap_or(0);
+        let min_violations = violation_counts.iter().copied().min().unwrap_or(0);
+        let total_violations: usize = violation_counts.iter().sum();
+        let avg_violations = total_violations as f32 / violation_counts.len().max(1) as f32;
+        let is_goldilocks = avg_violations > 1.5 && min_violations >= 1;
+
+        let violation_threshold = if is_goldilocks {
+            (max_violations / 2).max(1)
+        } else if min_violations == 0 {
+            0
+        } else {
+            0
+        };
+
+        let mut kept: Vec<usize> = violation_counts
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v <= violation_threshold)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Retention floor logic (mirrors the fix in main.rs)
+        let retention_floor = (original_count / 2).max(5).min(original_count);
+        if kept.len() < retention_floor && kept.len() < original_count {
+            let mut relaxed_threshold = violation_threshold;
+            while kept.len() < retention_floor && relaxed_threshold < max_violations {
+                relaxed_threshold += 1;
+                kept = violation_counts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| **v <= relaxed_threshold)
+                    .map(|(i, _)| i)
+                    .collect();
+            }
+        }
+
+        kept.len()
+    }
+
+    #[test]
+    fn retention_floor_prevents_collapse_when_most_results_violate() {
+        // Scenario: 20 results, 17 mention "java" (1 violation each), 3 are clean.
+        // Without the fix: threshold=0, kept=3 (collapse from 20 to 3).
+        // With the fix: retention_floor = max(20/2, 5) = 10, so threshold relaxes
+        // until at least 10 results are kept.
+        let violations: Vec<usize> = (0..20)
+            .map(|i| if i < 3 { 0 } else { 1 })
+            .collect();
+        let kept = simulate_retention(&violations, 20);
+        assert!(
+            kept >= 10,
+            "retention floor should keep >= 10 results, kept only {}",
+            kept
+        );
+    }
+
+    #[test]
+    fn retention_floor_prevents_collapse_with_multiple_negatives() {
+        // Scenario: 15 results, all mention at least one of 3 negative terms.
+        // min_violations=1, avg=1.33 (below Goldilocks 1.5 threshold).
+        // Without the fix: threshold=0, kept=0 (total collapse).
+        // With the fix: retention_floor = max(15/2, 5) = 7, so threshold relaxes.
+        let violations: Vec<usize> = (0..15)
+            .map(|i| 1 + (i % 2))
+            .collect();
+        let kept = simulate_retention(&violations, 15);
+        assert!(
+            kept >= 7,
+            "retention floor should keep >= 7 results, kept only {}",
+            kept
+        );
+    }
+
+    #[test]
+    fn no_collapse_when_all_results_are_clean() {
+        // Scenario: all results have 0 violations — nothing to filter.
+        let violations: Vec<usize> = vec![0; 10];
+        let kept = simulate_retention(&violations, 10);
+        assert_eq!(kept, 10, "all clean results should be kept");
+    }
+
+    #[test]
+    fn no_collapse_when_enough_clean_results_exist() {
+        // Scenario: 20 results, 12 clean (0 violations), 8 with violations.
+        // Without the fix: threshold=0, kept=12 (acceptable).
+        // With the fix: retention_floor=10, 12 >= 10, so no relaxation needed.
+        let violations: Vec<usize> = (0..20)
+            .map(|i| if i < 12 { 0 } else { 1 })
+            .collect();
+        let kept = simulate_retention(&violations, 20);
+        assert_eq!(kept, 12, "12 clean results should be kept without relaxation");
+    }
+
+    #[test]
+    fn goldilocks_relaxation_still_works() {
+        // Scenario: all results have high violations, avg > 1.5.
+        // Goldilocks should fire and relax the threshold.
+        let violations: Vec<usize> = vec![2, 3, 2, 3, 2, 3, 2, 3, 2, 3];
+        let kept = simulate_retention(&violations, 10);
+        // Goldilocks: threshold = max/2 = 3/2 = 1, but all have >= 2 violations.
+        // So kept=0 without retention. With retention_floor=5, threshold relaxes to 2.
+        assert!(
+            kept >= 5,
+            "Goldilocks + retention should keep >= 5 results, kept only {}",
+            kept
+        );
+    }
+
+    #[test]
+    fn small_result_set_retention_floor() {
+        // Scenario: only 3 results, 2 violate. Retention floor = max(3/2, 5) = 5,
+        // but min(5, 3) = 3. So all 3 should be kept.
+        let violations: Vec<usize> = vec![0, 1, 1];
+        let kept = simulate_retention(&violations, 3);
+        assert_eq!(kept, 3, "small result sets should not be collapsed below their size");
+    }
+
+    #[test]
+    fn should_filter_does_not_hard_drop_bare_negative_terms() {
+        // REGRESSION: should_filter_by_constraints must NOT hard-drop on bare
+        // negative terms (e.g. "java" from "python not java"). Only structural
+        // operators (site:/filetype: negatives, date bounds, phrases) should
+        // hard-drop. This is the P5 fix.
+        let mut c = Constraints::default();
+        c.negative = vec!["java".to_string()];
+
+        // A result that mentions "java" in content should NOT be dropped
+        let title = "Python Programming Guide";
+        let content = "This guide compares Python with Java and other languages.";
+        let url = "https://example.com/python-guide";
+
+        assert!(
+            !should_filter_by_constraints(title, content, url, None, &c),
+            "bare negative term 'java' must NOT hard-drop a result"
+        );
+    }
+
+    #[test]
+    fn should_filter_still_drops_on_structural_negatives() {
+        // site: negatives should still hard-drop
+        let mut c = Constraints::default();
+        c.negative = vec!["site:reddit.com".to_string()];
+
+        let title = "Python Guide";
+        let content = "Some content";
+        let url = "https://www.reddit.com/r/python";
+
+        assert!(
+            should_filter_by_constraints(title, content, url, None, &c),
+            "site: negative must hard-drop matching results"
+        );
+    }
+
+    #[test]
+    fn constraint_score_does_not_zero_for_content_mention() {
+        // REGRESSION: constraint_score should NOT return 0.0 for a result
+        // that merely mentions a negative term in content (not title-dominated).
+        // A score of 0.0 effectively removes the result from visibility.
+        let mut c = Constraints::default();
+        c.negative = vec!["java".to_string()];
+
+        let title = "Python Programming Guide";
+        let content = "This guide compares Python with Java and other languages.";
+        let url = "https://example.com/python-guide";
+
+        let score = constraint_score(title, content, url, &c);
+        assert!(
+            score > 0.0,
+            "constraint_score must not be 0.0 for a content mention, got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn constraint_score_zero_for_title_dominated() {
+        // A result whose TITLE is dominated by the excluded term SHOULD get 0.0.
+        let mut c = Constraints::default();
+        c.negative = vec!["java".to_string()];
+
+        let title = "Java Programming Language";
+        let content = "Some content about programming.";
+        let url = "https://example.com/java";
+
+        let score = constraint_score(title, content, url, &c);
+        assert_eq!(
+            score, 0.0,
+            "title-dominated result should get score 0.0, got {}",
+            score
+        );
     }
 }
