@@ -14092,8 +14092,18 @@ async fn handle_inspect(
 /// exposes only the deterministic local classification so the contract is
 /// stable + fully testable without the intent engine up, and so clients can
 /// reason about the offline baseline the ranker guarantees.
+///
+/// The rule-based override chain (`apply_search_intent_overrides`) IS applied
+/// here — it is pure, so the preview matches the offline `/search` baseline
+/// exactly. Verified live before this wiring: `/intent` returned
+/// `informational` @ 0.30 for "iphone 16 pro max price" while `/search`
+/// returned `transactional` @ 0.80 for the same query.
 fn build_intent(q: &str) -> serde_json::Value {
-    let intent_resp = fallback_intent(q);
+    let mut intent_resp = fallback_intent(q);
+    // Same override chain /search runs (extracted verbatim into a pure fn).
+    // Without this the preview reported the RAW classifier label and disagreed
+    // with /search on every query an override rewrites.
+    apply_search_intent_overrides(&mut intent_resp, q);
     let category = parent_category(&intent_resp.intent);
     let contrastive = query_is_contrastive(q);
     let local = has_local_intent(q);
@@ -16132,9 +16142,24 @@ async fn handle_search(
         }
     }
 
-    // ─── Rule-based intent overrides for known misclassification patterns ───
-    // Fire when the linear probe has low confidence (<0.30) — the model is guessing,
-    // so pattern-based heuristics beat random chance.
+/// `/search`'s rule-based intent-override chain, extracted verbatim into a pure
+/// function so the `/intent` preview can run the EXACT same logic.
+///
+/// WHY THIS EXISTS: `build_intent` called `fallback_intent` and stopped there, so
+/// `/intent` reported the *raw* classifier label while `/search` ran ~12
+/// compensating overrides on top of it. The two endpoints therefore disagreed on
+/// every query whose label an override rewrites — verified live:
+/// `/intent?q=iphone 16 pro max price` → `informational` @ 0.30 while
+/// `/search?q=…` → `transactional` @ 0.80. The overrides are pure functions of
+/// `(intent, query)`, so they are factored out here and called from BOTH sites:
+/// `handle_search` (after the engine/fallback resolves, before the contract
+/// normalization) and `build_intent`. One implementation, two callers — the
+/// disagreement is structurally impossible, not patched per-endpoint.
+///
+/// The body below is the override block moved out of `handle_search` unchanged
+/// (same gates, same order, same confidence floors). No per-query literals were
+/// added; every signal is the structural/data-driven one the ranker already used.
+fn apply_search_intent_overrides(intent: &mut IntentResponse, q: &str) {
     {
         let q_lower = q.to_lowercase();
         let only_negative_pattern = !intent.structured_constraints.negative.is_empty()
@@ -16546,6 +16571,14 @@ async fn handle_search(
             intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
         }
     }
+}
+
+    // ─── Rule-based intent overrides for known misclassification patterns ───
+    // Fire when the linear probe has low confidence (<0.30) — the model is guessing,
+    // so pattern-based heuristics beat random chance. Extracted into
+    // `apply_search_intent_overrides` so `/intent` runs the IDENTICAL chain (the
+    // two endpoints previously disagreed on every override-rewritten label).
+    apply_search_intent_overrides(&mut intent, &q);
 
     let vector: Option<Vec<f32>> = match embed_res {
         Some(resp) => {
