@@ -16149,433 +16149,6 @@ async fn handle_search(
     // two endpoints previously disagreed on every override-rewritten label).
     apply_search_intent_overrides(&mut intent, &q);
 
-/// `/search`'s rule-based intent-override chain, extracted verbatim into a pure
-/// function so the `/intent` preview can run the EXACT same logic.
-///
-/// WHY THIS EXISTS: `build_intent` called `fallback_intent` and stopped there, so
-/// `/intent` reported the *raw* classifier label while `/search` ran ~12
-/// compensating overrides on top of it. The two endpoints therefore disagreed on
-/// every query whose label an override rewrites — verified live:
-/// `/intent?q=iphone 16 pro max price` → `informational` @ 0.30 while
-/// `/search?q=…` → `transactional` @ 0.80. The overrides are pure functions of
-/// `(intent, query)`, so they are factored out here and called from BOTH sites:
-/// `handle_search` (after the engine/fallback resolves, before the contract
-/// normalization) and `build_intent`. One implementation, two callers — the
-/// disagreement is structurally impossible, not patched per-endpoint.
-///
-/// The body below is the override block moved out of `handle_search` unchanged
-/// (same gates, same order, same confidence floors). No per-query literals were
-/// added; every signal is the structural/data-driven one the ranker already used.
-fn apply_search_intent_overrides(intent: &mut IntentResponse, q: &str) {
-    let only_negative_pattern = !intent.structured_constraints.negative.is_empty()
-        && intent.structured_constraints.positive.is_empty();
-
-    // Override 1: only-negative queries classified as navigational → informational
-    // e.g. "not django" (conf=0.24, classified navigational — should be informational)
-    if only_negative_pattern && intent.intent.as_str() != "informational" && intent.confidence < 0.30 {
-        tracing::info!(
-            "INTENT OVERRIDE: only-negative '{}' was '{}' (conf={:.3}) → informational",
-            q, intent.intent, intent.confidence
-        );
-        intent.intent = "informational".to_string();
-        intent.confidence = intent.confidence.max(0.35);
-        // Boost informational in the distribution for correct RankingWeights blending
-        let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-        let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
-        intent.distribution.insert("informational".to_string(), info_prob + nav_prob * 0.5);
-        intent.distribution.insert("navigational".to_string(), nav_prob * 0.5);
-    }
-
-    // Override 2: temporal/freshness signal → force fresh intent.
-    // Phase 4 (CROSS-CUTTING): the engine now emits intent="fresh" for
-    // recency queries, but as defense-in-depth the gateway also forces it
-    // here. The OLD gate (confidence < 0.30) let "latest ai news 2026"
-    // (0.459) and "recent rust releases" (0.519) slip through to a 90-day
-    // navigational half-life. We now trigger on the recency signal itself,
-    // not on low confidence.
-    {
-        let has_news_signal = q_lower.contains("latest") || q_lower.contains("recent")
-            || q_lower.contains("breaking") || q_lower.contains("headline")
-            || q_lower.contains("new ") || q_lower.contains("newest")
-            || q_lower.contains("cve-") || q_lower.contains("vulnerability")
-            || q_lower.contains("this week") || q_lower.contains("this month")
-            || q_lower.contains("past week") || q_lower.contains("last week");
-        let has_topic_signal = q_lower.contains("news") || q_lower.contains("update")
-            || q_lower.contains("today") || q_lower.contains("this week")
-            || q_lower.contains("2026") || q_lower.contains("2025")
-            || q_lower.contains("release") || q_lower.contains("version");
-        // Don't clobber a fresh intent that the engine already set.
-        if intent.intent != "fresh" && has_news_signal && has_topic_signal {
-            tracing::info!(
-                "INTENT OVERRIDE (STRONG): news query '{}' was '{}' (conf={:.3}) — forcing fresh",
-                q, intent.intent, intent.confidence
-            );
-            intent.intent = "fresh".to_string();
-            intent.confidence = intent.confidence.max(0.45);
-            // Reshape distribution: fresh gets the top probability
-            let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
-            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-            intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
-            // Boost informational as secondary intent (for ranking weight blending)
-            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-            intent.distribution.insert("informational".to_string(), info_prob + 0.15);
-        }
-        // Weak signal: only topic signal (e.g. year without news keywords).
-        else if intent.intent != "fresh" && (q_lower.contains("2026") || q_lower.contains("2025")) {
-            let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
-            let current_prob = intent.distribution.get(&intent.intent).copied().unwrap_or(0.0);
-            if fresh_prob + 0.15 > current_prob {
-                tracing::info!(
-                    "INTENT OVERRIDE (WEAK): year query '{}' was '{}' (conf={:.3}) — boosting fresh (fresh={:.3})",
-                    q, intent.intent, intent.confidence, fresh_prob
-                );
-                intent.distribution.insert("fresh".to_string(), fresh_prob + 0.15);
-            }
-        }
-    }
-
-    // Override 2b: a fresh intent with no derived date window must still
-    // apply a real recency cutoff (not just re-weight scoring). Without this,
-    // "latest ai news" would rank newer items higher but never drop stale ones.
-    // The actual hard window is applied AFTER the web merge (see dated_result_count
-    // guard near line ~8485): we only set it when at least one web result actually
-    // carries a parseable date, so date-less fresh queries (e.g. "latest movies
-    // released in 2026") fail OPEN and keep recency as a scoring boost instead of
-    // collapsing to 0 results.
-    if intent.intent == "fresh" && intent.structured_constraints.after_date.is_none() {
-        tracing::info!("FRESH OVERRIDE: fresh intent without date window — window applied post-merge (fail-open if no dated results)");
-    }
-
-    // Override 3: "other than X" with low confidence → boost comparison + technical
-    // e.g. "programming language other than java" (conf=0.12, technical is correct base)
-    if q_lower.contains("other than") && intent.confidence < 0.20 {
-        tracing::info!(
-            "INTENT OVERRIDE: 'other than' query '{}' was '{}' (conf={:.3}) — boosting comparison/technical",
-            q, intent.intent, intent.confidence
-        );
-        let comp = intent.distribution.get("comparison").copied().unwrap_or(0.0);
-        let tech = intent.distribution.get("technical").copied().unwrap_or(0.0);
-        intent.distribution.insert("comparison".to_string(), comp + 0.1);
-        intent.distribution.insert("technical".to_string(), tech + 0.1);
-    }
-
-    // Override 4: local intent signals → force local intent
-    // Delegates to `has_local_intent` so the keyword list stays in ONE
-    // place. This covers "near me", "nearby", "coffee shop", AND
-    // gazetteer-city patterns like "restaurants in bangalore".
-    let has_local_keywords = has_local_intent(&q_lower);
-    if has_local_keywords && intent.intent != "local" {
-        tracing::info!(
-            "INTENT OVERRIDE (STRONG): local query '{}' was '{}' (conf={:.3}) -> local",
-            q, intent.intent, intent.confidence
-        );
-        intent.intent = "local".to_string();
-        intent.confidence = intent.confidence.max(0.75);
-        let local_prob = intent.distribution.get("local").copied().unwrap_or(0.0);
-        let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-        intent.distribution.insert("local".to_string(), (local_prob + current_top_prob * 0.5 + 0.4).min(0.90));
-    }
-
-    // Override 5: Comparison & Alternatives signals (H2 fix)
-    // e.g. "alternatives to adobe photoshop that are free", "best budget smartphones under 30000 rupees"
-    let comp_signals = [
-        "alternatives to", "alternative to", "alternatives for", "alternative for",
-        "similar to", "apps like", "tools like", "software like", "sites like",
-        "equivalent to", "replacement for", "competing with", "vs", "versus",
-        "best budget", "best ... under", "top ... under", "compared to", "difference between",
-        "which is better", "comparison", "compare "
-    ];
-    let has_comp_signal = comp_signals.iter().any(|s| {
-        if s.contains("...") {
-            let parts: Vec<&str> = s.split("...").collect();
-            parts.len() == 2 && q_lower.contains(parts[0].trim()) && q_lower.contains(parts[1].trim())
-        } else {
-            q_lower.contains(s)
-        }
-    });
-    if has_comp_signal {
-        tracing::info!(
-            "INTENT OVERRIDE (DECISIVE): comparison query '{}' was '{}' (conf={:.3}) -> comparison",
-            q, intent.intent, intent.confidence
-        );
-        intent.intent = "comparison".to_string();
-        intent.confidence = intent.confidence.max(0.85);
-        intent.distribution.insert("comparison".to_string(), 0.85);
-        if intent.distribution.get("informational").copied().unwrap_or(0.0) > 0.4 {
-            intent.distribution.insert("informational".to_string(), 0.15);
-        }
-    }
-
-    // Override 6: transactional keywords OR an explicit price bound -> transactional
-    // GUARD: do not fire the keyword-based override on queries whose primary intent
-    // is clearly informational/how-to. A how-to query like "how to convert PDF to
-    // Word under 5 minutes" or "how to calculate conversion rate" contains "under "
-    // or "rate" but is NOT transactional. The keyword list is a weak signal; the
-    // how-to/informational starter is a strong one. Only an explicit price bound
-    // (parsed from NL) can override a how-to starter — that is a decisive signal.
-    //
-    // EXCEPTION: "how much does X cost" / "how many" queries are price questions,
-    // not informational. The word "cost" or a price/cost term in the query body
-    // is a decisive transactional signal even when the query starts with "how much".
-    let informational_starters = [
-        "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
-        "what is ", "what are ", "what was ", "what were ", "why ", "why is ",
-        "why are ", "why does ", "why do ", "guide to ", "tutorial", "explain ",
-        "understand ", "learn ", "teach me ",
-    ];
-    let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
-    // "how much does X cost" / "how much is X" / "how many" with a price/cost term
-    // is a transactional price question, NOT informational. The presence of
-    // "cost", "price", "rupee", "inr", "₹", "dollar", etc. in the query body is a
-    // decisive signal that overrides the informational starter guard.
-    let has_price_term_in_body = ["cost", "price", "pricing", "rupee", "rupees", "inr", "₹", "dollar", "dollars", "budget", "cheap", "expensive", "affordable", "worth"]
-        .iter().any(|t| q_lower.contains(t));
-    let is_how_much_price_query = (q_lower.starts_with("how much") || q_lower.starts_with("how many"))
-        && has_price_term_in_body;
-    // Word-boundary matching: each keyword must appear as a complete word,
-    // not as a substring of another word (e.g. "price" must not match
-    // "priceless"). The trailing-space convention ("price ") missed queries
-    // ending with the keyword ("sony wh-1000xm5 price"). \b word boundaries
-    // fix both ends without per-query literals.
-    let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
-    let has_tx_signal = tx_keywords.iter().any(|k| {
-        let pattern = format!(r"\b{}\b", regex::escape(k));
-        regex::Regex::new(&pattern).map(|re| re.is_match(&q_lower)).unwrap_or(false)
-    });
-    // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
-    // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
-    // `comparison` on the generic "best ... under" signal — but a budget-anchored
-    // buy query is transactional, not a comparison. The price bound is signal-driven
-    // (parsed from NL), not a per-query literal, so this is general and future-proof.
-    let sc = &intent.structured_constraints;
-    let has_price_bound = sc.price_lt.is_some() || sc.price_max.is_some()
-        || sc.price_min.is_some() || sc.price_gt.is_some();
-    // The keyword-based tx signal is suppressed when the query starts with an
-    // informational/how-to starter. A price bound is still allowed through — it is
-    // a decisive signal that the user wants to buy, not just learn.
-    // EXCEPTION: "how much does X cost" is a price question, not informational.
-    let tx_signal_effective = (has_tx_signal && !has_informational_starter) || is_how_much_price_query;
-    if (tx_signal_effective || has_price_bound) && !has_local_keywords {
-        if (intent.intent != "comparison" || has_price_bound)
-            && (intent.intent != "transactional" || intent.confidence < 0.60)
-        {
-            if has_price_bound && intent.intent == "comparison" {
-                tracing::info!(
-                    "INTENT OVERRIDE (STRONG): price-bounded buy query '{}' was 'comparison' (conf={:.3}) -> transactional",
-                    q, intent.confidence
-                );
-                // Dampen the spurious comparison probability so ranking blends transactional.
-                if let Some(c) = intent.distribution.get_mut("comparison") {
-                    *c = (*c * 0.4).min(0.30);
-                }
-            } else {
-                tracing::info!(
-                    "INTENT OVERRIDE (STRONG): transactional query '{}' was '{}' (conf={:.3}) -> transactional",
-                    q, intent.intent, intent.confidence
-                );
-            }
-            intent.intent = "transactional".to_string();
-            intent.confidence = intent.confidence.max(0.80);
-            let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
-            intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
-        }
-    }
-
-    // Override 6b: Career-advice / transition queries → informational
-    // Long conversational queries like "i am a 28 year old chartered accountant
-    // ... i want to transition into data analytics ... should i learn python or r"
-    // are career advice, NOT technical. The intent engine misclassifies them as
-    // "technical" because they mention tech terms (python, data, programming).
-    // The decisive signal: the query describes a career situation (job title +
-    // "transition" / "switch" / "move into" / "career" / "should i learn").
-    // General: pattern-based on career vocabulary, no per-query literals.
-    let career_signals = [
-        "transition", "transitioning", "switch", "switching", "move into",
-        "moving into", "career", "job change", "new field", "new career",
-        "should i learn", "should i study", "how do i become",
-        "how to become", "what should i learn", "advice", "guidance",
-    ];
-    let has_career_signal = career_signals.iter().any(|s| q_lower.contains(s));
-    let has_job_context = ["i am a ", "i'm a ", "i work as ", "i have been working",
-        "years of experience", "working as", "my job", "my career",
-    ].iter().any(|s| q_lower.contains(s));
-    if has_career_signal && has_job_context && intent.intent == "technical" {
-        tracing::info!(
-            "INTENT OVERRIDE (CAREER): career-advice query '{}' was 'technical' -> informational",
-            q
-        );
-        intent.intent = "informational".to_string();
-        intent.confidence = intent.confidence.max(0.75);
-        let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-        intent.distribution.insert("informational".to_string(), (info_prob + 0.50).min(0.88));
-        // Dampen the spurious technical probability
-        if let Some(t) = intent.distribution.get_mut("technical") {
-            *t = (*t * 0.4).min(0.30);
-        }
-    }
-
-    // Override 7: Model-number + price/cost terms → transactional
-    // The classifier misses model-number patterns ("iphone 16 pro max price",
-    // "oneplus 12 price") — the word "price" alone is weak signal. When a known
-    // brand+model pattern co-occurs with a price/cost term, the intent is
-    // decisively transactional (P10/P11 style compensation for the linear probe).
-    if is_model_number_price_query(&q_lower) {
-        if intent.intent != "transactional" || intent.confidence < 0.60 {
-            tracing::info!(
-                "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
-                q, intent.intent, intent.confidence
-            );
-            intent.intent = "transactional".to_string();
-            intent.confidence = intent.confidence.max(0.80);
-            let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
-            intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
-        }
-    }
-
-    // Override 8: Driver / Software Download Intent -> force decisive Navigational + Download intent
-    let download_keywords = [
-        "driver", "drivers", "download", "downloads", "installer", "installers",
-        "firmware", "patch", "software download", "official download", "setup.exe"
-    ];
-    let has_download_signal = download_keywords.iter().any(|k| q_lower.contains(k));
-    if has_download_signal {
-        tracing::info!(
-            "INTENT OVERRIDE (DECISIVE): driver/download query '{}' was '{}' (conf={:.3}) -> navigational",
-            q, intent.intent, intent.confidence
-        );
-        intent.intent = "navigational".to_string();
-        intent.confidence = intent.confidence.max(0.88);
-        let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
-        intent.distribution.insert("navigational".to_string(), (nav_prob + 0.60).min(0.95));
-        intent.distribution.insert("download".to_string(), 0.90);
-    }
-
-    // Override 7: weather / forecast queries → fresh
-    // WHOLE-WORD match only: a naive `contains("rain")` wrongly fired inside
-    // "fe**rain**al" (a rescue-cat query) and forced fresh intent on a how-to
-    // question, which then re-ranked results by recency instead of relevance.
-    // Use the same `q_has_word` boundary helper that guards "fresh"/"latest".
-    let weather_signals = [
-        "weather", "forecast", "temperature", "rain", "snow", "humidity",
-        "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
-    ];
-    let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
-    // A weather word alone is not enough — the query must be PRIMARILY about
-    // weather, not merely mention it as context. "cold weather" in a car repair
-    // query ("why does my car make a clicking noise when i try to start it in
-    // cold weather") is not a weather query. Require a weather-specific signal
-    // (forecast/temperature/rain/snow/etc.) OR the word "weather" as the first
-    // content word (i.e. the query is about weather itself, not a topic that
-    // happens to mention weather).
-    let weather_primary = q_has_word(&q_lower, "forecast")
-        || q_has_word(&q_lower, "temperature")
-        || q_has_word(&q_lower, "rain")
-        || q_has_word(&q_lower, "snow")
-        || q_has_word(&q_lower, "humidity")
-        || q_has_word(&q_lower, "precipitation")
-        || q_has_word(&q_lower, "thunderstorm")
-        || q_has_word(&q_lower, "sunny")
-        || q_has_word(&q_lower, "cloudy")
-        || q_has_word(&q_lower, "meteorology")
-        || q_lower.starts_with("weather ");
-    let has_weather_signal = weather_primary;
-    // Do NOT clobber a decisive action/decision intent (comparison,
-    // transactional, how-to, technical, navigational) to fresh. A weather word
-    // like "rain" legitimately appears inside gear/commercial/how-to queries
-    // ("backpacking tent in the rain", "fix laptop fan after rain") and must not
-    // re-rank them by news-recency. Weather override only applies to
-    // informational/chitchat-style queries; genuine weather queries are still
-    // caught by the "today"/"forecast" temporal signals in other overrides.
-    let weather_skip_intents = ["comparison", "transactional", "how-to", "technical", "navigational"];
-    let weather_should_skip = weather_skip_intents.contains(&intent.intent.as_str());
-    // Also skip when the query itself carries decisive product / recommendation /
-    // instructional framing. A weather word inside such a query does NOT make it a
-    // weather query: "best lightweight tent for backpacking in the rain",
-    // "hiking boots that work in snow" are gear/how-to questions the engine may
-    // classify as `informational` (low confidence) -- which the 5-intent skip list
-    // above does not catch, so the weather override would wrongly re-rank them by
-    // news-recency. Genuine weather queries ("weather forecast today rain") carry
-    // none of these markers and still force `fresh` below.
-    let has_decisive_framing = [
-        "best ", "top ", "vs ", " review", "reviews", " for camping", " for backpacking",
-        " for hiking", "how to", "how do i", "buy ", "compare", "alternatives",
-        "which ", "cheapest", " vs. ", "best-",
-    ]
-    .iter()
-    .any(|m| q_lower.contains(m));
-    let weather_should_skip = weather_should_skip || has_decisive_framing;
-    if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" && !weather_should_skip {
-        tracing::info!(
-            "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
-            q, intent.intent, intent.confidence
-        );
-        intent.intent = "fresh".to_string();
-        intent.confidence = intent.confidence.max(0.45);
-        let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
-        let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-        intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
-    }
-
-    // Override 8: procedural / how-to queries → how-to
-    // Only fire when the query STARTS with a how-to signal, not when "how can i"
-    // appears as a secondary clause in an informational query (e.g. "why do some
-    // people get altitude sickness and how can i prevent it" is primarily about
-    // causes, not a how-to guide).
-    let howto_starters = [
-        "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
-    ];
-    let has_howto_starter = howto_starters.iter().any(|s| q_lower.starts_with(s));
-    let howto_mid_signals = [
-        "tutorial", "step by step", "step-by-step", "ways to", "guide to", "guide:",
-        "find files", "find the", "modified", "fix ", "install", "configure",
-        "set up", "setup", "uninstall", "upgrade", "build from", "compile",
-        "debug", "troubleshoot", "resolve", "workaround",
-    ];
-    let has_howto_signal = has_howto_starter
-        || (!q_lower.starts_with("why ") && !q_lower.starts_with("what ")
-            && howto_mid_signals.iter().any(|s| q_lower.contains(s)));
-    if has_howto_signal
-        && (intent.intent == "navigational" || intent.confidence < 0.40)
-        && intent.intent != "how-to"
-    {
-        tracing::info!(
-            "INTENT OVERRIDE (STRONG): how-to query '{}' was '{}' (conf={:.3}) → how-to",
-            q, intent.intent, intent.confidence
-        );
-        intent.intent = "how-to".to_string();
-        intent.confidence = intent.confidence.max(0.45);
-        let howto_prob = intent.distribution.get("how-to").copied().unwrap_or(0.0);
-        let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-        intent.distribution.insert("how-to".to_string(), (howto_prob + current_top_prob * 0.5).min(0.85));
-        let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
-        intent.distribution.insert("technical".to_string(), tech_prob + 0.15);
-    }
-
-    // Override 9: research / study queries → informational
-    let research_signals = [
-        "study", "studies", "efficacy", "research", "analysis", "literature",
-        "paper", "survey", "whitepaper", "benchmark", "experiment", "findings",
-        "meta-analysis", "peer review", "journal", "abstract",
-    ];
-    let has_research_signal = research_signals.iter().any(|s| q_lower.contains(s));
-    if has_research_signal
-        && (intent.intent == "navigational" || intent.confidence < 0.40)
-        && intent.intent != "informational"
-        && intent.intent != "fresh"
-    {
-        tracing::info!(
-            "INTENT OVERRIDE (STRONG): research query '{}' was '{}' (conf={:.3}) → informational",
-            q, intent.intent, intent.confidence
-        );
-        intent.intent = "informational".to_string();
-        intent.confidence = intent.confidence.max(0.45);
-        let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
-        let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
-        intent.distribution.insert("informational".to_string(), (info_prob + current_top_prob * 0.5).min(0.85));
-        let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
-        intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
-    }
-}
 
     let vector: Option<Vec<f32>> = match embed_res {
         Some(resp) => {
@@ -19269,6 +18842,433 @@ let mut results = match tokio::task::spawn_blocking(move || {
         response_json
     };
     (axum::http::StatusCode::OK, Json(final_json))
+}
+/// `/search`'s rule-based intent-override chain, extracted verbatim into a pure
+/// function so the `/intent` preview can run the EXACT same logic.
+///
+/// WHY THIS EXISTS: `build_intent` called `fallback_intent` and stopped there, so
+/// `/intent` reported the *raw* classifier label while `/search` ran ~12
+/// compensating overrides on top of it. The two endpoints therefore disagreed on
+/// every query whose label an override rewrites — verified live:
+/// `/intent?q=iphone 16 pro max price` → `informational` @ 0.30 while
+/// `/search?q=…` → `transactional` @ 0.80. The overrides are pure functions of
+/// `(intent, query)`, so they are factored out here and called from BOTH sites:
+/// `handle_search` (after the engine/fallback resolves, before the contract
+/// normalization) and `build_intent`. One implementation, two callers — the
+/// disagreement is structurally impossible, not patched per-endpoint.
+///
+/// The body below is the override block moved out of `handle_search` unchanged
+/// (same gates, same order, same confidence floors). No per-query literals were
+/// added; every signal is the structural/data-driven one the ranker already used.
+fn apply_search_intent_overrides(intent: &mut IntentResponse, q: &str) {
+    let only_negative_pattern = !intent.structured_constraints.negative.is_empty()
+        && intent.structured_constraints.positive.is_empty();
+
+    // Override 1: only-negative queries classified as navigational → informational
+    // e.g. "not django" (conf=0.24, classified navigational — should be informational)
+    if only_negative_pattern && intent.intent.as_str() != "informational" && intent.confidence < 0.30 {
+        tracing::info!(
+            "INTENT OVERRIDE: only-negative '{}' was '{}' (conf={:.3}) → informational",
+            q, intent.intent, intent.confidence
+        );
+        intent.intent = "informational".to_string();
+        intent.confidence = intent.confidence.max(0.35);
+        // Boost informational in the distribution for correct RankingWeights blending
+        let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+        let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
+        intent.distribution.insert("informational".to_string(), info_prob + nav_prob * 0.5);
+        intent.distribution.insert("navigational".to_string(), nav_prob * 0.5);
+    }
+
+    // Override 2: temporal/freshness signal → force fresh intent.
+    // Phase 4 (CROSS-CUTTING): the engine now emits intent="fresh" for
+    // recency queries, but as defense-in-depth the gateway also forces it
+    // here. The OLD gate (confidence < 0.30) let "latest ai news 2026"
+    // (0.459) and "recent rust releases" (0.519) slip through to a 90-day
+    // navigational half-life. We now trigger on the recency signal itself,
+    // not on low confidence.
+    {
+        let has_news_signal = q_lower.contains("latest") || q_lower.contains("recent")
+            || q_lower.contains("breaking") || q_lower.contains("headline")
+            || q_lower.contains("new ") || q_lower.contains("newest")
+            || q_lower.contains("cve-") || q_lower.contains("vulnerability")
+            || q_lower.contains("this week") || q_lower.contains("this month")
+            || q_lower.contains("past week") || q_lower.contains("last week");
+        let has_topic_signal = q_lower.contains("news") || q_lower.contains("update")
+            || q_lower.contains("today") || q_lower.contains("this week")
+            || q_lower.contains("2026") || q_lower.contains("2025")
+            || q_lower.contains("release") || q_lower.contains("version");
+        // Don't clobber a fresh intent that the engine already set.
+        if intent.intent != "fresh" && has_news_signal && has_topic_signal {
+            tracing::info!(
+                "INTENT OVERRIDE (STRONG): news query '{}' was '{}' (conf={:.3}) — forcing fresh",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "fresh".to_string();
+            intent.confidence = intent.confidence.max(0.45);
+            // Reshape distribution: fresh gets the top probability
+            let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
+            let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+            intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
+            // Boost informational as secondary intent (for ranking weight blending)
+            let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+            intent.distribution.insert("informational".to_string(), info_prob + 0.15);
+        }
+        // Weak signal: only topic signal (e.g. year without news keywords).
+        else if intent.intent != "fresh" && (q_lower.contains("2026") || q_lower.contains("2025")) {
+            let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
+            let current_prob = intent.distribution.get(&intent.intent).copied().unwrap_or(0.0);
+            if fresh_prob + 0.15 > current_prob {
+                tracing::info!(
+                    "INTENT OVERRIDE (WEAK): year query '{}' was '{}' (conf={:.3}) — boosting fresh (fresh={:.3})",
+                    q, intent.intent, intent.confidence, fresh_prob
+                );
+                intent.distribution.insert("fresh".to_string(), fresh_prob + 0.15);
+            }
+        }
+    }
+
+    // Override 2b: a fresh intent with no derived date window must still
+    // apply a real recency cutoff (not just re-weight scoring). Without this,
+    // "latest ai news" would rank newer items higher but never drop stale ones.
+    // The actual hard window is applied AFTER the web merge (see dated_result_count
+    // guard near line ~8485): we only set it when at least one web result actually
+    // carries a parseable date, so date-less fresh queries (e.g. "latest movies
+    // released in 2026") fail OPEN and keep recency as a scoring boost instead of
+    // collapsing to 0 results.
+    if intent.intent == "fresh" && intent.structured_constraints.after_date.is_none() {
+        tracing::info!("FRESH OVERRIDE: fresh intent without date window — window applied post-merge (fail-open if no dated results)");
+    }
+
+    // Override 3: "other than X" with low confidence → boost comparison + technical
+    // e.g. "programming language other than java" (conf=0.12, technical is correct base)
+    if q_lower.contains("other than") && intent.confidence < 0.20 {
+        tracing::info!(
+            "INTENT OVERRIDE: 'other than' query '{}' was '{}' (conf={:.3}) — boosting comparison/technical",
+            q, intent.intent, intent.confidence
+        );
+        let comp = intent.distribution.get("comparison").copied().unwrap_or(0.0);
+        let tech = intent.distribution.get("technical").copied().unwrap_or(0.0);
+        intent.distribution.insert("comparison".to_string(), comp + 0.1);
+        intent.distribution.insert("technical".to_string(), tech + 0.1);
+    }
+
+    // Override 4: local intent signals → force local intent
+    // Delegates to `has_local_intent` so the keyword list stays in ONE
+    // place. This covers "near me", "nearby", "coffee shop", AND
+    // gazetteer-city patterns like "restaurants in bangalore".
+    let has_local_keywords = has_local_intent(&q_lower);
+    if has_local_keywords && intent.intent != "local" {
+        tracing::info!(
+            "INTENT OVERRIDE (STRONG): local query '{}' was '{}' (conf={:.3}) -> local",
+            q, intent.intent, intent.confidence
+        );
+        intent.intent = "local".to_string();
+        intent.confidence = intent.confidence.max(0.75);
+        let local_prob = intent.distribution.get("local").copied().unwrap_or(0.0);
+        let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+        intent.distribution.insert("local".to_string(), (local_prob + current_top_prob * 0.5 + 0.4).min(0.90));
+    }
+
+    // Override 5: Comparison & Alternatives signals (H2 fix)
+    // e.g. "alternatives to adobe photoshop that are free", "best budget smartphones under 30000 rupees"
+    let comp_signals = [
+        "alternatives to", "alternative to", "alternatives for", "alternative for",
+        "similar to", "apps like", "tools like", "software like", "sites like",
+        "equivalent to", "replacement for", "competing with", "vs", "versus",
+        "best budget", "best ... under", "top ... under", "compared to", "difference between",
+        "which is better", "comparison", "compare "
+    ];
+    let has_comp_signal = comp_signals.iter().any(|s| {
+        if s.contains("...") {
+            let parts: Vec<&str> = s.split("...").collect();
+            parts.len() == 2 && q_lower.contains(parts[0].trim()) && q_lower.contains(parts[1].trim())
+        } else {
+            q_lower.contains(s)
+        }
+    });
+    if has_comp_signal {
+        tracing::info!(
+            "INTENT OVERRIDE (DECISIVE): comparison query '{}' was '{}' (conf={:.3}) -> comparison",
+            q, intent.intent, intent.confidence
+        );
+        intent.intent = "comparison".to_string();
+        intent.confidence = intent.confidence.max(0.85);
+        intent.distribution.insert("comparison".to_string(), 0.85);
+        if intent.distribution.get("informational").copied().unwrap_or(0.0) > 0.4 {
+            intent.distribution.insert("informational".to_string(), 0.15);
+        }
+    }
+
+    // Override 6: transactional keywords OR an explicit price bound -> transactional
+    // GUARD: do not fire the keyword-based override on queries whose primary intent
+    // is clearly informational/how-to. A how-to query like "how to convert PDF to
+    // Word under 5 minutes" or "how to calculate conversion rate" contains "under "
+    // or "rate" but is NOT transactional. The keyword list is a weak signal; the
+    // how-to/informational starter is a strong one. Only an explicit price bound
+    // (parsed from NL) can override a how-to starter — that is a decisive signal.
+    //
+    // EXCEPTION: "how much does X cost" / "how many" queries are price questions,
+    // not informational. The word "cost" or a price/cost term in the query body
+    // is a decisive transactional signal even when the query starts with "how much".
+    let informational_starters = [
+        "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
+        "what is ", "what are ", "what was ", "what were ", "why ", "why is ",
+        "why are ", "why does ", "why do ", "guide to ", "tutorial", "explain ",
+        "understand ", "learn ", "teach me ",
+    ];
+    let has_informational_starter = informational_starters.iter().any(|s| q_lower.starts_with(s));
+    // "how much does X cost" / "how much is X" / "how many" with a price/cost term
+    // is a transactional price question, NOT informational. The presence of
+    // "cost", "price", "rupee", "inr", "₹", "dollar", etc. in the query body is a
+    // decisive signal that overrides the informational starter guard.
+    let has_price_term_in_body = ["cost", "price", "pricing", "rupee", "rupees", "inr", "₹", "dollar", "dollars", "budget", "cheap", "expensive", "affordable", "worth"]
+        .iter().any(|t| q_lower.contains(t));
+    let is_how_much_price_query = (q_lower.starts_with("how much") || q_lower.starts_with("how many"))
+        && has_price_term_in_body;
+    // Word-boundary matching: each keyword must appear as a complete word,
+    // not as a substring of another word (e.g. "price" must not match
+    // "priceless"). The trailing-space convention ("price ") missed queries
+    // ending with the keyword ("sony wh-1000xm5 price"). \b word boundaries
+    // fix both ends without per-query literals.
+    let tx_keywords = ["buy", "price", "pricing", "cheap", "purchase", "shop", "store", "discount", "coupon", "under"];
+    let has_tx_signal = tx_keywords.iter().any(|k| {
+        let pattern = format!(r"\b{}\b", regex::escape(k));
+        regex::Regex::new(&pattern).map(|re| re.is_match(&q_lower)).unwrap_or(false)
+    });
+    // D5 (2026-08-17): a query that carries a REAL price bound ("laptop under 60000",
+    // "smartwatch under 5000") is a purchase intent. Override 5 may have forced
+    // `comparison` on the generic "best ... under" signal — but a budget-anchored
+    // buy query is transactional, not a comparison. The price bound is signal-driven
+    // (parsed from NL), not a per-query literal, so this is general and future-proof.
+    let sc = &intent.structured_constraints;
+    let has_price_bound = sc.price_lt.is_some() || sc.price_max.is_some()
+        || sc.price_min.is_some() || sc.price_gt.is_some();
+    // The keyword-based tx signal is suppressed when the query starts with an
+    // informational/how-to starter. A price bound is still allowed through — it is
+    // a decisive signal that the user wants to buy, not just learn.
+    // EXCEPTION: "how much does X cost" is a price question, not informational.
+    let tx_signal_effective = (has_tx_signal && !has_informational_starter) || is_how_much_price_query;
+    if (tx_signal_effective || has_price_bound) && !has_local_keywords {
+        if (intent.intent != "comparison" || has_price_bound)
+            && (intent.intent != "transactional" || intent.confidence < 0.60)
+        {
+            if has_price_bound && intent.intent == "comparison" {
+                tracing::info!(
+                    "INTENT OVERRIDE (STRONG): price-bounded buy query '{}' was 'comparison' (conf={:.3}) -> transactional",
+                    q, intent.confidence
+                );
+                // Dampen the spurious comparison probability so ranking blends transactional.
+                if let Some(c) = intent.distribution.get_mut("comparison") {
+                    *c = (*c * 0.4).min(0.30);
+                }
+            } else {
+                tracing::info!(
+                    "INTENT OVERRIDE (STRONG): transactional query '{}' was '{}' (conf={:.3}) -> transactional",
+                    q, intent.intent, intent.confidence
+                );
+            }
+            intent.intent = "transactional".to_string();
+            intent.confidence = intent.confidence.max(0.80);
+            let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
+            intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
+        }
+    }
+
+    // Override 6b: Career-advice / transition queries → informational
+    // Long conversational queries like "i am a 28 year old chartered accountant
+    // ... i want to transition into data analytics ... should i learn python or r"
+    // are career advice, NOT technical. The intent engine misclassifies them as
+    // "technical" because they mention tech terms (python, data, programming).
+    // The decisive signal: the query describes a career situation (job title +
+    // "transition" / "switch" / "move into" / "career" / "should i learn").
+    // General: pattern-based on career vocabulary, no per-query literals.
+    let career_signals = [
+        "transition", "transitioning", "switch", "switching", "move into",
+        "moving into", "career", "job change", "new field", "new career",
+        "should i learn", "should i study", "how do i become",
+        "how to become", "what should i learn", "advice", "guidance",
+    ];
+    let has_career_signal = career_signals.iter().any(|s| q_lower.contains(s));
+    let has_job_context = ["i am a ", "i'm a ", "i work as ", "i have been working",
+        "years of experience", "working as", "my job", "my career",
+    ].iter().any(|s| q_lower.contains(s));
+    if has_career_signal && has_job_context && intent.intent == "technical" {
+        tracing::info!(
+            "INTENT OVERRIDE (CAREER): career-advice query '{}' was 'technical' -> informational",
+            q
+        );
+        intent.intent = "informational".to_string();
+        intent.confidence = intent.confidence.max(0.75);
+        let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+        intent.distribution.insert("informational".to_string(), (info_prob + 0.50).min(0.88));
+        // Dampen the spurious technical probability
+        if let Some(t) = intent.distribution.get_mut("technical") {
+            *t = (*t * 0.4).min(0.30);
+        }
+    }
+
+    // Override 7: Model-number + price/cost terms → transactional
+    // The classifier misses model-number patterns ("iphone 16 pro max price",
+    // "oneplus 12 price") — the word "price" alone is weak signal. When a known
+    // brand+model pattern co-occurs with a price/cost term, the intent is
+    // decisively transactional (P10/P11 style compensation for the linear probe).
+    if is_model_number_price_query(&q_lower) {
+        if intent.intent != "transactional" || intent.confidence < 0.60 {
+            tracing::info!(
+                "INTENT OVERRIDE (DECISIVE): model-number price query '{}' was '{}' (conf={:.3}) -> transactional",
+                q, intent.intent, intent.confidence
+            );
+            intent.intent = "transactional".to_string();
+            intent.confidence = intent.confidence.max(0.80);
+            let tx_prob = intent.distribution.get("transactional").copied().unwrap_or(0.0);
+            intent.distribution.insert("transactional".to_string(), (tx_prob + 0.50).min(0.88));
+        }
+    }
+
+    // Override 8: Driver / Software Download Intent -> force decisive Navigational + Download intent
+    let download_keywords = [
+        "driver", "drivers", "download", "downloads", "installer", "installers",
+        "firmware", "patch", "software download", "official download", "setup.exe"
+    ];
+    let has_download_signal = download_keywords.iter().any(|k| q_lower.contains(k));
+    if has_download_signal {
+        tracing::info!(
+            "INTENT OVERRIDE (DECISIVE): driver/download query '{}' was '{}' (conf={:.3}) -> navigational",
+            q, intent.intent, intent.confidence
+        );
+        intent.intent = "navigational".to_string();
+        intent.confidence = intent.confidence.max(0.88);
+        let nav_prob = intent.distribution.get("navigational").copied().unwrap_or(0.0);
+        intent.distribution.insert("navigational".to_string(), (nav_prob + 0.60).min(0.95));
+        intent.distribution.insert("download".to_string(), 0.90);
+    }
+
+    // Override 7: weather / forecast queries → fresh
+    // WHOLE-WORD match only: a naive `contains("rain")` wrongly fired inside
+    // "fe**rain**al" (a rescue-cat query) and forced fresh intent on a how-to
+    // question, which then re-ranked results by recency instead of relevance.
+    // Use the same `q_has_word` boundary helper that guards "fresh"/"latest".
+    let weather_signals = [
+        "weather", "forecast", "temperature", "rain", "snow", "humidity",
+        "precipitation", "thunderstorm", "sunny", "cloudy", "meteorology",
+    ];
+    let has_weather_signal = weather_signals.iter().copied().any(|s| q_has_word(&q_lower, s));
+    // A weather word alone is not enough — the query must be PRIMARILY about
+    // weather, not merely mention it as context. "cold weather" in a car repair
+    // query ("why does my car make a clicking noise when i try to start it in
+    // cold weather") is not a weather query. Require a weather-specific signal
+    // (forecast/temperature/rain/snow/etc.) OR the word "weather" as the first
+    // content word (i.e. the query is about weather itself, not a topic that
+    // happens to mention weather).
+    let weather_primary = q_has_word(&q_lower, "forecast")
+        || q_has_word(&q_lower, "temperature")
+        || q_has_word(&q_lower, "rain")
+        || q_has_word(&q_lower, "snow")
+        || q_has_word(&q_lower, "humidity")
+        || q_has_word(&q_lower, "precipitation")
+        || q_has_word(&q_lower, "thunderstorm")
+        || q_has_word(&q_lower, "sunny")
+        || q_has_word(&q_lower, "cloudy")
+        || q_has_word(&q_lower, "meteorology")
+        || q_lower.starts_with("weather ");
+    let has_weather_signal = weather_primary;
+    // Do NOT clobber a decisive action/decision intent (comparison,
+    // transactional, how-to, technical, navigational) to fresh. A weather word
+    // like "rain" legitimately appears inside gear/commercial/how-to queries
+    // ("backpacking tent in the rain", "fix laptop fan after rain") and must not
+    // re-rank them by news-recency. Weather override only applies to
+    // informational/chitchat-style queries; genuine weather queries are still
+    // caught by the "today"/"forecast" temporal signals in other overrides.
+    let weather_skip_intents = ["comparison", "transactional", "how-to", "technical", "navigational"];
+    let weather_should_skip = weather_skip_intents.contains(&intent.intent.as_str());
+    // Also skip when the query itself carries decisive product / recommendation /
+    // instructional framing. A weather word inside such a query does NOT make it a
+    // weather query: "best lightweight tent for backpacking in the rain",
+    // "hiking boots that work in snow" are gear/how-to questions the engine may
+    // classify as `informational` (low confidence) -- which the 5-intent skip list
+    // above does not catch, so the weather override would wrongly re-rank them by
+    // news-recency. Genuine weather queries ("weather forecast today rain") carry
+    // none of these markers and still force `fresh` below.
+    let has_decisive_framing = [
+        "best ", "top ", "vs ", " review", "reviews", " for camping", " for backpacking",
+        " for hiking", "how to", "how do i", "buy ", "compare", "alternatives",
+        "which ", "cheapest", " vs. ", "best-",
+    ]
+    .iter()
+    .any(|m| q_lower.contains(m));
+    let weather_should_skip = weather_should_skip || has_decisive_framing;
+    if has_weather_signal && intent.intent != "fresh" && intent.intent != "local" && !weather_should_skip {
+        tracing::info!(
+            "INTENT OVERRIDE (STRONG): weather query '{}' was '{}' (conf={:.3}) → fresh",
+            q, intent.intent, intent.confidence
+        );
+        intent.intent = "fresh".to_string();
+        intent.confidence = intent.confidence.max(0.45);
+        let fresh_prob = intent.distribution.get("fresh").copied().unwrap_or(0.0);
+        let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+        intent.distribution.insert("fresh".to_string(), (fresh_prob + current_top_prob * 0.5).min(0.85));
+    }
+
+    // Override 8: procedural / how-to queries → how-to
+    // Only fire when the query STARTS with a how-to signal, not when "how can i"
+    // appears as a secondary clause in an informational query (e.g. "why do some
+    // people get altitude sickness and how can i prevent it" is primarily about
+    // causes, not a how-to guide).
+    let howto_starters = [
+        "how to ", "how do i ", "how do you ", "how can i ", "how can you ",
+    ];
+    let has_howto_starter = howto_starters.iter().any(|s| q_lower.starts_with(s));
+    let howto_mid_signals = [
+        "tutorial", "step by step", "step-by-step", "ways to", "guide to", "guide:",
+        "find files", "find the", "modified", "fix ", "install", "configure",
+        "set up", "setup", "uninstall", "upgrade", "build from", "compile",
+        "debug", "troubleshoot", "resolve", "workaround",
+    ];
+    let has_howto_signal = has_howto_starter
+        || (!q_lower.starts_with("why ") && !q_lower.starts_with("what ")
+            && howto_mid_signals.iter().any(|s| q_lower.contains(s)));
+    if has_howto_signal
+        && (intent.intent == "navigational" || intent.confidence < 0.40)
+        && intent.intent != "how-to"
+    {
+        tracing::info!(
+            "INTENT OVERRIDE (STRONG): how-to query '{}' was '{}' (conf={:.3}) → how-to",
+            q, intent.intent, intent.confidence
+        );
+        intent.intent = "how-to".to_string();
+        intent.confidence = intent.confidence.max(0.45);
+        let howto_prob = intent.distribution.get("how-to").copied().unwrap_or(0.0);
+        let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+        intent.distribution.insert("how-to".to_string(), (howto_prob + current_top_prob * 0.5).min(0.85));
+        let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
+        intent.distribution.insert("technical".to_string(), tech_prob + 0.15);
+    }
+
+    // Override 9: research / study queries → informational
+    let research_signals = [
+        "study", "studies", "efficacy", "research", "analysis", "literature",
+        "paper", "survey", "whitepaper", "benchmark", "experiment", "findings",
+        "meta-analysis", "peer review", "journal", "abstract",
+    ];
+    let has_research_signal = research_signals.iter().any(|s| q_lower.contains(s));
+    if has_research_signal
+        && (intent.intent == "navigational" || intent.confidence < 0.40)
+        && intent.intent != "informational"
+        && intent.intent != "fresh"
+    {
+        tracing::info!(
+            "INTENT OVERRIDE (STRONG): research query '{}' was '{}' (conf={:.3}) → informational",
+            q, intent.intent, intent.confidence
+        );
+        intent.intent = "informational".to_string();
+        intent.confidence = intent.confidence.max(0.45);
+        let info_prob = intent.distribution.get("informational").copied().unwrap_or(0.0);
+        let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+        intent.distribution.insert("informational".to_string(), (info_prob + current_top_prob * 0.5).min(0.85));
+        let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
+        intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
+    }
 }
 
 fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
