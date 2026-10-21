@@ -7840,6 +7840,50 @@ const COUNTRY_DEMONYMS: &[&str] = &[
     "australian", "australia",
 ];
 
+/// Finance-offer phrases that describe a PRODUCT FEATURE the user WANTS, not a
+/// topic to exclude. When a negated lead-in ("no", "without", "with no") is
+/// immediately followed by one of these phrases, the user is asking for products
+/// that HAVE that finance feature (e.g. "no cost emi" = "phones available with
+/// zero-cost EMI"), NOT excluding pages that mention it.
+///
+/// Without this guard, the negation extractor treats "no" as a negation marker
+/// and "cost emi" as the exclusion target, then hard-filters every page
+/// containing "cost emi" — which are exactly the pages the user WANTS to see
+/// (the ones advertising no-cost EMI offers).
+///
+/// Structural, data-driven seed (multi-word finance phrases, no per-query
+/// literals, no tuned thresholds — consistent with the hardcoding doctrine).
+const FINANCE_PHRASES: &[&str] = &[
+    "no cost emi",
+    "no-cost emi",
+    "nocost emi",
+    "zero interest",
+    "zero-interest",
+    "zero % interest",
+    "no processing fee",
+    "no hidden charges",
+    "no hidden fees",
+    "no interest",
+    "interest free",
+    "interest-free",
+    "0% interest",
+    "0 % interest",
+    "no finance charge",
+    "no extra cost",
+    "no additional cost",
+    "no down payment",
+    "zero down payment",
+    "no cost equivalent",
+];
+
+/// True when the negation compound (e.g. "cost emi" from "no cost emi") is part
+/// of a recognized finance-offer phrase in the query. The user WANTS this
+/// feature, so it must NOT become a search exclusion.
+fn is_finance_phrase(q_orig: &str, compound: &str) -> bool {
+    let lc = q_orig.to_lowercase();
+    FINANCE_PHRASES.iter().any(|fp| lc.contains(fp))
+}
+
 /// D3: precise manner-frame detection at the PHRASE level (not the bare-token
 /// level that `is_manner_phrase` uses). A declined candidate is a manner
 /// qualifier when it appears inside a "without/with-no <optional article> <term>"
