@@ -18861,6 +18861,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
 /// (same gates, same order, same confidence floors). No per-query literals were
 /// added; every signal is the structural/data-driven one the ranker already used.
 fn apply_search_intent_overrides(intent: &mut IntentResponse, q: &str) {
+    let q_lower = q.to_lowercase();
     let only_negative_pattern = !intent.structured_constraints.negative.is_empty()
         && intent.structured_constraints.positive.is_empty();
 
@@ -19228,7 +19229,36 @@ fn apply_search_intent_overrides(intent: &mut IntentResponse, q: &str) {
     let has_howto_signal = has_howto_starter
         || (!q_lower.starts_with("why ") && !q_lower.starts_with("what ")
             && howto_mid_signals.iter().any(|s| q_lower.contains(s)));
-    if has_howto_signal
+    // Technical-implementation how-tos (e.g. "how to build a rest api in rust",
+    // "how to debug a segfault") start with a how-to signal AND contain a build/
+    // implementation action from the howto_mid_signals set ("build from", "compile",
+    // "debug", "troubleshoot", "resolve", "workaround", "configure", "install",
+    // "upgrade", "uninstall"). These are development actions, not general
+    // procedural steps — the query's topic is technical, so it stays technical
+    // rather than being collapsed into the generic how-to bucket.
+    let technical_build_actions = [
+        "build ", "build from", "compile", "debug", "troubleshoot", "resolve",
+        "workaround", "configure", "install", "upgrade", "uninstall", "set up",
+        "setup", "implement", "coding", "program", "develop",
+    ];
+    let has_technical_build_signal = has_howto_starter
+        && technical_build_actions.iter().any(|s| q_lower.contains(s));
+    if has_technical_build_signal
+        && (intent.intent == "navigational" || intent.confidence < 0.40)
+        && intent.intent != "technical"
+    {
+        tracing::info!(
+            "INTENT OVERRIDE (STRONG): technical how-to query '{}' was '{}' (conf={:.3}) → technical",
+            q, intent.intent, intent.confidence
+        );
+        intent.intent = "technical".to_string();
+        intent.confidence = intent.confidence.max(0.45);
+        let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
+        let current_top_prob = intent.distribution.values().cloned().fold(0.0f32, f32::max);
+        intent.distribution.insert("technical".to_string(), (tech_prob + current_top_prob * 0.5).min(0.85));
+        let howto_prob = intent.distribution.get("how-to").copied().unwrap_or(0.0);
+        intent.distribution.insert("how-to".to_string(), howto_prob * 0.5);
+    } else if has_howto_signal
         && (intent.intent == "navigational" || intent.confidence < 0.40)
         && intent.intent != "how-to"
     {
