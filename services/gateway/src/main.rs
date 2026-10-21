@@ -17737,6 +17737,10 @@ async fn handle_search(
             if is_manner_frame(&q_orig, &n) {
                 continue; // manner qualifier: not an exclusion at all
             }
+            if is_finance_phrase(&q_orig, &n) {
+                continue; // finance-offer phrase ("no cost emi", "zero interest"):
+                          // the user WANTS this feature, not excludes it
+            }
             if !explicit_survivors.contains(&n) {
                 explicit_survivors.push(n.clone());
             }
