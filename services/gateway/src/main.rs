@@ -15814,6 +15814,7 @@ async fn handle_search(
         for neg in &constraints.negative {
             let n = neg.trim();
             if n.is_empty() { continue; }
+            if constraints.soft_negatives.iter().any(|s| s.eq_ignore_ascii_case(n)) { continue; }
             alt_variants.push(format!("alternative to {}", n));
             alt_variants.push(format!("{} alternatives", n));
             if alt_variants.len() >= 6 { break; }
@@ -16912,13 +16913,16 @@ async fn handle_search(
         alt_queries.push(format!("{} alternatives", s_q));
         alt_queries.push(format!("{} comparison", s_q));
     }
-    for neg in &intent.structured_constraints.negative {
-        let n = neg.trim();
-        if n.is_empty() { continue; }
-        alt_queries.push(format!("alternative to {}", n));
-        alt_queries.push(format!("{} alternatives", n));
-        alt_queries.push(format!("best {} 2026", n));
-        if alt_queries.len() >= 9 { break; }
+    if query_is_contrastive(&q) {
+        for neg in &intent.structured_constraints.negative {
+            let n = neg.trim();
+            if n.is_empty() { continue; }
+            if intent.structured_constraints.soft_negatives.iter().any(|s| s.eq_ignore_ascii_case(n)) { continue; }
+            alt_queries.push(format!("alternative to {}", n));
+            alt_queries.push(format!("{} alternatives", n));
+            alt_queries.push(format!("best {} 2026", n));
+            if alt_queries.len() >= 9 { break; }
+        }
     }
     if let Some(ref s_q) = stripped_query {
         alt_queries.push(format!("best {} 2026", s_q));
@@ -18431,7 +18435,16 @@ async fn handle_search(
             // ("not from X", "except X", "other than X") carry no such frame
             // and keep their explicit-directive status.
             if is_manner_frame(&q_orig, &n) {
-                continue; // manner qualifier: not an exclusion at all
+                // Retained as a soft negative (demoted, not dropped) so the negated
+                // object cannot dominate expansion or scoring. (FIX-IF-06)
+                if !is_subjective_quality_term(&n)
+                    && !n.split_whitespace().any(|t| IGNORED_CONSTRAINT_NOISE.contains(&t))
+                    && !n.is_empty()
+                    && !soft_negatives.contains(&n)
+                {
+                    soft_negatives.push(n.clone());
+                }
+                continue; // manner qualifier: not a hard exclusion
             }
             if !explicit_survivors.contains(&n) {
                 explicit_survivors.push(n.clone());
@@ -18440,18 +18453,22 @@ async fn handle_search(
         }
         if is_real_exclusion(&n, &q_orig, query_contrastive) && !gated_neg_dedup.contains(&n) {
             gated_neg_dedup.push(n);
-        } else if !is_manner_phrase(&n) && !is_manner_frame(&q_orig, &n) && !soft_negatives.contains(&n) {
-            // Soft negative: generic noun the gate declined but not a manner qualifier.
-            // Demoted in scoring (×0.3), never hard-dropped.
+        } else if !soft_negatives.contains(&n)
+            && !is_subjective_quality_term(&n)
+            && !n.split_whitespace().any(|t| IGNORED_CONSTRAINT_NOISE.contains(&t))
+            && !n.is_empty()
+        {
+            // Retained as a soft negative (demoted, not dropped) so the negated
+            // object cannot dominate expansion or scoring. (FIX-IF-06)
             soft_negatives.push(n);
         }
     }
     // query_neg_dropped: compounds the extractor already classified as non-manner
     // declined candidates — these are soft negatives by definition.
     for d in &query_neg_dropped {
-        if is_manner_frame(&q_orig, d) {
-            continue;
-        }
+        if is_subjective_quality_term(d) { continue; }
+        if d.split_whitespace().any(|t| IGNORED_CONSTRAINT_NOISE.contains(&t)) { continue; }
+        if d.is_empty() { continue; }
         if !soft_negatives.contains(d) {
             soft_negatives.push(d.clone());
         }
