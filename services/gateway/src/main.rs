@@ -5791,6 +5791,51 @@ fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx) {
 /// Indian number units (lakh, crore) are converted to their numeric equivalents:
 ///   1 lakh = 100,000; 1 crore = 10,000,000. Without this, "under 30 lakh" was
 ///   parsed as price:<30 instead of price:<3000000.
+const NON_PRICE_MEASUREMENT_UNITS: &[&str] = &[
+    // Distance
+    "km", "kms", "kilometer", "kilometers", "kilometre", "kilometres",
+    "mile", "miles", "mi", "meter", "meters", "metre", "metres",
+    "foot", "feet", "ft", "yard", "yards", "yd",
+    "cm", "cms", "centimeter", "centimeters", "centimetre", "centimetres",
+    "mm", "millimeter", "millimeters", "millimetre", "millimetres",
+    "inch", "inches", "in",
+    // Mass
+    "kg", "kgs", "kilogram", "kilograms", "kilogramme", "kilogrammes",
+    "g", "gram", "grams", "gramme", "grammes",
+    "mg", "milligram", "milligrams", "milligramme", "milligrammes",
+    "ug", "microgram", "micrograms",
+    "lb", "lbs", "pound", "pounds",
+    "oz", "ounce", "ounces",
+    "ton", "tons", "tonne", "tonnes",
+    // Volume
+    "ml", "milliliter", "milliliters", "millilitre", "millilitres",
+    "l", "liter", "liters", "litre", "litres",
+    "cl", "dl",
+    "gallon", "gallons", "gal",
+    "pint", "pints", "pt",
+    "quart", "quarts", "qt",
+    "cup", "cups",
+    "tbsp", "tablespoon", "tablespoons",
+    "tsp", "teaspoon", "teaspoons",
+    "fl",
+    // Data / bandwidth
+    "kb", "kilobyte", "kilobytes",
+    "mb", "megabyte", "megabytes",
+    "gb", "gigabyte", "gigabytes",
+    "tb", "terabyte", "terabytes",
+    "pb", "petabyte", "petabytes",
+    "kbps", "mbps", "gbps", "tbps",
+    "byte", "bytes", "bit", "bits",
+    "kib", "mib", "gib", "tib",
+    // Time
+    "years", "year", "months", "month", "weeks", "week", "days", "day",
+    "hours", "hour", "minutes", "minute", "seconds", "second",
+    "ms", "msec", "millisecond", "milliseconds",
+    // Count
+    "item", "items", "piece", "pieces", "unit", "units", "pack", "packs",
+    "count", "counts",
+];
+
 fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     let lower = q.to_lowercase();
     let upper_markers = [
@@ -5805,25 +5850,19 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
         ("lakh", 100_000.0), ("lakhs", 100_000.0),
         ("crore", 10_000_000.0), ("crores", 10_000_000.0),
     ];
-    // Distance units: a number followed by one of these is a RANGE/DISTANCE
-    // bound (e.g. "within 300 kilometers", "up to 50 miles"), NOT a price.
-    // Without this guard, "within 300 kilometers" was mis-read as price:<300
-    // and the spurious price bound dropped relevant results (round 2026-08-15).
-    // General, unit-aware — no per-query literals.
-    // Inspect only the immediate token following the number, not the entire rest.
-    let distance_units = [
-        "km", "kms", "kilometer", "kilometers", "kilometre", "kilometres",
-        "mile", "miles", "mi", "meter", "meters", "metre", "metres",
-        "foot", "feet", "ft", "yard", "yards", "yd",
-    ];
-    let is_distance_bound = |rest_after_num: &str| -> bool {
-        // Extract the next token after optional whitespace
+    // Non-price measurement units (distance/mass/volume/data/time/count): a
+    // number followed by one of these is a MEASUREMENT bound, NOT a price.
+    // General data seed; see NON_PRICE_MEASUREMENT_UNITS. Renamed from
+    // `distance_units` to cover the whole non-price class (round 2026-10-21
+    // FIX-IF-03: "under 2 kilograms" was mis-read as price:<2).
+    let measurement_units = NON_PRICE_MEASUREMENT_UNITS;
+    let is_non_price_measurement_unit = |rest_after_num: &str| -> bool {
         let next_token = rest_after_num.trim_start()
             .split(|c: char| !c.is_alphanumeric())
             .next()
             .unwrap_or("");
         let next_token_lower = next_token.to_lowercase();
-        distance_units.iter().any(|u| next_token_lower == *u)
+        measurement_units.iter().any(|u| next_token_lower == *u)
     };
     /// Check if the token immediately after the number is an Indian unit
     /// (lakh/lakhs/crore/crores). Returns the multiplier if found.
@@ -5851,7 +5890,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         // price marker, if any, match instead).
                         // NOTE: check the text AFTER the number, not `rest`
                         // (which still contains the number itself).
-                        if is_distance_bound(after_num) {
+                        if is_non_price_measurement_unit(after_num) {
                             continue;
                         }
                         let multiplier = get_indian_multiplier(after_num).unwrap_or(1.0);
@@ -5888,7 +5927,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                 // Distance-bound guard (see Pattern A): a currency-symbol amount
                 // followed by a distance unit is not a price.
                 let after_num = &lower[caps.get(2).unwrap().end()..];
-                if is_distance_bound(after_num) {
+                if is_non_price_measurement_unit(after_num) {
                     // fall through; do not return a price bound
                 } else {
                     return Some((v, normalize_currency_str(cur.as_str())));
@@ -5904,7 +5943,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                 // Distance-bound guard (see Pattern A): number + currency word +
                 // marker, where a distance unit follows, is a range not a price.
                 let after_num = &lower[caps.get(1).unwrap().end()..];
-                if is_distance_bound(after_num) {
+                if is_non_price_measurement_unit(after_num) {
                     // fall through; do not return a price bound
                 } else {
                     return Some((v, normalize_currency_str(cur.as_str())));
@@ -19274,26 +19313,13 @@ fn normalize_nl_operators(query: &str) -> String {
     let query = normalize_spoken_numbers(query);
     let mut out = query.to_string();
 
-    // Time-unit guard: a number immediately followed by a temporal unit
-    // (years/months/weeks/days/hours/minutes) is a DURATION, not a price.
-    // Without this guard, "over five years" / "under 3 months" / "within 2
-    // weeks" were mis-read as price bounds (round 2026-08-20: "over five years"
-    // in a car TCO comparison became price:>5 and crushed every result).
-    //
-    // This guard was originally written as an IN-PATTERN negative lookahead,
-    // `(?!\s*(?:years?|...))`. The `regex` crate has NO look-around support, so
-    // `Regex::new` returns `Err` for such a pattern — and the `if let Ok(re)`
-    // below then skipped the rule SILENTLY. Every natural-language price rule
-    // ("under 3000", "below 100", "less than 50", "over 200", ...) was
-    // therefore dead code: no NL price bound was ever produced here, and the
-    // digits leaked out as junk. The guard is now applied AFTER the match,
-    // against the text that follows it, which is what it was always meant to do.
-    let temporal_units = [
-        "years", "year", "months", "month", "weeks", "week", "days", "day",
-        "hours", "hour", "minutes", "minute",
-    ];
-    // Does the first alphanumeric token at `pos` name a temporal unit?
-    let followed_by_temporal_unit = |hay: &str, pos: usize| -> bool {
+    // Non-price measurement units: a number immediately followed by one of these
+    // is a MEASUREMENT (distance/mass/volume/data/time/count), not a price.
+    // General data seed (NON_PRICE_MEASUREMENT_UNITS). Blocks "under 2 kilograms",
+    // "within 300 kilometers", "under 500 millilitres", "up to 8 gb", etc.
+    let non_price_units = NON_PRICE_MEASUREMENT_UNITS;
+    // Does the first alphanumeric token at `pos` name a non-price measurement unit?
+    let followed_by_non_price_unit = |hay: &str, pos: usize| -> bool {
         if pos > hay.len() {
             return false;
         }
@@ -19303,7 +19329,7 @@ fn normalize_nl_operators(query: &str) -> String {
             .take_while(|c| c.is_alphanumeric())
             .collect::<String>()
             .to_lowercase();
-        temporal_units.iter().any(|u| *u == token)
+        non_price_units.iter().any(|u| *u == token)
     };
 
     for (re_src, replacement) in [
@@ -19339,7 +19365,7 @@ fn normalize_nl_operators(query: &str) -> String {
                 let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
                 let end = caps.get(0).map(|m| m.end()).unwrap_or(0);
                 // Duration guard: leave the phrase exactly as the user typed it.
-                if followed_by_temporal_unit(&input, end) {
+                if followed_by_non_price_unit(&input, end) {
                     return whole.to_string();
                 }
                 // Expand `$1`..`$9` capture references. Done here rather than via
@@ -25859,5 +25885,56 @@ mod negative_constraint_retention_tests {
             "title-dominated result should get score 0.0, got {}",
             score
         );
+    }
+}
+
+#[cfg(test)]
+mod non_price_measurement_unit_tests {
+    use super::*;
+
+    #[test]
+    fn weight_unit_not_a_price() {
+        // Mass units must never become a price bound.
+        assert!(extract_nl_price_bound("a mechanical keyboard under 2 kilograms with gasket mount").is_none());
+        assert!(extract_nl_price_bound("laptop below 500 grams").is_none());
+        assert!(extract_nl_price_bound("headphones under 300 mg").is_none());
+        assert!(extract_nl_price_bound("mouse under 2 pounds").is_none());
+        assert!(extract_nl_price_bound("monitor under 10 kg").is_none());
+    }
+
+    #[test]
+    fn volume_and_data_units_not_a_price() {
+        assert!(extract_nl_price_bound("bottle under 500 millilitres").is_none());
+        assert!(extract_nl_price_bound("drive under 2 litres").is_none());
+        assert!(extract_nl_price_bound("ssd under 8 gb").is_none());
+        assert!(extract_nl_price_bound("ram under 16 gb").is_none());
+        assert!(extract_nl_price_bound("bandwidth up to 100 mbps").is_none());
+    }
+
+    #[test]
+    fn distance_unit_still_not_a_price() {
+        assert!(extract_nl_price_bound("within 300 kilometers").is_none());
+        assert!(extract_nl_price_bound("up to 50 miles").is_none());
+    }
+
+    #[test]
+    fn currency_path_still_a_price() {
+        assert!(extract_nl_price_bound("under 5000 rupees").is_some());
+        assert!(extract_nl_price_bound("laptop under 150 dollars").is_some());
+        let (v, _) = extract_nl_price_bound("under 5000 rupees").unwrap();
+        assert!((v - 5000.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn normalize_does_not_rewrite_measurement_bound() {
+        // normalize_nl_operators must NOT produce price:<N for a measurement.
+        let out = normalize_nl_operators("a mechanical keyboard under 2 kilograms with gasket mount");
+        assert!(!out.contains("price:<2"), "got: {}", out);
+        // currency still rewrites
+        let out2 = normalize_nl_operators("laptop under 500 dollars");
+        assert!(out2.contains("price:<500"), "got: {}", out2);
+        // temporal still blocked
+        let out3 = normalize_nl_operators("car over 5 years");
+        assert!(!out3.contains("price:>5"), "got: {}", out3);
     }
 }
