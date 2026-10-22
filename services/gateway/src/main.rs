@@ -8191,11 +8191,14 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
         if head_frames.iter().any(|f| head.starts_with(f)) {
             return true;
         }
-        // Qualifier: "with no X" is a prepositional qualifier about the user's
-        // own state ("with no music background", "with no experience", "with no
-        // budget"), NOT a content exclusion. Treat as manner regardless of head.
+        // "with no X": treat as manner (user-state qualifier) only when X contains
+        // an attribute/user-state noun (e.g. "music background", "experience",
+        // "budget"). Content nouns (e.g. "nuts", "laces") are real exclusions.
         if lc.contains("with no") {
-            return true;
+            let comp_tokens: Vec<&str> = c.split_whitespace().collect();
+            if ATTRIBUTE_NOUNS.iter().any(|a| comp_tokens.contains(a)) {
+                return true;
+            }
         }
         // Non-instructional queries: "without X" names content to exclude,
         // not manner. Fall through to the pronoun check below (a compound
@@ -8512,11 +8515,11 @@ fn is_explicit_without_directive(q_orig: &str, _lc: &str, compound: &str) -> boo
     if !has_directive {
         return false;
     }
-    // Qualifier: "with no X" is a prepositional qualifier about the user's own
-    // state, not a content exclusion. Decline entirely.
-    if q_lc.contains("with no") {
-        return false;
-    }
+    // NOTE: "with no X" is NOT blanket-declined here. Whether X is a manner/
+    // user-state qualifier is decided by the ATTRIBUTE_NOUNS check below (and the
+    // how-to head gate). Blanket-declining collapsed real exclusions like
+    // "recipes with no nuts" (see negation_never_emits_empty_exclusion_on_compound_no_and_no).
+
     // (1) Manner-frame / verb-led / predicate negations stay declined.
     if is_manner_phrase(&comp) {
         return false;
@@ -8695,15 +8698,12 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
         let mut is_neg = neg_markers.contains(&w) || w.starts_with('-');
         // Qualifier: "no" preceded by a preposition ("with no X", "for ... with no X")
         // is a prepositional qualifier about the user's state, not an exclusion.
-        if w == "no" && i > 0 {
-            let prev = words[i - 1];
-            let preps = ["with", "for", "by", "from", "to", "in", "on", "at", "of",
-                         "about", "into", "onto", "upon", "over", "under", "through",
-                         "across", "within", "as", "than"];
-            if preps.contains(&prev) {
-                is_neg = false;
-            }
-        }
+        // NOTE: "no" preceded by a preposition (e.g. "with no X") is NOT blanket-
+        // skipped here. Whether X is a manner/user-state qualifier or a real
+        // content exclusion is decided downstream by is_real_exclusion (attribute-
+        // noun + how-to + manner gates). Blanket-skipping collapsed real
+        // exclusions like "recipes with no nuts" (regression:
+        // negation_never_emits_empty_exclusion_on_compound_no_and_no).
         let mut skip_marker_len = 1;
 
         if i + 1 < words.len() {
@@ -9003,14 +9003,39 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
                 // Qualifier: "with no X" / "for ... with no X" is a prepositional
                 // qualifier about the user's own state, not a content exclusion.
                 // Skip "no" occurrences that are directly preceded by a preposition.
-                if *lead == r"(?i)no" {
+                if *lead == r"(?i)\bno\b" {
                     let abs_start = search + m.start();
                     let before = &lower[..abs_start];
                     let prev_word = before.split_whitespace().last().unwrap_or("");
                     let preps = ["with", "for", "by", "from", "to", "in", "on", "at", "of", "about", "into", "onto", "upon", "over", "under", "through", "across", "within", "as", "than"];
                     if preps.contains(&prev_word) {
-                        search = search + m.end();
-                        continue;
+                        // Only skip (manner/user-state qualifier) when the following
+                        // content word is an attribute/user-state noun or manner word.
+                        // Content nouns (e.g. "nuts", "laces") are real exclusions.
+                        let after = search + m.end();
+                        let tail_words: Vec<&str> = lower[after..].split_whitespace().collect();
+                        let mut la = 0;
+                        while la < tail_words.len() {
+                            let wc: String = tail_words[la].chars().filter(|c| c.is_alphanumeric()).collect();
+                            if wc.is_empty() || NL_NEG_STOPWORDS.contains(&wc.as_str()) {
+                                la += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        let next_clean = if la < tail_words.len() {
+                            tail_words[la].chars().filter(|c| c.is_alphanumeric()).collect::<String>()
+                        } else {
+                            String::new()
+                        };
+                        let is_manner_lookahead = ATTRIBUTE_NOUNS.contains(&next_clean.as_str())
+                            || MANNER_VERBS.contains(&next_clean.as_str())
+                            || MANNER_PRONOUNS.contains(&next_clean.as_str());
+                        if is_manner_lookahead {
+                            search = search + m.end();
+                            continue;
+                        }
+                        // otherwise fall through and process as real exclusion
                     }
                 }
                 let after = search + m.end();
@@ -10764,6 +10789,59 @@ fn merge_local_and_web(
     let superlative_terms: &[&str] = &["best", "top", "greatest", "cheapest", "finest"];
     let query_has_superlative = q_words.iter().any(|w| superlative_terms.contains(&w.to_lowercase().as_str()));
 
+    // ── FIX-IF-05: head-noun fidelity for purpose-clause queries ──
+    // Queries of the shape "<subject> for/without/to <purpose>" (e.g. "4k monitor
+    // ... for photo editing", "best laptop for programming", "make tea without
+    // kettle") carry a USE-CASE qualifier that must NARROW, not REPLACE, the
+    // subject. The intent engine / token overlap can let the purpose terms dominate
+    // (a "photo editing cost" page ranks above a "monitor" page). We derive the
+    // SUBJECT's head nouns (content nouns before the purpose marker, minus
+    // locations/adjectives/meta/units) and, in the per-result loop below, heavily
+    // dampen any result that contains NONE of them. General, structural: no
+    // per-query literals. Only active when a purpose marker is actually present.
+    let head_noun_excluders: std::collections::HashSet<&str> = [
+        // degree/quality adjectives that describe, not name, the subject
+        "decent", "good", "great", "best", "top", "cheap", "affordable", "premium",
+        "nice", "fine", "better", "excellent", "high", "low", "budget", "better",
+        "decent", "nice", "ok", "okay",
+        // common weak discriminators / quantifiers that are not the subject
+        "much", "many", "lot", "lots", "plenty", "several", "various", "some",
+        "any", "all", "more", "most", "very", "really", "just", "only",
+    ].iter().copied().collect();
+    // Find the first purpose-clause marker (for/without preferred over "to",
+    // which is often an infinitive in "how to ...").
+    let for_without_pos: Vec<usize> = q_words.iter().enumerate()
+        .filter(|(_, w)| { let l = w.to_lowercase(); l == "for" || l == "without" })
+        .map(|(i, _)| i).collect();
+    let to_pos: Vec<usize> = q_words.iter().enumerate()
+        .filter(|(_, w)| w.to_lowercase() == "to").map(|(i, _)| i).collect();
+    let purpose_split: Option<usize> = for_without_pos.first().copied()
+        .or_else(|| to_pos.first().copied());
+    let head_nouns: Vec<String> = match purpose_split {
+        Some(idx) if idx > 0 => {
+            let subject_words = &q_words[..idx];
+            let mut out: Vec<String> = Vec::new();
+            for w in subject_words.iter() {
+                let lower = w.to_lowercase();
+                if lower.len() < 3 { continue; }
+                if stop_words.contains(lower.as_str()) { continue; }
+                if generic_web_terms.contains(lower.as_str()) { continue; }
+                if meta_action_terms.contains(lower.as_str()) { continue; }
+                if unit_terms.contains(lower.as_str()) { continue; }
+                if role_descriptor_terms.contains(lower.as_str()) { continue; }
+                if weak_discriminative.contains(lower.as_str()) { continue; }
+                if temporal_fillers.contains(lower.as_str()) { continue; }
+                if lower.chars().all(|c| c.is_ascii_digit()) { continue; }
+                if COUNTRY_DEMONYMS.contains(&lower.as_str()) { continue; }
+                if head_noun_excluders.contains(lower.as_str()) { continue; }
+                if !out.contains(&lower) { out.push(lower); }
+            }
+            out
+        }
+        _ => Vec::new(),
+    };
+    let has_purpose_clause = purpose_split.is_some() && !head_nouns.is_empty();
+
     let mut relevance_vec: Vec<f32> = Vec::with_capacity(merged.len());
 
     for r in merged.iter_mut() {
@@ -12129,6 +12207,27 @@ fn merge_local_and_web(
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
+        // ── FIX-IF-05: head-noun fidelity for purpose-clause queries ──
+        // When the query carries a purpose/use-case qualifier ("for X",
+        // "without X", "to X"), a result that contains NONE of the subject's
+        // head nouns is almost certainly about the qualifier alone (e.g. a
+        // "photo editing cost" page for a "4k monitor ... for photo editing"
+        // query). Heavily dampen it so subject-bearing pages outrank it.
+        // General, structural: no per-query literals; only active when a purpose
+        // marker was actually present and head nouns were derived.
+        if has_purpose_clause {
+            let title_content_url = format!("{} {} {}", title_lower, content_lower, url_lower);
+            let has_head = head_nouns.iter().any(|h| title_content_url.contains(h.as_str()));
+            if !has_head {
+                relevance *= 0.1;
+                tracing::info!(
+                    "FIX-IF-05 HEAD-NOUN DAMPEN: '{}' lacks subject head noun(s) {:?} — relevance x0.1",
+                    title_lower.chars().take(50).collect::<String>(),
+                    head_nouns
+                );
+            }
+        }
+
         // Capture this result's relevance for the post-loop adaptive-floor pass.
         relevance_vec.push(relevance);
     }
@@ -12948,6 +13047,26 @@ fn merge_local_and_web(
                         r.post_cal_cap = Some(d3_cap);
                         r.score = d3_cap;
                     }
+                }
+            }
+
+            // ── FIX-IF-05: post-cal head-noun cap ──
+            // Durable version of the in-loop head-noun dampening: a result that
+            // contains NONE of the subject's head nouns (for a purpose-clause
+            // query) is capped below the on-topic floor even after calibrate_scores
+            // rescales the set. Mirrors the D3 comparison cap.
+            if has_purpose_clause && !head_nouns.is_empty() {
+                let names_head = head_nouns.iter().any(|h| {
+                    rl.contains(h.as_str()) || cl.contains(h.as_str()) || ul.contains(h.as_str())
+                });
+                if !names_head && r.score > weak_cap {
+                    let fix05_cap = weak_cap * (r.score / max_pre_cap_score).max(0.3);
+                    tracing::info!(
+                        "POST-CAL FIX-IF-05 HEAD-NOUN CAP -> {:.4}: '{}' names none of subject head noun(s) {:?} (pre_cap={:.4})",
+                        fix05_cap, r.url.chars().take(60).collect::<String>(), head_nouns, r.score
+                    );
+                    r.post_cal_cap = Some(fix05_cap);
+                    r.score = fix05_cap;
                 }
             }
         }
@@ -15571,11 +15690,32 @@ async fn handle_search(
         || q.starts_with("-") || q.contains(" not ") || q.contains(" no ")
         || q.contains(" without ") || q.contains(" -");
     let stripped_override: Option<String> = if has_neg_pattern {
-        simple_negation_strip(&q).filter(|(s, _)| {
-            let processed = preprocess_searxng_query(s);
-            !processed.is_empty() && processed != preprocess_searxng_query(&q)
-        }).map(|(s, _)| s)
-    } else { None };
+            simple_negation_strip(&q).filter(|(s, _)| {
+                let processed = preprocess_searxng_query(s);
+                !processed.is_empty() && processed != preprocess_searxng_query(&q)
+            }).map(|(s, _)| s)
+        } else {
+            // FIX-IF-05: purpose-clause stripped primary fetch. For "<subject> ... for
+            // <purpose>" queries, make the purpose-stripped query fire FIRST (as the
+            // primary) so subject-bearing pages are fetched and prioritized, instead
+            // of being cancelled by the early-return on the purpose-dominated primary.
+            let q_words: Vec<&str> = q.split_whitespace().collect();
+            let forw: Vec<usize> = q_words.iter().enumerate()
+                .filter(|(_, w)| { let l = w.to_lowercase(); l == "for" || l == "without" }).map(|(i,_)| i).collect();
+            let topos: Vec<usize> = q_words.iter().enumerate()
+                .filter(|(_, w)| w.to_lowercase() == "to").map(|(i,_)| i).collect();
+            let split = forw.first().copied().or_else(|| topos.first().copied());
+            if let Some(idx) = split {
+                if idx > 0 && idx + 1 < q_words.len() {
+                    let stripped_raw = q_words[..idx].join(" ");
+                    let relaxed = keyphrase_relax_variant(&stripped_raw).unwrap_or(stripped_raw.clone());
+                    let processed = preprocess_searxng_query(&relaxed);
+                    if !processed.is_empty() && processed != preprocess_searxng_query(&q) {
+                        Some(relaxed)
+                    } else { None }
+                } else { None }
+            } else { None }
+        };
 
     let mut searx_urls: Vec<String> = Vec::new();
     let mut searx_instance_keys: Vec<String> = Vec::new();
@@ -15622,7 +15762,7 @@ async fn handle_search(
             Some(stripped) => {
                 let clean_stripped = preprocess_searxng_query(stripped);
                 if !clean_stripped.is_empty() {
-                    (clean_stripped, clean_q.clone())
+                    (clean_stripped, String::new())  // FIX-IF-05: don't fetch the purpose-dominated raw query
                 } else {
                     (clean_q.clone(), String::new())
                 }
@@ -15686,6 +15826,39 @@ async fn handle_search(
                 if !clean_v.is_empty() && clean_v != clean_q_outer {
                     searx_urls.push(searxng_url_with_geo(base_url, &clean_v, geo_location.as_ref(), lang));
                     searx_instance_keys.push(key.clone());
+                }
+            }
+        }
+    }
+
+    // ── FIX-IF-05: purpose-clause stripped fetch on ALL instances ──
+    // For "<subject> ... for <use-case>" queries, the purpose clause can dominate
+    // upstream engines (SearXNG returns purpose-only pages). Inject an additional
+    // upstream query that drops the purpose clause and relaxes to keywords, so
+    // subject-bearing pages are fetched on EVERY instance (VPN + Tor) — not just
+    // the retry fan-out (which only fires on the VPN instance and is deadline-gated).
+    // General, structural — no per-query literals.
+    {
+        let qw: Vec<&str> = q.split_whitespace().collect();
+        let forw: Vec<usize> = qw.iter().enumerate()
+            .filter(|(_, w)| **w == "for" || **w == "without").map(|(i,_)| i).collect();
+        let topos: Vec<usize> = qw.iter().enumerate()
+            .filter(|(_, w)| **w == "to").map(|(i,_)| i).collect();
+        let split = forw.first().copied().or_else(|| topos.first().copied());
+        if let Some(idx) = split {
+            if idx > 0 && idx + 1 < qw.len() {
+                let stripped_raw = qw[..idx].join(" ");
+                // apply keyphrase relaxation (strip stop words) for better upstream recall
+                let relaxed = keyphrase_relax_variant(&stripped_raw).unwrap_or(stripped_raw.clone());
+                let clean_relaxed = preprocess_searxng_query(&relaxed);
+                let clean_q_outer = preprocess_searxng_query(&q);
+                if !clean_relaxed.is_empty() && clean_relaxed != clean_q_outer {
+                    for (i, base_url) in searx_base_urls.iter().enumerate() {
+                        let key = searx_base_keys[i].clone();
+                        let url = searxng_url_with_geo(base_url, &clean_relaxed, geo_location.as_ref(), lang);
+                        searx_urls.push(url);
+                        searx_instance_keys.push(key);
+                    }
                 }
             }
         }
@@ -16423,6 +16596,90 @@ async fn handle_search(
             intent.structured_constraints.hard_exclusions.push(he);
         }
     }
+
+    // ── FIX-IF-05: purpose-clause terms must not be required positive constraints ──
+    // A query of shape "<subject> for/without/to <purpose>" (e.g. "4k monitor ...
+    // for photo editing") carries the purpose as a USE-CASE qualifier, not a
+    // required content term. If the engine/gateway put the purpose ("photo
+    // editing") into `positive`, SearXNG-returned subject pages (monitors) that
+    // do NOT mention the purpose get hard-dropped, and the result set collapses
+    // to purpose-only pages. Reuse the head-noun machinery: drop any positive
+    // term whose tokens are all within the purpose clause, and any weak
+    // quantifier ("much", "many", ...), and ensure the subject's head nouns are
+    // present as required positives. General, structural — no per-query literals.
+    {
+        let q_words_local: Vec<String> = q.split_whitespace().map(|w| w.to_lowercase()).collect();
+        // purpose marker position
+        let forw: Vec<usize> = q_words_local.iter().enumerate()
+            .filter(|(_, w)| *w == "for" || *w == "without").map(|(i,_)| i).collect();
+        let topos: Vec<usize> = q_words_local.iter().enumerate()
+            .filter(|(_, w)| *w == "to").map(|(i,_)| i).collect();
+        let split = forw.first().copied().or_else(|| topos.first().copied());
+        let weak_quantifiers: std::collections::HashSet<&str> = [
+            "much", "many", "lot", "lots", "plenty", "several", "various", "some",
+            "any", "all", "more", "most", "very", "really", "just", "only",
+        ].iter().copied().collect();
+        if let Some(idx) = split {
+            if idx > 0 && idx + 1 < q_words_local.len() {
+                let purpose_words: std::collections::HashSet<String> =
+                    q_words_local[idx + 1..].iter().cloned().collect();
+                // subject head nouns
+                let excluders: std::collections::HashSet<&str> = [
+                    "decent", "good", "great", "best", "top", "cheap", "affordable", "premium",
+                    "nice", "fine", "better", "excellent", "high", "low", "budget",
+                    "ok", "okay", "much", "many", "lot", "lots", "plenty", "several",
+                    "various", "some", "any", "all", "more", "most", "very", "really",
+                    "just", "only",
+                ].iter().copied().collect();
+                let mut head_nouns: Vec<String> = Vec::new();
+                for w in &q_words_local[..idx] {
+                    let lower = w.as_str();
+                    if lower.len() < 3 { continue; }
+                    if weak_quantifiers.contains(lower) { continue; }
+                    // filter standard stop words so auxiliaries ("how","does") aren't head nouns
+                    if ["the","a","an","is","are","was","were","be","been","have","has","had",
+                        "do","does","did","will","would","can","may","might","shall","must","could",
+                        "should","in","on","at","to","for","of","with","from","by","and","but","or",
+                        "nor","not","so","yet","this","that","these","those","it","its","what","which",
+                        "who","whom","when","where","why","how","all","each","every","both","few",
+                        "more","most","other","some","such","no","only","own","same","than","too",
+                        "very","just","about","also","any","because","before","after","during",
+                        "between","through","under","over","again","then","there","here","into",
+                        "upon","within","without","out","off","up","down"].contains(&lower) { continue; }
+                    // reuse stop/meta/unit/role/temporal filters best-effort
+                    if lower.chars().all(|c| c.is_ascii_digit()) { continue; }
+                    if excluders.contains(lower) { continue; }
+                    if !head_nouns.contains(&lower.to_string()) { head_nouns.push(lower.to_string()); }
+                }
+                // filter positive
+                let mut new_positive: Vec<String> = Vec::new();
+                for p in &intent.structured_constraints.positive {
+                    let pl = p.to_lowercase();
+                    let tokens: Vec<&str> = pl.split_whitespace().collect();
+                    // drop if all tokens are purpose words
+                    let all_purpose = !tokens.is_empty()
+                        && tokens.iter().all(|t| purpose_words.contains(*t));
+                    // drop weak quantifiers
+                    let is_weak = tokens.len() == 1 && weak_quantifiers.contains(tokens[0]);
+                    if all_purpose || is_weak {
+                        tracing::info!("FIX-IF-05 DROPPED positive term '{}' (purpose/weak)", p);
+                        continue;
+                    }
+                    if !new_positive.contains(p) { new_positive.push(p.clone()); }
+                }
+                // ensure head nouns present
+                for h in &head_nouns {
+                    let present = new_positive.iter().any(|p| p.to_lowercase().contains(h.as_str()));
+                    if !present {
+                        new_positive.push(h.clone());
+                        tracing::info!("FIX-IF-05 ADDED head noun '{}' to positive", h);
+                    }
+                }
+                intent.structured_constraints.positive = new_positive;
+            }
+        }
+    }
+
     // P3 NL-price fix: also derive a bound from natural-language price words
     // ("under 150 dollars", "below 1000 rupees") — these never matched the
     // `price:<` operator parser, so the bound stayed None and ranking fell back
@@ -16558,7 +16815,7 @@ async fn handle_search(
     // Secondary fan-out with expanded queries if initial results are sparse
     // Apply language disambiguation for short language names
     let disambiguated_q = disambiguate_engine_query(&q, &intent.intent, &intent.expanded_queries);
-    let expanded_queries = if intent.expanded_queries.len() > 1 {
+    let mut expanded_queries = if intent.expanded_queries.len() > 1 {
         let mut eq = intent.expanded_queries.clone();
         if disambiguated_q != q {
             eq.insert(0, disambiguated_q);
@@ -16571,6 +16828,39 @@ async fn handle_search(
             vec![q.clone()]
         }
     };
+    // ── FIX-IF-05: purpose-clause stripped fan-out ──
+    // For "<subject> for/without/to <purpose>" queries, the purpose terms can
+    // dominate upstream engines (SearXNG returns purpose-only pages). Add an
+    // expanded query that drops the purpose clause so subject-bearing pages are
+    // also fetched; the head-noun cap + scoring then lets them outrank the
+    // purpose-only pages. General, structural — no per-query literals.
+    {
+        let qw: Vec<&str> = q.split_whitespace().collect();
+        let forw: Vec<usize> = qw.iter().enumerate()
+            .filter(|(_, w)| **w == "for" || **w == "without").map(|(i,_)| i).collect();
+        let topos: Vec<usize> = qw.iter().enumerate()
+            .filter(|(_, w)| **w == "to").map(|(i,_)| i).collect();
+        let split = forw.first().copied().or_else(|| topos.first().copied());
+        if let Some(idx) = split {
+            if idx > 0 && idx + 1 < qw.len() {
+                // subject part + tail after purpose (location/price/etc. stay)
+                let mut stripped: Vec<&str> = qw[..idx].to_vec();
+                // keep trailing location/price words after the purpose clause
+                // only if they look like a place/price; simplest: drop purpose,
+                // keep everything before it (subject + how-much/cost/in/india
+                // already live before "for").
+                let stripped_q = stripped.join(" ");
+                if !stripped_q.trim().is_empty() && stripped_q != q {
+                    // append if not duplicate
+                    let mut eq = expanded_queries.clone();
+                    if !eq.iter().any(|e| e == &stripped_q) {
+                        eq.push(stripped_q);
+                        expanded_queries = eq;
+                    }
+                }
+            }
+        }
+    }
     // When query has ONLY negative constraints ("not X not Y"), SearXNG searched with
     // the raw query including negative terms. Strip negation trigger words to create a
     // clean query and prepend it to expanded_queries so the retry re-fetches with clean terms.
