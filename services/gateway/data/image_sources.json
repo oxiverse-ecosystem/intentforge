@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "note": "Runtime-loaded image/stock-photo URL patterns. Used by the stock-photo demotion fix so that stock-photo / image-library results arriving through the GENERAL web result set (e.g. a pinterest.com or pixabay.com URL returned by SearXNG) are recognized as image sources and demoted for non-image queries. Structural allow-list of platforms the engine treats as 'image surfaces', not a per-query tuned list — same approach as AUDIO_HOSTS / VIDEO_HOSTS.",
+  "hosts": [
+    "pinterest.com",
+    "pinterest.co.uk",
+    "pixabay.com",
+    "stock.adobe.com",
+    "shutterstock.com",
+    "gettyimages.com",
+    "istockphoto.com",
+    "unsplash.com",
+    "pexels.com",
+    "freepik.com",
+    "vecteezy.com",
+    "adobestock.com",
+    "dreamstime.com",
+    "alamy.com",
+    "123rf.com",
+    "depositphotos.com",
+    "bigstockphoto.com"
+  ],
+  "intent_markers": [
+    "image",
+    "images",
+    "photo",
+    "photos",
+    "picture",
+    "pictures",
+    "wallpaper",
+    "wallpapers",
+    "stock photo",
+    "stock photos",
+    "clipart",
+    "icon",
+    "icons",
+    "graphic",
+    "graphics"
+  ]
+}

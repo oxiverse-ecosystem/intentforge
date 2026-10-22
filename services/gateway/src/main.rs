@@ -7737,6 +7737,88 @@ fn has_audio_intent(query: &str) -> bool {
     audio_intent_markers().iter().any(|m| q_lc.contains(m.as_str()))
 }
 
+/// Image/stock-photo host patterns loaded from data/image_sources.json at runtime.
+static IMAGE_HOSTS_RUNTIME: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn image_hosts() -> &'static Vec<String> {
+    IMAGE_HOSTS_RUNTIME.get_or_init(|| {
+        let mut hosts = Vec::new();
+        let candidates = [
+            "data/image_sources.json",
+            "/app/data/image_sources.json",
+            "./data/image_sources.json",
+        ];
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("hosts").and_then(|h| h.as_array()) {
+                        for h in arr {
+                            if let Some(s) = h.as_str() {
+                                hosts.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                if !hosts.is_empty() {
+                    break;
+                }
+            }
+        }
+        tracing::info!("image: loaded {} host(s) from data file", hosts.len());
+        hosts
+    })
+}
+
+fn is_url_image_host(url: &str) -> bool {
+    let u = url.to_lowercase();
+    let host = if let Some(idx) = u.find("://") {
+        &u[idx + 3..]
+    } else {
+        &u
+    };
+    let host = host.split(['/', '?', '#']).next().unwrap_or(host);
+    image_hosts().iter().any(|h| {
+        let h_str = h.as_str();
+        host == h_str || host.ends_with(&format!(".{}", h_str))
+    })
+}
+
+static IMAGE_INTENT_MARKERS_RUNTIME: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn image_intent_markers() -> &'static Vec<String> {
+    IMAGE_INTENT_MARKERS_RUNTIME.get_or_init(|| {
+        let mut markers = Vec::new();
+        let candidates = [
+            "data/image_sources.json",
+            "/app/data/image_sources.json",
+            "./data/image_sources.json",
+        ];
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = v.get("intent_markers").and_then(|m| m.as_array()) {
+                        for m in arr {
+                            if let Some(s) = m.as_str() {
+                                markers.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                if !markers.is_empty() {
+                    break;
+                }
+            }
+        }
+        tracing::info!("image: loaded {} intent marker(s) from data file", markers.len());
+        markers
+    })
+}
+
+fn has_image_intent(query: &str) -> bool {
+    let q_lc = query.to_lowercase();
+    image_intent_markers().iter().any(|m| q_lc.contains(m.as_str()))
+}
+
 /// Video-intent markers: words/phrases that signal a query is seeking video content.
 /// This is the EXACT data set the P8 video-dominance fix keys off — shared with
 /// /search so the /video preview always matches real engine behavior. No per-query
@@ -8070,6 +8152,12 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
         if head_frames.iter().any(|f| head.starts_with(f)) {
             return true;
         }
+        // Qualifier: "with no X" is a prepositional qualifier about the user's
+        // own state ("with no music background", "with no experience", "with no
+        // budget"), NOT a content exclusion. Treat as manner regardless of head.
+        if lc.contains("with no") {
+            return true;
+        }
         // Non-instructional queries: "without X" names content to exclude,
         // not manner. Fall through to the pronoun check below (a compound
         // like "track you as" still catches manner via MANNER_PRONOUNS even
@@ -8385,6 +8473,11 @@ fn is_explicit_without_directive(q_orig: &str, _lc: &str, compound: &str) -> boo
     if !has_directive {
         return false;
     }
+    // Qualifier: "with no X" is a prepositional qualifier about the user's own
+    // state, not a content exclusion. Decline entirely.
+    if q_lc.contains("with no") {
+        return false;
+    }
     // (1) Manner-frame / verb-led / predicate negations stay declined.
     if is_manner_phrase(&comp) {
         return false;
@@ -8561,6 +8654,17 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
     while i < words.len() {
         let w = words[i];
         let mut is_neg = neg_markers.contains(&w) || w.starts_with('-');
+        // Qualifier: "no" preceded by a preposition ("with no X", "for ... with no X")
+        // is a prepositional qualifier about the user's state, not an exclusion.
+        if w == "no" && i > 0 {
+            let prev = words[i - 1];
+            let preps = ["with", "for", "by", "from", "to", "in", "on", "at", "of",
+                         "about", "into", "onto", "upon", "over", "under", "through",
+                         "across", "within", "as", "than"];
+            if preps.contains(&prev) {
+                is_neg = false;
+            }
+        }
         let mut skip_marker_len = 1;
 
         if i + 1 < words.len() {
@@ -8857,6 +8961,19 @@ fn extract_explicit_negation_terms(q_orig: &str) -> Vec<String> {
         if let Ok(re) = regex::Regex::new(lead) {
             let mut search = 0;
             while let Some(m) = re.find(&lower[search..]) {
+                // Qualifier: "with no X" / "for ... with no X" is a prepositional
+                // qualifier about the user's own state, not a content exclusion.
+                // Skip "no" occurrences that are directly preceded by a preposition.
+                if *lead == r"(?i)no" {
+                    let abs_start = search + m.start();
+                    let before = &lower[..abs_start];
+                    let prev_word = before.split_whitespace().last().unwrap_or("");
+                    let preps = ["with", "for", "by", "from", "to", "in", "on", "at", "of", "about", "into", "onto", "upon", "over", "under", "through", "across", "within", "as", "than"];
+                    if preps.contains(&prev_word) {
+                        search = search + m.end();
+                        continue;
+                    }
+                }
                 let after = search + m.end();
                 let tail = &lower[after..];
                 let words: Vec<&str> = tail.split_whitespace().collect();
@@ -12670,6 +12787,25 @@ fn merge_local_and_web(
                 }
             }
 
+            // (b0-image) POST-CALIBRATION IMAGE/STOCK-PHOTO CAP (mirrors P8 video/audio caps).
+            // Stock-photo / image-library hosts (pinterest, pixabay, stock.adobe, etc.) are
+            // a third class with the same dominance problem as video/audio: for a non-image
+            // query they outrank topical results. Dampen them for non-image queries.
+            let is_image_src = is_url_image_host(&r.url);
+            if is_image_src {
+                if !has_image_intent(query) {
+                    let image_cap = 0.04f32;
+                    if r.score > image_cap {
+                        tracing::info!(
+                            "POST-CAL IMAGE CAP -> {:.2}: '{}' (non-image query, image source)",
+                            image_cap, r.url.chars().take(60).collect::<String>()
+                        );
+                        r.post_cal_cap = Some(image_cap);
+                        r.score = image_cap;
+                    }
+                }
+            }
+
             // (b) single-distinctive-term-only match on a multi-topic query
             if query_has_many_topics {
                 let matched_strong = strong_topics.iter().filter(|t| {
@@ -14297,7 +14433,7 @@ async fn handle_inspect(
 /// reason about the offline baseline the ranker guarantees.
 fn build_intent(q: &str) -> serde_json::Value {
     let mut intent_resp = fallback_intent(q);
-    apply_search_intent_overrides(&mut intent_resp, q, &ExactModelConfig::default());
+    apply_search_intent_overrides(&mut intent_resp, &q, &ExactModelConfig::default());
     let category = parent_category(&intent_resp.intent);
     let contrastive = query_is_contrastive(q);
     let local = has_local_intent(q);
@@ -16358,7 +16494,7 @@ async fn handle_search(
     }
 
     // ─── Rule-based intent overrides (shared with /intent, see below) ───
-    apply_search_intent_overrides(&mut intent, q, &state.exact_model_config);
+    apply_search_intent_overrides(&mut intent, &q, &state.exact_model_config);
 
     let vector: Option<Vec<f32>> = match embed_res {
         Some(resp) => {
@@ -17889,6 +18025,36 @@ async fn handle_search(
         // experience" become hard content filters and collapse the result set.
         .filter(|t| !is_manner_frame(&q_orig, t))
         .filter(|t| !is_verb_attribute_exclusion(t)) // V1: drop verb-led/attribute exclusions
+        // Qualifier: a "with no X" phrase is a prepositional qualifier about
+        // the user's own state ("with no music background", "with no experience",
+        // "for someone with no budget"), NOT a content exclusion. Drop any engine
+        // Exclusion that is contained in the "with no <noun phrase>" span.
+        .filter(|t| {
+            let q_lc = q_orig.to_lowercase();
+            if let Some(idx) = q_lc.find("with no") {
+                let after = &q_lc[idx + "with no".len()..];
+                let stop_words = ["the", "a", "an", "or", "vs", "versus", "compare", "between", "someone", "for", "with", "and"];
+                let mut qual_words: Vec<&str> = Vec::new();
+                for w in after.split_whitespace() {
+                    let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
+                    if stop_words.contains(&clean) { break; }
+                    if !clean.is_empty() { qual_words.push(clean); }
+                }
+                if !qual_words.is_empty() {
+                    let t_words: Vec<&str> = t.split_whitespace().collect();
+                    let n = qual_words.len();
+                    let m = t_words.len();
+                    if m > 0 && m <= n {
+                        for start in 0..=(n - m) {
+                            if qual_words[start..start + m] == t_words[..] {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            true
+        })
         .filter(|t| {
             // D2 (2026-08-19): a bare "pay"/"paying" engine Exclusion is only a
             // manner false-positive when the query context says so. "pay attention"
@@ -17946,11 +18112,72 @@ async fn handle_search(
     // query_neg_dropped: compounds the extractor already classified as non-manner
     // declined candidates — these are soft negatives by definition.
     for d in &query_neg_dropped {
+        if is_manner_frame(&q_orig, d) {
+            continue;
+        }
         if !soft_negatives.contains(d) {
             soft_negatives.push(d.clone());
         }
     }
     gated_neg_dedup.extend(explicit_survivors.clone());
+    // Part 2 (FIX-IF-04): comparison entities are REQUIRED, never excluded.
+    // In a X or Y / X versus Y comparison, both flanking entities must be positive
+    // constraints; strip them from the negative + soft-negative sets and ensure
+    // they are present in positive. Recompute anchors locally (comparison_query /
+    // comparison_anchor_terms live in merge_local_and_web, not this scope).
+    {
+        let q_words_local: Vec<&str> = q.split_whitespace().collect();
+        // A comparison query carries a comparison signal. A bare "or" list that
+        // follows a negation marker ("without oven or microwave") is a negation
+        // list, NOT a comparison -- do not treat its items as comparison entities.
+        let has_neg_marker = q_words_local.iter().any(|w| {
+            let l = w.to_lowercase();
+            l == "without" || l == "not" || l == "except" || l == "excluding" || l == "minus" || l == "no"
+        });
+        let has_cmp_signal = q_words_local.iter().any(|w| {
+            let l = w.to_lowercase();
+            l == "compare" || l == "comparison" || l == "versus" || l == "vs" || l == "v"
+                || l == "between" || l == "harder" || l == "easier" || l == "better"
+                || l == "worse" || l == "prefer" || l == "difference" || l == "rather"
+        });
+        let has_or = q_words_local.iter().any(|w| w.to_lowercase() == "or");
+        let is_cmp = has_cmp_signal || (has_or && !has_neg_marker);
+        if is_cmp {
+            // find marker index
+            let marker_idx = q_words_local.iter().position(|w| {
+                let l = w.to_lowercase();
+                l == "versus" || l == "vs" || l == "compare" || l == "comparison"
+                    || l == "between" || l == "or"
+            });
+            let mut anchors: Vec<String> = Vec::new();
+            if let Some(mi) = marker_idx {
+                let is_structure = |w: &str| -> bool {
+                    let l = w.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+                    l.is_empty() || ["to","of","the","a","an","for","with","and","or","which"].contains(&l.as_str())
+                };
+                if mi > 0 {
+                    for w in q_words_local[..mi].iter().rev() {
+                        if !is_structure(w) { anchors.push(w.to_lowercase()); break; }
+                    }
+                }
+                for w in q_words_local[mi + 1..].iter() {
+                    if !is_structure(w) { anchors.push(w.to_lowercase()); break; }
+                }
+            }
+            if !anchors.is_empty() {
+                let anchor_set: std::collections::HashSet<String> =
+                    anchors.iter().map(|t| t.to_lowercase()).collect();
+                gated_neg_dedup.retain(|n| !anchor_set.contains(&n.to_lowercase()));
+                soft_negatives.retain(|n| !anchor_set.contains(&n.to_lowercase()));
+                for a in &anchors {
+                    let al = a.to_lowercase();
+                    if !intent.structured_constraints.positive.iter().any(|p| p.to_lowercase() == al) {
+                        intent.structured_constraints.positive.push(a.clone());
+                    }
+                }
+            }
+        }
+    }
     intent.structured_constraints.negative = gated_neg_dedup.clone();
 
     // Explicit NL-negation directives must NOT also appear as POSITIVE terms.
@@ -20375,6 +20602,7 @@ fn apply_search_intent_overrides(
             let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
             intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
         }
+}
 }
 
 fn fallback_intent(q: &str) -> IntentResponse {
