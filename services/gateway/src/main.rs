@@ -16358,7 +16358,7 @@ async fn handle_search(
     }
 
     // ─── Rule-based intent overrides (shared with /intent, see below) ───
-    apply_search_intent_overrides(&mut intent, q, &state.exact_model_config);
+    apply_search_intent_overrides(&mut intent, &q, &state.exact_model_config);
 
     let vector: Option<Vec<f32>> = match embed_res {
         Some(resp) => {
@@ -19930,7 +19930,6 @@ const FALLBACK_TERM_MAX_WORDS: usize = 2;
 fn apply_search_intent_overrides(
     intent: &mut IntentResponse, q: &str, cfg: &ExactModelConfig,
 ) {
-    {
         let q_lower = q.to_lowercase();
         let only_negative_pattern = !intent.structured_constraints.negative.is_empty()
             && intent.structured_constraints.positive.is_empty();
