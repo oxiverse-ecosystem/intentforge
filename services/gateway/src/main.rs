@@ -16535,7 +16535,12 @@ async fn handle_search(
         }
     }
 
-    // TODO: Secondary fan-out with expanded queries if searx_results are sparse
+    // Secondary fan-out (implemented below by the parallel retry block):
+    // when primary SearXNG results are sparse (total_results < expected_min),
+    // fan out using expanded_queries and merge/dedup by URL. The merge is
+    // ADDITIVE ONLY — retry results are appended and deduped against
+    // url_rrf_contributions, never reordering the already-ranked primary set
+    // (no-manipulation guarantee: fan-out only adds results).
     // For now, scoring uses intent-based weighting on the raw query results
 
     // 4. Process Local Results
@@ -16808,14 +16813,16 @@ async fn handle_search(
         if !retry_futs.is_empty() {
             let elapsed = search_start.elapsed();
             let limit = Duration::from_millis(4500); // 4.5s overall target limit (handler budget is 5.5s)
-            // Allow contrastive-negative retries to bypass the elapsed-time skip (they
-            // are critical for "alternative to X" queries and get a bounded 1s budget),
-            // but still enforce the deadline for ordinary count-based retries.
-            if elapsed >= limit && !has_contrastive_negatives {
+            // Allow contrastive-negative AND sparse-result retries to bypass the
+            // elapsed-time skip: sparse primary results are exactly the case the
+            // secondary fan-out exists to fix, so skipping it when the deadline is
+            // already exceeded defeats the purpose. Both get a bounded 1s budget.
+            // Ordinary (non-sparse) count-based retries still enforce the deadline.
+            if elapsed >= limit && !has_contrastive_negatives && !needs_more_results {
                 tracing::warn!("Retry skipped: elapsed time ({:?}) already exceeds target deadline ({:?})", elapsed, limit);
             } else {
                 let retry_budget = if elapsed >= limit {
-                    // Contrastive-negative bypass: grant a bounded 1s budget
+                    // Contrastive-negative / sparse-result bypass: bounded 1s budget
                     Duration::from_secs(1)
                 } else {
                     limit - elapsed
