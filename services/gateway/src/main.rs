@@ -8155,7 +8155,7 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
         // Qualifier: "with no X" is a prepositional qualifier about the user's
         // own state ("with no music background", "with no experience", "with no
         // budget"), NOT a content exclusion. Treat as manner regardless of head.
-        if lc.contains("with no") {
+        if lc.contains("with no") && !query_is_contrastive(q_orig) {
             return true;
         }
         // Non-instructional queries: "without X" names content to exclude,
@@ -8661,7 +8661,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
             let preps = ["with", "for", "by", "from", "to", "in", "on", "at", "of",
                          "about", "into", "onto", "upon", "over", "under", "through",
                          "across", "within", "as", "than"];
-            if preps.contains(&prev) {
+            if preps.contains(&prev) && !query_contrastive {
                 is_neg = false;
             }
         }
@@ -21777,6 +21777,17 @@ mod constraint_fix_tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn negation_with_no_compound_new_query_regression() {
+        // NEW unique query (not in the failing test) verifying the contrastive
+        // 'with no X and no Y' fix: both exclusions must survive.
+        let q = "pancakes with no gluten and no dairy";
+        let (kept, _declined, _manner) = extract_query_negative_terms_with_dropped(q);
+        let joined = kept.join(" ");
+        assert!(!kept.iter().any(|t| t.trim().is_empty()), "empty exclusion: {:?}", kept);
+        assert!(joined.contains("gluten") && joined.contains("dairy"), "both exclusions must survive: {:?}", kept);
     }
 
     #[test]
