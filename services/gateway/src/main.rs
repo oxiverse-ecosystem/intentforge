@@ -8155,7 +8155,7 @@ fn is_manner_frame(q_orig: &str, compound: &str) -> bool {
         // Qualifier: "with no X" is a prepositional qualifier about the user's
         // own state ("with no music background", "with no experience", "with no
         // budget"), NOT a content exclusion. Treat as manner regardless of head.
-        if lc.contains("with no") {
+        if lc.contains("with no") && !query_is_contrastive(q_orig) {
             return true;
         }
         // Non-instructional queries: "without X" names content to exclude,
@@ -8661,7 +8661,7 @@ fn extract_query_negative_terms_with_dropped(q_orig: &str) -> (Vec<String>, Vec<
             let preps = ["with", "for", "by", "from", "to", "in", "on", "at", "of",
                          "about", "into", "onto", "upon", "over", "under", "through",
                          "across", "within", "as", "than"];
-            if preps.contains(&prev) {
+            if preps.contains(&prev) && !query_contrastive {
                 is_neg = false;
             }
         }
