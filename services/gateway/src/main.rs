@@ -21780,6 +21780,17 @@ mod constraint_fix_tests {
     }
 
     #[test]
+    fn negation_with_no_compound_new_query_regression() {
+        // NEW unique query (not in the failing test) verifying the contrastive
+        // 'with no X and no Y' fix: both exclusions must survive.
+        let q = "pancakes with no gluten and no dairy";
+        let (kept, _declined, _manner) = extract_query_negative_terms_with_dropped(q);
+        let joined = kept.join(" ");
+        assert!(!kept.iter().any(|t| t.trim().is_empty()), "empty exclusion: {:?}", kept);
+        assert!(joined.contains("gluten") && joined.contains("dairy"), "both exclusions must survive: {:?}", kept);
+    }
+
+    #[test]
     fn analyze_endpoint_response_shape_matches_docs() {
         // Locks the JSON shape documented in API_REFERENCE.md `GET /analyze`:
         // the handler builds `{query, contrastive_framing, exclusions, declined,
