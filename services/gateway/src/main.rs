@@ -15539,6 +15539,10 @@ async fn handle_search(
         .map(|k| circuit_ref.is_open(k))
         .collect();
     let all_searx_open = searx_instance_open.iter().all(|&o| o);
+    // Primary (VPN/gluetun) instance open flag, captured as a plain bool so it
+    // can be read inside the attempt loop without borrowing `searx_instance_open`
+    // (which is moved into the `build_searx_futs` closure).
+    let primary_instance_open = searx_instance_open.first().copied().unwrap_or(false);
     let invidious_open = circuit_ref.is_open("invidious");
 
     // NOTE (flaky-connection fix): the indexer lives behind gluetun and its
@@ -15972,7 +15976,11 @@ async fn handle_search(
             // recovered. Both egress paths are always tried. Non-site queries
             // keep normal breaker-respecting behaviour on the first attempt and
             // only force-reprobe on the retry.
-            let force = has_site || attempt == 2;
+            // LATENCY FIX (t_ac646aba): when the primary (VPN/gluetun) instance
+            // is already open (circuit breaker), force-probe in attempt 1 so
+            // Tor2 (the reliable path) can return and early-exit on the first
+            // pass instead of waiting for the retry (6s + 6s = ~12s+).
+            let force = has_site || attempt == 2 || primary_instance_open;
             let futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<SearxResponse, reqwest::Error>)> + Send>>> =
                 build_searx_futs(&searx_urls, force).into_iter().enumerate().map(|(i, f)| {
                     f.map(move |r| (i, r)).boxed()
