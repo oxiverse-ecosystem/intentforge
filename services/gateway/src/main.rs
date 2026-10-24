@@ -8361,9 +8361,47 @@ fn is_real_exclusion(
     // "music background") stay declined — they constrain the learner, not result
     // content. Fully structural / data-driven: no per-query literals.
     if is_explicit_without_directive(q_orig, &lc, compound) {
-        return true;
-    }
-    false
+            return true;
+        }
+        // Structural concrete-noun guard (IF-03): a negated single-word term that is
+        // not a known non-content word (verb/attribute/subjective/manner/noise) is a
+        // real exclusion regardless of noun genericity. This routes generic concrete
+        // nouns (oven, microwave, blender, ...) through the exclusion gate instead of
+        // declining them as "soft" negatives, so they are ENFORCED (hard negative)
+        // rather than merely demoted. No per-query literals: the decline lists are the
+        // existing structural seeds (MANNER_*, ATTRIBUTE_NOUNS, SUBJECTIVE_QUALITY_TERMS,
+        // IGNORED_CONSTRAINT_NOISE, is_verb_attribute_exclusion, is_exclusion_grammar_noise).
+        // A negation marker must be present in the query, and manner frames (how-to
+        // queries) are excluded so "without soap" in "how to ... without soap" stays a
+        // manner qualifier. Multi-word compounds are left to the existing gates.
+        if !is_manner_frame(q_orig, &lc) && !is_manner_phrase(&lc) {
+            let tokens: Vec<&str> = lc.split_whitespace().collect();
+            if tokens.len() == 1 {
+                let t = tokens[0];
+                if t.len() >= 3
+                    && t.chars().all(|c| c.is_alphabetic())
+                    && !is_verb_attribute_exclusion(t)
+                    && !is_subjective_quality_term(t)
+                    && !is_exclusion_grammar_noise(t)
+                    && !ATTRIBUTE_NOUNS.contains(&t)
+                    && !IGNORED_CONSTRAINT_NOISE.contains(&t)
+                {
+                    let q_lower = q_orig.to_lowercase();
+                    if q_lower.contains(" not ")
+                        || q_lower.contains(" no ")
+                        || q_lower.contains(" without ")
+                        || q_lower.contains(" except ")
+                        || q_lower.contains(" excluding ")
+                        || q_lower.contains(" minus ")
+                        || q_lower.starts_with("not ")
+                        || q_lower.starts_with("no ")
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
 }
 
 /// Accepts a bare `without <entity>` / `with no <entity>` directive on a non-how-to
