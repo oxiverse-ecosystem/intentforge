@@ -8284,6 +8284,56 @@ fn is_bare_not_selection(q_orig: &str, compound: &str) -> bool {
 /// fixed structural vocabulary, entity recognition is the existing protected-term
 /// list, and manner detection uses open-class verb/pronoun signals. No per-query
 /// literals, no magic thresholds.
+/// True when `term` is the object of a PREDICATE or PREPOSITION-governed negation
+/// in `q_orig` ("does not spin", "is not working", "books not in hardcover",
+/// "news not about politics") — i.e. an attribute/qualifier/predicate negation
+/// that must NOT be promoted to a hard search exclusion by the concrete-noun
+/// guard. Structural signals only (auxiliary seed + preposition set), no
+/// per-query literals.
+fn is_attribute_negation_context(q_orig: &str, term: &str) -> bool {
+    let t = term.to_lowercase();
+    let q_toks: Vec<String> = q_orig
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|x| !x.is_empty())
+        .map(|x| x.to_string())
+        .collect();
+    const PREPS: &[&str] = &[
+        "in", "on", "at", "about", "for", "with", "by", "of", "to", "from",
+        "into", "onto", "upon", "over", "under", "before", "after", "than",
+        "that", "which",
+    ];
+    const DETERMINERS: &[&str] = &["a", "an", "the", "any", "some"];
+    for i in 0..q_toks.len() {
+        if q_toks[i] != "not" {
+            continue;
+        }
+        // Skip determiners right after `not`.
+        let mut j = i + 1;
+        while j < q_toks.len() && DETERMINERS.contains(&q_toks[j].as_str()) {
+            j += 1;
+        }
+        // Preposition-governed: `not in X` / `not about X` → attribute negation.
+        if j < q_toks.len() && PREPS.contains(&q_toks[j].as_str()) {
+            let mut k = j + 1;
+            while k < q_toks.len() && DETERMINERS.contains(&q_toks[k].as_str()) {
+                k += 1;
+            }
+            if k < q_toks.len() && q_toks[k] == t {
+                return true;
+            }
+        }
+        // Direct predicate auxiliary: `does not spin`, `is not working`.
+        if j < q_toks.len() && q_toks[j] == t
+            && i > 0
+            && NEGATION_PREDICATE_AUXILIARIES.contains(&q_toks[i - 1].as_str())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_real_exclusion(
     compound: &str,
     q_orig: &str,
@@ -8385,6 +8435,9 @@ fn is_real_exclusion(
                     && !is_exclusion_grammar_noise(t)
                     && !ATTRIBUTE_NOUNS.contains(&t)
                     && !IGNORED_CONSTRAINT_NOISE.contains(&t)
+                    && !(t.len() > 3 && t.ends_with("ed"))
+                    && !(t.len() > 4 && t.ends_with("ing"))
+                    && !is_attribute_negation_context(q_orig, t)
                 {
                     let q_lower = q_orig.to_lowercase();
                     if q_lower.contains(" not ")
@@ -16535,7 +16588,12 @@ async fn handle_search(
         }
     }
 
-    // TODO: Secondary fan-out with expanded queries if searx_results are sparse
+    // Secondary fan-out (implemented below by the parallel retry block):
+    // when primary SearXNG results are sparse (total_results < expected_min),
+    // fan out using expanded_queries and merge/dedup by URL. The merge is
+    // ADDITIVE ONLY — retry results are appended and deduped against
+    // url_rrf_contributions, never reordering the already-ranked primary set
+    // (no-manipulation guarantee: fan-out only adds results).
     // For now, scoring uses intent-based weighting on the raw query results
 
     // 4. Process Local Results
@@ -16808,14 +16866,16 @@ async fn handle_search(
         if !retry_futs.is_empty() {
             let elapsed = search_start.elapsed();
             let limit = Duration::from_millis(4500); // 4.5s overall target limit (handler budget is 5.5s)
-            // Allow contrastive-negative retries to bypass the elapsed-time skip (they
-            // are critical for "alternative to X" queries and get a bounded 1s budget),
-            // but still enforce the deadline for ordinary count-based retries.
-            if elapsed >= limit && !has_contrastive_negatives {
+            // Allow contrastive-negative AND sparse-result retries to bypass the
+            // elapsed-time skip: sparse primary results are exactly the case the
+            // secondary fan-out exists to fix, so skipping it when the deadline is
+            // already exceeded defeats the purpose. Both get a bounded 1s budget.
+            // Ordinary (non-sparse) count-based retries still enforce the deadline.
+            if elapsed >= limit && !has_contrastive_negatives && !needs_more_results {
                 tracing::warn!("Retry skipped: elapsed time ({:?}) already exceeds target deadline ({:?})", elapsed, limit);
             } else {
                 let retry_budget = if elapsed >= limit {
-                    // Contrastive-negative bypass: grant a bounded 1s budget
+                    // Contrastive-negative / sparse-result bypass: bounded 1s budget
                     Duration::from_secs(1)
                 } else {
                     limit - elapsed
