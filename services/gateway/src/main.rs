@@ -17346,6 +17346,14 @@ async fn handle_search(
         resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
     }).count();
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
+    // FIX-IF-43: a result "carries a parseable published_date" only when the
+    // upstream actually populated `published_date`. `resolve_item_date` also
+    // fabricates a date from any year in the URL (e.g. ipl-2026 -> 2026-01-01),
+    // which is imprecise and made zero-width "today" windows delete every
+    // result. Fabricated URL-year dates must NOT count toward this gate.
+    let real_dated_result_count = web_results.iter().filter(|r| {
+        r.published_date.as_deref().and_then(parse_date_to_comparable).is_some()
+    }).count();
 
     // FRESH/date fail-open (prevents 0-result collapse): the FRESH OVERRIDE may have
     // flagged this as a recency query, and should_filter_by_constraints DROPS any
@@ -17386,25 +17394,21 @@ async fn handle_search(
             }
             ok
         }).count();
-        // (A) no dates at all, or (B) all dated-but-out-of-range -> would empty.
-        // (C) RESIDUAL P6: the window keeps SOME results but crushes the set
-        //     pathologically (e.g. date-less upstream snippets for "latest X this
-        //     week" → 8/9 dropped, 1 survives = 11%). A near-empty result set is
-        //     the same user-facing failure as a zero one: relevant, date-less
-        //     results get discarded in favour of a single stale-but-dated item.
-        //     Fail-open when the surviving fraction is below a general 25% floor
-        //     AND the surviving count is too small to be useful (< 3). This is
-        //     keyed on survival ratio, not on any query/window, so it stays general.
+        // (A) no real published dates (fabricated URL-year dates don't count)
+        //     -> the hard window has nothing real to anchor on -> fail open.
+        // (B) all dated-but-out-of-range -> would empty.
+        // (C) surviving fraction below 0.5 (widened from 0.25) -> near-empty.
+        let hard_window_allowed = real_dated_result_count > 0;
         let survivor_fraction = if pre_filter_count > 0 {
             survivors_after_window as f32 / pre_filter_count as f32
         } else {
             1.0
         };
-        let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.25;
-        if survivors_after_window == 0 || fraction_too_low {
+        let fraction_too_low = survivor_fraction < 0.5;
+        if !hard_window_allowed || survivors_after_window == 0 || fraction_too_low {
             tracing::info!(
-                "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
-                pre_filter_count, survivors_after_window, survivor_fraction, dated_result_count
+                "DATE WINDOW FAIL-OPEN (would-empty/near-empty/no-real-dates): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}, real_dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
+                pre_filter_count, survivors_after_window, survivor_fraction, dated_result_count, real_dated_result_count
             );
             intent.structured_constraints.after_date = None;
             intent.structured_constraints.before_date = None;
@@ -18709,7 +18713,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
     for n in &sc.negative { applied.push(format!("not:{}", n)); }
     for he in &sc.hard_exclusions { applied.push(format!("not:{}", he)); }
 
-    if (sc.after_date.is_some() || sc.before_date.is_some()) && dated_result_count == 0 {
+    if (sc.after_date.is_some() || sc.before_date.is_some()) && (dated_result_count == 0 || real_dated_result_count == 0) {
         ignored.push(
             "date range — no returned result carried a parseable date, so filtering relied on the upstream engine only".to_string(),
         );
