@@ -9,7 +9,7 @@ services:
   # ══════════════════════════════════════════════════════════════════
 
   gluetun:
-    image: qmcgaw/gluetun:v3.39.0
+    image: qmcgaw/gluetun:v3.41.3
     container_name: if-dev-gluetun
     mem_limit: 512m
     cap_add:
@@ -26,7 +26,7 @@ services:
       - HTTP_PROXY=on
       - SHADOWSOCKS=on
       - HTTP_CONTROL_SERVER_ADDRESS=:8000
-      - HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE=public
+      # - HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE=public  # v3.41 expects JSON role object; omit for built-in public/none default
       - OPENVPN_OPTIONS=--route-nopull
       - OPENVPN_ENDPOINT_PORT=443
       - OPENVPN_PROTOCOL=udp
@@ -67,7 +67,7 @@ services:
           - indexer
           - tor
     ports:
-      - "18888:8888/tcp"
+      - "20000:8888/tcp"
       - "8388:8388/tcp"
       - "8080:8080"
       # crawler binds 0.0.0.0:5001 (crawler/src/main.rs, EXPOSE 5001).  The

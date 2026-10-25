@@ -5632,6 +5632,12 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     let lower_markers = ["over", "more than", "above", "minimum", "at least", "from"];
     let amount_pat = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
     let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.", "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw"];
+    // Indian number units: "30 lakh" = 3,000,000; "5 crore" = 50,000,000.
+    // The multiplier is applied to the parsed number before returning.
+    let indian_units: &[(&str, f32)] = &[
+        ("lakh", 100_000.0), ("lakhs", 100_000.0),
+        ("crore", 10_000_000.0), ("crores", 10_000_000.0),
+    ];
     // Distance units: a number followed by one of these is a RANGE/DISTANCE
     // bound (e.g. "within 300 kilometers", "up to 50 miles"), NOT a price.
     // Without this guard, "within 300 kilometers" was mis-read as price:<300
@@ -5651,6 +5657,16 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
             .unwrap_or("");
         let next_token_lower = next_token.to_lowercase();
         distance_units.iter().any(|u| next_token_lower == *u)
+    };
+    /// Check if the token immediately after the number is an Indian unit
+    /// (lakh/lakhs/crore/crores). Returns the multiplier if found.
+    let get_indian_multiplier = |rest_after_num: &str| -> Option<f32> {
+        let next_token = rest_after_num.trim_start()
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        indian_units.iter().find(|(u, _)| next_token == *u).map(|(_, m)| *m)
     };
 
     // Pattern A: upper-marker then number (+ optional currency word)
@@ -16433,20 +16449,8 @@ async fn handle_search(
         None => geo_location,
     };
 
-    // M3 fix: fallback location for loopback/private IP or missing geo DB when query has local intent ("near me")
-    if geo_location.is_none() && has_local_intent(&q) {
-        geo_location = Some(geoloc::GeoLocation {
-            country_code: Some("US".to_string()),
-            country_name: Some("United States".to_string()),
-            region: Some("New York".to_string()),
-            city: Some("New York".to_string()),
-            postal_code: Some("10001".to_string()),
-            latitude: Some(40.7128),
-            longitude: Some(-74.0060),
-            time_zone: Some("America/New_York".to_string()),
-        });
-        tracing::info!("GEO: local intent detected, applied default geolocation fallback (New York, US)");
-    }
+    // P12 fix: never fabricate a city/country when there is no real
+    // IP-derived or explicit location. Leaving geo_location as None is honest.
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
     // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
@@ -16884,12 +16888,13 @@ async fn handle_search(
                                     m.contains("403")
                                         || m.contains("access denied")
                                         || m.contains("captcha")
+                                        || m.contains("timeout")
                                 })
                                 .unwrap_or(false)
                         });
                         if ip_banned {
-                            // Throttle: skip if we already rotated within 120s.
-                            if ratelimit_for_searx.count_in_window(120) == 0 {
+                            // Throttle: skip if we already rotated within 60s.
+                            if ratelimit_for_searx.count_in_window(60) == 0 {
                                 ratelimit_for_searx.record();
                                 let new_count = ratelimit_for_searx.count_in_window(300);
                                 tracing::warn!(
@@ -17080,7 +17085,7 @@ async fn handle_search(
         // budget and surfaces upstream_unavailable even though tor2 would
         // have answered once warm. We only wait when tor2 is actually in the
         // fan-out (it is, for every request) and it's currently marked cold.
-        // Cap at 12s so a genuinely stuck tor2 can't hang the request.
+        // Cap at 3s so a genuinely stuck tor2 can't hang the request.
         if searx_urls.iter().any(|u| u.contains("tor2")) && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
             let mut waited = 0u64;
             while waited < 3000 && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
@@ -17090,7 +17095,7 @@ async fn handle_search(
             if TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
                 tracing::debug!("tor2 warmed during pre-query wait ({}ms)", waited);
             } else {
-                tracing::warn!("tor2 still cold after 12s pre-query wait; querying anyway");
+                tracing::warn!("tor2 still cold after 3s pre-query wait; querying anyway");
             }
         }
 
@@ -17277,14 +17282,14 @@ async fn handle_search(
         //
         // The join deadline is Tor-aware: the gluetun-VPN (SearXNG1) instance is
         // bounded ~4.2s and the fan-out early-returns at 15 results, so a 5s join
-        // is plenty for it. BUT the SearXNG2/Tor (tor2) instance runs over an
-        // independent Tor circuit whose COLD build (after a NEWNYM rotation) takes
-        // 10-15s; its own branch budget is 15s (see is_tor_url branch_timeout_ms)
-        // and the per-instance attempt budget is 10s (non-site). A flat 5s join cut
-        // the legitimate slow Tor response before it arrived, discarding the whole
-        // second egress path. When tor2 is in the fan-out we extend the join to 15s
-        // so its valid results are captured instead of dropped (the partial collector
-        // is still used if even 15s is exceeded). Fast-path behaviour is unchanged.
+        // is plenty for it. The SearXNG2/Tor (tor2) instance runs over an
+        // independent Tor circuit whose COLD build takes 10-15s; its own branch
+        // budget is 15s. A flat 5s join cuts the legitimate slow Tor response
+        // before it arrives, discarding the whole second egress path. When tor2
+        // is in the fan-out we extend the join to 15s so its valid results are
+        // captured instead of dropped (the partial collector is still used if
+        // even 15s is exceeded). Fast-path behaviour is unchanged.
+        // NOTE: reduced to 5s always per sibling card t_8fbf0013 to cap latency.
         async {
             let partial_collector_ref = searx_partial_collector.clone();
             let join_deadline = Duration::from_secs(5);
