@@ -17083,7 +17083,7 @@ async fn handle_search(
         // Cap at 12s so a genuinely stuck tor2 can't hang the request.
         if searx_urls.iter().any(|u| u.contains("tor2")) && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
             let mut waited = 0u64;
-            while waited < 12000 && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
+            while waited < 3000 && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 waited += 500;
             }
@@ -17287,11 +17287,7 @@ async fn handle_search(
         // is still used if even 15s is exceeded). Fast-path behaviour is unchanged.
         async {
             let partial_collector_ref = searx_partial_collector.clone();
-            let join_deadline = if tor2_in_fanout {
-                Duration::from_secs(15)
-            } else {
-                Duration::from_secs(5)
-            };
+            let join_deadline = Duration::from_secs(5);
             match tokio::time::timeout(join_deadline, searx_fut_with_timeout).await {
                 Ok(res) => {
                     if res.is_empty() {
