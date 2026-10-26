@@ -604,3 +604,26 @@ pub fn decorate_affiliate(results: &mut [serde_json::Value], ctx: &AffiliateCtx)
     }
 }
 
+
+/// Best-effort real-time bid value fetch for REPORTING ONLY.
+/// Returns None on missing key/URL, any network error, parse failure, or
+/// timeout. NEVER influences ranking. Uses a short (2s) timeout so a slow
+/// bid-check endpoint cannot stall the search response.
+pub fn fetch_bid_value(url: &str, key: &str) -> Option<f64> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(url)
+        .query(&[("key", key)])
+        .send()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().ok()?;
+    json.get("bid")
+        .and_then(|v| v.as_f64())
+        .or_else(|| json.get("value").and_then(|v| v.as_f64()))
+}
