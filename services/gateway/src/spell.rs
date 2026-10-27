@@ -241,29 +241,6 @@ impl SymSpellIndex {
             char_bigram_model.reference_perplexity,
             phonetic_dict.len()
         );
-
-        // Build phonetic dictionary from word frequencies
-        let mut phonetic_dict: HashMap<String, Vec<String>> = HashMap::new();
-        let double_metaphone = rphonetic::DoubleMetaphone::default();
-        for (word, _freq) in crate::dictionary::WORD_FREQUENCIES {
-            let word_lower = word.to_lowercase();
-            // Only include ASCII words (rphonetic panics on non-ASCII)
-            if !word_lower.is_ascii() {
-                continue;
-            }
-            // DoubleMetaphone returns primary and alternate codes — index both
-            // so that lookups match either variant (e.g. "cancing" codes to KNSN
-            // while "cancelling" codes to KNSL; indexing under both links them).
-            let primary = double_metaphone.encode(&word_lower);
-            let alternate = double_metaphone.encode_alternate(&word_lower);
-            if !primary.is_empty() {
-                phonetic_dict.entry(primary.clone()).or_default().push(word_lower.clone());
-            }
-            if !alternate.is_empty() && alternate != primary {
-                phonetic_dict.entry(alternate).or_default().push(word_lower);
-            }
-        }
-
         Self {
             deletions,
             words,
@@ -635,124 +612,6 @@ impl SymSpellIndex {
 
     /// Phonetic fallback: find a correction using phonetic codes.
     /// Called after SymSpell/LinSpell fail. Applies strict guards:
-    /// (1) input word is NOT in the dictionary (absent-word guard),
-    /// (2) best phonetic match has edit distance ≤ 3,
-    /// (3) the match is a common word (frequency above threshold),
-    /// (4) the input is a letter-drop typo of the candidate (subsequence check).
-    fn phonetic_fallback(&self, word: &str) -> Option<String> {
-        let word_lower = word.to_lowercase();
-        // Guard: only attempt for ASCII words (rphonetic panics on non-ASCII)
-        if !word_lower.is_ascii() {
-            return None;
-        }
-        // Skip exact matches that are real (non-seed) dictionary words — they don't
-        // need correction. But DO proceed for known-misspelling seeds (e.g. "cancing"
-        // at freq 0.0010) — they are explicitly present to be corrected to a better
-        // form (e.g. "cancelling" at freq 0.100) which the phonetic path can find.
-        if self.exact_map.contains_key(&word_lower) && !self.is_known_misspelling(word) {
-            return None;
-        }
-        let dmeta = DoubleMetaphone::default();
-        let input_code = dmeta.encode(&word_lower);
-        let input_alt = dmeta.encode_alternate(&word_lower);
-
-        // Match on phonetic prefix: near-identical pronunciations often differ
-        // in the last character (KNSN vs KNSL). Iterate all phonetic_dict
-        // entries and collect word_ids whose code shares the same prefix.
-        let prefix_len = Self::PHONETIC_PREFIX_LEN;
-        let input_prefix = if input_code.len() >= prefix_len {
-            &input_code[..prefix_len]
-        } else {
-            &input_code[..]
-        };
-        let alt_prefix = if input_alt.len() >= prefix_len {
-            &input_alt[..prefix_len]
-        } else {
-            &input_alt[..]
-        };
-
-        let mut all_candidates: Vec<u32> = Vec::new();
-        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        if word_lower == "cancing" {
-            eprintln!("[DEBUG] cancing input_prefix={} alt_prefix={}", input_prefix, alt_prefix);
-        }
-        for (code, ids) in &self.phonetic_dict {
-            let code_prefix = if code.len() >= prefix_len {
-                &code[..prefix_len]
-            } else {
-                &code[..]
-            };
-            if code_prefix == input_prefix || code_prefix == alt_prefix {
-                for &id in ids {
-                    seen.insert(id);
-                }
-                if word_lower == "cancing" {
-                    let sample: Vec<String> = ids.iter().map(|&id| self.words[id as usize].clone()).collect();
-                    eprintln!("[DEBUG]   code={} prefix={} matches={:?}", code, code_prefix, sample);
-                }
-            }
-        }
-        all_candidates.extend(seen);
-        if word_lower == "cancing" {
-            eprintln!("[DEBUG] cancing candidates={}", all_candidates.len());
-            for &word_id in &all_candidates {
-                let dict_word = &self.words[word_id as usize];
-                let freq = self.frequencies[word_id as usize];
-                let dist = self.compute_edit_distance(&word_lower, dict_word);
-                let is_drop = Self::is_letter_drop_typo(&word_lower, dict_word);
-                let perp = self.char_bigram_model.perplexity_ratio(&word_lower, dict_word);
-                eprintln!("[DEBUG]   cand={} freq={:.4} dist={} is_drop={} perp={:.2}", dict_word, freq, dist, is_drop, perp);
-            }
-        }
-
-        let mut best: Option<(u32, f64, usize)> = None;
-        for &word_id in &all_candidates {
-            let dict_word = &self.words[word_id as usize];
-            let freq = self.frequencies[word_id as usize];
-            // Guard 3: candidate must be a common word
-            if freq < MIN_FREQ_THRESHOLD * 10.0 {
-                continue;
-            }
-            let dist = self.compute_edit_distance(&word_lower, dict_word);
-            // Guard 2: edit distance must be ≤ 3
-            if dist > 3 || dist == 0 {
-                continue;
-            }
-            // Guard 4: input must be a letter-drop typo of the candidate
-            if !Self::is_letter_drop_typo(&word_lower, dict_word) {
-                continue;
-            }
-            // Guard 5: perplexity ratio must not indicate a tech-term→English swap.
-            // Exception: letter-drop typos (e.g. "cancing" → "canceling") have
-            // natural bigrams from the candidate word, so the perplexity ratio
-            // is ~1.0 and does not indicate a tech-term swap. Skip this guard
-            // when the input is a letter-drop typo of the candidate.
-            let perp_ratio = self.char_bigram_model.perplexity_ratio(&word_lower, dict_word);
-            if perp_ratio > 1.4 && !Self::is_letter_drop_typo(&word_lower, dict_word) {
-                continue;
-            }
-            // Pick the best candidate: lowest edit distance, but when two
-            // candidates are within 1 edit distance of each other, prefer
-            // the higher-frequency word. This handles cases like
-            // "cancing" → "cancelling" (dist 3, freq 0.100) over
-            // "canceling" (dist 2, freq 0.080) — the British spelling is
-            // more common in the corpus and is the intended correction.
-            match best {
-                None => best = Some((word_id, freq, dist)),
-                Some((_, best_freq, best_dist)) => {
-                    if dist < best_dist && freq >= best_freq {
-                        best = Some((word_id, freq, dist));
-                    } else if dist <= best_dist + 1 && freq > best_freq {
-                        best = Some((word_id, freq, dist));
-                    }
-                }
-            }
-        }
-
-        best.map(|(word_id, _, _)| self.words[word_id as usize].clone())
-    }
-
-    /// SymSpell O(1) lookup: generate deletions of the input word and check
     /// against the pre-computed index.
     fn symspell_lookup(&self, word: &str) -> Option<String> {
         let chars: Vec<char> = word.chars().collect();
@@ -1039,7 +898,7 @@ impl SymSpellIndex {
         // without requiring exact code equality.
         let prefix_len = code.len().min(3);
         let code_prefix = &code[..prefix_len];
-        let mut all_candidates: Vec<&String> = Vec::new();
+        let mut all_candidates: Vec<u32> = Vec::new();
         for (key, cands) in self.phonetic_dict.iter() {
             if key.len() >= prefix_len && &key[..prefix_len] == code_prefix {
                 all_candidates.extend(cands);
@@ -1051,31 +910,29 @@ impl SymSpellIndex {
 
         // Pick the best candidate: lowest edit distance, then highest frequency.
         // Only accept candidates where the input is a letter-drop typo (subsequence).
-        let mut best_candidate: Option<(&String, f64, usize)> = None; // (word, freq, dist)
-        for candidate in all_candidates {
+        let mut best_candidate: Option<(u32, f64, usize)> = None; // (word_id, freq, dist)
+        for &word_id in &all_candidates {
+            let candidate = &self.words[word_id as usize];
             // Must be a letter-drop typo: input is a subsequence of candidate
             if !Self::is_subsequence(word, candidate) {
                 continue;
             }
-            let freq = self.exact_map
-                .get(candidate)
-                .map(|&id| self.frequencies[id as usize])
-                .unwrap_or(0.0);
+            let freq = self.frequencies[word_id as usize];
             let dist = self.compute_edit_distance(word, candidate);
             if dist == 0 {
                 continue; // Skip exact matches (already handled)
             }
             match best_candidate {
-                None => best_candidate = Some((candidate, freq, dist)),
+                None => best_candidate = Some((word_id, freq, dist)),
                 Some((_, best_freq, best_dist)) => {
                     if dist < best_dist || (dist == best_dist && freq > best_freq) {
-                        best_candidate = Some((candidate, freq, dist));
+                        best_candidate = Some((word_id, freq, dist));
                     }
                 }
             }
         }
 
-        best_candidate.map(|(word, _, _)| word.clone())
+        best_candidate.map(|(word_id, _, _)| self.words[word_id as usize].clone())
     }
 
     /// Check if `input` is a subsequence of `candidate` (letter-drop typo).
