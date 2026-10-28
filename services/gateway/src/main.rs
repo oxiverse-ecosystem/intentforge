@@ -15538,27 +15538,13 @@ async fn handle_search(
         None => geo_location,
     };
 
-    // M3 fix: fallback location for loopback/private IP or missing geo DB when query has local intent ("near me")
-    if geo_location.is_none() && has_local_intent(&q) {
-        // COUNTRY-LEVEL fallback only (no city). A city-level default is a
-        // fabricated requirement: it gets injected into `positive` and the
-        // cross-location gate, so "nearby restaurants" demanded a page mention
-        // "New York" — the wrong region for a user in India. Country-level is
-        // the correct granularity for a location we could not resolve: it
-        // scopes the upstream query (`source_country`) without inventing a
-        // place the user never named.
-        geo_location = Some(geoloc::GeoLocation {
-            country_code: Some("IN".to_string()),
-            country_name: Some("India".to_string()),
-            region: None,
-            city: None,
-            postal_code: None,
-            latitude: None,
-            longitude: None,
-            time_zone: None,
-        });
-        tracing::info!("GEO: local intent detected, applied country-level geolocation fallback (IN) — no city invented");
-    }
+    // FIX-IF-10: no fabricated geo fallback at all. When there is no
+    // IP-derived or explicit location, leave geo_location = None (fail-open).
+    // Injecting a hardcoded country (even country-only) fabricates a region
+    // the user never named and biases upstream source_country; downstream
+    // ranking must not assume a location we did not resolve. Soft
+    // country-aware boosts, if any, must be derived from detected
+    // language/region signals — never from a hardcoded default.
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
     // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
