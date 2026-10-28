@@ -17878,7 +17878,7 @@ async fn handle_search(
             1.0
         };
         let fraction_too_low = survivors_after_window < 3 && survivor_fraction < 0.25;
-        if survivors_after_window == 0 || fraction_too_low {
+        if survivors_after_window == 0 || fraction_too_low || dated_result_count == 0 {
             tracing::info!(
                 "DATE WINDOW FAIL-OPEN (would-empty/near-empty): {} web results, {} would survive (fraction={:.2}) the date window (dated_result_count={}) — clearing hard recency window (recency stays scoring-only)",
                 pre_filter_count, survivors_after_window, survivor_fraction, dated_result_count
