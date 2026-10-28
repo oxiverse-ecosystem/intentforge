@@ -5798,7 +5798,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     ];
     let lower_markers = ["over", "more than", "above", "minimum", "at least", "from"];
     let amount_pat = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
-    let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.", "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw"];
+    let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.", "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw", "$", "¥", "€", "£"];
     // Indian number units: "30 lakh" = 3,000,000; "5 crore" = 50,000,000.
     // The multiplier is applied to the parsed number before returning.
     let indian_units: &[(&str, f32)] = &[
