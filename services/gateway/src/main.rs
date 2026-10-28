@@ -5798,7 +5798,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     ];
     let lower_markers = ["over", "more than", "above", "minimum", "at least", "from"];
     let amount_pat = r"(\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)";
-    let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.", "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw"];
+    let currency_words = ["dollars", "dollar", "usd", "rupees", "rupee", "inr", "rs", "₹", "rs.", "euros", "euro", "eur", "pounds", "pound", "gbp", "yen", "jpy", "won", "krw", "$", "¥", "€", "£"];
     // Indian number units: "30 lakh" = 3,000,000; "5 crore" = 50,000,000.
     // The multiplier is applied to the parsed number before returning.
     let indian_units: &[(&str, f32)] = &[
@@ -5840,10 +5840,15 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     for marker in upper_markers {
         if let Some(pos) = lower.find(marker) {
             let rest = &lower[pos + marker.len()..];
-            let re_num = regex::Regex::new(&format!(r"\s*{}\b", amount_pat)).ok()?;
+            let re_num = regex::Regex::new(&format!(r"\s*(?:(?:₹|¥|€|£|\$|usd|inr|rs\.?|rupees?|dollars?|euros?|eur|pounds?|gbp|yen|jpy|won|krw)\s*)?{}\b", amount_pat)).ok()?;
             if let Some(caps) = re_num.captures(rest) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(v) = m.as_str().replace(',', "").parse::<f32>() {
+                        // Text between the marker and the matched number — may
+                        // contain an optional currency symbol/word (e.g. "$" in
+                        // "under $50000"). Used to recover the currency when it
+                        // precedes the number rather than following it.
+                        let prefix = &rest[..m.start()];
                         // Indian unit conversion: "30 lakh" → 3,000,000
                         let after_num = &rest[m.end()..];
                         // Distance-bound guard: "within 300 kilometers" is a
@@ -5865,6 +5870,8 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         // currency word, this is not a price bound — skip and try
                         // the next marker. General guard; no per-query literals.
                         let near_currency = currency_words.iter().any(|c| {
+                            prefix.contains(c)
+                        }) || currency_words.iter().any(|c| {
                             after_num.len() >= c.len() && after_num[..c.len()].starts_with(c)
                                 || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
                                 || after_num[..after_num.len().min(20)].contains(c)
@@ -5872,7 +5879,8 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         if !near_currency {
                             continue;
                         }
-                        let currency = currency_words.iter().find(|c| after_num[..after_num.len().min(20)].contains(*c))
+                        let currency = currency_words.iter().find(|c| prefix.contains(*c))
+                            .or_else(|| currency_words.iter().find(|c| after_num[..after_num.len().min(20)].contains(*c)))
                             .map(|c| normalize_currency_str(c)).unwrap_or_else(|| "usd".to_string());
                         return Some((v, currency));
                     }
@@ -20980,6 +20988,18 @@ mod constraint_fix_tests {
         assert!(cheap <= b, "Rs 10,000 must stay in budget");
     }
 
+    #[test]
+    fn price_bound_parses_under_currency_symbol() {
+        let (bound, cur) = extract_nl_price_bound("best laptop under $50000")
+            .expect("under $50000 should be extracted");
+        assert_eq!(bound, 50000.0);
+        assert_eq!(cur, "USD");
+
+        let (bound2, cur2) = extract_nl_price_bound("phone under ₹30000")
+            .expect("under ₹30000 should be extracted");
+        assert_eq!(bound2, 30000.0);
+        assert_eq!(cur2, "INR");
+    }
     #[test]
     fn p3_usd_bound_behaviour_is_unchanged() {
         // No stated currency (the `price:<N` operator form, or bare dollars)

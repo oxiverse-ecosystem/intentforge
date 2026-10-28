@@ -1,3 +1,4 @@
 # VPN signal files - ephemeral, not tracked
 *
 !.gitignore
+!resolv-gateway.conf
