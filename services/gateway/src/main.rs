@@ -4511,7 +4511,7 @@ async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> 
 /// applied at the `commerce_fetch_budget` site, so hanging merchants ran for
 /// the full remaining wall (~22s) per pass — 44.94s total across the two
 /// passes. This is the single source of truth for the per-fetch ceiling.
-const COMMERCE_PER_FETCH_CAP_SECS: u64 = 8;
+const COMMERCE_PER_FETCH_CAP_SECS: u64 = 2;
 
 fn commerce_fetch_budget(
     remaining_wall: std::time::Duration,
@@ -4893,7 +4893,7 @@ const MAX_PARALLEL_FETCH: usize = 4;
 /// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
 /// This is now only the CEILING for `commerce_wall_for_elapsed`, never the value
 /// used unconditionally — see that function for why a flat cap is unsafe.
-const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 22;
+const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 6;
 
 /// The global request budget enforced by the `TimeoutLayer` wrapped around the
 /// router (see the `.layer(TimeoutLayer::new(...))` call). Kept as a named
@@ -13058,7 +13058,7 @@ struct CommerceConfig {
 
 impl Default for CommerceConfig {
     fn default() -> Self {
-        Self { mainpath_top_n: 8, enrich_window: 24 }
+        Self { mainpath_top_n: 8, enrich_window: 4 }
     }
 }
 
