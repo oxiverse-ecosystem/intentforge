@@ -4504,11 +4504,30 @@ async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> 
 /// geometry, not a tuned latency constant: 22s over 2 waves of 4 = 11s per page,
 /// which is far above the real ~8s VPN-routed page fetch, while still bounding
 /// the total.
+/// Cap on a single merchant page fetch. A real VPN-routed page (techradar.com)
+/// completes in ~6.5-8s; beyond this a merchant is almost certainly hanging
+/// (code=000, never responds) and must not be allowed to consume the whole
+/// remaining wall. Prior fix (PR #210) intended this cap but it was never
+/// applied at the `commerce_fetch_budget` site, so hanging merchants ran for
+/// the full remaining wall (~22s) per pass — 44.94s total across the two
+/// passes. This is the single source of truth for the per-fetch ceiling.
+const COMMERCE_PER_FETCH_CAP_SECS: u64 = 8;
+
 fn commerce_fetch_budget(
     remaining_wall: std::time::Duration,
-    _waves_remaining: usize,
+    waves_remaining: usize,
 ) -> std::time::Duration {
-    remaining_wall
+    if waves_remaining == 0 {
+        return remaining_wall;
+    }
+    // Cap the per-fetch timeout so a hanging merchant (code=000) cannot consume
+    // the entire remaining wall. The wall drain in `enrich_with_commerce_par`
+    // already bounds the total, but without this cap each individual fetch
+    // waits the full wall before the drain's recv times out — and across two
+    // passes (handle_search + /shopping safety net) that is ~44s.
+    remaining_wall.min(std::time::Duration::from_secs(
+        COMMERCE_PER_FETCH_CAP_SECS,
+    ))
 }
 
 /// PURE, OFFLINE-TESTABLE enrichment: attach honest product facts to already-ranked
