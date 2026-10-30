@@ -8353,10 +8353,16 @@ fn is_real_exclusion(
         return true;
     }
     // FIX-IF-03: concrete object nouns as real exclusions
-    if OBJECT_NOUNS.contains(&lc.as_str())
-        || tokens.iter().any(|t| OBJECT_NOUNS.contains(t))
-    {
-        return true;
+    // BUT: eligibility/qualifier compounds containing an ATTRIBUTE_NOUN
+    // (e.g. "computer science degree", "music background") are NOT real
+    // exclusions even if a constituent token is a concrete object noun
+    // ("computer"). Decline when an attribute noun is present.
+    if !(ATTRIBUTE_NOUNS.iter().any(|a| tokens.contains(a))) {
+        if OBJECT_NOUNS.contains(&lc.as_str())
+            || tokens.iter().any(|t| OBJECT_NOUNS.contains(t))
+        {
+            return true;
+        }
     }
     // Entity: a term in the compound is capitalized in the original query
     // (proper noun the user named, e.g. "without Samsung bloat" → Samsung).
