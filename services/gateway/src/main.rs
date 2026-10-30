@@ -4506,9 +4506,19 @@ async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> 
 /// the total.
 fn commerce_fetch_budget(
     remaining_wall: std::time::Duration,
-    _waves_remaining: usize,
+    waves_remaining: usize,
 ) -> std::time::Duration {
-    remaining_wall
+    // A real VPN-routed page needs ~6.5-8s; merchants that never respond
+    // (code=000) must not consume the whole remaining wall and block the
+    // wave's drain. Cap each fetch at 8s so a hanging merchant fails fast
+    // while genuine slow pages still succeed.
+    // waves_remaining == 0 is a degenerate input: there is no wave to run,
+    // so return the whole remaining wall (never divide by zero).
+    if waves_remaining == 0 {
+        return remaining_wall;
+    }
+    let per_page_cap = std::time::Duration::from_secs(8);
+    remaining_wall.min(per_page_cap)
 }
 
 /// PURE, OFFLINE-TESTABLE enrichment: attach honest product facts to already-ranked
