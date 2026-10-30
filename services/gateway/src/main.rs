@@ -8301,6 +8301,20 @@ fn is_real_exclusion(
     if is_manner_phrase(compound) {
         return false;
     }
+    // FIX-IF-BACKFILL-15: any noun appearing in a negated clause ("without X",
+    // "not X", "with no X") is a real exclusion regardless of generic-ness,
+    // unless it is a stopword/function word. Inverted P9 grammar-noise gate.
+    let _q_lc_for_neg = q_orig.to_lowercase();
+    let lc_neg_check = compound.to_lowercase();
+    let in_negated_clause = _q_lc_for_neg.contains(&format!("without {}", lc_neg_check))
+        || _q_lc_for_neg.contains(&format!("not {}", lc_neg_check))
+        || _q_lc_for_neg.contains(&format!("with no {}", lc_neg_check));
+    if in_negated_clause
+        && !EXCLUSION_GRAMMAR_NOISE.contains(&lc_neg_check.as_str())
+        && !is_manner_phrase(compound)
+    {
+        return true;
+    }
     let lc = compound.to_lowercase();
     // D2 (2026-08-19): the bare token "pay"/"paying" is ambiguous. If the query
     // context shows a MANNER object ("pay attention", "pay respect"), it is a
@@ -10616,6 +10630,38 @@ fn merge_local_and_web(
     let superlative_terms: &[&str] = &["best", "top", "greatest", "cheapest", "finest"];
     let query_has_superlative = q_words.iter().any(|w| superlative_terms.contains(&w.to_lowercase().as_str()));
 
+    // Comparison-entity constraint gate (FIX-IF-BACKFILL-14): when a query
+    // compares two entities ("violin or clarinet", "X vs Y"), results that
+    // mention only ONE of the compared entities (e.g. stock-photo "violin
+    // background" pages) are weak/partial matches and must be dampened so
+    // pages mentioning BOTH entities (comparison articles) outrank them.
+    let comparison_entities: Vec<String> = {
+        let q = query.to_lowercase();
+        let mut split_parts: Vec<&str> = Vec::new();
+        for sep in [" vs ", " versus ", " or "] {
+            if q.contains(sep) {
+                split_parts = q.split(sep).collect();
+                break;
+            }
+        }
+        let mut ents = Vec::new();
+        if split_parts.len() >= 2 {
+            for part in split_parts.iter() {
+                // take last content word of each side as the entity
+                let words: Vec<&str> = part.split_whitespace().collect();
+                for w in words.iter().rev() {
+                    let w = w.trim_matches(|c: char| !c.is_alphanumeric());
+                    if w.len() >= 3 && !stop_words.contains(w) {
+                        ents.push(w.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        ents
+    };
+    let is_comparison_query = comparison_entities.len() >= 2;
+
     let mut relevance_vec: Vec<f32> = Vec::with_capacity(merged.len());
 
     for r in merged.iter_mut() {
@@ -10809,7 +10855,14 @@ fn merge_local_and_web(
             // drops to at most ~0.45 of its token-overlap relevance; full phrase coverage
             // keeps it intact. This lets "Why Is the Sky Blue?" (title has the phrase) rank
             // above "Sky Blue Credit" (no contiguous phrase), purely from structure.
-            relevance *= 0.45 + 0.55 * phrase_ratio;
+            // Stronger crush when a result matches NO contiguous phrase entity at all:
+            // off-topic dictionary/how-to pages (e.g. "How - Wikipedia") that share
+            // only scattered tokens should sink well below genuine multi-phrase matches.
+            if phrase_ratio == 0.0 {
+                relevance *= 0.10;
+            } else {
+                relevance *= 0.45 + 0.55 * phrase_ratio;
+            }
         }
 
         // ── Administrative & Sitemap Demotion ──
@@ -10826,6 +10879,24 @@ fn merge_local_and_web(
         let query_wants_sitemap = clean_query.to_lowercase().contains("sitemap");
         if is_sitemap_page && !query_wants_sitemap {
             relevance *= 0.05;
+        }
+
+        // ── Wikipedia Meta-Page / Namespace Demotion ──
+        // Wikipedia "Help:"/"Special:" namespace pages and meta-pages whose titles contain
+        // "recent changes" (e.g. "Help:Recent changes - Wikipedia", "MediaWiki Recent changes")
+        // are lexical traps: they match query tokens like "recent changes" but contain no
+        // substantive answer. Suppress them unless the user explicitly searched for them.
+        let is_wiki_meta_page = title_lower.starts_with("help:")
+            || title_lower.starts_with("special:")
+            || title_lower.starts_with("media:")
+            || title_lower.contains("recent changes")
+            || url_lower.contains("/wiki/help:")
+            || url_lower.contains("/wiki/special:")
+            || url_lower.contains("/wiki/media:");
+        let query_wants_wiki_meta = clean_query.to_lowercase().contains("recent changes")
+            && (clean_query.to_lowercase().contains("wikipedia") || clean_query.to_lowercase().contains("mediawiki") || clean_query.to_lowercase().contains("help:"));
+        if is_wiki_meta_page && !query_wants_wiki_meta {
+            relevance *= 0.02;
         }
 
         // ── Brand / Commercial Category Collision Detector ──
@@ -11976,8 +12047,20 @@ fn merge_local_and_web(
             1.0
         };
 
+        // Comparison-entity constraint gate (FIX-IF-BACKFILL-14): dampen
+        // results that mention only a subset of the compared entities.
+        let mut relevance = relevance;
+        if is_comparison_query {
+            let mentioned = comparison_entities.iter().filter(|e| {
+                title_lower.contains(e.as_str()) || content_lower.contains(e.as_str()) || url_lower.contains(e.as_str())
+            }).count();
+            if mentioned < comparison_entities.len() {
+                relevance *= 0.35;
+            }
+        }
+
         let p2d_mult = if p2d_offtopic { 0.05 } else { 1.0 };
-        r.score = base * c_score * generic_penalty * relevance_factor * relevance_mult * video_mult * audio_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * negation_exclusion_penalty;
+        r.score = base * c_score * generic_penalty * relevance_factor * relevance.clamp(0.005, 1.0) * video_mult * audio_mult * lang_mismatch_mult * cross_loc_mult * engine_trust_mult * vendor_affiliate_final_mult * p2d_mult * negation_exclusion_penalty;
         // Capture the D4 per-engine trust multiplier on the result so tests/operators
         // can observe whether this result was trust-crushed (see engine_trust_mult field).
         r.engine_trust_mult = engine_trust_mult;
