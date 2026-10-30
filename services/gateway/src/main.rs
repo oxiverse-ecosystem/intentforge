@@ -8033,7 +8033,30 @@ const COUNTRY_DEMONYMS: &[&str] = &[
     "australian", "australia",
 ];
 
-/// D3: precise manner-frame detection at the PHRASE level (not the bare-token
+/// OBJECT_NOUNS (FIX-IF-03): concrete object nouns that are genuine content
+/// exclusions when negated ("cook salmon without oven or microwave").
+const OBJECT_NOUNS: &[&str] = &[
+    "oven", "microwave", "stove", "grill", "toaster", "blender", "mixer",
+    "pan", "pot", "skillet", "wok", "fridge", "refrigerator", "freezer",
+    "dishwasher", "dryer", "washer", "computer", "laptop", "phone", "tablet",
+    "keyboard", "mouse", "monitor", "camera", "printer", "router", "modem",
+    "speaker", "car", "bike", "bicycle", "motorcycle", "truck", "van",
+    "boat", "plane", "train", "bus", "taxi", "knife", "fork", "spoon",
+    "plate", "bowl", "cup", "glass", "mug", "table", "chair", "desk", "bed",
+    "sofa", "couch", "lamp", "shelf", "door", "window", "wall", "floor",
+    "ceiling", "roof", "hammer", "screwdriver", "wrench", "drill", "saw",
+    "pliers", "nail", "screw", "bolt", "nut", "brush", "comb", "scissors",
+    "razor", "toothbrush", "umbrella", "backpack", "suitcase", "wallet",
+    "purse", "bag", "watch", "clock", "timer", "scale", "thermometer",
+    "fan", "heater", "ac", "humidifier", "dehumidifier", "vacuum", "broom",
+    "mop", "bucket", "sponge", "iron", "board", "hanger", "rack", "hook",
+    "bottle", "jar", "can", "tin", "box", "container", "basket", "pen",
+    "pencil", "marker", "eraser", "ruler", "notebook", "guitar", "piano",
+    "drum", "violin", "flute", "trumpet", "ball", "bat", "racket", "net",
+    "goal", "hoop",
+];
+
+/// D3: precise manner-frame detection at the PHRASE level (not the bare-token'''
 /// level that `is_manner_phrase` uses). A declined candidate is a manner
 /// qualifier when it appears inside a "without/with-no <optional article> <term>"
 /// frame, or carries a manner pronoun (e.g. "does not track you as"). These
@@ -8326,6 +8349,12 @@ fn is_real_exclusion(
     // literal, so excluding "made in china" / "american cloud" etc. all work.
     if COUNTRY_DEMONYMS.contains(&lc.as_str())
         || tokens.iter().any(|t| COUNTRY_DEMONYMS.contains(t))
+    {
+        return true;
+    }
+    // FIX-IF-03: concrete object nouns as real exclusions
+    if OBJECT_NOUNS.contains(&lc.as_str())
+        || tokens.iter().any(|t| OBJECT_NOUNS.contains(t))
     {
         return true;
     }
@@ -12044,6 +12073,18 @@ fn merge_local_and_web(
             if mentioned < comparison_entities.len() {
                 relevance *= 0.35;
             }
+            // Content-type penalty (FIX-IF-04): demote image/gallery/stock-photo
+            // pages on comparison queries so comparison articles outrank them.
+            let url_lc = r.url.to_lowercase();
+            let is_image_page = url_lc.contains("stock") || url_lc.contains("gallery")
+                || url_lc.contains("/image") || url_lc.contains("photo")
+                || url_lc.contains("wallpaper") || url_lc.contains("background");
+            let title_lc = title_lower.clone();
+            let title_imagey = title_lc.contains("background") || title_lc.contains("wallpaper")
+                || title_lc.contains("stock photo") || title_lc.contains("image");
+            if is_image_page || title_imagey {
+                relevance *= 0.2;
+            }
         }
 
         let p2d_mult = if p2d_offtopic { 0.05 } else { 1.0 };
@@ -14133,33 +14174,14 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    // Stage 2: local-intent fallback (mirrors /search's "near me" default).
-    if local_intent {
-        return GeolocateResponse {
-            query: q.to_string(),
-            resolved: Some(geoloc::GeoLocation {
-                country_code: Some("IN".to_string()),
-                country_name: Some("India".to_string()),
-                region: None,
-                city: None,
-                postal_code: None,
-                latitude: None,
-                longitude: None,
-                time_zone: None,
-            }),
-            source: "local_intent_fallback".to_string(),
-            explicit_location: false,
-            local_intent: true,
-        };
-    }
-
-    // No signal at all.
+    // FIX-IF-01: no fabricated fallback. Leave resolved = None when there is
+    // no explicit place and no IP-derived geolocation.
     GeolocateResponse {
         query: q.to_string(),
         resolved: None,
         source: "none".to_string(),
         explicit_location: false,
-        local_intent: false,
+        local_intent,
     }
 }
 
@@ -15322,27 +15344,10 @@ async fn handle_search(
         None => geo_location,
     };
 
-    // M3 fix: fallback location for loopback/private IP or missing geo DB when query has local intent ("near me")
-    if geo_location.is_none() && has_local_intent(&q) {
-        // COUNTRY-LEVEL fallback only (no city). A city-level default is a
-        // fabricated requirement: it gets injected into `positive` and the
-        // cross-location gate, so "nearby restaurants" demanded a page mention
-        // "New York" — the wrong region for a user in India. Country-level is
-        // the correct granularity for a location we could not resolve: it
-        // scopes the upstream query (`source_country`) without inventing a
-        // place the user never named.
-        geo_location = Some(geoloc::GeoLocation {
-            country_code: Some("IN".to_string()),
-            country_name: Some("India".to_string()),
-            region: None,
-            city: None,
-            postal_code: None,
-            latitude: None,
-            longitude: None,
-            time_zone: None,
-        });
-        tracing::info!("GEO: local intent detected, applied country-level geolocation fallback (IN) — no city invented");
-    }
+    // FIX-IF-01: never fabricate a location. When there is no explicit place in
+    // the query and no IP-derived geolocation, leave geo_location = None. A
+    // fabricated country/city was previously injected into `positive` and the
+    // upstream query, producing wrong-region results for users outside it.
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
     // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
@@ -17423,6 +17428,20 @@ async fn handle_search(
     let dated_result_count = web_results.iter().filter(|r| {
         resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content).is_some()
     }).count();
+    // FIX-IF-02: apply the hard recency window ONLY when at least one merged
+    // web result carries a parseable date. Otherwise keep recency as a scoring
+    // boost only (fail-open) — a zero-width 'today' window combined with
+    // fabricated URL-year dates would otherwise delete every result.
+    if dated_result_count == 0
+        && (intent.structured_constraints.after_date.is_some()
+            || intent.structured_constraints.before_date.is_some())
+    {
+        tracing::info!(
+            "FIX-IF-02: no merged web result carries a parseable date (dated_result_count=0) — clearing hard recency window (recency stays scoring-only)"
+        );
+        intent.structured_constraints.after_date = None;
+        intent.structured_constraints.before_date = None;
+    }
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
 
     // FRESH/date fail-open (prevents 0-result collapse): the FRESH OVERRIDE may have
