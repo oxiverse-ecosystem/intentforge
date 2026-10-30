@@ -4511,7 +4511,7 @@ async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> 
 /// applied at the `commerce_fetch_budget` site, so hanging merchants ran for
 /// the full remaining wall (~22s) per pass — 44.94s total across the two
 /// passes. This is the single source of truth for the per-fetch ceiling.
-const COMMERCE_PER_FETCH_CAP_SECS: u64 = 2;
+const COMMERCE_PER_FETCH_CAP_SECS: u64 = 1;
 
 fn commerce_fetch_budget(
     remaining_wall: std::time::Duration,
@@ -4893,7 +4893,7 @@ const MAX_PARALLEL_FETCH: usize = 4;
 /// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
 /// This is now only the CEILING for `commerce_wall_for_elapsed`, never the value
 /// used unconditionally — see that function for why a flat cap is unsafe.
-const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 6;
+const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 2;
 
 /// The global request budget enforced by the `TimeoutLayer` wrapped around the
 /// router (see the `.layer(TimeoutLayer::new(...))` call). Kept as a named
@@ -4907,7 +4907,7 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// response serialization, and the network hop. Enrichment is a progressive
 /// enhancement — the ranked results are already correct without it — so when
 /// the budget is tight the honest outcome is fewer facts, never a 408.
-const ENRICHMENT_HEADROOM_SECS: u64 = 6;
+const ENRICHMENT_HEADROOM_SECS: u64 = 3;
 
 /// Derive the wall-clock budget available to commerce enrichment from the time
 /// ALREADY spent on this request.
@@ -18728,6 +18728,16 @@ let mut results = match tokio::task::spawn_blocking(move || {
     }
     if let Some(ref bd) = intent.structured_constraints.before_date {
         flat_constraints.push(format!("+before:{}", bd));
+    }
+    // Surface the price bound in the flat `constraints` list so callers can see it
+    // (not just in structured_constraints / applied_constraints). Previously the
+    // `under 50000` bound was parsed into price_lt/price_max and applied_constraints
+    // but never appeared in `constraints`, making it look like no price constraint.
+    if let Some(v) = intent.structured_constraints.price_lt {
+        flat_constraints.push(format!("price:<{}", v));
+    }
+    if let Some(v) = intent.structured_constraints.price_gt {
+        flat_constraints.push(format!("price:>{}", v));
     }
 
     // Renormalize distribution before returning
