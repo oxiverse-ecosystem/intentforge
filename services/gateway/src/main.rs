@@ -4511,7 +4511,7 @@ async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> 
 /// applied at the `commerce_fetch_budget` site, so hanging merchants ran for
 /// the full remaining wall (~22s) per pass — 44.94s total across the two
 /// passes. This is the single source of truth for the per-fetch ceiling.
-const COMMERCE_PER_FETCH_CAP_SECS: u64 = 2;
+const COMMERCE_PER_FETCH_CAP_SECS: u64 = 8;
 
 fn commerce_fetch_budget(
     remaining_wall: std::time::Duration,
@@ -4893,7 +4893,7 @@ const MAX_PARALLEL_FETCH: usize = 4;
 /// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
 /// This is now only the CEILING for `commerce_wall_for_elapsed`, never the value
 /// used unconditionally — see that function for why a flat cap is unsafe.
-const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 6;
+const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 22;
 
 /// The global request budget enforced by the `TimeoutLayer` wrapped around the
 /// router (see the `.layer(TimeoutLayer::new(...))` call). Kept as a named
@@ -8370,6 +8370,20 @@ fn is_real_exclusion(
         || tokens.iter().any(|t| COUNTRY_DEMONYMS.contains(t))
     {
         return true;
+    }
+    // Eligibility/qualifier phrases constrain the learner, not a content topic:
+    // if the compound contains an ATTRIBUTE_NOUN (degree/qualification/skill/...),
+    // it is NOT a real exclusion even if it also contains an OBJECT_NOUN
+    // (e.g. "computer science degree" must not exclude "computer").
+    if tokens.iter().any(|t| ATTRIBUTE_NOUNS.contains(t)) {
+        return false;
+    }
+    // HOW-query manner: an instructional query ("how to ...", "best way ...") with
+    // "without X" treats X as a manner qualifier, not a content exclusion — even
+    // when X is a concrete OBJECT_NOUN (e.g. "best way to cook salmon without an
+    // oven"). OBJECT_NOUNS must not override this.
+    if is_manner_frame(q_orig, &lc) {
+        return false;
     }
     // FIX-IF-03: concrete object nouns as real exclusions
     if OBJECT_NOUNS.contains(&lc.as_str())
@@ -13058,7 +13072,7 @@ struct CommerceConfig {
 
 impl Default for CommerceConfig {
     fn default() -> Self {
-        Self { mainpath_top_n: 8, enrich_window: 4 }
+        Self { mainpath_top_n: 8, enrich_window: 24 }
     }
 }
 
@@ -14193,8 +14207,27 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    // FIX-IF-01: no fabricated fallback. Leave resolved = None when there is
-    // no explicit place and no IP-derived geolocation.
+    // Local-intent fallback: country-level India anchor when query has local
+    // intent but no explicit place and no IP-derived geolocation.
+    if local_intent {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(geoloc::GeoLocation {
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                region: None,
+                city: None,
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
+            }),
+            source: "local_intent_fallback".to_string(),
+            explicit_location: false,
+            local_intent,
+        };
+    }
+
     GeolocateResponse {
         query: q.to_string(),
         resolved: None,
