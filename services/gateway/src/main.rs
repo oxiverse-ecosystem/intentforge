@@ -8301,20 +8301,6 @@ fn is_real_exclusion(
     if is_manner_phrase(compound) {
         return false;
     }
-    // FIX-IF-BACKFILL-15: any noun appearing in a negated clause ("without X",
-    // "not X", "with no X") is a real exclusion regardless of generic-ness,
-    // unless it is a stopword/function word. Inverted P9 grammar-noise gate.
-    let _q_lc_for_neg = q_orig.to_lowercase();
-    let lc_neg_check = compound.to_lowercase();
-    let in_negated_clause = _q_lc_for_neg.contains(&format!("without {}", lc_neg_check))
-        || _q_lc_for_neg.contains(&format!("not {}", lc_neg_check))
-        || _q_lc_for_neg.contains(&format!("with no {}", lc_neg_check));
-    if in_negated_clause
-        && !EXCLUSION_GRAMMAR_NOISE.contains(&lc_neg_check.as_str())
-        && !is_manner_phrase(compound)
-    {
-        return true;
-    }
     let lc = compound.to_lowercase();
     // D2 (2026-08-19): the bare token "pay"/"paying" is ambiguous. If the query
     // context shows a MANNER object ("pay attention", "pay respect"), it is a
