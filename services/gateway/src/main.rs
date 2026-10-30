@@ -8353,8 +8353,20 @@ fn is_real_exclusion(
         return true;
     }
     // FIX-IF-03: concrete object nouns as real exclusions
-    if OBJECT_NOUNS.contains(&lc.as_str())
-        || tokens.iter().any(|t| OBJECT_NOUNS.contains(t))
+    // Guard: if an ATTRIBUTE_NOUN is present (degree/qualification/skill/...),
+    // this is an eligibility qualifier constraining the learner, not a content
+    // topic — decline promotion even when an object noun (e.g. "computer") is
+    // also present. Also decline on how-to/manner queries (e.g. "cook salmon
+    // without an oven") where the object is a manner qualifier, not a filter.
+    let q_lc_for_obj = q_orig.to_lowercase();
+    let is_howto = q_lc_for_obj.contains("how to") || q_lc_for_obj.contains("how do")
+        || q_lc_for_obj.contains("how can") || q_lc_for_obj.contains("ways to")
+        || q_lc_for_obj.contains("best way") || q_lc_for_obj.contains("tips for")
+        || q_lc_for_obj.contains("guide to") || q_lc_for_obj.contains("how to learn");
+    if (OBJECT_NOUNS.contains(&lc.as_str())
+        || tokens.iter().any(|t| OBJECT_NOUNS.contains(t)))
+        && !ATTRIBUTE_NOUNS.iter().any(|a| tokens.contains(&a))
+        && !is_howto
     {
         return true;
     }
@@ -14172,6 +14184,27 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
                 local_intent,
             };
         }
+    }
+
+    // Local-intent fallback: "near me"/"nearby" queries with no explicit place
+    // and no IP resolve to a country-level default (India) — never a city.
+    if local_intent {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(geoloc::GeoLocation {
+                city: None,
+                region: None,
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
+            }),
+            source: "local_intent_fallback".to_string(),
+            explicit_location: false,
+            local_intent,
+        };
     }
 
     // FIX-IF-01: no fabricated fallback. Leave resolved = None when there is
