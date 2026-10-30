@@ -16580,6 +16580,27 @@ async fn handle_search(
         }
     }
 
+    // FIX-IF-06: multi-constraint transactional queries often yield thin recall
+    // upstream. Add a broader fallback expanded query that drops the least-specific
+    // trailing constraint (e.g. "7 day battery") so a simplified upstream fetch
+    // can backfill results. Only for transactional intent with >=3 constraint-ish
+    // tokens; never hardcodes query-specific literals.
+    if intent.intent == "transactional" {
+        let tokens: Vec<&str> = q.split_whitespace().collect();
+        if tokens.len() >= 6 {
+            // Drop the last 3 tokens as the least-specific trailing clause.
+            let simplified = tokens[..tokens.len().saturating_sub(3)].join(" ");
+            let simplified_clean = preprocess_searxng_query(&simplified);
+            if !simplified_clean.is_empty()
+                && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == simplified_clean)
+            {
+                tracing::info!(target: "expansion.debug", "FIX-IF-06 broadened expanded query: {:?}", simplified_clean);
+                let insert_pos = expanded_queries.len().min(2);
+                expanded_queries.insert(insert_pos, simplified_clean);
+            }
+        }
+    }
+
     // TODO: Secondary fan-out with expanded queries if searx_results are sparse
     // For now, scoring uses intent-based weighting on the raw query results
 
