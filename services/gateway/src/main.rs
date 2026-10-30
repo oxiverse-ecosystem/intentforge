@@ -8353,10 +8353,20 @@ fn is_real_exclusion(
         return true;
     }
     // FIX-IF-03: concrete object nouns as real exclusions
-    if OBJECT_NOUNS.contains(&lc.as_str())
-        || tokens.iter().any(|t| OBJECT_NOUNS.contains(t))
-    {
-        return true;
+    // BUT: in a manner-frame query (how-to / best way / ...), decline even
+    // concrete object nouns — they are manner qualifiers there, not exclusions.
+    let q_lc_full = q_orig.to_lowercase();
+    let manner_frame = q_lc_full.contains("how to") || q_lc_full.contains("how do")
+        || q_lc_full.contains("how can") || q_lc_full.contains("ways to")
+        || q_lc_full.contains("best way") || q_lc_full.contains("tips for")
+        || q_lc_full.contains("guide to");
+    // (also apply the attribute-noun guard from t_2600d9f6)
+    if !manner_frame && !(ATTRIBUTE_NOUNS.iter().any(|a| tokens.contains(a))) {
+        if OBJECT_NOUNS.contains(&lc.as_str())
+            || tokens.iter().any(|t| OBJECT_NOUNS.contains(t))
+        {
+            return true;
+        }
     }
     // Entity: a term in the compound is capitalized in the original query
     // (proper noun the user named, e.g. "without Samsung bloat" → Samsung).
@@ -14172,6 +14182,27 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
                 local_intent,
             };
         }
+    }
+
+    // Local-intent fallback: "near me"/"nearby" queries with no explicit place
+    // and no IP resolve to a country-level default (India) — never a city.
+    if local_intent {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(geoloc::GeoLocation {
+                city: None,
+                region: None,
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
+            }),
+            source: "local_intent_fallback".to_string(),
+            explicit_location: false,
+            local_intent,
+        };
     }
 
     // FIX-IF-01: no fabricated fallback. Leave resolved = None when there is
