@@ -10594,6 +10594,7 @@ fn merge_local_and_web(
             let lower = w.to_lowercase();
             let is_content = lower.len() >= 2
                 && !stop_words.contains(lower.as_str())
+                && !meta_action_terms.contains(lower.as_str())
                 && !lower.chars().all(|c| c.is_ascii_digit());
             if is_content {
                 run.push(lower);
