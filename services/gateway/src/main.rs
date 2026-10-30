@@ -8335,6 +8335,12 @@ fn is_real_exclusion(
     if compound == "pay" || compound == "paying" || lc == "pay" || lc == "paying" {
         return pay_exclusion_is_money(&q_orig);
     }
+    // Manner frame: "without X" inside an instructional query (e.g. "best way
+    // to cook salmon without an oven") is a HOW qualifier, not a content
+    // exclusion.
+    if is_manner_frame(q_orig, compound) {
+        return false;
+    }
     let tokens: Vec<&str> = lc.split_whitespace().collect();
     // Entity: any token (or the whole compound) is a protected brand/tech term.
     if tokens.iter().any(|t| spell::is_protected_term(t)) {
@@ -14178,6 +14184,27 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
                 local_intent,
             };
         }
+    }
+
+    // Local-intent fallback: "near me"/"nearby" queries with no explicit place
+    // and no IP resolve to a country-level default (India) — never a city.
+    if local_intent {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(geoloc::GeoLocation {
+                city: None,
+                region: None,
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
+            }),
+            source: "local_intent_fallback".to_string(),
+            explicit_location: false,
+            local_intent,
+        };
     }
 
     // FIX-IF-01: no fabricated fallback. Leave resolved = None when there is
