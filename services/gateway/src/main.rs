@@ -8458,7 +8458,7 @@ fn is_explicit_without_directive(q_orig: &str, _lc: &str, compound: &str) -> boo
     // ATTRIBUTE_NOUNS (degree/qualification/skill/...) declines e.g.
     // "computer science degree", "music background".
     let comp_tokens: Vec<&str> = comp.split_whitespace().collect();
-    if ATTRIBUTE_NOUNS.iter().any(|a| comp_tokens.contains(&a)) {
+    if ATTRIBUTE_NOUNS.iter().any(|a| comp_tokens.contains(a)) {
         return false;
     }
     // Multi-token compounds whose HEAD (first token) is a verb are predicate/manner
@@ -14193,8 +14193,27 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    // FIX-IF-01: no fabricated fallback. Leave resolved = None when there is
-    // no explicit place and no IP-derived geolocation.
+    // Local-intent fallback: country-level India anchor when query has local
+    // intent but no explicit place and no IP-derived geolocation.
+    if local_intent {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(geoloc::GeoLocation {
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                region: None,
+                city: None,
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
+            }),
+            source: "local_intent_fallback".to_string(),
+            explicit_location: false,
+            local_intent,
+        };
+    }
+
     GeolocateResponse {
         query: q.to_string(),
         resolved: None,
