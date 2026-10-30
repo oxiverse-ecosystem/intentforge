@@ -8371,6 +8371,20 @@ fn is_real_exclusion(
     {
         return true;
     }
+    // Eligibility/qualifier phrases constrain the learner, not a content topic:
+    // if the compound contains an ATTRIBUTE_NOUN (degree/qualification/skill/...),
+    // it is NOT a real exclusion even if it also contains an OBJECT_NOUN
+    // (e.g. "computer science degree" must not exclude "computer").
+    if tokens.iter().any(|t| ATTRIBUTE_NOUNS.contains(t)) {
+        return false;
+    }
+    // HOW-query manner: an instructional query ("how to ...", "best way ...") with
+    // "without X" treats X as a manner qualifier, not a content exclusion — even
+    // when X is a concrete OBJECT_NOUN (e.g. "best way to cook salmon without an
+    // oven"). OBJECT_NOUNS must not override this.
+    if is_manner_frame(q_orig, &lc) {
+        return false;
+    }
     // FIX-IF-03: concrete object nouns as real exclusions
     if OBJECT_NOUNS.contains(&lc.as_str())
         || tokens.iter().any(|t| OBJECT_NOUNS.contains(t))
