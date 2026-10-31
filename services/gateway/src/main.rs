@@ -16642,8 +16642,8 @@ async fn handle_search(
         }
     }
 
-    // TODO: Secondary fan-out with expanded queries if searx_results are sparse
-    // For now, scoring uses intent-based weighting on the raw query results
+    // Secondary fan-out with expanded queries when initial SearXNG results are sparse
+    // is implemented below (count-gated retry using needs_more_results + has_contrastive_negatives).
 
     // 4. Process Local Results
     // indexer_res is Result<Result<Vec<IndexerResult>, reqwest::Error>, JoinError>:
