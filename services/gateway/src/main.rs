@@ -2786,6 +2786,9 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         
         if is_neg {
             if !clean_p.is_empty() && clean_p.split_whitespace().count() <= 2 {
+                if is_subjective_quality_term(&clean_p) || is_exclusion_grammar_noise(&clean_p) {
+                    continue;
+                }
                 if !negative.contains(&clean_p) {
                     negative.push(clean_p);
                 }
@@ -8362,21 +8365,25 @@ fn is_real_exclusion(
     {
         return true;
     }
-    // FIX-IF-03: concrete object nouns as real exclusions
-    // BUT: in a manner-frame query (how-to / best way / ...), decline even
-    // concrete object nouns — they are manner qualifiers there, not exclusions.
+    // FIX-IF-03: any concrete content noun is a real exclusion when negated
+    // ("cook salmon without oven or microwave"). We no longer gate on a
+    // hardcoded OBJECT_NOUNS list — that list can never be exhaustive and
+    // violates the no-hardcoding doctrine. Instead, after the manner-frame,
+    // attribute-noun, verb-attribute, subjective-quality, and grammar-noise
+    // guards have all declined, ANY remaining term is treated as a genuine
+    // topical exclusion. This covers all nouns generically.
     let q_lc_full = q_orig.to_lowercase();
     let manner_frame = q_lc_full.contains("how to") || q_lc_full.contains("how do")
         || q_lc_full.contains("how can") || q_lc_full.contains("ways to")
         || q_lc_full.contains("best way") || q_lc_full.contains("tips for")
         || q_lc_full.contains("guide to");
-    // (also apply the attribute-noun guard from t_2600d9f6)
-    if !manner_frame && !(ATTRIBUTE_NOUNS.iter().any(|a| tokens.contains(a))) {
-        if OBJECT_NOUNS.contains(&lc.as_str())
-            || tokens.iter().any(|t| OBJECT_NOUNS.contains(t))
-        {
-            return true;
-        }
+    if !manner_frame
+        && !(ATTRIBUTE_NOUNS.iter().any(|a| tokens.contains(a)))
+        && !is_subjective_quality_term(&lc)
+        && !is_verb_attribute_exclusion(&lc)
+        && !is_exclusion_grammar_noise(&lc)
+    {
+        return true;
     }
     // Entity: a term in the compound is capitalized in the original query
     // (proper noun the user named, e.g. "without Samsung bloat" → Samsung).
@@ -14194,28 +14201,7 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    // Local-intent fallback: "near me"/"nearby" queries with no explicit place
-    // and no IP resolve to a country-level default (India) — never a city.
-    if local_intent {
-        return GeolocateResponse {
-            query: q.to_string(),
-            resolved: Some(geoloc::GeoLocation {
-                city: None,
-                region: None,
-                country_code: Some("IN".to_string()),
-                country_name: Some("India".to_string()),
-                postal_code: None,
-                latitude: None,
-                longitude: None,
-                time_zone: None,
-            }),
-            source: "local_intent_fallback".to_string(),
-            explicit_location: false,
-            local_intent,
-        };
-    }
-
-    // FIX-IF-01: no fabricated fallback. Leave resolved = None when there is
+    // FIX-IF-01: never fabricate a location. Leave resolved = None when there is
     // no explicit place and no IP-derived geolocation.
     GeolocateResponse {
         query: q.to_string(),
@@ -18048,6 +18034,11 @@ async fn handle_search(
         // experience" become hard content filters and collapse the result set.
         .filter(|t| !is_manner_frame(&q_orig, t))
         .filter(|t| !is_verb_attribute_exclusion(t)) // V1: drop verb-led/attribute exclusions
+        // P9 (2026-10-31): route engine Exclusion entities through the same
+        // is_real_exclusion gate as gateway-derived negatives, so a negated
+        // country-of-origin demonym ("chinese") is honored even without
+        // contrastive framing.
+        .filter(|t| is_real_exclusion(t, &q_orig, query_contrastive))
         .filter(|t| {
             // D2 (2026-08-19): a bare "pay"/"paying" engine Exclusion is only a
             // manner false-positive when the query context says so. "pay attention"
