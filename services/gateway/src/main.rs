@@ -2786,6 +2786,9 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
         
         if is_neg {
             if !clean_p.is_empty() && clean_p.split_whitespace().count() <= 2 {
+                if is_subjective_quality_term(&clean_p) || is_exclusion_grammar_noise(&clean_p) {
+                    continue;
+                }
                 if !negative.contains(&clean_p) {
                     negative.push(clean_p);
                 }
@@ -5821,19 +5824,28 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     // and the spurious price bound dropped relevant results (round 2026-08-15).
     // General, unit-aware — no per-query literals.
     // Inspect only the immediate token following the number, not the entire rest.
-    let distance_units = [
+    let non_price_units = [
         "km", "kms", "kilometer", "kilometers", "kilometre", "kilometres",
         "mile", "miles", "mi", "meter", "meters", "metre", "metres",
         "foot", "feet", "ft", "yard", "yards", "yd",
+        // Mass units: a number followed by one of these is a WEIGHT bound
+        // (e.g. "under 2 kilograms", "below 500 grams"), NOT a price.
+        // Without this guard, "under 2 kilograms" was mis-read as price:<2
+        // (round 2026-11-01, IF-05).
+        "kg", "kgs", "kilogram", "kilograms", "kilogramme", "kilogrammes",
+        "g", "gs", "gram", "grams", "gramme", "grammes",
+        "lb", "lbs", "pound", "pounds",
+        "oz", "ounce", "ounces",
+        "ton", "tons", "tonne", "tonnes",
     ];
-    let is_distance_bound = |rest_after_num: &str| -> bool {
+    let is_non_price_bound = |rest_after_num: &str| -> bool {
         // Extract the next token after optional whitespace
         let next_token = rest_after_num.trim_start()
             .split(|c: char| !c.is_alphanumeric())
             .next()
             .unwrap_or("");
         let next_token_lower = next_token.to_lowercase();
-        distance_units.iter().any(|u| next_token_lower == *u)
+        non_price_units.iter().any(|u| next_token_lower == *u)
     };
     /// Check if the token immediately after the number is an Indian unit
     /// (lakh/lakhs/crore/crores). Returns the multiplier if found.
@@ -5866,7 +5878,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         // price marker, if any, match instead).
                         // NOTE: check the text AFTER the number, not `rest`
                         // (which still contains the number itself).
-                        if is_distance_bound(after_num) {
+                        if is_non_price_bound(after_num) {
                             continue;
                         }
                         let multiplier = get_indian_multiplier(after_num).unwrap_or(1.0);
@@ -5906,7 +5918,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                 // Distance-bound guard (see Pattern A): a currency-symbol amount
                 // followed by a distance unit is not a price.
                 let after_num = &lower[caps.get(2).unwrap().end()..];
-                if is_distance_bound(after_num) {
+                if is_non_price_bound(after_num) {
                     // fall through; do not return a price bound
                 } else {
                     return Some((v, normalize_currency_str(cur.as_str())));
@@ -5922,7 +5934,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                 // Distance-bound guard (see Pattern A): number + currency word +
                 // marker, where a distance unit follows, is a range not a price.
                 let after_num = &lower[caps.get(1).unwrap().end()..];
-                if is_distance_bound(after_num) {
+                if is_non_price_bound(after_num) {
                     // fall through; do not return a price bound
                 } else {
                     return Some((v, normalize_currency_str(cur.as_str())));
@@ -7969,22 +7981,26 @@ fn is_verb_attribute_exclusion(term: &str) -> bool {
         "replaceing", "charge", "charging", "harm", "harming", "damage", "damaging",
         "burn", "burning", "fire", "cost", "costs", "spend", "spending", "pay", "pays",
         "paying", "register", "registering", "download", "downloading", "install",
-        "installing", "sign", "signing", "subscribe", "subscribing", "login",
+        "installing", "installed", "sign", "signing", "subscribe", "subscribing", "login",
         "cook", "cooking", "drive", "driving", "travel", "travelling", "traveling",
         "learn", "learning", "work", "working", "study", "studying", "read", "reading",
+        "rate", "rated", "rating", "rates",
+        "spin", "spinning", "spins",
+        "latch", "latches", "latching",
     ];
     let tokens: Vec<&str> = lc.split_whitespace().collect();
     if tokens.is_empty() {
         return true;
     }
-    // Reject if EVERY token is a verb/attribute head or a filler — i.e. the whole
-    // extracted exclusion describes an action/trait, not a named topic.
-    tokens.iter().all(|t| {
-        MANNER_VERBS.contains(t)
-            || VERB_HEADS.contains(t)
-            || ATTRIBUTE_NOUNS.contains(t)
-            || MANNER_PRONOUNS.contains(t)
-    })
+    // Reject if the HEAD token is a verb/attribute head or a filler — i.e. the
+    // extracted exclusion describes an action/trait, not a named topic. Only the
+    // head matters: "rated r" is declined because "rated" is a verb head even
+    // though "r" is not in any seed list.
+    let head = tokens[0];
+    MANNER_VERBS.contains(&head)
+        || VERB_HEADS.contains(&head)
+        || ATTRIBUTE_NOUNS.contains(&head)
+        || MANNER_PRONOUNS.contains(&head)
 }
 
 
@@ -8362,21 +8378,33 @@ fn is_real_exclusion(
     {
         return true;
     }
-    // FIX-IF-03: concrete object nouns as real exclusions
-    // BUT: in a manner-frame query (how-to / best way / ...), decline even
-    // concrete object nouns — they are manner qualifiers there, not exclusions.
+    // FIX-IF-03: any concrete content noun is a real exclusion when negated
+    // ("cook salmon without oven or microwave"). We no longer gate on a
+    // hardcoded OBJECT_NOUNS list — that list can never be exhaustive and
+    // violates the no-hardcoding doctrine. Instead, after the manner-frame,
+    // attribute-noun, verb-attribute, subjective-quality, and grammar-noise
+    // guards have all declined, ANY remaining term is treated as a genuine
+    // topical exclusion. This covers all nouns generically.
+    // Preposition-mediated negations ("not in X", "not about X", "not rated X")
+    // describe a property/filter of the subject, not a topical exclusion — decline.
+    let q_lc_full_lower = q_orig.to_lowercase();
+    if q_lc_full_lower.contains(" not in ")
+        || q_lc_full_lower.contains(" not about ")
+        || q_lc_full_lower.contains(" not rated ") {
+        return false;
+    }
     let q_lc_full = q_orig.to_lowercase();
     let manner_frame = q_lc_full.contains("how to") || q_lc_full.contains("how do")
         || q_lc_full.contains("how can") || q_lc_full.contains("ways to")
         || q_lc_full.contains("best way") || q_lc_full.contains("tips for")
         || q_lc_full.contains("guide to");
-    // (also apply the attribute-noun guard from t_2600d9f6)
-    if !manner_frame && !(ATTRIBUTE_NOUNS.iter().any(|a| tokens.contains(a))) {
-        if OBJECT_NOUNS.contains(&lc.as_str())
-            || tokens.iter().any(|t| OBJECT_NOUNS.contains(t))
-        {
-            return true;
-        }
+    if !manner_frame
+        && !(ATTRIBUTE_NOUNS.iter().any(|a| tokens.contains(a)))
+        && !is_subjective_quality_term(&lc)
+        && !is_verb_attribute_exclusion(&lc)
+        && !is_exclusion_grammar_noise(&lc)
+    {
+        return true;
     }
     // Entity: a term in the compound is capitalized in the original query
     // (proper noun the user named, e.g. "without Samsung bloat" → Samsung).
@@ -9442,6 +9470,15 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
             // A new clause begins: the negation scope is over. This word is a
             // boundary word itself (kept as ordinary structure, not topic), and
             // everything AFTER it is back in normal scope.
+            // P11-style how-to tail preservation: a how-to phrase after a
+            // negation clause ("... without X how to Y") must NOT be swallowed
+            // by the negation scope — keep the how-to tail as the main query
+            // intent. Treat "how"/"to" as clause boundaries that are KEPT.
+            if w_lower == "how" || w_lower == "to" {
+                in_negation = false;
+                result.push(w);
+                continue;
+            }
             if clause_boundary.contains(w_lower.as_str()) {
                 in_negation = false;
                 continue; // boundary word itself is not topical content
@@ -14194,8 +14231,8 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    // Local-intent fallback: "near me"/"nearby" queries with no explicit place
-    // and no IP resolve to a country-level default (India) — never a city.
+    // Local-intent fallback: when the query has local intent and no explicit
+    // place or IP-derived geolocation, anchor to country-level India.
     if local_intent {
         return GeolocateResponse {
             query: q.to_string(),
@@ -14204,10 +14241,10 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
                 region: None,
                 country_code: Some("IN".to_string()),
                 country_name: Some("India".to_string()),
-                postal_code: None,
                 latitude: None,
                 longitude: None,
                 time_zone: None,
+                postal_code: None,
             }),
             source: "local_intent_fallback".to_string(),
             explicit_location: false,
@@ -14215,7 +14252,7 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         };
     }
 
-    // FIX-IF-01: no fabricated fallback. Leave resolved = None when there is
+    // FIX-IF-01: never fabricate a location. Leave resolved = None when there is
     // no explicit place and no IP-derived geolocation.
     GeolocateResponse {
         query: q.to_string(),
@@ -16627,20 +16664,39 @@ async fn handle_search(
     // can backfill results. Only for transactional intent with >=3 constraint-ish
     // tokens; never hardcodes query-specific literals.
     if intent.intent == "transactional" {
-        let tokens: Vec<&str> = q.split_whitespace().collect();
-        if tokens.len() >= 6 {
-            // Drop the last 3 tokens as the least-specific trailing clause.
-            let simplified = tokens[..tokens.len().saturating_sub(3)].join(" ");
-            let simplified_clean = preprocess_searxng_query(&simplified);
-            if !simplified_clean.is_empty()
-                && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == simplified_clean)
-            {
-                tracing::info!(target: "expansion.debug", "FIX-IF-06 broadened expanded query: {:?}", simplified_clean);
-                let insert_pos = expanded_queries.len().min(2);
-                expanded_queries.insert(insert_pos, simplified_clean);
+            let tokens: Vec<&str> = q.split_whitespace().collect();
+            if tokens.len() >= 6 {
+                // Progressive broadening: drop trailing constraint clauses in
+                // increasing chunks so at least one upstream fetch is likely to
+                // return candidates even when the full constrained query is too
+                // specific. Never hardcodes query-specific literals.
+                for drop in [3usize, 6usize] {
+                    if tokens.len() <= drop + 2 {
+                        continue;
+                    }
+                    let simplified = tokens[..tokens.len().saturating_sub(drop)].join(" ");
+                    let simplified_clean = preprocess_searxng_query(&simplified);
+                    if !simplified_clean.is_empty()
+                        && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == simplified_clean)
+                    {
+                        tracing::info!(target: "expansion.debug", "FIX-IF-06 broadened expanded query (drop {}): {:?}", drop, simplified_clean);
+                        let insert_pos = expanded_queries.len().min(2);
+                        expanded_queries.insert(insert_pos, simplified_clean);
+                    }
+                }
+                // Core-only fallback: keep just the leading product noun phrase
+                // (first two tokens) so a generic candidate set can backfill.
+                let core = tokens[..2.min(tokens.len())].join(" ");
+                let core_clean = preprocess_searxng_query(&core);
+                if core.len() >= 4
+                    && !core_clean.is_empty()
+                    && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == core_clean)
+                {
+                    tracing::info!(target: "expansion.debug", "FIX-IF-06 core fallback: {:?}", core_clean);
+                    expanded_queries.push(core_clean);
+                }
             }
         }
-    }
 
     // Secondary fan-out with expanded queries when initial SearXNG results are sparse
     // is implemented below (count-gated retry using needs_more_results + has_contrastive_negatives).
@@ -18048,6 +18104,11 @@ async fn handle_search(
         // experience" become hard content filters and collapse the result set.
         .filter(|t| !is_manner_frame(&q_orig, t))
         .filter(|t| !is_verb_attribute_exclusion(t)) // V1: drop verb-led/attribute exclusions
+        // P9 (2026-10-31): route engine Exclusion entities through the same
+        // is_real_exclusion gate as gateway-derived negatives, so a negated
+        // country-of-origin demonym ("chinese") is honored even without
+        // contrastive framing.
+        .filter(|t| is_real_exclusion(t, &q_orig, query_contrastive))
         .filter(|t| {
             // D2 (2026-08-19): a bare "pay"/"paying" engine Exclusion is only a
             // manner false-positive when the query context says so. "pay attention"
