@@ -7981,22 +7981,26 @@ fn is_verb_attribute_exclusion(term: &str) -> bool {
         "replaceing", "charge", "charging", "harm", "harming", "damage", "damaging",
         "burn", "burning", "fire", "cost", "costs", "spend", "spending", "pay", "pays",
         "paying", "register", "registering", "download", "downloading", "install",
-        "installing", "sign", "signing", "subscribe", "subscribing", "login",
+        "installing", "installed", "sign", "signing", "subscribe", "subscribing", "login",
         "cook", "cooking", "drive", "driving", "travel", "travelling", "traveling",
         "learn", "learning", "work", "working", "study", "studying", "read", "reading",
+        "rate", "rated", "rating", "rates",
+        "spin", "spinning", "spins",
+        "latch", "latches", "latching",
     ];
     let tokens: Vec<&str> = lc.split_whitespace().collect();
     if tokens.is_empty() {
         return true;
     }
-    // Reject if EVERY token is a verb/attribute head or a filler — i.e. the whole
-    // extracted exclusion describes an action/trait, not a named topic.
-    tokens.iter().all(|t| {
-        MANNER_VERBS.contains(t)
-            || VERB_HEADS.contains(t)
-            || ATTRIBUTE_NOUNS.contains(t)
-            || MANNER_PRONOUNS.contains(t)
-    })
+    // Reject if the HEAD token is a verb/attribute head or a filler — i.e. the
+    // extracted exclusion describes an action/trait, not a named topic. Only the
+    // head matters: "rated r" is declined because "rated" is a verb head even
+    // though "r" is not in any seed list.
+    let head = tokens[0];
+    MANNER_VERBS.contains(&head)
+        || VERB_HEADS.contains(&head)
+        || ATTRIBUTE_NOUNS.contains(&head)
+        || MANNER_PRONOUNS.contains(&head)
 }
 
 
@@ -8381,6 +8385,14 @@ fn is_real_exclusion(
     // attribute-noun, verb-attribute, subjective-quality, and grammar-noise
     // guards have all declined, ANY remaining term is treated as a genuine
     // topical exclusion. This covers all nouns generically.
+    // Preposition-mediated negations ("not in X", "not about X", "not rated X")
+    // describe a property/filter of the subject, not a topical exclusion — decline.
+    let q_lc_full_lower = q_orig.to_lowercase();
+    if q_lc_full_lower.contains(" not in ")
+        || q_lc_full_lower.contains(" not about ")
+        || q_lc_full_lower.contains(" not rated ") {
+        return false;
+    }
     let q_lc_full = q_orig.to_lowercase();
     let manner_frame = q_lc_full.contains("how to") || q_lc_full.contains("how do")
         || q_lc_full.contains("how can") || q_lc_full.contains("ways to")
@@ -9458,6 +9470,15 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
             // A new clause begins: the negation scope is over. This word is a
             // boundary word itself (kept as ordinary structure, not topic), and
             // everything AFTER it is back in normal scope.
+            // P11-style how-to tail preservation: a how-to phrase after a
+            // negation clause ("... without X how to Y") must NOT be swallowed
+            // by the negation scope — keep the how-to tail as the main query
+            // intent. Treat "how"/"to" as clause boundaries that are KEPT.
+            if w_lower == "how" || w_lower == "to" {
+                in_negation = false;
+                result.push(w);
+                continue;
+            }
             if clause_boundary.contains(w_lower.as_str()) {
                 in_negation = false;
                 continue; // boundary word itself is not topical content
@@ -14208,6 +14229,27 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
                 local_intent,
             };
         }
+    }
+
+    // Local-intent fallback: when the query has local intent and no explicit
+    // place or IP-derived geolocation, anchor to country-level India.
+    if local_intent {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(geoloc::GeoLocation {
+                city: None,
+                region: None,
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                latitude: None,
+                longitude: None,
+                time_zone: None,
+                postal_code: None,
+            }),
+            source: "local_intent_fallback".to_string(),
+            explicit_location: false,
+            local_intent,
+        };
     }
 
     // FIX-IF-01: never fabricate a location. Leave resolved = None when there is
