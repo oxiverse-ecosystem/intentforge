@@ -5824,19 +5824,28 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     // and the spurious price bound dropped relevant results (round 2026-08-15).
     // General, unit-aware — no per-query literals.
     // Inspect only the immediate token following the number, not the entire rest.
-    let distance_units = [
+    let non_price_units = [
         "km", "kms", "kilometer", "kilometers", "kilometre", "kilometres",
         "mile", "miles", "mi", "meter", "meters", "metre", "metres",
         "foot", "feet", "ft", "yard", "yards", "yd",
+        // Mass units: a number followed by one of these is a WEIGHT bound
+        // (e.g. "under 2 kilograms", "below 500 grams"), NOT a price.
+        // Without this guard, "under 2 kilograms" was mis-read as price:<2
+        // (round 2026-11-01, IF-05).
+        "kg", "kgs", "kilogram", "kilograms", "kilogramme", "kilogrammes",
+        "g", "gs", "gram", "grams", "gramme", "grammes",
+        "lb", "lbs", "pound", "pounds",
+        "oz", "ounce", "ounces",
+        "ton", "tons", "tonne", "tonnes",
     ];
-    let is_distance_bound = |rest_after_num: &str| -> bool {
+    let is_non_price_bound = |rest_after_num: &str| -> bool {
         // Extract the next token after optional whitespace
         let next_token = rest_after_num.trim_start()
             .split(|c: char| !c.is_alphanumeric())
             .next()
             .unwrap_or("");
         let next_token_lower = next_token.to_lowercase();
-        distance_units.iter().any(|u| next_token_lower == *u)
+        non_price_units.iter().any(|u| next_token_lower == *u)
     };
     /// Check if the token immediately after the number is an Indian unit
     /// (lakh/lakhs/crore/crores). Returns the multiplier if found.
@@ -5869,7 +5878,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         // price marker, if any, match instead).
                         // NOTE: check the text AFTER the number, not `rest`
                         // (which still contains the number itself).
-                        if is_distance_bound(after_num) {
+                        if is_non_price_bound(after_num) {
                             continue;
                         }
                         let multiplier = get_indian_multiplier(after_num).unwrap_or(1.0);
@@ -5909,7 +5918,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                 // Distance-bound guard (see Pattern A): a currency-symbol amount
                 // followed by a distance unit is not a price.
                 let after_num = &lower[caps.get(2).unwrap().end()..];
-                if is_distance_bound(after_num) {
+                if is_non_price_bound(after_num) {
                     // fall through; do not return a price bound
                 } else {
                     return Some((v, normalize_currency_str(cur.as_str())));
@@ -5925,7 +5934,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                 // Distance-bound guard (see Pattern A): number + currency word +
                 // marker, where a distance unit follows, is a range not a price.
                 let after_num = &lower[caps.get(1).unwrap().end()..];
-                if is_distance_bound(after_num) {
+                if is_non_price_bound(after_num) {
                     // fall through; do not return a price bound
                 } else {
                     return Some((v, normalize_currency_str(cur.as_str())));
@@ -16613,20 +16622,39 @@ async fn handle_search(
     // can backfill results. Only for transactional intent with >=3 constraint-ish
     // tokens; never hardcodes query-specific literals.
     if intent.intent == "transactional" {
-        let tokens: Vec<&str> = q.split_whitespace().collect();
-        if tokens.len() >= 6 {
-            // Drop the last 3 tokens as the least-specific trailing clause.
-            let simplified = tokens[..tokens.len().saturating_sub(3)].join(" ");
-            let simplified_clean = preprocess_searxng_query(&simplified);
-            if !simplified_clean.is_empty()
-                && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == simplified_clean)
-            {
-                tracing::info!(target: "expansion.debug", "FIX-IF-06 broadened expanded query: {:?}", simplified_clean);
-                let insert_pos = expanded_queries.len().min(2);
-                expanded_queries.insert(insert_pos, simplified_clean);
+            let tokens: Vec<&str> = q.split_whitespace().collect();
+            if tokens.len() >= 6 {
+                // Progressive broadening: drop trailing constraint clauses in
+                // increasing chunks so at least one upstream fetch is likely to
+                // return candidates even when the full constrained query is too
+                // specific. Never hardcodes query-specific literals.
+                for drop in [3usize, 6usize] {
+                    if tokens.len() <= drop + 2 {
+                        continue;
+                    }
+                    let simplified = tokens[..tokens.len().saturating_sub(drop)].join(" ");
+                    let simplified_clean = preprocess_searxng_query(&simplified);
+                    if !simplified_clean.is_empty()
+                        && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == simplified_clean)
+                    {
+                        tracing::info!(target: "expansion.debug", "FIX-IF-06 broadened expanded query (drop {}): {:?}", drop, simplified_clean);
+                        let insert_pos = expanded_queries.len().min(2);
+                        expanded_queries.insert(insert_pos, simplified_clean);
+                    }
+                }
+                // Core-only fallback: keep just the leading product noun phrase
+                // (first two tokens) so a generic candidate set can backfill.
+                let core = tokens[..2.min(tokens.len())].join(" ");
+                let core_clean = preprocess_searxng_query(&core);
+                if core.len() >= 4
+                    && !core_clean.is_empty()
+                    && !expanded_queries.iter().any(|eq| preprocess_searxng_query(eq) == core_clean)
+                {
+                    tracing::info!(target: "expansion.debug", "FIX-IF-06 core fallback: {:?}", core_clean);
+                    expanded_queries.push(core_clean);
+                }
             }
         }
-    }
 
     // TODO: Secondary fan-out with expanded queries if searx_results are sparse
     // For now, scoring uses intent-based weighting on the raw query results
