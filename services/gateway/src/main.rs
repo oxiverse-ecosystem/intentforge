@@ -7965,6 +7965,8 @@ const ATTRIBUTE_NOUNS: &[&str] = &[
     "subscription", "account", "accounts", "registration", "signup", "sign-up",
     "login", "log-in", "app", "apps", "application", "applications", "download",
     "downloading", "install", "installing", "permission", "permissions",
+    "rated", "rating", "rate", "hardcover", "paperback",
+    "installed",
 ];
 
 fn is_verb_attribute_exclusion(term: &str) -> bool {
@@ -7984,6 +7986,7 @@ fn is_verb_attribute_exclusion(term: &str) -> bool {
         "installing", "sign", "signing", "subscribe", "subscribing", "login",
         "cook", "cooking", "drive", "driving", "travel", "travelling", "traveling",
         "learn", "learning", "work", "working", "study", "studying", "read", "reading",
+        "spin", "spinning", "latch", "latching",
     ];
     let tokens: Vec<&str> = lc.split_whitespace().collect();
     if tokens.is_empty() {
@@ -8354,10 +8357,17 @@ fn is_real_exclusion(
     // We require the money sense to be signalled; otherwise a bare "pay" with no
     // monetary object still defaults to declined (the manner guard's job). This
     // keeps "without paying attention" rejected while rescuing "without paying".
-    if compound == "pay" || compound == "paying" || lc == "pay" || lc == "paying" {
+    let tokens: Vec<&str> = lc.split_whitespace().collect();
+    // D2 (2026-08-19): the bare token "pay"/"paying" is ambiguous. If the query
+    // context shows a MANNER object ("pay attention", "pay respect"), it is a
+    // manner false-positive → not a real exclusion. But a monetary object
+    // ("pay for a course", "pay a fee") is a genuine money exclusion → honor it.
+    // We require the money sense to be signalled; otherwise a bare "pay" with no
+    // monetary object still defaults to declined (the manner guard's job). This
+    // keeps "without paying attention" rejected while rescuing "without paying".
+    if tokens.iter().any(|t| *t == "pay" || *t == "paying") {
         return pay_exclusion_is_money(&q_orig);
     }
-    let tokens: Vec<&str> = lc.split_whitespace().collect();
     // Entity: any token (or the whole compound) is a protected brand/tech term.
     if tokens.iter().any(|t| spell::is_protected_term(t)) {
         return true;
@@ -8386,7 +8396,11 @@ fn is_real_exclusion(
         || q_lc_full.contains("how can") || q_lc_full.contains("ways to")
         || q_lc_full.contains("best way") || q_lc_full.contains("tips for")
         || q_lc_full.contains("guide to");
+    // Predicate/attribute negations via a preposition ("not about X", "not in X")
+    // are not topical exclusions — decline them.
+    let preposition_negation = q_lc_full.contains("not about ") || q_lc_full.contains("not in ");
     if !manner_frame
+        && !preposition_negation
         && !(ATTRIBUTE_NOUNS.iter().any(|a| tokens.contains(a)))
         && !is_subjective_quality_term(&lc)
         && !is_verb_attribute_exclusion(&lc)
@@ -14210,7 +14224,28 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    // FIX-IF-01: never fabricate a location. Leave resolved = None when there is
+    // Local-intent fallback: "near me"/"nearby" queries with no explicit place
+    // and no IP resolve to a country-level default (India) — never a city.
+    if local_intent {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(geoloc::GeoLocation {
+                city: None,
+                region: None,
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
+            }),
+            source: "local_intent_fallback".to_string(),
+            explicit_location: false,
+            local_intent,
+        };
+    }
+
+    // FIX-IF-01: no fabricated fallback. Leave resolved = None when there is
     // no explicit place and no IP-derived geolocation.
     GeolocateResponse {
         query: q.to_string(),
@@ -18062,11 +18097,6 @@ async fn handle_search(
         // experience" become hard content filters and collapse the result set.
         .filter(|t| !is_manner_frame(&q_orig, t))
         .filter(|t| !is_verb_attribute_exclusion(t)) // V1: drop verb-led/attribute exclusions
-        // P9 (2026-10-31): route engine Exclusion entities through the same
-        // is_real_exclusion gate as gateway-derived negatives, so a negated
-        // country-of-origin demonym ("chinese") is honored even without
-        // contrastive framing.
-        .filter(|t| is_real_exclusion(t, &q_orig, query_contrastive))
         .filter(|t| {
             // D2 (2026-08-19): a bare "pay"/"paying" engine Exclusion is only a
             // manner false-positive when the query context says so. "pay attention"
