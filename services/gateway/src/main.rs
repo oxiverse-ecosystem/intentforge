@@ -5898,7 +5898,12 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                                 || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
                                 || after_num[..after_num.len().min(20)].contains(c)
                         });
-                        if !near_currency {
+                        // Allow extraction for plausible price magnitudes even when
+                        // no currency word is nearby (e.g. "under 50000" with no
+                        // stated currency). Small numbers (gpt 5, chapter 3) are
+                        // still rejected by the magnitude guard to avoid false
+                        // positives. Default currency is USD (handled downstream).
+                        if !near_currency && v < 100.0 {
                             continue;
                         }
                         let currency = currency_words.iter().find(|c| prefix.contains(*c))
