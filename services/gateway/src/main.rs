@@ -13096,7 +13096,7 @@ struct CommerceConfig {
 
 impl Default for CommerceConfig {
     fn default() -> Self {
-        Self { mainpath_top_n: 8, enrich_window: 24 }
+        Self { mainpath_top_n: 8, enrich_window: 8 }
     }
 }
 
