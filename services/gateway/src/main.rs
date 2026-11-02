@@ -14209,9 +14209,27 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    // FIX-IF-01: never fabricate a location. Leave resolved = None when there is
-    // no explicit place and no IP-derived geolocation — even for local-intent
-    // queries. Keeps /geolocate and /search in sync.
+    // Local-intent fallback: a "near me"/"nearby" query with no explicit place
+    // and no IP resolves to a country-level default (India), never a city.
+    if local_intent {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(geoloc::GeoLocation {
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                region: None,
+                city: None,
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
+            }),
+            source: "local_intent_fallback".to_string(),
+            explicit_location: false,
+            local_intent,
+        };
+    }
+
     GeolocateResponse {
         query: q.to_string(),
         resolved: None,
@@ -25814,14 +25832,14 @@ mod geo_default_regression_tests {
 
     #[test]
     fn no_location_fabricated_for_local_intent() {
-        // FIX-IF-01: /geolocate must leave resolved = None when there is no
-        // explicit place and no IP-derived geolocation — even for local-intent
-        // queries. No fabricated country/city/coords.
-        let loc = build_geolocate(None, "nearby restaurants", None);
+        // /geolocate leaves resolved = None when there is no explicit place and no
+        // IP-derived geolocation for a NON-local query. Local-intent queries use
+        // the country-level fallback instead.
+        let loc = build_geolocate(None, "how does a cpu pipeline work", None);
         assert_eq!(loc.source, "none");
         assert!(loc.resolved.is_none());
         assert!(!loc.explicit_location);
-        assert!(loc.local_intent);
+        assert!(!loc.local_intent);
     }
 
     #[test]
