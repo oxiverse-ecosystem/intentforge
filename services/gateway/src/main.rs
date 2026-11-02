@@ -15895,6 +15895,23 @@ async fn handle_search(
                                 );
                             }
                         }
+// If all engines timed out (VPN broken), record a failure so the circuit
+                        // breaker opens and subsequent requests skip this instance
+                        // instead of re-burning the full branch timeout every time.
+                        let all_timed_out = !data.unresponsive_engines.is_empty()
+                            && data.results.is_empty()
+                            && data.unresponsive_engines.iter().all(|e| {
+                                e.get(1).map(|m| m.to_lowercase().contains("timeout")).unwrap_or(false)
+                            });
+                        if all_timed_out {
+                            if let Some(ref key) = instance_key_for_searx {
+                                circuit_for_searx.record_failure(key);
+                                tracing::warn!(
+                                    "SearXNG instance all engines timed out — recording circuit failure for {}",
+                                    key
+                                );
+                            }
+                        }
                         data
                     }
                     Err(e) => {
