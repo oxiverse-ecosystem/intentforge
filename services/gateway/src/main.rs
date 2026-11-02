@@ -15422,10 +15422,23 @@ async fn handle_search(
         None => geo_location,
     };
 
-    // FIX-IF-01: never fabricate a location. When there is no explicit place in
-    // the query and no IP-derived geolocation, leave geo_location = None. A
-    // fabricated country/city was previously injected into `positive` and the
-    // upstream query, producing wrong-region results for users outside it.
+    // FIX-IF-01: never fabricate a city. When there is no explicit place and no
+    // IP-derived geolocation, but the query has local intent, anchor to a
+    // country-level fallback (India) so geo_location is detected — mirroring
+    // build_geolocate. No city/coordinates/postal_code are fabricated, so
+    // is_inferred_location keeps it out of `positive`/upstream query.
+    if geo_location.is_none() && has_local_intent(&q) {
+        geo_location = Some(geoloc::GeoLocation {
+            city: None,
+            region: None,
+            country_code: Some("IN".to_string()),
+            country_name: Some("India".to_string()),
+            latitude: None,
+            longitude: None,
+            time_zone: None,
+            postal_code: None,
+        });
+    }
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
     // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
