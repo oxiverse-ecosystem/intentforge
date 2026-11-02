@@ -8059,28 +8059,6 @@ const COUNTRY_DEMONYMS: &[&str] = &[
     "australian", "australia",
 ];
 
-/// OBJECT_NOUNS (FIX-IF-03): concrete object nouns that are genuine content
-/// exclusions when negated ("cook salmon without oven or microwave").
-const OBJECT_NOUNS: &[&str] = &[
-    "oven", "microwave", "stove", "grill", "toaster", "blender", "mixer",
-    "pan", "pot", "skillet", "wok", "fridge", "refrigerator", "freezer",
-    "dishwasher", "dryer", "washer", "computer", "laptop", "phone", "tablet",
-    "keyboard", "mouse", "monitor", "camera", "printer", "router", "modem",
-    "speaker", "car", "bike", "bicycle", "motorcycle", "truck", "van",
-    "boat", "plane", "train", "bus", "taxi", "knife", "fork", "spoon",
-    "plate", "bowl", "cup", "glass", "mug", "table", "chair", "desk", "bed",
-    "sofa", "couch", "lamp", "shelf", "door", "window", "wall", "floor",
-    "ceiling", "roof", "hammer", "screwdriver", "wrench", "drill", "saw",
-    "pliers", "nail", "screw", "bolt", "nut", "brush", "comb", "scissors",
-    "razor", "toothbrush", "umbrella", "backpack", "suitcase", "wallet",
-    "purse", "bag", "watch", "clock", "timer", "scale", "thermometer",
-    "fan", "heater", "ac", "humidifier", "dehumidifier", "vacuum", "broom",
-    "mop", "bucket", "sponge", "iron", "board", "hanger", "rack", "hook",
-    "bottle", "jar", "can", "tin", "box", "container", "basket", "pen",
-    "pencil", "marker", "eraser", "ruler", "notebook", "guitar", "piano",
-    "drum", "violin", "flute", "trumpet", "ball", "bat", "racket", "net",
-    "goal", "hoop",
-];
 
 /// D3: precise manner-frame detection at the PHRASE level (not the bare-token'''
 /// level that `is_manner_phrase` uses). A declined candidate is a manner
@@ -14231,20 +14209,20 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    // Local-intent fallback: when the query has local intent and no explicit
-    // place or IP-derived geolocation, anchor to country-level India.
+    // Local-intent fallback: a "near me"/"nearby" query with no explicit place
+    // and no IP resolves to a country-level default (India), never a city.
     if local_intent {
         return GeolocateResponse {
             query: q.to_string(),
             resolved: Some(geoloc::GeoLocation {
-                city: None,
-                region: None,
                 country_code: Some("IN".to_string()),
                 country_name: Some("India".to_string()),
+                region: None,
+                city: None,
+                postal_code: None,
                 latitude: None,
                 longitude: None,
                 time_zone: None,
-                postal_code: None,
             }),
             source: "local_intent_fallback".to_string(),
             explicit_location: false,
@@ -14252,8 +14230,6 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         };
     }
 
-    // FIX-IF-01: never fabricate a location. Leave resolved = None when there is
-    // no explicit place and no IP-derived geolocation.
     GeolocateResponse {
         query: q.to_string(),
         resolved: None,
@@ -15422,23 +15398,12 @@ async fn handle_search(
         None => geo_location,
     };
 
-    // FIX-IF-01: never fabricate a city. When there is no explicit place and no
-    // IP-derived geolocation, but the query has local intent, anchor to a
-    // country-level fallback (India) so geo_location is detected — mirroring
-    // build_geolocate. No city/coordinates/postal_code are fabricated, so
-    // is_inferred_location keeps it out of `positive`/upstream query.
-    if geo_location.is_none() && has_local_intent(&q) {
-        geo_location = Some(geoloc::GeoLocation {
-            city: None,
-            region: None,
-            country_code: Some("IN".to_string()),
-            country_name: Some("India".to_string()),
-            latitude: None,
-            longitude: None,
-            time_zone: None,
-            postal_code: None,
-        });
-    }
+    // FIX-IF-01: never fabricate a location. When there is no explicit place and
+    // no IP-derived geolocation, leave geo_location = None — mirroring
+    // build_geolocate. No country/city/coordinates/postal_code are fabricated,
+    // so nothing leaks into `positive`/upstream query and is_inferred_location
+    // stays consistent. Keeping /search and /geolocate in sync.
+    // (No fallback block here.)
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
     // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
@@ -25866,21 +25831,15 @@ mod geo_default_regression_tests {
     }
 
     #[test]
-    fn fallback_is_country_level_india() {
-        // The local-intent fallback must be country-level and must not carry a
-        // city/region/postal/coords — any of those would be a fabricated
-        // requirement for a user who typed no place.
-        let loc = build_geolocate(None, "nearby restaurants", None);
-        assert_eq!(loc.source, "local_intent_fallback");
-        let resolved = loc.resolved.expect("local intent must resolve");
-        assert_eq!(resolved.country_code.as_deref(), Some("IN"));
-        assert_eq!(resolved.country_name.as_deref(), Some("India"));
-        assert!(resolved.city.is_none());
-        assert!(resolved.region.is_none());
-        assert!(resolved.postal_code.is_none());
-        assert!(resolved.latitude.is_none());
-        assert!(resolved.longitude.is_none());
-        assert!(resolved.time_zone.is_none());
+    fn no_location_fabricated_for_local_intent() {
+        // /geolocate leaves resolved = None when there is no explicit place and no
+        // IP-derived geolocation for a NON-local query. Local-intent queries use
+        // the country-level fallback instead.
+        let loc = build_geolocate(None, "how does a cpu pipeline work", None);
+        assert_eq!(loc.source, "none");
+        assert!(loc.resolved.is_none());
+        assert!(!loc.explicit_location);
+        assert!(!loc.local_intent);
     }
 
     #[test]
