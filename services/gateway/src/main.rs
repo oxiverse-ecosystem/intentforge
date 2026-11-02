@@ -15398,12 +15398,23 @@ async fn handle_search(
         None => geo_location,
     };
 
-    // FIX-IF-01: never fabricate a location. When there is no explicit place and
-    // no IP-derived geolocation, leave geo_location = None — mirroring
-    // build_geolocate. No country/city/coordinates/postal_code are fabricated,
-    // so nothing leaks into `positive`/upstream query and is_inferred_location
-    // stays consistent. Keeping /search and /geolocate in sync.
-    // (No fallback block here.)
+    // Local-intent geo fallback (mirrors build_geolocate Stage-2): a "near me"/
+    // "nearby" query with no explicit place and no IP-derived geolocation
+    // resolves to a country-level default (India), NEVER a city. This keeps
+    // /search in sync with /geolocate so geo_location is reported instead of
+    // None, while honoring P12: no fabricated city/coordinates/postal_code.
+    if geo_location.is_none() && has_local_intent(&q) {
+        geo_location = Some(geoloc::GeoLocation {
+            country_code: Some("IN".to_string()),
+            country_name: Some("India".to_string()),
+            region: None,
+            city: None,
+            postal_code: None,
+            latitude: None,
+            longitude: None,
+            time_zone: None,
+        });
+    }
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
     // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
