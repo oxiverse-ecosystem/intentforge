@@ -10446,6 +10446,17 @@ fn merge_local_and_web(
         "past", "last", "upcoming", "update", "updates", "2026", "2025", "2024",
     ].iter().copied().collect();
 
+    // Question / framing words (how/what/why/...) are not topical subject terms.
+    // Treating "how" as a distinctive term lets "How - Wikipedia" / "How to Use How
+    // Correctly" / "How? (Remastered)" survive as full/partial matches for a
+    // multi-word how-to query whose real subject is the trailing topic. They are
+    // structural framing, not subject matter, so exclude them from distinctive
+    // terms (mirrors temporal_fillers).
+    let question_framing_words: std::collections::HashSet<&str> = [
+        "how", "what", "why", "when", "where", "which", "who", "whom", "whose",
+        "can", "could", "should", "would", "do", "does", "did",
+    ].iter().copied().collect();
+
     let q_words: Vec<&str> = clean_query.split_whitespace().collect();
     let distinctive_terms: Vec<&str> = q_words.iter()
         .filter(|w| {
@@ -10457,6 +10468,7 @@ fn merge_local_and_web(
                 && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
                 && !temporal_fillers.contains(lower.as_str())
+                && !question_framing_words.contains(lower.as_str())
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
@@ -10639,6 +10651,7 @@ fn merge_local_and_web(
                 && !role_descriptor_terms.contains(lower.as_str())
                 && !weak_discriminative.contains(lower.as_str())
                 && !temporal_fillers.contains(lower.as_str())
+                && !question_framing_words.contains(lower.as_str())
                 && !lower.chars().all(|c| c.is_ascii_digit())
         })
         .copied()
