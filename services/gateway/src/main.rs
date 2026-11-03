@@ -5891,13 +5891,20 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         // not anywhere in the rest of the query. Without a nearby
                         // currency word, this is not a price bound — skip and try
                         // the next marker. General guard; no per-query literals.
+                        // Currency-proximity guard, relaxed for large bare numbers
+                        // (round fix): a discourse marker like "about" followed by a
+                        // small number ("gpt 5", "chapter 3", "version 2") is not a
+                        // price, but a large bare number following a price marker
+                        // ("under 50000", "below 1000") is overwhelmingly a price even
+                        // without an explicit currency word. Permit those so the
+                        // bound is applied instead of silently dropped.
                         let near_currency = currency_words.iter().any(|c| {
                             prefix.contains(c)
                         }) || currency_words.iter().any(|c| {
                             after_num.len() >= c.len() && after_num[..c.len()].starts_with(c)
                                 || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
                                 || after_num[..after_num.len().min(20)].contains(c)
-                        });
+                        }) || v >= 100.0;
                         if !near_currency {
                             continue;
                         }
