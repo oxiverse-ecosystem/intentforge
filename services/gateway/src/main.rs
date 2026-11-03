@@ -9455,8 +9455,11 @@ fn simple_negation_strip(query: &str) -> Option<(String, Vec<String>)> {
             // P11-style how-to tail preservation: a how-to phrase after a
             // negation clause ("... without X how to Y") must NOT be swallowed
             // by the negation scope — keep the how-to tail as the main query
-            // intent. Treat "how"/"to" as clause boundaries that are KEPT.
-            if w_lower == "how" || w_lower == "to" {
+            // intent. Treat "how"/"to" (and other how-to intent markers) as
+            // clause boundaries that are KEPT in the result.
+            if w_lower == "how" || w_lower == "to" || w_lower == "do"
+                || w_lower == "i" || w_lower == "guide" || w_lower == "tutorial"
+                || w_lower == "steps" || w_lower == "learn" {
                 in_negation = false;
                 result.push(w);
                 continue;
