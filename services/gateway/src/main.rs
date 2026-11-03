@@ -20943,7 +20943,6 @@ fn apply_search_intent_overrides(
             intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
         }
 }
-}
 
 fn fallback_intent(q: &str) -> IntentResponse {
     let mut structured = extract_gateway_constraints(q);
