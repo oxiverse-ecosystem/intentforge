@@ -4484,16 +4484,24 @@ async fn handle_commerce_extract(
 /// again be a hand-tuned constant tighter than reality. The reqwest client's own
 /// 25s request timeout remains the backstop for a pathological upstream.
 async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> {
-    let resp = client
-        .get(url)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        )
-        .send()
+    let fut = async {
+        let resp = client
+            .get(url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            .send()
+            .await
+            .ok()?;
+        resp.text().await.ok()
+    };
+    // Hanging merchants (code=000) never respond; cap each fetch so a single
+    // dead host cannot consume the whole enrichment wall.
+    tokio::time::timeout(std::time::Duration::from_secs(3), fut)
         .await
-        .ok()?;
-    resp.text().await.ok()
+        .ok()
+        .flatten()
 }
 
 /// Derive the per-page-fetch budget for one wave of parallel enrichment.
@@ -4874,7 +4882,7 @@ const MAX_PARALLEL_FETCH: usize = 4;
 /// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
 /// This is now only the CEILING for `commerce_wall_for_elapsed`, never the value
 /// used unconditionally — see that function for why a flat cap is unsafe.
-const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 22;
+const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 4;
 
 /// The global request budget enforced by the `TimeoutLayer` wrapped around the
 /// router (see the `.layer(TimeoutLayer::new(...))` call). Kept as a named
@@ -20942,7 +20950,6 @@ fn apply_search_intent_overrides(
             let tech_prob = intent.distribution.get("technical").copied().unwrap_or(0.0);
             intent.distribution.insert("technical".to_string(), tech_prob + 0.10);
         }
-}
 }
 
 fn fallback_intent(q: &str) -> IntentResponse {
