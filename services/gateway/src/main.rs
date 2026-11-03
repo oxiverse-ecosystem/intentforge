@@ -4498,7 +4498,7 @@ async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> 
     };
     // Hanging merchants (code=000) never respond; cap each fetch so a single
     // dead host cannot consume the whole enrichment wall.
-    tokio::time::timeout(std::time::Duration::from_secs(3), fut)
+    tokio::time::timeout(std::time::Duration::from_secs(2), fut)
         .await
         .ok()
         .flatten()
@@ -4512,11 +4512,15 @@ async fn fetch_page_html(client: &reqwest::Client, url: &str) -> Option<String> 
 /// geometry, not a tuned latency constant: 22s over 2 waves of 4 = 11s per page,
 /// which is far above the real ~8s VPN-routed page fetch, while still bounding
 /// the total.
+/// Hard cap per merchant page fetch: a hanging merchant (code=000) must NOT
+/// consume the whole enrichment wall. Accept null provenance instead.
+const PER_MERCHANT_FETCH_CAP_SECS: u64 = 3;
+
 fn commerce_fetch_budget(
     remaining_wall: std::time::Duration,
     _waves_remaining: usize,
 ) -> std::time::Duration {
-    remaining_wall
+    remaining_wall.min(std::time::Duration::from_secs(PER_MERCHANT_FETCH_CAP_SECS))
 }
 
 /// PURE, OFFLINE-TESTABLE enrichment: attach honest product facts to already-ranked
@@ -4882,7 +4886,7 @@ const MAX_PARALLEL_FETCH: usize = 4;
 /// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
 /// This is now only the CEILING for `commerce_wall_for_elapsed`, never the value
 /// used unconditionally — see that function for why a flat cap is unsafe.
-const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 15;
+const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 3;
 
 /// The global request budget enforced by the `TimeoutLayer` wrapped around the
 /// router (see the `.layer(TimeoutLayer::new(...))` call). Kept as a named
