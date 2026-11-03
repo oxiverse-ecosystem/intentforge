@@ -4931,7 +4931,6 @@ fn commerce_wall_for_elapsed(elapsed: std::time::Duration) -> std::time::Duratio
     budget
         .saturating_sub(elapsed)
         .saturating_sub(headroom)
-        .min(ceiling)
 }
 
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
@@ -5898,7 +5897,7 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                                 || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
                                 || after_num[..after_num.len().min(20)].contains(c)
                         });
-                        if !near_currency {
+                        if !near_currency && v < 10.0 {
                             continue;
                         }
                         let currency = currency_words.iter().find(|c| prefix.contains(*c))
@@ -18818,11 +18817,15 @@ let mut results = match tokio::task::spawn_blocking(move || {
     if let Some(ref bd) = intent.structured_constraints.before_date {
         flat_constraints.push(format!("+before:{}", bd));
     }
+    if let Some(v) = intent.structured_constraints.price_lt {
+        flat_constraints.push(format!("price:<{}", v));
+    }
+    if let Some(v) = intent.structured_constraints.price_gt {
+        flat_constraints.push(format!("price:>{}", v));
+    }
 
     // Renormalize distribution before returning
     renormalize_distribution(&mut intent.distribution);
-
-    // Mutable error/message so we can signal upstream-unavailable below.
     let mut error: Option<String> = None;
     let mut message: Option<String> = None;
 
