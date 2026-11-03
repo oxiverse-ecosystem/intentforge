@@ -4520,7 +4520,7 @@ fn commerce_fetch_budget(
     if waves_remaining == 0 {
         return remaining_wall;
     }
-    let per_page_cap = std::time::Duration::from_secs(2);
+    let per_page_cap = std::time::Duration::from_secs(8);
     remaining_wall.min(per_page_cap)
 }
 
@@ -4922,16 +4922,19 @@ const ENRICHMENT_HEADROOM_SECS: u64 = 6;
 /// query. Pure function of its inputs — offline-testable, no query/domain
 /// literals, and no new magic number beyond the transport budget it mirrors.
 fn commerce_wall_for_elapsed(elapsed: std::time::Duration) -> std::time::Duration {
-    let budget = std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS);
-    let headroom = std::time::Duration::from_secs(ENRICHMENT_HEADROOM_SECS);
-    let ceiling = std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS);
-    // `saturating_sub` on each step: a request that has already overrun the
-    // budget yields ZERO rather than wrapping, and the wave loop then skips
-    // enrichment entirely (results keep honest null provenance).
-    budget
-        .saturating_sub(elapsed)
-        .saturating_sub(headroom)
-        .min(ceiling)
+    let elapsed_secs = elapsed.as_secs();
+    // Scale the enrichment ceiling with the remaining request budget so the
+    // wall shrinks monotonically as the request gets slower (a flat ceiling
+    // kept the wall at MAINPATH for every elapsed < 20s).
+    let remaining_total = REQUEST_TIMEOUT_SECS.saturating_sub(elapsed_secs);
+    let ceiling_secs = MAINPATH_ENRICHMENT_WALL_SECS * remaining_total / REQUEST_TIMEOUT_SECS;
+    let ceiling = std::time::Duration::from_secs(ceiling_secs);
+    let headroom = ENRICHMENT_HEADROOM_SECS;
+    let available = REQUEST_TIMEOUT_SECS
+        .saturating_sub(elapsed_secs)
+        .saturating_sub(headroom);
+    let available_d = std::time::Duration::from_secs(available);
+    available_d.min(ceiling)
 }
 
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
