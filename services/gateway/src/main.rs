@@ -5898,7 +5898,12 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                                 || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
                                 || after_num[..after_num.len().min(20)].contains(c)
                         });
-                        if !near_currency {
+                        // Bare-numeric prices (e.g. "under 50000") carry no currency
+                        // word but are still price bounds. Only the discourse markers
+                        // "about"/"around" require a nearby currency word to avoid
+                        // mis-reading unrelated numbers ("gpt 5", "chapter 3").
+                        let soft_marker = marker == "about" || marker == "around";
+                        if soft_marker && !near_currency {
                             continue;
                         }
                         let currency = currency_words.iter().find(|c| prefix.contains(*c))
@@ -16542,8 +16547,19 @@ async fn handle_search(
     // Secondary fan-out with expanded queries if initial results are sparse
     // Apply language disambiguation for short language names
     let disambiguated_q = disambiguate_engine_query(&q, &intent.intent, &intent.expanded_queries);
+    // Drop degenerate expanded queries that are just a single question-framing/stop
+    // word (e.g. LLM emits "how" for a "how to ..." query), which fetch
+    // irrelevant results like "How - Wikipedia".
+    let is_degenerate_eq = |s: &str| {
+        let t = s.trim().to_lowercase();
+        let words: Vec<&str> = t.split_whitespace().collect();
+        if words.len() != 1 { return false; }
+        let w = words[0];
+        ["how","what","why","when","where","who","which","to","is","are","a","an","the"].contains(&w)
+    };
     let expanded_queries = if intent.expanded_queries.len() > 1 {
-        let mut eq = intent.expanded_queries.clone();
+        let mut eq: Vec<String> = intent.expanded_queries.iter().cloned().filter(|s| !is_degenerate_eq(s)).collect();
+        if eq.is_empty() { eq = vec![q.clone()]; }
         if disambiguated_q != q {
             eq.insert(0, disambiguated_q);
         }
