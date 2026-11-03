@@ -15398,12 +15398,14 @@ async fn handle_search(
         None => geo_location,
     };
 
-    // Local-intent geo fallback (mirrors build_geolocate Stage-2): a "near me"/
-    // "nearby" query with no explicit place and no IP-derived geolocation
-    // resolves to a country-level default (India), NEVER a city. This keeps
-    // /search in sync with /geolocate so geo_location is reported instead of
-    // None, while honoring P12: no fabricated city/coordinates/postal_code.
-    if geo_location.is_none() && has_local_intent(&q) {
+    // Local-intent geo fallback: IP geolocation often yields a country but no
+    // city (VPN/proxy IPs). For local-intent queries, ensure geo_location is
+    // populated at country level; city stays None per P12 (no fabrication).
+    let needs_geo_fallback = match &geo_location {
+        None => true,
+        Some(g) => g.city.is_none() && g.country_code.is_some(),
+    };
+    if needs_geo_fallback && has_local_intent(&q) {
         geo_location = Some(geoloc::GeoLocation {
             country_code: Some("IN".to_string()),
             country_name: Some("India".to_string()),
