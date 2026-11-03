@@ -4520,7 +4520,12 @@ fn commerce_fetch_budget(
     remaining_wall: std::time::Duration,
     _waves_remaining: usize,
 ) -> std::time::Duration {
-    remaining_wall.min(std::time::Duration::from_secs(PER_MERCHANT_FETCH_CAP_SECS))
+    // The per-fetch budget is the whole remaining outer wall: fetches inside a
+    // wave run CONCURRENTLY, so a wave costs the SLOWEST fetch, not the sum.
+    // Dividing by wave count starves every fetch as the result set grows.
+    // The per-merchant fetch cap lives in fetch_page_html (2s) so a hanging
+    // host can never consume the whole wall here.
+    remaining_wall
 }
 
 /// PURE, OFFLINE-TESTABLE enrichment: attach honest product facts to already-ranked
@@ -4886,7 +4891,7 @@ const MAX_PARALLEL_FETCH: usize = 4;
 /// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
 /// This is now only the CEILING for `commerce_wall_for_elapsed`, never the value
 /// used unconditionally — see that function for why a flat cap is unsafe.
-const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 3;
+const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 15;
 
 /// The global request budget enforced by the `TimeoutLayer` wrapped around the
 /// router (see the `.layer(TimeoutLayer::new(...))` call). Kept as a named
