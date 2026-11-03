@@ -5892,12 +5892,12 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
                         // currency word, this is not a price bound — skip and try
                         // the next marker. General guard; no per-query literals.
                         let near_currency = currency_words.iter().any(|c| {
-                            prefix.contains(c)
-                        }) || currency_words.iter().any(|c| {
-                            after_num.len() >= c.len() && after_num[..c.len()].starts_with(c)
-                                || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
-                                || after_num[..after_num.len().min(20)].contains(c)
-                        });
+                                                    prefix.contains(c)
+                                                }) || currency_words.iter().any(|c| {
+                                                    after_num.len() >= c.len() && after_num[..c.len()].starts_with(c)
+                                                        || (after_num.len() > c.len() + 20 && after_num[..c.len() + 20].contains(c))
+                                                        || after_num[..after_num.len().min(20)].contains(c)
+                                                }) || after_num.trim().is_empty();
                         if !near_currency {
                             continue;
                         }
