@@ -23038,11 +23038,10 @@ mod spellcheck_endpoint_tests {
             // a user in India.
             let loc = build_geolocate(None, "coffee shops near me open now", None);
             assert!(loc.local_intent);
-            assert_eq!(loc.source, "local_intent_fallback");
-            assert_eq!(loc.resolved.as_ref().unwrap().city, None,
-                "the fallback must not invent a city the query never named");
-            assert_eq!(loc.resolved.as_ref().unwrap().country_code.as_deref(), Some("IN"));
-            assert_eq!(loc.resolved.as_ref().unwrap().country_name.as_deref(), Some("India"));
+            assert_eq!(loc.source, "none");
+            assert!(loc.resolved.is_none(),
+                "no fabricated country/city fallback when no IP or explicit place");
+            assert!(!loc.explicit_location);
         }
 
         #[test]
