@@ -16545,7 +16545,7 @@ async fn handle_search(
     // Secondary fan-out with expanded queries if initial results are sparse
     // Apply language disambiguation for short language names
     let disambiguated_q = disambiguate_engine_query(&q, &intent.intent, &intent.expanded_queries);
-    let expanded_queries = if intent.expanded_queries.len() > 1 {
+    let mut expanded_queries = if intent.expanded_queries.len() > 1 {
         let mut eq = intent.expanded_queries.clone();
         if disambiguated_q != q {
             eq.insert(0, disambiguated_q);
