@@ -14222,27 +14222,9 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    // Local-intent fallback: a "near me"/"nearby" query with no explicit place
-    // and no IP resolves to a country-level default (India), never a city.
-    if local_intent {
-        return GeolocateResponse {
-            query: q.to_string(),
-            resolved: Some(geoloc::GeoLocation {
-                country_code: Some("IN".to_string()),
-                country_name: Some("India".to_string()),
-                region: None,
-                city: None,
-                postal_code: None,
-                latitude: None,
-                longitude: None,
-                time_zone: None,
-            }),
-            source: "local_intent_fallback".to_string(),
-            explicit_location: false,
-            local_intent,
-        };
-    }
-
+    // P12 fix: leave resolved=None when there is no explicit or IP-derived
+    // location. Never fabricate a country/city fallback. Keep in sync with
+    // /search, which also returns None here.
     GeolocateResponse {
         query: q.to_string(),
         resolved: None,
@@ -15411,23 +15393,10 @@ async fn handle_search(
         None => geo_location,
     };
 
-    // Local-intent geo fallback (mirrors build_geolocate Stage-2): a "near me"/
-    // "nearby" query with no explicit place and no IP-derived geolocation
-    // resolves to a country-level default (India), NEVER a city. This keeps
-    // /search in sync with /geolocate so geo_location is reported instead of
-    // None, while honoring P12: no fabricated city/coordinates/postal_code.
-    if geo_location.is_none() && has_local_intent(&q) {
-        geo_location = Some(geoloc::GeoLocation {
-            country_code: Some("IN".to_string()),
-            country_name: Some("India".to_string()),
-            region: None,
-            city: None,
-            postal_code: None,
-            latitude: None,
-            longitude: None,
-            time_zone: None,
-        });
-    }
+    // P12 fix: leave geo_location=None when there is no explicit and no
+    // IP-derived location. Never fabricate a country/city fallback (was
+    // previously a hardcoded "New York", then a country-level India default).
+    // Keep /search and /geolocate in sync: both return None here.
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
     // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
