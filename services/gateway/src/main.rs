@@ -10262,7 +10262,7 @@ fn merge_local_and_web(
                 score: r.score,
                 authority,
                 sources,
-                is_local: false,"
+                is_local: false,
                 published_date: r.published_date.clone(),
                 price: r.price.clone(),
                 currency: r.currency.clone(),
