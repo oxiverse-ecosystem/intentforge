@@ -4520,7 +4520,7 @@ fn commerce_fetch_budget(
     if waves_remaining == 0 {
         return remaining_wall;
     }
-    let per_page_cap = std::time::Duration::from_secs(8);
+    let per_page_cap = std::time::Duration::from_secs(2);
     remaining_wall.min(per_page_cap)
 }
 
@@ -4887,7 +4887,7 @@ const MAX_PARALLEL_FETCH: usize = 4;
 /// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
 /// This is now only the CEILING for `commerce_wall_for_elapsed`, never the value
 /// used unconditionally — see that function for why a flat cap is unsafe.
-const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 4;
+const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 2;
 
 /// The global request budget enforced by the `TimeoutLayer` wrapped around the
 /// router (see the `.layer(TimeoutLayer::new(...))` call). Kept as a named
@@ -24746,9 +24746,9 @@ structured product data, so nothing must be extracted from the body.</p></body><
     #[test]
     fn per_fetch_budget_is_never_starved_by_wave_count() {
         let wall = std::time::Duration::from_secs(MAINPATH_ENRICHMENT_WALL_SECS);
-        // Hard per-merchant cap (3s) so hanging merchants fail fast and total
+        // Hard per-merchant cap (2s) so hanging merchants fail fast and total
         // request latency stays under ~5s. Slow pages accept null provenance.
-        let real_page_latency = std::time::Duration::from_millis(3000);
+        let real_page_latency = std::time::Duration::from_millis(2000);
 
 
         for waves in 1usize..=12 {
