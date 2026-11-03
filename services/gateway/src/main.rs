@@ -10251,14 +10251,18 @@ fn merge_local_and_web(
         } else {
             let source = if r.engine.is_empty() { "web".to_string() } else { r.engine.clone() };
             let authority = domain_authority_score(&r.url);
+            let mut sources = vec![source];
+            for s in &r.sources {
+                if !sources.contains(s) { sources.push(s.clone()); }
+            }
             let entry = MergedResult {
                 url: r.url,
                 title: r.title,
                 content: r.content,
                 score: r.score,
                 authority,
-                sources: vec![source],
-                is_local: false,
+                sources,
+                is_local: false,"
                 published_date: r.published_date.clone(),
                 price: r.price.clone(),
                 currency: r.currency.clone(),
