@@ -16558,6 +16558,19 @@ async fn handle_search(
             vec![q.clone()]
         }
     };
+    // Degenerate-expanded-query guard: the intent engine can emit single-word
+    // expanded queries like "how" that flood results with dictionary/Wikipedia
+    // pages. Drop any expanded entry that is a lone question/framing word.
+    {
+        const DEGENERATE: &[&str] = &["how", "what", "why", "when", "where", "who", "which", "to", "for", "a", "the"];
+        expanded_queries.retain(|eq| {
+            let toks: Vec<&str> = eq.split_whitespace().collect();
+            !(toks.len() == 1 && DEGENERATE.contains(&toks[0].to_lowercase().as_str()))
+        });
+        if expanded_queries.is_empty() {
+            expanded_queries.push(q.clone());
+        }
+    }
     // When query has ONLY negative constraints ("not X not Y"), SearXNG searched with
     // the raw query including negative terms. Strip negation trigger words to create a
     // clean query and prepend it to expanded_queries so the retry re-fetches with clean terms.
