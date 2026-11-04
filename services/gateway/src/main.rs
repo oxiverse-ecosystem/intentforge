@@ -14004,7 +14004,7 @@ async fn main() {
             Router::new()
                 .route("/commerce/extract", post(handle_commerce_extract))
                 .route("/shopping", get(handle_shopping))
-                .route("/goals", post(goals::handle_create_goal))
+                .route("/goals", get(goals::handle_list_goals).post(goals::handle_create_goal))
                 .route("/goals/quick", post(goals::handle_quick_roadmap))
                 .route("/goals/leaderboard", get(goals::handle_leaderboard))
                 .route("/goals/:goal_id", get(goals::handle_get_goal))
