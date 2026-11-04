@@ -127,7 +127,7 @@ pub struct Roadmap {
     pub total_buffer_days: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredGoal {
     pub goal_id: String,
     pub goal: String,
@@ -942,6 +942,12 @@ impl GoalStore {
         self.goals.get(goal_id)
     }
 
+    pub fn list(&self) -> Vec<StoredGoal> {
+        let mut v: Vec<StoredGoal> = self.goals.values().cloned().collect();
+        v.sort_by(|a, b| a.goal_id.cmp(&b.goal_id));
+        v
+    }
+
     pub fn leaderboard(&self, limit: usize) -> Vec<LeaderboardEntry> {
         let mut entries: Vec<LeaderboardEntry> = self.goals.values()
             .filter(|g| g.roadmap.is_some())
@@ -1095,7 +1101,7 @@ pub async fn handle_create_goal(
         if let Ok(c) = serde_json::from_str::<GoalResourceCache>(&cached) {
             (c.intent, c.resources)
         } else {
-            let intent = classify_goal(&state.http_client, &goal).await;
+            let intent = crate::build_intent(&goal).get("intent").and_then(|v| v.as_str()).unwrap_or("general").to_string();
             let resources = search_resources(&state.http_client, &goal).await;
             let entry = GoalResourceCache { intent: intent.clone(), resources: resources.clone() };
             if let Ok(s) = serde_json::to_string(&entry) {
@@ -1104,7 +1110,7 @@ pub async fn handle_create_goal(
             (intent, resources)
         }
     } else {
-        let intent = classify_goal(&state.http_client, &goal).await;
+        let intent = crate::build_intent(&goal).get("intent").and_then(|v| v.as_str()).unwrap_or("general").to_string();
         let resources = search_resources(&state.http_client, &goal).await;
         let entry = GoalResourceCache { intent: intent.clone(), resources: resources.clone() };
         if let Ok(s) = serde_json::to_string(&entry) {
@@ -1244,6 +1250,15 @@ pub async fn handle_get_goal(
     }
 }
 
+/// GET /goals — list all goals
+pub async fn handle_list_goals(
+    State(state): State<Arc<crate::AppState>>,
+) -> Response {
+    let store = state.goals_state.lock();
+    let goals = store.list();
+    (StatusCode::OK, Json(goals)).into_response()
+}
+
 /// GET /goals/leaderboard — get leaderboard
 pub async fn handle_leaderboard(
     State(state): State<Arc<crate::AppState>>,
@@ -1271,7 +1286,7 @@ pub async fn handle_quick_roadmap(
         if let Ok(c) = serde_json::from_str::<GoalResourceCache>(&cached) {
             (c.intent, c.resources)
         } else {
-            let intent = classify_goal(&state.http_client, &goal).await;
+            let intent = crate::build_intent(&goal).get("intent").and_then(|v| v.as_str()).unwrap_or("general").to_string();
             let resources = search_resources(&state.http_client, &goal).await;
             let entry = GoalResourceCache { intent: intent.clone(), resources: resources.clone() };
             if let Ok(s) = serde_json::to_string(&entry) {
@@ -1280,7 +1295,7 @@ pub async fn handle_quick_roadmap(
             (intent, resources)
         }
     } else {
-        let intent = classify_goal(&state.http_client, &goal).await;
+        let intent = crate::build_intent(&goal).get("intent").and_then(|v| v.as_str()).unwrap_or("general").to_string();
         let resources = search_resources(&state.http_client, &goal).await;
         let entry = GoalResourceCache { intent: intent.clone(), resources: resources.clone() };
         if let Ok(s) = serde_json::to_string(&entry) {

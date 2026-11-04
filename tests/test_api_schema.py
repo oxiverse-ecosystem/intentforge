@@ -845,3 +845,11 @@ def test_commerce_extract_schema(session):
         assert field in body, f"POST /commerce/extract missing provenance key '{field}'; have {sorted(body.keys())}"
     assert data.get("price") == 29.99, f"POST /commerce/extract price should be 29.99; got {data.get('price')!r}"
     assert data.get("currency") == "USD", f"POST /commerce/extract currency should be 'USD'; got {data.get('currency')!r}"
+
+
+def test_api_key_auth_gated_endpoint(session):
+    """Unauthenticated request to gated endpoint -> 401; valid key -> 200."""
+    r = session.post(f"{BASE}/goals", json={"title": "t"}, timeout=10)
+    assert r.status_code == 401, f"unauth /goals expected 401 got {r.status_code}"
+    r2 = session.post(f"{BASE}/goals", json={"title": "t"}, headers={"X-API-Key": "intentforge-dev-key"}, timeout=10)
+    assert r2.status_code == 200, f"auth /goals expected 200 got {r2.status_code} {r2.text[:200]}"

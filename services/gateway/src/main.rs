@@ -11,7 +11,45 @@ use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tower_http::timeout::TimeoutLayer;
 use axum::http::HeaderMap;
+use axum::middleware;
+use axum::response::IntoResponse;
 use std::net::IpAddr;
+
+fn extract_api_key(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get("x-api-key") {
+        if let Ok(s) = v.to_str() { return Some(s.trim().to_string()); }
+    }
+    if let Some(v) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Ok(s) = v.to_str() {
+            if let Some(rest) = s.strip_prefix("Bearer ") { return Some(rest.trim().to_string()); }
+        }
+    }
+    None
+}
+fn valid_api_keys() -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    set.insert("intentforge-dev-key".to_string());
+    if let Ok(env) = std::env::var("INTENTFORGE_API_KEYS") {
+        for k in env.split(',') { let k=k.trim(); if !k.is_empty() { set.insert(k.to_string()); } }
+    }
+    set
+}
+fn api_key_valid(headers: &HeaderMap) -> bool {
+    match extract_api_key(headers) {
+        Some(k) => valid_api_keys().contains(&k),
+        None => false,
+    }
+}
+async fn auth_middleware(
+    headers: HeaderMap,
+    request: axum::http::Request<axum::body::Body>,
+    next: middleware::Next,
+) -> axum::response::Response {
+    if !api_key_valid(&headers) {
+        return (axum::http::StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({"error":"unauthorized"}))).into_response();
+    }
+    next.run(request).await
+}
 
 mod spell;
 mod geoloc;
@@ -13958,41 +13996,25 @@ async fn main() {
         .route("/news", get(handle_news))
         .route("/spellcheck", get(handle_spellcheck))
         .route("/analyze", get(handle_analyze))
-        // Unified pre-search introspection: mirrors the FULL /search reasoning
-        // pipeline (spell -> negation -> intent -> constraints -> recency ->
-        // query-quality) in one additive, zero-side-effect payload. See handle_inspect.
         .route("/inspect", get(handle_inspect))
-        // Geo introspection: mirrors /inspect's precedent — additive, zero-side-
-        // effect, pure. Exposes how /search resolves a query's geographic focus
-        // (explicit gazetteer hit, or local-intent "near me" fallback) BEFORE the
-        // search runs. See handle_geolocate / build_geolocate.
         .route("/geolocate", get(handle_geolocate))
-        // Intent introspection: completes the additive introspection family
-        // (/spellcheck /analyze /inspect /geolocate). Exposes /search's full
-        // intent object (parent category, contrastive + local signals,
-        // structured constraints, expanded queries) using the EXACT pure fns
-        // /search falls back to — zero-side-effect, no new ranking logic.
         .route("/intent", get(handle_intent))
-        // Video introspection: additive, zero-side-effect preview of the P8
-        // video-dominance decision (does the query carry video intent? which
-        // URLs are classified as video sources?). Completes the introspection
-        // family. See handle_video / build_video_inspect.
         .route("/video", get(handle_video))
-        // Commerce: honest product-fact extraction primitive (ROADMAP item 1).
-        // Returns the typed CommerceOffer extracted from supplied HTML — no
-        // ranking, no monetization, no user-tracking surface. The /shopping
-        // endpoint and affiliate decoration land in later increments.
-        .route("/commerce/extract", post(handle_commerce_extract))
-        .route("/shopping", get(handle_shopping))
-        // Goal Feature endpoints
-        .route("/goals", post(goals::handle_create_goal))
-        .route("/goals/quick", post(goals::handle_quick_roadmap))
-        .route("/goals/leaderboard", get(goals::handle_leaderboard))
-        .route("/goals/:goal_id", get(goals::handle_get_goal))
-        .route("/goals/:goal_id/answers", post(goals::handle_submit_answers))
-        .route("/goals/:goal_id/phases/:phase_id/complete", post(goals::handle_complete_phase))
-        .route("/goals/:goal_id/progress", get(goals::handle_get_progress))
-        .route("/goals/:goal_id/progress", post(goals::handle_update_progress))
+        .merge(
+            Router::new()
+                .route("/commerce/extract", post(handle_commerce_extract))
+                .route("/shopping", get(handle_shopping))
+                .route("/goals", get(goals::handle_list_goals).post(goals::handle_create_goal))
+                .route("/goals/quick", post(goals::handle_quick_roadmap))
+                .route("/goals/leaderboard", get(goals::handle_leaderboard))
+                .route("/goals/:goal_id", get(goals::handle_get_goal))
+                .route("/goals/:goal_id/answers", post(goals::handle_submit_answers))
+                .route("/goals/:goal_id/phases/:phase_id/complete", post(goals::handle_complete_phase))
+                .route("/goals/:goal_id/progress", get(goals::handle_get_progress))
+                .route("/goals/:goal_id/progress", post(goals::handle_update_progress))
+                .with_state(state.clone())
+                .route_layer(middleware::from_fn(auth_middleware)),
+        )
         .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
 
     // Bind port is env-configurable (default 4000) so a second, side-by-side
@@ -14444,7 +14466,7 @@ async fn handle_inspect(
 /// exposes only the deterministic local classification so the contract is
 /// stable + fully testable without the intent engine up, and so clients can
 /// reason about the offline baseline the ranker guarantees.
-fn build_intent(q: &str) -> serde_json::Value {
+pub(crate) fn build_intent(q: &str) -> serde_json::Value {
     let mut intent_resp = fallback_intent(q);
     apply_search_intent_overrides(&mut intent_resp, q, &ExactModelConfig::default());
     let category = parent_category(&intent_resp.intent);
