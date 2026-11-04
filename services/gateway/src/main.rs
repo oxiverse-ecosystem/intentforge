@@ -14466,7 +14466,7 @@ async fn handle_inspect(
 /// exposes only the deterministic local classification so the contract is
 /// stable + fully testable without the intent engine up, and so clients can
 /// reason about the offline baseline the ranker guarantees.
-fn build_intent(q: &str) -> serde_json::Value {
+pub(crate) fn build_intent(q: &str) -> serde_json::Value {
     let mut intent_resp = fallback_intent(q);
     apply_search_intent_overrides(&mut intent_resp, q, &ExactModelConfig::default());
     let category = parent_category(&intent_resp.intent);

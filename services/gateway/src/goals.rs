@@ -1101,7 +1101,7 @@ pub async fn handle_create_goal(
         if let Ok(c) = serde_json::from_str::<GoalResourceCache>(&cached) {
             (c.intent, c.resources)
         } else {
-            let intent = classify_goal(&state.http_client, &goal).await;
+            let intent = crate::build_intent(&goal).get("intent").and_then(|v| v.as_str()).unwrap_or("general").to_string();
             let resources = search_resources(&state.http_client, &goal).await;
             let entry = GoalResourceCache { intent: intent.clone(), resources: resources.clone() };
             if let Ok(s) = serde_json::to_string(&entry) {
@@ -1110,7 +1110,7 @@ pub async fn handle_create_goal(
             (intent, resources)
         }
     } else {
-        let intent = classify_goal(&state.http_client, &goal).await;
+        let intent = crate::build_intent(&goal).get("intent").and_then(|v| v.as_str()).unwrap_or("general").to_string();
         let resources = search_resources(&state.http_client, &goal).await;
         let entry = GoalResourceCache { intent: intent.clone(), resources: resources.clone() };
         if let Ok(s) = serde_json::to_string(&entry) {
@@ -1286,7 +1286,7 @@ pub async fn handle_quick_roadmap(
         if let Ok(c) = serde_json::from_str::<GoalResourceCache>(&cached) {
             (c.intent, c.resources)
         } else {
-            let intent = classify_goal(&state.http_client, &goal).await;
+            let intent = crate::build_intent(&goal).get("intent").and_then(|v| v.as_str()).unwrap_or("general").to_string();
             let resources = search_resources(&state.http_client, &goal).await;
             let entry = GoalResourceCache { intent: intent.clone(), resources: resources.clone() };
             if let Ok(s) = serde_json::to_string(&entry) {
@@ -1295,7 +1295,7 @@ pub async fn handle_quick_roadmap(
             (intent, resources)
         }
     } else {
-        let intent = classify_goal(&state.http_client, &goal).await;
+        let intent = crate::build_intent(&goal).get("intent").and_then(|v| v.as_str()).unwrap_or("general").to_string();
         let resources = search_resources(&state.http_client, &goal).await;
         let entry = GoalResourceCache { intent: intent.clone(), resources: resources.clone() };
         if let Ok(s) = serde_json::to_string(&entry) {
