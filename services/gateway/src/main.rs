@@ -7348,7 +7348,10 @@ fn calibrate_scores(scores: &mut [f32]) {
         }
         return;
     }
-    let ceil = 1.0f32;
+    // FIX-IF-35: do NOT pin the set maximum to a constant 1.0. The ceiling must
+    // reflect the absolute best raw score so that s=1.000 carries real meaning
+    // (earned confidence) rather than being purely positional ("rank #1 of set").
+    let ceil = raw_max.clamp(floor, 1.0f32);
     let span = ceil - floor;
     let norm = raw_max - raw_min;
     for score in scores.iter_mut() {
