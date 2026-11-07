@@ -14252,28 +14252,6 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    // Local-intent geo fallback: keep /geolocate in sync with /search — a
-    // "near me" query must never report resolved=None. Derive a country-level
-    // inferred location instead of fabricating a city (P12).
-    if local_intent {
-        return GeolocateResponse {
-            query: q.to_string(),
-            resolved: Some(geoloc::GeoLocation {
-                country_code: Some("IN".to_string()),
-                country_name: Some("India".to_string()),
-                region: None,
-                city: None,
-                postal_code: None,
-                latitude: None,
-                longitude: None,
-                time_zone: None,
-            }),
-            source: "local_intent".to_string(),
-            explicit_location: false,
-            local_intent,
-        };
-    }
-
     GeolocateResponse {
         query: q.to_string(),
         resolved: None,
