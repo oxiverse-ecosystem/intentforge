@@ -10,6 +10,10 @@ services:
 
   gluetun:
     image: qmcgaw/gluetun:v3.41.3
+    # Docker resolves service aliases and forwards external queries to the
+    # Gluetun DNS listener inside this network namespace.
+    dns:
+      - 127.0.0.1
     container_name: if-dev-gluetun
     mem_limit: 512m
     cap_add:
@@ -22,7 +26,7 @@ services:
       - VPN_SERVICE_PROVIDER=protonvpn
       - VPN_TYPE=openvpn
       - FREE_ONLY=on
-      - DNS_ADDRESS=1.1.1.1
+      - DNS_ADDRESS=127.0.0.1
       - HTTP_PROXY=on
       - SHADOWSOCKS=on
       - HTTP_CONTROL_SERVER_ADDRESS=:8000

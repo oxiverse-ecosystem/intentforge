@@ -3,57 +3,68 @@ set -e
 
 MODEL_DIR="/app/models"
 
-# MiniLM L6 v2 (for embeddings + intent classification)
-EMBED_MODEL_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/model.safetensors"
-EMBED_CONFIG_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json"
-EMBED_TOKENIZER_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+# MiniLM L6 v2 (for embeddings + intent classification). All artifacts share a
+# pinned revision; SHA-256 values are verified before reuse or promotion.
+EMBED_REVISION="1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+EMBED_MODEL_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/${EMBED_REVISION}/model.safetensors"
+EMBED_CONFIG_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/${EMBED_REVISION}/config.json"
+EMBED_TOKENIZER_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/${EMBED_REVISION}/tokenizer.json"
 
 mkdir -p "$MODEL_DIR"
+
+verify_file() {
+    [ -f "$1" ] && printf '%s  %s\n' "$2" "$1" | sha256sum -c - >/dev/null 2>&1
+}
 
 download_and_verify() {
     URL="$1"
     TARGET="$2"
-    MIN_SIZE="$3"
+    EXPECTED_SHA256="$3"
     TMP="${TARGET}.tmp"
 
-    if [ -f "$TARGET" ]; then
-        SIZE=$(wc -c < "$TARGET" 2>/dev/null || echo 0)
-        if [ "$SIZE" -ge "$MIN_SIZE" ]; then
-            echo "File $TARGET exists and is valid (size $SIZE bytes >= $MIN_SIZE bytes)."
-            return 0
-        else
-            echo "File $TARGET is corrupted/incomplete (size $SIZE < min $MIN_SIZE bytes). Removing..."
-            rm -f "$TARGET"
-        fi
+    if verify_file "$TARGET" "$EXPECTED_SHA256"; then
+        echo "Verified existing $TARGET."
+        return 0
     fi
+    rm -f "$TARGET"
 
-    echo "Downloading $URL..."
-    # Resume a partial download rather than restarting from zero: the model is
-    # ~86MB and the VPN tunnel can drop mid-transfer. curl falls back to a
-    # full download if the server ignores Range.
-    if [ -f "$TMP" ]; then
-        TMP_SIZE=$(wc -c < "$TMP" 2>/dev/null || echo 0)
-        if [ "$TMP_SIZE" -ge "$MIN_SIZE" ]; then
+    if verify_file "$TMP" "$EXPECTED_SHA256"; then
+        mv "$TMP" "$TARGET"
+        return 0
+    fi
+    # An unverified partial may belong to an older revision. Start clean.
+    rm -f "$TMP"
+    ATTEMPT=0
+    while [ "$ATTEMPT" -lt 2 ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        echo "Downloading $URL..."
+        if curl -fL -C - --retry 5 --retry-delay 2 "$URL" -o "$TMP"; then
+            :
+        else
+            CURL_STATUS=$?
+            if [ "$CURL_STATUS" -eq 33 ]; then
+                # Server ignored Range: curl cannot restart this transfer itself.
+                rm -f "$TMP"
+                curl -fL --retry 5 --retry-delay 2 "$URL" -o "$TMP" || return $?
+            else
+                return "$CURL_STATUS"
+            fi
+        fi
+        if verify_file "$TMP" "$EXPECTED_SHA256"; then
             mv "$TMP" "$TARGET"
-            echo "Successfully downloaded $TARGET (size $TMP_SIZE bytes)."
+            echo "Verified and installed $TARGET."
             return 0
         fi
-    fi
-    curl -fL -C - --retry 5 --retry-delay 2 "$URL" -o "$TMP"
-    TMP_SIZE=$(wc -c < "$TMP" 2>/dev/null || echo 0)
-    if [ "$TMP_SIZE" -ge "$MIN_SIZE" ]; then
-        mv "$TMP" "$TARGET"
-        echo "Successfully downloaded $TARGET (size $TMP_SIZE bytes)."
-    else
-        echo "Error: Downloaded file $TMP size $TMP_SIZE is smaller than minimum $MIN_SIZE bytes!"
+        echo "Checksum mismatch for $TMP; discarding download." >&2
         rm -f "$TMP"
-        exit 1
-    fi
+    done
+    echo "Error: unable to download verified $TARGET." >&2
+    return 1
 }
 
-download_and_verify "$EMBED_MODEL_URL" "$MODEL_DIR/model.safetensors" 85000000
-download_and_verify "$EMBED_CONFIG_URL" "$MODEL_DIR/config.json" 100
-download_and_verify "$EMBED_TOKENIZER_URL" "$MODEL_DIR/tokenizer_embed.json" 100000
+download_and_verify "$EMBED_MODEL_URL" "$MODEL_DIR/model.safetensors" 53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db
+download_and_verify "$EMBED_CONFIG_URL" "$MODEL_DIR/config.json" 953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41
+download_and_verify "$EMBED_TOKENIZER_URL" "$MODEL_DIR/tokenizer_embed.json" be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037
 
 # Clean up old Qwen models if present (save ~400MB)
 rm -f "$MODEL_DIR/qwen2.5-0.5b-instruct-q4_k_m.gguf"
