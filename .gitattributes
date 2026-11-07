@@ -16,6 +16,11 @@ Dockerfile* text eol=lf
 
 # Model metadata is checksum-verified by setup.sh against the LF upstream
 # blobs; CRLF checkout would fail the SHA and be re-downloaded on every start.
+# Upgrade: existing CRLF checkouts may retain their line endings. Back up or
+# stash local changes first, then re-check out the tracked model JSON files once
+# before restarting (run from the repository root):
+# git checkout-index --force -- services/intent-engine/models/*.json
+# Otherwise setup.sh may delete the metadata and require a download that can fail.
 services/intent-engine/models/*.json text eol=lf
 
 # Binary files
