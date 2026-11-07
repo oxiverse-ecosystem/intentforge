@@ -4966,10 +4966,9 @@ fn commerce_wall_for_elapsed(elapsed: std::time::Duration) -> std::time::Duratio
     // `saturating_sub` on each step: a request that has already overrun the
     // budget yields ZERO rather than wrapping, and the wave loop then skips
     // enrichment entirely (results keep honest null provenance).
-    budget
+    ceiling
+        .min(budget.saturating_sub(headroom))
         .saturating_sub(elapsed)
-        .saturating_sub(headroom)
-        .min(ceiling)
 }
 
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
