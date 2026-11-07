@@ -451,8 +451,56 @@ make dev-port-check
 
 ---
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:60fe5b801eebaa506b5463ea54609970cf73493262a59a767292c78bdb868ee5 -->
+
+### DNS configuration and upgrades
+
+In the development stack, `services/shared-signals/resolv-gluetun.conf` and
+`resolv-gateway.conf` contain `nameserver 127.0.0.11` and `options ndots:0`.
+Docker's embedded resolver answers service aliases. Gluetun's Compose `dns:
+[127.0.0.1]` setting forwards external queries to Gluetun's DNS listener in the
+VPN network namespace; `DNS_ADDRESS=127.0.0.1` binds that listener locally.
+Keep Gluetun's DNS server enabled (do not enable `DNS_KEEP_NAMESERVER`, which
+disables it). Do not replace the upstream with a host resolver or public DNS IP.
+The independent Tor2 resolver `resolv-searxng-host.conf` is a separate path.
+
+The two VPN resolver files are tracked defaults in this version; older/local
+installations may ignore them. Before updating, back up **both** files outside
+the checkout so customized DNS settings survive updates and container recreation:
+
+```bash
+# From the repository root, before updating:
+backup_dir="$HOME/intentforge-dns-backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$backup_dir"
+cp services/shared-signals/resolv-gluetun.conf "$backup_dir/"
+cp services/shared-signals/resolv-gateway.conf "$backup_dir/"
+# Keep backup_dir available in this shell across the update.
+```
+
+After updating, recreate the development containers, then restore the customized
+contents in place (preserving the bind-mounted file inodes):
+
+```bash
+docker compose -f services/docker-compose.dev.yml up -d --force-recreate
+cat "$backup_dir/resolv-gluetun.conf" > services/shared-signals/resolv-gluetun.conf
+cat "$backup_dir/resolv-gateway.conf" > services/shared-signals/resolv-gateway.conf
+```
+
+Check custom settings against the forwarding arrangement above before restoring;
+legacy host/public upstreams need migrating to the VPN-local listener. Verify
+service discovery and external resolution from the gateway after restoration:
+
+```bash
+docker compose -f services/docker-compose.dev.yml exec gateway getent hosts searxng2
+docker compose -f services/docker-compose.dev.yml exec gateway getent hosts huggingface.co
+```
+
 ## Deployment
 
+
+<!-- /coderabbit-ai-generated:v1 -->
 ### Production Stack
 
 The production stack (see `services/docker-compose.prod.yml`) adds:
