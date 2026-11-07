@@ -2,3 +2,6 @@
 *
 !.gitignore
 !resolv-gateway.conf
+
+!resolv-gluetun.conf
+!resolv-searxng-host.conf

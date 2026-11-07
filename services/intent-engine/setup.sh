@@ -28,8 +28,18 @@ download_and_verify() {
     fi
 
     echo "Downloading $URL..."
-    rm -f "$TMP"
-    curl -fL --retry 5 --retry-delay 2 "$URL" -o "$TMP"
+    # Resume a partial download rather than restarting from zero: the model is
+    # ~86MB and the VPN tunnel can drop mid-transfer. curl falls back to a
+    # full download if the server ignores Range.
+    if [ -f "$TMP" ]; then
+        TMP_SIZE=$(wc -c < "$TMP" 2>/dev/null || echo 0)
+        if [ "$TMP_SIZE" -ge "$MIN_SIZE" ]; then
+            mv "$TMP" "$TARGET"
+            echo "Successfully downloaded $TARGET (size $TMP_SIZE bytes)."
+            return 0
+        fi
+    fi
+    curl -fL -C - --retry 5 --retry-delay 2 "$URL" -o "$TMP"
     TMP_SIZE=$(wc -c < "$TMP" 2>/dev/null || echo 0)
     if [ "$TMP_SIZE" -ge "$MIN_SIZE" ]; then
         mv "$TMP" "$TARGET"

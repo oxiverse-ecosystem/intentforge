@@ -25,7 +25,11 @@ tmp/
 services/privacy-layer/tor/data/
 services/privacy-layer/tor2/data/
 services/traefik/acme/
-shared-signals/
+shared-signals/*
+!shared-signals/.gitignore
+!shared-signals/resolv-gateway.conf
+!shared-signals/resolv-gluetun.conf
+!shared-signals/resolv-searxng-host.conf
 
 # Test artifacts
 searx_test.json
