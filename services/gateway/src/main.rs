@@ -18147,6 +18147,13 @@ async fn handle_search(
             raw_neg.push(en.clone());
         }
     }
+    // Route engine Exclusion entities through the same is_real_exclusion gate and
+    // merge survivors into raw_neg so they are honored as real exclusions.
+    for e in &engine_exclusions {
+        if !raw_neg.contains(e) {
+            raw_neg.push(e.clone());
+        }
+    }
     let mut gated_neg_dedup: Vec<String> = Vec::new();
     let mut explicit_survivors: Vec<String> = Vec::new();
     let mut soft_negatives: Vec<String> = Vec::new();
