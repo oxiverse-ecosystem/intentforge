@@ -14251,9 +14251,6 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    // P12 fix: leave resolved=None when there is no explicit or IP-derived
-    // location. Never fabricate a country/city fallback. Keep in sync with
-    // /search, which also returns None here.
     GeolocateResponse {
         query: q.to_string(),
         resolved: None,
@@ -15422,10 +15419,23 @@ async fn handle_search(
         None => geo_location,
     };
 
-    // P12 fix: leave geo_location=None when there is no explicit and no
-    // IP-derived location. Never fabricate a country/city fallback (was
-    // previously a hardcoded "New York", then a country-level India default).
-    // Keep /search and /geolocate in sync: both return None here.
+    // Country-level fallback for local-intent queries: when there is no explicit
+    // place and no IP-derived geolocation, but the query has local intent, anchor
+    // to a country-level fallback (India) so geo_location is detected. No
+    // city/coordinates/postal_code are fabricated, so is_inferred_location keeps
+    // it out of `positive`/upstream query. Mirrors build_geolocate.
+    if geo_location.is_none() && has_local_intent(&q) {
+        geo_location = Some(geoloc::GeoLocation {
+            city: None,
+            region: None,
+            country_code: Some("IN".to_string()),
+            country_name: Some("India".to_string()),
+            latitude: None,
+            longitude: None,
+            time_zone: None,
+            postal_code: None,
+        });
+    }
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
     // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
