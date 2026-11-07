@@ -14,6 +14,10 @@ Dockerfile* text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 
+# Model metadata is checksum-verified by setup.sh against the LF upstream
+# blobs; CRLF checkout would fail the SHA and be re-downloaded on every start.
+services/intent-engine/models/*.json text eol=lf
+
 # Binary files
 *.mmdb binary
 *.tar.gz binary
