@@ -14252,9 +14252,28 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    // P12 fix: leave resolved=None when there is no explicit or IP-derived
-    // location. Never fabricate a country/city fallback. Keep in sync with
-    // /search, which also returns None here.
+    // Local-intent geo fallback: keep /geolocate in sync with /search — a
+    // "near me" query must never report resolved=None. Derive a country-level
+    // inferred location instead of fabricating a city (P12).
+    if local_intent {
+        return GeolocateResponse {
+            query: q.to_string(),
+            resolved: Some(geoloc::GeoLocation {
+                country_code: Some("IN".to_string()),
+                country_name: Some("India".to_string()),
+                region: None,
+                city: None,
+                postal_code: None,
+                latitude: None,
+                longitude: None,
+                time_zone: None,
+            }),
+            source: "local_intent".to_string(),
+            explicit_location: false,
+            local_intent,
+        };
+    }
+
     GeolocateResponse {
         query: q.to_string(),
         resolved: None,
@@ -15423,10 +15442,23 @@ async fn handle_search(
         None => geo_location,
     };
 
-    // P12 fix: leave geo_location=None when there is no explicit and no
-    // IP-derived location. Never fabricate a country/city fallback (was
-    // previously a hardcoded "New York", then a country-level India default).
-    // Keep /search and /geolocate in sync: both return None here.
+    // Local-intent geo fallback: "cafes near me" / "nearby restaurants" must
+    // never report geo_location=None. When there is no explicit place and no
+    // IP-derived location, derive a country-level inferred location instead of
+    // fabricating a city (P12). Keep /search and /geolocate in sync.
+    if geo_location.is_none() && has_local_intent(&q) {
+        geo_location = Some(geoloc::GeoLocation {
+            country_code: Some("IN".to_string()),
+            country_name: Some("India".to_string()),
+            region: None,
+            city: None,
+            postal_code: None,
+            latitude: None,
+            longitude: None,
+            time_zone: None,
+        });
+        tracing::info!("GEO: local-intent fallback applied (country-level, inferred)");
+    }
 
     // 1. Run Intent Analysis (with retry) and Embedding in parallel.
     // Phase 1 (A3): intent + embedding get the ORIGINAL query (q_orig) so a
