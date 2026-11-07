@@ -14252,25 +14252,6 @@ fn build_geolocate(geo_locator: Option<&geoloc::GeoLocator>, q: &str, ip: Option
         }
     }
 
-    if local_intent {
-        return GeolocateResponse {
-            query: q.to_string(),
-            resolved: Some(geoloc::GeoLocation {
-                city: None,
-                region: None,
-                country_code: Some("IN".to_string()),
-                country_name: Some("India".to_string()),
-                latitude: None,
-                longitude: None,
-                time_zone: None,
-                postal_code: None,
-            }),
-            source: "local_intent_fallback".to_string(),
-            explicit_location: false,
-            local_intent,
-        };
-    }
-
     GeolocateResponse {
         query: q.to_string(),
         resolved: None,
