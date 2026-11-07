@@ -4925,7 +4925,7 @@ const MAX_PARALLEL_FETCH: usize = 4;
 /// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
 /// This is now only the CEILING for `commerce_wall_for_elapsed`, never the value
 /// used unconditionally — see that function for why a flat cap is unsafe.
-const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 15;
+const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 4;
 
 /// The global request budget enforced by the `TimeoutLayer` wrapped around the
 /// router (see the `.layer(TimeoutLayer::new(...))` call). Kept as a named
@@ -4966,10 +4966,9 @@ fn commerce_wall_for_elapsed(elapsed: std::time::Duration) -> std::time::Duratio
     // `saturating_sub` on each step: a request that has already overrun the
     // budget yields ZERO rather than wrapping, and the wave loop then skips
     // enrichment entirely (results keep honest null provenance).
-    budget
+    ceiling
+        .min(budget.saturating_sub(headroom))
         .saturating_sub(elapsed)
-        .saturating_sub(headroom)
-        .min(ceiling)
 }
 
 /// True when ANY result in the slice carries a REAL `commerce` block (i.e. its
