@@ -7348,7 +7348,10 @@ fn calibrate_scores(scores: &mut [f32]) {
         }
         return;
     }
-    let ceil = 1.0f32;
+    // FIX-IF-35: do NOT pin the set maximum to a constant 1.0. The ceiling must
+    // reflect the absolute best raw score so that s=1.000 carries real meaning
+    // (earned confidence) rather than being purely positional ("rank #1 of set").
+    let ceil = raw_max.clamp(floor, 1.0f32);
     let span = ceil - floor;
     let norm = raw_max - raw_min;
     for score in scores.iter_mut() {
@@ -7897,6 +7900,11 @@ const EXCLUSION_GRAMMAR_NOISE: &[&str] = &[
     "this", "these", "those", "what", "when", "where", "who", "why", "how",
     "their", "them", "they", "our", "your", "his", "her", "its", "the", "a", "an",
     "and", "or", "but", "not", "no", "any", "some", "all", "each", "every", "of",
+    // Discourse fillers / interjections: carry no topical signal. A result whose
+    // entire surviving match is one of these (e.g. "heygen.com" matching "hey")
+    // must be suppressed rather than surfaced as a top hit.
+    "hey", "hi", "hello", "yo", "hmm", "uh", "um", "oh", "ah", "okay", "ok",
+    "yeah", "yep", "nope", "well", "so", "like",
 ];
 
 /// True if `term` is a subjective-quality/sentiment adjective or a grammar-noise
@@ -20257,7 +20265,19 @@ fn apply_search_intent_overrides(
         // Delegates to `has_local_intent` so the keyword list stays in ONE
         // place. This covers "near me", "nearby", "coffee shop", AND
         // gazetteer-city patterns like "restaurants in bangalore".
-        let has_local_keywords = has_local_intent(&q_lower);
+        // FIX-IF-37: a trailing geo qualifier ("... in india") must NOT hijack a
+        // how-to/informational head. Only treat as local when the query's primary
+        // head is not an informational/how-to question.
+        let informational_head = q_lower.starts_with("what is ")
+            || q_lower.starts_with("what are ")
+            || q_lower.starts_with("how to ")
+            || q_lower.starts_with("how do ")
+            || q_lower.starts_with("how can ")
+            || q_lower.starts_with("how should ")
+            || q_lower.starts_with("guide to ")
+            || q_lower.starts_with("easiest way")
+            || q_lower.contains("easiest way to");
+        let has_local_keywords = has_local_intent(&q_lower) && !informational_head;
         if has_local_keywords && intent.intent != "local" {
             tracing::info!(
                 "INTENT OVERRIDE (STRONG): local query '{}' was '{}' (conf={:.3}) -> local",
