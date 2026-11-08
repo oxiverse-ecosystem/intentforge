@@ -3358,7 +3358,7 @@ struct CommerceBlock<T> {
     /// When the page facts were observed (Unix seconds, UTC). A stale/unknown
     /// fetch time must be labelled, never presented as current.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    observed_at: Option<String>,
+    observed_at: Option<u64>,
     /// Where the facts came from: "json-ld", "og", or "none". Structured
     /// extraction only — no heuristic. Surfaced so the frontend can label
     /// provenance.
@@ -3402,7 +3402,7 @@ struct MerchantOffer {
     /// Provenance for THIS offer's price: the source URL + when its facts were
     /// observed. Never presented as "current" without this label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    observed_at: Option<String>,
+    observed_at: Option<u64>,
     /// Where the facts came from on that page: "json-ld" | "og" | "none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<String>,
@@ -3428,7 +3428,7 @@ struct OfferComparison {
 /// Extract the gtin/sku + observed_at from a single ranked result's `commerce`
 /// block. Returns None when the result has no usable product identifier (so it
 /// cannot participate in a comparison).
-fn offer_key_from_result(r: &serde_json::Value) -> Option<(String, String, Option<String>)> {
+fn offer_key_from_result(r: &serde_json::Value) -> Option<(String, String, Option<u64>)> {
     let data = r
         .get("commerce")
         .and_then(|c| c.get("data"))
@@ -3438,8 +3438,7 @@ fn offer_key_from_result(r: &serde_json::Value) -> Option<(String, String, Optio
     let observed = r
         .get("commerce")
         .and_then(|c| c.get("observed_at"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .and_then(json_get_u64);
     match (gtin, sku) {
         (Some(g), _) => Some((g, "gtin".to_string(), observed)),
         (None, Some(s)) => Some((s, "sku".to_string(), observed)),
@@ -3452,7 +3451,7 @@ fn offer_key_from_result(r: &serde_json::Value) -> Option<(String, String, Optio
 /// attached to each result. Never reorders or reselects results.
 fn build_offer_comparisons(results: &[serde_json::Value]) -> Vec<OfferComparison> {
     use std::collections::HashMap;
-    let mut groups: HashMap<String, (String, Vec<(Option<String>, MerchantOffer)>)> =
+    let mut groups: HashMap<String, (String, Vec<(Option<u64>, MerchantOffer)>)> =
         HashMap::new();
     for r in results {
         let (pid, kind, observed) = match offer_key_from_result(r) {
@@ -3509,7 +3508,7 @@ fn build_offer_comparisons(results: &[serde_json::Value]) -> Vec<OfferComparison
             (None, None) => std::cmp::Ordering::Equal,
         });
         let mixed = {
-            let times: Vec<&Option<String>> = offers.iter().map(|(o, _)| o).collect();
+            let times: Vec<&Option<u64>> = offers.iter().map(|(o, _)| o).collect();
             let first = times.first().and_then(|o| o.as_ref());
             times.iter().any(|o| o.as_ref() != first)
         };
@@ -3523,13 +3522,12 @@ fn build_offer_comparisons(results: &[serde_json::Value]) -> Vec<OfferComparison
     out
 }
 
-/// Coarse UTC observation timestamp without extra crates.
-fn now_unix_string() -> String {
-    let secs = std::time::SystemTime::now()
+/// Coarse UTC observation timestamp (Unix seconds) without extra crates.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{}", secs)
+        .unwrap_or(0)
 }
 
 /// Parse a JSON value as f64 whether it is a number OR a numeric string
@@ -3946,7 +3944,7 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
 
     CommerceOffer {
         url: Some(url.to_string()),
-        observed_at: Some(now_unix_string()),
+        observed_at: Some(now_unix()),
         source,
         data: Some(facts),
     }
@@ -4629,7 +4627,7 @@ async fn enrich_with_commerce<F, Fut>(
             if data_has_fact(&facts) {
                 let offer = CommerceOffer {
                     url: Some(url.clone()),
-                    observed_at: Some(now_unix_string()),
+                    observed_at: Some(now_unix()),
                     source: Some("snippet_extracted".to_string()),
                     data: Some(facts),
                 };
@@ -4640,7 +4638,7 @@ async fn enrich_with_commerce<F, Fut>(
         }
         let provenance = serde_json::json!({
             "url": url,
-            "observed_at": now_unix_string(),
+            "observed_at": now_unix(),
             "source": r.get("commerce").and_then(|c| c.get("source")).and_then(|s| s.as_str()),
             "data": r.get("commerce").and_then(|c| c.get("data")),
         });
@@ -4908,7 +4906,7 @@ async fn enrich_with_commerce_par<F, Fut>(
                 .to_string();
             let provenance = serde_json::json!({
                 "url": url,
-                "observed_at": now_unix_string(),
+                "observed_at": now_unix(),
                 "source": null,
                 "data": null,
             });
@@ -23909,8 +23907,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn observed_at_is_always_set() {
         let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
         assert!(o.observed_at.is_some());
-        // A unix-second string is digits only.
-        assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
+        // Unix seconds -- a number, not a numeric string.
+        assert!(o.observed_at.unwrap() > 0);
     }
 
     #[test]
@@ -24544,7 +24542,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             p["source"]
         );
         assert!(
-            p["observed_at"].as_str().is_some(),
+            p["observed_at"].as_u64().is_some(),
             "provenance must carry observed_at for an attached fact"
         );
         assert!(
@@ -24553,8 +24551,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         );
         // observed_at must match the attached offer's own stamp (same observation).
         assert_eq!(
-            p["observed_at"].as_str().unwrap(),
-            r["commerce"]["observed_at"].as_str().unwrap()
+            p["observed_at"].as_u64().unwrap(),
+            r["commerce"]["observed_at"].as_u64().unwrap()
         );
     }
 
@@ -24669,7 +24667,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
                 "provenance url must be the exact result url the facts came from"
             );
             assert!(
-                r["commerce_provenance"]["observed_at"].as_str().is_some(),
+                r["commerce_provenance"]["observed_at"].as_u64().is_some(),
                 "every attached fact carries observed_at provenance"
             );
         }
