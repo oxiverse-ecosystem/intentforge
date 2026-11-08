@@ -28,7 +28,12 @@ fn extract_api_key(headers: &HeaderMap) -> Option<String> {
 }
 fn valid_api_keys() -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
-    set.insert("intentforge-dev-key".to_string());
+    // Built-in development key. Accepted only when the dev compose stack sets
+    // INTENTFORGE_DEV_MODE=1; production must configure INTENTFORGE_API_KEYS
+    // instead, so a committed credential can never grant access there.
+    if std::env::var("INTENTFORGE_DEV_MODE").map(|v| v == "1").unwrap_or(false) {
+        set.insert("intentforge-dev-key".to_string());
+    }
     if let Ok(env) = std::env::var("INTENTFORGE_API_KEYS") {
         for k in env.split(',') { let k=k.trim(); if !k.is_empty() { set.insert(k.to_string()); } }
     }
@@ -4494,7 +4499,37 @@ async fn handle_commerce_extract(
     Json(body): Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let html = body.get("html").and_then(|v| v.as_str()).unwrap_or("");
-    let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+
+    // Validate the input. A missing/blank URL (or a non-http(s) one) used to
+    // return 200 with an empty `data` object, which reads as "extracted
+    // nothing" rather than "bad request". `html` alone is a valid request --
+    // the URL is only needed for merchant/domain facts.
+    if html.trim().is_empty() && url.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "empty_request",
+                "message": "Provide a non-empty 'url' and/or 'html' to extract from"
+            })),
+        );
+    }
+    if !url.is_empty() {
+        match reqwest::Url::parse(url) {
+            Ok(parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {}
+            _ => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_url",
+                        "message": "parameter 'url' must be an absolute http(s) URL",
+                        "url": url
+                    })),
+                );
+            }
+        }
+    }
+
     let offer = extract_commerce_offer(html, url);
     match serde_json::to_value(&offer) {
         Ok(v) => (axum::http::StatusCode::OK, Json(v)),
@@ -13293,6 +13328,19 @@ struct AppState {
     exact_model_config: ExactModelConfig,
 }
 
+/// Apply the optional `limit` to a `{results, count, query}` media response.
+/// The cache stores the full result set, so truncation happens on read and a
+/// cached response can still serve a different page size.
+fn apply_media_limit(mut value: serde_json::Value, limit: Option<usize>) -> serde_json::Value {
+    let Some(limit) = limit else { return value };
+    if let Some(arr) = value.get_mut("results").and_then(|v| v.as_array_mut()) {
+        arr.truncate(limit);
+    }
+    let n = value.get("results").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    value["count"] = serde_json::json!(n);
+    value
+}
+
 async fn handle_images(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
@@ -13315,7 +13363,7 @@ async fn handle_images(
     let cache_key = format!("images:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return (axum::http::StatusCode::OK, Json(value));
+        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
     }
 
     // Resolve client geolocation for location-aware image search
@@ -13412,7 +13460,7 @@ async fn handle_images(
         }
     }
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "results": results,
         "count": results.len(),
         "query": q,
@@ -13423,7 +13471,7 @@ async fn handle_images(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    (axum::http::StatusCode::OK, Json(response))
+    (axum::http::StatusCode::OK, Json(apply_media_limit(response, params.limit)))
 }
 
 async fn handle_videos(
@@ -13448,7 +13496,7 @@ async fn handle_videos(
     let cache_key = format!("videos:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return (axum::http::StatusCode::OK, Json(value));
+        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
     }
 
     // Resolve client geolocation for location-aware video search
@@ -13621,7 +13669,7 @@ async fn handle_videos(
         }
     }
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "results": results,
         "count": results.len(),
         "query": q,
@@ -13632,7 +13680,7 @@ async fn handle_videos(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    (axum::http::StatusCode::OK, Json(response))
+    (axum::http::StatusCode::OK, Json(apply_media_limit(response, params.limit)))
 }
 
 async fn handle_news(
@@ -13657,7 +13705,7 @@ async fn handle_news(
     let cache_key = format!("news:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return (axum::http::StatusCode::OK, Json(value));
+        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
     }
 
     // Resolve client geolocation for location-aware news search
@@ -13761,7 +13809,7 @@ async fn handle_news(
         }
     }
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "results": results,
         "count": results.len(),
         "query": q,
@@ -13772,7 +13820,7 @@ async fn handle_news(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    (axum::http::StatusCode::OK, Json(response))
+    (axum::http::StatusCode::OK, Json(apply_media_limit(response, params.limit)))
 }
 
 /// Generic stopwords shared by the recall-gap / distinctive-term extractors.
@@ -18860,6 +18908,19 @@ let mut results = match tokio::task::spawn_blocking(move || {
         };
     let mut paginated_results = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
 
+    // Backfill `published_date` from the same resolver the date filter uses
+    // (upstream value, then a year in the URL, then a date in the title/content
+    // snippet). Upstream engines attach a date to only a minority of results, so
+    // without this the field is almost always absent and clients cannot do their
+    // own date filtering. Runs AFTER filtering, so filter behaviour is unchanged.
+    for r in paginated_results.iter_mut() {
+        if r.published_date.is_none() {
+            if let Some((y, m, d)) = resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content) {
+                r.published_date = Some(format!("{:04}-{:02}-{:02}", y, m, d));
+            }
+        }
+    }
+
     // ─── Constraint transparency (applied / ignored / warnings) ───
     // D3 (price bound reporting): re-apply the user's stated price bound into the
     // RESPONSE's structured_constraints. The fail-open below only disables price
@@ -19243,7 +19304,9 @@ let mut results = match tokio::task::spawn_blocking(move || {
         None
     };
     let response = UnifiedResponse {
-        query: q.clone(),
+        // The user's query exactly as typed. The corrected form (when one was
+        // applied) is reported separately in `spell_corrected_query`.
+        query: q_trimmed.to_string(),
         intent: Some(intent.intent.clone()),
         category: Some(parent_category(&intent.intent)),
         confidence: Some(intent.confidence),
@@ -19254,7 +19317,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         deep_result,
         results: paginated_results,
         geo_location,
-        spell_corrected_query: if spell_changed { Some(q_cleaned_spelling.clone()) } else { None },
+        spell_corrected_query: if spell_changed { Some(q.clone()) } else { None },
         error,
         message,
         query_quality: if qflag == "low" { Some("low".to_string()) } else { None },
