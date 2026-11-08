@@ -22104,40 +22104,64 @@ mod constraint_fix_tests {
     }
 
     #[test]
-    fn preprocess_preserves_native_operators() {
-        // BUG1a: intitle:/inurl:/intext: must be FORWARDED to SearXNG,
-        // not stripped (the old behaviour zeroed out `rust inurl:blog` → `rust`).
-        let q = preprocess_searxng_query("rust inurl:blog");
-        assert!(q.contains("inurl:blog"), "inurl: must survive preprocessing, got: '{}'", q);
+    fn preprocess_operator_forwarding() {
+        // BUG1a: `intitle:` IS implemented by SearXNG, so it must be forwarded.
         let q2 = preprocess_searxng_query("cli intitle:deploy");
         assert!(q2.contains("intitle:deploy"), "intitle: must survive preprocessing, got: '{}'", q2);
-        let q3 = preprocess_searxng_query("docs intext:quickstart");
-        assert!(q3.contains("intext:quickstart"), "intext: must survive preprocessing, got: '{}'", q3);
-        // Non-operator term is retained alongside the operator.
+        // `inurl:`/`intext:` are NOT implemented by SearXNG (verified live: it
+        // searches the operator text as literals and returns unrelated pages), so
+        // forwarding them pollutes the candidate pool. They are enforced locally
+        // by should_filter_by_constraints instead and must be stripped here.
+        let q = preprocess_searxng_query("rust inurl:blog");
+        assert!(!q.contains("inurl:"), "inurl: must be stripped (SearXNG does not implement it), got: '{}'", q);
         assert!(q.contains("rust"), "operator query must keep its plain term, got: '{}'", q);
+        let q3 = preprocess_searxng_query("docs intext:quickstart");
+        assert!(!q3.contains("intext:"), "intext: must be stripped (SearXNG does not implement it), got: '{}'", q3);
+        assert!(q3.contains("docs"), "operator query must keep its plain term, got: '{}'", q3);
     }
 
     #[test]
-    fn intitle_inurl_no_longer_hard_drop() {
-        // BUG1b: should_filter_by_constraints must NOT hard-drop results that
-        // lack the intitle:/inurl:/intext: token. The engine enforces upstream;
-        // the gateway only boosts. A bare result for `rust inurl:blog` must pass.
+    fn inurl_intext_are_hard_filtered_locally() {
+        // BUG1b (revised): SearXNG ignores `inurl:`/`intext:`, so the gateway is
+        // the only enforcer and the predicate DOES hard-drop non-matching results.
+        // The handler applies a fail-open net so a strict drop can never empty a
+        // non-empty page.
         let mut c = cst();
         c.inurl = vec!["blog".to_string()];
-        let kept = should_filter_by_constraints(
-            "Rust blog",
-            "A rust programming blog post",
-            "https://example.com/about", // does NOT contain "blog" in url
-            None,
-            &c,
+        assert!(
+            should_filter_by_constraints(
+                "Rust blog",
+                "A rust programming blog post",
+                "https://example.com/about", // does NOT contain "blog" in url
+                None,
+                &c,
+            ),
+            "inurl: must hard-drop a result whose URL lacks the token"
         );
-        assert!(!kept, "inurl: must NOT hard-drop when engine is the enforcer (was the n=0 trap)");
-        // And the boost rewards results that DO satisfy the operator.
-        let mut c2 = cst();
-        c2.inurl = vec!["blog".to_string()];
-        let boost = constraint_boost("Rust blog", "post", "https://example.com/blog/rust", &c2);
+        assert!(
+            !should_filter_by_constraints(
+                "Rust blog",
+                "A rust programming blog post",
+                "https://example.com/blog/rust",
+                None,
+                &c,
+            ),
+            "inurl: must keep a result whose URL carries the token"
+        );
+        let mut c3 = cst();
+        c3.intext = vec!["borrow".to_string()];
+        assert!(
+            should_filter_by_constraints("Rust", "nothing here", "https://example.com/x", None, &c3),
+            "intext: must hard-drop a result whose content lacks the token"
+        );
+        assert!(
+            !should_filter_by_constraints("Rust", "the borrow checker", "https://example.com/x", None, &c3),
+            "intext: must keep a result whose content carries the token"
+        );
+        // The boost still rewards results that satisfy the operator.
+        let boost = constraint_boost("Rust blog", "post", "https://example.com/blog/rust", &c);
         assert!(boost > 0.0, "inurl:-matching result should receive a positive boost");
-        let boost_none = constraint_boost("Rust", "post", "https://example.com/x", &c2);
+        let boost_none = constraint_boost("Rust", "post", "https://example.com/x", &c);
         assert_eq!(boost_none, 0.0, "non-matching result should get no intitle/inurl/intext boost");
     }
 
