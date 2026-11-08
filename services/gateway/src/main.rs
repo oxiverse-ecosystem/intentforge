@@ -28,7 +28,12 @@ fn extract_api_key(headers: &HeaderMap) -> Option<String> {
 }
 fn valid_api_keys() -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
-    set.insert("intentforge-dev-key".to_string());
+    // Built-in development key. Accepted only when the dev compose stack sets
+    // INTENTFORGE_DEV_MODE=1; production must configure INTENTFORGE_API_KEYS
+    // instead, so a committed credential can never grant access there.
+    if std::env::var("INTENTFORGE_DEV_MODE").map(|v| v == "1").unwrap_or(false) {
+        set.insert("intentforge-dev-key".to_string());
+    }
     if let Ok(env) = std::env::var("INTENTFORGE_API_KEYS") {
         for k in env.split(',') { let k=k.trim(); if !k.is_empty() { set.insert(k.to_string()); } }
     }
