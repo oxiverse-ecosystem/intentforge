@@ -302,6 +302,11 @@ Search operators are parsed directly from the query string:
 | `not X` / `without X` | `python not django` | Negative constraint (natural language) |
 | `vs` / `versus` | `react vs vue` | Comparison intent |
 
+`intitle:` is applied by the upstream engine. `inurl:` and `intext:` are applied
+by the gateway itself, because SearXNG does not implement them (it would search
+the operator text as literals). All three are fail-open: if enforcement would
+empty a non-empty result set, the unfiltered set is kept.
+
 **Natural language date ranges** are automatically converted:
 - `"past 7 days"`, `"last week"`, `"this month"`, `"yesterday"`, `"recent"`, `"latest"`
 
