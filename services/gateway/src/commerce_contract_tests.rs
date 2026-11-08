@@ -646,7 +646,7 @@ fn item6_bf_fbu_never_change_ranking() {
 /// attached `commerce` blocks. These tests prove it groups by gtin/sku, sorts by
 /// extracted price, and flags mixed observation times — and never reorders results.
 /// ─────────────────────────────────────────────────────────────────────────────
-fn commerce_result(url: &str, gtin: &str, price: f64, observed_at: &str) -> Value {
+fn commerce_result(url: &str, gtin: &str, price: f64, observed_at: u64) -> Value {
     json!({
         "url": url,
         "commerce": {
@@ -666,9 +666,9 @@ fn commerce_result(url: &str, gtin: &str, price: f64, observed_at: &str) -> Valu
 #[test]
 fn item5_groups_by_gtin_sorts_by_price_and_flags_mixed_times() {
     let results = vec![
-        commerce_result("https://a.example/prod", "GTIN1", 19.99, "100"),
-        commerce_result("https://b.example/prod", "GTIN1", 9.99, "200"),
-        commerce_result("https://c.example/other", "GTIN2", 5.00, "300"),
+        commerce_result("https://a.example/prod", "GTIN1", 19.99, 100),
+        commerce_result("https://b.example/prod", "GTIN1", 9.99, 200),
+        commerce_result("https://c.example/other", "GTIN2", 5.00, 300),
     ];
     let comps = build_offer_comparisons(&results);
     // GTIN1 has 2 offers => one comparison. GTIN2 has only 1 offer => correctly
@@ -700,8 +700,8 @@ fn item5_groups_by_gtin_sorts_by_price_and_flags_mixed_times() {
 #[test]
 fn item5_no_comparison_without_shared_id() {
     let results = vec![
-        commerce_result("https://a.example/prod", "GTIN_A", 19.99, "100"),
-        commerce_result("https://b.example/prod", "GTIN_B", 9.99, "100"),
+        commerce_result("https://a.example/prod", "GTIN_A", 19.99, 100),
+        commerce_result("https://b.example/prod", "GTIN_B", 9.99, 100),
     ];
     let comps = build_offer_comparisons(&results);
     assert!(

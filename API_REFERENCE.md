@@ -1663,13 +1663,13 @@ Top result (truncated):
   "title": "Best Wireless Earbuds Under $50 2026: 10 Budget Models Tested",
   "commerce_provenance": {
     "data": null,
-    "observed_at": "1787637896",
+    "observed_at": 1787637896,
     "source": null,
     "url": "https://powersof10.com/best-wireless-earbuds-under-50/"
   },
   "commerce": {
     "data": { "merchant": "Powers Of 10" },
-    "observed_at": "1787637898",
+    "observed_at": 1787637898,
     "source": "og",
     "url": "https://powersof10.com/best-wireless-earbuds-under-50/"
   },
@@ -1843,6 +1843,9 @@ facts).
 `merchant`, `condition`, `sku`, `gtin`, `rating`, `price_low`, `price_high`,
 `offer_count`, `observed_at`, `source`). All fields `Optional`. If the page has no
 structured product data, the returned object carries `null` for every fact (no guess).
+
+`observed_at` is a Unix timestamp in **seconds** serialized as a JSON number
+(e.g. `1794116489`), not a numeric string.
 
 **Honesty properties (locked by unit tests):**
 
