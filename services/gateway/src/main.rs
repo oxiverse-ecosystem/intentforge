@@ -28,7 +28,12 @@ fn extract_api_key(headers: &HeaderMap) -> Option<String> {
 }
 fn valid_api_keys() -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
-    set.insert("intentforge-dev-key".to_string());
+    // Built-in development key. Accepted only when the dev compose stack sets
+    // INTENTFORGE_DEV_MODE=1; production must configure INTENTFORGE_API_KEYS
+    // instead, so a committed credential can never grant access there.
+    if std::env::var("INTENTFORGE_DEV_MODE").map(|v| v == "1").unwrap_or(false) {
+        set.insert("intentforge-dev-key".to_string());
+    }
     if let Ok(env) = std::env::var("INTENTFORGE_API_KEYS") {
         for k in env.split(',') { let k=k.trim(); if !k.is_empty() { set.insert(k.to_string()); } }
     }
@@ -3358,7 +3363,7 @@ struct CommerceBlock<T> {
     /// When the page facts were observed (Unix seconds, UTC). A stale/unknown
     /// fetch time must be labelled, never presented as current.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    observed_at: Option<String>,
+    observed_at: Option<u64>,
     /// Where the facts came from: "json-ld", "og", or "none". Structured
     /// extraction only — no heuristic. Surfaced so the frontend can label
     /// provenance.
@@ -3402,7 +3407,7 @@ struct MerchantOffer {
     /// Provenance for THIS offer's price: the source URL + when its facts were
     /// observed. Never presented as "current" without this label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    observed_at: Option<String>,
+    observed_at: Option<u64>,
     /// Where the facts came from on that page: "json-ld" | "og" | "none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<String>,
@@ -3428,7 +3433,7 @@ struct OfferComparison {
 /// Extract the gtin/sku + observed_at from a single ranked result's `commerce`
 /// block. Returns None when the result has no usable product identifier (so it
 /// cannot participate in a comparison).
-fn offer_key_from_result(r: &serde_json::Value) -> Option<(String, String, Option<String>)> {
+fn offer_key_from_result(r: &serde_json::Value) -> Option<(String, String, Option<u64>)> {
     let data = r
         .get("commerce")
         .and_then(|c| c.get("data"))
@@ -3438,8 +3443,7 @@ fn offer_key_from_result(r: &serde_json::Value) -> Option<(String, String, Optio
     let observed = r
         .get("commerce")
         .and_then(|c| c.get("observed_at"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .and_then(json_get_u64);
     match (gtin, sku) {
         (Some(g), _) => Some((g, "gtin".to_string(), observed)),
         (None, Some(s)) => Some((s, "sku".to_string(), observed)),
@@ -3452,7 +3456,7 @@ fn offer_key_from_result(r: &serde_json::Value) -> Option<(String, String, Optio
 /// attached to each result. Never reorders or reselects results.
 fn build_offer_comparisons(results: &[serde_json::Value]) -> Vec<OfferComparison> {
     use std::collections::HashMap;
-    let mut groups: HashMap<String, (String, Vec<(Option<String>, MerchantOffer)>)> =
+    let mut groups: HashMap<String, (String, Vec<(Option<u64>, MerchantOffer)>)> =
         HashMap::new();
     for r in results {
         let (pid, kind, observed) = match offer_key_from_result(r) {
@@ -3509,7 +3513,7 @@ fn build_offer_comparisons(results: &[serde_json::Value]) -> Vec<OfferComparison
             (None, None) => std::cmp::Ordering::Equal,
         });
         let mixed = {
-            let times: Vec<&Option<String>> = offers.iter().map(|(o, _)| o).collect();
+            let times: Vec<&Option<u64>> = offers.iter().map(|(o, _)| o).collect();
             let first = times.first().and_then(|o| o.as_ref());
             times.iter().any(|o| o.as_ref() != first)
         };
@@ -3523,13 +3527,12 @@ fn build_offer_comparisons(results: &[serde_json::Value]) -> Vec<OfferComparison
     out
 }
 
-/// Coarse UTC observation timestamp without extra crates.
-fn now_unix_string() -> String {
-    let secs = std::time::SystemTime::now()
+/// Coarse UTC observation timestamp (Unix seconds) without extra crates.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{}", secs)
+        .unwrap_or(0)
 }
 
 /// Parse a JSON value as f64 whether it is a number OR a numeric string
@@ -3946,7 +3949,7 @@ fn extract_commerce_offer(html: &str, url: &str) -> CommerceOffer {
 
     CommerceOffer {
         url: Some(url.to_string()),
-        observed_at: Some(now_unix_string()),
+        observed_at: Some(now_unix()),
         source,
         data: Some(facts),
     }
@@ -4496,7 +4499,37 @@ async fn handle_commerce_extract(
     Json(body): Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let html = body.get("html").and_then(|v| v.as_str()).unwrap_or("");
-    let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+
+    // Validate the input. A missing/blank URL (or a non-http(s) one) used to
+    // return 200 with an empty `data` object, which reads as "extracted
+    // nothing" rather than "bad request". `html` alone is a valid request --
+    // the URL is only needed for merchant/domain facts.
+    if html.trim().is_empty() && url.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "empty_request",
+                "message": "Provide a non-empty 'url' and/or 'html' to extract from"
+            })),
+        );
+    }
+    if !url.is_empty() {
+        match reqwest::Url::parse(url) {
+            Ok(parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {}
+            _ => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_url",
+                        "message": "parameter 'url' must be an absolute http(s) URL",
+                        "url": url
+                    })),
+                );
+            }
+        }
+    }
+
     let offer = extract_commerce_offer(html, url);
     match serde_json::to_value(&offer) {
         Ok(v) => (axum::http::StatusCode::OK, Json(v)),
@@ -4629,7 +4662,7 @@ async fn enrich_with_commerce<F, Fut>(
             if data_has_fact(&facts) {
                 let offer = CommerceOffer {
                     url: Some(url.clone()),
-                    observed_at: Some(now_unix_string()),
+                    observed_at: Some(now_unix()),
                     source: Some("snippet_extracted".to_string()),
                     data: Some(facts),
                 };
@@ -4640,7 +4673,7 @@ async fn enrich_with_commerce<F, Fut>(
         }
         let provenance = serde_json::json!({
             "url": url,
-            "observed_at": now_unix_string(),
+            "observed_at": now_unix(),
             "source": r.get("commerce").and_then(|c| c.get("source")).and_then(|s| s.as_str()),
             "data": r.get("commerce").and_then(|c| c.get("data")),
         });
@@ -4908,7 +4941,7 @@ async fn enrich_with_commerce_par<F, Fut>(
                 .to_string();
             let provenance = serde_json::json!({
                 "url": url,
-                "observed_at": now_unix_string(),
+                "observed_at": now_unix(),
                 "source": null,
                 "data": null,
             });
@@ -13316,6 +13349,19 @@ struct AppState {
     exact_model_config: ExactModelConfig,
 }
 
+/// Apply the optional `limit` to a `{results, count, query}` media response.
+/// The cache stores the full result set, so truncation happens on read and a
+/// cached response can still serve a different page size.
+fn apply_media_limit(mut value: serde_json::Value, limit: Option<usize>) -> serde_json::Value {
+    let Some(limit) = limit else { return value };
+    if let Some(arr) = value.get_mut("results").and_then(|v| v.as_array_mut()) {
+        arr.truncate(limit);
+    }
+    let n = value.get("results").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    value["count"] = serde_json::json!(n);
+    value
+}
+
 async fn handle_images(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
@@ -13338,7 +13384,7 @@ async fn handle_images(
     let cache_key = format!("images:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return (axum::http::StatusCode::OK, Json(value));
+        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
     }
 
     // Resolve client geolocation for location-aware image search
@@ -13435,7 +13481,7 @@ async fn handle_images(
         }
     }
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "results": results,
         "count": results.len(),
         "query": q,
@@ -13446,7 +13492,7 @@ async fn handle_images(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    (axum::http::StatusCode::OK, Json(response))
+    (axum::http::StatusCode::OK, Json(apply_media_limit(response, params.limit)))
 }
 
 async fn handle_videos(
@@ -13471,7 +13517,7 @@ async fn handle_videos(
     let cache_key = format!("videos:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return (axum::http::StatusCode::OK, Json(value));
+        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
     }
 
     // Resolve client geolocation for location-aware video search
@@ -13644,7 +13690,7 @@ async fn handle_videos(
         }
     }
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "results": results,
         "count": results.len(),
         "query": q,
@@ -13655,7 +13701,7 @@ async fn handle_videos(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    (axum::http::StatusCode::OK, Json(response))
+    (axum::http::StatusCode::OK, Json(apply_media_limit(response, params.limit)))
 }
 
 async fn handle_news(
@@ -13680,7 +13726,7 @@ async fn handle_news(
     let cache_key = format!("news:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return (axum::http::StatusCode::OK, Json(value));
+        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
     }
 
     // Resolve client geolocation for location-aware news search
@@ -13784,7 +13830,7 @@ async fn handle_news(
         }
     }
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "results": results,
         "count": results.len(),
         "query": q,
@@ -13795,7 +13841,7 @@ async fn handle_news(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    (axum::http::StatusCode::OK, Json(response))
+    (axum::http::StatusCode::OK, Json(apply_media_limit(response, params.limit)))
 }
 
 /// Generic stopwords shared by the recall-gap / distinctive-term extractors.
@@ -18896,6 +18942,19 @@ let mut results = match tokio::task::spawn_blocking(move || {
         };
     let mut paginated_results = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
 
+    // Backfill `published_date` from the same resolver the date filter uses
+    // (upstream value, then a year in the URL, then a date in the title/content
+    // snippet). Upstream engines attach a date to only a minority of results, so
+    // without this the field is almost always absent and clients cannot do their
+    // own date filtering. Runs AFTER filtering, so filter behaviour is unchanged.
+    for r in paginated_results.iter_mut() {
+        if r.published_date.is_none() {
+            if let Some((y, m, d)) = resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content) {
+                r.published_date = Some(format!("{:04}-{:02}-{:02}", y, m, d));
+            }
+        }
+    }
+
     // ─── Constraint transparency (applied / ignored / warnings) ───
     // D3 (price bound reporting): re-apply the user's stated price bound into the
     // RESPONSE's structured_constraints. The fail-open below only disables price
@@ -19279,7 +19338,9 @@ let mut results = match tokio::task::spawn_blocking(move || {
         None
     };
     let response = UnifiedResponse {
-        query: q.clone(),
+        // The user's query exactly as typed. The corrected form (when one was
+        // applied) is reported separately in `spell_corrected_query`.
+        query: q_trimmed.to_string(),
         intent: Some(intent.intent.clone()),
         category: Some(parent_category(&intent.intent)),
         confidence: Some(intent.confidence),
@@ -19290,7 +19351,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         deep_result,
         results: paginated_results,
         geo_location,
-        spell_corrected_query: if spell_changed { Some(q_cleaned_spelling.clone()) } else { None },
+        spell_corrected_query: if spell_changed { Some(q.clone()) } else { None },
         error,
         message,
         query_quality: if qflag == "low" { Some("low".to_string()) } else { None },
@@ -23967,8 +24028,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
     fn observed_at_is_always_set() {
         let o = extract_commerce_offer(HTML_SINGLE_OFFER, "https://store.example.com/p/1");
         assert!(o.observed_at.is_some());
-        // A unix-second string is digits only.
-        assert!(o.observed_at.as_ref().unwrap().chars().all(|c| c.is_ascii_digit()));
+        // Unix seconds -- a number, not a numeric string.
+        assert!(o.observed_at.unwrap() > 0);
     }
 
     #[test]
@@ -24602,7 +24663,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
             p["source"]
         );
         assert!(
-            p["observed_at"].as_str().is_some(),
+            p["observed_at"].as_u64().is_some(),
             "provenance must carry observed_at for an attached fact"
         );
         assert!(
@@ -24611,8 +24672,8 @@ structured product data, so nothing must be extracted from the body.</p></body><
         );
         // observed_at must match the attached offer's own stamp (same observation).
         assert_eq!(
-            p["observed_at"].as_str().unwrap(),
-            r["commerce"]["observed_at"].as_str().unwrap()
+            p["observed_at"].as_u64().unwrap(),
+            r["commerce"]["observed_at"].as_u64().unwrap()
         );
     }
 
@@ -24727,7 +24788,7 @@ structured product data, so nothing must be extracted from the body.</p></body><
                 "provenance url must be the exact result url the facts came from"
             );
             assert!(
-                r["commerce_provenance"]["observed_at"].as_str().is_some(),
+                r["commerce_provenance"]["observed_at"].as_u64().is_some(),
                 "every attached fact carries observed_at provenance"
             );
         }

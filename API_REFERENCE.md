@@ -54,6 +54,17 @@
 
 The steps below were **executed on 2026-08-05** against the already-running dev stack (`localhost:4000`). The stack is brought up with `make dev-up` (see `Makefile` → builds `services/docker-compose.dev.yml`). All example responses are real and traceable to `docs/_generated/api-transcript.md`.
 
+**0. API key (only needed for `/goals`, `/shopping`, `/commerce/extract`)**
+
+Those three route groups are guarded by `auth_middleware`; every other
+endpoint is open. Send the key as `x-api-key: <key>` or
+`Authorization: Bearer <key>`. Missing/invalid keys return
+`401 {"error":"unauthorized"}`.
+
+The dev stack sets `INTENTFORGE_DEV_MODE=1`, enabling the built-in
+`intentforge-dev-key`. Production configures `INTENTFORGE_API_KEYS`
+(comma-separated) instead; the built-in key is not accepted there.
+
 **1. Health check**
 ```bash
 curl -s http://localhost:4000/health
@@ -276,6 +287,7 @@ Image search via SearXNG (`categories=images`). Returns a flat list with image +
 | Parameter | Type   | Required | Default | Description                |
 |-----------|--------|----------|---------|----------------------------|
 | `q`       | string | yes      | —       | Search query (URL-encoded) |
+| `limit`   | int    | no       | all     | Max results to return      |
 
 **Response** `200 OK` — top-level `{ count, query, results[] }`. Each result (verified live, 2026-08-05):
 
@@ -310,6 +322,7 @@ Video search via SearXNG (`categories=videos`). Returns a flat list with `thumbn
 | Parameter | Type   | Required | Default | Description                |
 |-----------|--------|----------|---------|----------------------------|
 | `q`       | string | yes      | —       | Search query (URL-encoded) |
+| `limit`   | int    | no       | all     | Max results to return      |
 
 **Response** `200 OK` — top-level `{ count, query, results[] }`. Each result (verified live, 2026-08-05):
 
@@ -344,6 +357,7 @@ News search via SearXNG (`categories=news`). Returns a flat list with `published
 | Parameter | Type   | Required | Default | Description                |
 |-----------|--------|----------|---------|----------------------------|
 | `q`       | string | yes      | —       | Search query (URL-encoded) |
+| `limit`   | int    | no       | all     | Max results to return      |
 
 **Response** `200 OK` — top-level `{ count, query, results[] }`. Each result (verified live, 2026-08-05):
 
@@ -874,6 +888,15 @@ The `/search` endpoint parses a rich set of operators directly from the query st
 > enforced by the gateway (SearXNG does not implement them and would search the
 > operator text as literals). Both are fail-open: enforcement never collapses a
 > non-empty result set to zero.
+
+
+> **Date bounds are fail-open.** A result whose resolved date falls outside the
+> range is dropped; a result with **no resolvable date is kept**. Dates resolve
+> from the upstream engine's `publishedDate`, then a year in the URL, then a date
+> in the title/snippet — most web pages expose none, so dropping dateless results
+> would empty most queries. The same resolver backs the `published_date` field on
+> each result (omitted when nothing resolves).
+
 | `price:<` or `price:>` | `price:%3C50 headphones` | Filter by price range (URL-encode `<` to `%3C`, `>` to `%3E`) | `price_lt: 50.0` or `price_gt: 50.0` |
 | `price_min:` | `price_min:10` | Minimum price | `price_min: 10.0` |
 | `price_max:` | `price_max:100` | Maximum price | `price_max: 100.0` |
@@ -976,7 +999,7 @@ curl "http://localhost:4000/search?q=python&limit=10&offset=40"
 | `applied_constraints` | string[] | — | Which operators were understood and enforced |
 | `ignored_constraints` | string[] | — | Which operators could not take effect (e.g. date range with no parseable dates in results) |
 | `warnings` | string[] | — | Human-readable diagnostics (empty result set, upstream flakiness) |
-| `spell_corrected_query` | string | — | Original query before spell correction (only present if correction was applied) |
+| `spell_corrected_query` | string | — | The spell-corrected query (only present if a correction was applied) |
 | `geo_location` | object | — | Client IP geolocation or query-derived location (see [Geolocation](#geolocation--local-queries)) |
 | `query_quality` | string | — | Quality rating of the query: `"high"`, `"medium"`, `"low"`, or `"noise"` |
 | `error` | string | — | Error code (`"empty_query"`, `"upstream_unavailable"`, etc.) |
@@ -1117,8 +1140,8 @@ The engine prevents false-positive hits for negative constraints:
 The API automatically detects and corrects spelling errors in queries using a two-stage SymSpell + LinSpell approach with an embedded 15,000+ word frequency dictionary.
 
 **When a correction is applied:**
-- The `query` field reflects the corrected query
-- The `spell_corrected_query` field contains the original (uncorrected) query
+- The `query` field is the query exactly as the user typed it
+- The `spell_corrected_query` field contains the corrected query
 - The `expanded_queries` array includes expansions of the corrected form
 
 **Protection against false positives:**
@@ -1511,6 +1534,10 @@ All search backends are queried in parallel with configurable timeouts. Results 
 
 ## Goals API
 
+> **Authentication required.** All `/goals*` routes return
+> `401 {"error":"unauthorized"}` without a valid API key — see
+> [Getting Started > API key](#0-api-key-only-needed-for-goals-shopping-commerceextract).
+
 The Goals feature transforms a user's long-term goal (e.g. "build an AI assistant", "write a fantasy novel", "start a SaaS business") into a personalized, phased roadmap with curated resources, deadlines, and deliverables.
 
 The system works in two flows:
@@ -1644,13 +1671,13 @@ Top result (truncated):
   "title": "Best Wireless Earbuds Under $50 2026: 10 Budget Models Tested",
   "commerce_provenance": {
     "data": null,
-    "observed_at": "1787637896",
+    "observed_at": 1787637896,
     "source": null,
     "url": "https://powersof10.com/best-wireless-earbuds-under-50/"
   },
   "commerce": {
     "data": { "merchant": "Powers Of 10" },
-    "observed_at": "1787637898",
+    "observed_at": 1787637898,
     "source": "og",
     "url": "https://powersof10.com/best-wireless-earbuds-under-50/"
   },
@@ -1811,10 +1838,22 @@ would attach, or in tests/fixtures.
 { "html": "<html>…schema.org/Product JSON-LD or OG meta…</html>", "url": "https://store.example.com/p/1" }
 ```
 
+`url` and `html` are each optional, but at least one must be non-empty. A supplied
+`url` must be an absolute `http`/`https` URL (it is only used for merchant/domain
+facts).
+
+| Status | `error` | When |
+|--------|---------|-------|
+| 400 | `empty_request` | both `url` and `html` are missing or blank |
+| 400 | `invalid_url` | `url` is not an absolute http(s) URL |
+
 **Response** — a `CommerceOffer` JSON object (`price`, `currency`, `availability`,
 `merchant`, `condition`, `sku`, `gtin`, `rating`, `price_low`, `price_high`,
 `offer_count`, `observed_at`, `source`). All fields `Optional`. If the page has no
 structured product data, the returned object carries `null` for every fact (no guess).
+
+`observed_at` is a Unix timestamp in **seconds** serialized as a JSON number
+(e.g. `1794116489`), not a numeric string.
 
 **Honesty properties (locked by unit tests):**
 
