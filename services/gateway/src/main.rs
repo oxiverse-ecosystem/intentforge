@@ -19245,7 +19245,9 @@ let mut results = match tokio::task::spawn_blocking(move || {
         None
     };
     let response = UnifiedResponse {
-        query: q.clone(),
+        // The user's query exactly as typed. The corrected form (when one was
+        // applied) is reported separately in `spell_corrected_query`.
+        query: q_trimmed.to_string(),
         intent: Some(intent.intent.clone()),
         category: Some(parent_category(&intent.intent)),
         confidence: Some(intent.confidence),
@@ -19256,7 +19258,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         deep_result,
         results: paginated_results,
         geo_location,
-        spell_corrected_query: if spell_changed { Some(q_cleaned_spelling.clone()) } else { None },
+        spell_corrected_query: if spell_changed { Some(q.clone()) } else { None },
         error,
         message,
         query_quality: if qflag == "low" { Some("low".to_string()) } else { None },
