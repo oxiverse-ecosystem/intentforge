@@ -54,6 +54,17 @@
 
 The steps below were **executed on 2026-08-05** against the already-running dev stack (`localhost:4000`). The stack is brought up with `make dev-up` (see `Makefile` → builds `services/docker-compose.dev.yml`). All example responses are real and traceable to `docs/_generated/api-transcript.md`.
 
+**0. API key (only needed for `/goals`, `/shopping`, `/commerce/extract`)**
+
+Those three route groups are guarded by `auth_middleware`; every other
+endpoint is open. Send the key as `x-api-key: <key>` or
+`Authorization: Bearer <key>`. Missing/invalid keys return
+`401 {"error":"unauthorized"}`.
+
+The dev stack sets `INTENTFORGE_DEV_MODE=1`, enabling the built-in
+`intentforge-dev-key`. Production configures `INTENTFORGE_API_KEYS`
+(comma-separated) instead; the built-in key is not accepted there.
+
 **1. Health check**
 ```bash
 curl -s http://localhost:4000/health
@@ -1507,6 +1518,10 @@ All search backends are queried in parallel with configurable timeouts. Results 
 ---
 
 ## Goals API
+
+> **Authentication required.** All `/goals*` routes return
+> `401 {"error":"unauthorized"}` without a valid API key — see
+> [Getting Started > API key](#0-api-key-only-needed-for-goals-shopping-commerceextract).
 
 The Goals feature transforms a user's long-term goal (e.g. "build an AI assistant", "write a fantasy novel", "start a SaaS business") into a personalized, phased roadmap with curated resources, deadlines, and deliverables.
 
