@@ -18862,6 +18862,19 @@ let mut results = match tokio::task::spawn_blocking(move || {
         };
     let mut paginated_results = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
 
+    // Backfill `published_date` from the same resolver the date filter uses
+    // (upstream value, then a year in the URL, then a date in the title/content
+    // snippet). Upstream engines attach a date to only a minority of results, so
+    // without this the field is almost always absent and clients cannot do their
+    // own date filtering. Runs AFTER filtering, so filter behaviour is unchanged.
+    for r in paginated_results.iter_mut() {
+        if r.published_date.is_none() {
+            if let Some((y, m, d)) = resolve_item_date(r.published_date.as_deref(), &r.url, &r.title, &r.content) {
+                r.published_date = Some(format!("{:04}-{:02}-{:02}", y, m, d));
+            }
+        }
+    }
+
     // ─── Constraint transparency (applied / ignored / warnings) ───
     // D3 (price bound reporting): re-apply the user's stated price bound into the
     // RESPONSE's structured_constraints. The fail-open below only disables price
