@@ -276,6 +276,7 @@ Image search via SearXNG (`categories=images`). Returns a flat list with image +
 | Parameter | Type   | Required | Default | Description                |
 |-----------|--------|----------|---------|----------------------------|
 | `q`       | string | yes      | —       | Search query (URL-encoded) |
+| `limit`   | int    | no       | all     | Max results to return      |
 
 **Response** `200 OK` — top-level `{ count, query, results[] }`. Each result (verified live, 2026-08-05):
 
@@ -310,6 +311,7 @@ Video search via SearXNG (`categories=videos`). Returns a flat list with `thumbn
 | Parameter | Type   | Required | Default | Description                |
 |-----------|--------|----------|---------|----------------------------|
 | `q`       | string | yes      | —       | Search query (URL-encoded) |
+| `limit`   | int    | no       | all     | Max results to return      |
 
 **Response** `200 OK` — top-level `{ count, query, results[] }`. Each result (verified live, 2026-08-05):
 
@@ -344,6 +346,7 @@ News search via SearXNG (`categories=news`). Returns a flat list with `published
 | Parameter | Type   | Required | Default | Description                |
 |-----------|--------|----------|---------|----------------------------|
 | `q`       | string | yes      | —       | Search query (URL-encoded) |
+| `limit`   | int    | no       | all     | Max results to return      |
 
 **Response** `200 OK` — top-level `{ count, query, results[] }`. Each result (verified live, 2026-08-05):
 
