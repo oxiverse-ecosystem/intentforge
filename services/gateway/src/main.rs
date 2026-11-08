@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use axum::{
     extract::Query,
     routing::{get, post},
@@ -110,6 +111,88 @@ struct SearchParams {
     offset: Option<usize>,
     #[serde(default)]
     ip: Option<String>,
+}
+
+/// Validate the non-string query parameters before axum's extractor runs.
+///
+/// `serde_urlencoded` reports `invalid digit found in string` without naming
+/// the offending field, so `limit=abc` produced a bare plain-text 400. Returns
+/// the parameter name and the decoded value when one is not a valid `usize`.
+fn validate_numeric_params(raw: &str) -> Option<(String, String)> {
+    for pair in raw.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if !matches!(key, "limit" | "offset" | "count" | "n") {
+            continue;
+        }
+        let decoded = urlencoding::decode(value)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| value.to_string());
+        if decoded.parse::<usize>().is_err() {
+            return Some((key.to_string(), decoded));
+        }
+    }
+    None
+}
+
+/// Query-string extractor that keeps the documented JSON error envelope.
+///
+/// axum's built-in `Query` rejects a malformed parameter with a **plain-text**
+/// 400 body (`Failed to deserialize query string: ...`), which breaks the API's
+/// error contract -- every other error path returns the `UnifiedResponse`
+/// envelope as JSON. This wrapper pre-validates the numeric parameters so the
+/// message can name the offending field, then delegates to `Query`.
+pub struct JsonQuery<T>(pub T);
+
+#[async_trait]
+impl<T, S> axum::extract::FromRequestParts<S> for JsonQuery<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = axum::response::Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        if let Some(raw) = parts.uri.query() {
+            if let Some((key, value)) = validate_numeric_params(raw) {
+                return Err(parameter_error(&format!(
+                    "Invalid value for '{}': expected a non-negative integer, got '{}'",
+                    key, value
+                )));
+            }
+        }
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(params)) => Ok(JsonQuery(params)),
+            Err(rejection) => Err(parameter_error(&rejection.body_text())),
+        }
+    }
+}
+
+/// Build the documented `400 invalid_parameter` body: the `UnifiedResponse`
+/// envelope with neutral fields, matching `empty_query` / `invalid_query`.
+fn parameter_error(message: &str) -> axum::response::Response {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "query": "",
+            "intent": null,
+            "category": null,
+            "confidence": null,
+            "constraints": [],
+            "structured_constraints": serde_json::to_value(Constraints::default())
+                .unwrap_or(serde_json::json!({})),
+            "expanded_queries": [],
+            "distribution": null,
+            "results": [],
+            "error": "invalid_parameter",
+            "message": message,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -5135,7 +5218,7 @@ fn select_shopping_strip(
 /// `commerce_provenance` carry the honest facts.
 async fn handle_shopping(
     state: axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    JsonQuery(params): JsonQuery<SearchParams>,
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     // Request clock for THIS /shopping request, captured before handle_search is
@@ -5150,7 +5233,7 @@ async fn handle_shopping(
     // 1) Run the SAME /search pipeline (ranking, intent, merge, scoring).
     let (status, body) = handle_search(
         state.clone(),
-        Query(params),
+        JsonQuery(params),
         headers,
     ).await;
 
@@ -13364,7 +13447,7 @@ fn apply_media_limit(mut value: serde_json::Value, limit: Option<usize>) -> serd
 
 async fn handle_images(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    JsonQuery(params): JsonQuery<SearchParams>,
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
@@ -13497,7 +13580,7 @@ async fn handle_images(
 
 async fn handle_videos(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    JsonQuery(params): JsonQuery<SearchParams>,
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
@@ -13706,7 +13789,7 @@ async fn handle_videos(
 
 async fn handle_news(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    JsonQuery(params): JsonQuery<SearchParams>,
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
@@ -14214,7 +14297,7 @@ fn spellcheck_query(index: &spell::SymSpellIndex, q: &str) -> serde_json::Value 
 /// engine's actual behavior. JSON envelope mirrors the rest of the API reference.
 async fn handle_spellcheck(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    JsonQuery(params): JsonQuery<SearchParams>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
     if q.trim().is_empty() {
@@ -14362,7 +14445,7 @@ fn make_geolocate_empty_response() -> (axum::http::StatusCode, Json<serde_json::
 
 async fn handle_geolocate(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    JsonQuery(params): JsonQuery<SearchParams>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
     if q.trim().is_empty() {
@@ -14401,7 +14484,7 @@ async fn handle_geolocate(
 /// identical functions `/search` calls, so the preview matches real behavior.
 async fn handle_analyze(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    JsonQuery(params): JsonQuery<SearchParams>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
     if q.trim().is_empty() {
@@ -14491,7 +14574,7 @@ async fn handle_analyze(
 /// not change ranking, negation gating, calibration, or fetch anything.
 async fn handle_inspect(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    JsonQuery(params): JsonQuery<SearchParams>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
     if q.trim().is_empty() {
@@ -14589,7 +14672,7 @@ fn build_intent_empty() -> serde_json::Value {
 /// `/search`/`spellcheck`'s empty response).
 async fn handle_intent(
     axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    JsonQuery(params): JsonQuery<SearchParams>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
     if q.trim().is_empty() {
@@ -14705,7 +14788,7 @@ fn build_audio_empty() -> serde_json::Value {
 /// envelope.
 async fn handle_video(
     axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    JsonQuery(params): JsonQuery<SearchParams>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
     if q.trim().is_empty() {
@@ -15252,7 +15335,7 @@ impl Drop for DedupGuard {
 
 async fn handle_search(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    JsonQuery(params): JsonQuery<SearchParams>,
     headers: HeaderMap,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     // Start of the request clock, used to DERIVE the commerce-enrichment budget
@@ -20764,7 +20847,7 @@ fn fallback_intent(q: &str) -> IntentResponse {
 
 async fn handle_search_fast(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    JsonQuery(params): JsonQuery<SearchParams>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let q = params.q.clone().unwrap_or_default();
     let q_encoded = urlencoding::encode(&q);
@@ -26214,6 +26297,51 @@ mod negative_constraint_retention_tests {
             "constraint_score must not be 0.0 for a content mention, got {}",
             score
         );
+    }
+
+    #[test]
+    fn numeric_params_validate_cleanly() {
+        assert!(validate_numeric_params("q=rust&limit=10&offset=0").is_none());
+        assert!(validate_numeric_params("q=rust&limit=%35").is_none(), "percent-encoded 5 is valid");
+        assert!(validate_numeric_params("q=rust").is_none());
+        assert!(validate_numeric_params("q=rust+web+framework&limit=8").is_none());
+        assert!(validate_numeric_params("q=rust&count=5&n=3").is_none());
+    }
+
+    #[test]
+    fn bad_numeric_params_name_the_field() {
+        for (raw, key) in [
+            ("limit=abc", "limit"),
+            ("limit=-5", "limit"),
+            ("offset=1.5", "offset"),
+            ("count=ten", "count"),
+            ("n=1e3", "n"),
+        ] {
+            let (got, _) = validate_numeric_params(&format!("q=rust&{}", raw)).expect("must reject");
+            assert_eq!(got, key, "{}", raw);
+        }
+    }
+
+    #[test]
+    fn empty_numeric_param_is_rejected_with_a_clear_message() {
+        // An empty numeric value is not a valid usize; reject it here so the
+        // response never falls through to serde's unnamed-field message.
+        assert_eq!(
+            validate_numeric_params("q=rust&limit="),
+            Some(("limit".to_string(), String::new()))
+        );
+    }
+
+    #[tokio::test]
+    async fn parameter_error_uses_the_documented_envelope() {
+        let resp = parameter_error("Invalid value for 'limit': expected a non-negative integer, got 'abc'");
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "invalid_parameter");
+        assert!(v["message"].as_str().unwrap().contains("limit"));
+        assert_eq!(v["results"], serde_json::json!([]));
+        assert!(v["structured_constraints"].is_object());
     }
 
     #[test]

@@ -1278,6 +1278,7 @@ The cache is reset on the first request after expiry, not on a fixed interval. T
 | `400` | `empty_query` | `Query must contain at least one alphabetic character` | `q` has no letters (e.g. `"123"`, `"]]["`) |
 | `400` | `invalid_query` | `Query has no retrievable content (stopword-only or single character)` | Stopword-only (`the and or`) **or** a single non-protected character (`r`). A single **protected** term (`go`, `rust`, `c++`) is exempt and searches normally (verified). |
 | `400` | `invalid_query` | `Query appears to be gibberish; no results returned` | Query flagged `junk` by the quality classifier (verified: `zxqw lkjasd qwe`, and non-Latin script `为什么天空是蓝色的`). Body includes `"query_quality":"junk"`. |
+| `400` | `invalid_parameter` | `Invalid value for 'limit': expected a non-negative integer, got 'abc'` | A numeric parameter (`limit`, `offset`, `count`, `n`) is not a valid `usize` -- e.g. `?limit=abc`, `?limit=-5`, `?limit=`, `?offset=1.5`. The message names the offending parameter. Same `UnifiedResponse` envelope as the other codes. |
 
 Error bodies always include the full `UnifiedResponse` envelope (with `null` for `intent`/`category`/`confidence`/`distribution`, empty `results: []`, and an empty `structured_constraints` object), plus `error`, `message`, and (for gibberish) `query_quality`. See `docs/_generated/api-transcript.md` blocks 18–25 for the exact raw bodies.
 
