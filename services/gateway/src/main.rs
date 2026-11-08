@@ -28,7 +28,12 @@ fn extract_api_key(headers: &HeaderMap) -> Option<String> {
 }
 fn valid_api_keys() -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
-    set.insert("intentforge-dev-key".to_string());
+    // Built-in development key. Accepted only when the dev compose stack sets
+    // INTENTFORGE_DEV_MODE=1; production must configure INTENTFORGE_API_KEYS
+    // instead, so a committed credential can never grant access there.
+    if std::env::var("INTENTFORGE_DEV_MODE").map(|v| v == "1").unwrap_or(false) {
+        set.insert("intentforge-dev-key".to_string());
+    }
     if let Ok(env) = std::env::var("INTENTFORGE_API_KEYS") {
         for k in env.split(',') { let k=k.trim(); if !k.is_empty() { set.insert(k.to_string()); } }
     }
@@ -13295,6 +13300,19 @@ struct AppState {
     exact_model_config: ExactModelConfig,
 }
 
+/// Apply the optional `limit` to a `{results, count, query}` media response.
+/// The cache stores the full result set, so truncation happens on read and a
+/// cached response can still serve a different page size.
+fn apply_media_limit(mut value: serde_json::Value, limit: Option<usize>) -> serde_json::Value {
+    let Some(limit) = limit else { return value };
+    if let Some(arr) = value.get_mut("results").and_then(|v| v.as_array_mut()) {
+        arr.truncate(limit);
+    }
+    let n = value.get("results").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    value["count"] = serde_json::json!(n);
+    value
+}
+
 async fn handle_images(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
@@ -13317,7 +13335,7 @@ async fn handle_images(
     let cache_key = format!("images:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return (axum::http::StatusCode::OK, Json(value));
+        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
     }
 
     // Resolve client geolocation for location-aware image search
@@ -13414,7 +13432,7 @@ async fn handle_images(
         }
     }
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "results": results,
         "count": results.len(),
         "query": q,
@@ -13425,7 +13443,7 @@ async fn handle_images(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    (axum::http::StatusCode::OK, Json(response))
+    (axum::http::StatusCode::OK, Json(apply_media_limit(response, params.limit)))
 }
 
 async fn handle_videos(
@@ -13450,7 +13468,7 @@ async fn handle_videos(
     let cache_key = format!("videos:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return (axum::http::StatusCode::OK, Json(value));
+        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
     }
 
     // Resolve client geolocation for location-aware video search
@@ -13623,7 +13641,7 @@ async fn handle_videos(
         }
     }
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "results": results,
         "count": results.len(),
         "query": q,
@@ -13634,7 +13652,7 @@ async fn handle_videos(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    (axum::http::StatusCode::OK, Json(response))
+    (axum::http::StatusCode::OK, Json(apply_media_limit(response, params.limit)))
 }
 
 async fn handle_news(
@@ -13659,7 +13677,7 @@ async fn handle_news(
     let cache_key = format!("news:{}", q.to_lowercase().trim());
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return (axum::http::StatusCode::OK, Json(value));
+        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
     }
 
     // Resolve client geolocation for location-aware news search
@@ -13763,7 +13781,7 @@ async fn handle_news(
         }
     }
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "results": results,
         "count": results.len(),
         "query": q,
@@ -13774,7 +13792,7 @@ async fn handle_news(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    (axum::http::StatusCode::OK, Json(response))
+    (axum::http::StatusCode::OK, Json(apply_media_limit(response, params.limit)))
 }
 
 /// Generic stopwords shared by the recall-gap / distinctive-term extractors.

@@ -334,6 +334,10 @@ services:
     mem_reservation: 256m
     environment:
       - INTENT_ENGINE_URL=http://intent-engine:3005
+      # Enables the built-in development API key (`intentforge-dev-key`) that
+      # guards /goals*, /shopping and /commerce/extract. Production must NOT set
+      # this -- it should configure INTENTFORGE_API_KEYS instead.
+      - INTENTFORGE_DEV_MODE=1
       - SEARXNG_URL=http://searxng:8080
       - SEARXNG2_URL=http://if-dev-searxng2:8081
       - CRAWLER_URL=http://crawler:5001
