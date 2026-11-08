@@ -143,6 +143,33 @@ curl "http://localhost:4000/search?q=rust+web+framework&limit=3"
 | `GET` | `/videos` | Video search via SearXNG + Invidious |
 | `GET` | `/news` | News search via SearXNG |
 
+### Authentication
+
+Most endpoints are open. Three route groups require an API key:
+
+| Routes | Auth |
+|--------|------|
+| `/goals`, `/goals/*`, `/goals/quick`, `/goals/leaderboard` | **Required** |
+| `/shopping` | **Required** |
+| `/commerce/extract` | **Required** |
+| `/`, `/health`, `/search`, `/search/fast`, `/images`, `/videos`, `/news`, `/spellcheck`, `/analyze`, `/inspect`, `/geolocate`, `/intent`, `/video` | Open |
+
+Send the key in either header:
+
+```bash
+curl -H "x-api-key: YOUR_KEY" http://localhost:4000/goals
+curl -H "Authorization: Bearer YOUR_KEY" http://localhost:4000/goals
+```
+
+Missing or invalid keys get `401 {"error":"unauthorized"}`.
+
+**Development:** the dev compose stack sets `INTENTFORGE_DEV_MODE=1`, which
+enables a built-in dev key — `intentforge-dev-key`. That key is rejected
+everywhere else.
+
+**Production:** set `INTENTFORGE_API_KEYS` to a comma-separated list (see
+`.env.example`). With neither configured, every key is rejected (fail-closed).
+
 ### `/search` Parameters
 
 | Param | Type | Default | Description |
@@ -173,7 +200,7 @@ curl "http://localhost:4000/search?q=rust+web+framework&limit=3"
       "score": 0.970,
       "authority": 0.90,
       "sources": ["bing", "brave"],
-      "published_date": null
+      "published_date": "2026-03-14"
     }
   ],
   "applied_constraints": ["not:django"],
@@ -182,7 +209,7 @@ curl "http://localhost:4000/search?q=rust+web+framework&limit=3"
   "has_more": true
 }
 ```
-> **Note:** `confidence` is a real float (≈0.3–0.9) that varies per query — it is **not** always `0.75`. `geo_location` and `spell_corrected_query` are omitted from the JSON on clean queries (they serialize as `None`). The full, verified response schema (including `category`, `distribution`, `expanded_queries`, `results_before_filter`, `results_after_filter`, `total`, `limit`, `offset`) is in [API_REFERENCE.md](API_REFERENCE.md).
+> **Note:** `confidence` is a real float (≈0.3–0.9) that varies per query — it is **not** always `0.75`. Optional fields (`geo_location`, `spell_corrected_query`, `published_date`, `applied_constraints`, …) are **omitted** from the JSON when they have no value rather than serialized as `null`. `published_date` is the resolved publish date — the upstream engine's value when it provides one, otherwise inferred from a year in the URL or a date in the title/snippet — and is omitted when nothing can be resolved. The full, verified response schema (including `category`, `distribution`, `expanded_queries`, `results_before_filter`, `results_after_filter`, `total`, `limit`, `offset`) is in [API_REFERENCE.md](API_REFERENCE.md).
 
 See **[API_REFERENCE.md](API_REFERENCE.md)** for the complete API documentation.
 
@@ -191,6 +218,10 @@ See **[API_REFERENCE.md](API_REFERENCE.md)** for the complete API documentation.
 ## Goals
 
 IntentForge includes a **Goals** feature that turns a long-term goal into a personalized, phased roadmap with curated resources, deadlines, and progress tracking. It runs on the same gateway and exposes a small REST surface. All endpoints were exercised live against `localhost:4000` on 2026-08-05 (full transcript: `docs/_generated/_round_v2_raw.md`).
+
+> **Note:** every Goals endpoint requires an API key — see
+> [Authentication](#authentication). The dev stack enables the built-in
+> `intentforge-dev-key` automatically.
 
 **Two flows:**
 
@@ -273,6 +304,12 @@ Search operators are parsed directly from the query string:
 
 **Natural language date ranges** are automatically converted:
 - `"past 7 days"`, `"last week"`, `"this month"`, `"yesterday"`, `"recent"`, `"latest"`
+
+> **Date filters are fail-open.** `after:` / `before:` drop a result whose
+> resolved date falls outside the range, but a result with **no resolvable date
+> is kept** — most web pages expose none, and dropping them would empty most
+> queries. Dates are resolved from the upstream engine, then a year in the URL,
+> then a date in the title/snippet.
 
 ---
 
