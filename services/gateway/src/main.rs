@@ -6173,9 +6173,28 @@ fn should_filter_by_constraints(
     // applied by the callers (constraint_boost). This block intentionally does
     // nothing for intitle (left in place as an explicit no-op marker).
 
-    // 4c. Soft preference on inurl: (BOOST, not hard-drop — see 4b).
-    // 4d. Soft preference on intext: (BOOST, not hard-drop — see 4b).
-    // (All three are now enforced upstream + boosted downstream; never hard-dropped.)
+    // 4c. Hard filter on inurl: — the URL must carry at least one token.
+    // SearXNG does not implement `inurl:` (it searches the operator text as
+    // literals), so the gateway is the only enforcer. Fail-open is applied by the
+    // caller, which restores the set when this would empty the page.
+    if !constraints.inurl.is_empty() {
+        let u_low = url.to_lowercase();
+        let matched = constraints.inurl.iter()
+            .any(|u| !u.is_empty() && u_low.contains(&u.to_lowercase()));
+        if !matched {
+            return true;
+        }
+    }
+
+    // 4d. Hard filter on intext: — the content must carry at least one token.
+    if !constraints.intext.is_empty() {
+        let c_low = content.to_lowercase();
+        let matched = constraints.intext.iter()
+            .any(|t| !t.is_empty() && c_low.contains(&t.to_lowercase()));
+        if !matched {
+            return true;
+        }
+    }
 
     // 4e. Hard filter on related:
     // Semantics: "related:amazon.com" means sites SIMILAR to amazon, NOT amazon
@@ -9194,9 +9213,8 @@ fn preprocess_searxng_query(query: &str) -> String {
     // Operators SearXNG understands natively. Stripping them and never re-emitting
     // (the old behaviour) silently forwarded e.g. `rust inurl:blog` as just `rust`,
     // so the engine could never honour the constraint and a downstream hard filter
-    // then dropped every result → n=0. We preserve them verbatim so the engine
-    // itself applies them (it supports intitle:/inurl:/intext: natively), and the
-    // local `should_filter_by_constraints` hard-drop is downgraded to a soft boost.
+    // then dropped every result → n=0. `intitle:` is preserved verbatim because
+    // SearXNG applies it natively; `inurl:`/`intext:` are enforced locally.
     let mut passthrough_emitted: Vec<String> = Vec::new();
     for w in q.split_whitespace() {
         let wl = w.to_lowercase();
@@ -9206,9 +9224,12 @@ fn preprocess_searxng_query(query: &str) -> String {
         {
             // Emit native operators (everything except price:, after:, before: which
             // are handled via dedicated query params / date-window overrides).
-            if wl.starts_with("intitle:") || wl.starts_with("inurl:") || wl.starts_with("intext:")
-                || wl.starts_with("lang:")
-            {
+            // Only `intitle:` is actually implemented by SearXNG. `inurl:` and
+            // `intext:` are NOT (verified live: `inurl:rust` / `intext:borrow` return
+            // unrelated pages), and forwarding them makes the engine search the
+            // operator text as literals, polluting the candidate pool. They are
+            // enforced locally by `should_filter_by_constraints` instead.
+            if wl.starts_with("intitle:") || wl.starts_with("lang:") {
                 passthrough_emitted.push(w.to_string());
             }
             continue;
@@ -18693,6 +18714,19 @@ let mut results = match tokio::task::spawn_blocking(move || {
     results.retain(|r| {
         !should_filter_by_constraints(&r.title, &r.content, &r.url, r.published_date.as_deref(), &intent.structured_constraints)
     });
+    // FAIL-OPEN for inurl:/intext: — same never-collapse-to-zero policy as the
+    // negative-constraint net below. These two operators are enforced only locally
+    // (SearXNG ignores them), so a strict drop can empty the page when no candidate
+    // carries the token. Keep the pre-filter set rather than return nothing.
+    let had_url_text_filter = !intent.structured_constraints.inurl.is_empty()
+        || !intent.structured_constraints.intext.is_empty();
+    if had_url_text_filter && !pre_hard.is_empty() && results.is_empty() {
+        tracing::warn!(
+            "INURL/INTEXT FAIL-OPEN: all {} results dropped by inurl:/intext:; keeping pre-filter set",
+            pre_hard.len()
+        );
+        results = pre_hard.clone();
+    }
     // FAIL-OPEN for negative constraints (mirrors the junk-filter fail-open at ~12642:
     // "never let a gate collapse a non-empty result set to ZERO"). A misclassified NL
     // negation — a symptom/state verb inside a problem description ("my washing machine
