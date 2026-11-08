@@ -882,6 +882,13 @@ The `/search` endpoint parses a rich set of operators directly from the query st
 | `intext:` | `intext:benchmark` | Require term in page body | `intext: ["benchmark"]` |
 | `after:` | `after:2026-01-01` | Only results published after date | `after_date: "2026-01-01"` |
 | `before:` | `before:2025-01-01` | Only results published before date | `before_date: "2025-01-01"` |
+
+> **Date bounds are fail-open.** A result whose resolved date falls outside the
+> range is dropped; a result with **no resolvable date is kept**. Dates resolve
+> from the upstream engine's `publishedDate`, then a year in the URL, then a date
+> in the title/snippet — most web pages expose none, so dropping dateless results
+> would empty most queries. The same resolver backs the `published_date` field on
+> each result (omitted when nothing resolves).
 | `price:<` or `price:>` | `price:%3C50 headphones` | Filter by price range (URL-encode `<` to `%3C`, `>` to `%3E`) | `price_lt: 50.0` or `price_gt: 50.0` |
 | `price_min:` | `price_min:10` | Minimum price | `price_min: 10.0` |
 | `price_max:` | `price_max:100` | Maximum price | `price_max: 100.0` |

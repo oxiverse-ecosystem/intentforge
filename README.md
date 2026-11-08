@@ -200,7 +200,7 @@ everywhere else.
       "score": 0.970,
       "authority": 0.90,
       "sources": ["bing", "brave"],
-      "published_date": null
+      "published_date": "2026-03-14"
     }
   ],
   "applied_constraints": ["not:django"],
@@ -209,7 +209,7 @@ everywhere else.
   "has_more": true
 }
 ```
-> **Note:** `confidence` is a real float (≈0.3–0.9) that varies per query — it is **not** always `0.75`. `geo_location` and `spell_corrected_query` are omitted from the JSON on clean queries (they serialize as `None`). The full, verified response schema (including `category`, `distribution`, `expanded_queries`, `results_before_filter`, `results_after_filter`, `total`, `limit`, `offset`) is in [API_REFERENCE.md](API_REFERENCE.md).
+> **Note:** `confidence` is a real float (≈0.3–0.9) that varies per query — it is **not** always `0.75`. Optional fields (`geo_location`, `spell_corrected_query`, `published_date`, `applied_constraints`, …) are **omitted** from the JSON when they have no value rather than serialized as `null`. `published_date` is the resolved publish date — the upstream engine's value when it provides one, otherwise inferred from a year in the URL or a date in the title/snippet — and is omitted when nothing can be resolved. The full, verified response schema (including `category`, `distribution`, `expanded_queries`, `results_before_filter`, `results_after_filter`, `total`, `limit`, `offset`) is in [API_REFERENCE.md](API_REFERENCE.md).
 
 See **[API_REFERENCE.md](API_REFERENCE.md)** for the complete API documentation.
 
@@ -304,6 +304,12 @@ Search operators are parsed directly from the query string:
 
 **Natural language date ranges** are automatically converted:
 - `"past 7 days"`, `"last week"`, `"this month"`, `"yesterday"`, `"recent"`, `"latest"`
+
+> **Date filters are fail-open.** `after:` / `before:` drop a result whose
+> resolved date falls outside the range, but a result with **no resolvable date
+> is kept** — most web pages expose none, and dropping them would empty most
+> queries. Dates are resolved from the upstream engine, then a year in the URL,
+> then a date in the title/snippet.
 
 ---
 
