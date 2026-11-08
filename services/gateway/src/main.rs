@@ -4501,7 +4501,37 @@ async fn handle_commerce_extract(
     Json(body): Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let html = body.get("html").and_then(|v| v.as_str()).unwrap_or("");
-    let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+
+    // Validate the input. A missing/blank URL (or a non-http(s) one) used to
+    // return 200 with an empty `data` object, which reads as "extracted
+    // nothing" rather than "bad request". `html` alone is a valid request --
+    // the URL is only needed for merchant/domain facts.
+    if html.trim().is_empty() && url.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "empty_request",
+                "message": "Provide a non-empty 'url' and/or 'html' to extract from"
+            })),
+        );
+    }
+    if !url.is_empty() {
+        match reqwest::Url::parse(url) {
+            Ok(parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {}
+            _ => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_url",
+                        "message": "parameter 'url' must be an absolute http(s) URL",
+                        "url": url
+                    })),
+                );
+            }
+        }
+    }
+
     let offer = extract_commerce_offer(html, url);
     match serde_json::to_value(&offer) {
         Ok(v) => (axum::http::StatusCode::OK, Json(v)),
