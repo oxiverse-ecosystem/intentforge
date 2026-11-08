@@ -1805,6 +1805,15 @@ would attach, or in tests/fixtures.
 { "html": "<html>…schema.org/Product JSON-LD or OG meta…</html>", "url": "https://store.example.com/p/1" }
 ```
 
+`url` and `html` are each optional, but at least one must be non-empty. A supplied
+`url` must be an absolute `http`/`https` URL (it is only used for merchant/domain
+facts).
+
+| Status | `error` | When |
+|--------|---------|-------|
+| 400 | `empty_request` | both `url` and `html` are missing or blank |
+| 400 | `invalid_url` | `url` is not an absolute http(s) URL |
+
 **Response** — a `CommerceOffer` JSON object (`price`, `currency`, `availability`,
 `merchant`, `condition`, `sku`, `gtin`, `rating`, `price_low`, `price_high`,
 `offer_count`, `observed_at`, `source`). All fields `Optional`. If the page has no
