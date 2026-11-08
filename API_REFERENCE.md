@@ -984,7 +984,7 @@ curl "http://localhost:4000/search?q=python&limit=10&offset=40"
 | `applied_constraints` | string[] | — | Which operators were understood and enforced |
 | `ignored_constraints` | string[] | — | Which operators could not take effect (e.g. date range with no parseable dates in results) |
 | `warnings` | string[] | — | Human-readable diagnostics (empty result set, upstream flakiness) |
-| `spell_corrected_query` | string | — | Original query before spell correction (only present if correction was applied) |
+| `spell_corrected_query` | string | — | The spell-corrected query (only present if a correction was applied) |
 | `geo_location` | object | — | Client IP geolocation or query-derived location (see [Geolocation](#geolocation--local-queries)) |
 | `query_quality` | string | — | Quality rating of the query: `"high"`, `"medium"`, `"low"`, or `"noise"` |
 | `error` | string | — | Error code (`"empty_query"`, `"upstream_unavailable"`, etc.) |
@@ -1125,8 +1125,8 @@ The engine prevents false-positive hits for negative constraints:
 The API automatically detects and corrects spelling errors in queries using a two-stage SymSpell + LinSpell approach with an embedded 15,000+ word frequency dictionary.
 
 **When a correction is applied:**
-- The `query` field reflects the corrected query
-- The `spell_corrected_query` field contains the original (uncorrected) query
+- The `query` field is the query exactly as the user typed it
+- The `spell_corrected_query` field contains the corrected query
 - The `expanded_queries` array includes expansions of the corrected form
 
 **Protection against false positives:**
