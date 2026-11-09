@@ -109,6 +109,7 @@ flowchart TB
 | D9 | Identity thresholds | **Conservative**; never auto-merge on weak signals |
 | D10 | Query log retention | 90 days, salted hashes |
 | D11 | Takedown SLA | 24 hours for suppression |
+| D4A | Price history retention | Per-source ceilings; none for Amazon-sourced data |
 | D12 | Crawl egress | VPN + Tor with per-domain routing |
 
 Full reasoning, alternatives, and consequences are in `10_OPEN_DECISIONS_AND_RISKS.md`.
@@ -120,6 +121,7 @@ Full reasoning, alternatives, and consequences are in `10_OPEN_DECISIONS_AND_RIS
 | Risk | Impact | Mitigation |
 |---|---|---|
 | **Commerce sources forbid the assumed use** | **Severe — threatens the commerce thesis** | Redesign around permissioned feeds, live proxying, or link-only models; legal review |
+| **Amazon §31 prohibits price tracking** | **Severe — invalidates price-history retention** | Per-source retention ceilings; no Amazon price history; decision D4A |
 | Legal claim over extraction or redistribution | Severe | Permissions model; prohibit by default; counsel review |
 | Crawler blocked or IP banned | Medium | Strict budgets, honest User-Agent, Tor fallback |
 | PostgreSQL FTS insufficient for ranking | Medium | Measure in Phase 0; Tantivy fallback |
@@ -161,6 +163,7 @@ Full reasoning, alternatives, and consequences are in `10_OPEN_DECISIONS_AND_RIS
 8. **D8 — Affiliate-first revenue** with structural ranking independence.
 9. **D10 — 90-day query log retention**, salted hashes by default.
 10. **D11 — 24-hour takedown suppression SLA.**
+11. **D4A — Per-source price-history retention**, and specifically that Amazon-sourced price history must not be retained (Amazon Operating Agreement §31).
 
 ---
 

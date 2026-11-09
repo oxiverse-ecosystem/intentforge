@@ -96,6 +96,10 @@ CREATE TABLE source_permission (
     may_extract         BOOLEAN NOT NULL DEFAULT false,
     may_store           BOOLEAN NOT NULL DEFAULT false,
     may_redistribute    BOOLEAN NOT NULL DEFAULT false,
+    -- Per-source retention ceiling. Provider terms often cap how long data may be
+    -- held (e.g. Amazon Operating Agreement §11(13) caps caching at 24 hours and
+    -- §31 prohibits price tracking altogether). NULL means "no special ceiling".
+    retention_days      INTEGER,
     permit_scope        TEXT NOT NULL DEFAULT 'all',   -- 'all' | 'paths' | 'none'
     permit_paths        TEXT[],                         -- when scope = 'paths'
     licence_ref         TEXT,                           -- link or identifier
@@ -715,6 +719,10 @@ CREATE INDEX idx_revision_fts ON page_revision USING GIN (search_vector);
 | `page_revision` | no partition; index by `url_id` | — | until URL removed + retention window |
 
 **Retention enforcement:** a scheduled job drops expired partitions and marks records suppressed. Deletion is logged in `audit_event`.
+
+**Per-source ceilings override global defaults.** `source_permission.retention_days` is the binding limit for any record derived from that source; the effective retention is `LEAST(global_default, source_permission.retention_days)`. This is what makes provider terms enforceable rather than aspirational — Amazon-sourced price observations are not retained at all, because Amazon's terms prohibit price tracking (§31), while a partner feed permitting 24 months can retain 24 months.
+
+The price-history API must return an explicit empty result for a source that does not permit retention, rather than silently omitting data.
 
 ---
 

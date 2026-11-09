@@ -23,6 +23,7 @@ This document records every decision that was **not** self-evident, the options 
 | D10 | Query log retention | 30 / 90 / 365 days | **90 days** | FOUNDER APPROVAL |
 | D11 | Takedown response SLA | 24h / 7d / 30d | **24h for suppression** | FOUNDER APPROVAL |
 | D12 | Crawl egress | VPN only vs. VPN + Tor | **VPN + Tor with per-domain routing** | Approved by design |
+| D4A | Price history retention | Uniform vs. per-source | **Per-source ceilings; none for Amazon** | FOUNDER APPROVAL |
 
 ---
 
@@ -220,6 +221,7 @@ The following cannot proceed without explicit approval:
 8. **D8** — Affiliate-first revenue model with structural ranking independence.
 9. **D10** — 90-day query log retention.
 10. **D11** — 24-hour takedown suppression SLA.
+11. **D4A** — Per-source price-history retention, and specifically that Amazon-sourced price history must not be retained.
 
 ---
 
