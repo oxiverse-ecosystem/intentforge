@@ -90,8 +90,12 @@ engines:
   # Brave clearnet through Tor2 exit node (reliable). The old brave-onion
   # variant pointed at a dead onion service and timed out every query (4s),
   # dragging the gateway's parallel fan-out into a full 4s wait. Use clearnet.
+  # DISABLED 2026-11-09: the Tor2 exit IP is suspended by Brave
+  # ("Too many request (suspended_time=30)"), so this returns 0 results while
+  # adding ~0.6-0.9s. The VPN-side instance keeps Brave. Re-enable if the Tor
+  # exit rotates to a non-suspended IP.
   - name: brave
-    disabled: false
+    disabled: true
 
   # Brave .onion engine — reachable but cold onion circuits exceed the 4s
   # engine timeout (and the gateway's hard 4s fan-out cap), so it was
@@ -108,8 +112,15 @@ engines:
 
   # DDG clearnet through Tor2 exit node (reliable, fast ~1-2s, under the
   # gateway's 4s fan-out cap). Primary DDG path for SearXNG2.
+  # DISABLED 2026-11-09: through the Tor2 exit this engine returns ZERO results
+  # while burning its full 8s timeout (curl_cffi Timeout to html.duckduckgo.com,
+  # then "engine timeout"). Because SearXNG waits for every enabled engine, this
+  # set a hard ~10s floor on EVERY query that awaited tor2 -- measured 10.01s on
+  # 8/8 runs, versus 1.35-2.73s with this engine excluded (same instance, same
+  # query). `duckduckgo-onion` below remains enabled as the layered bypass, and
+  # the VPN-side SearXNG instance keeps clearnet DDG, so no recall is lost.
   - name: duckduckgo
-    disabled: false
+    disabled: true
 
   # DDG .onion front-end — RE-ENABLED 2026-07-18 as a LAYERED BYPASS, not a
   # replacement. Design intent: Tor's job is to bypass search-engine suspensions;
@@ -138,8 +149,10 @@ engines:
     disabled: false
     timeout: 4.0
 
+  # DISABLED 2026-11-09: measured at 10.0s through Tor2 (2x its own 4s timeout)
+  # and it never contributes a result to the merged set. Pure latency, no recall.
   - name: marginalia
-    disabled: false
+    disabled: true
     timeout: 4.0
 
   # ── Academic engines via Tor ──
