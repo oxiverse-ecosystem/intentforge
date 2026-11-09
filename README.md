@@ -387,13 +387,18 @@ Two mechanisms:
 | Metric | Value |
 |--------|-------|
 | **Warm request (cached)** | 3–6ms |
-| **Normal query latency (uncached)** | ~3.7s avg, ~5.8s max |
-| **Operator query latency (uncached)** | ~4.8s avg, ~5.1s max |
-| **Fast local search** (`/search/fast`) | ~13ms (measured, local index only) |
-| **Concurrent requests** | 5 simultaneous → all 200 OK |
-| **Cache hit rate** | ~100% for repeated queries within TTL |
+| **Normal query latency (uncached)** | ~3.8s avg, ~6.8s max (20-query sample) |
+| **Operator query latency (uncached)** | ~1.4-1.8s (`site:`/`filetype:` fan out to fewer engines) |
+| **Fast local search** (`/search/fast`) | ~25ms (measured, local index only) |
+| **Concurrent requests** | 5 simultaneous cold queries → 4.04s wall (4.2x speedup), all 200 OK |
+| **Cache hit rate** | ~100% for repeated queries within TTL (~10ms on a hit) |
 
-Normal complex queries (natural constraints like `not X`, `vs Y`) are ~34% faster than operator queries (`site:`, `filetype:`) because the gateway's constraint engine applies operators post-search rather than passing them to upstream engines.
+Operator queries (`site:`, `filetype:`) are consistently **faster** than plain or
+natural-language queries -- measured 1.4-1.8s versus 3.5-6.8s over the same
+20-query sample -- because the gateway rewrites them into a single structured
+upstream query and fans out to fewer engines, while plain queries fan out across
+the full engine set plus the local index. (Earlier revisions of this table had
+the ordering inverted; the numbers above are from a live measurement pass.)
 
 See **[performance section in API_REFERENCE.md](API_REFERENCE.md#performance--stress-test-results)** for detailed benchmarks.
 
