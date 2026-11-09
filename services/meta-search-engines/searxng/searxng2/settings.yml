@@ -129,9 +129,12 @@ engines:
   # SearXNG fails over across engines in one instance, so clearnet `duckduckgo`
   # above covers this engine if it 406s. Timeout raised to 10s (instance
   # max_request_timeout is 12.0) so a slow cold onion circuit isn't killed at 4s.
-  # NOTE: this engine is intentionally NOT counted on the critical latency path —
-  # the gateway's 4s tor2 cap is satisfied by the clearnet engines; the onion
-  # engine contributes when it can and is skipped (harmlessly) when it can't.
+  # NOTE: this engine is intentionally NOT counted on the critical latency path.
+  # The gateway's tor2 branch budget is 6s (main.rs:16061, raised from 4s), which
+  # the fast clearnet engines satisfy; the onion engine contributes when it can
+  # and is skipped (harmlessly) when it can't. Its own timeout is 5s so a failed
+  # onion rendezvous is capped INSIDE that 6s budget -- at the old 10s it
+  # overran the budget and the gateway discarded tor2's healthy results too.
   - name: duckduckgo-onion
     engine: duckduckgo
     ddg_url: "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/html/"
