@@ -1945,7 +1945,39 @@ const LOCATION_GAZETTEER: &[(&str, &str)] = &[
 ///     "teheran". Only exact gazetteer entries win.
 ///   • The city name is recorded so ranking can still boost the specific city.
 ///   • Returns `None` when no gazetteer entry is present — then IP geo is used.
+/// Memoized `detect_explicit_location`.
+///
+/// The gazetteer holds 320 entries and the scan is a linear pass with a
+/// substring test per entry, run TWICE per /search request (once for the cache
+/// key / upstream URL at ~15625, once inside `merge_local_and_web` at ~10404).
+/// The result is a pure function of the query string, so it is safe to memoize.
+/// Bounded so a long tail of unique queries cannot grow it without limit.
 fn detect_explicit_location(query: &str) -> Option<geoloc::GeoLocation> {
+    const GEO_CACHE_MAX: usize = 4096;
+    static GEO_CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<String, Option<geoloc::GeoLocation>>>,
+    > = std::sync::OnceLock::new();
+    let cache = GEO_CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+
+    {
+        let guard = cache.lock();
+        if let Some(hit) = guard.get(query) {
+            return hit.clone();
+        }
+    }
+    let result = detect_explicit_location_uncached(query);
+    {
+        let mut guard = cache.lock();
+        if guard.len() >= GEO_CACHE_MAX {
+            guard.clear();
+        }
+        guard.insert(query.to_string(), result.clone());
+    }
+    result
+}
+
+/// The uncached gazetteer scan. See `detect_explicit_location` for why it is memoized.
+fn detect_explicit_location_uncached(query: &str) -> Option<geoloc::GeoLocation> {
     let q_lower = query.to_lowercase();
     let tokens: Vec<&str> = q_lower.split_whitespace().collect();
     // Try multi-word phrases first (longest first), then single words.
@@ -6631,23 +6663,87 @@ fn warm_tor2_cache() {
         if let Ok(client) = client {
             // Fire ONE warmup query. A cold Tor circuit builds on the first
             // request (the result is discarded); once it returns, the circuit
-            // is HOT, so flip TOR2_WARM immediately rather than waiting for a
-            // second confirmation. This keeps the warmup well under the
-            // search recovery path's 12s pre-query wait window.
-            let _ = client
+            // is HOT.
+            //
+            // But "returns" is not "succeeded": the previous code flipped
+            // TOR2_WARM=true on `.send()` returning alone, so a timeout, a 5xx
+            // or an empty body still marked the circuit hot. The pre-query wait
+            // at main.rs:16400 then skipped the wait it exists to perform, and
+            // the first real query paid the cold-circuit cost. Require a 2xx
+            // with a non-empty body before claiming the circuit is hot.
+            let warmed = match client
                 .get("http://tor2:8081/search")
                 .query(&[("q", "warmup"), ("format", "json")])
-                .send();
-            TOR2_WARM.store(true, std::sync::atomic::Ordering::SeqCst);
-            tracing::info!("tor2 cache warmed after NEWNYM (TOR2_WARM=true)");
+                .send()
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let len = resp.content_length().unwrap_or(0);
+                    if status.is_success() && len > 0 {
+                        true
+                    } else {
+                        tracing::warn!(
+                            "tor2 warmup returned HTTP {} with {} bytes; keeping TOR2_WARM=false",
+                            status, len
+                        );
+                        false
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("tor2 warmup request failed: {}; keeping TOR2_WARM=false", e);
+                    false
+                }
+            };
+            if warmed {
+                TOR2_WARM.store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!("tor2 cache warmed after NEWNYM (TOR2_WARM=true)");
+            }
         }
     });
 }
 
+/// Rotate both egress paths WITHOUT taking them down at the same time.
+///
+/// The previous implementation fired `trigger_vpn_rotation` and
+/// `rotate_tor_circuit` back-to-back, so every rotation produced a window in
+/// which BOTH paths were degraded simultaneously:
+///   · VPN:   PUT stopped -> 5s -> PUT running -> 15s -> GET ip  = ~20s down
+///   · Tor:   NEWNYM -> TOR2_WARM=false -> warmup GET -> TOR2_WARM=true
+/// Measured live: a query arriving in that window could pay the 6s pre-query
+/// `TOR2_WARM` wait (main.rs:16400) on top of a 6s attempt-1 budget and a
+/// retry, because the VPN path was also unavailable. With a 600s periodic
+/// rotation that is a recurring multi-second outage, not a rare edge case.
+///
+/// Now the two are STAGGERED: Tor rotates first and we wait (bounded) for its
+/// circuit to come back hot, and only then rotate the VPN. At any instant at
+/// least one egress path is healthy, so no query ever sees both cold.
+///
+/// Safe to call from both sync and async contexts: the sequencing lives in a
+/// detached thread, so the caller never blocks.
 fn rotate_all_ips(reason: &str) {
-    tracing::info!("Rotating ALL IPs (gluetun VPN + tor2): {}", reason);
-    trigger_vpn_rotation(reason);
-    rotate_tor_circuit();
+    tracing::info!("Rotating IPs staggered (tor2 first, then gluetun VPN): {}", reason);
+    let reason = reason.to_string();
+    std::thread::spawn(move || {
+        // 1) Tor first. rotate_tor_circuit() already flips TOR2_WARM=false and
+        //    kicks off warm_tor2_cache(); wait (bounded) for it to come back.
+        rotate_tor_circuit();
+        let mut waited = 0u64;
+        while waited < 15000 && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            waited += 500;
+        }
+        if !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::warn!(
+                "tor2 still cold {}ms after NEWNYM; rotating VPN anyway (tor2 will warm in the background)",
+                waited
+            );
+        } else {
+            tracing::info!("tor2 circuit hot again after {}ms; rotating VPN", waited);
+        }
+        // 2) Only now take the VPN down. The Tor path is healthy and can serve
+        //    the fan-out while gluetun restarts.
+        trigger_vpn_rotation(&reason);
+    });
 }
 
 // ─── Simple Stemming (English Plurals) ──────────────────────────────
@@ -14228,15 +14324,51 @@ async fn main() {
             prewarm_client.get(format!("{}/search?q=warmup&format=json&pageno=1", searxng_url())).send(),
             prewarm_client.get(format!("{}/embed?text=warmup", intent_engine_url())).send(),
         ];
-        if let Some(ref s2_url) = prewarm_searxng2 {
-            let url = format!("{}/search?q=warmup&format=json&pageno=1", s2_url);
-            prewarm_futs.push(prewarm_client.get(url).send());
+        // Track the tor2 future separately so its RESULT can be checked. The
+        // previous code discarded every result with `let _ =` and then
+        // unconditionally set TOR2_WARM=true, so a tor2 that was down or cold at
+        // startup was declared hot -- and the first real query paid the
+        // cold-circuit cost the flag exists to prevent.
+        let tor2_prewarm = match prewarm_searxng2 {
+            Some(ref s2_url) => {
+                let url = format!("{}/search?q=warmup&format=json&pageno=1", s2_url);
+                Some(prewarm_client.get(url).send())
+            }
+            None => None,
+        };
+        if let Some(fut) = tor2_prewarm {
+            prewarm_futs.push(fut);
         }
-        let _ = futures::future::join_all(prewarm_futs).await;
-        // The tor2 GET above rebuilt the circuit; mark it hot so the search
-        // recovery path can query tor2 without paying the cold-build penalty.
-        TOR2_WARM.store(true, std::sync::atomic::Ordering::SeqCst);
-        tracing::info!("Prewarm complete (tor2 circuit marked hot)");
+        let results = futures::future::join_all(prewarm_futs).await;
+        // The tor2 future is the LAST one pushed, so it is the last element --
+        // unless searxng2_url was absent, in which case there is no tor2 to
+        // warm and the flag must stay false.
+        let tor2_ok = match (prewarm_searxng2.as_ref(), results.last()) {
+            (Some(_), Some(Ok(resp))) => {
+                let ok = resp.status().is_success() && resp.content_length().unwrap_or(0) > 0;
+                if !ok {
+                    tracing::warn!(
+                        "tor2 startup prewarm returned HTTP {}; keeping TOR2_WARM=false",
+                        resp.status()
+                    );
+                }
+                ok
+            }
+            (Some(_), Some(Err(e))) => {
+                tracing::warn!("tor2 startup prewarm failed: {}; keeping TOR2_WARM=false", e);
+                false
+            }
+            (Some(_), None) => false,
+            // No tor2 configured: nothing to warm, and the pre-query wait is
+            // gated on tor2 being in the fan-out, so leaving it false is correct.
+            (None, _) => false,
+        };
+        if tor2_ok {
+            TOR2_WARM.store(true, std::sync::atomic::Ordering::SeqCst);
+            tracing::info!("Prewarm complete (tor2 circuit confirmed hot)");
+        } else {
+            tracing::warn!("Prewarm complete; tor2 NOT confirmed hot (searches will wait for it)");
+        }
     });
 
     // Periodic IP rotation every 10 minutes — rotates both gluetun VPN and tor2 circuit
@@ -15522,31 +15654,47 @@ async fn handle_search(
         state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
     });
 
-    // 0b. Check cache first (5-min TTL)
-    // Cache key must include pagination params: results are sliced by
+    // 0b. Cache key geometry. The lookup itself happens AFTER spell correction
+    // (see 0b.5) so the key is built from the CORRECTED query -- otherwise
+    // "biryani recipie" and "biryani recipe" are two cache entries and two full
+    // upstream fan-outs for the same search.
+    //
+    // The key must include pagination params: results are sliced by
     // limit/offset before serialization, so two requests for the same query
     // with different count/offset must NOT share a cached body.
     let page_key = match (params.limit.or(params.count).or(params.n), params.offset) {
         (None, None) => "all".to_string(),
         (l, o) => format!("l{}_o{}", l.unwrap_or(24), o.unwrap_or(0)),
     };
+    let geo_key = geo_location
+        .as_ref()
+        .and_then(|g| g.country_code.as_deref())
+        .unwrap_or("none")
+        .to_string();
+    // 0b.5: Spelling correction — correct misspellings before fan-out.
+    // Done BEFORE the cache lookup and BEFORE the semaphore acquire, so the key
+    // is the corrected query and a cache hit still costs no concurrency slot.
+    let (q_corrected_cleaned, mut spell_changed) = spell::correct_query(&state.spell_index, &q_cleaned_spelling);
+    if spell_changed {
+        tracing::info!("Spell-corrected query: '{}' -> '{}'", q_trimmed, q_corrected_cleaned);
+    }
+
+    // 0b.6: Cache lookup, keyed on the CORRECTED query. Done after correction so
+    // typo variants share one entry (and one upstream fan-out).
+    // `q_corrected_cleaned` is what the engine actually searches, so it is the
+    // right identity for the cached body.
     let cache_key = format!(
         "{}:{}:{}",
-        q_trimmed.to_lowercase(),
+        q_corrected_cleaned.to_lowercase(),
         page_key,
-        geo_location
-            .as_ref()
-            .and_then(|g| g.country_code.as_deref())
-            .unwrap_or("none")
+        geo_key
     );
-    // `geo_location` above is the IP-derived value; an explicit location in the
-    // query overrides it later (P3 fix), so re-derive the key component from the
-    // SAME resolution the ranking path uses rather than duplicating the logic.
     if let Some(cached) = state.cache.get(&cache_key) {
-        tracing::info!("Cache hit for query: {}", q_trimmed);
+        tracing::info!("Cache hit for query: {}", q_corrected_cleaned);
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
         return (axum::http::StatusCode::OK, Json(value));
     }
+
     // 0b.x: Bound concurrency. Acquire a slot in the global search semaphore so
     // the combined per-request working set can never exceed the container cgroup.
     // `permit` is held for the whole handler and dropped (released) on return,
@@ -15573,12 +15721,6 @@ async fn handle_search(
             return make_error_response(q_trimmed, "search_busy", "Search service is busy; please retry", false);
         }
     };
-
-    // 0b.5: Spelling correction — correct misspellings before fan-out
-    let (q_corrected_cleaned, mut spell_changed) = spell::correct_query(&state.spell_index, &q_cleaned_spelling);
-    if spell_changed {
-        tracing::info!("Spell-corrected query: '{}' -> '{}'", q_trimmed, q_corrected_cleaned);
-    }
 
     // 0c. Request deduplication: if another task is already fetching this query, wait for it.
     // `dedup_guard` lives for the whole handler so it removes the in_flight entry even
@@ -20103,7 +20245,42 @@ fn extract_decimal_constraints(q: &str) -> Vec<String> {
     results
 }
 
+/// Memoized `extract_gateway_constraints`.
+///
+/// This parser runs a full char-by-char phrase parse plus nine `match_indices`
+/// operator scans, and `/search` calls it THREE times per request (the spell
+/// reconstruction at ~15644, the fan-out language lookup at ~15872, and the
+/// merge at ~16660). Two of those three use the identical input string
+/// (`q_trimmed` / `q_orig`, which are the same value).
+///
+/// The result is a pure function of the query string, so memoizing is safe.
+/// Bounded so a long tail of unique queries cannot grow it without limit.
 fn extract_gateway_constraints(q: &str) -> Constraints {
+    const CONSTRAINT_CACHE_MAX: usize = 4096;
+    static CONSTRAINT_CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<String, Constraints>>,
+    > = std::sync::OnceLock::new();
+    let cache = CONSTRAINT_CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+
+    {
+        let guard = cache.lock();
+        if let Some(hit) = guard.get(q) {
+            return hit.clone();
+        }
+    }
+    let result = extract_gateway_constraints_uncached(q);
+    {
+        let mut guard = cache.lock();
+        if guard.len() >= CONSTRAINT_CACHE_MAX {
+            guard.clear();
+        }
+        guard.insert(q.to_string(), result.clone());
+    }
+    result
+}
+
+/// The uncached constraint parse. See `extract_gateway_constraints` for why it is memoized.
+fn extract_gateway_constraints_uncached(q: &str) -> Constraints {
     // Normalize spoken constraint forms (under $500, in url:, …) before
     // scanning for operators so the gateway's own parsing matches the engine
     // query and the intent engine's extraction.
