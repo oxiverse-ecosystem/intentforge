@@ -137,7 +137,13 @@ engines:
     ddg_url: "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/html/"
     disabled: false
     shortcut: ddo
-    timeout: 10.0
+    # 10.0 -> 5.0 (2026-11-09). This engine DOES return results (verified: it is
+    # the sole source for some queries), so it stays enabled -- but 10s was
+    # longer than the gateway's own 6s branch budget (main.rs:16061), so a slow
+    # onion fetch could never actually be used. Measured warm latency is
+    # 1.35-2.7s (p50), with cold-circuit outliers to ~6.4s; 5s admits the warm
+    # path and the occasional slow one while bounding the tail.
+    timeout: 5.0
     categories: general
     network: default  # use the default network's SOCKS5 proxy for .onion
 
