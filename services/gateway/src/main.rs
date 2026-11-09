@@ -16051,7 +16051,14 @@ async fn handle_search(
             // isn't cut before it responds; the gluetun instance (index 0)
             // keeps the original 4.2s budget.
             let is_tor_url = url.contains("tor2") || url.contains("8081");
-            let branch_timeout_ms: u64 = if is_tor_url { 15000 } else { 4200 };
+            // tor2 was given 15s because a COLD Tor circuit (after NEWNYM) can
+            // take 10-12s to build. That reasoning was correct but the budget was
+            // being consumed by a dead engine, not by circuit build: with
+            // duckduckgo/marginalia/brave disabled (they returned 0 results
+            // through the Tor exit while burning 8-10s each), tor2 answers in
+            // 1.35-2.73s measured. 6s keeps ample cold-circuit headroom while
+            // capping the tail.
+            let branch_timeout_ms: u64 = if is_tor_url { 6000 } else { 4200 };
             let task = tokio::spawn(async move {
                 let resp = match tokio::time::timeout(
                     std::time::Duration::from_millis(branch_timeout_ms),
@@ -16561,8 +16568,12 @@ async fn handle_search(
         // is still used if even 15s is exceeded). Fast-path behaviour is unchanged.
         async {
             let partial_collector_ref = searx_partial_collector.clone();
+            // 6s (was 15s): the 15s figure assumed tor2 could legitimately take
+            // that long. It never did -- the delay was three dead engines timing
+            // out, now disabled. Measured tor2 latency after that change:
+            // 1.35-2.73s. 6s preserves cold-circuit headroom and bounds the tail.
             let join_deadline = if tor2_in_fanout {
-                Duration::from_secs(15)
+                Duration::from_secs(6)
             } else {
                 Duration::from_secs(5)
             };
