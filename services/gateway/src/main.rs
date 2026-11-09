@@ -6637,7 +6637,11 @@ fn rotate_tor_circuit() {
                     // gateway's retry budget and surface `upstream_unavailable`
                     // for the very first user query after a rotation. Warm the
                     // circuit in the background so real queries hit a HOT path.
-                    warm_tor2_cache();
+                    // Use the SAME base URL the fan-out uses, so the warmup
+                    // confirms the circuit the searches will actually query.
+                    let warm_url = std::env::var("SEARXNG2_URL")
+                        .unwrap_or_else(|_| "http://tor2:8081".to_string());
+                    warm_tor2_cache(warm_url);
                 } else {
                     tracing::warn!("tor2 NEWNYM response: {}", newnym_resp.trim());
                 }
@@ -6655,8 +6659,8 @@ fn rotate_tor_circuit() {
 /// 10-15s circuit-build cost. Runs detached; results are discarded. Once the
 /// circuit is confirmed hot, flips `TOR2_WARM` so the search recovery path
 /// knows it can query tor2 without the cold penalty.
-fn warm_tor2_cache() {
-    std::thread::spawn(|| {
+fn warm_tor2_cache(searxng2_url: String) {
+    std::thread::spawn(move || {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(25))
             .build();
@@ -6671,8 +6675,14 @@ fn warm_tor2_cache() {
             // at main.rs:16400 then skipped the wait it exists to perform, and
             // the first real query paid the cold-circuit cost. Require a 2xx
             // with a non-empty body before claiming the circuit is hot.
+            // Target the SAME base URL the fan-out uses. The hard-coded
+            // `http://tor2:8081` happens to resolve to the same container in this
+            // deployment, but it silently breaks if SEARXNG2_URL is ever pointed
+            // elsewhere -- and then the warmup would confirm a circuit the
+            // fan-out never uses.
+            let tor2_warmup_url = format!("{}/search", searxng2_url);
             let warmed = match client
-                .get("http://tor2:8081/search")
+                .get(&tor2_warmup_url)
                 .query(&[("q", "warmup"), ("format", "json")])
                 .send()
             {
@@ -16200,6 +16210,10 @@ async fn handle_search(
             // through the Tor exit while burning 8-10s each), tor2 answers in
             // 1.35-2.73s measured. 6s keeps ample cold-circuit headroom while
             // capping the tail.
+            // 6s, matching duckduckgo-onion's own 5s engine timeout plus slack:
+            // when that engine fails on a cold circuit, tor2 still returns its
+            // healthy bing/wikipedia results inside this budget rather than the
+            // gateway discarding the whole tor2 response.
             let branch_timeout_ms: u64 = if is_tor_url { 6000 } else { 4200 };
             let task = tokio::spawn(async move {
                 let resp = match tokio::time::timeout(
@@ -16507,7 +16521,15 @@ async fn handle_search(
         // Cap at 6s (reduced from 12s) so a genuinely stuck tor2 can't hang the
         // request. The 24s circuit-breaker timeout defect (round 2026-10-14)
         // showed that 12s warm-up + 10s × 2 attempts exceeded the 30s budget.
-        if searx_urls.iter().any(|u| u.contains("tor2")) && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
+        // NOTE: the predicate must match the ACTUAL configured URL. SEARXNG2_URL
+        // is `http://if-dev-searxng2:8081` (docker-compose.dev.yml), which does
+        // NOT contain the substring "tor2" -- so the old `contains("tor2")` gate
+        // was false for every request and this 6s wait was dead code. The tor2
+        // branch budget just below already uses the correct
+        // `contains("tor2") || contains("8081")` form; this now matches it.
+        if searx_urls.iter().any(|u| u.contains("tor2") || u.contains("8081"))
+            && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst)
+        {
             let mut waited = 0u64;
             while waited < 6000 && !TOR2_WARM.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -16714,8 +16736,14 @@ async fn handle_search(
             // that long. It never did -- the delay was three dead engines timing
             // out, now disabled. Measured tor2 latency after that change:
             // 1.35-2.73s. 6s preserves cold-circuit headroom and bounds the tail.
+            // 12s when tor2 is in the fan-out (was 6s). The pre-query TOR2_WARM
+            // wait above can now actually fire (its hostname predicate was dead
+            // code until this round), and a cold circuit needs room: 6s wait +
+            // 6s attempt-1 = 12s. The old 6s join would cut the attempt off the
+            // instant the wait engaged, making the wait self-defeating. 12s still
+            // leaves 18s of the 30s TimeoutLayer for the retry and the tail.
             let join_deadline = if tor2_in_fanout {
-                Duration::from_secs(6)
+                Duration::from_secs(12)
             } else {
                 Duration::from_secs(5)
             };
