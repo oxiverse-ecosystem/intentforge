@@ -1,4 +1,10 @@
 use_default_settings:
+  categories_as_tabs:
+    general: {}
+    images: {}
+    videos: {}
+    news: {}
+    shopping: {}
   engines:
     keep_only:
       # ── General web search ──
@@ -26,8 +32,10 @@ use_default_settings:
       - google videos
       - duckduckgo videos
       # ── Shopping engines ──
-      - google shopping
+      # (google shopping removed: searx/engines/google_shopping.py does not
+      # exist in this build, so the entry could never load)
       - ebay
+      - geizhals
 
 server:
   port: 8080
@@ -207,12 +215,31 @@ engines:
     categories: [videos]  # restrict to /videos; prevents pollution of /search
 
   # ── Shopping engines (via VPN) ──
-  - name: google shopping
-    engine: google_shopping
-    disabled: false
-    timeout: 4.0
+  # NOTE: a `google shopping` engine was configured here, but
+  # `searx/engines/google_shopping.py` does not exist in this SearXNG build
+  # (the only shopping-categorised engines shipped are ebay.py and
+  # geizhals.py). The entry was a phantom that could never load. Removed.
 
+  # eBay is the ONLY shopping-categorised engine in this SearXNG build that
+  # returns structured commerce fields (price, shipping, source_country,
+  # thumbnail). It was configured here but could never load, for two reasons:
+  #   1. SearXNG's own default entry for ebay is `inactive: true`; the
+  #      `keep_only` filter keeps the NAME while leaving `inactive` set, so the
+  #      loader skipped it. `inactive: false` below overrides that.
+  #   2. The default entry also carries `base_url`, but this override replaces
+  #      the whole mapping, so it must be repeated here.
   - name: ebay
     engine: ebay
+    shortcut: eb
+    base_url: https://www.ebay.com
+    inactive: false
     disabled: false
-    timeout: 4.0
+    timeout: 6.0
+  # geizhals.de -- German price comparison. Unlike eBay (which 403s datacenter
+  # IPs), it answers from this VPN exit and returns best-offer price, rating,
+  # offer count and specs. Disabled in SearXNG's defaults; enabled here.
+  - name: geizhals
+    engine: geizhals
+    shortcut: geiz
+    disabled: false
+    timeout: 6.0
