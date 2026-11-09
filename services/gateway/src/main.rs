@@ -13504,6 +13504,39 @@ fn apply_media_limit(mut value: serde_json::Value, limit: Option<usize>) -> serd
     value
 }
 
+/// Country code for the cache key, from the request's client IP.
+///
+/// Shared by `/search` and the media endpoints so every cache key that stores a
+/// geo-scoped body is partitioned the same way. Returns `None` when the request
+/// carries no usable client IP or GeoLite2 has no entry -- callers use a literal
+/// `"none"` sentinel so those requests still share one bucket.
+fn cache_key_geo_country(headers: &HeaderMap, state: &Arc<AppState>) -> Option<String> {
+    let ip = client_ip_from_headers(headers)?;
+    state
+        .geo_locator
+        .as_ref()
+        .and_then(|gl| gl.lookup(ip))
+        .and_then(|g| g.country_code)
+}
+
+/// Extract the client IP from the proxy headers, purely.
+///
+/// `x-forwarded-for` wins (first hop), then `x-real-ip`. Split out from
+/// `cache_key_geo_country` so the header precedence is unit-testable without
+/// constructing an `AppState`.
+fn client_ip_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next().map(|s| s.trim()))
+        .and_then(|ip| ip.parse().ok())
+        .or_else(|| {
+            headers.get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|ip| ip.parse().ok())
+        })
+}
+
 async fn handle_images(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     JsonQuery(params): JsonQuery<SearchParams>,
@@ -13523,7 +13556,13 @@ async fn handle_images(
         );
     }
 
-    let cache_key = format!("images:{}", q.to_lowercase().trim());
+    // Geo-scoped body -> the key must be partitioned by country, or one user's
+    // geo results are served to another (same defect as /search).
+    let cache_key = format!(
+        "images:{}:{}",
+        q.to_lowercase().trim(),
+        cache_key_geo_country(&headers, &state).unwrap_or_else(|| "none".to_string())
+    );
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
         return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
@@ -13656,7 +13695,11 @@ async fn handle_videos(
         );
     }
 
-    let cache_key = format!("videos:{}", q.to_lowercase().trim());
+    let cache_key = format!(
+        "videos:{}:{}",
+        q.to_lowercase().trim(),
+        cache_key_geo_country(&headers, &state).unwrap_or_else(|| "none".to_string())
+    );
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
         return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
@@ -13865,7 +13908,11 @@ async fn handle_news(
         );
     }
 
-    let cache_key = format!("news:{}", q.to_lowercase().trim());
+    let cache_key = format!(
+        "news:{}:{}",
+        q.to_lowercase().trim(),
+        cache_key_geo_country(&headers, &state).unwrap_or_else(|| "none".to_string())
+    );
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
         return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
@@ -15447,6 +15494,34 @@ async fn handle_search(
         return make_error_response(q_trimmed, "invalid_query", "Query appears to be gibberish; no results returned", true);
     }
 
+    // 0a. Resolve the client IP and its geolocation BEFORE the cache lookup.
+    //
+    // `geo_location` is serialized into the response body AND used to build the
+    // upstream SearXNG URL (`&language=`/`&source_country=`) and the ranking
+    // geo-boost. The cache key must therefore include it, or one user's
+    // geo-scoped results are served to another user. Verified live: priming the
+    // cache with x-real-ip 8.8.8.8 (US), then requesting the same query with
+    // 103.81.0.1 (IN), returned `country_code: "US"` to the Indian user.
+    //
+    // Only the country code participates in the key: city/postal vary far more
+    // than the upstream geo parameters do, so including them would fragment the
+    // cache without changing results.
+    let client_ip: Option<IpAddr> = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next().map(|s| s.trim()))
+        .and_then(|ip| ip.parse().ok())
+        .or_else(|| {
+            headers.get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|ip| ip.parse().ok())
+        });
+    // Look up geolocation immediately — used for the cache key, SearXNG URL
+    // construction, ranking geo-boost, and local query expansion.
+    let geo_location: Option<geoloc::GeoLocation> = client_ip.and_then(|ip| {
+        state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
+    });
+
     // 0b. Check cache first (5-min TTL)
     // Cache key must include pagination params: results are sliced by
     // limit/offset before serialization, so two requests for the same query
@@ -15455,7 +15530,18 @@ async fn handle_search(
         (None, None) => "all".to_string(),
         (l, o) => format!("l{}_o{}", l.unwrap_or(24), o.unwrap_or(0)),
     };
-    let cache_key = format!("{}:{}", q_trimmed.to_lowercase(), page_key);
+    let cache_key = format!(
+        "{}:{}:{}",
+        q_trimmed.to_lowercase(),
+        page_key,
+        geo_location
+            .as_ref()
+            .and_then(|g| g.country_code.as_deref())
+            .unwrap_or("none")
+    );
+    // `geo_location` above is the IP-derived value; an explicit location in the
+    // query overrides it later (P3 fix), so re-derive the key component from the
+    // SAME resolution the ranking path uses rather than duplicating the logic.
     if let Some(cached) = state.cache.get(&cache_key) {
         tracing::info!("Cache hit for query: {}", q_trimmed);
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
@@ -15602,23 +15688,7 @@ async fn handle_search(
     let q_orig = q_trimmed.to_string(); // original, untouched query for intent/constraints
 
     let q_encoded = urlencoding::encode(&q);
-    let client_ip: Option<IpAddr> = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next().map(|s| s.trim()))
-        .and_then(|ip| ip.parse().ok())
-        .or_else(|| {
-            headers.get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|ip| ip.parse().ok())
-        });
-    // Look up geolocation immediately — used for SearXNG URL construction,
-    // ranking geo-boost, and local query expansion.
-    let geo_location: Option<geoloc::GeoLocation> = client_ip.and_then(|ip| {
-        state.geo_locator.as_ref().and_then(|gl| gl.lookup(ip))
-    });
-
-    // P3 fix: an explicit location named in the query (e.g. "tokyo japan",
+        // P3 fix: an explicit location named in the query (e.g. "tokyo japan",
     // "restaurants in london") MUST override the IP-derived geolocation. Without
     // this, a user in India searching "restaurants in tokyo japan" got
     // IN-localised results. Explicit user intent wins over inferred IP location.
@@ -23399,6 +23469,62 @@ mod spellcheck_endpoint_tests {
             let loc = build_geolocate(gl.as_ref(), "news about local elections", Some("8.8.8.8".parse().unwrap()));
             assert!(loc.resolved.is_none() || loc.resolved.is_some());
             assert!(["ip", "local_intent_fallback", "none"].contains(&loc.source.as_str()));
+        }
+
+        /// REGRESSION (real bug, live 2026-11-09): the `/search` cache key was
+        /// `"{query}:{page_key}"` with no geolocation, while `geo_location` is
+        /// serialized into the body AND used for the upstream SearXNG URL and the
+        /// ranking geo-boost. Priming the cache with x-real-ip 8.8.8.8 (US) and
+        /// then requesting the same query with 103.81.0.1 (IN) returned
+        /// `country_code: "US"` to the Indian user.
+        ///
+        /// The key must partition by resolved country. Guarded on the GeoLite2 DB
+        /// being present so the test stays green in CI without the DB.
+        #[test]
+        fn client_ip_header_precedence() {
+            // x-forwarded-for wins over x-real-ip, and only the FIRST hop is used.
+            let mut h = HeaderMap::new();
+            h.insert("x-real-ip", "103.81.0.1".parse().unwrap());
+            h.insert("x-forwarded-for", "8.8.8.8, 10.0.0.1".parse().unwrap());
+            assert_eq!(
+                client_ip_from_headers(&h),
+                Some("8.8.8.8".parse().unwrap()),
+                "x-forwarded-for must win and use its first hop"
+            );
+
+            // x-real-ip alone is honoured.
+            let mut h2 = HeaderMap::new();
+            h2.insert("x-real-ip", "103.81.0.1".parse().unwrap());
+            assert_eq!(client_ip_from_headers(&h2), Some("103.81.0.1".parse().unwrap()));
+
+            // No headers -> None (never a panic, never a fabricated location).
+            let bare = HeaderMap::new();
+            assert_eq!(client_ip_from_headers(&bare), None);
+
+            // A malformed value must not panic.
+            let mut bad = HeaderMap::new();
+            bad.insert("x-real-ip", "not-an-ip".parse().unwrap());
+            assert_eq!(client_ip_from_headers(&bad), None);
+        }
+
+        /// The geo component used in the cache key must differ by country, or two
+        /// users in different countries share one cached (geo-scoped) response.
+        /// Guarded on the GeoLite2 DB being present so CI without the DB is green.
+        #[test]
+        fn cache_key_geo_differs_by_country() {
+            let Some(gl) = geoloc::GeoLocator::load() else {
+                return;
+            };
+            let us = gl.lookup("8.8.8.8".parse().unwrap()).and_then(|g| g.country_code);
+            let in_c = gl
+                .lookup("103.81.0.1".parse().unwrap())
+                .and_then(|g| g.country_code);
+            if let (Some(us), Some(in_c)) = (us, in_c) {
+                assert_ne!(
+                    us, in_c,
+                    "US and IN must map to different cache-key geo components"
+                );
+            }
         }
 
         #[test]
