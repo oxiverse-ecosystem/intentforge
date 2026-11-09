@@ -4674,7 +4674,11 @@ fn commerce_fetch_budget(
     if waves_remaining == 0 {
         return remaining_wall;
     }
-    let per_page_cap = std::time::Duration::from_secs(3);
+    // A real VPN-routed merchant page needs ~6.5-8s (measured live from the
+    // gateway container: flipkart 4.5s, walmart 2.6s, amazon 1.7s, bestbuy
+    // blocked). The old 3s cap silently discarded every slow-but-valid fetch,
+    // so even when the wall budget existed, no facts were ever attached.
+    let per_page_cap = std::time::Duration::from_secs(8);
     remaining_wall.min(per_page_cap)
 }
 
@@ -4951,20 +4955,38 @@ async fn enrich_with_commerce_par<F, Fut>(
     let deadline = std::time::Instant::now() + wall_timeout;
     let wave_width = max_par.max(1);
     let mut fetched: Vec<(usize, String)> = Vec::new();
+    // Fetches that complete EARLY must not be held hostage by a slow sibling.
+    // The drain below waits only until every fetch in the wave has settled --
+    // never for the whole remaining wall.
+    let mut pending = 0usize;
     // Completed fetches are streamed back through a channel rather than collected
     // from JoinHandles at the end of the wave, so a slow/timed-out SIBLING never
     // discards facts that already arrived (partial progress is preserved). The
     // previous JoinHandle-collect-on-whole-wave shape was all-or-nothing per wave.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, String)>(wave_width);
+    // One message per fetch: (index, optional html). `None` means the fetch timed
+    // out or errored -- the result is still settled, just without facts.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, Option<String>)>(wave_width);
     // Wave-based, bounded concurrency. A rolling window was tried here and
     // reverted: it always consumes the ENTIRE wall (there is always another
     // eligible URL to start), so /shopping — which runs handle_search (itself
     // enriching for up to the same wall) and THEN enriches again — blew past
     // the global 30s TimeoutLayer and every request returned 408. The wave
     // shape lets the batch finish early when the eligible set runs out.
-    for wave in eligible.chunks(wave_width) {
+    tracing::info!(
+        "COMMERCE ENRICH: {} eligible result(s), wall budget {:?}, concurrency {}",
+        eligible.len(),
+        wall_timeout,
+        max_par
+    );
+    for (wave_index, wave) in eligible.chunks(wave_width).enumerate() {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
+            tracing::warn!(
+                "COMMERCE ENRICH: budget exhausted before wave {} — {} of {} result(s) left unfetched",
+                wave_index,
+                eligible.len().saturating_sub(fetched.len()),
+                eligible.len()
+            );
             // Budget exhausted — abandon pending waves (handles are dropped;
             // tokio detaches the tasks, matching the pre-existing semantics
             // where a slow fetch could never block the response past the cap).
@@ -4984,35 +5006,62 @@ async fn enrich_with_commerce_par<F, Fut>(
             let tx = tx.clone();
             let per_fetch = per_fetch;
             tokio::spawn(async move {
-                if let Ok(Some(html)) = tokio::time::timeout(per_fetch, fetch_clone(url_owned)).await
-                {
-                    let _ = tx.send((idx, html)).await;
-                }
+                // Exactly one message per fetch, on EVERY path (success, timeout,
+                // error). Carrying the optional result in the SAME message as the
+                // settlement signal removes the race where the drain could observe
+                // "all settled" while the last result was still sitting in a
+                // separate channel.
+                let html =
+                    tokio::time::timeout(per_fetch, fetch_clone(url_owned)).await;
+                let payload = match html {
+                    Ok(Some(h)) => Some(h),
+                    _ => None,
+                };
+                let _ = tx.send((idx, payload)).await;
             });
         }
-        // Drain this wave. Each recv is bounded by whatever wall remains, and a
-        // recv timeout abandons only the SLOW tail of the wave — everything
-        // already delivered above stays in `fetched`.
-        for _ in 0..wave.len() {
+        pending += wave.len();
+        // Drain this wave. Two exits, whichever comes first:
+        //   · every fetch settled (delivered or abandoned) -> stop immediately
+        //   · the wall expired -> keep whatever arrived, abandon the rest
+        // Previously this loop waited out the FULL remaining wall even when all
+        // fetches had already finished, so a single commercial query burned the
+        // entire enrichment ceiling (measured: every commercial /search pinned at
+        // exactly 15.0s regardless of how fast the pages actually were).
+        // Waiting for exactly `pending` messages -- one per fetch -- stops the
+        // instant the wave settles.
+        let mut received = 0usize;
+        while received < pending {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                break;
+                break; // wall expired — keep whatever arrived
             }
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(item)) => fetched.push(item),
-                Ok(None) => break, // all senders gone (only at end of function)
-                Err(_) => break,    // wall clock expired mid-wave — keep partial progress
+                Ok(Some((idx, Some(html)))) => { fetched.push((idx, html)); received += 1; }
+                Ok(Some((_, None))) => { received += 1; } // settled without facts
+                Ok(None) => break,                       // all senders gone
+                Err(_) => break,                         // wall expired mid-wave
             }
         }
+        pending = 0;
     }
     drop(tx);
 
     // 3) Attach results back onto the original array (preserving order).
+    let attached_count = fetched.len();
     for (idx, html) in fetched {
         if let Some(r) = results.get_mut(idx) {
             enrich_single_commerce(r, &html);
         }
     }
+
+    tracing::info!(
+        "COMMERCE ENRICH: attached facts to {} of {} eligible result(s) in {:?}",
+        attached_count,
+        eligible.len(),
+        wall_timeout
+            .saturating_sub(deadline.saturating_duration_since(std::time::Instant::now()))
+    );
 
     // 4) Attach provenance to any result we didn't fetch (idempotent path).
     for r in results.iter_mut() {
@@ -5041,7 +5090,17 @@ const MAX_PARALLEL_FETCH: usize = 4;
 /// Wall-time cap for main-path parallel enrichment (ROADMAP item 7, refinement).
 /// This is now only the CEILING for `commerce_wall_for_elapsed`, never the value
 /// used unconditionally — see that function for why a flat cap is unsafe.
-const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 4;
+///
+/// Raised from 4s: the budget is `ceiling - elapsed`, and a cold `/search`
+/// spends 3-12s on upstreams first, so a 4s ceiling made the enrichment budget
+/// ZERO on every cold query — the feature silently never ran.
+///
+/// The ceiling must exceed the realistic worst-case search time, otherwise the
+/// subtraction still yields zero. Measured cold `/search` on the dev stack:
+/// p50 ~3.6s, tail up to 12.3s. 15s leaves >=2s of enrichment budget even after
+/// a 12s search, and the absolute worst case (12s + 15s = 27s) stays inside the
+/// 30s transport ceiling.
+const MAINPATH_ENRICHMENT_WALL_SECS: u64 = 15;
 
 /// The global request budget enforced by the `TimeoutLayer` wrapped around the
 /// router (see the `.layer(TimeoutLayer::new(...))` call). Kept as a named
@@ -24936,6 +24995,57 @@ structured product data, so nothing must be extracted from the body.</p></body><
     /// `elapsed` exceeds the transport budget the request is already lost
     /// upstream, and the honest contract is only that enrichment then adds
     /// NOTHING further (wall == 0), never that the sum is somehow reduced.
+    /// REGRESSION (real bug, live 2026-11-09): `MAINPATH_ENRICHMENT_WALL_SECS`
+    /// was cut 15s -> 4s (PR #485) to hit a latency target. But the budget is
+    /// `ceiling - elapsed`, and a cold `/search` spends 3-12s on upstreams first,
+    /// so a 4s ceiling made the enrichment budget ZERO on every cold query --
+    /// the commerce strip silently never appeared, and nothing was logged.
+    ///
+    /// The ceiling must be large enough that a realistic cold search still leaves
+    /// room for at least one wave of page fetches.
+    #[test]
+    fn enrichment_ceiling_leaves_budget_after_a_realistic_cold_search() {
+        // Measured cold /search latencies on the dev stack: 1.8s - 12.3s.
+        for elapsed_secs in [2u64, 4, 6, 8, 10, 12] {
+            let wall = commerce_wall_for_elapsed(std::time::Duration::from_secs(elapsed_secs));
+            assert!(
+                wall >= std::time::Duration::from_secs(2),
+                "a cold search that took {}s must still leave >=2s for enrichment, got {:?}",
+                elapsed_secs,
+                wall
+            );
+        }
+        // And the absolute worst case must stay inside the transport ceiling.
+        let worst = commerce_wall_for_elapsed(std::time::Duration::from_secs(12));
+        assert!(
+            std::time::Duration::from_secs(12) + worst
+                <= std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            "worst case must stay inside the {}s transport ceiling",
+            REQUEST_TIMEOUT_SECS
+        );
+    }
+
+    /// REGRESSION (real bug, live 2026-11-09): `commerce_fetch_budget` capped each
+    /// page fetch at 3s while a real VPN-routed merchant page needs ~6.5-8s, so
+    /// every slow-but-valid fetch was discarded even when the wall budget existed.
+    /// The per-fetch cap must not be below a realistic page latency.
+    #[test]
+    fn per_fetch_cap_admits_a_realistic_page_latency() {
+        // A generous remaining wall must still allow a ~7s page fetch.
+        let cap = commerce_fetch_budget(
+            std::time::Duration::from_secs(10),
+            1,
+        );
+        assert!(
+            cap >= std::time::Duration::from_secs(6),
+            "per-fetch cap {:?} is below a realistic ~6.5-8s VPN-routed page",
+            cap
+        );
+        // And it must still be bounded by the remaining wall.
+        let tight = commerce_fetch_budget(std::time::Duration::from_secs(2), 1);
+        assert_eq!(tight, std::time::Duration::from_secs(2));
+    }
+
     #[test]
     fn enrichment_wall_always_preserves_request_headroom() {
         for elapsed_secs in 0..=REQUEST_TIMEOUT_SECS {
