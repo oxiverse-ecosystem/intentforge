@@ -58,6 +58,25 @@ Three viable paths remain:
 
 **Recommended starting stack:** Amazon India → Myntra (via Cuelinks) → Cuelinks aggregator → Shopify Affiliates → Amazon US once the API gate is cleared.
 
+### 1.3A WebGraph infrastructure is cheap; labour is not
+
+`12_WEBGRAPH_INFRASTRUCTURE_COSTS.md` models the crawler and index at three scales (self-hosted Hetzner, managed PostgreSQL, R2 storage):
+
+| | 20 domains | 200 domains | 2,000 domains |
+|---|---|---|---|
+| Infrastructure | **$56/mo** | **$474/mo** | **$1,675/mo** |
+| Domain admission labour | $188/mo | $563/mo | $1,875/mo |
+| Infrastructure labour | $1,500/mo | $2,400/mo | $3,600/mo |
+| **Total** | **$1,744/mo** | **$3,437/mo** | **$7,150/mo** |
+
+**The decisive finding: infrastructure is a rounding error.** At 20 domains the hardware, database, storage, egress, and VPN together cost **$56/month** — under 4% of the total. Labour dominates at every scale.
+
+**Egress is the one variable that can hurt.** Hetzner includes **20 TB per server**; AWS charges **$0.09/GB**. At 2,000 domains that is $194/month versus $0. Hosting choice matters more than any other single decision.
+
+**Self-hosted headless browsers save $1,100–1,450/month at large scale** versus a hosted service, at the cost of supervision time.
+
+**Legal review is the largest unpriced line** and is deliberately marked [UNKNOWN] — no number was invented.
+
 ### 1.4 There is no keyless structured-price engine available
 
 SearXNG ships exactly two shopping-categorised engines in this build: `ebay` and `geizhals`. Both are disabled by default; both return **HTTP 403** from a datacenter/VPN egress. The gateway's existing `categories=shopping` fan-out has been silently falling back to general web results because the category was never registered.
@@ -231,6 +250,7 @@ Full reasoning, alternatives, and consequences are in `10_OPEN_DECISIONS_AND_RIS
 | `09_IMPLEMENTATION_ROADMAP.md` | Phases, dependencies, agent work packages |
 | `10_OPEN_DECISIONS_AND_RISKS.md` | Decision register, risk register, approvals needed |
 | `11_COMMERCE_COST_ANALYSIS.md` | Programme costs, thresholds, hidden fees, recommended stack |
+| `12_WEBGRAPH_INFRASTRUCTURE_COSTS.md` | Crawler and index cost model at 20 / 200 / 2,000 domains |
 | `SOURCES.md` | Bibliography with URLs and access dates |
 
 **Evidence convention used throughout:** **[CONFIRMED]** = primary source states it · **[INFERRED]** = well-supported engineering reasoning · **[UNKNOWN]** = undisclosed or unverified.
