@@ -49,6 +49,15 @@ Three viable paths remain:
 2. **Link-only monetisation** — deep links and affiliate redirects; no product data stored.
 3. **Permissioned feeds** — merchant consent, partner agreements, or feeds the operator is authorised to manage.
 
+**Cost analysis (`11_COMMERCE_COST_ANALYSIS.md`):** joining is **free everywhere** — no programme charges an application or setup fee. The costs are elsewhere:
+- **Minimum payout thresholds** are the real barrier: Amazon India ₹1,000, Myntra ₹500, Cuelinks ₹500, vCommission ₹1,000 — but Flipkart's own pages contradict each other (₹25,000 vs ₹2,500/₹5,000).
+- **Payment delays** of 30–90 days are standard; eBay is ~2 months.
+- **Hidden fees exist**: CJ charges a dormant-account fee plus **1.5%/month interest** on negative balances; Rakuten charges an inactivity fee of **10% of balance** (cap 50/month); Impact charges **$10–25/month** maintenance after 6 months unpaid.
+- **Clawback is universal**; Amazon US can permanently cease all commission income for a violation.
+- **Meesho, Croma, and Tata CLiQ publish no rate cards at all** — any attributed rate is secondary.
+
+**Recommended starting stack:** Amazon India → Myntra (via Cuelinks) → Cuelinks aggregator → Shopify Affiliates → Amazon US once the API gate is cleared.
+
 ### 1.4 There is no keyless structured-price engine available
 
 SearXNG ships exactly two shopping-categorised engines in this build: `ebay` and `geizhals`. Both are disabled by default; both return **HTTP 403** from a datacenter/VPN egress. The gateway's existing `categories=shopping` fan-out has been silently falling back to general web results because the category was never registered.
@@ -221,6 +230,7 @@ Full reasoning, alternatives, and consequences are in `10_OPEN_DECISIONS_AND_RIS
 | `08_BENCHMARK_PLAN.md` | Metrics, datasets, thresholds, failure injection |
 | `09_IMPLEMENTATION_ROADMAP.md` | Phases, dependencies, agent work packages |
 | `10_OPEN_DECISIONS_AND_RISKS.md` | Decision register, risk register, approvals needed |
+| `11_COMMERCE_COST_ANALYSIS.md` | Programme costs, thresholds, hidden fees, recommended stack |
 | `SOURCES.md` | Bibliography with URLs and access dates |
 
 **Evidence convention used throughout:** **[CONFIRMED]** = primary source states it · **[INFERRED]** = well-supported engineering reasoning · **[UNKNOWN]** = undisclosed or unverified.
