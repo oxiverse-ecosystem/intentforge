@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use axum::{
     extract::Query,
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -40,7 +40,7 @@ fn valid_api_keys() -> std::collections::HashSet<String> {
     }
     set
 }
-fn api_key_valid(headers: &HeaderMap) -> bool {
+pub(crate) fn api_key_valid(headers: &HeaderMap) -> bool {
     match extract_api_key(headers) {
         Some(k) => valid_api_keys().contains(&k),
         None => false,
@@ -51,6 +51,26 @@ async fn auth_middleware(
     request: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
 ) -> axum::response::Response {
+    // Phase 1: the leaderboard is public (it returns [] until accounts launch).
+    let path = request.uri().path().to_string();
+    if path == "/goals/leaderboard" {
+        return next.run(request).await;
+    }
+    // A verified Supabase access token is accepted on goal routes only.
+    if (path.starts_with("/goals") || path.starts_with("/consents"))
+        && crate::auth::jwt_uid(&headers).await.is_some()
+    {
+        return next.run(request).await;
+    }
+    // Anonymous capability is accepted on goal routes only — never on
+    // /shopping or /commerce/extract.
+    if path.starts_with("/goals") {
+        if let Some(v) = headers.get("x-anonymous-owner").and_then(|v| v.to_str().ok()) {
+            if goals::valid_owner_ref(v.trim()) {
+                return next.run(request).await;
+            }
+        }
+    }
     if !api_key_valid(&headers) {
         return (axum::http::StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({"error":"unauthorized"}))).into_response();
     }
@@ -58,6 +78,7 @@ async fn auth_middleware(
 }
 
 mod spell;
+mod auth;
 mod geoloc;
 mod dictionary;
 mod clean;
@@ -13573,8 +13594,8 @@ struct AppState {
     /// burst of N concurrent "near me" / local queries pushes RSS to the cgroup
     /// ceiling and the OOM-killer recycles the container (dropped connections).
     search_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Goal Feature: stores user goals, roadmaps, and leaderboard data
-    goals_state: parking_lot::Mutex<goals::GoalStore>,
+    /// Goal Feature: owner-scoped store (in-memory by default, Supabase in prod).
+    goals: Arc<dyn goals::GoalsBackend>,
     /// Affiliate template engine config (ROADMAP item 3). Loaded once at
     /// startup from `data/commerce/affiliate.json`; all network/template/key-env
     /// knowledge is data, never code. Used only as a strict post-rank decoration
@@ -14281,7 +14302,7 @@ async fn main() {
         in_flight: Mutex::new(HashMap::new()),
         spell_index: Arc::new(spell::SymSpellIndex::build()),
         geo_locator: geoloc::GeoLocator::load(),
-        goals_state: parking_lot::Mutex::new(goals::GoalStore::new()),
+        goals: goals::backend_from_env(),
         // Cap concurrent heavy searches. Measured peak per concurrent search is
         // ~350-400 MiB; with a 4 GiB cgroup, 8 keeps peak RSS safely under the
         // limit even under a burst, while still allowing real parallelism.
@@ -14405,18 +14426,20 @@ async fn main() {
         .route("/geolocate", get(handle_geolocate))
         .route("/intent", get(handle_intent))
         .route("/video", get(handle_video))
+        .route("/goals/leaderboard", get(goals::handle_leaderboard))
         .merge(
             Router::new()
                 .route("/commerce/extract", post(handle_commerce_extract))
                 .route("/shopping", get(handle_shopping))
                 .route("/goals", get(goals::handle_list_goals).post(goals::handle_create_goal))
                 .route("/goals/quick", post(goals::handle_quick_roadmap))
-                .route("/goals/leaderboard", get(goals::handle_leaderboard))
                 .route("/goals/:goal_id", get(goals::handle_get_goal))
                 .route("/goals/:goal_id/answers", post(goals::handle_submit_answers))
                 .route("/goals/:goal_id/phases/:phase_id/complete", post(goals::handle_complete_phase))
                 .route("/goals/:goal_id/progress", get(goals::handle_get_progress))
                 .route("/goals/:goal_id/progress", post(goals::handle_update_progress))
+                .route("/goals/claim", post(goals::handle_claim))
+                .route("/consents/:purpose", put(goals::handle_set_consent))
                 .with_state(state.clone())
                 .route_layer(middleware::from_fn(auth_middleware)),
         )

@@ -15,12 +15,13 @@
 use axum::{
     async_trait,
     extract::{FromRequest, Path, Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 
 use serde::{Deserialize, Serialize};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -187,7 +188,13 @@ fn truncate_at_word_boundary(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         return text.to_string();
     }
-    let truncated = &text[..max_len];
+    // Never slice through a multibyte UTF-8 character — that panics and 500s
+    // the request on any non-ASCII goal or resource description.
+    let mut end = max_len;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = &text[..end];
     match truncated.rfind(char::is_whitespace) {
         Some(idx) => format!("{}...", &truncated[..idx].trim_end()),
         None => format!("{}...", truncated),
@@ -754,6 +761,16 @@ fn is_commercial_or_spam(title: &str, url: &str) -> bool {
     false
 }
 
+/// Same-origin search URL, configurable for deployments where the gateway is
+/// not reachable on loopback:4000 (e.g. a split network namespace).
+fn self_search_url() -> String {
+    std::env::var("GATEWAY_SELF_URL")
+        .unwrap_or_else(|_| "http://localhost:4000".to_string())
+        .trim()
+        .trim_end_matches('/')
+        .to_string()
+}
+
 async fn search_resources(client: &reqwest::Client, goal: &str) -> Vec<Resource> {
     let gl = goal.to_lowercase();
     let domain = detect_sub_domain(&gl);
@@ -766,7 +783,8 @@ async fn search_resources(client: &reqwest::Client, goal: &str) -> Vec<Resource>
     }
 
     let url = format!(
-        "http://localhost:4000/search?q={}&limit=20",
+        "{}/search?q={}&limit=20",
+        self_search_url(),
         urlencoding::encode(&query)
     );
     match client.get(&url).timeout(std::time::Duration::from_secs(15)).send().await {
@@ -970,6 +988,679 @@ impl GoalStore {
     }
 }
 
+/// POST /goals/claim — attach an anonymous capability's goals to a Supabase user.
+pub async fn handle_claim(
+    State(state): State<Arc<crate::AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let token = match crate::auth::bearer_token(&headers) {
+        Some(t) => t,
+        None => return unauthorized(),
+    };
+    let uid = match crate::auth::validate_jwt(&token).await {
+        Some(u) => u,
+        None => return unauthorized(),
+    };
+    let anon_ref = match headers.get("x-anonymous-owner").and_then(|v| v.to_str().ok()) {
+        Some(v) if valid_owner_ref(v.trim()) => v.trim().to_ascii_lowercase(),
+        _ => return unauthorized(),
+    };
+    let goals = state.goals.claim(&anon_ref, &uid, &token).await;
+    (StatusCode::OK, Json(goals)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConsentRequest {
+    pub enabled: bool,
+}
+
+/// PUT /consents/:purpose — user-scoped, RLS-protected consent toggle.
+pub async fn handle_set_consent(
+    State(state): State<Arc<crate::AppState>>,
+    headers: HeaderMap,
+    Path(purpose): Path<String>,
+    AppJson(payload): AppJson<ConsentRequest>,
+) -> Response {
+    let token = match crate::auth::bearer_token(&headers) {
+        Some(t) => t,
+        None => return unauthorized(),
+    };
+    let uid = match crate::auth::validate_jwt(&token).await {
+        Some(u) => u,
+        None => return unauthorized(),
+    };
+    match state.goals.set_consent(&uid, &token, &purpose, payload.enabled).await {
+        Ok(row) => (StatusCode::OK, Json(row)).into_response(),
+        Err("invalid_purpose") => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "invalid_purpose",
+            "message": "purpose must be leaderboard or hiring_notices"
+        }))).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "internal_error"
+        }))).into_response(),
+    }
+}
+
+// ─── Owner-scoped async backend (Phase 1: anonymous goals) ──────────
+
+/// Who is calling a goal route. Service = existing API-key path (global,
+/// unchanged); Anonymous = browser capability scoped to one `owner_ref`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Owner {
+    Service,
+    Anonymous(String),
+    Claimed(String),
+}
+
+impl Owner {
+    pub fn is_anonymous(&self) -> bool {
+        matches!(self, Owner::Anonymous(_))
+    }
+    fn key(&self) -> String {
+        match self {
+            Owner::Service => "service".to_string(),
+            Owner::Anonymous(r) => format!("anon:{}", r),
+            Owner::Claimed(uid) => format!("claimed:{}", uid),
+        }
+    }
+    /// The UUID written to `goals.owner_ref` for this caller.
+    fn supabase_ref(&self) -> String {
+        match self {
+            // Service calls stay global but must still own a valid ref in DB.
+            Owner::Service => "00000000-0000-4000-8000-000000000000".to_string(),
+            Owner::Anonymous(r) => r.clone(),
+            Owner::Claimed(uid) => uid.clone(),
+        }
+    }
+    /// PostgREST filter pair for this caller: anonymous/service use owner_ref,
+    /// claimed users use owner_id.
+    fn supabase_filter(&self) -> (&'static str, String) {
+        match self {
+            Owner::Claimed(uid) => ("owner_id", uid.clone()),
+            _ => ("owner_ref", self.supabase_ref()),
+        }
+    }
+}
+
+/// Validate a UUID string without pulling in the `uuid` crate. We only need
+/// shape (8-4-4-4-12 hex, version 4, RFC 4122 variant) at the trust boundary.
+pub fn valid_owner_ref(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, &c) in b.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if c != b'-' {
+                return false;
+            }
+        } else if !c.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    b[14] == b'4' && matches!(b[19], b'8' | b'9' | b'a' | b'b' | b'A' | b'B')
+}
+
+pub async fn parse_owner(headers: &HeaderMap) -> Option<Owner> {
+    if crate::api_key_valid(headers) {
+        return Some(Owner::Service);
+    }
+    if let Some(uid) = crate::auth::jwt_uid(headers).await {
+        return Some(Owner::Claimed(uid));
+    }
+    if let Some(v) = headers.get("x-anonymous-owner").and_then(|v| v.to_str().ok()) {
+        let s = v.trim();
+        if valid_owner_ref(s) {
+            return Some(Owner::Anonymous(s.to_ascii_lowercase()));
+        }
+    }
+    None
+}
+
+fn unauthorized() -> Response {
+    (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"}))).into_response()
+}
+
+pub fn ttl_hours() -> u64 {
+    std::env::var("IF_ANON_GOAL_TTL_HOURS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(6)
+}
+
+/// Additive `expires_at` field for anonymous responses.
+pub fn add_expires(value: &mut serde_json::Value, owner: &Owner) {
+    if !owner.is_anonymous() {
+        return;
+    }
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        + ttl_hours() * 3600;
+    let days = (secs / 86400) as i64;
+    let ymd = crate::days_to_ymd(days);
+    let expiry = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        ymd.0,
+        ymd.1,
+        ymd.2,
+        (secs % 86400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    );
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("expires_at".to_string(), serde_json::json!(expiry));
+    }
+}
+
+#[async_trait]
+pub trait GoalsBackend: Send + Sync {
+    async fn create(&self, owner: &Owner, goal: &str, intent: &str, resources: Vec<Resource>) -> StoredGoal;
+    async fn get(&self, owner: &Owner, goal_id: &str) -> Option<StoredGoal>;
+    async fn list(&self, owner: &Owner) -> Vec<StoredGoal>;
+    async fn set_roadmap(&self, owner: &Owner, goal_id: &str, roadmap: Roadmap) -> bool;
+    async fn complete_phase(&self, owner: &Owner, goal_id: &str, phase_id: usize) -> Result<StoredGoal, &'static str>;
+    async fn set_phase(&self, owner: &Owner, goal_id: &str, phase_id: usize, completed: bool) -> Result<StoredGoal, &'static str>;
+    async fn leaderboard(&self) -> Vec<LeaderboardEntry>;
+    async fn touch(&self, owner: &Owner);
+    async fn claim(&self, anon_ref: &str, uid: &str, jwt: &str) -> Vec<StoredGoal>;
+    async fn set_consent(&self, uid: &str, jwt: &str, purpose: &str, enabled: bool) -> Result<serde_json::Value, &'static str>;
+}
+
+/// In-memory implementation: one existing GoalStore per owner namespace, so
+/// service behavior is byte-for-byte unchanged and anonymous callers are
+/// isolated from each other.
+pub struct InMemoryBackend {
+    stores: Mutex<HashMap<String, GoalStore>>,
+}
+
+impl InMemoryBackend {
+    pub fn new() -> Self {
+        Self { stores: Mutex::new(HashMap::new()) }
+    }
+}
+
+#[async_trait]
+impl GoalsBackend for InMemoryBackend {
+    async fn create(&self, owner: &Owner, goal: &str, intent: &str, resources: Vec<Resource>) -> StoredGoal {
+        let mut stores = self.stores.lock();
+        let store = stores.entry(owner.key()).or_insert_with(GoalStore::new);
+        let id = store.insert(goal.to_string(), intent.to_string(), resources);
+        store.get(&id).cloned().unwrap_or(StoredGoal {
+            goal_id: id,
+            goal: goal.to_string(),
+            intent: intent.to_string(),
+            resources: vec![],
+            roadmap: None,
+            created_at: String::new(),
+            completed_phases: 0,
+            total_phases: 0,
+            score: 0,
+            user_name: "Anonymous".to_string(),
+        })
+    }
+
+    async fn get(&self, owner: &Owner, goal_id: &str) -> Option<StoredGoal> {
+        let mut stores = self.stores.lock();
+        stores.entry(owner.key()).or_insert_with(GoalStore::new).get(goal_id).cloned()
+    }
+
+    async fn list(&self, owner: &Owner) -> Vec<StoredGoal> {
+        let mut stores = self.stores.lock();
+        stores.entry(owner.key()).or_insert_with(GoalStore::new).list()
+    }
+
+    async fn set_roadmap(&self, owner: &Owner, goal_id: &str, roadmap: Roadmap) -> bool {
+        let mut stores = self.stores.lock();
+        stores.entry(owner.key()).or_insert_with(GoalStore::new).update_roadmap(goal_id, roadmap)
+    }
+
+    async fn complete_phase(&self, owner: &Owner, goal_id: &str, phase_id: usize) -> Result<StoredGoal, &'static str> {
+        let mut stores = self.stores.lock();
+        stores.entry(owner.key()).or_insert_with(GoalStore::new).complete_phase(goal_id, phase_id)
+    }
+
+    async fn set_phase(&self, owner: &Owner, goal_id: &str, phase_id: usize, completed: bool) -> Result<StoredGoal, &'static str> {
+        let mut stores = self.stores.lock();
+        stores.entry(owner.key()).or_insert_with(GoalStore::new).set_phase_status(goal_id, phase_id, completed)
+    }
+
+    async fn leaderboard(&self) -> Vec<LeaderboardEntry> {
+        // Service namespace only: anonymous goals never enter the leaderboard.
+        let stores = self.stores.lock();
+        stores.get("service").map(|s| s.leaderboard(50)).unwrap_or_default()
+    }
+
+    async fn touch(&self, _owner: &Owner) {
+        // Expiry is enforced on read in Phase 1; nothing to refresh in memory.
+    }
+
+    async fn claim(&self, anon_ref: &str, uid: &str, _jwt: &str) -> Vec<StoredGoal> {
+        let mut stores = self.stores.lock();
+        let from = format!("anon:{}", anon_ref);
+        let to = format!("claimed:{}", uid);
+        match stores.remove(&from) {
+            Some(mut moved) => {
+                let goals = moved.list();
+                let target = stores.entry(to).or_insert_with(GoalStore::new);
+                for g in goals {
+                    target.insert(g.goal, g.intent, g.resources);
+                }
+                target.list()
+            }
+            None => vec![],
+        }
+    }
+
+    async fn set_consent(&self, uid: &str, _jwt: &str, purpose: &str, enabled: bool) -> Result<serde_json::Value, &'static str> {
+        if purpose != "leaderboard" && purpose != "hiring_notices" {
+            return Err("invalid_purpose");
+        }
+        Ok(serde_json::json!({
+            "owner_id": uid,
+            "purpose": purpose,
+            "enabled": enabled,
+        }))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GoalRow {
+    goal_id: String,
+    goal: String,
+    intent: Option<String>,
+    resources: Option<Vec<Resource>>,
+    roadmap: Option<Roadmap>,
+    created_at: String,
+    completed_phases: Option<i64>,
+    total_phases: Option<i64>,
+    score: Option<i64>,
+}
+
+impl From<GoalRow> for StoredGoal {
+    fn from(r: GoalRow) -> Self {
+        // Supabase returns RFC3339 with microseconds/offset; the wire contract
+        // uses second precision with a trailing Z.
+        let created_at = if r.created_at.len() >= 19 {
+            format!("{}Z", &r.created_at[..19])
+        } else {
+            r.created_at.clone()
+        };
+        StoredGoal {
+            goal_id: r.goal_id,
+            goal: r.goal,
+            intent: r.intent.unwrap_or_default(),
+            resources: r.resources.unwrap_or_default(),
+            roadmap: r.roadmap,
+            created_at,
+            completed_phases: r.completed_phases.unwrap_or(0) as usize,
+            total_phases: r.total_phases.unwrap_or(0) as usize,
+            score: r.score.unwrap_or(0) as u32,
+            user_name: "Anonymous".to_string(),
+        }
+    }
+}
+
+/// Hosted Supabase backend. Per-request HTTPS only — no PgPool, because the
+/// gateway shares gluetun's rotating VPN namespace.
+pub struct SupabaseStore {
+    client: reqwest::Client,
+    base: String,
+    secret: String,
+    publishable: String,
+}
+
+impl SupabaseStore {
+    pub fn from_env() -> anyhow::Result<Self> {
+        let base = std::env::var("SUPABASE_URL")?.trim().trim_end_matches('/').to_string();
+        let secret = std::env::var("SUPABASE_SECRET_KEY")
+            .or_else(|_| std::env::var("SUPABASE_SERVICE_ROLE_KEY"))?;
+        let publishable = std::env::var("SUPABASE_PUBLISHABLE_KEY")
+            .or_else(|_| std::env::var("SUPABASE_ANON_KEY"))?;
+        if secret.trim().is_empty() || publishable.trim().is_empty() {
+            anyhow::bail!("Supabase keys must not be empty");
+        }
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()?,
+            base,
+            secret: secret.trim().to_string(),
+            publishable: publishable.trim().to_string(),
+        })
+    }
+
+    fn ep(&self, path: &str) -> String {
+        format!("{}/rest/v1/{}", self.base, path.trim_start_matches('/'))
+    }
+
+    /// Phase 1 dedupe is enforced in the gateway: reuse an existing row for the
+    /// same owner + goal text instead of hitting the unique index and 409ing.
+    async fn find_by_goal(&self, owner: &Owner, goal: &str) -> Option<StoredGoal> {
+        let trimmed = goal.trim();
+        let lowered = trimmed.to_lowercase();
+        let (col, val) = owner.supabase_filter();
+        for candidate in [trimmed, lowered.as_str()] {
+            let url = format!(
+                "{}?{}=eq.{}&goal=eq.{}&select=*&limit=1",
+                self.ep("goals"),
+                col,
+                val,
+                urlencoding::encode(candidate)
+            );
+            let resp = match self.client.get(url)
+                .header("apikey", &self.secret)
+                .header("Accept", "application/json")
+                .send().await {
+                    Ok(r) => r,
+                    Err(e) => { tracing::warn!("Supabase dedupe lookup error: {}", e); continue; }
+                };
+            if !resp.status().is_success() {
+                continue;
+            }
+            if let Ok(rows) = resp.json::<Vec<GoalRow>>().await {
+                if let Some(row) = rows.into_iter().next() {
+                    return Some(StoredGoal::from(row));
+                }
+            }
+        }
+        None
+    }
+
+    async fn select_goal(&self, owner: &Owner, goal_id: &str) -> Option<StoredGoal> {
+        let (col, val) = owner.supabase_filter();
+        let url = format!(
+            "{}?goal_id=eq.{}&{}=eq.{}&select=*",
+            self.ep("goals"),
+            urlencoding::encode(goal_id),
+            col,
+            val
+        );
+        let resp = self.client.get(url)
+            .header("apikey", &self.secret)
+            .header("Accept", "application/json")
+            .send().await.ok()?;
+        if !resp.status().is_success() {
+            tracing::warn!("Supabase select_goal status {}", resp.status());
+            return None;
+        }
+        let rows: Vec<GoalRow> = resp.json().await.ok()?;
+        rows.into_iter().next().map(StoredGoal::from)
+    }
+}
+
+#[async_trait]
+impl GoalsBackend for SupabaseStore {
+    async fn create(&self, owner: &Owner, goal: &str, intent: &str, resources: Vec<Resource>) -> StoredGoal {
+        if let Some(existing) = self.find_by_goal(owner, goal).await {
+            return existing;
+        }
+        let (col, val) = owner.supabase_filter();
+        let mut body = serde_json::json!({
+            "goal": goal,
+            "intent": intent,
+            "resources": resources,
+        });
+        body[col] = serde_json::json!(val);
+        // The gateway shares gluetun's rotating VPN namespace; transient
+        // connection drops are normal. Retry before giving up, and never panic
+        // in a request handler (that drops the client connection).
+        let mut last_error = String::new();
+        for attempt in 0..3 {
+            match self.client.post(self.ep("goals"))
+                .header("apikey", &self.secret)
+                .header("Content-Type", "application/json")
+                .header("Prefer", "return=representation")
+                .json(&body)
+                .send().await {
+                    Ok(r) if r.status().is_success() => {
+                        if let Ok(mut rows) = r.json::<Vec<GoalRow>>().await {
+                            if !rows.is_empty() {
+                                return StoredGoal::from(rows.remove(0));
+                            }
+                        }
+                        last_error = "empty response".to_string();
+                    }
+                    Ok(r) => last_error = format!("status {}", r.status()),
+                    Err(e) => last_error = e.to_string(),
+                }
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(300 * (attempt + 1) as u64)).await;
+            }
+        }
+        tracing::warn!("Supabase create failed after 3 attempts: {}", last_error);
+        StoredGoal {
+            goal_id: String::new(),
+            goal: goal.to_string(),
+            intent: intent.to_string(),
+            resources: vec![],
+            roadmap: None,
+            created_at: String::new(),
+            completed_phases: 0,
+            total_phases: 0,
+            score: 0,
+            user_name: "Anonymous".to_string(),
+        }
+    }
+
+    async fn get(&self, owner: &Owner, goal_id: &str) -> Option<StoredGoal> {
+        self.select_goal(owner, goal_id).await
+    }
+
+    async fn list(&self, owner: &Owner) -> Vec<StoredGoal> {
+        let (col, val) = owner.supabase_filter();
+        let url = format!(
+            "{}?{}=eq.{}&select=*&order=goal_id.asc",
+            self.ep("goals"),
+            col,
+            val
+        );
+        let resp = match self.client.get(url)
+            .header("apikey", &self.secret)
+            .header("Accept", "application/json")
+            .send().await {
+                Ok(r) => r,
+                Err(e) => { tracing::warn!("Supabase list error: {}", e); return vec![]; }
+            };
+        if !resp.status().is_success() {
+            tracing::warn!("Supabase list status {}", resp.status());
+            return vec![];
+        }
+        resp.json::<Vec<GoalRow>>().await
+            .unwrap_or_default()
+            .into_iter()
+            .map(StoredGoal::from)
+            .collect()
+    }
+
+    async fn set_roadmap(&self, owner: &Owner, goal_id: &str, mut roadmap: Roadmap) -> bool {
+        let Some(current) = self.select_goal(owner, goal_id).await else { return false };
+        if let Some(old) = &current.roadmap {
+            let completed: Vec<usize> = old.phases.iter().filter(|p| p.is_completed).map(|p| p.id).collect();
+            for p in roadmap.phases.iter_mut() {
+                if completed.contains(&p.id) {
+                    p.is_completed = true;
+                }
+            }
+        }
+        let total = roadmap.phases.len();
+        let completed_count = roadmap.phases.iter().filter(|p| p.is_completed).count();
+        let bonus = if completed_count == total && total > 0 { 500 } else { 0 };
+        let body = serde_json::json!({
+            "roadmap": roadmap,
+            "completed_phases": completed_count,
+            "total_phases": total,
+            "score": (completed_count * 100 + bonus) as i64,
+        });
+        let (col, val) = owner.supabase_filter();
+        let url = format!(
+            "{}?goal_id=eq.{}&{}=eq.{}",
+            self.ep("goals"),
+            urlencoding::encode(goal_id),
+            col,
+            val
+        );
+        match self.client.patch(url)
+            .header("apikey", &self.secret)
+            .header("Content-Type", "application/json")
+            .json(&body).send().await {
+                Ok(r) => r.status().is_success(),
+                Err(e) => { tracing::warn!("Supabase set_roadmap error: {}", e); false }
+        }
+    }
+
+    async fn complete_phase(&self, owner: &Owner, goal_id: &str, phase_id: usize) -> Result<StoredGoal, &'static str> {
+        self.set_phase(owner, goal_id, phase_id, true).await
+    }
+
+    async fn set_phase(&self, owner: &Owner, goal_id: &str, phase_id: usize, completed: bool) -> Result<StoredGoal, &'static str> {
+        let mut current = self.select_goal(owner, goal_id).await.ok_or("goal_not_found")?;
+        let mut roadmap = current.roadmap.clone().ok_or("roadmap_not_generated")?;
+        if !roadmap.phases.iter().any(|p| p.id == phase_id) {
+            return Err("phase_not_found");
+        }
+        for p in roadmap.phases.iter_mut() {
+            if p.id == phase_id {
+                p.is_completed = completed;
+            }
+        }
+        let total = roadmap.phases.len();
+        let completed_count = roadmap.phases.iter().filter(|p| p.is_completed).count();
+        let bonus = if completed_count == total && total > 0 { 500 } else { 0 };
+        let body = serde_json::json!({
+            "roadmap": roadmap.clone(),
+            "completed_phases": completed_count,
+            "total_phases": total,
+            "score": (completed_count * 100 + bonus) as i64,
+        });
+        let (col, val) = owner.supabase_filter();
+        let url = format!(
+            "{}?goal_id=eq.{}&{}=eq.{}",
+            self.ep("goals"),
+            urlencoding::encode(goal_id),
+            col,
+            val
+        );
+        let resp = self.client.patch(url)
+            .header("apikey", &self.secret)
+            .header("Content-Type", "application/json")
+            .json(&body).send().await
+            .map_err(|_| "internal_error")?;
+        if !resp.status().is_success() {
+            return Err("internal_error");
+        }
+        current.roadmap = Some(roadmap);
+        current.completed_phases = completed_count;
+        current.total_phases = total;
+        current.score = (completed_count * 100 + bonus) as u32;
+        Ok(current)
+    }
+
+    async fn leaderboard(&self) -> Vec<LeaderboardEntry> {
+        // Phase 1: the view has no claimed rows, so this is always [].
+        let resp = match self.client
+            .get(self.ep("leaderboard?select=*"))
+            .header("apikey", &self.publishable)
+            .header("Accept", "application/json")
+            .send().await {
+                Ok(r) => r,
+                Err(_) => return vec![],
+            };
+        resp.json::<Vec<LeaderboardEntry>>().await.unwrap_or_default()
+    }
+
+    async fn touch(&self, owner: &Owner) {
+        if !owner.is_anonymous() {
+            return;
+        }
+        let body = serde_json::json!({ "p_ref": owner.supabase_ref() });
+        let _ = self.client.post(self.ep("rpc/touch_anonymous_goals"))
+            .header("apikey", &self.secret)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send().await;
+    }
+
+    async fn claim(&self, anon_ref: &str, uid: &str, jwt: &str) -> Vec<StoredGoal> {
+        let body = serde_json::json!({ "p_ref": anon_ref });
+        let resp = match self.client.post(self.ep("rpc/claim_anonymous_goals"))
+            .header("apikey", &self.publishable)
+            .header("Authorization", format!("Bearer {}", jwt))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send().await {
+                Ok(r) => r,
+                Err(e) => { tracing::warn!("Supabase claim error: {}", e); return vec![]; }
+            };
+        if !resp.status().is_success() {
+            tracing::warn!("Supabase claim status {}", resp.status());
+            return vec![];
+        }
+        resp.json::<Vec<GoalRow>>().await
+            .unwrap_or_default()
+            .into_iter()
+            .map(StoredGoal::from)
+            .collect()
+    }
+
+    async fn set_consent(&self, uid: &str, jwt: &str, purpose: &str, enabled: bool) -> Result<serde_json::Value, &'static str> {
+        if purpose != "leaderboard" && purpose != "hiring_notices" {
+            return Err("invalid_purpose");
+        }
+        let now = chrono_now();
+        let row = serde_json::json!({
+            "owner_id": uid,
+            "purpose": purpose,
+            "enabled": enabled,
+            "granted_at": if enabled { serde_json::json!(now) } else { serde_json::Value::Null },
+            "revoked_at": if enabled { serde_json::Value::Null } else { serde_json::json!(now) },
+            "updated_at": now,
+        });
+        let resp = self.client.post(format!("{}?on_conflict=owner_id,purpose", self.ep("consents")))
+            .header("apikey", &self.publishable)
+            .header("Authorization", format!("Bearer {}", jwt))
+            .header("Content-Type", "application/json")
+            .header("Prefer", "resolution=merge-duplicates,return=representation")
+            .json(&row)
+            .send().await
+            .map_err(|_| "internal_error")?;
+        if !resp.status().is_success() {
+            tracing::warn!("Supabase consent status {}", resp.status());
+            return Err("internal_error");
+        }
+        resp.json::<serde_json::Value>().await.map_err(|_| "internal_error")
+    }
+}
+
+/// RFC3339 UTC timestamp without adding a chrono dependency.
+fn chrono_now() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let days = (secs / 86400) as i64;
+    let ymd = crate::days_to_ymd(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        ymd.0, ymd.1, ymd.2,
+        (secs % 86400) / 3600, (secs % 3600) / 60, secs % 60
+    )
+}
+
+pub fn backend_from_env() -> Arc<dyn GoalsBackend> {
+    let kind = std::env::var("IF_GOAL_STORE")
+        .unwrap_or_else(|_| "in_memory".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    match kind.as_str() {
+        "in_memory" => Arc::new(InMemoryBackend::new()),
+        "supabase" => match SupabaseStore::from_env() {
+            Ok(s) => Arc::new(s),
+            Err(e) => panic!("IF_GOAL_STORE=supabase but Supabase config is invalid: {}", e),
+        },
+        other => panic!("IF_GOAL_STORE must be in_memory or supabase, got: {}", other),
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1089,6 +1780,7 @@ mod tests {
 /// POST /goals — create a goal, return questions
 pub async fn handle_create_goal(
     State(state): State<Arc<crate::AppState>>,
+    headers: HeaderMap,
     AppJson(payload): AppJson<GoalRequest>,
 ) -> Response {
     let goal = match validate_goal(&payload.goal) {
@@ -1121,13 +1813,18 @@ pub async fn handle_create_goal(
 
     let questions = generate_questions(&goal, &intent);
 
-    let goal_id = state.goals_state.lock().insert(goal.clone(), intent.clone(), resources);
-    let created_at = {
-        let store = state.goals_state.lock();
-        store.get(&goal_id).map(|s| s.created_at.clone()).unwrap_or_default()
-    };
+    let owner = match crate::goals::parse_owner(&headers).await { Some(o) => o, None => return unauthorized() };
+    state.goals.touch(&owner).await;
+    let stored = state.goals.create(&owner, &goal, &intent, resources).await;
+    if stored.goal_id.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": "degraded", "message": "goal storage unavailable"
+        }))).into_response();
+    }
+    let goal_id = stored.goal_id.clone();
+    let created_at = stored.created_at.clone();
 
-    let response_json = serde_json::json!({
+    let mut response_json = serde_json::json!({
         "goal_id": goal_id,
         "goal": goal,
         "intent": intent,
@@ -1140,6 +1837,7 @@ pub async fn handle_create_goal(
             "body": { "answers": [{ "question_id": 1, "answer": "..." }] }
         }
     });
+    add_expires(&mut response_json, &owner);
 
     (StatusCode::OK, Json(response_json)).into_response()
 }
@@ -1147,6 +1845,7 @@ pub async fn handle_create_goal(
 /// POST /goals/{goal_id}/answers — submit answers, get full roadmap
 pub async fn handle_submit_answers(
     State(state): State<Arc<crate::AppState>>,
+    headers: HeaderMap,
     Path(goal_id): Path<String>,
     AppJson(payload): AppJson<AnswerSubmission>,
 ) -> Response {
@@ -1157,25 +1856,24 @@ pub async fn handle_submit_answers(
         }))).into_response();
     }
 
-    let stored = {
-        let store = state.goals_state.lock();
-        store.get(&goal_id).cloned()
-    };
+    let owner = match crate::goals::parse_owner(&headers).await { Some(o) => o, None => return unauthorized() };
+    state.goals.touch(&owner).await;
+    let stored = state.goals.get(&owner, &goal_id).await;
 
     match stored {
         Some(stored) => {
             let roadmap = generate_roadmap(&stored.goal, &payload.answers, &stored.resources);
             let total = roadmap.phases.len();
 
-            let updated = state.goals_state.lock().update_roadmap(&goal_id, roadmap.clone());
+            let updated = state.goals.set_roadmap(&owner, &goal_id, roadmap.clone()).await;
 
             if updated {
-                let current_stored = state.goals_state.lock().get(&goal_id).cloned();
+                let current_stored = state.goals.get(&owner, &goal_id).await;
                 let score = current_stored.as_ref().map(|s| s.score).unwrap_or(0);
                 let completed = current_stored.as_ref().map(|s| s.completed_phases).unwrap_or(0);
                 let final_roadmap = current_stored.as_ref().and_then(|s| s.roadmap.clone()).unwrap_or(roadmap);
 
-                (StatusCode::OK, Json(serde_json::json!({
+                let mut response_json = serde_json::json!({
                     "goal_id": goal_id,
                     "goal": stored.goal,
                     "intent": stored.intent,
@@ -1185,7 +1883,9 @@ pub async fn handle_submit_answers(
                     "completed_phases": completed,
                     "total_phases": total,
                     "score": score
-                }))).into_response()
+                });
+                add_expires(&mut response_json, &owner);
+                (StatusCode::OK, Json(response_json)).into_response()
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                     "error": "internal_error",
@@ -1215,10 +1915,12 @@ fn goal_status(roadmap: Option<&Roadmap>, completed_phases: usize, total_phases:
 /// GET /goals/{goal_id} — get goal status and roadmap
 pub async fn handle_get_goal(
     State(state): State<Arc<crate::AppState>>,
+    headers: HeaderMap,
     Path(goal_id): Path<String>,
 ) -> Response {
-    let store = state.goals_state.lock();
-    match store.get(&goal_id) {
+    let owner = match crate::goals::parse_owner(&headers).await { Some(o) => o, None => return unauthorized() };
+    state.goals.touch(&owner).await;
+    match state.goals.get(&owner, &goal_id).await {
         Some(s) => {
             let status = goal_status(s.roadmap.as_ref(), s.completed_phases, s.total_phases);
 
@@ -1241,6 +1943,7 @@ pub async fn handle_get_goal(
                 ));
             }
 
+            add_expires(&mut resp, &owner);
             (StatusCode::OK, Json(resp)).into_response()
         }
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
@@ -1253,18 +1956,23 @@ pub async fn handle_get_goal(
 /// GET /goals — list all goals
 pub async fn handle_list_goals(
     State(state): State<Arc<crate::AppState>>,
+    headers: HeaderMap,
 ) -> Response {
-    let store = state.goals_state.lock();
-    let goals = store.list();
-    (StatusCode::OK, Json(goals)).into_response()
+    let owner = match crate::goals::parse_owner(&headers).await { Some(o) => o, None => return unauthorized() };
+    state.goals.touch(&owner).await;
+    let mut values: Vec<serde_json::Value> = state.goals.list(&owner).await
+        .into_iter()
+        .map(|g| serde_json::to_value(g).unwrap_or_default())
+        .collect();
+    for v in values.iter_mut() { add_expires(v, &owner); }
+    (StatusCode::OK, Json(values)).into_response()
 }
 
 /// GET /goals/leaderboard — get leaderboard
 pub async fn handle_leaderboard(
     State(state): State<Arc<crate::AppState>>,
 ) -> Response {
-    let store = state.goals_state.lock();
-    let entries = store.leaderboard(50);
+    let entries = state.goals.leaderboard().await;
     // Returns a bare JSON ARRAY (Vec<LeaderboardEntry>) per the audit's schema
     // assertion: the leaderboard response MUST be a list (iterable) of goal objects,
     // not a dict wrapper. (Formerly returned `{"entries":[...],"total_entries":N}`.)
@@ -1274,6 +1982,7 @@ pub async fn handle_leaderboard(
 /// POST /goals/quick — one-shot goal to full roadmap (no questions)
 pub async fn handle_quick_roadmap(
     State(state): State<Arc<crate::AppState>>,
+    headers: HeaderMap,
     AppJson(payload): AppJson<QuickGoalRequest>,
 ) -> Response {
     let goal = match validate_goal(&payload.goal) {
@@ -1313,14 +2022,19 @@ pub async fn handle_quick_roadmap(
     let total = roadmap.phases.len();
     let distributed_count: usize = roadmap.phases.iter().map(|p| p.resources.len()).sum();
 
-    let goal_id = state.goals_state.lock().insert(goal.clone(), intent.clone(), resources);
-    state.goals_state.lock().update_roadmap(&goal_id, roadmap.clone());
-    let stored = {
-        let store = state.goals_state.lock();
-        store.get(&goal_id).cloned()
-    };
+    let owner = match crate::goals::parse_owner(&headers).await { Some(o) => o, None => return unauthorized() };
+    state.goals.touch(&owner).await;
+    let stored = state.goals.create(&owner, &goal, &intent, resources).await;
+    if stored.goal_id.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": "degraded", "message": "goal storage unavailable"
+        }))).into_response();
+    }
+    let goal_id = stored.goal_id.clone();
+    state.goals.set_roadmap(&owner, &goal_id, roadmap.clone()).await;
+    let stored = state.goals.get(&owner, &goal_id).await;
 
-    let response_json = serde_json::json!({
+    let mut response_json = serde_json::json!({
         "goal_id": goal_id,
         "goal": goal,
         "intent": intent,
@@ -1332,6 +2046,7 @@ pub async fn handle_quick_roadmap(
         "total_phases": total,
         "score": 0
     });
+    add_expires(&mut response_json, &owner);
 
     (StatusCode::OK, Json(response_json)).into_response()
 }
@@ -1339,9 +2054,12 @@ pub async fn handle_quick_roadmap(
 /// POST /goals/{goal_id}/phases/{phase_id}/complete — mark a phase completed
 pub async fn handle_complete_phase(
     State(state): State<Arc<crate::AppState>>,
+    headers: HeaderMap,
     Path((goal_id, phase_id)): Path<(String, usize)>,
 ) -> Response {
-    let result = state.goals_state.lock().complete_phase(&goal_id, phase_id);
+    let owner = match crate::goals::parse_owner(&headers).await { Some(o) => o, None => return unauthorized() };
+    state.goals.touch(&owner).await;
+    let result = state.goals.complete_phase(&owner, &goal_id, phase_id).await;
     match result {
         Ok(s) => (StatusCode::OK, Json(serde_json::json!({
             "goal_id": s.goal_id,
@@ -1367,11 +2085,14 @@ pub async fn handle_complete_phase(
 /// POST /goals/{goal_id}/progress — update phase completion progress
 pub async fn handle_update_progress(
     State(state): State<Arc<crate::AppState>>,
+    headers: HeaderMap,
     Path(goal_id): Path<String>,
     AppJson(payload): AppJson<PhaseProgressRequest>,
 ) -> Response {
+    let owner = match crate::goals::parse_owner(&headers).await { Some(o) => o, None => return unauthorized() };
+    state.goals.touch(&owner).await;
     let is_completed = payload.is_completed.unwrap_or(true);
-    let result = state.goals_state.lock().set_phase_status(&goal_id, payload.phase_id, is_completed);
+    let result = state.goals.set_phase(&owner, &goal_id, payload.phase_id, is_completed).await;
     match result {
         Ok(s) => (StatusCode::OK, Json(serde_json::json!({
             "goal_id": s.goal_id,
@@ -1398,10 +2119,12 @@ pub async fn handle_update_progress(
 /// GET /goals/:id/progress — return current progress state (read-only)
 pub async fn handle_get_progress(
     State(state): State<Arc<crate::AppState>>,
+    headers: HeaderMap,
     Path(goal_id): Path<String>,
 ) -> Response {
-    let store = state.goals_state.lock();
-    match store.get(&goal_id) {
+    let owner = match crate::goals::parse_owner(&headers).await { Some(o) => o, None => return unauthorized() };
+    state.goals.touch(&owner).await;
+    match state.goals.get(&owner, &goal_id).await {
         Some(s) => {
             let status = if s.roadmap.is_none() {
                 "pending_answers".to_string()
@@ -1458,5 +2181,38 @@ mod roadmap_schema_tests {
                 goal
             );
         }
+    }
+
+    #[test]
+    fn self_search_url_is_configurable_not_hardcoded() {
+        // search_resources used to hardcode localhost:4000; the endpoint must
+        // be overridable for split network namespaces.
+        let default = self_search_url();
+        assert_eq!(default, "http://localhost:4000");
+        std::env::set_var("GATEWAY_SELF_URL", "http://example.invalid:9/");
+        let configured = self_search_url();
+        std::env::remove_var("GATEWAY_SELF_URL");
+        assert_eq!(configured, "http://example.invalid:9");
+    }
+
+    #[test]
+    fn truncate_at_word_boundary_handles_multibyte_utf8() {
+        // Byte-slicing at 85/180 used to panic on multibyte characters.
+        let s = "learn 日本語 and emoji 🎯 plus more text that is definitely long enough to exceed the byte cap by a wide margin for this test";
+        let out = truncate_at_word_boundary(s, 85);
+        assert!(out.ends_with("..."), "expected truncated marker, got {:?}", out);
+        assert!(out.is_char_boundary(out.len() - 3), "invalid UTF-8 boundary in {:?}", out);
+        let out2 = truncate_at_word_boundary(&s.repeat(20), 180);
+        assert!(out2.is_char_boundary(out2.len() - 3));
+    }
+
+    #[test]
+    fn owner_ref_validation_accepts_v4_uuids_only() {
+        let good = "7f1d4c2a-3b5e-4f80-9a12-0c3d4e5f6a7b";
+        assert!(valid_owner_ref(good));
+        assert!(valid_owner_ref(&good.to_ascii_uppercase()));
+        assert!(!valid_owner_ref("not-a-uuid"));
+        assert!(!valid_owner_ref("7f1d4c2a-3b5e-3f80-9a12-0c3d4e5f6a7b")); // wrong version
+        assert!(!valid_owner_ref("7f1d4c2a-3b5e-4f80-7a12-0c3d4e5f6a7b")); // wrong variant
     }
 }

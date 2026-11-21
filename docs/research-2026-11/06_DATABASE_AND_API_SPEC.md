@@ -13,7 +13,7 @@
 3. **State machines are explicit.** URL lifecycle, ingestion runs, and permission status are enumerations with constrained transitions.
 4. **Soft deletion with suppression flags.** Takedowns suppress content without destroying audit history.
 5. **Time-series data is separated.** Price and availability observations are append-only and partitioned.
-6. **No user tracking tables.** There is no `users`, no `sessions`, no clickstream. Query logs are anonymised and short-lived (see `07`).
+6. **No mandatory identity and no behavioral tracking.** Accounts, if introduced, are user-initiated attachment for achievement portability; all other analytics remain anonymized and short-lived. Anonymous goal data carries a short, fixed expiry.[^anon-goals]
 
 ---
 
@@ -1094,3 +1094,5 @@ Each `webgraph-*` and `commerce-*` module is an independently runnable binary wi
 ---
 
 *Proposal only. Not approved architecture until founder sign-off. See `10_OPEN_DECISIONS_AND_RISKS.md`.*
+
+[^anon-goals]: Scope note for Phase 1 anonymous goals: see `10_OPEN_DECISIONS_AND_RISKS.md` §6 for the dated D1–D11 decision record and `docs/IMPLEMENTATION_PLAN_GOALS_SUPABASE.md` (§5 and §6) for the implementation plan. This principle is the only approved amendment to this document; the rest of the spec remains unapproved.

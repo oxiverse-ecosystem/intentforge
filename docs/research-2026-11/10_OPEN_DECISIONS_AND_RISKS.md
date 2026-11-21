@@ -259,4 +259,26 @@ Any decision in this register that would change a gate threshold must be re-appr
 
 ---
 
+## 6. Phase 1 — Anonymous Goals Decision Record (accepted 2026-11-21)
+
+Accepted from `docs/IMPLEMENTATION_PLAN_GOALS_SUPABASE.md` §0. This record is additive to D1–D12 above, which govern the WebGraph/commerce research package. The identifiers below are the plan's own D1–D11 and must not be read as amendments to the register in §1.
+
+| # | Decision (Phase 1 anonymous goals) | Status |
+|---|---|---|
+| D1 | Anonymous goals are the only supported mode. A browser-generated `owner_ref` (UUID v4, localStorage `if_owner_ref`) is the sole identity, sent as `X-Anonymous-Owner` header only — never in a query string. | Accepted |
+| D2 | Goals and their `owner_ref` expire on a sliding 6-hour TTL of last goal activity (`IF_ANON_GOAL_TTL_HOURS=6`); on expiry rows are deleted, not anonymised. | Accepted |
+| D3 | No login in Phase 1: no Google OAuth, no JWT verification, no `POST /goals/claim`; all auth scaffolding stays dormant. | deferred — Phase 2 |
+| D4 | `GET /goals/leaderboard` keeps its 200/bare-array contract but returns `[]`; the view and consents table are created dormant for Phase 2, with a UI empty-state placeholder. | deferred — Phase 2 |
+| D5 | Hiring notices are a separate, default-off, revocable consent — schema only in Phase 1, with no UI, no delivery and no company access. | deferred — Phase 2 |
+| D6 | Supabase is hosted, not self-hosted in Compose; no new containers, only env vars on the gateway. | Accepted |
+| D7 | The gateway talks to Supabase over HTTPS per request (PostgREST + RPC); no `sqlx`/PgPool because of gluetun VPN IP rotation; `reqwest` is used. | Accepted |
+| D8 | The in-memory store stays the default (`IF_GOAL_STORE=in_memory`); all 27 existing tests pass without Supabase. | Accepted |
+| D9 | Wire contract unchanged (`goal_<zero-padded digits>`, 1-indexed phases, bare arrays for `/goals` and `/goals/leaderboard` capped at 50, score = `completed_phases*100` + 500 all-complete bonus); only additive field is `expires_at`. | Accepted |
+| D10 | No JWT is expected on any goal request in Phase 1; a `Bearer` value is treated as the legacy service API key. | Accepted |
+| D11 | Use the new publishable/secret API keys (`sb_publishable_*` / `sb_secret_*`); legacy `anon`/`service_role` names are fallback only. Non-JWT keys go on the `apikey` header only, never `Authorization: Bearer`. | Accepted |
+
+D3, D4 and D5 are recorded as **deferred — Phase 2**: no OAuth, claim endpoint, account attachment, consent UI, leaderboard entries or hiring-notice delivery may be implemented in Phase 1. See `docs/IMPLEMENTATION_PLAN_GOALS_SUPABASE.md` §9.
+
+---
+
 *This document is the authoritative list of unresolved decisions. Nothing here is approved until the founder signs off.*

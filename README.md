@@ -266,11 +266,13 @@ IntentForge includes a **Goals** feature that turns a long-term goal into a pers
 |--------|------|-------------|
 | `POST` | `/goals` | Create a goal → returns `goal_id` + tailored questions |
 | `POST` | `/goals/quick` | One-shot: goal → full roadmap immediately (no questions) |
+| `GET`  | `/goals` | List the caller's goals (bare JSON array, sorted by `goal_id`) |
 | `GET`  | `/goals/:goal_id` | Get goal status and roadmap |
+| `GET`  | `/goals/:goal_id/progress` | Get a goal's current phase-completion state |
 | `POST` | `/goals/:goal_id/answers` | Submit answers → generate the phased roadmap |
-| `POST` | `/goals/:goal_id/progress` | Update a phase's completion (`{"phase_id":N,"is_completed":bool}`) |
-| `POST` | `/goals/:goal_id/phases/:phase_id/complete` | Mark a phase complete (1-indexed `:phase_id`) |
-| `GET`  | `/goals/leaderboard` | All goals sorted by score |
+| `POST` | `/goals/:goal_id/progress` | Update a phase's completion (`{"phase_id":N,"is_completed":bool}`) — toggles on/off |
+| `POST` | `/goals/:goal_id/phases/:phase_id/complete` | Mark a phase complete (1-indexed `:phase_id`); sets `true` only |
+| `GET`  | `/goals/leaderboard` | All goals sorted by score (bare array, ≤50; empty in Phase 1) |
 
 **Verified behavior notes (2026-08-05):**
 
@@ -280,7 +282,7 @@ IntentForge includes a **Goals** feature that turns a long-term goal into a pers
 - Questions are `0-indexed` in the **answers** body (`question_id:0..n`) but phases are `1-indexed` in the **roadmap** — a common source of confusion; the `invalid_phase` 400 is the tell.
 - Goals are stored **in-memory** (non-persistent across gateway restarts). `GET /goals/leaderboard` returns a bare JSON **array** of goal objects (each with goal_id/goal/user_name/score/completed_phases/total_phases/created_at) — `len(response)` gives the count.
 - Goals are stored **in-memory** (non-persistent across gateway restarts). `GET /goals/leaderboard` returns a bare JSON **array** of up to 50 entries sorted by score (descending); the count is `len(array)`.
-- Error codes: `400 empty_goal` (goal < 3 chars), `400 invalid_phase`, `404 not_found` (unknown goal id), `422 invalid_payload` (bad JSON).
+- Error codes: `400 empty_goal` (goal < 3 chars), `400 invalid_goal` (< 3 alphabetic chars), `400 invalid_answers` (malformed or missing answers), `400 invalid_phase`, `404 not_found` (unknown goal id), `422 invalid_payload` (bad JSON), `500 internal_error` (unexpected gateway failure).
 
 See **[API_REFERENCE.md → Goals API](API_REFERENCE.md#goals-api)** for the full request/response schemas and domain-specific question banks.
 

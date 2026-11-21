@@ -238,6 +238,13 @@ services:
       - SEARXNG2_URL=http://localhost:8081
       - CRAWLER_URL=http://localhost:5001
       - INDEXER_URL=http://localhost:6000
+      # Phase 1 goals: anonymous roadmaps persisted in hosted Supabase.
+      # Never put key values here — they come from .env at runtime.
+      - IF_GOAL_STORE=supabase
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_PUBLISHABLE_KEY=${SUPABASE_PUBLISHABLE_KEY}
+      - SUPABASE_SECRET_KEY=${SUPABASE_SECRET_KEY}
+      - IF_ANON_GOAL_TTL_HOURS=${IF_ANON_GOAL_TTL_HOURS:-6}
     volumes:
       - ./shared-signals:/tmp/vpn-signals
       - geolite2-data:/var/lib/geolite2:ro

@@ -346,6 +346,13 @@ services:
       # `affiliate: null` (graceful). Set a value here only to exercise the path
       # locally; NEVER commit real keys. Production keys come from the runtime env.
       - SOVRN_COMMERCE_KEY=dummy-test-key-do-not-use
+      # Optional Supabase integration testing: uncomment and set IF_GOAL_STORE=supabase.
+      # Keys come from ../../.env — never commit literal values.
+      # - IF_GOAL_STORE=supabase
+      # - SUPABASE_URL=${SUPABASE_URL}
+      # - SUPABASE_PUBLISHABLE_KEY=${SUPABASE_PUBLISHABLE_KEY}
+      # - SUPABASE_SECRET_KEY=${SUPABASE_SECRET_KEY}
+      # - IF_ANON_GOAL_TTL_HOURS=6
     volumes:
       - ./shared-signals:/tmp/vpn-signals
       - ./shared-signals/resolv-gateway.conf:/etc/resolv.conf:ro

@@ -152,15 +152,17 @@ jobs:
       - name: Check gateway reachability
         id: gateway-check
         env:
-          INTENTFORGE_BASE: http://localhost:4000
+          # IF_GATEWAY_URL comes from secrets (preferred) or a repo variable when
+          # CI targets a deployed gateway; the in-stack URL is the fallback.
+          IF_GATEWAY_URL: ${{ vars.IF_GATEWAY_URL || secrets.IF_GATEWAY_URL || 'http://localhost:4000' }}
         run: |
-          echo "Checking gateway reachability at $INTENTFORGE_BASE..."
-          if curl -sf --max-time 5 "$INTENTFORGE_BASE/health" > /dev/null 2>&1; then
+          echo "Checking gateway reachability at $IF_GATEWAY_URL..."
+          if curl -sf --max-time 5 "$IF_GATEWAY_URL/health" > /dev/null 2>&1; then
             echo "gateway_reachable=true" >> "$GITHUB_OUTPUT"
             echo "Gateway is UP — schema regression will run as a real guard."
           else
             echo "gateway_reachable=false" >> "$GITHUB_OUTPUT"
-            echo "Gateway at $INTENTFORGE_BASE is NOT reachable."
+            echo "Gateway at $IF_GATEWAY_URL is NOT reachable."
             echo "schema-regression skipped (no live gateway). The Rust unit tests"
             echo "(gateway-tests job) cover pure logic. Live-API schema tests are the"
             echo "QA loop's responsibility (runs where the stack exists)."
@@ -169,14 +171,19 @@ jobs:
       - name: Run API schema regression
         if: steps.gateway-check.outputs.gateway_reachable == 'true'
         env:
-          # Only reached when gateway is reachable — now REQUIRE it (fail if down).
+          # Only reached when a gateway is reachable — now REQUIRE it (fail if down).
+          # The probe above is the only gate; there is no unconditional skip.
           INTENTFORGE_REQUIRE_GATEWAY: "1"
-          INTENTFORGE_BASE: http://localhost:4000
-        run: pytest tests/goals_api_schema.py -v
+          IF_GATEWAY_URL: ${{ vars.IF_GATEWAY_URL || secrets.IF_GATEWAY_URL || 'http://localhost:4000' }}
+          IF_API_KEY: ${{ secrets.IF_API_KEY }}
+          INTENTFORGE_BASE_URL: ${{ vars.IF_GATEWAY_URL || secrets.IF_GATEWAY_URL || 'http://localhost:4000' }}
+        run: pytest tests/test_goals_api_schema.py -v
 
       - name: Report schema-regression skip
         if: steps.gateway-check.outputs.gateway_reachable == 'false'
+        env:
+          IF_GATEWAY_URL: ${{ vars.IF_GATEWAY_URL || secrets.IF_GATEWAY_URL || 'http://localhost:4000' }}
         run: |
-          echo "::warning::schema-regression SKIPPED — no live gateway at $INTENTFORGE_BASE"
-          echo "::warning::This job is a no-op on a bare runner. The QA loop runs"
-          echo "::warning::the suite where the stack exists."
+          echo "::warning::schema-regression SKIPPED — no live gateway at $IF_GATEWAY_URL"
+          echo "::warning::This job is a no-op only because no gateway was reachable."
+          echo "::warning::The QA loop runs the suite where the stack exists."

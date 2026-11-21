@@ -47,6 +47,7 @@ BASE_URL = os.environ.get(
     "INTENTFORGE_BASE",
     os.environ.get("INTENTFORGE_BASE_URL", "http://localhost:4000"),
 )
+API_KEY = os.environ.get("IF_API_KEY", "")
 # First request after a gateway cold-start can be ~10s; leave generous headroom.
 HTTP_TIMEOUT = 60
 
@@ -99,16 +100,20 @@ def _get_json(path, params=None):
     url = BASE_URL + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as r:
+    headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=HTTP_TIMEOUT) as r:
         return r.status, json.loads(r.read().decode())
 
 
 def _post_json(path, payload):
     data = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
     req = urllib.request.Request(
         BASE_URL + path,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
@@ -449,7 +454,7 @@ def _negation_probe(q):
     return (
         sc.get("negative", []),
         sc.get("positive", []),
-        sc.get("price_lt"),
+        sc.get("price_max"),  # engine reports price_max, not price_lt
         sc,
     )
 
@@ -563,23 +568,20 @@ if __name__ == "__main__":
 
 
 # 7. POST /goals/:id/phases/:phase_id/complete
-def test_complete_phase_schema(session):
+def test_complete_phase_schema():
     """POST /goals/:id/phases/:phase_id/complete -> 200, phase completion tracked."""
-    goal_id, questions = _create_goal(session)
-    answers = _real_answers(questions)
-    r = session.post(
-        f"{BASE}/goals/{goal_id}/answers", json={"answers": answers}, timeout=60
+    _assert_gateway_up()
+    created = _create_goal("learn phase completion tracking")
+    goal_id = created["goal_id"]
+    status, resp = _post_json(
+        f"/goals/{goal_id}/answers", {"answers": _real_answers(created["questions"])}
     )
-    assert r.status_code == 200, f"POST answers -> {r.status_code} {r.text[:300]}"
-    roadmap = r.json().get("roadmap", {})
-    total_phases = roadmap.get("total_phases", 0)
-    assert total_phases >= 1, "roadmap must have at least 1 phase to test completion"
+    assert status == 200, f"POST answers -> {status} {resp!r}"
+    total_phases = (resp.get("roadmap") or {}).get("total_phases", 0)
+    assert total_phases >= 1, "roadmap must have at least 1 phase"
 
-    r2 = session.post(
-        f"{BASE}/goals/{goal_id}/phases/1/complete", json={}, timeout=10
-    )
-    assert r2.status_code == 200, f"POST complete phase -> {r2.status_code} {r2.text[:300]}"
-    body = r2.json()
+    status, body = _post_json(f"/goals/{goal_id}/phases/1/complete", {})
+    assert status == 200, f"POST complete phase -> {status} {body!r}"
     assert body.get("goal_id") == goal_id
     assert body.get("completed_phase_id") == 1
     assert body.get("completed_phases") == 1
@@ -588,24 +590,23 @@ def test_complete_phase_schema(session):
 
 
 # 8. POST /goals/:id/progress
-def test_update_progress_schema(session):
+def test_update_progress_schema():
     """POST /goals/:id/progress -> 200, phase progress updated via JSON payload."""
-    goal_id, questions = _create_goal(session)
-    answers = _real_answers(questions)
-    r = session.post(
-        f"{BASE}/goals/{goal_id}/answers", json={"answers": answers}, timeout=60
+    _assert_gateway_up()
+    created = _create_goal("learn progress tracking")
+    goal_id = created["goal_id"]
+    status, resp = _post_json(
+        f"/goals/{goal_id}/answers", {"answers": _real_answers(created["questions"])}
     )
-    assert r.status_code == 200, f"POST answers -> {r.status_code} {r.text[:300]}"
-    total_phases = r.json().get("roadmap", {}).get("total_phases", 0)
+    assert status == 200, f"POST answers -> {status} {resp!r}"
+    total_phases = (resp.get("roadmap") or {}).get("total_phases", 0)
     assert total_phases >= 1
 
-    r2 = session.post(
-        f"{BASE}/goals/{goal_id}/progress",
-        json={"phase_id": 1, "is_completed": True},
-        timeout=10,
+    status, body = _post_json(
+        f"/goals/{goal_id}/progress",
+        {"phase_id": 1, "is_completed": True},
     )
-    assert r2.status_code == 200, f"POST progress -> {r2.status_code} {r2.text[:300]}"
-    body = r2.json()
+    assert status == 200, f"POST progress -> {status} {body!r}"
     assert body.get("goal_id") == goal_id
     assert body.get("phase_id") == 1
     assert body.get("is_completed") is True
