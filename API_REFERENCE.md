@@ -897,7 +897,7 @@ The `/search` endpoint parses a rich set of operators directly from the query st
 > would empty most queries. The same resolver backs the `published_date` field on
 > each result (omitted when nothing resolves).
 
-| `price:<` or `price:>` | `price:%3C50 headphones` | Filter by price range (URL-encode `<` to `%3C`, `>` to `%3E`) | `price_lt: 50.0` or `price_gt: 50.0` |
+| `price:<` or `price:>` | `price:%3C50 headphones` | Filter by price range (URL-encode `<` to `%3C`, `>` to `%3E`) | `price_max: 50.0` or `price_min: 50.0` (the live engine also emits `price_max` for natural-language "under $N") |
 | `price_min:` | `price_min:10` | Minimum price | `price_min: 10.0` |
 | `price_max:` | `price_max:100` | Maximum price | `price_max: 100.0` |
 | `lang:` | `lang:en` | Language filter (ISO code). Auto-applied as `lang:en` for English queries even without explicit use. | `language: "en"` |
@@ -1040,7 +1040,7 @@ The unified result type for the main search endpoint. Results can come from loca
 | `before_date` | string | Date upper bound (YYYY-MM-DD). **Observed** (see above). |
 | `price_min` | float | Minimum price. **Unverified this session** — the `price:<` / `price:>` / `price_min:` / `price_max:` operators were NOT exercised live; these field names are taken from source, not observed output. |
 | `price_max` | float | Maximum price. **Unverified this session.** |
-| `price_lt` | float | Upper price bound from `<` operator. **Unverified this session.** |
+| `price_lt` | float | Legacy/test-era field name. The live engine emits `price_max` for "under $N" and `<` operators; retained here only for historical trailers. |
 | `price_gt` | float | Lower price bound from `>` operator. **Unverified this session.** |
 
 ---
@@ -1584,6 +1584,12 @@ Quick Flow (one-shot):
 | `GET`  | `/goals/:goal_id` | Get goal status and roadmap by ID |
 | `GET`  | `/goals/leaderboard` | Get leaderboard of all goals (sorted by score) |
 | `POST` | `/goals/quick` | One-shot: goal → full roadmap immediately (no questions) |
+| `GET`  | `/goals` | List the caller's goals (bare JSON array) |
+| `POST` | `/goals/:goal_id/phases/:phase_id/complete` | Mark a phase complete (1-indexed `phase_id`, sets `true` only) |
+| `GET`  | `/goals/:goal_id/progress` | Read-only progress state for a goal |
+| `POST` | `/goals/:goal_id/progress` | Update phase completion (`{"phase_id":1,"is_completed":true}`; can toggle `false`) |
+
+Phase 1 (2026-11): `/goals/leaderboard` is public and returns `[]` until accounts launch; anonymous callers send `X-Anonymous-Owner: <uuid-v4>` and receive an additive `expires_at` field.
 
 ---
 
@@ -1594,6 +1600,9 @@ All Goals errors return a JSON body with `error` + `message`.
 | Status | `error` | When (verified) |
 |--------|---------|-----------------|
 | `400` | `empty_goal` | `goal` missing or `< 3` characters (e.g. `{"goal":"ab"}`) |
+| `400` | `invalid_goal` | `goal` has fewer than 3 alphabetic characters |
+| `400` | `invalid_answers` | `answers` array is empty or malformed |
+| `500` | `internal_error` | Unexpected server-side failure (e.g. roadmap update failed) |
 | `400` | `invalid_phase` | `phase_id` not in `1..total_phases`. Phase IDs are **1-indexed** — `phase_id:0` returns this (verified: `POST /goals/goal_0002/progress` with `{"phase_id":0}` → `invalid_phase`). Use the `id` field from each roadmap phase. |
 | `404` | `not_found` | Goal ID does not exist (e.g. `GET /goals/goal_does_not_exist`) |
 | `422` | `invalid_payload` | Malformed JSON body or missing required field (from the custom `AppJson` extractor). Also fires on `POST /goals/:goal_id/answers` when `answers` is a flat string array instead of objects — `{"answers":["beginner"]}` → `answers[0]: invalid type: string "beginner", expected struct UserAnswer` (verified live 2026-09-27). See [POST /goals/:goal_id/answers](#post-goalsgoal_idanswers). |
